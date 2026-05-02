@@ -50,12 +50,22 @@ fn to_tokio_command(cmd: &Cmd) -> Command {
     c
 }
 
+/// Spawn the command, capture stdout and stderr, and return the `Output`
+/// regardless of exit status. Only true I/O / spawn failures propagate as
+/// errors. Use this when a non-zero exit is meaningful information to the
+/// caller (e.g. `git rev-parse --git-dir` for "is this a git repo?",
+/// `buildah images --quiet TAG` for "does this tag exist?") rather than an
+/// error condition.
+pub async fn try_capture(cmd: Cmd) -> Result<Output> {
+    Ok(to_tokio_command(&cmd).output().await?)
+}
+
 /// Spawn the command, capture stdout and stderr, and return the `Output` on
 /// success. On non-zero (or signal) exit, return [`OutrigError::Process`] with
 /// the program, argv, exit code, and the last `STDERR_TAIL_LIMIT` bytes of
 /// stderr (lossy UTF-8, prefixed with a truncation marker if elision occurred).
 pub async fn run_capture(cmd: Cmd) -> Result<Output> {
-    let output = to_tokio_command(&cmd).output().await?;
+    let output = try_capture(cmd.clone()).await?;
     if output.status.success() {
         Ok(output)
     } else {

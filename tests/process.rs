@@ -55,6 +55,15 @@ async fn run_capture_false_fails_with_exit_1() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn try_capture_returns_output_on_nonzero_exit() {
+    let out = process::try_capture(Cmd::new("/bin/false"))
+        .await
+        .expect("try_capture must not error on non-zero exit");
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn run_capture_truncates_long_stderr_with_marker() {
     // Emit 5000 lines to stderr; each line is short, total exceeds 2 KiB.
     let cmd = Cmd::new("/bin/sh").args([
