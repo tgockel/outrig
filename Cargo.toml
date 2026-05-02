@@ -3,4 +3,38 @@ name = "outrig"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+e2e = []
+
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.40", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "process",
+    "signal",
+    "fs",
+    "time",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+toml_edit = "0.22"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+blake3 = "1.5"
+tempfile = "3.10"
+directories = "5.0"
+walkdir = "2.5"
+ignore = "0.4"
+dialoguer = "0.11"
+rig-core = { version = "0.36", default-features = false, features = ["reqwest", "rustls"] }
+rmcp = { version = "0.1", default-features = false, features = [
+    "base64",
+    "client",
+    "macros",
+    "transport-child-process",
+] }

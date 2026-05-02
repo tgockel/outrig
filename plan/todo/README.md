@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase A -- skeleton + config
 
-- **[0001](0001-cargo-skeleton.md)** Cargo deps + module stubs + clap subcommand shells.
 - **[0002](0002-repo-and-config-paths.md)** Locate the repo and global config files.
 - **[0003](0003-config-schema.md)** Type the config schema with serde round-trip.
 - **[0004](0004-api-key-syntax.md)** Enforce `${VAR}` api-key syntax.
