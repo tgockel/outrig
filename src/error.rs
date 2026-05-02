@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::config::api_key::ApiKeyError;
+
 #[derive(Debug, Error)]
 pub enum OutrigError {
     #[error("not implemented: {0}")]
@@ -15,6 +17,9 @@ pub enum OutrigError {
 
     #[error("{0}")]
     Config(#[from] toml::de::Error),
+
+    #[error("{0}")]
+    ApiKey(#[from] ApiKeyError),
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

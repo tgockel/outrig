@@ -1,9 +1,13 @@
 //! Config schema and parsing.
 
+pub mod api_key;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+pub use api_key::ApiKeyRef;
 
 use crate::error::Result;
 
@@ -44,7 +48,7 @@ impl Config {
 pub struct LlmProvider {
     pub style: String,
     pub base_url: String,
-    pub api_key: String,
+    pub api_key: ApiKeyRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<u64>,
 }

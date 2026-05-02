@@ -93,7 +93,7 @@ srv = { command = ["bin", "arg1"] }
         let openai = &cfg.providers["openai"];
         assert_eq!(openai.style, "openai");
         assert_eq!(openai.base_url, "https://api.openai.com/v1");
-        assert_eq!(openai.api_key, "${OPENAI_API_KEY}");
+        assert_eq!(openai.api_key.var_name(), "OPENAI_API_KEY");
         assert_eq!(openai.request_timeout_secs, Some(90));
         assert_eq!(cfg.providers["anthropic"].request_timeout_secs, None);
 

@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase A -- skeleton + config
 
-- **[0004](0004-api-key-syntax.md)** Enforce `${VAR}` api-key syntax.
 - **[0005](0005-config-merge-validate.md)** Merge global + repo and validate cross-references.
 
 ## Phase B -- subprocess + container

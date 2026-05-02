@@ -30,6 +30,7 @@ tempfile = "3.10"
 directories = "5.0"
 walkdir = "2.5"
 ignore = "0.4"
+regex = "1.10"
 dialoguer = "0.11"
 rig-core = { version = "0.36", default-features = false, features = ["reqwest", "rustls"] }
 rmcp = { version = "0.1", default-features = false, features = [
