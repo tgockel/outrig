@@ -15,7 +15,11 @@ the environment the agent gets to play in, leaving the agents free to work quick
   authoritative record of design calls made during that task.
 - `plan/next/` -- follow-up work discovered mid-execution (no leading `NNNN-`); folded
   into the numbered queue periodically.
-- `crates/` -- Rust workspace.
+- `src/` -- Rust source. Single-crate layout for v0; convert to a `crates/` workspace
+  later if/when subsystems want their own published crates.
+- `tests/` -- integration tests, including e2e tests gated behind `--features e2e`.
+- `scripts/` -- repo-local tooling (doc-style audit, mdbook assets).
+- `book.toml` -- mdbook config; output goes to `target/book/`.
 
 ## Conventions for `doc/`
 

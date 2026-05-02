@@ -30,8 +30,8 @@ If the output is non-empty, **abort** and tell the user to commit or stash first
 
 ## 2. Branch
 
-Create a branch named for the task's short-name (e.g. `0001-workspace-skeleton.md` becomes
-branch `0001-workspace-skeleton`). One task per branch:
+Create a branch named for the task's short-name (e.g. `0001-cargo-skeleton.md` becomes
+branch `0001-cargo-skeleton`). One task per branch:
 
 ```bash
 git checkout -b "<short-name>"
@@ -40,7 +40,7 @@ git checkout -b "<short-name>"
 ## 3. Context
 
 - Read the task's plan markdown.
-- Read every `doc/` and `crates/` file referenced (or implied) by the task.
+- Read every `doc/` and `src/` file referenced (or implied) by the task.
 - Drop into plan mode for the standard Explore-agent / Plan-agent flow.
 
 ## 4. Clarify
@@ -70,9 +70,9 @@ Run the `/simplify` skill on the changes (review for reuse, quality, efficiency)
 Then run the standard cargo checks:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt --all -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt -- --check
 ```
 
 All three must pass. If any fail, fix and re-run -- do not commit broken code.
@@ -92,9 +92,10 @@ The script prints `Width: OK`, `Links: OK`, `Spelling: OK` when clean, and exits
 non-zero if any check finds violations. CI runs the same script (see
 `.github/workflows/ci.yml`).
 
-Update / expand `doc/` to match the implemented surface. Specifically: if this task makes
-a subsystem real for the first time, **drop the `Status: Draft` line** from that
-subsystem's `doc/architecture/<subsystem>.md` (or wherever the surface was promised).
+Update / expand `doc/` to match the implemented surface. Specifically: drop the
+`> TODO: Incomplete` blockquote from any `doc/{concepts,usage,reference}/` page whose
+behavior is now fully real. Each task's `## Acceptance` section lists the markers it's
+expected to drop.
 
 ## 7. Confirm
 
@@ -125,7 +126,7 @@ Stage all changes and commit using conventional-commits style:
 |------------|-------------------------------------------------------|
 | `feat:`    | New feature or capability (most implementation tasks) |
 | `fix:`     | Bug fix                                               |
-| `chore:`   | Build, tooling, workspace, dependencies               |
+| `chore:`   | Build, tooling, dependencies                          |
 | `docs:`    | Documentation-only change                             |
 | `test:`    | Test-only change                                      |
 | `refactor:`| Restructuring without behavior change                 |
