@@ -37,6 +37,12 @@ pub enum OutrigError {
 
     #[error("could not allocate {kind} name during container bootstrap after retries")]
     BootstrapExhausted { kind: &'static str },
+
+    #[error("mcp service: {0}")]
+    McpService(#[from] rmcp::service::ServiceError),
+
+    #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
+    McpArgsNotObject { kind: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

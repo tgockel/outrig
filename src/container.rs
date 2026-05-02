@@ -214,23 +214,19 @@ impl Container {
         Err(OutrigError::BootstrapExhausted { kind })
     }
 
-    /// Spawn a command inside the container as the host user, with all three
-    /// stdio streams piped back to the caller. `HOME` is always set to the
-    /// in-container home directory; entries in `env` are forwarded via
-    /// `--env K=V` (BTreeMap order makes the resulting argv deterministic).
+    /// Build the argv for a `podman exec -i --user --env HOME ...` invocation
+    /// without spawning. `HOME` is always set to the in-container home
+    /// directory; entries in `env` are forwarded via `--env K=V` (BTreeMap
+    /// order makes the resulting argv deterministic).
     ///
     /// Panics if [`Container::bootstrap_user`] has not yet been called --
     /// the user/group don't exist inside the container, so a `--user`-scoped
     /// exec would fail at the podman layer with a less useful message.
-    pub async fn exec_stdio(
-        &self,
-        cmd: &[String],
-        env: &BTreeMap<String, String>,
-    ) -> Result<Child> {
+    pub fn build_exec_argv(&self, cmd: &[String], env: &BTreeMap<String, String>) -> Cmd {
         let user_name = self
             .user_name
             .as_deref()
-            .expect("bootstrap_user must be called before exec_stdio");
+            .expect("bootstrap_user must be called before build_exec_argv");
 
         let mut c = Cmd::new("podman")
             .args(["exec", "-i"])
@@ -244,7 +240,17 @@ impl Container {
         for arg in cmd {
             c = c.arg(arg);
         }
-        process::spawn_stdio(c).await
+        c
+    }
+
+    /// Spawn a command inside the container as the host user, with all three
+    /// stdio streams piped back to the caller.
+    pub async fn exec_stdio(
+        &self,
+        cmd: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<Child> {
+        process::spawn_stdio(self.build_exec_argv(cmd, env)).await
     }
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {

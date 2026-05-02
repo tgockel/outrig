@@ -149,10 +149,10 @@ pub enum McpServerSpec {
 }
 
 impl McpServerSpec {
-    pub fn normalize(self) -> (Vec<String>, BTreeMap<String, String>) {
+    pub fn normalize(&self) -> (Vec<String>, BTreeMap<String, String>) {
         match self {
-            Self::Short(command) => (command, BTreeMap::new()),
-            Self::Full { command, env } => (command, env),
+            Self::Short(command) => (command.clone(), BTreeMap::new()),
+            Self::Full { command, env } => (command.clone(), env.clone()),
         }
     }
 }

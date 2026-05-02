@@ -73,7 +73,7 @@ srv = { command = ["bin", "arg1"] }
 
         assert_eq!(short_spec.normalize(), full_spec.normalize());
         assert_eq!(
-            short.containers["c"].mcp["srv"].clone().normalize(),
+            short.containers["c"].mcp["srv"].normalize(),
             (vec!["bin".to_string(), "arg1".to_string()], BTreeMap::new()),
         );
     }
@@ -124,10 +124,10 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding_ctr.build_args["NODE_VERSION"], "20");
 
         assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
-        let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].clone().normalize();
+        let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].normalize();
         assert_eq!(fs_cmd, vec!["mcp-server-filesystem", "/workspace"]);
         assert!(fs_env.is_empty());
-        let (build_cmd, build_env) = coding_ctr.mcp["build"].clone().normalize();
+        let (build_cmd, build_env) = coding_ctr.mcp["build"].normalize();
         assert_eq!(build_cmd, vec!["cargo-mcp"]);
         assert_eq!(build_env["CARGO_HOME"], "/workspace/.cargo");
     }

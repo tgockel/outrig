@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase C -- MCP + LLM
 
-- **[0010](0010-mcp-client.md)** rmcp client over `podman exec` stdio.
 - **[0011](0011-rig-tool-adapter.md)** MCP -> Rig dynamic-tool adapter.
 - **[0012](0012-llm-resolver.md)** Resolve agent -> model -> provider, build Rig client.
 - **[0013](0013-llm-provider-enum.md)** Migrate `LlmProvider` to a tagged enum.

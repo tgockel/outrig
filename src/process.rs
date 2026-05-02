@@ -42,12 +42,15 @@ impl Cmd {
             .extend(args.into_iter().map(|s| s.as_ref().to_os_string()));
         self
     }
-}
 
-fn to_tokio_command(cmd: &Cmd) -> Command {
-    let mut c = Command::new(cmd.program);
-    c.args(&cmd.args);
-    c
+    /// Build a fresh `tokio::process::Command` from this argv. No stdio
+    /// configuration is applied -- the caller layers `.stdin()` / `.stdout()`
+    /// / `.stderr()` to taste before spawning.
+    pub fn to_tokio_command(&self) -> Command {
+        let mut c = Command::new(self.program);
+        c.args(&self.args);
+        c
+    }
 }
 
 /// Spawn the command, capture stdout and stderr, and return the `Output`
@@ -57,7 +60,7 @@ fn to_tokio_command(cmd: &Cmd) -> Command {
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
 pub async fn try_capture(cmd: Cmd) -> Result<Output> {
-    Ok(to_tokio_command(&cmd).output().await?)
+    Ok(cmd.to_tokio_command().output().await?)
 }
 
 /// Spawn the command, capture stdout and stderr, and return the `Output` on
@@ -84,7 +87,8 @@ pub async fn run_capture(cmd: Cmd) -> Result<Output> {
 /// non-zero exit is **not** an error, since callers may want to inspect
 /// status before deciding what it means.
 pub async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> {
-    let mut child = to_tokio_command(&cmd)
+    let mut child = cmd
+        .to_tokio_command()
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -111,7 +115,8 @@ pub async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> 
 /// the [`Child`]. The caller owns the child and is responsible for waiting on
 /// it. Used by `podman exec -i` callers that want full bidirectional control.
 pub async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
-    let child = to_tokio_command(&cmd)
+    let child = cmd
+        .to_tokio_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
