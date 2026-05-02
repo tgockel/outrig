@@ -1,5 +1,7 @@
 //! Top-level error type.
 
+use std::ffi::OsString;
+
 use thiserror::Error;
 
 use crate::config::api_key::ApiKeyError;
@@ -24,6 +26,30 @@ pub enum OutrigError {
 
     #[error("{0}")]
     ConfigValidation(#[from] ConfigValidationError),
+
+    #[error("{}", format_process(program, argv, *exit_code, stderr_tail))]
+    Process {
+        program: &'static str,
+        argv: Vec<OsString>,
+        exit_code: Option<i32>,
+        stderr_tail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;
+
+fn format_process(
+    program: &str,
+    argv: &[OsString],
+    exit_code: Option<i32>,
+    stderr_tail: &str,
+) -> String {
+    let exit = match exit_code {
+        Some(c) => format!("code {c}"),
+        None => "signal".to_string(),
+    };
+    format!(
+        "process `{program}` exited with {exit}\nargv: {argv:?}\n\
+         --- stderr (tail) ---\n{stderr_tail}"
+    )
+}

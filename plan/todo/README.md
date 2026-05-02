@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase B -- subprocess + container
 
-- **[0006](0006-process-wrappers.md)** tokio::process wrappers for buildah/podman.
 - **[0007](0007-image-build.md)** Image build via buildah, content-addressed cache.
 - **[0008](0008-container-lifecycle.md)** Container start/stop with reliable cleanup.
 - **[0009](0009-runtime-user-bootstrap.md)** Runtime UID/GID bootstrap inside the container.

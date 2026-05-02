@@ -41,3 +41,26 @@ stderr capture, and tracing are consistent.
   `tracing_subscriber::fmt::Subscriber` + a thread-local capture. Keep simple.
 - This module shouldn't know about buildah or podman specifically; it's a generic subprocess
   helper. Image/container modules pass the program name in.
+
+## Decisions
+
+- **`Process` Display via free `format_process` helper, not inline thiserror format string.**
+  The variant has multi-line output and a Some/None branch on `exit_code` ("code N" vs
+  "signal"). thiserror's `#[error("...", expr)]` with `match .exit_code { ... }` works but
+  reads worse than a small free function. Helper lives next to the variant in `error.rs`.
+- **`argv` stores just args, not the program.** `Cmd` has `program` and `args` separately;
+  the error variant mirrors that split, and `Display` prints `program` separately on its own
+  line. Avoids the "is `argv[0]` the binary or the first arg?" ambiguity that comes with
+  Unix-style argv.
+- **`run_streamed` emits `tracing::info!` at target `outrig::process`.** info, not warn or
+  error -- buildah's progressive output is informational. The explicit target makes the
+  stream filterable and gives tests a stable handle to assert on.
+- **Streamed-tracing test uses a synchronous `#[test]` with a `current_thread` tokio runtime
+  and `tracing::subscriber::set_default`.** `set_default` is per-thread; `current_thread`
+  keeps spawned tasks on the same OS thread so the log task sees the same subscriber. A
+  `#[tokio::test]` (multi-thread) would race against the per-thread default. The test owns a
+  shared `Arc<Mutex<Vec<u8>>>` buffer fed via a custom `MakeWriter` -- no new dev-deps.
+- **Unbounded stderr in `run_capture` is accepted for v0.** `Command::output()` buffers all
+  stderr before `tail_string` truncates. A 10 GB stderr would OOM. The task spec frames the
+  contract as "last ~2 KiB" and a streaming-bounded read is a v1 follow-up if real callers
+  hit it.
