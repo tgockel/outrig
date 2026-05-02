@@ -10,6 +10,7 @@
   - [MCP Servers](concepts/mcp-servers.md)
   - [Workspace](concepts/workspace.md)
   - [Providers, Models, and Agents](concepts/llm-providers.md)
+  - [In-process LLMs](concepts/in-process-llm.md)
 
 # Usage
 

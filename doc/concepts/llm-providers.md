@@ -47,9 +47,11 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 ```
 
-`style` is the protocol (v0 wires `"openai"` only; OpenAI-compatible endpoints all use this
-style). `base-url` is the HTTPS endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig
-resolves it at run time, never reads a key from disk. See
+`style` is the protocol. v0 wires `"openai"` for any OpenAI-compatible endpoint, and
+recognizes `"mistralrs"` for in-process LLMs (gated behind a Cargo feature -- see
+[In-process providers](#in-process-providers-mistralrs) below). `base-url` is the HTTPS
+endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at run time,
+never reads a key from disk. See
 [Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
 
 You can declare as many providers as you want -- one per account, one per local Ollama install,
@@ -168,6 +170,42 @@ style    = "anthropic"
 base-url = "https://api.anthropic.com/v1"
 api-key  = "${ANTHROPIC_API_KEY}"
 ```
+
+## In-process providers (`mistralrs`)
+
+> **TODO: Incomplete** -- this provider is gated behind `--features mistralrs` and the
+> implementation hasn't landed yet.
+
+An in-process provider runs the model in the outrig process itself, with no socket and no
+serialization. The use case is questions whose *content* must not leave the host -- the
+eventual egress filter, tool-use filter, and prompt-injection scanner all want this. See
+[In-process LLMs](in-process-llm.md) for the full picture.
+
+```toml
+# Auto-download from HuggingFace on first use:
+[providers.local]
+style      = "mistralrs"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+
+# Or point at a GGUF you placed on disk yourself:
+[providers.local-offline]
+style      = "mistralrs"
+model-path = "/var/cache/outrig/models/Phi-3-mini-4k-instruct-q4.gguf"
+```
+
+Neither form takes `base-url` or `api-key`. Exactly one of `model-id` / `model-path` is
+required.
+
+The backend is gated behind `cargo build --features mistralrs`. A build *without* the
+feature still parses and validates `style = "mistralrs"` blocks cleanly; the error fires
+only when an agent tries to actually use one of those providers, with a message that names
+the missing feature flag. This keeps configs portable across builds.
+
+For the full schema (including `revision`, `context-length`, and the top-level
+`model-cache-root` key) see [Reference -> Config](../reference/config.md). For why this
+exists at all -- and why "localhost LLM" isn't the same thing -- see
+[In-process LLMs](in-process-llm.md).
 
 ## Tool calling
 

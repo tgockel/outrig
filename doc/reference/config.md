@@ -23,31 +23,42 @@ default-container = "coding"
 default-agent     = "coding"
 
 # global config (~/.outrig/config.toml):
-default-model = "fast"
-session-root  = "/var/lib/outrig/sessions"   # optional; defaults to XDG data dir
+default-model     = "fast"
+session-root      = "/var/lib/outrig/sessions"        # optional; defaults to XDG data dir
+model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XDG cache dir
 ```
 
-| Key                 | Type   | Required                     | Where  | Description                               |
-|---------------------|--------|------------------------------|--------|-------------------------------------------|
-| `default-container` | string | for `outrig run`             | repo   | Used if `--container-config` omitted.     |
-| `default-agent`     | string | for `outrig run`             | repo   | Used if `--agent` omitted.                |
-| `default-model`     | string | when an agent has no `model` | global | Fallback model name.                      |
-| `session-root`      | path   | no                           | global | Root dir for sessions. Default: XDG data. |
+| Key                 | Type   | Required               | Where  | Description                   |
+|---------------------|--------|------------------------|--------|-------------------------------|
+| `default-container` | string | for `outrig run`       | repo   | Default `--container-config`. |
+| `default-agent`     | string | for `outrig run`       | repo   | Default `--agent`.            |
+| `default-model`     | string | if agent omits `model` | global | Fallback model name.          |
+| `session-root`      | path   | no                     | global | Sessions root dir.            |
+| `model-cache-root`  | path   | no                     | global | GGUF download cache dir.      |
 
 `default-container` and `default-agent` belong in the repo config -- containers and agents are
-project-scoped. `default-model` and `session-root` belong in the global config since they're
-user/machine-level. Each may also appear in the other file; repo entries override global by
-name.
+project-scoped. `default-model`, `session-root`, and `model-cache-root` belong in the global
+config since they're user/machine-level. Each may also appear in the other file; repo entries
+override global by name.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
 config value and the default; `--session-dir <path>` (on `outrig run`/`logs`/`discard`) instead
 points at one specific session directory. See [Sessions](../usage/sessions.md).
 
+`model-cache-root` defaults to `<XDG_CACHE_HOME>/outrig/models/` (typically
+`~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` providers configured
+with `model-id` -- that's where the auto-downloaded GGUFs land. See
+[Concepts -> In-process LLMs](../concepts/in-process-llm.md).
+
 ## `[providers.<name>]`
 
-A provider is an HTTPS endpoint that speaks a known wire format and authenticates with one API
-key. Multiple providers in either file. Repo entries with the same name override globals.
+A provider tells outrig how to reach a model -- either a remote HTTPS endpoint that speaks
+a known wire format, or a local in-process backend. Multiple providers in either file. Repo
+entries with the same name override globals. The accepted `style` values are `"openai"` and
+`"mistralrs"`. Which other fields are valid depends on `style`.
+
+### `style = "openai"`
 
 ```toml
 [providers.openai]
@@ -66,12 +77,62 @@ base-url = "http://localhost:11434/v1"
 api-key  = "${OLLAMA_API_KEY}"
 ```
 
-| Key                    | Type         | Required | Default | Description                            |
-|------------------------|--------------|----------|---------|----------------------------------------|
-| `style`                | string       | yes      | --      | Wire format. v0 wires `"openai"` only. |
-| `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider.       |
-| `api-key`              | string       | yes      | --      | Env-var reference, see below.          |
-| `request-timeout-secs` | integer      | no       | `120`   | HTTP timeout for LLM calls.            |
+| Key                    | Type         | Required | Default | Description                      |
+|------------------------|--------------|----------|---------|----------------------------------|
+| `style`                | string       | yes      | --      | Must be `"openai"` for this row. |
+| `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider. |
+| `api-key`              | string       | yes      | --      | Env-var reference, see below.    |
+| `request-timeout-secs` | integer      | no       | `120`   | HTTP timeout for LLM calls.      |
+
+### `style = "mistralrs"`
+
+> **TODO: Incomplete** -- gated behind `--features mistralrs`; the implementation hasn't
+> landed yet.
+
+In-process LLM backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. No
+HTTP, no API key. Either `model-id` (auto-download from HuggingFace) or `model-path`
+(local file) -- exactly one. See [Concepts -> In-process LLMs](../concepts/in-process-llm.md).
+
+```toml
+# HuggingFace auto-download:
+[providers.local]
+style      = "mistralrs"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+# revision       = "main"   # optional git ref on the HF repo
+# context-length = 4096     # optional override
+
+# Local GGUF file:
+[providers.local-offline]
+style      = "mistralrs"
+model-path = "/var/cache/outrig/models/Phi-3-mini-4k-instruct-q4.gguf"
+```
+
+| Key              | Type    | Required | Default  | Description                                  |
+|------------------|---------|----------|----------|----------------------------------------------|
+| `style`          | string  | yes      | --       | Must be `"mistralrs"` for this row.          |
+| `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
+| `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
+| `model-file`     | string  | no       | --       | Which GGUF in a multi-file repo. With `id`.  |
+| `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
+| `context-length` | integer | no       | model    | Override the model's default context window. |
+
+\* Exactly one of `model-id` / `model-path` must be set; setting both, or neither, is an
+error.
+
+`base-url` and `api-key` are not allowed on `style = "mistralrs"`.
+
+#### Always parses, even without `--features mistralrs`
+
+outrig **always** recognizes `style = "mistralrs"` for parsing and cross-reference
+validation, regardless of whether the binary was built with `--features mistralrs`. The
+build-time feature gates only the *use* of the provider: trying to resolve an agent that
+points at a `mistralrs` provider on a non-feature build fails at run time, with a message
+that names the missing flag.
+
+The reason is portability -- a checked-in `.agents/outrig/config.toml` can declare both
+remote and in-process providers, and the same config works for teammates whether or not
+they built with the feature on.
 
 ### `api-key` syntax
 
@@ -241,8 +302,9 @@ before the REPL starts.
 ### Global `~/.outrig/config.toml`
 
 ```toml
-default-model = "fast"
-session-root  = "/var/lib/outrig/sessions"   # optional; default = XDG data dir
+default-model    = "fast"
+session-root     = "/var/lib/outrig/sessions"   # optional; default = XDG data dir
+model-cache-root = "/var/cache/outrig/models"   # optional; default = XDG cache dir
 
 [providers.openai]
 style    = "openai"
@@ -253,6 +315,12 @@ api-key  = "${OPENAI_API_KEY}"
 style    = "anthropic"
 base-url = "https://api.anthropic.com/v1"
 api-key  = "${ANTHROPIC_API_KEY}"
+
+[providers.local]
+# requires `cargo build --features mistralrs` to actually use, but always parses.
+style      = "mistralrs"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
 
 [models.fast]
 provider   = "openai"
@@ -306,7 +374,16 @@ build-args = { NODE_VERSION = "20" }
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.
 - Every `agents.<name>.container` (if set) must name an existing `[containers.<name>]`.
-- Every `providers.<name>.api-key` must match `^\$\{[A-Z_][A-Z0-9_]*\}$`.
+- Every `providers.<name>.style` must be one of `{"openai", "mistralrs"}`. Other styles are
+  reserved for future Rig adapters and listed as TODO in the providers concept page. The
+  build-time feature gate (`--features mistralrs`) is **not** checked at validate time --
+  see "Always parses, even without `--features mistralrs`" above.
+- Every `providers.<name>.api-key` (on `style = "openai"`) must match
+  `^\$\{[A-Z_][A-Z0-9_]*\}$`.
+- For every `style = "mistralrs"` provider, exactly one of `model-id` / `model-path` must
+  be set. `model-file` and `revision` are only meaningful with `model-id`. A `model-path`,
+  if set, must exist on disk relative to the repo root (or be absolute).
+- `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.
 - Every `command` array must be non-empty.

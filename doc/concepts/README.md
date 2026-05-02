@@ -17,3 +17,7 @@ where they're spelled out.
 - **[Providers, Models, and Agents](llm-providers.md)** -- the three-layer LLM config:
   providers (where), models (what), agents (which preamble + container). Most users keep
   providers and models in the global config; agents are typically per-repo.
+- **[In-process LLMs](in-process-llm.md)** -- a feature-gated provider that runs the
+  model inside the outrig process itself, for questions whose content must not leave the
+  host. Plumbing for the future egress filter, tool-use filter, and prompt-injection
+  scanner.

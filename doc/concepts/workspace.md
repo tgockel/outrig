@@ -115,7 +115,8 @@ access can run `curl`, `git push`, `npm publish`, etc. -- anything that talks to
 world.
 
 > **TODO: Incomplete** -- egress interception (CONNECT proxy + per-host allowlist + per-session
-> log) is deferred.
+> log) is deferred. The eventual filter will lean on an [in-process LLM](in-process-llm.md) so
+> the question being filtered never leaves the host process.
 
 If the consequences of free network access matter for your repo, gate the agent at the MCP-server
 level for now: don't include a `shell` MCP, only include MCP servers whose tools are scoped (a
