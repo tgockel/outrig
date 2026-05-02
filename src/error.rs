@@ -12,6 +12,9 @@ pub enum OutrigError {
 
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Config(#[from] toml::de::Error),
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

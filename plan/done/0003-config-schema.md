@@ -59,3 +59,24 @@ Type the config schema as Rust structs, with serde round-trip against the exampl
 - If `inner` `env` keys end up rejected because of `rename_all = "kebab-case"` on the parent
   table, restructure as a `HashMap<String, McpServerSpec>` field whose value isn't itself a
   serde-renamed struct -- the inner map keys aren't subject to outer rename rules.
+
+## Decisions
+
+- **Inner-map keys passed through unchanged.** `serde`'s `rename_all = "kebab-case"` applies only
+  to struct field names, not `BTreeMap<String, _>` keys -- so `build-args.NODE_VERSION` and
+  `mcp.build.env.CARGO_HOME` round-trip without restructuring. The `Notes` fallback (a separate
+  unrenamed wrapper struct) wasn't needed; the spot-check test pins this down.
+- **`Workspace` defaults centralised in `Default`.** Used `#[serde(default, ...)]` on the struct
+  itself (so missing per-field values fall back to `Default::default()`) and put `"."` /
+  `"/workspace"` only inside `impl Default for Workspace`. Avoids duplicating the literal
+  defaults across separate `default_host_path` / `default_container_path` helpers.
+- **`OutrigError::Config(#[from] toml::de::Error)` with `#[error("{0}")]`.** Mirrors the existing
+  `Io` variant so toml's line/column-pointing diagnostic surfaces verbatim through the project's
+  `Result<T>` alias.
+- **`McpServerSpec::Full` does not get `#[serde(deny_unknown_fields)]`.** Task spec gives the
+  enum verbatim without it; an unknown field still fails the parse (the table form falls through
+  to `Short`, which can't deserialize a table). Re-evaluate if a future bug shows confusing
+  diagnostics.
+- **No common test helpers.** `tests/repo_paths.rs` and `tests/config_schema.rs` are
+  self-contained -- different test setups (tempdir vs. inline TOML), no shared `tests/common/`
+  module to introduce yet.

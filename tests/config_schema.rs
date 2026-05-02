@@ -1,0 +1,141 @@
+//! Integration tests for the config schema: round-trip parsing, unknown-key
+//! rejection, and MCP shape parity.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use outrig::config::{Config, McpServerSpec};
+use outrig::error::OutrigError;
+
+const FIXTURE: &str = include_str!("fixtures/config-full.toml");
+
+mod config_schema {
+    use super::*;
+
+    #[test]
+    fn fixture_round_trips_through_serde() {
+        let parsed = Config::load_from_str(FIXTURE).expect("fixture parses");
+        let reserialized = toml::to_string(&parsed).expect("config serializes");
+        let again = Config::load_from_str(&reserialized).expect("reserialized parses");
+        assert_eq!(parsed, again);
+    }
+
+    #[test]
+    fn unknown_top_level_key_rejected() {
+        let bad = r#"
+default-agent = "coding"
+oops          = "this key is not in the schema"
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        let OutrigError::Config(toml_err) = err else {
+            panic!("expected OutrigError::Config, got: {err:?}");
+        };
+        let msg = toml_err.to_string();
+        assert!(
+            msg.contains("oops"),
+            "error message should point at the offending key, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn mcp_short_and_full_normalize_equal() {
+        let short_toml = r#"
+[containers.c]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.c.mcp]
+srv = ["bin", "arg1"]
+"#;
+        let full_toml = r#"
+[containers.c]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.c.mcp]
+srv = { command = ["bin", "arg1"] }
+"#;
+
+        let short = Config::load_from_str(short_toml).expect("short form parses");
+        let full = Config::load_from_str(full_toml).expect("full form parses");
+
+        let short_spec = short.containers["c"].mcp["srv"].clone();
+        let full_spec = full.containers["c"].mcp["srv"].clone();
+
+        assert!(
+            matches!(short_spec, McpServerSpec::Short(_)),
+            "array form should parse to Short, got: {short_spec:?}",
+        );
+        assert!(
+            matches!(full_spec, McpServerSpec::Full { .. }),
+            "table form should parse to Full, got: {full_spec:?}",
+        );
+
+        assert_eq!(short_spec.normalize(), full_spec.normalize());
+        assert_eq!(
+            short.containers["c"].mcp["srv"].clone().normalize(),
+            (vec!["bin".to_string(), "arg1".to_string()], BTreeMap::new()),
+        );
+    }
+
+    #[test]
+    fn fixture_spot_checks_match_documented_keys() {
+        let cfg = Config::load_from_str(FIXTURE).expect("fixture parses");
+
+        assert_eq!(cfg.default_container.as_deref(), Some("coding"));
+        assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
+        assert_eq!(cfg.default_model.as_deref(), Some("fast"));
+        assert_eq!(
+            cfg.session_root.as_deref(),
+            Some(std::path::Path::new("/var/lib/outrig/sessions")),
+        );
+
+        let openai = &cfg.providers["openai"];
+        assert_eq!(openai.style, "openai");
+        assert_eq!(openai.base_url, "https://api.openai.com/v1");
+        assert_eq!(openai.api_key, "${OPENAI_API_KEY}");
+        assert_eq!(openai.request_timeout_secs, Some(90));
+        assert_eq!(cfg.providers["anthropic"].request_timeout_secs, None);
+
+        assert_eq!(cfg.models["fast"].provider, "openai");
+        assert_eq!(cfg.models["fast"].identifier, "gpt-4o-mini");
+
+        let coding = &cfg.agents["coding"];
+        assert_eq!(coding.model, None);
+        assert_eq!(coding.container.as_deref(), Some("coding"));
+        assert_eq!(coding.temperature, Some(0.2));
+        assert_eq!(coding.max_tokens, Some(4096));
+        assert_eq!(cfg.agents["review"].model.as_deref(), Some("smart"));
+
+        assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
+        assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+
+        let coding_ctr = &cfg.containers["coding"];
+        assert_eq!(
+            coding_ctr.dockerfile,
+            PathBuf::from(".agents/outrig/containers/coding/Dockerfile"),
+        );
+        assert_eq!(
+            coding_ctr.context,
+            PathBuf::from(".agents/outrig/containers/coding"),
+        );
+        // Inner map keys (build-args ARG names, mcp env-var names) keep user
+        // casing -- they're not subject to the outer `rename_all = kebab-case`.
+        assert_eq!(coding_ctr.build_args["NODE_VERSION"], "20");
+
+        assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
+        let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].clone().normalize();
+        assert_eq!(fs_cmd, vec!["mcp-server-filesystem", "/workspace"]);
+        assert!(fs_env.is_empty());
+        let (build_cmd, build_env) = coding_ctr.mcp["build"].clone().normalize();
+        assert_eq!(build_cmd, vec!["cargo-mcp"]);
+        assert_eq!(build_env["CARGO_HOME"], "/workspace/.cargo");
+    }
+
+    #[test]
+    fn workspace_table_absent_yields_documented_defaults() {
+        let cfg = Config::load_from_str("").expect("empty config parses");
+        assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
+        assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+    }
+}

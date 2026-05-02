@@ -1,0 +1,54 @@
+# Mirror of doc/reference/config.md "Full examples", flattened into one file
+# so the schema fixture exercises every legal section in a single round-trip.
+
+default-container = "coding"
+default-agent     = "coding"
+default-model     = "fast"
+session-root      = "/var/lib/outrig/sessions"
+
+[providers.openai]
+style                = "openai"
+base-url             = "https://api.openai.com/v1"
+api-key              = "${OPENAI_API_KEY}"
+request-timeout-secs = 90
+
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com/v1"
+api-key  = "${ANTHROPIC_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[models.smart]
+provider   = "openai"
+identifier = "gpt-4o"
+
+[models.claude]
+provider   = "anthropic"
+identifier = "claude-sonnet-4-6"
+
+[agents.coding]
+container   = "coding"
+preamble    = "You are a careful coding assistant. Repo is at /workspace."
+temperature = 0.2
+max-tokens  = 4096
+
+[agents.review]
+model    = "smart"
+preamble = "You are a meticulous code reviewer."
+
+[workspace]
+host-path      = "."
+container-path = "/workspace"
+
+[containers.coding]
+dockerfile = ".agents/outrig/containers/coding/Dockerfile"
+context    = ".agents/outrig/containers/coding"
+build-args = { NODE_VERSION = "20" }
+
+  [containers.coding.mcp]
+  shell = ["bash", "-lc", "exec mcp-server-shell"]
+  fs    = { command = ["mcp-server-filesystem", "/workspace"] }
+  build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
