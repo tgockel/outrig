@@ -131,6 +131,7 @@ Stage all changes and commit using conventional-commits style:
 | `test:`    | Test-only change                                      |
 | `refactor:`| Restructuring without behavior change                 |
 | `plan:`    | Plan-only changes (e.g. clarifying the plan file)     |
+| `ai:`      | AI-only changes (e.g. prompt tweaks)                  |
 
 ```bash
 git add -A
