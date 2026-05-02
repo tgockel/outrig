@@ -1,8 +1,5 @@
 # Workspace
 
-> **TODO: Incomplete** -- every behavior described here is the intended behavior; the
-> implementation isn't ready yet.
-
 The workspace is what the agent gets to read and write. By default it's your repository, mounted
 live into the container at `/workspace`. Read this page before you run outrig on anything you
 can't easily roll back.

@@ -34,6 +34,9 @@ pub enum OutrigError {
         exit_code: Option<i32>,
         stderr_tail: String,
     },
+
+    #[error("could not allocate {kind} name during container bootstrap after retries")]
+    BootstrapExhausted { kind: &'static str },
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

@@ -11,18 +11,23 @@
 //! 3. [`install_panic_hook`] -- last-resort sweep over [`TRACKED`] when
 //!    the process is unwinding from a panic and `Drop` cannot run.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use jiff::Zoned;
+use nix::unistd::{Gid, Group, Uid, User};
 use rand::RngCore;
+use tokio::process::Child;
 
-use crate::error::Result;
+use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd};
+
+/// Maximum `_`-suffix retries before bootstrap gives up.
+const BOOTSTRAP_RETRIES: usize = 10;
 
 static TRACKED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -34,6 +39,12 @@ pub struct Container {
     pub container_workspace: PathBuf,
     pub uid: u32,
     pub gid: u32,
+    /// In-container user name resolved by [`Container::bootstrap_user`].
+    /// `None` until bootstrap has run.
+    pub user_name: Option<String>,
+    /// In-container group name resolved by [`Container::bootstrap_user`].
+    /// `None` until bootstrap has run.
+    pub group_name: Option<String>,
     disposed: bool,
 }
 
@@ -81,8 +92,159 @@ impl Container {
             container_workspace: ws_container.to_path_buf(),
             uid,
             gid,
+            user_name: None,
+            group_name: None,
             disposed: false,
         })
+    }
+
+    /// Materialize an in-container user+group matching the host UID/GID,
+    /// reusing existing entries when present and appending `_` to candidate
+    /// names on collision.
+    ///
+    /// All `podman exec` calls here go through `--user=0:0` to land at
+    /// in-container UID 0; under `--userns=keep-id` an unscoped exec would
+    /// default to the host user, which can't `useradd` / `groupadd` / write
+    /// to `/home`. Records the resolved names on the struct for
+    /// [`Container::exec_stdio`] to reference. Must be called once, after
+    /// [`Container::start`], before any host-user-scoped exec.
+    pub async fn bootstrap_user(&mut self) -> Result<()> {
+        let host_user = User::from_uid(Uid::from_raw(self.uid))
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap_or_else(|| format!("u{}", self.uid));
+        let host_group = Group::from_gid(Gid::from_raw(self.gid))
+            .ok()
+            .flatten()
+            .map(|g| g.name)
+            .unwrap_or_else(|| format!("g{}", self.gid));
+
+        let group_name = self.resolve_or_create_group(&host_group).await?;
+        let user_name = self.resolve_or_create_user(&host_user, &group_name).await?;
+
+        let home = format!("/home/{user_name}");
+        process::run_capture(
+            podman_exec_root(&self.name)
+                .arg("mkdir")
+                .arg("-p")
+                .arg(&home),
+        )
+        .await?;
+        process::run_capture(
+            podman_exec_root(&self.name)
+                .arg("chown")
+                .arg(format!("{user_name}:{group_name}"))
+                .arg(&home),
+        )
+        .await?;
+
+        self.user_name = Some(user_name);
+        self.group_name = Some(group_name);
+        Ok(())
+    }
+
+    async fn resolve_or_create_group(&self, candidate: &str) -> Result<String> {
+        if let Some(name) = self.probe_entry("group", self.gid).await? {
+            return Ok(name);
+        }
+        self.create_with_retry(candidate, "group", |name| {
+            podman_exec_root(&self.name)
+                .arg("groupadd")
+                .arg("--gid")
+                .arg(self.gid.to_string())
+                .arg(name)
+        })
+        .await
+    }
+
+    async fn resolve_or_create_user(&self, candidate: &str, group: &str) -> Result<String> {
+        if let Some(name) = self.probe_entry("passwd", self.uid).await? {
+            return Ok(name);
+        }
+        self.create_with_retry(candidate, "user", |name| {
+            podman_exec_root(&self.name)
+                .arg("useradd")
+                .arg("-u")
+                .arg(self.uid.to_string())
+                .arg("-g")
+                .arg(group)
+                .arg(name)
+        })
+        .await
+    }
+
+    /// Look up an existing entry in the in-container `getent` database
+    /// (`group` or `passwd`) by id. Returns the first `:`-field of the first
+    /// matching line, or `None` if `getent` exited non-zero (no match).
+    async fn probe_entry(&self, db: &str, id: u32) -> Result<Option<String>> {
+        let probe = process::try_capture(
+            podman_exec_root(&self.name)
+                .arg("getent")
+                .arg(db)
+                .arg(id.to_string()),
+        )
+        .await?;
+        if !probe.status.success() {
+            return Ok(None);
+        }
+        Ok(first_colon_field(&probe.stdout))
+    }
+
+    /// Try `build(candidate)`; on non-zero exit, append `_` and retry up to
+    /// [`BOOTSTRAP_RETRIES`] times. `kind` labels the entity in the
+    /// exhausted-error message (e.g. `"group"`, `"user"`).
+    async fn create_with_retry<F>(
+        &self,
+        candidate: &str,
+        kind: &'static str,
+        mut build: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Cmd,
+    {
+        let mut name = candidate.to_string();
+        for _ in 0..BOOTSTRAP_RETRIES {
+            let attempt = process::try_capture(build(&name)).await?;
+            if attempt.status.success() {
+                return Ok(name);
+            }
+            name.push('_');
+        }
+        Err(OutrigError::BootstrapExhausted { kind })
+    }
+
+    /// Spawn a command inside the container as the host user, with all three
+    /// stdio streams piped back to the caller. `HOME` is always set to the
+    /// in-container home directory; entries in `env` are forwarded via
+    /// `--env K=V` (BTreeMap order makes the resulting argv deterministic).
+    ///
+    /// Panics if [`Container::bootstrap_user`] has not yet been called --
+    /// the user/group don't exist inside the container, so a `--user`-scoped
+    /// exec would fail at the podman layer with a less useful message.
+    pub async fn exec_stdio(
+        &self,
+        cmd: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<Child> {
+        let user_name = self
+            .user_name
+            .as_deref()
+            .expect("bootstrap_user must be called before exec_stdio");
+
+        let mut c = Cmd::new("podman")
+            .args(["exec", "-i"])
+            .arg(format!("--user={}:{}", self.uid, self.gid))
+            .arg("--env")
+            .arg(format!("HOME=/home/{user_name}"));
+        for (k, v) in env {
+            c = c.arg("--env").arg(format!("{k}={v}"));
+        }
+        c = c.arg(&self.name);
+        for arg in cmd {
+            c = c.arg(arg);
+        }
+        process::spawn_stdio(c).await
     }
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
@@ -112,6 +274,32 @@ impl Drop for Container {
         }
         spawn_detached_rm(&self.name);
         untrack(&self.name);
+    }
+}
+
+/// `podman exec --user=0:0 <name> ...`, i.e. running as the container's
+/// root regardless of how the container was started. Used by
+/// [`Container::bootstrap_user`] -- under `--userns=keep-id`, an unscoped
+/// `podman exec` defaults to the *host* user, which can't `useradd` /
+/// `groupadd` / write to `/home`. Forcing `--user=0:0` explicitly puts us
+/// at in-container UID 0, which is what we need before any host user
+/// exists inside the container.
+fn podman_exec_root(name: &str) -> Cmd {
+    Cmd::new("podman").args(["exec", "--user=0:0"]).arg(name)
+}
+
+/// Parse the first `:`-separated field of the first line of `getent`-style
+/// output. `tgockel:x:1000:` -> `Some("tgockel")`. Returns `None` for empty
+/// or malformed input. Stdout is lossy-decoded; this is fine for entries
+/// in `/etc/passwd` and `/etc/group`, which are ASCII in practice.
+fn first_colon_field(stdout: &[u8]) -> Option<String> {
+    let line = String::from_utf8_lossy(stdout);
+    let line = line.lines().next()?;
+    let name = line.split(':').next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 

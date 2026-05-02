@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase B -- subprocess + container
-
-- **[0009](0009-runtime-user-bootstrap.md)** Runtime UID/GID bootstrap inside the container.
-
 ## Phase C -- MCP + LLM
 
 - **[0010](0010-mcp-client.md)** rmcp client over `podman exec` stdio.
