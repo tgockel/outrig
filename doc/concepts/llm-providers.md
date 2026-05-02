@@ -1,0 +1,228 @@
+# Providers, Models, and Agents
+
+> **TODO: Incomplete** -- these examples describe outrig's intended behavior; the implementation
+> isn't ready yet.
+
+outrig delegates LLM calls to the [Rig](https://crates.io/crates/rig-core) crate, but configures
+the LLM stack in three layers so the same providers and models can be reused across many repos
+without copy-pasting:
+
+- **Provider** -- where to talk to (`base-url`, `api-key`, wire format).
+- **Model** -- a named identifier living on one provider (e.g. `gpt-4o-mini` on `openai`).
+- **Agent** -- a runnable unit: model + system preamble (+ optional default container).
+
+Most users keep providers and models in the **global** config (`~/.outrig/config.toml`) since
+those depend on the user's accounts and preferences. Agents typically live in the **repo** config
+because their preambles and container choices are project-specific.
+
+```mermaid
+flowchart LR
+    user[("user / API key")]
+    subgraph global["~/.outrig/config.toml"]
+        prov["[providers.openai]<br/>base-url<br/>api-key"]
+        m1["[models.fast]<br/>identifier=gpt-4o-mini"]
+        m2["[models.smart]<br/>identifier=gpt-4o"]
+    end
+    subgraph repo[".agents/outrig/config.toml"]
+        a1["[agents.coding]<br/>preamble"]
+        a2["[agents.review]<br/>preamble"]
+        cont["[containers.coding]"]
+    end
+    user --> prov
+    m1 --> prov
+    m2 --> prov
+    a1 --> m1
+    a2 --> m2
+    a1 -. "container" .-> cont
+```
+
+## `[providers.<name>]`
+
+A provider is a wire-format + endpoint + API key.
+
+```toml
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+```
+
+`style` is the protocol (v0 wires `"openai"` only; OpenAI-compatible endpoints all use this
+style). `base-url` is the HTTPS endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig
+resolves it at run time, never reads a key from disk. See
+[Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
+
+You can declare as many providers as you want -- one per account, one per local Ollama install,
+one per OpenAI-compatible aggregator. Names you pick (e.g. `openai`, `local-ollama`,
+`work-account`) become labels you reference from models.
+
+## `[models.<name>]`
+
+A model picks a specific identifier on a specific provider.
+
+```toml
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[models.smart]
+provider   = "openai"
+identifier = "gpt-4o"
+
+[models.claude]
+provider   = "anthropic"
+identifier = "claude-sonnet-4-6"
+```
+
+`provider` references one of the names you defined under `[providers.<name>]`. `identifier` is
+whatever string the provider expects in its API request's `model` field.
+
+The model layer exists so that agents can refer to a stable name (`fast`, `smart`, `claude`) and
+swap the underlying API model without touching every agent. If OpenAI renames a model, you edit
+one identifier; every agent using that name picks up the change.
+
+## `[agents.<name>]`
+
+An agent ties a model to a system preamble and (optionally) a default container.
+
+```toml
+[agents.coding]
+# model omitted -> falls back to top-level default-model
+container   = "coding"
+preamble    = "You are a careful coding assistant. Repo is at /workspace."
+temperature = 0.2
+
+[agents.review]
+model    = "smart"      # explicit override of default-model
+preamble = "You are a meticulous code reviewer. Be specific about line numbers."
+```
+
+`model` is optional. If set, it must reference one of the names you defined under
+`[models.<name>]`; if omitted, the agent inherits the top-level `default-model` (typically
+declared in `~/.outrig/config.toml`). `container` is optional too: if set, `outrig run --agent
+<name>` defaults to that container-config. `preamble` is the system prompt the agent operates
+under -- the place to encode role, scope, voice.
+
+`temperature` and `max-tokens` live on the agent because the same underlying model is often used
+with different sampling for different tasks (e.g. low temperature for code, higher for
+brainstorming).
+
+### `default-model` at the top level
+
+Most users have one preferred model and reuse it across repos. Set it once globally:
+
+```toml
+# ~/.outrig/config.toml
+default-model = "fast"
+```
+
+Now any agent that omits `model` picks it up automatically. Per-repo overrides still work --
+write `default-model = "smart"` at the top of a repo config and that repo's agents fall back to
+`"smart"` instead. Per-agent overrides still work too: `agents.<a>.model = "claude"` wins
+over both defaults.
+
+## Pointing at OpenAI-compatible endpoints
+
+Anything that speaks the OpenAI Chat Completions wire format works as a `style = "openai"`
+provider:
+
+```toml
+[providers.together]
+style    = "openai"
+base-url = "https://api.together.xyz/v1"
+api-key  = "${TOGETHER_API_KEY}"
+
+[providers.openrouter]
+style    = "openai"
+base-url = "https://openrouter.ai/api/v1"
+api-key  = "${OPENROUTER_API_KEY}"
+
+[providers.local-ollama]
+style    = "openai"
+base-url = "http://localhost:11434/v1"
+api-key  = "${OLLAMA_API_KEY}"   # set to anything; some servers ignore the header
+```
+
+```toml
+[models.tg-llama]
+provider   = "together"
+identifier = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+
+[models.or-claude]
+provider   = "openrouter"
+identifier = "anthropic/claude-sonnet-4-6"
+```
+
+The agent loop is unchanged -- it's still tool calls in OpenAI's format, just routed somewhere
+else.
+
+## Other Rig provider styles
+
+> **TODO: Incomplete** -- only `style = "openai"` is wired up in v0. Native `"anthropic"` (which
+> would talk to the Anthropic API directly rather than via an OpenAI-compatible bridge), Cohere,
+> etc. are pending.
+
+```toml
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com/v1"
+api-key  = "${ANTHROPIC_API_KEY}"
+```
+
+## Tool calling
+
+outrig's agent loop relies on the model emitting tool calls in the provider's native format
+(e.g. OpenAI's `tool_calls` field). Models that don't support tool calling won't work -- the
+agent will appear to "see" tools in its prompt but never invoke them.
+
+If you're using an OpenAI-compatible endpoint, verify the underlying model supports
+tool/function calling before pointing outrig at it. A quick test: run a one-shot prompt asking
+the model to "list files in /workspace" and watch for `[outrig] tool call: fs__list_directory(...)`
+on stderr. No tool-call line means no tool calling.
+
+## API keys are env-var-only
+
+`api-key = "${VAR}"` is the **only** accepted form for the API key. outrig refuses to load any
+other value -- a literal key, a missing `${...}` wrapper, anything. This guarantees:
+
+- Configs are safe to commit to source control.
+- Keys never end up in `outrig logs` output, in tracing diagnostics, or in session metadata on
+  disk.
+- Rotating a key is a shell change, not a file edit.
+
+Different shells (different accounts, different rate limits) just point `api-key` at different
+env-var names:
+
+```toml
+[providers.cheap]
+style    = "openai"
+base-url = "https://api.together.xyz/v1"
+api-key  = "${TOGETHER_API_KEY}"
+
+[providers.expensive]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+```
+
+## Where things live: global vs repo
+
+| Layer                 | Global (`~/.outrig/config.toml`) | Repo (`.agents/outrig/config.toml`) |
+|-----------------------|----------------------------------|-------------------------------------|
+| `[providers.<name>]`  | typical home                     | allowed for repo-only providers     |
+| `[models.<name>]`     | typical home (reused names)      | allowed for repo-specific models    |
+| `[agents.<name>]`     | rare                             | typical home                        |
+| `[workspace]`         | --                               | repo only                           |
+| `[containers.<name>]` | --                               | repo only                           |
+| `default-model`       | typical home                     | optional override                   |
+| `default-agent`       | rare                             | required for `outrig run`           |
+| `default-container`   | rare                             | required for `outrig run`           |
+
+If a name is defined in both, the repo wins -- override by redefining.
+
+## See also
+
+- [Quickstart](../quickstart.md) -- shows `outrig init` writing both files.
+- [Reference -> Config](../reference/config.md) -- every key in `[providers]`, `[models]`,
+  `[agents]`.
+- [Rig documentation](https://docs.rs/rig-core) -- what each provider style Rig ships supports.

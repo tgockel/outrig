@@ -1,0 +1,19 @@
+[book]
+title    = "outrig"
+authors  = ["Travis Gockel"]
+src      = "doc"
+language = "en"
+
+[build]
+build-dir = "target/book"
+
+[output.html]
+default-theme = "ayu"
+git-repository-url = "https://github.com/tgockel/outrig"
+edit-url-template  = "https://github.com/tgockel/outrig/edit/trunk/{path}"
+additional-js = ["scripts/mermaid.min.js", "scripts/mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
