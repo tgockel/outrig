@@ -1,4 +1,4 @@
-# 0014 -- Agent loop (`outrig run`)
+# 0019 -- Agent loop (`outrig run`)
 
 ## Goal
 
@@ -25,7 +25,7 @@ agent, hand to REPL, run until EOF, clean up.
 - Slash command wiring:
   - `/tools` lists every registered tool with description and source server.
   - `/reset` clears the conversation history (`history.clear()`); container + MCPs stay up.
-  - `/help`, `/quit` from 0013.
+  - `/help`, `/quit` from 0018.
 - Iteration cap: if Rig's chat loop exceeds 50 tool calls in one turn, print
   `[outrig] tool-call iteration cap (50) reached; ending turn` on stderr and yield to user.
   (If rig-core has its own cap, this is a safety net.)
@@ -48,13 +48,13 @@ agent, hand to REPL, run until EOF, clean up.
 - 0009-runtime-user-bootstrap
 - 0011-rig-tool-adapter
 - 0012-llm-resolver
-- 0013-repl-skeleton
+- 0018-repl-skeleton
 
 ## Notes
 
-- This task doesn't include sessions. Running this without 0015 means no `session.json` is
+- This task doesn't include sessions. Running this without 0020 means no `session.json` is
   written and no per-MCP stderr is captured to disk. That's fine for the v0 of `outrig run`
-  -- 0015 layers session persistence on top.
+  -- 0020 layers session persistence on top.
 - Container cleanup is critical. Test by `^C`-ing manually mid-turn and verifying
   `podman ps -a --filter name=outrig-` is empty.
 - The banner text must match `doc/usage/run.md` verbatim (modulo concrete IDs/timestamps).

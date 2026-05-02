@@ -1,9 +1,9 @@
-# 0013 -- REPL skeleton
+# 0018 -- REPL skeleton
 
 ## Goal
 
 A stdin/stdout REPL that handles slash commands, EOF, and SIGINT cleanly, parameterized over
-an async callback that processes each user prompt. The actual agent wiring happens in 0014;
+an async callback that processes each user prompt. The actual agent wiring happens in 0019;
 this task delivers the I/O loop in isolation.
 
 ## Deliverables
@@ -30,9 +30,9 @@ this task delivers the I/O loop in isolation.
 - Slash commands stubbed:
   - `/help` -- print the slash-command list to stderr.
   - `/quit` -- break out of the loop (same as Ctrl-D).
-  - `/tools` -- placeholder, prints `(no tools registered)` until 0014 wires it.
-  - `/reset` -- placeholder, prints `(no history to reset)` until 0014 wires it.
-- The slash commands' real data (tool list, history clear) come in 0014 via additional
+  - `/tools` -- placeholder, prints `(no tools registered)` until 0019 wires it.
+  - `/reset` -- placeholder, prints `(no history to reset)` until 0019 wires it.
+- The slash commands' real data (tool list, history clear) come in 0019 via additional
   callbacks: `Repl::run_with_extras(banner, on_prompt, on_slash)` is a possible extension --
   designer's call. Simplest: pass a small `ReplCallbacks` struct.
 - `tests/repl_io.rs` driving via `tokio::io::duplex`:

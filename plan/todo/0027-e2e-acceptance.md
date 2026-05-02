@@ -1,4 +1,4 @@
-# 0022 -- End-to-end acceptance
+# 0027 -- End-to-end acceptance
 
 ## Goal
 
@@ -47,10 +47,10 @@ that lists files via the filesystem MCP. This is the v0 ship gate.
 
 ## Dependencies
 
-- 0014-agent-loop
-- 0016-session-cli
-- 0019-init
-- 0020-build-subcommand
+- 0019-agent-loop
+- 0021-session-cli
+- 0024-init
+- 0025-build-subcommand
 
 ## Notes
 

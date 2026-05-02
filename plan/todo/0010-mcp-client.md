@@ -54,5 +54,5 @@ file under the session dir.
   docs, verify the trait names and `serve_client` signature. If rmcp's public API doesn't fit
   cleanly, isolate the breakage inside `mcp.rs` -- callers should only see our facade.
 - Per-server stderr in `<log_dir>/<name>.stderr` matches `doc/usage/sessions.md`'s layout. The
-  `log_dir` here is the per-session `logs/` subdir; the caller (run subcommand, task 0014)
+  `log_dir` here is the per-session `logs/` subdir; the caller (run subcommand, task 0019)
   passes it in.

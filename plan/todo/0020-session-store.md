@@ -1,4 +1,4 @@
-# 0015 -- Session store
+# 0020 -- Session store
 
 ## Goal
 
@@ -46,7 +46,7 @@ explicit ones so `outrig ls` keeps working uniformly.
     in root points at it, remove that too.
 - session-root resolver: `fn resolve_session_root(flag: Option<&Path>, cfg: &Config,
   default: &Path) -> PathBuf` -- flag > cfg.session_root > default.
-- Wire into `outrig run` (0014): pass `--session-dir` and resolved root to `SessionStore`,
+- Wire into `outrig run` (0019): pass `--session-dir` and resolved root to `SessionStore`,
   capture per-MCP stderr to `<session_dir>/logs/<server>.stderr` (already done in 0010, but
   the `log_dir` argument now points into the session dir).
 - Atomic writes: `tempfile::NamedTempFile::persist` for session.json updates.
@@ -70,7 +70,7 @@ explicit ones so `outrig ls` keeps working uniformly.
 ## Dependencies
 
 - 0005-config-merge-validate
-- 0014-agent-loop
+- 0019-agent-loop
 
 ## Notes
 

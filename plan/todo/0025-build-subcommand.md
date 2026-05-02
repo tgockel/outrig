@@ -1,4 +1,4 @@
-# 0020 -- `outrig build`
+# 0025 -- `outrig build`
 
 ## Goal
 

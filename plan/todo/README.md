@@ -11,25 +11,30 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 - **[0010](0010-mcp-client.md)** rmcp client over `podman exec` stdio.
 - **[0011](0011-rig-tool-adapter.md)** MCP -> Rig dynamic-tool adapter.
 - **[0012](0012-llm-resolver.md)** Resolve agent -> model -> provider, build Rig client.
+- **[0013](0013-llm-provider-enum.md)** Migrate `LlmProvider` to a tagged enum.
+- **[0014](0014-mistralrs-feature.md)** `mistralrs` Cargo feature + CI matrix entry.
+- **[0015](0015-mistralrs-shim.md)** Rig `CompletionModel` shim + HF GGUF download.
+- **[0016](0016-llm-registry.md)** Lazy-load + cross-agent sharing of in-process models.
+- **[0017](0017-mistralrs-doc-final.md)** Drop in-process LLM `TODO: Incomplete` markers.
 
 ## Phase D -- REPL + agent loop
 
-- **[0013](0013-repl-skeleton.md)** stdin/stdout REPL with slash commands.
-- **[0014](0014-agent-loop.md)** `outrig run` -- the headline agent loop.
+- **[0018](0018-repl-skeleton.md)** stdin/stdout REPL with slash commands.
+- **[0019](0019-agent-loop.md)** `outrig run` -- the headline agent loop.
 
 ## Phase E -- sessions
 
-- **[0015](0015-session-store.md)** SessionStore (auto + explicit `--session-dir`).
-- **[0016](0016-session-cli.md)** `outrig ls` / `outrig logs` / `outrig discard`.
+- **[0020](0020-session-store.md)** SessionStore (auto + explicit `--session-dir`).
+- **[0021](0021-session-cli.md)** `outrig ls` / `outrig logs` / `outrig discard`.
 
 ## Phase F -- interactive scaffolding
 
-- **[0017](0017-prompt-ux.md)** Prompt UX wrapper (defaults + `?`-help).
-- **[0018](0018-init-container.md)** `outrig init-container` with Dockerfile templates.
-- **[0019](0019-init.md)** `outrig init` (chains into `init-container`).
+- **[0022](0022-prompt-ux.md)** Prompt UX wrapper (defaults + `?`-help).
+- **[0023](0023-init-container.md)** `outrig init-container` with Dockerfile templates.
+- **[0024](0024-init.md)** `outrig init` (chains into `init-container`).
 
 ## Phase G -- build, CI, end-to-end
 
-- **[0020](0020-build-subcommand.md)** `outrig build` subcommand.
-- **[0021](0021-ci.md)** GitHub Actions CI (cargo + mdbook).
-- **[0022](0022-e2e-acceptance.md)** End-to-end quickstart acceptance.
+- **[0025](0025-build-subcommand.md)** `outrig build` subcommand.
+- **[0026](0026-ci.md)** GitHub Actions CI (cargo + mdbook).
+- **[0027](0027-e2e-acceptance.md)** End-to-end quickstart acceptance.

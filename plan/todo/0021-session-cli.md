@@ -1,8 +1,8 @@
-# 0016 -- Session CLI (`ls`, `logs`, `discard`)
+# 0021 -- Session CLI (`ls`, `logs`, `discard`)
 
 ## Goal
 
-Implement the three session-management subcommands using the `SessionStore` from 0015.
+Implement the three session-management subcommands using the `SessionStore` from 0020.
 
 ## Deliverables
 
@@ -40,7 +40,7 @@ Implement the three session-management subcommands using the `SessionStore` from
 
 ## Dependencies
 
-- 0015-session-store
+- 0020-session-store
 
 ## Notes
 

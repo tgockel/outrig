@@ -1,4 +1,4 @@
-# 0018 -- `outrig init-container`
+# 0023 -- `outrig init-container`
 
 ## Goal
 
@@ -11,7 +11,7 @@ repo `config.toml` while preserving the surrounding TOML.
 
 - `src/init/container.rs::run(name: Option<String>, force: bool) -> Result<()>` matching the
   flow in `doc/usage/init-container.md`.
-- Prompts (using 0017's `ask_*`):
+- Prompts (using 0022's `ask_*`):
   - Container-config name (default from arg or `coding`).
   - Base image (select from preset list: `debian:bookworm-slim`, `ubuntu:24.04`,
     `alpine:latest`, `node:20-bookworm-slim`, `python:3.12-slim`).
@@ -44,7 +44,7 @@ repo `config.toml` while preserving the surrounding TOML.
 ## Dependencies
 
 - 0007-image-build
-- 0017-prompt-ux
+- 0022-prompt-ux
 
 ## Notes
 
