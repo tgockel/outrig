@@ -23,6 +23,15 @@ These are accepted by every subcommand.
 | `--verbose`              | Verbose stderr output. Repeats: `--verbose --verbose` for trace level. |
 | `--help`                 | Print subcommand help.                                                 |
 
+`--config` resolves in this order: this flag (used verbatim -- no walk-up, no existence check),
+then a walk up from cwd looking for `.agents/outrig/config.toml`. The walk stops at the
+filesystem root; a `.agents/` directory without an `outrig/config.toml` inside does not
+terminate the walk -- outrig keeps looking in parents.
+
+`--global-config` resolves in this order: this flag, then `<XDG_CONFIG_HOME>/outrig/config.toml`
+when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml` (the outrig-specific fallback --
+note this is `~/.outrig/`, not `~/.config/outrig/`).
+
 `--session-root` resolves in this order: this flag, then `session-root` in the repo or global
 config, then `<XDG_DATA_HOME>/outrig/sessions/`. `--verbose` adds buildah/podman command
 transcripts to stderr and to `<session_dir>/logs/container.log` for `outrig run`. It does not

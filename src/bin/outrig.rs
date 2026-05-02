@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
+
+use outrig::error::{OutrigError, Result};
+use outrig::repo;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,6 +13,14 @@ use tracing_subscriber::EnvFilter;
     about = "Run LLM agents inside podman-managed containers."
 )]
 struct Cli {
+    /// Path to the repo `config.toml`. Defaults to walking up from cwd.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Path to the global config. Defaults to `~/.outrig/config.toml`.
+    #[arg(long = "global-config", global = true, value_name = "PATH")]
+    global_config: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -41,17 +53,27 @@ fn main() -> ExitCode {
     tracing::debug!("outrig starting");
 
     let cli = Cli::parse();
-    let name: &'static str = match cli.cmd {
-        Cmd::Run => "run",
-        Cmd::Build => "build",
-        Cmd::Init => "init",
-        Cmd::InitContainer => "init-container",
-        Cmd::Ls => "ls",
-        Cmd::Logs => "logs",
-        Cmd::Discard => "discard",
-    };
+    match dispatch(&cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
 
-    tracing::debug!("subcommand {name} not implemented");
-    eprintln!("error: not implemented");
-    ExitCode::from(1)
+fn dispatch(cli: &Cli) -> Result<()> {
+    match cli.cmd {
+        Cmd::Run => {
+            let cwd = std::env::current_dir()?;
+            let _repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
+            Err(OutrigError::NotImplemented("run"))
+        }
+        Cmd::Build => Err(OutrigError::NotImplemented("build")),
+        Cmd::Init => Err(OutrigError::NotImplemented("init")),
+        Cmd::InitContainer => Err(OutrigError::NotImplemented("init-container")),
+        Cmd::Ls => Err(OutrigError::NotImplemented("ls")),
+        Cmd::Logs => Err(OutrigError::NotImplemented("logs")),
+        Cmd::Discard => Err(OutrigError::NotImplemented("discard")),
+    }
 }
