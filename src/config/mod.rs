@@ -1,17 +1,22 @@
-//! Config schema and parsing.
+//! Config schema, parsing, merge, and validation.
 
 pub mod api_key;
+pub mod merge;
+pub mod validate;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 pub use api_key::ApiKeyRef;
+pub use merge::merge;
+pub use validate::ConfigValidationError;
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +45,36 @@ pub struct Config {
 impl Config {
     pub fn load_from_str(s: &str) -> Result<Self> {
         Ok(toml::from_str(s)?)
+    }
+
+    /// Read repo + (optional) global config files, merge with repo precedence,
+    /// and validate the merged result against `repo_root`. The repo config
+    /// file is read from `<repo_root>/.agents/outrig/config.toml`.
+    pub fn load(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+        let repo_path = crate::repo::repo_config_path(repo_root);
+        let repo_text = fs::read_to_string(&repo_path)?;
+        let repo_cfg = Self::load_from_str(&repo_text)?;
+
+        let global_cfg = match global_path {
+            Some(g) => match fs::read_to_string(g) {
+                Ok(text) => Self::load_from_str(&text)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+                Err(e) => return Err(e.into()),
+            },
+            None => Self::default(),
+        };
+
+        let merged = merge(global_cfg, repo_cfg);
+        merged.validate(Some(repo_root))?;
+        Ok(merged)
+    }
+
+    /// Validate every cross-reference rule documented in `doc/reference/config.md`.
+    /// `repo_root: Some(_)` enables `dockerfile`/`context` on-disk existence checks;
+    /// `None` keeps the check pure-structural for unit tests.
+    pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
+        validate::validate(self, repo_root)?;
+        Ok(())
     }
 }
 

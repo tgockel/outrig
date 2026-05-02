@@ -1,8 +1,5 @@
 # Config Reference
 
-> **TODO: Incomplete** -- every key listed here describes outrig's intended behavior; the
-> implementation isn't ready yet.
-
 outrig reads two TOML files:
 
 - **Global config** -- user/machine-level. Default location: `~/.outrig/config.toml` (or

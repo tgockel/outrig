@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase A -- skeleton + config
-
-- **[0005](0005-config-merge-validate.md)** Merge global + repo and validate cross-references.
-
 ## Phase B -- subprocess + container
 
 - **[0006](0006-process-wrappers.md)** tokio::process wrappers for buildah/podman.

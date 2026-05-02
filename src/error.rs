@@ -3,6 +3,7 @@
 use thiserror::Error;
 
 use crate::config::api_key::ApiKeyError;
+use crate::config::validate::ConfigValidationError;
 
 #[derive(Debug, Error)]
 pub enum OutrigError {
@@ -20,6 +21,9 @@ pub enum OutrigError {
 
     #[error("{0}")]
     ApiKey(#[from] ApiKeyError),
+
+    #[error("{0}")]
+    ConfigValidation(#[from] ConfigValidationError),
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;
