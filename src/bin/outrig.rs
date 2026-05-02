@@ -50,6 +50,8 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
+    outrig::container::install_panic_hook();
+
     tracing::debug!("outrig starting");
 
     let cli = Cli::parse();
