@@ -17,4 +17,3 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 - **[0025](0025-build-subcommand.md)** `outrig build` subcommand.
 - **[0027](0027-e2e-acceptance.md)** End-to-end quickstart acceptance.
-- **[0028](0028-docs-publish.md)** Publish mdbook docs to GitHub Pages via CI.

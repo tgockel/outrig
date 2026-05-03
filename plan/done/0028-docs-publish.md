@@ -52,3 +52,23 @@ from the README, issues, and external write-ups.
   deploy, that's a follow-up -- v0 only deploys from `trunk`.
 - The build job can stay on `ubuntu-latest`; no podman/buildah needed since this is a
   pure mdbook compile.
+
+## Decisions
+
+- **Skipped `mdbook-mermaid install` in CI** -- the mermaid assets are already vendored at
+  `scripts/mermaid.min.js` and `scripts/mermaid-init.js` and referenced from `book.toml`'s
+  `additional-js`. The existing `mdbook` job in `ci.yml` already proves `mdbook build` alone
+  is sufficient. Running `install` in CI would either duplicate or fight the vendored copies
+  with no benefit; removing the vendored copies would break local `mdbook build` for anyone
+  without `mdbook-mermaid` installed. Net: install the mdbook + mdbook-mermaid binaries (the
+  preprocessor still needs the binary), skip the asset-install step.
+- **Pinned versions to upstream latest at execution time**: `MDBOOK_VERSION=0.5.2`,
+  `MDBOOK_MERMAID_VERSION=0.17.0`. These are the versions a fresh `cargo install --locked`
+  resolves to today, matching what the existing `ci.yml` mdbook job uses in practice.
+- **Used prebuilt release tarballs**, not `cargo install` -- saves ~60s per workflow run as
+  the task suggested. Tarballs extract a single binary at the root, so a flat
+  `tar -xz -C ~/.local/bin` works without further file moves.
+- **Trigger paths include `scripts/mermaid*.js`** in addition to `doc/`, `book.toml`, and
+  the workflow file itself. If the vendored mermaid scripts change, the rendered site needs
+  redeploying (they're served as `additional-js`). Slight expansion over the task's listed
+  paths; harmless extra coverage.

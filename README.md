@@ -32,7 +32,9 @@ src/, and doc/. src/ has lib.rs and main.rs...
 
 ## Documentation
 
-The full docs live in [`doc/`](doc/README.md) and render as an mdbook from the project root:
+The full docs live in [`doc/`](doc/README.md) and render as an mdbook. The latest `trunk`
+build is published at <https://tgockel.github.io/outrig/>. To preview locally from the
+project root:
 
 ```sh
 mdbook serve   # live preview at http://localhost:3000
