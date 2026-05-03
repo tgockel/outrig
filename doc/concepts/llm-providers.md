@@ -170,9 +170,6 @@ api-key  = "${ANTHROPIC_API_KEY}"
 
 ## In-process providers (`mistralrs`)
 
-> **TODO: Incomplete** -- this provider is gated behind `--features mistralrs` and the
-> implementation hasn't landed yet.
-
 An in-process provider runs the model in the outrig process itself, with no socket and no
 serialization. The use case is questions whose *content* must not leave the host -- the
 eventual egress filter, tool-use filter, and prompt-injection scanner all want this. See

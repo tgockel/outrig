@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase C -- MCP + LLM
 
-- **[0015](0015-mistralrs-shim.md)** Rig `CompletionModel` shim + HF GGUF download.
 - **[0016](0016-llm-registry.md)** Lazy-load + cross-agent sharing of in-process models.
 - **[0017](0017-mistralrs-doc-final.md)** Drop in-process LLM `TODO: Incomplete` markers.
 

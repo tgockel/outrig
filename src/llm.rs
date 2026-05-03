@@ -1,6 +1,6 @@
-//! Resolve agent -> model -> provider; build Rig client.
+//! Resolve agent -> model -> provider; build Rig agent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::rig_tool::McpToolAdapter;
 
 #[cfg(feature = "mistralrs")]
-mod mistralrs;
+pub mod mistralrs;
 
 /// Default preamble used when an agent leaves the field unset. Deliberately
 /// generic; agents that need anything specific spell it out themselves.
@@ -44,8 +44,23 @@ pub enum LlmResolveError {
     MistralrsFeatureDisabled { name: String },
 
     #[cfg(feature = "mistralrs")]
-    #[error("provider style 'mistralrs' has no runtime in this build")]
-    MistralrsRuntimeUnavailable,
+    #[error(
+        "mistralrs provider {provider:?}: requested context-length \
+         {requested} exceeds the model's maximum of {max}"
+    )]
+    MistralrsContextTooLong {
+        provider: String,
+        requested: u32,
+        max: usize,
+    },
+
+    #[cfg(feature = "mistralrs")]
+    #[error("mistralrs provider {provider:?}: failed to load model: {source}")]
+    MistralrsLoad {
+        provider: String,
+        #[source]
+        source: anyhow::Error,
+    },
 
     #[error("failed to build rig client: {0}")]
     RigClientBuild(String),
@@ -176,49 +191,92 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
     })
 }
 
-pub type RigClient = rig::providers::openai::CompletionsClient;
-pub type RigCompletionModel = rig::providers::openai::CompletionModel;
-pub type RigAgent = rig::agent::Agent<RigCompletionModel>;
-
-/// Build a Rig provider client from a resolved agent. Only the `OpenAi`
-/// variant is wired in v0; `Mistralrs` returns a feature-flag-aware error
-/// when the `mistralrs` feature is off, and a placeholder error when it is
-/// on -- task 0015 replaces the placeholder with the real shim.
-pub fn build_rig_client(resolved: &ResolvedAgent) -> Result<RigClient> {
-    match &resolved.provider {
-        ResolvedProvider::OpenAi {
-            base_url, api_key, ..
-        } => RigClient::builder()
-            .api_key(api_key.clone())
-            .base_url(base_url)
-            .build()
-            .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into()),
-        ResolvedProvider::Mistralrs { .. } => {
-            #[cfg(not(feature = "mistralrs"))]
-            return Err(LlmResolveError::MistralrsFeatureDisabled {
-                name: resolved.provider_name.clone(),
-            }
-            .into());
-
-            #[cfg(feature = "mistralrs")]
-            return Err(LlmResolveError::MistralrsRuntimeUnavailable.into());
-        }
-    }
+/// Runtime-dispatched Rig agent. The OpenAi-backed and mistralrs-backed
+/// `CompletionModel` impls produce concretely different `Agent<M>` types
+/// (Rig's trait carries associated types, so a single concrete `RigAgent`
+/// can't carry both). Callers (the agent loop) match on the variant.
+pub enum RigAgent {
+    OpenAi(rig::agent::Agent<rig::providers::openai::CompletionModel>),
+    #[cfg(feature = "mistralrs")]
+    Mistralrs(rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>),
 }
 
 /// Build a Rig `Agent` ready to receive a turn. Preamble, sampling params,
 /// and the dynamic-tool list come from `resolved` plus the caller-supplied
-/// MCP-backed adapters.
-pub fn build_agent(
+/// MCP-backed adapters. The `cache_root` argument is the directory into
+/// which the mistralrs HF-download path stages model files; it's ignored
+/// for OpenAi providers.
+///
+/// The function is async because the mistralrs arm has to load (and on
+/// first use, download) a multi-gigabyte model. The OpenAi arm is sync-in-
+/// async, free.
+pub async fn build_agent(
     resolved: &ResolvedAgent,
-    client: &RigClient,
     tools: Vec<McpToolAdapter>,
-) -> RigAgent {
+    cache_root: &Path,
+) -> Result<RigAgent> {
+    let _ = cache_root;
+    match &resolved.provider {
+        ResolvedProvider::OpenAi {
+            base_url, api_key, ..
+        } => {
+            use rig::client::CompletionClient;
+            use rig::providers::openai::CompletionsClient;
+
+            let client = CompletionsClient::builder()
+                .api_key(api_key.clone())
+                .base_url(base_url)
+                .build()
+                .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
+            let model = client.completion_model(&resolved.model_identifier);
+            Ok(RigAgent::OpenAi(finish_agent(model, resolved, tools)))
+        }
+        ResolvedProvider::Mistralrs {
+            #[cfg(feature = "mistralrs")]
+            model_id,
+            #[cfg(feature = "mistralrs")]
+            model_path,
+            #[cfg(feature = "mistralrs")]
+            model_file,
+            #[cfg(feature = "mistralrs")]
+            revision,
+            #[cfg(feature = "mistralrs")]
+            context_length,
+            ..
+        } => {
+            #[cfg(not(feature = "mistralrs"))]
+            {
+                Err(LlmResolveError::MistralrsFeatureDisabled {
+                    name: resolved.provider_name.clone(),
+                }
+                .into())
+            }
+            #[cfg(feature = "mistralrs")]
+            {
+                let model = crate::llm::mistralrs::load(
+                    &resolved.provider_name,
+                    model_id.as_deref(),
+                    model_path.as_deref(),
+                    model_file.as_deref(),
+                    revision.as_deref(),
+                    *context_length,
+                    cache_root,
+                )
+                .await?;
+                Ok(RigAgent::Mistralrs(finish_agent(model, resolved, tools)))
+            }
+        }
+    }
+}
+
+fn finish_agent<M: rig::completion::CompletionModel + 'static>(
+    model: M,
+    resolved: &ResolvedAgent,
+    tools: Vec<McpToolAdapter>,
+) -> rig::agent::Agent<M> {
     use rig::agent::AgentBuilder;
-    use rig::client::CompletionClient;
     use rig::tool::ToolDyn;
 
-    let model = client.completion_model(&resolved.model_identifier);
     let mut builder = AgentBuilder::new(model).preamble(&resolved.preamble);
     if let Some(temperature) = resolved.temperature {
         builder = builder.temperature(temperature as f64);

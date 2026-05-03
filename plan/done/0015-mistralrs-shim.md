@@ -92,3 +92,91 @@ install can resolve a `model-id` config without any user pre-staging. After this
   tool-call JSON, the answer is "pick a model that doesn't" -- the policy-oracle path
   (out of scope for this batch) won't depend on free-form tool-call competence anyway,
   since it uses constrained-JSON decoding.
+
+## Decisions
+
+- **HF cache layout follows `hf-hub`'s default**, not the spec's flat
+  `<cache_root>/<model_id>/<rev>/<model_file>`. `mistralrs-core 0.8.1` exposes a
+  process-global `OnceLock<Cache>` (`GLOBAL_HF_CACHE`) that the shim sets to
+  `Cache::new(cache_root)` on first call. Files land at
+  `<cache_root>/models--<org>--<repo>/snapshots/<rev_hash>/<file>`. Going around
+  mistralrs's downloader to honour the spec layout would re-implement HF auth /
+  redirects / etag handling for no real benefit; the spec's wording was
+  aspirational, not load-bearing. The `.part`-then-rename atomicity the spec
+  asked for is provided by `hf-hub` already.
+
+- **`RigAgent` reshape: enum, not concrete type alias.** The pre-0015
+  `pub type RigAgent = rig::agent::Agent<openai::CompletionModel>` couldn't
+  carry both an OpenAi-backed and a mistralrs-backed agent (Rig's
+  `CompletionModel` trait has associated types `Response` /
+  `StreamingResponse` / `Client` that make `dyn CompletionModel` non
+  object-safe). `RigAgent` now is a runtime enum with one variant per
+  provider style. `MistralrsRuntimeUnavailable` was deleted along with the
+  feature-on resolver test that asserted it.
+
+- **`build_rig_client` collapsed into `build_agent`.** The `client -> model
+  -> agent` two-step is artificial for in-process providers (the
+  loaded engine *is* the "client"), so the public surface is now a single
+  async `pub async fn build_agent(resolved, tools, cache_root) ->
+  Result<RigAgent>`. The OpenAi arm is sync-in-async (free); the Mistralrs
+  arm awaits `mistralrs::load`. A generic `finish_agent<M>` helper shares
+  the `AgentBuilder` setup between arms.
+
+- **Direct optional Cargo deps for the three transitives (`hf-hub`,
+  `candle-core`, `indexmap`).** mistralrs-core re-exports neither
+  `hf_hub::Cache`, `candle_core::Device`, nor `indexmap::IndexMap`, but the
+  shim constructs values of all three (cache root, CPU device, message
+  IndexMap). Pinning them with `=<exact-version>` matched against
+  mistralrs-core's locked picks keeps the dep tree free of duplicates.
+  Feature gate: `mistralrs = ["dep:mistralrs-core", "dep:hf-hub",
+  "dep:candle-core", "dep:indexmap"]`.
+
+- **`Self::Response` is a JSON wrapper, not the raw mistralrs response.**
+  `mistralrs_core::ChatCompletionResponse` impls `Serialize` only, but Rig's
+  trait demands `Serialize + DeserializeOwned`. `MistralrsRawResponse {
+  raw: serde_json::Value }` satisfies the trait via `Value`'s round-trip.
+  v0 has no consumer for `raw`; it pays the cost of one
+  `serde_json::to_value` per completion. Acceptable; revisit if the agent
+  loop ever inspects raw responses.
+
+- **`Self::StreamingResponse = ()`.** `()` already implements
+  `Clone + Unpin + Send + Sync + Serialize + DeserializeOwned +
+  GetTokenUsage` (rig provides the last impl). The `stream()` method
+  returns `CompletionError::ProviderError("streaming not supported by the
+  mistralrs in-process backend")`; v0's agent loop is non-streaming, so
+  this never fires.
+
+- **Tool-call argument fallback to raw string.** mistralrs returns
+  `arguments: String`, rig wants `arguments: serde_json::Value` (parsed).
+  On `serde_json::from_str` failure, the shim wraps the raw string as
+  `Value::String(raw)` instead of erroring. Rationale: the agent loop's
+  schema-validation produces a clearer downstream error ("tool 'foo' got
+  non-JSON arguments") than the shim would. Pinned by
+  `malformed_tool_call_arguments_fall_back_to_string` in the unit suite.
+
+- **`send_request` is offloaded via `tokio::task::spawn_blocking`.**
+  `MistralRs::send_request` calls `Sender::blocking_send` internally, which
+  blocks the calling thread. Calling it directly from an async task would
+  stall the runtime; `spawn_blocking` moves the call to the blocking
+  thread pool. The response arrives over an `mpsc::Sender<Response>`
+  embedded in the request; one channel per call, depth 1 (no concurrency
+  per `MistralrsModel::completion`).
+
+- **`context_length` is post-load validation, not pre-load peek.** The
+  alternative was to lock the loaded `Pipeline` before passing it to
+  `MistralRsBuilder` and read `metadata.max_seq_len` early. Cleaner code
+  to validate after `engine.config(None)` returns; the cost is one already-
+  loaded model in memory at the moment we error. v0 ships with that
+  trade-off.
+
+- **`tool_choice = Required` downgrades to `Auto`.** mistralrs has no
+  "Required" variant; the closest analogue is `Specific(tool)`, but that
+  needs a chosen tool name. Downgrading to `Auto` and relying on the
+  model is the lossy option; documented in the conversion site.
+
+- **Smoke tests gated on env vars, not `--ignored`.** `tests/mistralrs_
+  smoke.rs` reads `OUTRIG_MISTRALRS_TEST_MODEL{,_ID,_FILE}` and emits a
+  `println!("skip: ...")` when unset. Rationale: `cargo test --features
+  mistralrs` stays green in CI without any flag dance, and a single env
+  var unlocks the test for local verification. `#[ignore]` would force a
+  separate `cargo test -- --ignored` invocation.

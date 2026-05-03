@@ -1,10 +1,15 @@
-//! Integration tests for `resolve_agent` and `build_rig_client`. Covers
+//! Integration tests for `resolve_agent` and `build_agent`. Covers
 //! every failure mode listed in `plan/done/0012-llm-resolver.md`'s test
 //! plan plus the two happy-path resolutions.
 
+#[cfg(not(feature = "mistralrs"))]
+use std::path::Path;
+
 use outrig::config::Config;
 use outrig::error::OutrigError;
-use outrig::llm::{LlmResolveError, ResolvedProvider, build_rig_client, resolve_agent};
+#[cfg(not(feature = "mistralrs"))]
+use outrig::llm::build_agent;
+use outrig::llm::{LlmResolveError, ResolvedProvider, resolve_agent};
 
 fn parse(s: &str) -> Config {
     Config::load_from_str(s).expect("config parses")
@@ -220,11 +225,14 @@ preamble = "hi"
     );
 }
 
-/// Resolve an agent against the `local` mistralrs provider declared by
-/// `cfg_with_key_var` and return whatever `build_rig_client` errored with.
-/// Both the feature-off and feature-on tests below share this setup; only
-/// one test compiles per build, so they can share the env-var name.
-fn resolve_mistralrs_build_err() -> OutrigError {
+/// Feature-off build: building an agent for a `mistralrs` provider fails
+/// with a message that names both the provider and the missing feature
+/// flag, so the fix ("rebuild with --features mistralrs") is one shot.
+/// Pinned verbatim because `doc/concepts/llm-providers.md` promises this
+/// wording.
+#[cfg(not(feature = "mistralrs"))]
+#[tokio::test]
+async fn mistralrs_provider_feature_off_explains_clearly() {
     let var = "OUTRIG_TEST_LLM_RESOLVE_MISTRALRS";
     set_env(var, "k");
     let cfg = parse(&cfg_with_key_var(
@@ -241,19 +249,12 @@ preamble = "hi"
         "expected Mistralrs resolved-provider, got {:?}",
         resolved.provider,
     );
-    let err = build_rig_client(&resolved).unwrap_err();
+    let result = build_agent(&resolved, vec![], Path::new("/tmp/outrig-test-cache")).await;
     unset_env(var);
-    err
-}
-
-/// Feature-off build: resolving a `mistralrs` provider fails with a
-/// message that names both the provider and the missing feature flag, so
-/// the fix ("rebuild with --features mistralrs") is one shot. Pinned
-/// verbatim because `doc/concepts/llm-providers.md` promises this wording.
-#[cfg(not(feature = "mistralrs"))]
-#[test]
-fn mistralrs_provider_feature_off_explains_clearly() {
-    let err = resolve_mistralrs_build_err();
+    let err = match result {
+        Ok(_) => panic!("expected build_agent to error on feature-off mistralrs"),
+        Err(e) => e,
+    };
     assert!(
         matches!(
             &err,
@@ -267,23 +268,6 @@ fn mistralrs_provider_feature_off_explains_clearly() {
          does not include the 'mistralrs' feature; rebuild with \
          --features mistralrs to enable",
     );
-}
-
-/// Feature-on build: the resolver still errors because 0014 lands no
-/// runtime -- 0015 replaces this placeholder with the actual shim.
-#[cfg(feature = "mistralrs")]
-#[test]
-fn mistralrs_provider_feature_on_runtime_unavailable() {
-    let err = resolve_mistralrs_build_err();
-    let msg = err.to_string();
-    assert!(
-        matches!(
-            err,
-            OutrigError::LlmResolve(LlmResolveError::MistralrsRuntimeUnavailable),
-        ),
-        "got: {err:?}",
-    );
-    assert!(msg.contains("mistralrs"), "got: {msg}");
 }
 
 #[test]

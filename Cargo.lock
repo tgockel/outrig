@@ -3270,10 +3270,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "candle-core",
  "clap",
  "dialoguer",
  "directories",
+ "hf-hub",
  "ignore",
+ "indexmap 2.14.0",
  "jiff",
  "mistralrs-core",
  "nix",
