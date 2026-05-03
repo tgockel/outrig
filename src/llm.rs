@@ -10,6 +10,11 @@ use crate::rig_tool::McpToolAdapter;
 
 #[cfg(feature = "mistralrs")]
 pub mod mistralrs;
+#[cfg(feature = "mistralrs")]
+pub mod registry;
+
+#[cfg(feature = "mistralrs")]
+pub use registry::LlmRegistry;
 
 /// Default preamble used when an agent leaves the field unset. Deliberately
 /// generic; agents that need anything specific spell it out themselves.
@@ -214,7 +219,9 @@ pub async fn build_agent(
     resolved: &ResolvedAgent,
     tools: Vec<McpToolAdapter>,
     cache_root: &Path,
+    #[cfg(feature = "mistralrs")] registry: &LlmRegistry,
 ) -> Result<RigAgent> {
+    #[cfg(not(feature = "mistralrs"))]
     let _ = cache_root;
     match &resolved.provider {
         ResolvedProvider::OpenAi {
@@ -253,17 +260,31 @@ pub async fn build_agent(
             }
             #[cfg(feature = "mistralrs")]
             {
-                let model = crate::llm::mistralrs::load(
-                    &resolved.provider_name,
-                    model_id.as_deref(),
-                    model_path.as_deref(),
-                    model_file.as_deref(),
-                    revision.as_deref(),
-                    *context_length,
-                    cache_root,
-                )
-                .await?;
-                Ok(RigAgent::Mistralrs(finish_agent(model, resolved, tools)))
+                let provider_name = resolved.provider_name.as_str();
+                let model_id = model_id.as_deref();
+                let model_path = model_path.as_deref();
+                let model_file = model_file.as_deref();
+                let revision = revision.as_deref();
+                let context_length = *context_length;
+                let model = registry
+                    .get_or_init(provider_name, || async move {
+                        crate::llm::mistralrs::load(
+                            provider_name,
+                            model_id,
+                            model_path,
+                            model_file,
+                            revision,
+                            context_length,
+                            cache_root,
+                        )
+                        .await
+                    })
+                    .await?;
+                Ok(RigAgent::Mistralrs(finish_agent(
+                    (*model).clone(),
+                    resolved,
+                    tools,
+                )))
             }
         }
     }

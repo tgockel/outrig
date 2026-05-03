@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use outrig::config::Config;
-use outrig::llm::{RigAgent, build_agent, resolve_agent};
+use outrig::llm::{LlmRegistry, RigAgent, build_agent, resolve_agent};
 use rig::completion::Prompt;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -86,7 +86,8 @@ async fn offline_path_smoke() {
     let resolved = resolve_agent(&cfg, "smoke").expect("agent resolves");
 
     let cache = TempDir::new().expect("tempdir");
-    let agent = build_agent(&resolved, vec![], cache.path())
+    let registry = LlmRegistry::new();
+    let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
         .expect("agent builds");
 
@@ -114,7 +115,8 @@ async fn download_path_smoke() {
 
     // First load: downloads.
     let resolved = resolve_agent(&cfg, "smoke").expect("agent resolves");
-    let agent = build_agent(&resolved, vec![], cache.path())
+    let registry = LlmRegistry::new();
+    let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
         .expect("first agent build (download path)");
     let first_reply = one_shot(&agent, "Say hi.").await;
@@ -126,7 +128,7 @@ async fn download_path_smoke() {
         .expect("downloaded GGUF should be discoverable in cache dir");
 
     // Second load: must not re-download.
-    let agent = build_agent(&resolved, vec![], cache.path())
+    let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
         .expect("second agent build (cache reuse)");
     let _ = one_shot(&agent, "Say bye.").await;

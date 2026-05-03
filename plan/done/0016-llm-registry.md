@@ -73,3 +73,38 @@ keyed by provider name, value is a lazily-loaded `Arc<MistralrsModel>`.
   intentional: provider name is the user's identity for the model, and conflating
   same-file-different-providers would surprise the user (separate `context-length`
   settings, for instance, would silently merge).
+
+## Decisions
+
+- **`LlmRegistry<T = MistralrsModel>` (generic with default).** The spec literally
+  hardcodes `Arc<MistralrsModel>` in the map's value type. The implementation defaults
+  the generic to `MistralrsModel` so production callers still write `LlmRegistry::new()`,
+  but the test suite can substitute a lightweight `TestStub` via
+  `LlmRegistry::<TestStub>::new()`. Real `MistralrsModel`s wrap a heavy `MistralRs`
+  engine and can't be cheaply constructed; without the generic, the concurrent-load
+  test would have needed a Cargo feature (or unit-test fallback) to inject a fake.
+- **Single closure-form API: `get_or_init(name, init)`.** The spec proposes
+  `get_or_load(name, provider, cache_root) -> Result<Arc<MistralrsModel>>`, which
+  would force the registry to know about `LlmProvider`. Pushing the
+  field-extraction + `mistralrs::load` call into `build_agent`'s Mistralrs arm
+  keeps `registry.rs` decoupled from config types and gives one method to test.
+- **`tokio::sync::OnceCell<Arc<T>>`.** Async-friendly `get_or_try_init`. Outer
+  `Mutex` guard is dropped before any `await` (cell-clone-then-release pattern).
+  Cancellation- and failure-safe: a dropped init future or a returned `Err` leaves
+  the slot empty; the next caller retries. Steady-state cache hits skip the
+  `to_string()` allocation via a `get`-then-`entry` two-step.
+- **`build_agent`'s `&LlmRegistry` parameter is `#[cfg(feature = "mistralrs")]`-gated.**
+  Honors the spec's "non-feature build doesn't have a registry." Both call sites
+  (`tests/mistralrs_smoke.rs` is feature-gated; `tests/llm_resolve.rs`'s feature-off
+  test isn't) only see one arm, so the cfg-on-param is local. The pre-existing
+  `let _ = cache_root;` on the same function was tightened to
+  `#[cfg(not(feature = "mistralrs"))]` since the new mistralrs arm uses
+  `cache_root` inside the registry closure.
+- **No doc change for the `> TODO: Incomplete` marker.** The marker on
+  `doc/concepts/llm-providers.md` line 160 covers "Other Rig provider styles"
+  (anthropic, Cohere), not the in-process `mistralrs` section. 0015 already cleared
+  the in-process marker. The acceptance criterion is a no-op.
+- **A fourth test: `loader_failure_leaves_slot_empty`.** Not in the spec, but the
+  module doc explicitly promises retry-on-failure semantics, and an untested promise
+  is worse than a missing test. Construction of `LlmResolveError::MistralrsLoad`
+  inside the test mirrors the typed failure path that production hits.
