@@ -216,7 +216,7 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
         let name = prompt.ask_string(&PROVIDER_NAME_FIELD, style).await?;
         let provider = match style {
             "openai" => prompt_openai_provider(prompt).await?,
-            "mistralrs" => prompt_mistralrs_provider(prompt).await?,
+            "mistralrs" => LlmProvider::Mistralrs,
             other => {
                 return Err(OutrigError::Configuration(format!(
                     "unknown provider style: {other}"
@@ -249,7 +249,63 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
     })
 }
 
-async fn prompt_mistralrs_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
+async fn prompt_models(
+    prompt: &mut impl PromptSource,
+    providers: &BTreeMap<String, LlmProvider>,
+) -> Result<BTreeMap<String, Model>> {
+    let mut out = BTreeMap::new();
+    if !prompt.ask_bool(&DEFINE_MODEL_FIELD, true).await? {
+        return Ok(out);
+    }
+    let first_provider = providers
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "openai".to_string());
+
+    loop {
+        let name = prompt.ask_string(&MODEL_NAME_FIELD, "fast").await?;
+        let provider_name = loop {
+            let answer = prompt
+                .ask_string(&MODEL_PROVIDER_FIELD, &first_provider)
+                .await?;
+            if providers.contains_key(&answer) {
+                break answer;
+            }
+            eprintln!(
+                "[outrig] no provider named `{answer}`; defined: {}",
+                providers.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        };
+        let model = match providers.get(&provider_name).expect("validated above") {
+            LlmProvider::OpenAi { .. } => {
+                let identifier = prompt
+                    .ask_string(&MODEL_IDENTIFIER_FIELD, "gpt-4o-mini")
+                    .await?;
+                Model {
+                    provider: provider_name,
+                    identifier: Some(identifier),
+                    model_id: None,
+                    model_path: None,
+                    model_file: None,
+                    revision: None,
+                    context_length: None,
+                }
+            }
+            LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, provider_name).await?,
+        };
+        out.insert(name, model);
+        if !prompt.ask_bool(&ADD_MODEL_FIELD, false).await? {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn prompt_mistralrs_model(
+    prompt: &mut impl PromptSource,
+    provider_name: String,
+) -> Result<Model> {
     let auto_download = prompt.ask_bool(&AUTO_DOWNLOAD_FIELD, true).await?;
     let (model_id, model_path, revision) = if auto_download {
         let id = ask_required(prompt, &MODEL_ID_FIELD).await?;
@@ -268,58 +324,17 @@ async fn prompt_mistralrs_provider(prompt: &mut impl PromptSource) -> Result<Llm
             })
         })
         .transpose()?;
-    Ok(LlmProvider::Mistralrs {
+    Ok(Model {
+        provider: provider_name,
+        identifier: None,
         model_id,
         model_path,
+        // model-file is intentionally not prompted: the typical single-file
+        // GGUF repo case doesn't need it; multi-file repos hand-edit the TOML.
         model_file: None,
         revision,
         context_length,
     })
-}
-
-async fn prompt_models(
-    prompt: &mut impl PromptSource,
-    providers: &BTreeMap<String, LlmProvider>,
-) -> Result<BTreeMap<String, Model>> {
-    let mut out = BTreeMap::new();
-    if !prompt.ask_bool(&DEFINE_MODEL_FIELD, true).await? {
-        return Ok(out);
-    }
-    let first_provider = providers
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "openai".to_string());
-
-    loop {
-        let name = prompt.ask_string(&MODEL_NAME_FIELD, "fast").await?;
-        let identifier = prompt
-            .ask_string(&MODEL_IDENTIFIER_FIELD, "gpt-4o-mini")
-            .await?;
-        let provider = loop {
-            let answer = prompt
-                .ask_string(&MODEL_PROVIDER_FIELD, &first_provider)
-                .await?;
-            if providers.contains_key(&answer) {
-                break answer;
-            }
-            eprintln!(
-                "[outrig] no provider named `{answer}`; defined: {}",
-                providers.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        };
-        out.insert(
-            name,
-            Model {
-                provider,
-                identifier,
-            },
-        );
-        if !prompt.ask_bool(&ADD_MODEL_FIELD, false).await? {
-            break;
-        }
-    }
-    Ok(out)
 }
 
 async fn prompt_default_model(

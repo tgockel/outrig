@@ -41,14 +41,19 @@ $ outrig config init
 
 ? Define a model now? [Y/n]:
 ? Model name (used in agents) [default: fast]:
-? Model identifier [default: gpt-4o-mini]:
 ? Provider for this model [default: openai]:
+? Model identifier [default: gpt-4o-mini]:
 
 ? Add another model? [y/N]:
 ? Use this model as default-model? [Y/n]:
 
 [outrig] wrote ~/.outrig/config.toml
 ```
+
+If you pick `mistralrs` as the provider style, the provider itself has no follow-up
+prompts -- it's just a tag. The weight-source prompts (`Use auto-download by model
+ID?`, `HuggingFace model-id` or `Local model-path`, `revision`, `context-length`) are
+asked once per model in the model loop, since each model carries its own weight spec.
 
 ### Help at any prompt
 

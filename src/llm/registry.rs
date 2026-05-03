@@ -1,7 +1,7 @@
 //! Lazy, shared loading for in-process LLM models.
 //!
-//! Two agents that point at the same `[providers.<name>]` block should share
-//! one loaded model. `LlmRegistry` is keyed by provider name; the value is a
+//! Two agents that point at the same `[models.<name>]` block share one loaded
+//! engine. `LlmRegistry` is keyed by model name; the value is a
 //! lazily-initialized `Arc` produced by a caller-supplied loader closure.
 //! Concurrent first-load callers wait on the same init; subsequent callers
 //! get the cached `Arc` without further work.
@@ -40,7 +40,7 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
         Self::default()
     }
 
-    pub async fn get_or_init<F, Fut>(&self, provider_name: &str, init: F) -> Result<Arc<T>>
+    pub async fn get_or_init<F, Fut>(&self, model_name: &str, init: F) -> Result<Arc<T>>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -49,10 +49,10 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
             let mut map = self.models.lock().expect("registry mutex poisoned");
             // Skip the `to_string` on cache hits so the steady-state lookup
             // is allocation-free.
-            if let Some(existing) = map.get(provider_name) {
+            if let Some(existing) = map.get(model_name) {
                 existing.clone()
             } else {
-                map.entry(provider_name.to_string())
+                map.entry(model_name.to_string())
                     .or_insert_with(|| Arc::new(OnceCell::new()))
                     .clone()
             }

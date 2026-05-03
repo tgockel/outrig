@@ -115,7 +115,34 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(*anthropic_timeout, None);
 
         assert_eq!(cfg.models["fast"].provider, "openai");
-        assert_eq!(cfg.models["fast"].identifier, "gpt-4o-mini");
+        assert_eq!(
+            cfg.models["fast"].identifier.as_deref(),
+            Some("gpt-4o-mini")
+        );
+
+        // mistralrs-side models carry weight fields and no identifier.
+        let phi3 = &cfg.models["phi3-fast"];
+        assert_eq!(phi3.provider, "local");
+        assert_eq!(phi3.identifier, None);
+        assert_eq!(
+            phi3.model_id.as_deref(),
+            Some("microsoft/Phi-3-mini-4k-instruct-gguf")
+        );
+        assert_eq!(
+            phi3.model_file.as_deref(),
+            Some("Phi-3-mini-4k-instruct-q4.gguf")
+        );
+        let llama = &cfg.models["llama-local"];
+        assert_eq!(llama.provider, "local");
+        assert_eq!(llama.identifier, None);
+        assert_eq!(
+            llama.model_path.as_deref(),
+            Some(std::path::Path::new(
+                ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
+            )),
+        );
+        assert_eq!(llama.context_length, Some(4096));
+        assert!(matches!(cfg.providers["local"], LlmProvider::Mistralrs));
 
         let coding = &cfg.agents["coding"];
         assert_eq!(coding.model, None);

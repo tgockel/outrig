@@ -171,25 +171,31 @@ serialization. The use case is questions whose *content* must not leave the host
 eventual egress filter, tool-use filter, and prompt-injection scanner all want this. See
 [In-process LLMs](in-process-llm.md) for the full picture.
 
+A `mistralrs` provider table is bare -- it just declares "this is the in-process
+runtime." Each set of weights goes on a `[models.<name>]` row referencing the provider:
+
 ```toml
-# Auto-download from HuggingFace on first use:
 [providers.local]
-style      = "mistralrs"
+style = "mistralrs"
+
+# Auto-download from HuggingFace on first use:
+[models.phi3-fast]
+provider   = "local"
 model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
 model-file = "Phi-3-mini-4k-instruct-q4.gguf"
 
 # Or point at a GGUF you placed on disk yourself:
-[providers.local-offline]
-style      = "mistralrs"
-model-path = "/var/cache/outrig/models/Phi-3-mini-4k-instruct-q4.gguf"
+[models.llama-local]
+provider   = "local"
+model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 ```
 
-Neither form takes `base-url` or `api-key`. Exactly one of `model-id` / `model-path` is
-required.
+The provider takes no `base-url` and no `api-key`. Each mistralrs model must set
+exactly one of `model-id` / `model-path`. One provider can back many models.
 
 The backend is gated behind `cargo build --features mistralrs`. A build *without* the
 feature still parses and validates `style = "mistralrs"` blocks cleanly; the error fires
-only when an agent tries to actually use one of those providers, with a message that names
+only when an agent tries to actually use one of those models, with a message that names
 the missing feature flag. This keeps configs portable across builds.
 
 For the full schema (including `revision`, `context-length`, and the top-level

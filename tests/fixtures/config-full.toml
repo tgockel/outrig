@@ -18,6 +18,9 @@ style    = "openai"
 base-url = "https://api.anthropic.com/v1"
 api-key  = "${ANTHROPIC_API_KEY}"
 
+[providers.local]
+style = "mistralrs"
+
 [models.fast]
 provider   = "openai"
 identifier = "gpt-4o-mini"
@@ -29,6 +32,16 @@ identifier = "gpt-4o"
 [models.claude]
 provider   = "anthropic"
 identifier = "claude-sonnet-4-6"
+
+[models.phi3-fast]
+provider   = "local"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+
+[models.llama-local]
+provider       = "local"
+model-path     = ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
+context-length = 4096
 
 [agents.coding]
 container   = "coding"

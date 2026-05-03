@@ -8,9 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase F-pre -- foundation gaps (run first)
 
-- **[0029](0029-mistralrs-model-vs-provider.md)** Reshape mistralrs schema:
-  weight-source fields move off the provider, onto the model. Pulled in from
-  `plan/next/` -- a 0005 oversight that surfaced during 0024.
 - **[0030](0030-fuzzy-prompt-impl.md)** Rich-TUI `PromptSource` impl
   (FuzzySelect for picking models / agents / containers from N candidates).
 

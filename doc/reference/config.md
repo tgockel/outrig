@@ -47,7 +47,7 @@ config value and the default; `--session-dir <path>` (on `outrig run`/`logs`/`di
 points at one specific session directory. See [Sessions](../usage/sessions.md).
 
 `model-cache-root` defaults to `<XDG_CACHE_HOME>/outrig/models/` (typically
-`~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` providers configured
+`~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` models configured
 with `model-id` -- that's where the auto-downloaded GGUFs land. See
 [Concepts -> In-process LLMs](../concepts/in-process-llm.md).
 
@@ -82,37 +82,24 @@ api-key  = "${OLLAMA_API_KEY}"
 ### `style = "mistralrs"`
 
 In-process LLM backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. No
-HTTP, no API key. Either `model-id` (auto-download from HuggingFace) or `model-path`
-(local file) -- exactly one. See [Concepts -> In-process LLMs](../concepts/in-process-llm.md).
+HTTP, no API key. The provider table is bare -- just the `style` tag. Each set of
+weights is its own `[models.<name>]` row referencing this provider, so a single
+`mistralrs` provider can back many models. See
+[Concepts -> In-process LLMs](../concepts/in-process-llm.md).
 
 ```toml
-# HuggingFace auto-download:
 [providers.local]
-style      = "mistralrs"
-model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"
-# revision       = "main"   # optional git ref on the HF repo
-# context-length = 4096     # optional override
-
-# Local GGUF file:
-[providers.local-offline]
-style      = "mistralrs"
-model-path = "/var/cache/outrig/models/Phi-3-mini-4k-instruct-q4.gguf"
+style = "mistralrs"
 ```
 
-| Key              | Type    | Required | Default  | Description                                  |
-|------------------|---------|----------|----------|----------------------------------------------|
-| `style`          | string  | yes      | --       | Must be `"mistralrs"` for this row.          |
-| `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
-| `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
-| `model-file`     | string  | no       | --       | Which GGUF in a multi-file repo. With `id`.  |
-| `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
-| `context-length` | integer | no       | model    | Override the model's default context window. |
+| Key     | Type   | Required | Default | Description                         |
+|---------|--------|----------|---------|-------------------------------------|
+| `style` | string | yes      | --      | Must be `"mistralrs"` for this row. |
 
-\* Exactly one of `model-id` / `model-path` must be set; setting both, or neither, is an
-error.
-
-`base-url` and `api-key` are not allowed on `style = "mistralrs"`.
+`base-url` and `api-key` are not allowed on `style = "mistralrs"`. The weight-source
+fields (`model-id`, `model-path`, `model-file`, `revision`, `context-length`) live
+on `[models.<name>]` -- see the
+[mistralrs models](#mistralrs-models) subsection.
 
 #### Always parses, even without `--features mistralrs`
 
@@ -146,8 +133,10 @@ See [Concepts -> LLM Providers](../concepts/llm-providers.md).
 
 ## `[models.<name>]`
 
-A model picks a specific identifier (the string the provider expects in its `model` request
-field) and the provider it lives on.
+A model points at a provider and supplies whatever that provider needs to identify the
+weights or wire-format model name. The required fields depend on the provider's `style`.
+
+### openai-style models
 
 ```toml
 [models.fast]
@@ -163,6 +152,40 @@ identifier = "gpt-4o"
 |--------------|--------|----------|---------|-------------------------------------------|
 | `provider`   | string | yes      | --      | Name of an entry in `[providers.<name>]`. |
 | `identifier` | string | yes      | --      | Model id passed to the provider API.      |
+
+### mistralrs models
+
+For an in-process `style = "mistralrs"` provider, the model row carries the weight
+spec. Either `model-id` (HuggingFace auto-download) or `model-path` (local GGUF file)
+-- exactly one. `identifier` is **not** allowed on mistralrs models -- the weights
+are the model.
+
+```toml
+# HuggingFace auto-download:
+[models.phi3-fast]
+provider   = "local"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+# revision       = "main"   # optional git ref on the HF repo
+# context-length = 4096     # optional override
+
+# Local GGUF file:
+[models.llama-local]
+provider   = "local"
+model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
+```
+
+| Key              | Type    | Required | Default  | Description                                  |
+|------------------|---------|----------|----------|----------------------------------------------|
+| `provider`       | string  | yes      | --       | Name of a `style = "mistralrs"` provider.    |
+| `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
+| `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
+| `model-file`     | string  | no       | --       | Which GGUF in a multi-file repo. With `id`.  |
+| `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
+| `context-length` | integer | no       | model    | Override the model's default context window. |
+
+\* Exactly one of `model-id` / `model-path` must be set; setting both, or neither,
+is an error.
 
 ## `[agents.<name>]`
 
@@ -301,9 +324,7 @@ api-key  = "${OPENAI_API_KEY}"
 
 [providers.local]
 # requires `cargo build --features mistralrs` to actually use, but always parses.
-style      = "mistralrs"
-model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+style = "mistralrs"
 
 [models.fast]
 provider   = "openai"
@@ -312,6 +333,11 @@ identifier = "gpt-4o-mini"
 [models.smart]
 provider   = "openai"
 identifier = "gpt-4o"
+
+[models.phi3-fast]
+provider   = "local"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
 ```
 
 ### Repo `.agents/outrig/config.toml`
@@ -359,9 +385,14 @@ build-args = { NODE_VERSION = "20" }
   see "Always parses, even without `--features mistralrs`" above.
 - Every `providers.<name>.api-key` (on `style = "openai"`) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
-- For every `style = "mistralrs"` provider, exactly one of `model-id` / `model-path` must
-  be set. `model-file` and `revision` are only meaningful with `model-id`. A `model-path`,
-  if set, must exist on disk relative to the repo root (or be absolute).
+- Every `[models.<name>]` whose provider has `style = "openai"` must set
+  `identifier` and must not set any of `model-id`, `model-path`, `model-file`,
+  `revision`, `context-length`.
+- Every `[models.<name>]` whose provider has `style = "mistralrs"` must set
+  exactly one of `model-id` / `model-path`. `model-file` and `revision` are only
+  meaningful with `model-id`. A `model-path`, if set, must exist on disk relative
+  to the repo root (or be absolute). `identifier` is not allowed on mistralrs
+  models.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.

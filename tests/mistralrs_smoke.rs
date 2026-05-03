@@ -30,12 +30,11 @@ fn cfg_with_model_path(path: &str) -> String {
 default-model = "local"
 
 [providers.local]
-style      = "mistralrs"
-model-path = "{}"
+style = "mistralrs"
 
 [models.local]
 provider   = "local"
-identifier = "local"
+model-path = "{}"
 
 [agents.smoke]
 preamble = "You are a terse assistant."
@@ -50,18 +49,17 @@ fn cfg_with_model_id(id: &str, file: &str) -> String {
 default-model = "local"
 
 [providers.local]
-style      = "mistralrs"
-model-id   = "{}"
-model-file = "{}"
+style = "mistralrs"
 
 [models.local]
 provider   = "local"
-identifier = "{}"
+model-id   = "{}"
+model-file = "{}"
 
 [agents.smoke]
 preamble = "You are a terse assistant."
 "#,
-        id, file, id,
+        id, file,
     )
 }
 

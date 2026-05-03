@@ -40,8 +40,7 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${{{env_name}}}"
 
 [providers.local]
-style    = "mistralrs"
-model-id = "Qwen/Qwen2.5-7B-Instruct"
+style = "mistralrs"
 
 [models.fast]
 provider   = "openai"
@@ -52,8 +51,8 @@ provider   = "openai"
 identifier = "gpt-4o"
 
 [models.claude]
-provider   = "local"
-identifier = "Qwen/Qwen2.5-7B-Instruct"
+provider = "local"
+model-id = "Qwen/Qwen2.5-7B-Instruct"
 
 {agents}
 "#,
@@ -245,7 +244,7 @@ preamble = "hi"
     ));
     let resolved = resolve_agent(&cfg, "review").expect("resolves");
     assert!(
-        matches!(resolved.provider, ResolvedProvider::Mistralrs { .. }),
+        matches!(resolved.provider, ResolvedProvider::Mistralrs),
         "expected Mistralrs resolved-provider, got {:?}",
         resolved.provider,
     );

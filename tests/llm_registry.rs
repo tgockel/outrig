@@ -149,7 +149,7 @@ async fn loader_failure_leaves_slot_empty() {
             async move {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err(LlmResolveError::MistralrsLoad {
-                    provider: "flaky".into(),
+                    model: "flaky".into(),
                     source: anyhow!("transient load failure"),
                 }
                 .into())

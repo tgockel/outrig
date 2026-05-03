@@ -55,15 +55,22 @@ locality is itself the requirement.
 
 ## Configuring an in-process provider
 
-A `style = "mistralrs"` provider has no `base-url` and no `api-key`. Instead you tell outrig
-where to find the model -- either by HuggingFace repo id (outrig downloads it) or by local
-path (you place it on disk).
+A `style = "mistralrs"` provider has no `base-url` and no `api-key`. The provider table
+is bare -- it just declares "this is the in-process runtime." Each set of weights goes
+on its own `[models.<name>]` row referencing the provider, so one `mistralrs` provider
+can back many models. You tell outrig where to find each model's weights either by
+HuggingFace repo id (outrig downloads it) or by local path (you place it on disk).
+
+```toml
+[providers.local]
+style = "mistralrs"
+```
 
 ### From HuggingFace (recommended)
 
 ```toml
-[providers.local]
-style      = "mistralrs"
+[models.phi3-fast]
+provider   = "local"
 model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
 model-file = "Phi-3-mini-4k-instruct-q4.gguf"   # required when the repo has multiple GGUFs
 # revision      = "main"   # optional; pin a git ref for reproducibility
@@ -81,9 +88,9 @@ several quantizations (`-q4`, `-q5_k_m`, `-f16`, etc.) require an explicit pick.
 ### From a local path
 
 ```toml
-[providers.local]
-style      = "mistralrs"
-model-path = "/var/cache/outrig/models/Phi-3-mini-4k-instruct-q4.gguf"
+[models.llama-local]
+provider   = "local"
+model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 # context-length = 4096    # optional
 ```
 
@@ -93,8 +100,10 @@ relative to the repo root.
 
 ### One or the other, not both
 
-Exactly one of `model-id` and `model-path` is required. Specifying both, or neither, is a
-config error. `model-file` and `revision` are only meaningful with `model-id`.
+Exactly one of `model-id` and `model-path` is required on each mistralrs model.
+Specifying both, or neither, is a config error. `model-file` and `revision` are only
+meaningful with `model-id`. The `[models.<name>].identifier` field that openai-style
+models use is not allowed on mistralrs models -- the weights *are* the model.
 
 ### GGUF only
 
@@ -118,16 +127,16 @@ cargo build --features mistralrs
 
 A build *without* `--features mistralrs` still **recognizes** `style = "mistralrs"` in
 config files. Parsing succeeds, cross-reference validation succeeds, `outrig` will load and
-display configs that contain `mistralrs`-style providers without complaint. The error fires
-only when an agent actually tries to use one of those providers -- at agent-resolve time,
-when outrig walks `agent -> model -> provider` and tries to instantiate a client. The
-message names the missing feature flag so the fix ("rebuild with `--features mistralrs`") is
-one shot.
+display configs that contain `mistralrs`-style providers and models without complaint.
+The error fires only when an agent actually tries to use one of those models -- at
+agent-resolve time, when outrig walks `agent -> model -> provider` and tries to
+instantiate a client. The message names the missing feature flag so the fix ("rebuild
+with `--features mistralrs`") is one shot.
 
 The point of this design is portability: a repo's `.agents/outrig/config.toml` can declare
 both an OpenAI-style provider and a `mistralrs`-style provider, and the same checked-in
 config works for teammates whether or not they built with the feature on. The cost --
-"using a `mistralrs` provider on a build that doesn't support it errors out at run time" --
+"using a `mistralrs` model on a build that doesn't support it errors out at run time" --
 is paid only by users who actually try to use it.
 
 ### First-use download stalls
@@ -141,13 +150,15 @@ real work, or use the local-path form and place the file yourself.
 ## Model lifecycle
 
 Loading a GGUF is expensive (seconds, sometimes tens of seconds, sometimes gigabytes of
-RAM). outrig holds one loaded model per provider name for the lifetime of the process:
+RAM). outrig holds one loaded engine per *model name* for the lifetime of the process:
 
-- The first request to a `mistralrs` provider triggers the load.
-- Subsequent requests against the same provider reuse the loaded model.
-- Two agents that point at the same `[providers.<name>]` block share one in-memory copy.
-- The model is dropped on outrig process exit. There's no eviction in v0 -- one model per
-  provider, no multi-tenant pressure.
+- The first request to a `mistralrs` model triggers the load.
+- Subsequent requests against the same model reuse the loaded engine.
+- Two agents that point at the same `[models.<name>]` block share one in-memory copy.
+- Two `[models.<name>]` rows that share a provider but specify different weight specs
+  load distinct engines -- the cache key is the model name, not the provider.
+- The engine is dropped on outrig process exit. There's no eviction in v0 -- one engine
+  per model, no multi-tenant pressure.
 
 The registry lives in the host outrig process, never inside the sandboxed container.
 Loading the model in the container would defeat the trust property: the container is the
@@ -206,7 +217,8 @@ it ships, is so the "what is this provider *for*?" question has a concrete answe
 
 - [Providers, Models, and Agents](llm-providers.md) -- the three-layer LLM config; the
   in-process provider plugs into the same `[providers.<name>]` slot as a remote one.
-- [Reference -> Config](../reference/config.md) -- field-level schema for `style =
-  "mistralrs"` and the top-level `model-cache-root` key.
+- [Reference -> Config](../reference/config.md) -- field-level schema for the bare
+  `style = "mistralrs"` provider, the matching mistralrs `[models.<name>]` rows, and
+  the top-level `model-cache-root` key.
 - [Workspace](workspace.md) -- the eventual egress filter is the headline consumer of this
   provider.

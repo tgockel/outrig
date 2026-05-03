@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use thiserror::Error;
 
-use super::{Config, LlmProvider, McpServerSpec};
+use super::{Config, LlmProvider, McpServerSpec, Model};
 
 #[derive(Debug, Error)]
 pub enum ConfigValidationError {
@@ -64,28 +64,43 @@ pub enum ConfigValidationError {
     ModelCacheRootNotAbsolute { path: PathBuf },
 
     #[error(
-        "provider {provider:?} (style=mistralrs) must set exactly one of \
+        "model {model:?} (provider style=mistralrs) must set exactly one of \
          model-id or model-path; got neither"
     )]
-    MistralrsMissingModelSource { provider: String },
+    MistralrsMissingModelSource { model: String },
 
     #[error(
-        "provider {provider:?} (style=mistralrs) must set exactly one of \
+        "model {model:?} (provider style=mistralrs) must set exactly one of \
          model-id or model-path; got both"
     )]
-    MistralrsBothModelSources { provider: String },
+    MistralrsBothModelSources { model: String },
 
     #[error(
-        "provider {provider:?} (style=mistralrs) sets {field:?} which only \
+        "model {model:?} (provider style=mistralrs) sets {field:?} which only \
          applies when model-id is set"
     )]
-    MistralrsExtraFieldRequiresModelId {
-        provider: String,
-        field: &'static str,
-    },
+    MistralrsExtraFieldRequiresModelId { model: String, field: &'static str },
 
-    #[error("provider {provider:?} (style=mistralrs) model-path {path:?} does not exist")]
-    MistralrsModelPathMissing { provider: String, path: PathBuf },
+    #[error("model {model:?} (provider style=mistralrs) model-path {path:?} does not exist")]
+    MistralrsModelPathMissing { model: String, path: PathBuf },
+
+    #[error(
+        "model {model:?} (provider style=mistralrs) must not set {field:?} -- \
+         that field belongs to openai-style providers"
+    )]
+    MistralrsModelHasOpenAiField { model: String, field: &'static str },
+
+    #[error(
+        "model {model:?} (provider style=openai) must set 'identifier' (the \
+         string sent to the provider API)"
+    )]
+    OpenAiModelMissingIdentifier { model: String },
+
+    #[error(
+        "model {model:?} (provider style=openai) must not set {field:?} -- \
+         that field belongs to mistralrs-style providers"
+    )]
+    OpenAiModelHasMistralrsField { model: String, field: &'static str },
 }
 
 pub(super) fn validate(
@@ -134,15 +149,6 @@ pub(super) fn validate(
             return Err(ConfigValidationError::UnknownAgentContainer {
                 agent: agent_name.clone(),
                 container: c.clone(),
-            });
-        }
-    }
-
-    for (model_name, model) in &cfg.models {
-        if !cfg.providers.contains_key(&model.provider) {
-            return Err(ConfigValidationError::UnknownModelProvider {
-                model: model_name.clone(),
-                provider: model.provider.clone(),
             });
         }
     }
@@ -198,63 +204,86 @@ pub(super) fn validate(
         return Err(ConfigValidationError::ModelCacheRootNotAbsolute { path: path.clone() });
     }
 
-    for (provider_name, provider) in &cfg.providers {
-        if let LlmProvider::Mistralrs {
-            model_id,
-            model_path,
-            model_file,
-            revision,
-            ..
-        } = provider
-        {
-            validate_mistralrs(
-                provider_name,
-                model_id.as_deref(),
-                model_path.as_deref(),
-                model_file.as_deref(),
-                revision.as_deref(),
-                repo_root,
-            )?;
+    for (model_name, model) in &cfg.models {
+        let provider = cfg.providers.get(&model.provider).ok_or_else(|| {
+            ConfigValidationError::UnknownModelProvider {
+                model: model_name.clone(),
+                provider: model.provider.clone(),
+            }
+        })?;
+        match provider {
+            LlmProvider::OpenAi { .. } => validate_openai_model(model_name, model)?,
+            LlmProvider::Mistralrs => validate_mistralrs_model(model_name, model, repo_root)?,
         }
     }
 
     Ok(())
 }
 
-fn validate_mistralrs(
-    provider: &str,
-    model_id: Option<&str>,
-    model_path: Option<&Path>,
-    model_file: Option<&str>,
-    revision: Option<&str>,
+fn validate_openai_model(model_name: &str, model: &Model) -> Result<(), ConfigValidationError> {
+    if model.identifier.is_none() {
+        return Err(ConfigValidationError::OpenAiModelMissingIdentifier {
+            model: model_name.to_string(),
+        });
+    }
+    let weight_fields: [(bool, &'static str); 5] = [
+        (model.model_id.is_some(), "model-id"),
+        (model.model_path.is_some(), "model-path"),
+        (model.model_file.is_some(), "model-file"),
+        (model.revision.is_some(), "revision"),
+        (model.context_length.is_some(), "context-length"),
+    ];
+    for (present, field) in weight_fields {
+        if present {
+            return Err(ConfigValidationError::OpenAiModelHasMistralrsField {
+                model: model_name.to_string(),
+                field,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_mistralrs_model(
+    model_name: &str,
+    model: &Model,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
-    match (model_id.is_some(), model_path.is_some()) {
+    if model.identifier.is_some() {
+        return Err(ConfigValidationError::MistralrsModelHasOpenAiField {
+            model: model_name.to_string(),
+            field: "identifier",
+        });
+    }
+    match (model.model_id.is_some(), model.model_path.is_some()) {
         (false, false) => {
             return Err(ConfigValidationError::MistralrsMissingModelSource {
-                provider: provider.to_string(),
+                model: model_name.to_string(),
             });
         }
         (true, true) => {
             return Err(ConfigValidationError::MistralrsBothModelSources {
-                provider: provider.to_string(),
+                model: model_name.to_string(),
             });
         }
         _ => {}
     }
 
-    if model_id.is_none() {
-        for (value, field) in [(model_file, "model-file"), (revision, "revision")] {
+    if model.model_id.is_none() {
+        for (value, field) in [
+            (model.model_file.as_deref(), "model-file"),
+            (model.revision.as_deref(), "revision"),
+        ] {
             if value.is_some() {
                 return Err(ConfigValidationError::MistralrsExtraFieldRequiresModelId {
-                    provider: provider.to_string(),
+                    model: model_name.to_string(),
                     field,
                 });
             }
         }
     }
 
-    if let Some(path) = model_path
+    if let Some(path) = model.model_path.as_deref()
         && let Some(root) = repo_root
     {
         let resolved = if path.is_absolute() {
@@ -264,7 +293,7 @@ fn validate_mistralrs(
         };
         if !resolved.exists() {
             return Err(ConfigValidationError::MistralrsModelPathMissing {
-                provider: provider.to_string(),
+                model: model_name.to_string(),
                 path: path.to_path_buf(),
             });
         }

@@ -279,7 +279,7 @@ fn print_banner(
 ) {
     let provider_label = match &resolved.provider {
         llm::ResolvedProvider::OpenAi { .. } => "openai",
-        llm::ResolvedProvider::Mistralrs { .. } => "mistralrs",
+        llm::ResolvedProvider::Mistralrs => "mistralrs",
     };
     let mut buf = String::new();
     let _ = writeln!(

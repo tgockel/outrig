@@ -66,7 +66,7 @@ pub struct MistralrsRawResponse {
 /// root are silently ignored.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn load(
-    provider_name: &str,
+    model_name: &str,
     model_id: Option<&str>,
     model_path: Option<&Path>,
     model_file: Option<&str>,
@@ -77,7 +77,7 @@ pub(crate) async fn load(
     let _ = GLOBAL_HF_CACHE.set(hf_hub::Cache::new(cache_root.to_path_buf()));
 
     let load_err = |source: anyhow::Error| LlmResolveError::MistralrsLoad {
-        provider: provider_name.to_string(),
+        model: model_name.to_string(),
         source,
     };
 
@@ -92,7 +92,7 @@ pub(crate) async fn load(
                 ))
             })?;
             info!(
-                provider = provider_name,
+                model = model_name,
                 model_id = id,
                 model_file = file,
                 revision = revision.unwrap_or("main"),
@@ -119,7 +119,7 @@ pub(crate) async fn load(
                 ))
             })?;
             info!(
-                provider = provider_name,
+                model = model_name,
                 model_path = %path.display(),
                 "loading GGUF model from local path",
             );
@@ -163,7 +163,7 @@ pub(crate) async fn load(
         .map_err(load_err)?;
 
     info!(
-        provider = provider_name,
+        model = model_name,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "model loaded",
     );
@@ -178,7 +178,7 @@ pub(crate) async fn load(
         && (requested as usize) > max
     {
         return Err(LlmResolveError::MistralrsContextTooLong {
-            provider: provider_name.to_string(),
+            model: model_name.to_string(),
             requested,
             max,
         }

@@ -28,7 +28,10 @@ fn mistralrs_with_model_id_parses_and_validates() {
     let cfg = parse(
         r#"
 [providers.local]
-style    = "mistralrs"
+style = "mistralrs"
+
+[models.qwen]
+provider = "local"
 model-id = "Qwen/Qwen2.5-7B-Instruct"
 "#,
     );
@@ -44,14 +47,17 @@ fn mistralrs_missing_both_fails_validate() {
         r#"
 [providers.local]
 style = "mistralrs"
+
+[models.qwen]
+provider = "local"
 "#,
     );
     let err = expect_validation_err(&cfg, None);
     assert!(
         matches!(
             err,
-            ConfigValidationError::MistralrsMissingModelSource { ref provider }
-                if provider == "local"
+            ConfigValidationError::MistralrsMissingModelSource { ref model }
+                if model == "qwen"
         ),
         "got: {err:?}",
     );
@@ -62,7 +68,10 @@ fn mistralrs_with_both_fails_validate() {
     let cfg = parse(
         r#"
 [providers.local]
-style      = "mistralrs"
+style = "mistralrs"
+
+[models.qwen]
+provider   = "local"
 model-id   = "Qwen/Qwen2.5-7B-Instruct"
 model-path = "/tmp/model.gguf"
 "#,
@@ -71,8 +80,8 @@ model-path = "/tmp/model.gguf"
     assert!(
         matches!(
             err,
-            ConfigValidationError::MistralrsBothModelSources { ref provider }
-                if provider == "local"
+            ConfigValidationError::MistralrsBothModelSources { ref model }
+                if model == "qwen"
         ),
         "got: {err:?}",
     );
@@ -83,7 +92,10 @@ fn mistralrs_extra_field_without_model_id_fails_validate() {
     let cfg = parse(
         r#"
 [providers.local]
-style      = "mistralrs"
+style = "mistralrs"
+
+[models.qwen]
+provider   = "local"
 model-path = "/tmp/model.gguf"
 model-file = "weights.gguf"
 "#,
@@ -93,8 +105,82 @@ model-file = "weights.gguf"
         matches!(
             err,
             ConfigValidationError::MistralrsExtraFieldRequiresModelId {
-                ref provider, field,
-            } if provider == "local" && field == "model-file"
+                ref model, field,
+            } if model == "qwen" && field == "model-file"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
+fn mistralrs_model_with_identifier_fails_validate() {
+    let cfg = parse(
+        r#"
+[providers.local]
+style = "mistralrs"
+
+[models.qwen]
+provider   = "local"
+identifier = "qwen-on-the-wire"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+"#,
+    );
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::MistralrsModelHasOpenAiField { ref model, field }
+                if model == "qwen" && field == "identifier"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
+fn openai_model_missing_identifier_fails_validate() {
+    let cfg = parse(
+        r#"
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider = "openai"
+"#,
+    );
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::OpenAiModelMissingIdentifier { ref model }
+                if model == "fast"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
+fn openai_model_with_weight_field_fails_validate() {
+    let cfg = parse(
+        r#"
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+model-id   = "should-not-be-here"
+"#,
+    );
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::OpenAiModelHasMistralrsField { ref model, field }
+                if model == "fast" && field == "model-id"
         ),
         "got: {err:?}",
     );
@@ -166,7 +252,10 @@ fn mistralrs_relative_model_path_resolves_against_repo_root() {
     let cfg = parse(
         r#"
 [providers.local]
-style      = "mistralrs"
+style = "mistralrs"
+
+[models.local]
+provider   = "local"
 model-path = "models/local.gguf"
 "#,
     );
@@ -180,7 +269,10 @@ fn mistralrs_relative_model_path_missing_under_repo_root_errors() {
     let cfg = parse(
         r#"
 [providers.local]
-style      = "mistralrs"
+style = "mistralrs"
+
+[models.local]
+provider   = "local"
 model-path = "models/missing.gguf"
 "#,
     );
@@ -191,8 +283,8 @@ model-path = "models/missing.gguf"
     assert!(
         matches!(
             err,
-            ConfigValidationError::MistralrsModelPathMissing { ref provider, .. }
-                if provider == "local"
+            ConfigValidationError::MistralrsModelPathMissing { ref model, .. }
+                if model == "local"
         ),
         "got: {err:?}",
     );

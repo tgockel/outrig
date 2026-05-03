@@ -98,25 +98,25 @@ pub enum LlmProvider {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_timeout_secs: Option<u64>,
     },
-    Mistralrs {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model_path: Option<PathBuf>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model_file: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        revision: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        context_length: Option<u32>,
-    },
+    Mistralrs,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Model {
     pub provider: String,
-    pub identifier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -124,6 +124,57 @@ async fn force_overwrites_existing_file() {
 }
 
 #[tokio::test]
+async fn writes_mistralrs_config_with_model_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Provider: pick mistralrs style by value, name "local". Mistralrs
+    // provider has no follow-up prompts.
+    // Add another provider? n.
+    // Define a model now? (Y default).
+    // Model name "phi" -> provider "local" -> auto-download (Y default) ->
+    // model-id -> revision blank -> context-length blank.
+    // Add another model? n.
+    // Use as default-model? (Y default).
+    let script =
+        b"mistralrs\nlocal\nn\n\nphi\nlocal\n\nmicrosoft/Phi-3-mini-4k-instruct-gguf\n\n\nn\n\n";
+    let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+
+    assert!(
+        text.contains("default-model = \"phi\""),
+        "missing default-model:\n{text}"
+    );
+    assert!(
+        text.contains("[providers.local]"),
+        "missing providers.local:\n{text}"
+    );
+    assert!(
+        text.contains("style = \"mistralrs\""),
+        "missing style:\n{text}"
+    );
+    // Weight fields land under [models.<name>], not under the provider.
+    assert!(text.contains("[models.phi]"), "missing models.phi:\n{text}");
+    assert!(
+        text.contains("model-id = \"microsoft/Phi-3-mini-4k-instruct-gguf\""),
+        "missing model-id:\n{text}"
+    );
+    // mistralrs models don't carry `identifier`.
+    assert!(
+        !text.contains("identifier ="),
+        "unexpected identifier on mistralrs model:\n{text}"
+    );
+}
+
+#[tokio::test]
 async fn no_models_writes_providers_only() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("config.toml");

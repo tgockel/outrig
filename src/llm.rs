@@ -59,19 +59,19 @@ pub enum LlmResolveError {
 
     #[cfg(feature = "mistralrs")]
     #[error(
-        "mistralrs provider {provider:?}: requested context-length \
+        "mistralrs model {model:?}: requested context-length \
          {requested} exceeds the model's maximum of {max}"
     )]
     MistralrsContextTooLong {
-        provider: String,
+        model: String,
         requested: u32,
         max: usize,
     },
 
     #[cfg(feature = "mistralrs")]
-    #[error("mistralrs provider {provider:?}: failed to load model: {source}")]
+    #[error("mistralrs model {model:?}: failed to load model: {source}")]
     MistralrsLoad {
-        provider: String,
+        model: String,
         #[source]
         source: anyhow::Error,
     },
@@ -90,13 +90,20 @@ pub enum ResolvedProvider {
         api_key: String,
         request_timeout_secs: Option<u64>,
     },
-    Mistralrs {
-        model_id: Option<String>,
-        model_path: Option<PathBuf>,
-        model_file: Option<String>,
-        revision: Option<String>,
-        context_length: Option<u32>,
-    },
+    Mistralrs,
+}
+
+/// Weight-source spec for a mistralrs-backed model. Lifted off
+/// `[models.<name>]` at resolve time. Only one of `model_id` / `model_path`
+/// is meaningful in any given instance; validation enforces that, but
+/// `mistralrs::load` is also defensive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MistralrsWeights {
+    pub model_id: Option<String>,
+    pub model_path: Option<PathBuf>,
+    pub model_file: Option<String>,
+    pub revision: Option<String>,
+    pub context_length: Option<u32>,
 }
 
 /// Fully-resolved view of one agent: every knob the agent loop needs to
@@ -112,6 +119,9 @@ pub struct ResolvedAgent {
     pub model_identifier: String,
     pub provider_name: String,
     pub provider: ResolvedProvider,
+    /// `Some` for mistralrs-style models, `None` for openai-style. Carries
+    /// the per-model weight spec that used to live on the provider config.
+    pub model_weights: Option<MistralrsWeights>,
     pub preamble: String,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
@@ -164,37 +174,61 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
                 name: model.provider.clone(),
             })?;
 
-    let resolved_provider = match provider {
+    let (resolved_provider, model_weights, model_identifier) = match provider {
         LlmProvider::OpenAi {
             base_url,
             api_key,
             request_timeout_secs,
-        } => ResolvedProvider::OpenAi {
-            base_url: base_url.clone(),
-            api_key: api_key.resolve()?,
-            request_timeout_secs: *request_timeout_secs,
-        },
-        LlmProvider::Mistralrs {
-            model_id,
-            model_path,
-            model_file,
-            revision,
-            context_length,
-        } => ResolvedProvider::Mistralrs {
-            model_id: model_id.clone(),
-            model_path: model_path.clone(),
-            model_file: model_file.clone(),
-            revision: revision.clone(),
-            context_length: *context_length,
-        },
+        } => {
+            let identifier = model
+                .identifier
+                .clone()
+                .unwrap_or_else(|| model_name.to_string());
+            (
+                ResolvedProvider::OpenAi {
+                    base_url: base_url.clone(),
+                    api_key: api_key.resolve()?,
+                    request_timeout_secs: *request_timeout_secs,
+                },
+                None,
+                identifier,
+            )
+        }
+        LlmProvider::Mistralrs => {
+            let weights = MistralrsWeights {
+                model_id: model.model_id.clone(),
+                model_path: model.model_path.clone(),
+                model_file: model.model_file.clone(),
+                revision: model.revision.clone(),
+                context_length: model.context_length,
+            };
+            // For display: prefer the HF model-id, fall back to the GGUF
+            // basename, then the model name. mistralrs's own `load()`
+            // derives the same kind of identifier internally; this is for
+            // banner / error messaging only.
+            let identifier = weights
+                .model_id
+                .clone()
+                .or_else(|| {
+                    weights
+                        .model_path
+                        .as_deref()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| model_name.to_string());
+            (ResolvedProvider::Mistralrs, Some(weights), identifier)
+        }
     };
 
     Ok(ResolvedAgent {
         agent_name: agent_name.to_string(),
         model_name: model_name.to_string(),
-        model_identifier: model.identifier.clone(),
+        model_identifier,
         provider_name: model.provider.clone(),
         provider: resolved_provider,
+        model_weights,
         preamble: agent
             .preamble
             .clone()
@@ -247,19 +281,7 @@ pub async fn build_agent(
             let model = client.completion_model(&resolved.model_identifier);
             Ok(RigAgent::OpenAi(finish_agent(model, resolved, tools)))
         }
-        ResolvedProvider::Mistralrs {
-            #[cfg(feature = "mistralrs")]
-            model_id,
-            #[cfg(feature = "mistralrs")]
-            model_path,
-            #[cfg(feature = "mistralrs")]
-            model_file,
-            #[cfg(feature = "mistralrs")]
-            revision,
-            #[cfg(feature = "mistralrs")]
-            context_length,
-            ..
-        } => {
+        ResolvedProvider::Mistralrs => {
             #[cfg(not(feature = "mistralrs"))]
             {
                 Err(LlmResolveError::MistralrsFeatureDisabled {
@@ -269,16 +291,24 @@ pub async fn build_agent(
             }
             #[cfg(feature = "mistralrs")]
             {
-                let provider_name = resolved.provider_name.as_str();
-                let model_id = model_id.as_deref();
-                let model_path = model_path.as_deref();
-                let model_file = model_file.as_deref();
-                let revision = revision.as_deref();
-                let context_length = *context_length;
+                let weights = resolved.model_weights.as_ref().ok_or_else(|| {
+                    LlmResolveError::MistralrsLoad {
+                        model: resolved.model_name.clone(),
+                        source: anyhow::anyhow!(
+                            "internal: resolved mistralrs agent has no model_weights"
+                        ),
+                    }
+                })?;
+                let model_name = resolved.model_name.as_str();
+                let model_id = weights.model_id.as_deref();
+                let model_path = weights.model_path.as_deref();
+                let model_file = weights.model_file.as_deref();
+                let revision = weights.revision.as_deref();
+                let context_length = weights.context_length;
                 let model = registry
-                    .get_or_init(provider_name, || async move {
+                    .get_or_init(model_name, || async move {
                         crate::llm::mistralrs::load(
-                            provider_name,
+                            model_name,
                             model_id,
                             model_path,
                             model_file,

@@ -480,6 +480,12 @@ mod config_load {
         fs::create_dir_all(&ctx).unwrap();
         fs::write(ctx.join("Dockerfile"), "FROM scratch\n").unwrap();
 
+        // The fixture's mistralrs `llama-local` model uses a relative
+        // model-path; the existence check resolves against repo_root.
+        let model_dir = tmp.path().join(".agents/outrig/models");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("llama-3-8b-instruct.q4.gguf"), b"\0").unwrap();
+
         let cfg = Config::load(tmp.path(), None).expect("fixture loads end-to-end");
         assert_eq!(cfg.default_container.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
