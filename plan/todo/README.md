@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase F -- interactive scaffolding
 
-- **[0022](0022-prompt-ux.md)** Prompt UX wrapper (defaults + `?`-help).
 - **[0023](0023-container-add.md)** `outrig container add` with Dockerfile templates.
 - **[0024](0024-config-init.md)** `outrig config init` (global config; new `config` group).
 - **[0026](0026-init.md)** `outrig init` orchestrator (idempotent; loops `container add`).

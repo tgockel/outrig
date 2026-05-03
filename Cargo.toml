@@ -13,7 +13,6 @@ anyhow             = "1.0"
 blake3             = "1.5"
 candle-core        = { version = "=0.10.2", optional = true, default-features = false }
 clap               = { version = "4.5", features = ["derive"] }
-dialoguer          = "0.11"
 directories        = "5.0"
 hf-hub             = { version = "=0.4.3", optional = true, default-features = false }
 ignore             = "0.4"
