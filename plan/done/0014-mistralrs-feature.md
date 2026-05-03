@@ -95,3 +95,63 @@ Rejected alternatives, in order of how often they're likely to be re-proposed:
   built-in downloader we like, use it. If not, add `hf-hub` as an additional optional
   dep gated on the same feature flag, so the dep tree shape stays internal to the
   feature.
+
+## Decisions
+
+- **Picked `mistralrs-core = "=0.8.1"`**, not the top-level `mistralrs` facade.
+  `cargo tree --features mistralrs --prefix none | grep ^mistralrs` showed both
+  variants pulling the same sibling crates (`mistralrs-audio`, `-mcp`, `-quant`,
+  `-vision`); the only deltas were `mistralrs-macros` and `mistralrs` itself,
+  both small but clearly aimed at the server-binary use case. Going direct to
+  `-core` skips one layer that 0015's shim would otherwise have to import-around.
+  The `default-features = false` + the optional flag together keep the heavy dep
+  tree off the default build entirely.
+
+- **Pure-Rust GEMM, no native build steps.** A clean `cargo build --features
+  mistralrs` finishes in ~70s and pulls `gemm`, `gemm-f16`, `candle-core`,
+  `candle-nn`, `tokenizers`, `hf-hub`, `image`, etc. -- but no `cmake`, `cc`, or
+  BLAS crates. The Notes section's worry about a C++ toolchain didn't
+  materialize, so no `cpu`-style minimal feature selection was needed.
+
+- **Two error variants, not one cfg-gated message.** `MistralrsFeatureDisabled
+  { name: String }` (feature off, names the provider) and
+  `MistralrsRuntimeUnavailable` (feature on, placeholder for 0015) live as
+  distinct variants. Two reviewers independently flagged this -- the data
+  shapes differ (one carries the provider name; the other is empty), 0015's
+  cleanup is a one-symbol delete, and tests stay readable. The
+  `MistralrsRuntimeUnavailable` variant is itself gated on
+  `#[cfg(feature = "mistralrs")]` so feature-off builds don't expose a
+  variant they can't trigger.
+
+- **Cfg-gated `return` inside one match arm**, not two cfg-gated arms. The
+  match arm body uses `#[cfg(not(feature = "mistralrs"))] return ...;
+  #[cfg(feature = "mistralrs")] return ...;` -- exhaustiveness is structural
+  (the `Mistralrs { .. }` arm exists unconditionally), only one `return`
+  survives macro expansion per build, and clippy's `needless_return` does
+  not fire. This is the idiomatic shape for cfg-dispatched control flow
+  inside an otherwise unconditional match.
+
+- **Test helper `resolve_mistralrs_build_err`** in `tests/llm_resolve.rs`.
+  The two cfg-gated tests (feature-off and feature-on) share ~20 lines of
+  setup that differ only in the final assertion; a single helper does the
+  parse + resolve + variant check + `build_rig_client(...).unwrap_err()`
+  and returns the error. The helper is unconditional (not cfg-gated) --
+  exactly one cfg-gated test calls it per build, so it's never dead code.
+
+- **CI matrix uses `include:` with named rows**, not `features: ["", "mistralrs"]`
+  with a falsy-string trick. Job names render as `cargo (default)` and
+  `cargo (mistralrs)` in the Actions UI, the `Swatinem/rust-cache@v2` `key:`
+  is the row name (separate caches keep the heavier mistralrs build from
+  evicting the default cache), and a third config (e.g. `--no-default-features`)
+  is a one-line addition.
+
+- **`cargo fmt` factored into its own one-shot job.** Previously embedded in
+  the single `cargo` job; now a top-level `fmt` job that doesn't need
+  `clippy` or the matrix. Trades one extra checkout (~10s) for not running
+  fmt twice across the matrix.
+
+- **Crate variant note for 0015**: the `mistralrs-mcp` sibling crate is a
+  transitive dep of `mistralrs-core`. When 0015 lands, check for overlap
+  with the existing `rmcp` MCP wiring in `Cargo.toml` -- there's a non-zero
+  chance `mistralrs-mcp` exposes a client we'd rather use than `rmcp` for
+  the in-process LLM's tool-call surface. Out of scope for 0014.

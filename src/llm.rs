@@ -8,6 +8,9 @@ use crate::config::{Config, LlmProvider};
 use crate::error::Result;
 use crate::rig_tool::McpToolAdapter;
 
+#[cfg(feature = "mistralrs")]
+mod mistralrs;
+
 /// Default preamble used when an agent leaves the field unset. Deliberately
 /// generic; agents that need anything specific spell it out themselves.
 const DEFAULT_PREAMBLE: &str =
@@ -33,6 +36,14 @@ pub enum LlmResolveError {
     #[error("provider {name:?} is not defined under [providers.<name>]")]
     UnknownProvider { name: String },
 
+    #[error(
+        "mistralrs provider {name:?} requested but this build of outrig \
+         does not include the 'mistralrs' feature; rebuild with \
+         --features mistralrs to enable"
+    )]
+    MistralrsFeatureDisabled { name: String },
+
+    #[cfg(feature = "mistralrs")]
     #[error("provider style 'mistralrs' has no runtime in this build")]
     MistralrsRuntimeUnavailable,
 
@@ -170,8 +181,9 @@ pub type RigCompletionModel = rig::providers::openai::CompletionModel;
 pub type RigAgent = rig::agent::Agent<RigCompletionModel>;
 
 /// Build a Rig provider client from a resolved agent. Only the `OpenAi`
-/// variant is wired in v0; `Mistralrs` returns a placeholder error until
-/// task 0015 lands the feature-flag-aware path.
+/// variant is wired in v0; `Mistralrs` returns a feature-flag-aware error
+/// when the `mistralrs` feature is off, and a placeholder error when it is
+/// on -- task 0015 replaces the placeholder with the real shim.
 pub fn build_rig_client(resolved: &ResolvedAgent) -> Result<RigClient> {
     match &resolved.provider {
         ResolvedProvider::OpenAi {
@@ -182,7 +194,14 @@ pub fn build_rig_client(resolved: &ResolvedAgent) -> Result<RigClient> {
             .build()
             .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into()),
         ResolvedProvider::Mistralrs { .. } => {
-            Err(LlmResolveError::MistralrsRuntimeUnavailable.into())
+            #[cfg(not(feature = "mistralrs"))]
+            return Err(LlmResolveError::MistralrsFeatureDisabled {
+                name: resolved.provider_name.clone(),
+            }
+            .into());
+
+            #[cfg(feature = "mistralrs")]
+            return Err(LlmResolveError::MistralrsRuntimeUnavailable.into());
         }
     }
 }

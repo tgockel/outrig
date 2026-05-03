@@ -220,8 +220,11 @@ preamble = "hi"
     );
 }
 
-#[test]
-fn mistralrs_provider_runtime_unavailable() {
+/// Resolve an agent against the `local` mistralrs provider declared by
+/// `cfg_with_key_var` and return whatever `build_rig_client` errored with.
+/// Both the feature-off and feature-on tests below share this setup; only
+/// one test compiles per build, so they can share the env-var name.
+fn resolve_mistralrs_build_err() -> OutrigError {
     let var = "OUTRIG_TEST_LLM_RESOLVE_MISTRALRS";
     set_env(var, "k");
     let cfg = parse(&cfg_with_key_var(
@@ -232,7 +235,6 @@ fn mistralrs_provider_runtime_unavailable() {
 preamble = "hi"
 "#,
     ));
-
     let resolved = resolve_agent(&cfg, "review").expect("resolves");
     assert!(
         matches!(resolved.provider, ResolvedProvider::Mistralrs { .. }),
@@ -240,6 +242,39 @@ preamble = "hi"
         resolved.provider,
     );
     let err = build_rig_client(&resolved).unwrap_err();
+    unset_env(var);
+    err
+}
+
+/// Feature-off build: resolving a `mistralrs` provider fails with a
+/// message that names both the provider and the missing feature flag, so
+/// the fix ("rebuild with --features mistralrs") is one shot. Pinned
+/// verbatim because `doc/concepts/llm-providers.md` promises this wording.
+#[cfg(not(feature = "mistralrs"))]
+#[test]
+fn mistralrs_provider_feature_off_explains_clearly() {
+    let err = resolve_mistralrs_build_err();
+    assert!(
+        matches!(
+            &err,
+            OutrigError::LlmResolve(LlmResolveError::MistralrsFeatureDisabled { name }) if name == "local"
+        ),
+        "got: {err:?}",
+    );
+    assert_eq!(
+        err.to_string(),
+        "mistralrs provider \"local\" requested but this build of outrig \
+         does not include the 'mistralrs' feature; rebuild with \
+         --features mistralrs to enable",
+    );
+}
+
+/// Feature-on build: the resolver still errors because 0014 lands no
+/// runtime -- 0015 replaces this placeholder with the actual shim.
+#[cfg(feature = "mistralrs")]
+#[test]
+fn mistralrs_provider_feature_on_runtime_unavailable() {
+    let err = resolve_mistralrs_build_err();
     let msg = err.to_string();
     assert!(
         matches!(
@@ -249,8 +284,6 @@ preamble = "hi"
         "got: {err:?}",
     );
     assert!(msg.contains("mistralrs"), "got: {msg}");
-
-    unset_env(var);
 }
 
 #[test]

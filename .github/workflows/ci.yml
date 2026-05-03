@@ -6,18 +6,35 @@ on:
   pull_request:
 
 jobs:
-  cargo:
-    name: cargo
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+
+  cargo:
+    name: cargo (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default,   cargo_args: "" }
+          - { name: mistralrs, cargo_args: "--features mistralrs" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
+      - run: cargo test ${{ matrix.cargo_args }}
 
   mdbook:
     name: mdbook
