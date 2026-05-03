@@ -32,9 +32,12 @@ random hex digits -- sortable, unambiguous across concurrent runs):
     ├── session.json              # id, timestamps, container, image, exit status
     └── logs/
         ├── fs.stderr             # MCP "fs" server's captured stderr
-        ├── shell.stderr          # MCP "shell" server's captured stderr
-        └── container.log         # buildah/podman transcripts (only with --verbose)
+        └── shell.stderr          # MCP "shell" server's captured stderr
 ```
+
+> **TODO: Incomplete** -- `logs/container.log` (buildah/podman transcripts written when
+> `--verbose` is set) is part of the planned layout but not yet emitted; see the `--verbose`
+> note on the [`outrig run`](run.md) page.
 
 When you run `outrig run --session-dir <path>`, outrig writes the session content into
 `<path>` directly and creates a symlink at `<root>/<sid> -> <path>` so `outrig ls` still finds
@@ -160,8 +163,9 @@ container.
   in real time. Use `git diff`, `git status`, etc. for review. There is no per-session changeset
   on disk.
 - **Conversation history.** v0 doesn't persist the LLM conversation. If you need a transcript,
-  redirect stdin/stdout (`outrig run < prompts.txt > replies.txt`) or use the `--verbose` flag to
-  capture tool-call traces in `container.log`.
+  redirect stdin/stdout (`outrig run < prompts.txt > replies.txt`). (Once `--verbose` lands, it
+  will additionally capture buildah/podman traces in `container.log` -- see the
+  [`outrig run`](run.md) page.)
 - **API keys.** The bearer token used for the LLM call is never written to disk and never appears
   in tracing output.
 

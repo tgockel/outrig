@@ -1,8 +1,5 @@
 # Reference
 
-> **TODO: Incomplete** -- these pages describe outrig's intended behavior; the implementation
-> is in progress.
-
 The reference section is meant for lookup, not for reading start-to-finish. If you've read
 [Usage](../usage/README.md) and want the precise list of flags or config keys, you're in the right
 place.

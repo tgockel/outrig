@@ -1,7 +1,9 @@
 # Usage
 
-> **TODO: Incomplete** -- these pages describe outrig's intended behavior; the implementation
-> is in progress.
+> **TODO: Incomplete** -- the [`outrig init`](init.md), [`outrig config`](config.md),
+> [`outrig container`](container.md), and [`outrig build`](build.md) pages describe intended
+> behavior; those subcommands are not yet wired up. [`outrig run`](run.md) and
+> [Sessions](sessions.md) document subcommands that are implemented today.
 
 This section is the day-to-day operator's guide: what each subcommand does, what the REPL looks
 like in practice, what comes back when something goes wrong.

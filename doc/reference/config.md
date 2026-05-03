@@ -66,11 +66,6 @@ style    = "openai"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
-[providers.anthropic]
-style    = "anthropic"
-base-url = "https://api.anthropic.com/v1"
-api-key  = "${ANTHROPIC_API_KEY}"
-
 [providers.local-ollama]
 style    = "openai"
 base-url = "http://localhost:11434/v1"
@@ -162,10 +157,6 @@ identifier = "gpt-4o-mini"
 [models.smart]
 provider   = "openai"
 identifier = "gpt-4o"
-
-[models.claude]
-provider   = "anthropic"
-identifier = "claude-sonnet-4-6"
 ```
 
 | Key          | Type   | Required | Default | Description                               |
@@ -308,11 +299,6 @@ style    = "openai"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
-[providers.anthropic]
-style    = "anthropic"
-base-url = "https://api.anthropic.com/v1"
-api-key  = "${ANTHROPIC_API_KEY}"
-
 [providers.local]
 # requires `cargo build --features mistralrs` to actually use, but always parses.
 style      = "mistralrs"
@@ -326,10 +312,6 @@ identifier = "gpt-4o-mini"
 [models.smart]
 provider   = "openai"
 identifier = "gpt-4o"
-
-[models.claude]
-provider   = "anthropic"
-identifier = "claude-sonnet-4-6"
 ```
 
 ### Repo `.agents/outrig/config.toml`

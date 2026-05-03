@@ -1,7 +1,9 @@
 # CLI Reference
 
-> **TODO: Incomplete** -- every subcommand and flag listed here describes outrig's intended
-> behavior; the implementation isn't ready yet.
+> **TODO: Incomplete** -- `outrig init`, `outrig config init`, `outrig container add`, and
+> `outrig build` are not yet wired up; the sections below describe their intended behavior.
+> The remaining subcommands (`run`, `ls`, `logs`, `discard`) are implemented. `--verbose`
+> is also design-only -- the flag is documented below but is not yet accepted by the CLI.
 
 ## Synopsis
 
@@ -35,7 +37,7 @@ note this is `~/.outrig/`, not `~/.config/outrig/`).
 `--session-root` resolves in this order: this flag, then `session-root` in the repo or global
 config, then `<XDG_DATA_HOME>/outrig/sessions/`. `--verbose` adds buildah/podman command
 transcripts to stderr and to `<session_dir>/logs/container.log` for `outrig run`. It does not
-change behavior.
+change behavior. (Not yet implemented; see the page header.)
 
 ## Subcommands
 

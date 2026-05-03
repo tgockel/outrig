@@ -25,6 +25,9 @@ outrig run [--agent <name>]
 | `--session-root <path>`     | `session-root` config, else XDG               | Root directory containing all sessions.                                |
 | `--verbose`                 | off                                           | Adds buildah/podman command transcripts to stderr and `container.log`. |
 
+> **TODO: Incomplete** -- `--verbose` is design-only; the flag is not yet accepted by
+> `outrig run`.
+
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
 `<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`
 keep working. This lets you launch with a known path and read `session.json` immediately without

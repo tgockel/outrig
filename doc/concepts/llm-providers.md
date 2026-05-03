@@ -67,18 +67,14 @@ identifier = "gpt-4o-mini"
 [models.smart]
 provider   = "openai"
 identifier = "gpt-4o"
-
-[models.claude]
-provider   = "anthropic"
-identifier = "claude-sonnet-4-6"
 ```
 
 `provider` references one of the names you defined under `[providers.<name>]`. `identifier` is
 whatever string the provider expects in its API request's `model` field.
 
-The model layer exists so that agents can refer to a stable name (`fast`, `smart`, `claude`) and
-swap the underlying API model without touching every agent. If OpenAI renames a model, you edit
-one identifier; every agent using that name picks up the change.
+The model layer exists so that agents can refer to a stable name (`fast`, `smart`) and swap the
+underlying API model without touching every agent. If OpenAI renames a model, you edit one
+identifier; every agent using that name picks up the change.
 
 ## `[agents.<name>]`
 
@@ -117,7 +113,7 @@ default-model = "fast"
 
 Now any agent that omits `model` picks it up automatically. Per-repo overrides still work --
 write `default-model = "smart"` at the top of a repo config and that repo's agents fall back to
-`"smart"` instead. Per-agent overrides still work too: `agents.<a>.model = "claude"` wins
+`"smart"` instead. Per-agent overrides still work too: `agents.<a>.model = "smart"` wins
 over both defaults.
 
 ## Pointing at OpenAI-compatible endpoints

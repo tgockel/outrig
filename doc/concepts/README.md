@@ -1,8 +1,5 @@
 # Concepts
 
-> **TODO: Incomplete** -- these pages describe outrig's intended behavior; the implementation
-> is in progress.
-
 This section explains the moving parts an outrig user actually has to think about. If you've
 worked through the [Quickstart](../quickstart.md), you've already touched all four -- this is
 where they're spelled out.
