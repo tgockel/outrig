@@ -1,27 +1,13 @@
 //! SessionStore on-disk behavior. Each test owns its own tempdir as the
 //! session root; symlinks land inside that tree so cleanup is automatic.
 
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use outrig::error::OutrigError;
-use outrig::session::{Session, SessionId, SessionStore};
+use outrig::session::{SessionId, SessionStore};
 
-fn sample_session(id: &SessionId) -> Session {
-    Session {
-        id: id.clone(),
-        started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        ended_at: None,
-        container_name: format!("outrig-{}", id.as_str()),
-        image_tag: "outrig/test:abc123".to_string(),
-        container_config_name: "coding".to_string(),
-        agent_name: "default".to_string(),
-        working_dir: PathBuf::from("/some/repo"),
-        session_dir: PathBuf::new(),
-        exit_code: None,
-        link_target: None,
-    }
-}
+mod common;
+use common::sample_session;
 
 #[test]
 fn auto_path_creates_session_json() {

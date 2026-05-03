@@ -11,7 +11,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +97,14 @@ pub struct SessionStore {
 impl SessionStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
+    }
+
+    /// Path of the `<root>/<sid>` entry -- the symlink for explicitly-pathed
+    /// sessions, the directory itself for auto-allocated ones. Exposed so CLI
+    /// commands can name the path in user-facing messages without the store's
+    /// `root` field leaking out.
+    pub fn symlink_path(&self, id: &SessionId) -> PathBuf {
+        self.root.join(&id.0)
     }
 
     /// Materialize a session on disk. `create` overwrites `session.session_dir`
@@ -278,6 +286,74 @@ pub fn resolve_session_root(flag: Option<&Path>, cfg: &Config, default: &Path) -
         return p.to_path_buf();
     }
     default.to_path_buf()
+}
+
+/// Same cascade as [`resolve_session_root`], but suitable for read-only session
+/// commands (`ls`, `logs`, `discard`) that may run outside any repo. Skips the
+/// validation+merge that [`Config::load`] performs (we only need the
+/// `session-root` key) and degrades silently when the repo or global config
+/// file is missing -- the user might have neither and just want the XDG
+/// default.
+pub fn resolve_session_root_for_cli(
+    flag: Option<&Path>,
+    repo_cfg_override: Option<&Path>,
+    global_cfg_path: &Path,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    if let Some(p) = flag {
+        return Ok(p.to_path_buf());
+    }
+    let repo_cfg_path = match crate::repo::resolve_repo_config(repo_cfg_override, cwd) {
+        Ok(p) => Some(p),
+        Err(OutrigError::NoRepoConfig) => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(p) = repo_cfg_path
+        && let Some(root) = read_session_root(&p)?
+    {
+        return Ok(root);
+    }
+    if let Some(root) = read_session_root(global_cfg_path)? {
+        return Ok(root);
+    }
+    Ok(crate::repo::default_session_root())
+}
+
+fn read_session_root(path: &Path) -> Result<Option<PathBuf>> {
+    let text = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let cfg = Config::load_from_str(&text)?;
+    Ok(cfg.session_root)
+}
+
+/// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is
+/// ISO 8601 via [`iso_systime`]. Returns `?` if the timestamp can't be
+/// converted (only happens for SystemTimes outside jiff's representable
+/// range -- effectively never in practice).
+pub fn format_started_at(t: SystemTime) -> String {
+    match jiff::Timestamp::try_from(t) {
+        Ok(ts) => ts.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+        Err(_) => "?".to_string(),
+    }
+}
+
+/// `Mm SSs` for sub-hour, `Hh MMm` for an hour or more. Matches the
+/// example in `doc/usage/sessions.md` (`0m44s`, `2m18s`, `6m02s`,
+/// `1h05m`).
+pub fn format_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    if total < 3600 {
+        let m = total / 60;
+        let s = total % 60;
+        format!("{m}m{s:02}s")
+    } else {
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        format!("{h}h{m:02}m")
+    }
 }
 
 fn read_session_json(path: &Path) -> Result<Session> {

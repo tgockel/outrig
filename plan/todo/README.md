@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase E -- sessions
-
-- **[0021](0021-session-cli.md)** `outrig ls` / `outrig logs` / `outrig discard`.
-
 ## Phase F -- interactive scaffolding
 
 - **[0022](0022-prompt-ux.md)** Prompt UX wrapper (defaults + `?`-help).
