@@ -1,8 +1,5 @@
 # In-process LLMs
 
-> **TODO: Incomplete** -- this page describes outrig's intended behavior; the implementation
-> isn't ready yet.
-
 An **in-process LLM provider** runs the model in the same address space as the outrig CLI
 itself, backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. The model
 weights load into outrig's process; questions never cross a socket, never get serialized into
@@ -181,9 +178,6 @@ flowchart LR
 ```
 
 ## What this enables (sketch)
-
-> **TODO: Incomplete** -- this section previews an API the in-process LLM is plumbing
-> for; nothing in this section ships in v0.
 
 The downstream features named under "Why you might want this" will share a small
 one-shot policy API:

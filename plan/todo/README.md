@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase C -- MCP + LLM
-
-- **[0017](0017-mistralrs-doc-final.md)** Drop in-process LLM `TODO: Incomplete` markers.
-
 ## Phase D -- REPL + agent loop
 
 - **[0018](0018-repl-skeleton.md)** stdin/stdout REPL with slash commands.

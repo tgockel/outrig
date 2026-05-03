@@ -15,6 +15,10 @@ clean.
   - Drop the in-page `> **TODO: Incomplete**` block under "Why you might want this"
     (the one about downstream features) **only** if those downstream features have
     landed -- they haven't in this batch, so this marker stays.
+  - Drop the `> **TODO: Incomplete**` block under "What this enables (sketch)" -- the
+    section title and prose already telegraph that the `PolicyEngine` API is
+    forward-looking, so the marker is redundant. (Decision recorded mid-task; see
+    `## Decisions` below.)
 - `doc/concepts/llm-providers.md`:
   - Drop the `> **TODO: Incomplete**` block in the `## In-process providers (mistralrs)`
     section.
@@ -55,3 +59,18 @@ clean.
 - This is the right moment to also re-read the four touched pages end-to-end as a
   user might. If a paragraph has aged badly between the design pass and the
   implementation, fix the wording in this task rather than punt it to a follow-up.
+
+## Decisions
+
+- **Three TODO markers in `doc/concepts/in-process-llm.md`, not two.** The original
+  Deliverables list addressed the top-of-page block and the "downstream features"
+  block under "Why you might want this", but a third block lived under "What this
+  enables (sketch)" marking the `PolicyEngine` API preview. Resolved at task start
+  by dropping the line-185 block and keeping the line-34 one. The acceptance
+  criterion "at most one remaining block (the downstream-features one)" is now
+  satisfied exactly: line 34 is the sole remaining block. The `(sketch)` section's
+  own title and prose ("will share", "before any of it ships") already signal it's
+  forward-looking, so dropping the marker doesn't mislead readers.
+- **`doc/concepts/llm-providers.md` no-op.** The marker the deliverables call for
+  was already dropped during 0014 (commit `44d1c6d`); no change needed in this
+  task.

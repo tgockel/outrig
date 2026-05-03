@@ -86,9 +86,6 @@ api-key  = "${OLLAMA_API_KEY}"
 
 ### `style = "mistralrs"`
 
-> **TODO: Incomplete** -- gated behind `--features mistralrs`; the implementation hasn't
-> landed yet.
-
 In-process LLM backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. No
 HTTP, no API key. Either `model-id` (auto-download from HuggingFace) or `model-path`
 (local file) -- exactly one. See [Concepts -> In-process LLMs](../concepts/in-process-llm.md).
