@@ -1,4 +1,4 @@
-# Move mistralrs weight-source fields off the provider, onto the model
+# 0029 -- mistralrs weight-source fields belong on the model
 
 ## Goal
 
@@ -87,9 +87,8 @@ probably simpler than a tagged enum, but the implementer should pick.
 
 ## Dependencies
 
-- 0005 (config schema), 0024 (config init) -- both done; this is a follow-up.
-- Should land before 0027 (e2e quickstart) so the e2e fixture doesn't
-  immortalize the old shape.
+- 0005-config-merge-validate
+- 0024-config-init
 
 ## Notes
 

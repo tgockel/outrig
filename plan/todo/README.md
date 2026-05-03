@@ -6,12 +6,20 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
+## Phase F-pre -- foundation gaps (run first)
+
+- **[0029](0029-mistralrs-model-vs-provider.md)** Reshape mistralrs schema:
+  weight-source fields move off the provider, onto the model. Pulled in from
+  `plan/next/` -- a 0005 oversight that surfaced during 0024.
+- **[0030](0030-fuzzy-prompt-impl.md)** Rich-TUI `PromptSource` impl
+  (FuzzySelect for picking models / agents / containers from N candidates).
+
 ## Phase F -- interactive scaffolding
 
-- **[0023](0023-container-add.md)** `outrig container add` with Dockerfile templates.
-- **[0026](0026-init.md)** `outrig init` orchestrator (idempotent; loops `container add`).
+- **[0031](0031-container-add.md)** `outrig container add` with Dockerfile templates.
+- **[0033](0033-init.md)** `outrig init` orchestrator (idempotent; loops `container add`).
 
 ## Phase G -- build, CI, end-to-end
 
-- **[0025](0025-build-subcommand.md)** `outrig build` subcommand.
-- **[0027](0027-e2e-acceptance.md)** End-to-end quickstart acceptance.
+- **[0032](0032-build-subcommand.md)** `outrig build` subcommand.
+- **[0034](0034-e2e-acceptance.md)** End-to-end quickstart acceptance.

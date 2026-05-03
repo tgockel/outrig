@@ -1,6 +1,4 @@
-# Rich-TUI `PromptSource` impl (FuzzySelect, etc.)
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/` when ready.
+# 0030 -- Rich-TUI `PromptSource` impl (FuzzySelect, etc.)
 
 ## Context
 
@@ -64,7 +62,7 @@ abstraction already exists; this task adds a second impl alongside
        Box::new(TerminalPrompt::from_real_io())
    }
    ```
-   Callsites in 0023/0024/0026 use `prompt::auto()` and stop caring which
+   Callsites in 0024/0031/0033 use `prompt::auto()` and stop caring which
    impl is live.
 4. **Tests:** the rich impl can't be driven through `tokio::io::duplex`
    (dialoguer needs a real TTY). Test the trait contract with the existing
@@ -91,6 +89,10 @@ abstraction already exists; this task adds a second impl alongside
   the line-based `TerminalPrompt` and behaves exactly as today.
 - All existing `tests/prompt_ux.rs` tests still pass unchanged (they test
   `TerminalPrompt` directly, not `auto()`).
+
+## Dependencies
+
+- 0022-prompt-ux
 
 ## Notes
 
