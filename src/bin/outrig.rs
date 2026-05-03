@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -7,6 +7,7 @@ use outrig::cli::discard::{self, DiscardArgs};
 use outrig::cli::logs::{self, LogsArgs};
 use outrig::cli::ls::{self, LsArgs};
 use outrig::cli::run::{self, RunArgs};
+use outrig::config;
 use outrig::error::{OutrigError, Result};
 use outrig::repo;
 
@@ -40,6 +41,8 @@ enum Cmd {
     Run(RunArgs),
     /// Build (or cache-hit) one or more container-config images.
     Build,
+    /// Read or write outrig's configuration files.
+    Config(ConfigArgs),
     /// Interactively set up global + repo config.
     Init,
     /// Scaffold a new container-config.
@@ -50,6 +53,22 @@ enum Cmd {
     Logs(LogsArgs),
     /// Delete a session's on-disk record.
     Discard(DiscardArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    cmd: ConfigCmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCmd {
+    /// Interactively write the global config (`~/.outrig/config.toml`).
+    Init {
+        /// Overwrite an existing global config.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -91,6 +110,15 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             ))
         }
         Cmd::Build => Err(OutrigError::NotImplemented("build")),
+        Cmd::Config(args) => match &args.cmd {
+            ConfigCmd::Init { force } => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(config::init::run(*force, cli.global_config.as_deref()))?;
+                Ok(0)
+            }
+        },
         Cmd::Init => Err(OutrigError::NotImplemented("init")),
         Cmd::InitContainer => Err(OutrigError::NotImplemented("init-container")),
         Cmd::Ls(args) => {

@@ -1,6 +1,7 @@
 //! Config schema, parsing, merge, and validation.
 
 pub mod api_key;
+pub mod init;
 pub mod merge;
 pub mod validate;
 

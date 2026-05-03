@@ -372,8 +372,7 @@ fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.as_file_mut().write_all(&payload)?;
     tmp.as_file_mut().sync_all()?;
-    tmp.persist(dir.join(SESSION_JSON))
-        .map_err(|e| OutrigError::Io(e.error))?;
+    tmp.persist(dir.join(SESSION_JSON))?;
     Ok(())
 }
 

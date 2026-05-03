@@ -55,6 +55,12 @@ pub enum OutrigError {
     Prompt(#[from] rig::completion::PromptError),
 }
 
+impl From<tempfile::PersistError> for OutrigError {
+    fn from(e: tempfile::PersistError) -> Self {
+        OutrigError::Io(e.error)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, OutrigError>;
 
 fn format_process(

@@ -91,7 +91,13 @@ where
     W: AsyncWrite + Unpin,
 {
     async fn write_prompt(&mut self, field: &Field, default_render: &str) -> Result<()> {
-        let line = format!("? {} [{}]: ", field.name, default_render);
+        // An empty `default_render` means the caller has no useful default to
+        // suggest; drop the `[...]` suffix so the prompt reads cleanly.
+        let line = if default_render.is_empty() {
+            format!("? {}: ", field.name)
+        } else {
+            format!("? {} [{}]: ", field.name, default_render)
+        };
         self.stderr.write_all(line.as_bytes()).await?;
         self.stderr.flush().await?;
         Ok(())
@@ -151,8 +157,13 @@ where
     W: AsyncWrite + Unpin,
 {
     async fn ask_string(&mut self, field: &Field, default: &str) -> Result<String> {
+        let render = if default.is_empty() {
+            String::new()
+        } else {
+            format!("default: {default}")
+        };
         loop {
-            match self.read_one(field, &format!("default: {default}")).await? {
+            match self.read_one(field, &render).await? {
                 RawLine::Help => continue,
                 RawLine::Default => return Ok(default.to_string()),
                 RawLine::Value(s) => return Ok(s),

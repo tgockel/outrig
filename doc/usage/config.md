@@ -1,8 +1,5 @@
 # `outrig config`
 
-> **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
-> behavior; the implementation isn't ready yet.
-
 `outrig config` groups commands that read and write outrig's configuration files. In v0 only
 `outrig config init` is implemented; the rest of the group (`config get`, `config set`,
 `config list`) is reserved for later -- the same shape as `git config`.

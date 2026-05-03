@@ -17,12 +17,16 @@ static EXAMPLE_FIELD: Field = Field {
     doc_link: "doc/usage/init.md",
 };
 
-static ALL_FIELDS: &[&Field] = &[&EXAMPLE_FIELD];
+fn all_fields() -> Vec<&'static Field> {
+    let mut v: Vec<&'static Field> = vec![&EXAMPLE_FIELD];
+    v.extend(outrig::config::init::DOC_SYNC_FIELDS.iter().copied());
+    v
+}
 
 #[test]
 fn every_doc_link_resolves() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    for field in ALL_FIELDS {
+    for field in all_fields() {
         let path = Path::new(manifest_dir).join(field.doc_link);
         assert!(
             path.is_file(),
