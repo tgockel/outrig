@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::config::api_key::ApiKeyError;
 use crate::config::validate::ConfigValidationError;
+use crate::llm::LlmResolveError;
 
 #[derive(Debug, Error)]
 pub enum OutrigError {
@@ -43,6 +44,9 @@ pub enum OutrigError {
 
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
     McpArgsNotObject { kind: &'static str },
+
+    #[error("{0}")]
+    LlmResolve(#[from] LlmResolveError),
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

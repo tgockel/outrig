@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase C -- MCP + LLM
 
-- **[0012](0012-llm-resolver.md)** Resolve agent -> model -> provider, build Rig client.
 - **[0013](0013-llm-provider-enum.md)** Migrate `LlmProvider` to a tagged enum.
 - **[0014](0014-mistralrs-feature.md)** `mistralrs` Cargo feature + CI matrix entry.
 - **[0015](0015-mistralrs-shim.md)** Rig `CompletionModel` shim + HF GGUF download.

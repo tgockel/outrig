@@ -1,8 +1,5 @@
 # Providers, Models, and Agents
 
-> **TODO: Incomplete** -- these examples describe outrig's intended behavior; the implementation
-> isn't ready yet.
-
 outrig delegates LLM calls to the [Rig](https://crates.io/crates/rig-core) crate, but configures
 the LLM stack in three layers so the same providers and models can be reused across many repos
 without copy-pasting:
