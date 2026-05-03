@@ -5,6 +5,7 @@ default-container = "coding"
 default-agent     = "coding"
 default-model     = "fast"
 session-root      = "/var/lib/outrig/sessions"
+model-cache-root  = "/var/cache/outrig/models"
 
 [providers.openai]
 style                = "openai"
@@ -13,7 +14,7 @@ api-key              = "${OPENAI_API_KEY}"
 request-timeout-secs = 90
 
 [providers.anthropic]
-style    = "anthropic"
+style    = "openai"
 base-url = "https://api.anthropic.com/v1"
 api-key  = "${ANTHROPIC_API_KEY}"
 

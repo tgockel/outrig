@@ -7,7 +7,7 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use outrig::config::{Config, ConfigValidationError, McpServerSpec, merge};
+use outrig::config::{Config, ConfigValidationError, LlmProvider, McpServerSpec, merge};
 use outrig::error::OutrigError;
 
 const FIXTURE_FULL: &str = include_str!("fixtures/config-full.toml");
@@ -354,9 +354,12 @@ api-key  = "${OPENAI_API_KEY}"
 "#,
         );
         let merged = merge(global, repo);
+        let LlmProvider::OpenAi { base_url, .. } = &merged.providers["openai"] else {
+            panic!("expected OpenAi variant after merge");
+        };
         assert_eq!(
-            merged.providers["openai"].base_url, "https://repo.example.com/v1",
-            "repo entry should win",
+            base_url, "https://repo.example.com/v1",
+            "repo entry should win"
         );
     }
 
@@ -370,7 +373,7 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
 [providers.anthropic]
-style    = "anthropic"
+style    = "openai"
 base-url = "https://api.anthropic.com/v1"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
@@ -387,6 +390,40 @@ api-key  = "${STAGING_API_KEY}"
         assert!(merged.providers.contains_key("openai"));
         assert!(merged.providers.contains_key("anthropic"));
         assert!(merged.providers.contains_key("staging"));
+    }
+
+    #[test]
+    fn model_cache_root_repo_overrides_global() {
+        let global = parse(
+            r#"
+model-cache-root = "/var/cache/global/models"
+"#,
+        );
+        let repo = parse(
+            r#"
+model-cache-root = "/var/cache/repo/models"
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(
+            merged.model_cache_root.as_deref(),
+            Some(Path::new("/var/cache/repo/models")),
+        );
+    }
+
+    #[test]
+    fn model_cache_root_global_used_when_repo_unset() {
+        let global = parse(
+            r#"
+model-cache-root = "/var/cache/global/models"
+"#,
+        );
+        let repo = parse("");
+        let merged = merge(global, repo);
+        assert_eq!(
+            merged.model_cache_root.as_deref(),
+            Some(Path::new("/var/cache/global/models")),
+        );
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub struct Config {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_cache_root: Option<PathBuf>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -79,13 +81,34 @@ impl Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct LlmProvider {
-    pub style: String,
-    pub base_url: String,
-    pub api_key: ApiKeyRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_timeout_secs: Option<u64>,
+#[serde(
+    tag = "style",
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum LlmProvider {
+    // The kebab-case rule auto-converts `OpenAi` to `open-ai`; the doc'd
+    // tag is `openai`, so override per-variant.
+    #[serde(rename = "openai")]
+    OpenAi {
+        base_url: String,
+        api_key: ApiKeyRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_timeout_secs: Option<u64>,
+    },
+    Mistralrs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_length: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

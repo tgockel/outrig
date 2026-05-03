@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use outrig::config::{Config, McpServerSpec};
+use outrig::config::{Config, LlmProvider, McpServerSpec};
 use outrig::error::OutrigError;
 
 const FIXTURE: &str = include_str!("fixtures/config-full.toml");
@@ -89,13 +89,30 @@ srv = { command = ["bin", "arg1"] }
             cfg.session_root.as_deref(),
             Some(std::path::Path::new("/var/lib/outrig/sessions")),
         );
+        assert_eq!(
+            cfg.model_cache_root.as_deref(),
+            Some(std::path::Path::new("/var/cache/outrig/models")),
+        );
 
-        let openai = &cfg.providers["openai"];
-        assert_eq!(openai.style, "openai");
-        assert_eq!(openai.base_url, "https://api.openai.com/v1");
-        assert_eq!(openai.api_key.var_name(), "OPENAI_API_KEY");
-        assert_eq!(openai.request_timeout_secs, Some(90));
-        assert_eq!(cfg.providers["anthropic"].request_timeout_secs, None);
+        let LlmProvider::OpenAi {
+            base_url,
+            api_key,
+            request_timeout_secs,
+        } = &cfg.providers["openai"]
+        else {
+            panic!("expected OpenAi variant for [providers.openai]");
+        };
+        assert_eq!(base_url, "https://api.openai.com/v1");
+        assert_eq!(api_key.var_name(), "OPENAI_API_KEY");
+        assert_eq!(*request_timeout_secs, Some(90));
+        let LlmProvider::OpenAi {
+            request_timeout_secs: anthropic_timeout,
+            ..
+        } = &cfg.providers["anthropic"]
+        else {
+            panic!("expected OpenAi variant for [providers.anthropic]");
+        };
+        assert_eq!(*anthropic_timeout, None);
 
         assert_eq!(cfg.models["fast"].provider, "openai");
         assert_eq!(cfg.models["fast"].identifier, "gpt-4o-mini");

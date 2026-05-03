@@ -100,6 +100,60 @@ validate. See `plan/next/in-process-llm.md` for the rationale.
   panic or return a placeholder error on `Mistralrs`; tests in this task only exercise
   parse + validate, not resolve.
 
+## Decisions
+
+- **`deny_unknown_fields` on the outer enum works** under the current serde
+  pin (`serde = "1.0"`). Combined with `tag = "style"` and per-variant
+  struct fields, parsing rejects unknown variants and unknown fields
+  cleanly. The Notes section's "drop from outer, apply per-variant"
+  fallback was not needed.
+
+- **`OpenAi` variant needs an explicit `#[serde(rename = "openai")]`**.
+  `rename_all = "kebab-case"` auto-converts `OpenAi` to `open-ai`, which
+  doesn't match the documented tag. The override is one line; renaming
+  the Rust variant to `Openai` (single token) was rejected as awkward.
+
+- **Variant struct fields need `rename_all_fields = "kebab-case"`** at the
+  enum level. Serde's `rename_all` on an enum only renames the variant
+  tags, not the fields inside struct variants; the modern
+  `rename_all_fields` attribute (serde 1.0.157+) handles inner-field
+  renaming uniformly across variants without per-variant attributes.
+
+- **Errored, did not warn**, when a `Mistralrs` provider sets
+  `model-file` or `revision` without `model-id`. Variant:
+  `MistralrsExtraFieldRequiresModelId { provider, field: &'static str }`.
+  Pinned by
+  `tests/config_provider_enum.rs::mistralrs_extra_field_without_model_id_fails_validate`.
+
+- **`ResolvedAgent` shape change**: replaced flat `provider_style`,
+  `provider_base_url`, `api_key` fields with a single `provider:
+  ResolvedProvider`. `ResolvedProvider` is a runtime-shaped enum that
+  mirrors `LlmProvider` but stores the `OpenAi` variant's `api_key` as a
+  resolved `String` (post-`ApiKeyRef::resolve()`) rather than the
+  config-shaped `ApiKeyRef`. This keeps env-var resolution at
+  `resolve_agent` time (preserving the existing fail-fast `unset_api_key`
+  test), while moving the runtime dispatch onto an exhaustiveness-checked
+  match in `build_rig_client`.
+
+- **Placeholder error variant for the Mistralrs runtime gap**:
+  `LlmResolveError::MistralrsRuntimeUnavailable`. Replaced
+  `UnsupportedProviderStyle { style: String }`. Task 0015 will replace
+  this placeholder with the feature-flag-aware variant.
+
+- **`tests/fixtures/config-full.toml`**: changed the existing
+  `[providers.anthropic]` block from `style = "anthropic"` (no longer
+  legal) to `style = "openai"`. Kept the provider name `anthropic` and
+  the dependent `[models.claude]` so the round-trip exercises two
+  providers. Also added `model-cache-root = "/var/cache/outrig/models"`
+  so the new top-level field is exercised by the round-trip fixture.
+
+- **Test helper extraction skipped**. `tests/config_provider_enum.rs`
+  defines its own copy of `parse()` / `expect_validation_err()`, mirroring
+  what `tests/config_merge.rs` already has. A `tests/common/mod.rs`
+  pattern would dedupe ~10 lines but adds the `mod common;` declaration
+  to every test file. Not enough duplication to justify; revisit if a
+  fourth test file adds the same helpers.
+
 ### Rejected schema shapes
 
 - **Flat-struct `LlmProvider` with optional fields.** Add `model_path: Option<PathBuf>`,

@@ -1,8 +1,10 @@
 //! Resolve agent -> model -> provider; build Rig client.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
-use crate::config::Config;
+use crate::config::{Config, LlmProvider};
 use crate::error::Result;
 use crate::rig_tool::McpToolAdapter;
 
@@ -31,31 +33,45 @@ pub enum LlmResolveError {
     #[error("provider {name:?} is not defined under [providers.<name>]")]
     UnknownProvider { name: String },
 
-    #[error(
-        "provider style {style:?} is not yet supported in v0; \
-         v0 wires \"openai\" only"
-    )]
-    UnsupportedProviderStyle { style: String },
+    #[error("provider style 'mistralrs' has no runtime in this build")]
+    MistralrsRuntimeUnavailable,
 
     #[error("failed to build rig client: {0}")]
     RigClientBuild(String),
 }
 
+/// Runtime-shaped provider view -- mirrors the config `LlmProvider` enum, but
+/// with the env-var-backed `ApiKeyRef` already resolved to a plain `String`
+/// for the OpenAi variant. Variants are kept in sync with `LlmProvider`'s.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedProvider {
+    OpenAi {
+        base_url: String,
+        api_key: String,
+        request_timeout_secs: Option<u64>,
+    },
+    Mistralrs {
+        model_id: Option<String>,
+        model_path: Option<PathBuf>,
+        model_file: Option<String>,
+        revision: Option<String>,
+        context_length: Option<u32>,
+    },
+}
+
 /// Fully-resolved view of one agent: every knob the agent loop needs to
 /// build a Rig client and run a turn.
 ///
-/// `api_key` is resolved from the env at construction time. The struct lives
-/// in the agent loop, not in session metadata, so it should never get
-/// serialized.
+/// For the `OpenAi` provider variant, the api-key is resolved from the env at
+/// construction time. The struct lives in the agent loop, not in session
+/// metadata, so it should never get serialized.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAgent {
     pub agent_name: String,
     pub model_name: String,
     pub model_identifier: String,
     pub provider_name: String,
-    pub provider_style: String,
-    pub provider_base_url: String,
-    pub api_key: String,
+    pub provider: ResolvedProvider,
     pub preamble: String,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
@@ -108,16 +124,37 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
                 name: model.provider.clone(),
             })?;
 
-    let api_key = provider.api_key.resolve()?;
+    let resolved_provider = match provider {
+        LlmProvider::OpenAi {
+            base_url,
+            api_key,
+            request_timeout_secs,
+        } => ResolvedProvider::OpenAi {
+            base_url: base_url.clone(),
+            api_key: api_key.resolve()?,
+            request_timeout_secs: *request_timeout_secs,
+        },
+        LlmProvider::Mistralrs {
+            model_id,
+            model_path,
+            model_file,
+            revision,
+            context_length,
+        } => ResolvedProvider::Mistralrs {
+            model_id: model_id.clone(),
+            model_path: model_path.clone(),
+            model_file: model_file.clone(),
+            revision: revision.clone(),
+            context_length: *context_length,
+        },
+    };
 
     Ok(ResolvedAgent {
         agent_name: agent_name.to_string(),
         model_name: model_name.to_string(),
         model_identifier: model.identifier.clone(),
         provider_name: model.provider.clone(),
-        provider_style: provider.style.clone(),
-        provider_base_url: provider.base_url.clone(),
-        api_key,
+        provider: resolved_provider,
         preamble: agent
             .preamble
             .clone()
@@ -132,20 +169,22 @@ pub type RigClient = rig::providers::openai::CompletionsClient;
 pub type RigCompletionModel = rig::providers::openai::CompletionModel;
 pub type RigAgent = rig::agent::Agent<RigCompletionModel>;
 
-/// Build a Rig provider client from a resolved agent. Only `style = "openai"`
-/// is wired -- any other style errors out before touching rig.
+/// Build a Rig provider client from a resolved agent. Only the `OpenAi`
+/// variant is wired in v0; `Mistralrs` returns a placeholder error until
+/// task 0015 lands the feature-flag-aware path.
 pub fn build_rig_client(resolved: &ResolvedAgent) -> Result<RigClient> {
-    if resolved.provider_style != "openai" {
-        return Err(LlmResolveError::UnsupportedProviderStyle {
-            style: resolved.provider_style.clone(),
+    match &resolved.provider {
+        ResolvedProvider::OpenAi {
+            base_url, api_key, ..
+        } => RigClient::builder()
+            .api_key(api_key.clone())
+            .base_url(base_url)
+            .build()
+            .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into()),
+        ResolvedProvider::Mistralrs { .. } => {
+            Err(LlmResolveError::MistralrsRuntimeUnavailable.into())
         }
-        .into());
     }
-    RigClient::builder()
-        .api_key(resolved.api_key.clone())
-        .base_url(&resolved.provider_base_url)
-        .build()
-        .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
 }
 
 /// Build a Rig `Agent` ready to receive a turn. Preamble, sampling params,

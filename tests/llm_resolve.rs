@@ -4,7 +4,7 @@
 
 use outrig::config::Config;
 use outrig::error::OutrigError;
-use outrig::llm::{LlmResolveError, build_rig_client, resolve_agent};
+use outrig::llm::{LlmResolveError, ResolvedProvider, build_rig_client, resolve_agent};
 
 fn parse(s: &str) -> Config {
     Config::load_from_str(s).expect("config parses")
@@ -35,9 +35,8 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${{{env_name}}}"
 
 [providers.local]
-style    = "anthropic"
-base-url = "https://localhost:1234/v1"
-api-key  = "${{{env_name}}}"
+style    = "mistralrs"
+model-id = "Qwen/Qwen2.5-7B-Instruct"
 
 [models.fast]
 provider   = "openai"
@@ -49,7 +48,7 @@ identifier = "gpt-4o"
 
 [models.claude]
 provider   = "local"
-identifier = "claude-sonnet-4-6"
+identifier = "Qwen/Qwen2.5-7B-Instruct"
 
 {agents}
 "#,
@@ -76,9 +75,14 @@ max-tokens  = 4096
     assert_eq!(r.model_name, "fast");
     assert_eq!(r.model_identifier, "gpt-4o-mini");
     assert_eq!(r.provider_name, "openai");
-    assert_eq!(r.provider_style, "openai");
-    assert_eq!(r.provider_base_url, "https://api.openai.com/v1");
-    assert_eq!(r.api_key, "test-key");
+    let ResolvedProvider::OpenAi {
+        base_url, api_key, ..
+    } = &r.provider
+    else {
+        panic!("expected OpenAi resolved-provider, got {:?}", r.provider);
+    };
+    assert_eq!(base_url, "https://api.openai.com/v1");
+    assert_eq!(api_key, "test-key");
     assert_eq!(r.preamble, "you are a careful coder");
     assert_eq!(r.temperature, Some(0.2));
     assert_eq!(r.max_tokens, Some(4096));
@@ -217,8 +221,8 @@ preamble = "hi"
 }
 
 #[test]
-fn unsupported_provider_style_errors() {
-    let var = "OUTRIG_TEST_LLM_RESOLVE_BAD_STYLE";
+fn mistralrs_provider_runtime_unavailable() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_MISTRALRS";
     set_env(var, "k");
     let cfg = parse(&cfg_with_key_var(
         var,
@@ -230,18 +234,21 @@ preamble = "hi"
     ));
 
     let resolved = resolve_agent(&cfg, "review").expect("resolves");
+    assert!(
+        matches!(resolved.provider, ResolvedProvider::Mistralrs { .. }),
+        "expected Mistralrs resolved-provider, got {:?}",
+        resolved.provider,
+    );
     let err = build_rig_client(&resolved).unwrap_err();
     let msg = err.to_string();
     assert!(
         matches!(
             err,
-            OutrigError::LlmResolve(LlmResolveError::UnsupportedProviderStyle { ref style })
-                if style == "anthropic"
+            OutrigError::LlmResolve(LlmResolveError::MistralrsRuntimeUnavailable),
         ),
         "got: {err:?}",
     );
-    assert!(msg.contains("anthropic"), "got: {msg}");
-    assert!(msg.contains("openai"), "got: {msg}");
+    assert!(msg.contains("mistralrs"), "got: {msg}");
 
     unset_env(var);
 }
