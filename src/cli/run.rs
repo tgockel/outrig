@@ -11,10 +11,10 @@
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use rig::completion::Message;
@@ -28,6 +28,7 @@ use crate::mcp::McpClient;
 use crate::repl::Repl;
 use crate::repo;
 use crate::rig_tool::McpToolAdapter;
+use crate::session::{self, Session, SessionId, SessionStore};
 
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -41,10 +42,20 @@ pub struct RunArgs {
     /// and the top-level `default-container`.
     #[arg(long = "container-config", value_name = "NAME")]
     pub container_config: Option<String>,
+
+    /// Write the session into an explicit, already-existing directory. The
+    /// session root gets a symlink at `<root>/<sid>` pointing at this path.
+    #[arg(long = "session-dir", value_name = "PATH")]
+    pub session_dir: Option<PathBuf>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
-pub async fn execute(repo_cfg_path: &Path, global_cfg_path: &Path, args: &RunArgs) -> Result<i32> {
+pub async fn execute(
+    repo_cfg_path: &Path,
+    global_cfg_path: &Path,
+    session_root_flag: Option<&Path>,
+    args: &RunArgs,
+) -> Result<i32> {
     let repo_root = repo::repo_root_from_config_path(repo_cfg_path);
     let cfg = Config::load(&repo_root, Some(global_cfg_path))?;
 
@@ -83,6 +94,15 @@ pub async fn execute(repo_cfg_path: &Path, global_cfg_path: &Path, args: &RunArg
     };
     let container_workspace = cfg.workspace.container_path.clone();
 
+    if let Some(p) = args.session_dir.as_deref()
+        && !p.is_dir()
+    {
+        return Err(OutrigError::Configuration(format!(
+            "--session-dir {} is not an existing directory (create it first or omit the flag)",
+            p.display()
+        )));
+    }
+
     let mut container_slot =
         Some(Container::start(&image_tag, &host_workspace, &container_workspace).await?);
     if let Some(c) = container_slot.as_mut() {
@@ -92,8 +112,26 @@ pub async fn execute(repo_cfg_path: &Path, global_cfg_path: &Path, args: &RunArg
     let container = container_slot
         .as_ref()
         .expect("container_slot just populated");
-    let session_id = container.session_suffix().to_string();
-    let log_dir = std::env::temp_dir().join(format!("outrig-{session_id}/logs"));
+    let sid = SessionId(container.session_suffix().to_string());
+
+    let session_root =
+        session::resolve_session_root(session_root_flag, &cfg, &repo::default_session_root());
+    let store = SessionStore::new(session_root);
+    let mut session = Session {
+        id: sid.clone(),
+        started_at: SystemTime::now(),
+        ended_at: None,
+        container_name: container.name.clone(),
+        image_tag: image_tag.to_string(),
+        container_config_name: container_name.to_string(),
+        agent_name: resolved.agent_name.clone(),
+        working_dir: repo_root.clone(),
+        session_dir: PathBuf::new(), // set by `create` below
+        exit_code: None,
+        link_target: None,
+    };
+    let session_dir = store.create(&sid, args.session_dir.as_deref(), &mut session)?;
+    let log_dir = session_dir.join("logs");
     tokio::fs::create_dir_all(&log_dir).await?;
 
     let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
@@ -107,7 +145,7 @@ pub async fn execute(repo_cfg_path: &Path, global_cfg_path: &Path, args: &RunArg
         container_cfg,
         &log_dir,
         &cache_root,
-        &session_id,
+        sid.as_str(),
         &mut mcp_arcs,
     )
     .await;
@@ -134,6 +172,11 @@ pub async fn execute(repo_cfg_path: &Path, global_cfg_path: &Path, args: &RunArg
         && let Err(e) = c.stop(STOP_GRACE).await
     {
         tracing::warn!(target: "outrig::cli::run", "container stop failed: {e}");
+    }
+
+    let final_exit = outcome.as_ref().copied().unwrap_or(1);
+    if let Err(e) = store.finalize(&sid, SystemTime::now(), final_exit) {
+        tracing::warn!(target: "outrig::cli::run", "session finalize failed: {e}");
     }
 
     outcome

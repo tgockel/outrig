@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase E -- sessions
 
-- **[0020](0020-session-store.md)** SessionStore (auto + explicit `--session-dir`).
 - **[0021](0021-session-cli.md)** `outrig ls` / `outrig logs` / `outrig discard`.
 
 ## Phase F -- interactive scaffolding

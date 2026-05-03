@@ -69,6 +69,15 @@ pub fn model_cache_root(from_config: Option<&Path>) -> PathBuf {
     std::env::temp_dir().join("outrig-models")
 }
 
+/// XDG-default session root. The cascade lives in
+/// [`crate::session::resolve_session_root`] -- this is just the bottom rung.
+pub fn default_session_root() -> PathBuf {
+    if let Some(dirs) = ProjectDirs::from("", "", "outrig") {
+        return dirs.data_dir().join("sessions");
+    }
+    std::env::temp_dir().join("outrig-sessions")
+}
+
 pub fn global_config_path(override_path: Option<&Path>) -> PathBuf {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = BaseDirs::new()

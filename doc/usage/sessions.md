@@ -1,7 +1,8 @@
 # Sessions
 
-> **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
-> behavior; the implementation isn't ready yet.
+> **TODO: Incomplete** -- `outrig run` materializes the on-disk session record described
+> below, but the `outrig ls`, `outrig logs`, and `outrig discard` subcommands aren't wired up
+> yet. The session layout itself is real and stable.
 
 A session is the on-disk record of one `outrig run` invocation: when it started and ended, which
 container-config it used, what image tag, plus per-MCP-server stderr captured to disk. Sessions

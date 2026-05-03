@@ -17,14 +17,13 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use jiff::Zoned;
 use nix::unistd::{Gid, Group, Uid, User};
-use rand::RngCore;
 use tokio::process::Child;
 
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd};
+use crate::session::SessionId;
 
 /// Maximum `_`-suffix retries before bootstrap gives up.
 const BOOTSTRAP_RETRIES: usize = 10;
@@ -50,7 +49,7 @@ pub struct Container {
 
 impl Container {
     pub async fn start(image: &ImageTag, host_ws: &Path, ws_container: &Path) -> Result<Self> {
-        let name = format!("outrig-{}", session_id());
+        let name = format!("outrig-{}", SessionId::new());
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
 
@@ -360,15 +359,6 @@ fn untrack(name: &str) {
 #[cfg(any(test, feature = "e2e"))]
 pub fn is_tracked(name: &str) -> bool {
     TRACKED.lock().map(|g| g.contains(name)).unwrap_or(false)
-}
-
-fn session_id() -> String {
-    let ts = Zoned::now()
-        .with_time_zone(jiff::tz::TimeZone::UTC)
-        .strftime("%Y%m%dT%H%M%SZ");
-    let mut buf = [0u8; 2];
-    rand::thread_rng().fill_bytes(&mut buf);
-    format!("{ts}-{:02x}{:02x}", buf[0], buf[1])
 }
 
 async fn selinux_enforcing() -> bool {

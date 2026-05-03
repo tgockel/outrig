@@ -22,6 +22,11 @@ struct Cli {
     #[arg(long = "global-config", global = true, value_name = "PATH")]
     global_config: Option<PathBuf>,
 
+    /// Override the session root for this invocation. Default cascade:
+    /// flag > config's `session-root` > `<XDG_DATA_HOME>/outrig/sessions/`.
+    #[arg(long = "session-root", global = true, value_name = "PATH")]
+    session_root: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -75,7 +80,12 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(run::execute(&repo_config, &global_config, args))
+            runtime.block_on(run::execute(
+                &repo_config,
+                &global_config,
+                cli.session_root.as_deref(),
+                args,
+            ))
         }
         Cmd::Build => Err(OutrigError::NotImplemented("build")),
         Cmd::Init => Err(OutrigError::NotImplemented("init")),
