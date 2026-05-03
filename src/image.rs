@@ -74,6 +74,7 @@ pub async fn ensure_image(cfg: &ContainerConfig, repo_root: &Path) -> Result<Ima
     let probe =
         process::try_capture(Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag)).await?;
     if probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace) {
+        tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
         return Ok(ImageTag(tag));
     }
 
@@ -98,6 +99,7 @@ pub async fn ensure_image(cfg: &ContainerConfig, repo_root: &Path) -> Result<Ima
             stderr_tail: String::new(),
         });
     }
+    tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
     Ok(ImageTag(tag))
 }
 

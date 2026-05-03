@@ -2,10 +2,11 @@
 //!
 //! `Repl::run` drives the I/O loop: print a banner on stderr, prompt with `> `,
 //! and feed each non-slash line to a caller-supplied async callback. Slash
-//! commands (`/help`, `/quit`, `/tools`, `/reset`) are handled here; the latter
-//! two print placeholders until 0019 wires real data through. EOF (Ctrl-D)
-//! and `/quit` exit cleanly. SIGINT during a callback cancels the in-flight
-//! future, prints `[outrig] interrupted`, and returns to the prompt; a second
+//! commands (`/help`, `/quit`, `/tools`, `/reset`) are handled here; `/tools`
+//! and `/reset` defer to caller-supplied callbacks for their text + side
+//! effects (history clearing, tool-list assembly). EOF (Ctrl-D) and `/quit`
+//! exit cleanly. SIGINT during a callback cancels the in-flight future,
+//! prints `[outrig] interrupted`, and returns to the prompt; a second
 //! consecutive SIGINT (no input typed in between) exits.
 //!
 //! Strict stream separation: assistant text goes to stdout; everything else --
@@ -31,8 +32,6 @@ const HELP_TEXT: &str = "\
   /quit    exit the session
 ";
 
-const TOOLS_PLACEHOLDER: &[u8] = b"[outrig] (no tools registered)\n";
-const RESET_PLACEHOLDER: &[u8] = b"[outrig] (no history to reset)\n";
 const INTERRUPT_NOTICE: &[u8] = b"\n[outrig] interrupted\n";
 
 pub struct Repl;
@@ -42,16 +41,37 @@ impl Repl {
     /// `tokio::signal::ctrl_c()` as the interrupt source. The `banner` is
     /// printed once to stderr before the first prompt; `on_prompt` is invoked
     /// for every non-slash, non-empty input line and its returned text is
-    /// printed to stdout.
-    pub async fn run<F, Fut>(banner: &str, on_prompt: F) -> Result<()>
+    /// printed to stdout. `on_tools` and `on_reset` produce the stderr text
+    /// for `/tools` and `/reset` respectively (and `on_reset` is the side-
+    /// effect site for clearing whatever conversation state the caller owns).
+    pub async fn run<P, PFut, T, TFut, R, RFut>(
+        banner: &str,
+        on_prompt: P,
+        on_tools: T,
+        on_reset: R,
+    ) -> Result<()>
     where
-        F: FnMut(String) -> Fut,
-        Fut: Future<Output = Result<String>>,
+        P: FnMut(String) -> PFut,
+        PFut: Future<Output = Result<String>>,
+        T: FnMut() -> TFut,
+        TFut: Future<Output = String>,
+        R: FnMut() -> RFut,
+        RFut: Future<Output = String>,
     {
         let stdin = BufReader::new(tokio::io::stdin());
         let stdout = tokio::io::stdout();
         let stderr = tokio::io::stderr();
-        Self::run_with(stdin, stdout, stderr, ctrl_c_signal, banner, on_prompt).await
+        Self::run_with(
+            stdin,
+            stdout,
+            stderr,
+            ctrl_c_signal,
+            banner,
+            on_prompt,
+            on_tools,
+            on_reset,
+        )
+        .await
     }
 
     /// Generic form parameterized over the I/O streams and interrupt source.
@@ -59,22 +79,29 @@ impl Repl {
     /// tests call it with `tokio::io::duplex` halves and a `Notify`-driven
     /// interrupt closure to exercise EOF, slash commands, and SIGINT
     /// handling without touching real signals or terminals.
-    pub async fn run_with<R, W, E, I, IFut, F, Fut>(
-        stdin: R,
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_with<RD, W, E, I, IFut, P, PFut, T, TFut, R, RFut>(
+        stdin: RD,
         mut stdout: W,
         mut stderr: E,
         mut interrupt: I,
         banner: &str,
-        mut on_prompt: F,
+        mut on_prompt: P,
+        mut on_tools: T,
+        mut on_reset: R,
     ) -> Result<()>
     where
-        R: AsyncBufRead + Unpin,
+        RD: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
         E: AsyncWrite + Unpin,
         I: FnMut() -> IFut,
         IFut: Future<Output = ()>,
-        F: FnMut(String) -> Fut,
-        Fut: Future<Output = Result<String>>,
+        P: FnMut(String) -> PFut,
+        PFut: Future<Output = Result<String>>,
+        T: FnMut() -> TFut,
+        TFut: Future<Output = String>,
+        R: FnMut() -> RFut,
+        RFut: Future<Output = String>,
     {
         if !banner.is_empty() {
             stderr.write_all(banner.as_bytes()).await?;
@@ -126,12 +153,10 @@ impl Repl {
                         stderr.flush().await?;
                     }
                     "tools" => {
-                        stderr.write_all(TOOLS_PLACEHOLDER).await?;
-                        stderr.flush().await?;
+                        write_stderr_line(&mut stderr, &on_tools().await).await?;
                     }
                     "reset" => {
-                        stderr.write_all(RESET_PLACEHOLDER).await?;
-                        stderr.flush().await?;
+                        write_stderr_line(&mut stderr, &on_reset().await).await?;
                     }
                     other => {
                         stderr
@@ -164,4 +189,16 @@ impl Repl {
 
 async fn ctrl_c_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn write_stderr_line<E>(stderr: &mut E, text: &str) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    stderr.write_all(text.as_bytes()).await?;
+    if !text.ends_with('\n') {
+        stderr.write_all(b"\n").await?;
+    }
+    stderr.flush().await?;
+    Ok(())
 }

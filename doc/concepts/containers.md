@@ -1,8 +1,5 @@
 # Containers
 
-> **TODO: Incomplete** -- every behavior described here is the intended behavior; the
-> implementation isn't ready yet.
-
 The container is the agent's whole world. It's where MCP servers run, where shell commands
 execute, where files get read and written. You define it with a `Dockerfile` you commit to your
 repo, and outrig builds it with `buildah` and runs it with `podman`.

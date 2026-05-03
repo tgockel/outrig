@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
+use outrig::cli::run::{self, RunArgs};
 use outrig::error::{OutrigError, Result};
 use outrig::repo;
 
@@ -28,7 +29,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Start an interactive agent session.
-    Run,
+    Run(RunArgs),
     /// Build (or cache-hit) one or more container-config images.
     Build,
     /// Interactively set up global + repo config.
@@ -56,7 +57,8 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     match dispatch(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
@@ -64,12 +66,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: &Cli) -> Result<()> {
-    match cli.cmd {
-        Cmd::Run => {
+fn dispatch(cli: &Cli) -> Result<i32> {
+    match &cli.cmd {
+        Cmd::Run(args) => {
             let cwd = std::env::current_dir()?;
-            let _repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
-            Err(OutrigError::NotImplemented("run"))
+            let repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
+            let global_config = repo::global_config_path(cli.global_config.as_deref());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(run::execute(&repo_config, &global_config, args))
         }
         Cmd::Build => Err(OutrigError::NotImplemented("build")),
         Cmd::Init => Err(OutrigError::NotImplemented("init")),

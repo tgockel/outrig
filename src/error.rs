@@ -13,6 +13,9 @@ pub enum OutrigError {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 
+    #[error("configuration: {0}")]
+    Configuration(String),
+
     #[error("no .agents/outrig/config.toml found in current directory or any parent")]
     NoRepoConfig,
 
@@ -47,6 +50,9 @@ pub enum OutrigError {
 
     #[error("{0}")]
     LlmResolve(#[from] LlmResolveError),
+
+    #[error("agent prompt failed: {0}")]
+    Prompt(#[from] rig::completion::PromptError),
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

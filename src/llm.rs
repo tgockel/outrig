@@ -1,12 +1,21 @@
 //! Resolve agent -> model -> provider; build Rig agent.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rig::agent::{PromptHook, ToolCallHookAction};
+use rig::completion::{CompletionModel, Message, Prompt};
 use thiserror::Error;
 
 use crate::config::{Config, LlmProvider};
-use crate::error::Result;
+use crate::error::{OutrigError, Result};
 use crate::rig_tool::McpToolAdapter;
+
+/// Hard cap on tool calls per turn. The hook below trips this; rig's own
+/// `max_turns` is set to the same value as a defense in depth, so whichever
+/// fires first surfaces a controllable message.
+pub const MAX_TOOL_CALLS: usize = 50;
 
 #[cfg(feature = "mistralrs")]
 pub mod mistralrs;
@@ -287,6 +296,94 @@ pub async fn build_agent(
                 )))
             }
         }
+    }
+}
+
+impl RigAgent {
+    /// Run one user turn: prompt the model, drive the model->tool->model loop,
+    /// extend `history` with everything emitted (user prompt + tool turns +
+    /// final assistant reply), and return the assistant's text reply.
+    ///
+    /// The per-turn [`OutrigPromptHook`] prints `[outrig] tool call: ...` to
+    /// stderr for every tool invocation and terminates the loop after
+    /// [`MAX_TOOL_CALLS`] calls. On termination, history is left untouched
+    /// for that turn -- splicing partial mid-turn state cleanly is a
+    /// correctness rabbit hole; the next user turn just re-grounds.
+    pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
+        let hook = OutrigPromptHook::new(MAX_TOOL_CALLS);
+        match self {
+            RigAgent::OpenAi(a) => run_turn_inner(a, prompt, history, hook).await,
+            #[cfg(feature = "mistralrs")]
+            RigAgent::Mistralrs(a) => run_turn_inner(a, prompt, history, hook).await,
+        }
+    }
+}
+
+async fn run_turn_inner<M: CompletionModel + 'static>(
+    agent: &rig::agent::Agent<M>,
+    prompt: &str,
+    history: &mut Vec<Message>,
+    hook: OutrigPromptHook,
+) -> Result<String> {
+    let result = agent
+        .prompt(prompt.to_string())
+        .with_history(history.clone())
+        .max_turns(MAX_TOOL_CALLS)
+        .with_hook(hook)
+        .extended_details()
+        .await;
+
+    match result {
+        Ok(response) => {
+            let messages = response
+                .messages
+                .expect("rig populates messages on extended_details");
+            history.extend(messages);
+            Ok(response.output)
+        }
+        Err(rig::completion::PromptError::PromptCancelled { reason, .. }) => {
+            eprintln!("[outrig] {reason}");
+            Ok("(turn ended; tool-call cap reached)".to_string())
+        }
+        Err(other) => Err(OutrigError::Prompt(other)),
+    }
+}
+
+/// Per-request hook that traces every tool call to stderr and terminates the
+/// agent loop after `cap` calls. Cloned by rig per request; the `counter` is
+/// shared via `Arc` so a single turn's calls all count against the same cap.
+#[derive(Clone)]
+pub struct OutrigPromptHook {
+    counter: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+impl OutrigPromptHook {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            counter: Arc::new(AtomicUsize::new(0)),
+            cap,
+        }
+    }
+}
+
+impl<M: CompletionModel> PromptHook<M> for OutrigPromptHook {
+    async fn on_tool_call(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        if n > self.cap {
+            return ToolCallHookAction::terminate(format!(
+                "tool-call iteration cap ({}) reached; ending turn",
+                self.cap
+            ));
+        }
+        eprintln!("[outrig] tool call: {tool_name}({args})");
+        ToolCallHookAction::cont()
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use directories::BaseDirs;
+use directories::{BaseDirs, ProjectDirs};
 
 use crate::error::{OutrigError, Result};
 
@@ -33,11 +33,40 @@ pub fn repo_config_path(root: &Path) -> PathBuf {
     root.join(REPO_CONFIG_REL)
 }
 
+/// Inverse of [`repo_config_path`]: given the path
+/// `<root>/.agents/outrig/config.toml`, return `<root>`. Falls back to `.`
+/// only if the path doesn't have three parents (which shouldn't happen for
+/// any path produced by [`resolve_repo_config`]).
+pub fn repo_root_from_config_path(repo_cfg: &Path) -> PathBuf {
+    repo_cfg
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn resolve_repo_config(override_path: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     match override_path {
         Some(p) => Ok(p.to_path_buf()),
         None => find_repo_root_from(cwd).map(|root| repo_config_path(&root)),
     }
+}
+
+/// Resolve the directory under which mistralrs (and other LLM backends) stage
+/// downloaded model files. CLI override > config's `model-cache-root` > XDG
+/// project-dir cache. The XDG fallback uses `directories::ProjectDirs` so it
+/// matches platform conventions (`$XDG_CACHE_HOME/outrig/models` on Linux,
+/// `~/Library/Caches/outrig/models` on macOS, etc.). Falls back to a temp
+/// directory only if the platform can't supply a project-dir at all.
+pub fn model_cache_root(from_config: Option<&Path>) -> PathBuf {
+    if let Some(p) = from_config {
+        return p.to_path_buf();
+    }
+    if let Some(dirs) = ProjectDirs::from("", "", "outrig") {
+        return dirs.cache_dir().join("models");
+    }
+    std::env::temp_dir().join("outrig-models")
 }
 
 pub fn global_config_path(override_path: Option<&Path>) -> PathBuf {

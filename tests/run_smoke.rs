@@ -1,0 +1,313 @@
+//! End-to-end smoke for `outrig run`. Gated behind `--features e2e`.
+//!
+//! Sets up a fixture repo in a tempdir whose `.agents/outrig/config.toml`
+//! points its OpenAI base-url at a local hand-rolled mock server, then runs
+//! the `outrig` binary as a subprocess, pipes one prompt to stdin, and
+//! asserts on captured stdout/stderr.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo test --features e2e run_smoke -- --nocapture
+//! ```
+
+#![cfg(feature = "e2e")]
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio::time::timeout;
+
+const TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn fixture_mcp_fs_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_drives_one_tool_call_and_prints_reply() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    // 1. Spin up the mock OpenAI server.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = listener.local_addr().expect("mock addr");
+    let server_handle = tokio::spawn(run_mock_openai(listener));
+
+    // 2. Build the fixture repo in a tempdir.
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let agents_dir = repo_dir.path().join(".agents/outrig");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
+
+    let dockerfile = fixture_mcp_fs_dir().join("Dockerfile");
+    let context = fixture_mcp_fs_dir();
+    let config_toml = format!(
+        r#"
+default-agent = "smoke"
+default-container = "smoke"
+
+[providers.openai]
+style = "openai"
+base-url = "http://{addr}/v1"
+api-key = "${{OUTRIG_TEST_KEY}}"
+request-timeout-secs = 10
+
+[models.fast]
+provider = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.smoke]
+model = "fast"
+preamble = "test"
+
+[containers.smoke]
+dockerfile = "{dockerfile}"
+context = "{context}"
+
+  [containers.smoke.mcp]
+  fs = ["mcp-server-filesystem", "/workspace"]
+"#,
+        addr = mock_addr,
+        dockerfile = dockerfile.display(),
+        context = context.display(),
+    );
+    std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
+
+    // 3. Spawn the binary.
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut child = Command::new(bin)
+        .arg("run")
+        .current_dir(repo_dir.path())
+        .env("OUTRIG_TEST_KEY", "test-key")
+        .env("OUTRIG_LOG", "info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig");
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    // Stream stdout and stderr line-by-line into shared buffers so a hang
+    // dumps everything-so-far instead of a silent timeout.
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let stdout_task = tokio::spawn(stream_lines(stdout, stdout_buf.clone(), "stdout"));
+    let stderr_task = tokio::spawn(stream_lines(stderr, stderr_buf.clone(), "stderr"));
+
+    // Send one prompt, then close stdin so the REPL hits EOF after the reply.
+    // (Drop, not shutdown(): tokio's ChildStdin::poll_shutdown is a no-op on
+    // Unix; only Drop closes the pipe.)
+    stdin.write_all(b"hello\n").await.expect("write prompt");
+    stdin.flush().await.expect("flush stdin");
+    drop(stdin);
+
+    // 4. Wait for everything with a wall-clock bound.
+    let wait_result = timeout(TEST_TIMEOUT, child.wait()).await;
+    let _ = server_handle.abort();
+    let status = match wait_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => panic!("child.wait() failed: {e}"),
+        Err(_) => {
+            eprintln!(
+                "--- subprocess stderr (before timeout kill) ---\n{}",
+                stderr_buf.lock().unwrap()
+            );
+            eprintln!(
+                "--- subprocess stdout (before timeout kill) ---\n{}",
+                stdout_buf.lock().unwrap()
+            );
+            let _ = child.kill().await;
+            panic!("subprocess did not exit within {TEST_TIMEOUT:?}");
+        }
+    };
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    let stderr_str = stderr_buf.lock().unwrap().clone();
+    let stdout_str = stdout_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr_str}");
+    eprintln!("--- subprocess stdout ---\n{stdout_str}");
+
+    assert!(
+        status.success(),
+        "outrig run exited with {status:?}; stderr was: {stderr_str}"
+    );
+    assert!(
+        stderr_str.contains("[outrig] agent:"),
+        "stderr lacked banner: {stderr_str}"
+    );
+    assert!(
+        stderr_str.contains("[outrig] tool call: fs__list_directory"),
+        "stderr lacked tool-call trace: {stderr_str}"
+    );
+    assert!(
+        stdout_str.contains("listed the workspace"),
+        "stdout lacked canned reply: {stdout_str}"
+    );
+
+    // Verify our specific container was cleaned up (other tests / external
+    // processes may have unrelated outrig-* containers running, so we only
+    // check the session-id captured from this run's banner).
+    let session_line = stderr_str
+        .lines()
+        .find(|l| l.contains("[outrig] container started:"))
+        .expect("banner must include `container started` line");
+    let our_container = session_line
+        .split("started:")
+        .nth(1)
+        .expect("container name after `started:`")
+        .trim();
+    let ps = Command::new("podman")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("name={our_container}"))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        leftovers.trim().is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers}"
+    );
+}
+
+/// Hand-rolled mock OpenAI server. Reads HTTP/1.1 requests, parses
+/// Content-Length, and returns canned chat-completions responses. The first
+/// request is answered with a tool-call; the second with a final text reply.
+async fn run_mock_openai(listener: TcpListener) {
+    let mut request_count = 0u32;
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        request_count += 1;
+        let body = if request_count == 1 {
+            json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "fs__list_directory",
+                                "arguments": "{\"path\":\"/workspace\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+        } else {
+            json!({
+                "id": "chatcmpl-2",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "I listed the workspace."
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+        };
+        let _ = drain_request(&mut sock).await;
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_str.len(),
+            body_str
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.flush().await;
+        let _ = sock.shutdown().await;
+    }
+}
+
+/// Read the request headers + body out of the socket so the client doesn't
+/// stall waiting for us to consume its payload. Returns the JSON body if it
+/// parsed (unused here, but a useful debugging hook).
+async fn drain_request(sock: &mut tokio::net::TcpStream) -> Option<Value> {
+    let mut buf = vec![0u8; 8192];
+    let mut total = Vec::new();
+    let mut content_length: usize = 0;
+
+    let header_end = loop {
+        let n = sock.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        total.extend_from_slice(&buf[..n]);
+        if let Some(idx) = find_subseq(&total, b"\r\n\r\n") {
+            break idx + 4;
+        }
+        if total.len() > 1 << 20 {
+            return None;
+        }
+    };
+    let header_buf = String::from_utf8_lossy(&total[..header_end]).into_owned();
+    for line in header_buf.lines() {
+        if let Some(rest) = line.strip_prefix("Content-Length:") {
+            content_length = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("content-length:") {
+            content_length = rest.trim().parse().unwrap_or(0);
+        }
+    }
+    while total.len() < header_end + content_length {
+        let n = sock.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        total.extend_from_slice(&buf[..n]);
+    }
+    let body = &total[header_end..(header_end + content_length).min(total.len())];
+    serde_json::from_slice(body).ok()
+}
+
+fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+async fn stream_lines<R>(reader: R, sink: Arc<Mutex<String>>, label: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                eprintln!("[child {label}] {}", line.trim_end_matches('\n'));
+                sink.lock().unwrap().push_str(&line);
+            }
+            Err(_) => break,
+        }
+    }
+}

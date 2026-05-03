@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase D -- REPL + agent loop
-
-- **[0019](0019-agent-loop.md)** `outrig run` -- the headline agent loop.
-
 ## Phase E -- sessions
 
 - **[0020](0020-session-store.md)** SessionStore (auto + explicit `--session-dir`).

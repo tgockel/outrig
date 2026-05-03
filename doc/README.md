@@ -1,8 +1,5 @@
 # Introduction
 
-> **TODO: Incomplete** -- these examples describe outrig's intended behavior; the implementation
-> isn't ready yet.
-
 `outrig` is a command-line tool for running LLM agents against your repository, where every tool
 the agent invokes runs inside a [podman](https://podman.io)-managed container that you describe
 with a `Dockerfile`. You stay in control of the environment the agent gets to play in: which

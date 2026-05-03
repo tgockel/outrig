@@ -24,6 +24,14 @@ fn never_interrupt() -> impl FnMut() -> std::future::Pending<()> {
     || future::pending::<()>()
 }
 
+fn noop_tools() -> impl FnMut() -> std::future::Ready<String> {
+    || future::ready("[outrig] (no tools registered)\n".to_string())
+}
+
+fn noop_reset() -> impl FnMut() -> std::future::Ready<String> {
+    || future::ready("[outrig] (no history to reset)\n".to_string())
+}
+
 #[tokio::test]
 async fn processes_multiple_lines_in_order() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
@@ -42,6 +50,8 @@ async fn processes_multiple_lines_in_order() {
         never_interrupt(),
         "BANNER",
         on_prompt,
+        noop_tools(),
+        noop_reset(),
     );
 
     let mut stdout_buf = Vec::new();
@@ -87,6 +97,8 @@ async fn eof_exits_cleanly() {
         never_interrupt(),
         "",
         on_prompt,
+        noop_tools(),
+        noop_reset(),
     );
 
     timeout(TEST_TIMEOUT, run)
@@ -113,6 +125,8 @@ async fn slash_quit_exits() {
         never_interrupt(),
         "",
         on_prompt,
+        noop_tools(),
+        noop_reset(),
     );
 
     let read_out = async {
@@ -160,6 +174,8 @@ async fn empty_line_is_ignored() {
         never_interrupt(),
         "",
         on_prompt,
+        noop_tools(),
+        noop_reset(),
     );
 
     let read_out = async {
@@ -212,6 +228,8 @@ async fn sigint_mid_callback_returns_to_prompt() {
             interrupt,
             "",
             on_prompt,
+            noop_tools(),
+            noop_reset(),
         )
         .await
     });
@@ -237,6 +255,78 @@ async fn sigint_mid_callback_returns_to_prompt() {
     assert!(
         stderr.contains("[outrig] interrupted"),
         "stderr lacked interrupt notice: {stderr:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_tools_and_reset_invoke_callbacks() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w.write_all(b"/tools\n/reset\n").await.unwrap();
+    drop(stdin_w);
+    let (stdout_w, mut stdout_r) = duplex(BUF);
+    let (stderr_w, mut stderr_r) = duplex(BUF);
+
+    let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
+
+    let tools_calls = Arc::new(AtomicUsize::new(0));
+    let reset_calls = Arc::new(AtomicUsize::new(0));
+    let tools_cb = tools_calls.clone();
+    let reset_cb = reset_calls.clone();
+
+    let on_tools = move || {
+        let c = tools_cb.clone();
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            "[outrig] tools available (1):\n  fs__list_directory   List a directory.\n".to_string()
+        }
+    };
+    let on_reset = move || {
+        let c = reset_cb.clone();
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            "[outrig] history cleared".to_string() // no trailing newline; REPL adds one
+        }
+    };
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        on_prompt,
+        on_tools,
+        on_reset,
+    );
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let read_out = stdout_r.read_to_end(&mut stdout_buf);
+    let read_err = stderr_r.read_to_end(&mut stderr_buf);
+
+    let (run_res, _, _) = timeout(TEST_TIMEOUT, async {
+        tokio::join!(run, read_out, read_err)
+    })
+    .await
+    .expect("test must not hang");
+    run_res.expect("run_with must succeed");
+
+    assert_eq!(tools_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        stdout_buf.is_empty(),
+        "slash output must not reach stdout, got: {:?}",
+        String::from_utf8_lossy(&stdout_buf)
+    );
+
+    let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
+    assert!(
+        stderr.contains("[outrig] tools available (1):"),
+        "stderr lacked /tools text: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("[outrig] history cleared\n"),
+        "stderr lacked /reset text (with REPL-appended newline): {stderr:?}"
     );
 }
 

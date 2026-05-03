@@ -1,8 +1,5 @@
 # `outrig run`
 
-> **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
-> behavior; the implementation isn't ready yet.
-
 `outrig run` is the main subcommand. It walks up from the current directory to find
 `.agents/outrig/config.toml`, builds (or cache-hits) the container image, starts the container,
 attaches every MCP server defined for the selected container-config, and drops you into a
@@ -77,7 +74,7 @@ A typical startup looks like:
 ```
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
 [outrig] container-config:  coding
-[outrig] image:             outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
+[outrig] image:             outrig-cache:8c2a4f7e91d6b5a3
 [outrig] container started: outrig-20260502T103412-3f2a
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)

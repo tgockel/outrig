@@ -243,6 +243,13 @@ impl Container {
         c
     }
 
+    /// Suffix appended to `outrig-` in the container name -- the timestamp +
+    /// short random hex generated at start time. Falls back to the full name
+    /// if the prefix isn't present (defensive against name-format changes).
+    pub fn session_suffix(&self) -> &str {
+        self.name.strip_prefix("outrig-").unwrap_or(&self.name)
+    }
+
     /// Spawn a command inside the container as the host user, with all three
     /// stdio streams piped back to the caller.
     pub async fn exec_stdio(
