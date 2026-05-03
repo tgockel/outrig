@@ -50,8 +50,10 @@ features = [
     "rt-multi-thread",
     "macros",
     "io-util",
+    "io-std",
     "process",
     "signal",
     "fs",
     "time",
+    "sync",
 ]

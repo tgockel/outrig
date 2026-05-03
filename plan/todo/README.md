@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase D -- REPL + agent loop
 
-- **[0018](0018-repl-skeleton.md)** stdin/stdout REPL with slash commands.
 - **[0019](0019-agent-loop.md)** `outrig run` -- the headline agent loop.
 
 ## Phase E -- sessions
