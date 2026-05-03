@@ -31,12 +31,14 @@ that lets 0015 attach the actual shim. After this task, `cargo build` and `cargo
   some error for `style = "mistralrs"` when feature is off; here, harden the message:
   `mistralrs provider 'name' requested but this build of outrig does not include the
   'mistralrs' feature; rebuild with --features mistralrs to enable`.
-- `.github/workflows/ci.yml` (or wherever 0026 lives -- this task may predate it; if so,
-  drop a follow-up note in `plan/next/`):
+- `.github/workflows/ci.yml`:
   - Existing job: `cargo test` (default features off, mistralrs absent) keeps passing.
   - New job: `cargo test --features mistralrs` -- builds the dep, runs the test suite.
     Tests that need a real model file are gated behind an env var (set up in 0015), so
     this job runs the unit suite only.
+  - Factor `cargo fmt --all -- --check` into its own one-shot job so it doesn't run
+    twice across the matrix. (0026 deferred this factoring to whichever task added the
+    second matrix row.)
 
 ## Acceptance
 
@@ -93,5 +95,3 @@ Rejected alternatives, in order of how often they're likely to be re-proposed:
   built-in downloader we like, use it. If not, add `hf-hub` as an additional optional
   dep gated on the same feature flag, so the dep tree shape stays internal to the
   feature.
-- This task interleaves with 0026-ci. If 0026 hasn't landed yet, the CI matrix entry can
-  be a follow-up note; the local `cargo build`/`cargo test` checks are the binding ones.

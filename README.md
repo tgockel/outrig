@@ -1,5 +1,7 @@
 # outrig
 
+![CI](https://github.com/tgockel/outrig/actions/workflows/ci.yml/badge.svg)
+
 > **TODO: Incomplete** -- this README describes outrig's intended behavior. The implementation
 > is in progress; commands documented here are not yet available.
 
@@ -38,6 +40,11 @@ mdbook build   # static HTML in target/book/
 ```
 
 Start at the [Introduction](doc/README.md) or jump to the [Quickstart](doc/quickstart.md).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local checks, the e2e test invocation, and docs
+build instructions.
 
 ## License
 

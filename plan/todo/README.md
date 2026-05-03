@@ -35,5 +35,4 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 ## Phase G -- build, CI, end-to-end
 
 - **[0025](0025-build-subcommand.md)** `outrig build` subcommand.
-- **[0026](0026-ci.md)** GitHub Actions CI (cargo + mdbook).
 - **[0027](0027-e2e-acceptance.md)** End-to-end quickstart acceptance.
