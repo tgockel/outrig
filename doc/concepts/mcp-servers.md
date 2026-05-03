@@ -1,8 +1,5 @@
 # MCP Servers
 
-> **TODO: Incomplete** -- these examples describe outrig's intended behavior; the implementation
-> isn't ready yet.
-
 [MCP](https://modelcontextprotocol.io/) -- Model Context Protocol -- is the wire format outrig
 uses to talk to tools. Each MCP server is a child process that runs inside your container and
 speaks JSON-RPC over its stdio. outrig connects to each one by `podman exec -i`'ing into the

@@ -113,12 +113,16 @@ async fn is_git_context(ctx: &Path) -> Result<bool> {
 }
 
 async fn hash_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    let listing = process::run_capture(
-        Cmd::new("git")
-            .arg("-C")
-            .arg(ctx)
-            .args(["ls-files", "-z", "."]),
-    )
+    // `--full-name` makes `ls-files` emit paths relative to the repo root.
+    // Without it, paths come out cwd-relative, but `hash-object --stdin-paths`
+    // (below) only resolves repo-root-relative paths -- the two would
+    // disagree whenever `ctx` is a subdirectory of the working tree.
+    let listing = process::run_capture(Cmd::new("git").arg("-C").arg(ctx).args([
+        "ls-files",
+        "-z",
+        "--full-name",
+        ".",
+    ]))
     .await?;
 
     // Sort defensively (`git ls-files` already sorts, but pin the order so
