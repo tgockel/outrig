@@ -4,7 +4,8 @@
 > implementation isn't ready yet; don't try to run these commands.
 
 This walks you from a fresh repo to your first running agent in five minutes, mostly via
-`outrig init` and `outrig init-container`.
+`outrig init` (which orchestrates `outrig config init` and `outrig container add` under the
+hood).
 
 ## Prerequisites
 
@@ -43,10 +44,11 @@ $ git init && echo "hello, world" > HELLO.txt && git add . && git commit -m init
 $ outrig init
 ```
 
-`init` walks you through the global config first (providers and models), then the repo config
-(workspace, default agent), then chains into `init-container` for the first container. Every
-prompt shows its default in `[default: ...]`; press Enter to accept. Type `?` and Enter at any
-prompt for an explanation and the available options.
+`init` walks you through the global config first (providers and models -- skipped if it
+already exists), then the repo config (workspace, default agent), then offers to call
+`container add` for the first container-config. Every prompt shows its default in
+`[default: ...]`; press Enter to accept. Type `?` and Enter at any prompt for an explanation
+and the available options.
 
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.
@@ -159,7 +161,7 @@ WORKDIR /workspace
 CMD ["sleep", "infinity"]
 ```
 
-The Dockerfile is yours to edit -- `init-container` produces a known-good starting point, not a
+The Dockerfile is yours to edit -- `container add` produces a known-good starting point, not a
 finished spec. Note there's no `USER` directive and no `useradd`: outrig sets up a user matching
 your host UID/GID at run time, so the same image works for any host user without rebuilding.
 See [Concepts -> Workspace](concepts/workspace.md#uidgid-runtime-user-mapping).

@@ -254,7 +254,8 @@ If a name is defined in both, the repo wins -- override by redefining.
 
 ## See also
 
-- [Quickstart](../quickstart.md) -- shows `outrig init` writing both files.
+- [Quickstart](../quickstart.md) -- shows `outrig init` writing the repo config and
+  invoking `outrig config init` for the global one.
 - [Reference -> Config](../reference/config.md) -- every key in `[providers]`, `[models]`,
   `[agents]`.
 - [Rig documentation](https://docs.rs/rig-core) -- what each provider style Rig ships supports.

@@ -16,7 +16,8 @@
 
 - [Overview](usage/README.md)
   - [outrig init](usage/init.md)
-  - [outrig init-container](usage/init-container.md)
+  - [outrig config](usage/config.md)
+  - [outrig container](usage/container.md)
   - [outrig run](usage/run.md)
   - [outrig build](usage/build.md)
   - [Sessions](usage/sessions.md)

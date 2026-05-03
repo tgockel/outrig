@@ -9,10 +9,12 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 ## Phase F -- interactive scaffolding
 
 - **[0022](0022-prompt-ux.md)** Prompt UX wrapper (defaults + `?`-help).
-- **[0023](0023-init-container.md)** `outrig init-container` with Dockerfile templates.
-- **[0024](0024-init.md)** `outrig init` (chains into `init-container`).
+- **[0023](0023-container-add.md)** `outrig container add` with Dockerfile templates.
+- **[0024](0024-config-init.md)** `outrig config init` (global config; new `config` group).
+- **[0026](0026-init.md)** `outrig init` orchestrator (idempotent; loops `container add`).
 
 ## Phase G -- build, CI, end-to-end
 
 - **[0025](0025-build-subcommand.md)** `outrig build` subcommand.
 - **[0027](0027-e2e-acceptance.md)** End-to-end quickstart acceptance.
+- **[0028](0028-docs-publish.md)** Publish mdbook docs to GitHub Pages via CI.

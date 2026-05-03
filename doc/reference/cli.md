@@ -41,28 +41,46 @@ change behavior.
 
 ### `outrig init`
 
-Interactively set up `~/.outrig/config.toml` and `.agents/outrig/config.toml` for the current
-repo. Falls through into `outrig init-container` to scaffold a first container.
+Idempotent end-to-end setup orchestrator. Runs `outrig config init` if the global config is
+missing, writes `.agents/outrig/config.toml` if it doesn't exist, then offers to call
+`outrig container add` in a loop.
 
 ```
 outrig init [--force]
 ```
 
-| Flag      | Default | Description                                                             |
-|-----------|---------|-------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing config files. Without it, outrig refuses to clobber. |
+| Flag      | Default | Description                                                                 |
+|-----------|---------|-----------------------------------------------------------------------------|
+| `--force` | off     | Overwrite existing files. Propagates to `config init` and `container add`.  |
 
 See [Usage -> outrig init](../usage/init.md).
 
-### `outrig init-container`
+### `outrig config init`
+
+Interactively write the global config (`~/.outrig/config.toml`): provider styles, models,
+and `default-model`. The first subcommand of the `outrig config` group; future subcommands
+(`config get`, `config set`, `config list`) are deferred.
+
+```
+outrig config init [--force]
+```
+
+| Flag      | Default | Description                                                                 |
+|-----------|---------|-----------------------------------------------------------------------------|
+| `--force` | off     | Overwrite an existing global config. Without it, outrig refuses to clobber. |
+
+See [Usage -> outrig config](../usage/config.md).
+
+### `outrig container add`
 
 Interactively scaffold a container-config: writes a Dockerfile under
 `.agents/outrig/containers/<name>/Dockerfile` and adds the matching `[containers.<name>]` and
-`[containers.<name>.mcp]` blocks to the repo config.
+`[containers.<name>.mcp]` blocks to the repo config. The first subcommand of the `outrig
+container` group; future subcommands (`container ls`, `container rm`) are deferred.
 
 ```
-outrig init-container [<name>]
-                      [--force]
+outrig container add [<name>]
+                     [--force]
 ```
 
 | Argument / flag | Default  | Description                             |
@@ -70,7 +88,7 @@ outrig init-container [<name>]
 | `<name>`        | prompted | Container-config name.                  |
 | `--force`       | off      | Overwrite existing files for this name. |
 
-See [Usage -> outrig init-container](../usage/init-container.md).
+See [Usage -> outrig container](../usage/container.md).
 
 ### `outrig run`
 

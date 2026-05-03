@@ -1,19 +1,26 @@
-# `outrig init-container`
+# `outrig container`
 
 > **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
 > behavior; the implementation isn't ready yet.
 
-`outrig init-container` scaffolds a new container-config. It writes a Dockerfile under
+`outrig container` groups commands that manage container-configs (the named Dockerfile +
+MCP-server bundles agents run inside). In v0 only `outrig container add` is implemented;
+the rest of the group (`container ls`, `container rm`) is reserved for later.
+
+## `outrig container add`
+
+`outrig container add` scaffolds a new container-config. It writes a Dockerfile under
 `.agents/outrig/containers/<name>/Dockerfile` and appends matching `[containers.<name>]` and
 `[containers.<name>.mcp]` blocks to your repo's `config.toml`.
 
-It's the second half of [`outrig init`](init.md) and runs on its own when you want to add a
-container-config later (e.g. a `planning` config alongside `coding`).
+Run it any time you want to add a container-config -- e.g., a `planning` config alongside
+`coding`. [`outrig init`](init.md) calls `container add` in a loop for the first (and any
+further) containers you create during initial setup.
 
-## Synopsis
+### Synopsis
 
 ```
-outrig init-container [<name>] [--force]
+outrig container add [<name>] [--force]
 ```
 
 | Argument / flag | Default  | Description                                                 |
@@ -21,13 +28,13 @@ outrig init-container [<name>] [--force]
 | `<name>`        | prompted | Container-config name (becomes `[containers.<name>]`).      |
 | `--force`       | off      | Overwrite existing Dockerfile/config entries for this name. |
 
-## Run it
+### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
 Enter at any prompt for an explanation of what's being asked plus the available options.
 
 ```sh
-$ outrig init-container
+$ outrig container add
 ? Container-config name [default: coding]:
 ? Base image [default: debian:bookworm-slim]:
 ? Language toolchains, comma-separated [default: ]: rust, node
@@ -40,8 +47,8 @@ $ outrig init-container
 Next: try `outrig build` to verify the image builds, then `outrig run`.
 ```
 
-The prompts are intentionally limited -- the goal is a known-good starting point you can edit by
-hand, not an exhaustive Dockerfile generator.
+The prompts are intentionally limited -- the goal is a known-good starting point you can edit
+by hand, not an exhaustive Dockerfile generator.
 
 ### Help at any prompt
 
@@ -57,7 +64,7 @@ hand, not an exhaustive Dockerfile generator.
   go      Go 1.22.
   none    Just the base image -- nothing extra installed.
 
-  See: doc/usage/init-container.md#known-toolchains
+  See: doc/usage/container.md#known-toolchains
 
 ? Language toolchains, comma-separated [default: ]:
 ```
@@ -91,7 +98,7 @@ Picking `fs` and `shell` covers most coding workflows. Add more later by editing
 > **TODO: Incomplete** -- the catalogue of "known MCP servers" will grow as the ecosystem does.
 > Anything not listed here you install in the Dockerfile by hand.
 
-## What gets written
+### What gets written
 
 `.agents/outrig/containers/coding/Dockerfile` (excerpt):
 
@@ -137,13 +144,13 @@ context    = ".agents/outrig/containers/coding"
   shell = ["bash", "-lc", "exec mcp-server-shell"]
 ```
 
-## Re-running
+### Re-running
 
 Without `--force`, outrig refuses if either the Dockerfile path or the config block already
 exists for that name:
 
 ```
-$ outrig init-container coding
+$ outrig container add coding
 error: .agents/outrig/containers/coding/Dockerfile already exists; pass --force to overwrite.
 ```
 
@@ -152,9 +159,9 @@ place (preserving surrounding TOML).
 
 ## See also
 
-- [outrig init](init.md) -- runs `init-container` automatically as the last step.
+- [outrig init](init.md) -- runs `container add` in a loop as the last step of initial setup.
 - [Concepts -> Containers](../concepts/containers.md) -- Dockerfile conventions and named
   container-configs.
-- [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- the MCP servers `init-container`
+- [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- the MCP servers `container add`
   scaffolds.
 - [Reference -> Config](../reference/config.md) -- the `[containers.<name>]` schema.

@@ -3,14 +3,16 @@
 > **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
 > behavior; the implementation isn't ready yet.
 
-`outrig init` walks you through setting up the two config files outrig needs:
+`outrig init` is the one-shot setup for a new repo. It's a thin orchestrator over two more
+focused commands plus one inline repo-config phase:
 
-- `~/.outrig/config.toml` (global) -- providers and models, the user/machine-level pieces.
-- `.agents/outrig/config.toml` (repo) -- workspace, agents, and (after `init-container`)
-  containers.
+1. If `~/.outrig/config.toml` is missing, run [`outrig config init`](config.md#outrig-config-init).
+2. Create `.agents/outrig/` and `.agents/outrig/config.toml` if absent.
+3. Offer to call [`outrig container add`](container.md#outrig-container-add) in a loop.
 
-After both configs are written, `init` chains into [`outrig init-container`](init-container.md)
-to scaffold the first container.
+Each phase is idempotent. Re-running `outrig init` on a fully-set-up repo does nothing for
+the first two phases; the container loop is always offered (you may want to add another
+container-config later).
 
 ## Synopsis
 
@@ -18,9 +20,9 @@ to scaffold the first container.
 outrig init [--force]
 ```
 
-| Flag      | Default | Description                                                                    |
-|-----------|---------|--------------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing config files. Without `--force`, outrig refuses to clobber. |
+| Flag      | Default | Description                                                                |
+|-----------|---------|----------------------------------------------------------------------------|
+| `--force` | off     | Overwrite existing files. Propagates to `config init` and `container add`. |
 
 ## Run it
 
@@ -29,9 +31,11 @@ $ cd hello-outrig
 $ outrig init
 ```
 
-If `~/.outrig/config.toml` doesn't exist, outrig walks you through providers and models first.
-Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
-Enter at any prompt for an explanation of what's being asked plus the available options.
+If `~/.outrig/config.toml` doesn't exist, outrig walks you through providers and models first
+-- the same flow as `outrig config init`, inlined here so first-time users finish in one
+session. Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type
+`?` and Enter at any prompt for an explanation of what's being asked plus the available
+options.
 
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.
@@ -40,21 +44,20 @@ Enter at any prompt for an explanation of what's being asked plus the available 
 ? Provider name (used in models) [default: openai]:
 ? Base URL [default: https://api.openai.com/v1]:
 ? API key environment variable [default: OPENAI_API_KEY]:
-
-? Add another provider? [y/N]:
-
 ? Define a model now? [Y/n]:
 ? Model name (used in agents) [default: fast]:
 ? Model identifier [default: gpt-4o-mini]:
 ? Provider for this model [default: openai]:
-
-? Add another model? [y/N]:
 ? Use this model as default-model? [Y/n]:
 
 [outrig] wrote ~/.outrig/config.toml
 ```
 
-If the global config already exists, outrig skips that step and re-uses what's there.
+If the global config already exists, that step is skipped:
+
+```
+[outrig] using existing global config at ~/.outrig/config.toml
+```
 
 Then the repo half:
 
@@ -73,50 +76,22 @@ Then the repo half:
 The agent doesn't get its own `model` field unless you say "yes" to overriding the default --
 otherwise it inherits `default-model` from the global config.
 
-`init` then automatically runs [`outrig init-container`](init-container.md) so you finish with a
-working container too. Press Ctrl-C at any prompt to stop; partial files are not written until
-all answers are gathered.
-
-### Help at any prompt
-
-Type `?` and Enter at any prompt to get a short explanation of the field and its options. The
-prompt is then re-displayed so you can answer:
+Finally the container loop:
 
 ```
-? Pick a provider style [default: openai]: ?
+? Add a container-config now? [Y/n]:
 
-  A provider style is the wire format outrig uses to talk to your LLM endpoint.
+  ... (calls `outrig container add` -- see that page for the full prompt sequence)
 
-  openai     OpenAI Chat Completions wire format. Works with OpenAI itself, OpenRouter,
-             Together, vLLM, Ollama, and any compatible endpoint.
-  anthropic  (TODO: not yet wired in v0) Native Anthropic API.
-
-  See: doc/concepts/llm-providers.md
-
-? Pick a provider style [default: openai]:
+? Add another container-config? [y/N]:
 ```
 
-The help text comes from the same descriptions used in
-[Reference -> Config](../reference/config.md); prompts and reference stay in sync.
+Press Ctrl-C at any prompt to stop; partial files are not written until all answers are
+gathered.
 
 ## What gets written
 
-A minimal `~/.outrig/config.toml`:
-
-```toml
-default-model = "fast"
-
-[providers.openai]
-style    = "openai"
-base-url = "https://api.openai.com/v1"
-api-key  = "${OPENAI_API_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "gpt-4o-mini"
-```
-
-A minimal `.agents/outrig/config.toml` (containers will be filled in by `init-container`):
+A minimal `.agents/outrig/config.toml` (containers will be filled in by `container add`):
 
 ```toml
 default-container = "coding"
@@ -131,25 +106,32 @@ container-path = "/workspace"
 preamble = "You are a careful coding assistant."
 ```
 
+The global `~/.outrig/config.toml` is written by
+[`outrig config init`](config.md#outrig-config-init); the per-container Dockerfile and
+`[containers.<name>]` block come from
+[`outrig container add`](container.md#outrig-container-add).
+
 ## Re-running
 
-`outrig init` without `--force` refuses if either file already exists:
+Without `--force`, `outrig init` skips work that's already done:
 
-```
-$ outrig init
-error: ~/.outrig/config.toml already exists; pass --force to overwrite.
-```
+- Global config present -> skip the `config init` phase.
+- Repo `config.toml` present -> skip the repo-config phase.
+- Container loop -> always offered, since adding more containers later is the expected
+  workflow.
 
-To re-run a specific piece, edit the file directly or use `outrig init-container` for an
-additional container. There is no plan to support partial re-init in v0 -- the configs are
-small enough to edit by hand.
+With `--force`, every nested write rewrites in place. You probably want the more targeted
+commands instead -- `outrig config init --force` or `outrig container add <name> --force`.
 
-> **TODO: Incomplete** -- non-interactive mode (`outrig init --provider openai --model fast ...`)
-> is deferred.
+> **TODO: Incomplete** -- non-interactive mode (`outrig init --provider openai --model fast
+> ...`) is deferred.
 
 ## See also
 
-- [outrig init-container](init-container.md) -- the second half of `init`, runnable on its own.
+- [outrig config init](config.md#outrig-config-init) -- the global-config phase, runnable on
+  its own.
+- [outrig container add](container.md#outrig-container-add) -- scaffolds a container-config;
+  `init` calls it in a loop.
 - [Concepts -> LLM Providers](../concepts/llm-providers.md) -- what providers, models, and
   agents are and how they compose.
 - [Reference -> Config](../reference/config.md) -- every key in both config files.

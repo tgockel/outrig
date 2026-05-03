@@ -6,8 +6,8 @@ repo, and outrig builds it with `buildah` and runs it with `podman`.
 
 ## Default location
 
-[`outrig init-container`](../usage/init-container.md) writes container files under
-`.agents/outrig/containers/<name>/`:
+[`outrig container add`](../usage/container.md#outrig-container-add) writes container files
+under `.agents/outrig/containers/<name>/`:
 
 ```
 .agents/outrig/
@@ -148,8 +148,8 @@ post-install, fork-heavy shells), so the v0 floor is the default podman cap set 
 
 ## See also
 
-- [outrig init-container](../usage/init-container.md) -- the easiest way to scaffold a new
-  container-config.
+- [outrig container add](../usage/container.md#outrig-container-add) -- the easiest way to
+  scaffold a new container-config.
 - [MCP Servers](mcp-servers.md) -- declaring and invoking the tools that run inside the
   container.
 - [Workspace](workspace.md) -- what the container sees of your repo.

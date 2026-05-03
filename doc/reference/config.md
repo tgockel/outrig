@@ -238,7 +238,7 @@ build-args = { NODE_VERSION = "20" }
 
 Notes:
 
-- `outrig init-container` writes its output under `.agents/outrig/containers/<name>/`. You can
+- `outrig container add` writes its output under `.agents/outrig/containers/<name>/`. You can
   put Dockerfiles anywhere you want by editing these paths; the `.agents/outrig/containers/`
   default just keeps outrig-specific files together.
 - Inner keys of `build-args` are user-defined Dockerfile `ARG` names; they're left as written

@@ -1,4 +1,4 @@
-# 0023 -- `outrig init-container`
+# 0023 -- `outrig container add`
 
 ## Goal
 
@@ -7,17 +7,20 @@ toolchains, MCP servers; writes `.agents/outrig/containers/<name>/Dockerfile` fr
 templates; appends `[containers.<name>]` and `[containers.<name>.mcp]` blocks to the existing
 repo `config.toml` while preserving the surrounding TOML.
 
+`outrig container` is a new top-level command group; v0 ships only the `add` subcommand
+(`ls`, `rm`, etc., are reserved for later).
+
 ## Deliverables
 
-- `src/init/container.rs::run(name: Option<String>, force: bool) -> Result<()>` matching the
-  flow in `doc/usage/init-container.md`.
+- `src/container/add.rs::run(name: Option<String>, force: bool) -> Result<()>` matching the
+  flow in `doc/usage/container.md`.
 - Prompts (using 0022's `ask_*`):
   - Container-config name (default from arg or `coding`).
   - Base image (select from preset list: `debian:bookworm-slim`, `ubuntu:24.04`,
     `alpine:latest`, `node:20-bookworm-slim`, `python:3.12-slim`).
   - Language toolchains (multi-select: `rust`, `node`, `python`, `go`, `none`; default empty).
   - MCP servers (multi-select: `fs`, `shell`, `git`; default `fs, shell`).
-- Dockerfile templates compiled in via `include_str!` under `src/init/templates/`:
+- Dockerfile templates compiled in via `include_str!` under `src/container/templates/`:
   - One header file per base-image option (selects apt-get / apk / etc. for the install lines).
   - One fragment per toolchain (`rust.frag`, `node.frag`, `python.frag`, `go.frag`).
   - One MCP-install block computed at runtime by stitching per-server install lines.
@@ -30,16 +33,16 @@ repo `config.toml` while preserving the surrounding TOML.
     using `toml_edit` so surrounding content (comments, formatting) is preserved.
 - Idempotency: refuse without `--force` if either output exists (or the config block already
   has a `[containers.<name>]` entry); with `--force`, replace both atomically.
-- `tests/init_container_render.rs` for each (base x toolchain) combo (deterministic output).
-- `tests/init_container_buildable.rs` (`#[cfg(feature = "e2e")]`): generate, then run
+- `tests/container_add_render.rs` for each (base x toolchain) combo (deterministic output).
+- `tests/container_add_buildable.rs` (`#[cfg(feature = "e2e")]`): generate, then run
   `outrig build` against the result; assert the image builds.
 
 ## Acceptance
 
-- `cargo test init_container_render` passes.
-- `outrig init-container coding` from a configured repo writes a buildable Dockerfile and a
+- `cargo test container_add_render` passes.
+- `outrig container add coding` from a configured repo writes a buildable Dockerfile and a
   config block; `outrig build` then succeeds.
-- Drop the `> TODO: Incomplete` marker on `doc/usage/init-container.md`.
+- Drop the `> TODO: Incomplete` marker on `doc/usage/container.md`.
 
 ## Dependencies
 
