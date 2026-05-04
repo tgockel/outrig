@@ -52,23 +52,35 @@ pub async fn run_with(
         eprintln!("[outrig] wrote {}", global_path.display());
     }
 
-    // Phase 2: repo config.
-    repo::ensure(cwd, prompt).await?;
+    // Phase 2: repo config. Returns the bootstrapped container name (if
+    // we wrote the config) so phase 3's first container-add can skip its
+    // name prompt.
+    let mut bootstrapped_name = repo::ensure(cwd, &global_path, prompt).await?;
 
-    // Phase 3: container loop. Always offered -- adding more containers
-    // later is the expected workflow.
+    // Phase 3: container loop. The gate prompt is skipped on the first
+    // iteration when phase 2 just bootstrapped a container -- the user
+    // already chose to add one by walking through the container section,
+    // so asking again would be redundant. When phase 2 short-circuited
+    // on an existing config, the gate fires (re-runs may not want to
+    // add a container).
     let mut first = true;
     loop {
-        let field = if first {
-            &ADD_FIRST_CONTAINER_FIELD
+        let should_run = if first && bootstrapped_name.is_some() {
+            true
+        } else if first {
+            prompt.ask_bool(&ADD_FIRST_CONTAINER_FIELD, true).await?
         } else {
-            &ADD_ANOTHER_CONTAINER_FIELD
+            prompt.ask_bool(&ADD_ANOTHER_CONTAINER_FIELD, false).await?
         };
-        let default = first;
-        if !prompt.ask_bool(field, default).await? {
+        if !should_run {
             break;
         }
-        container::add::run_with(cwd, None, force, prompt).await?;
+        let name = if first {
+            bootstrapped_name.take()
+        } else {
+            None
+        };
+        container::add::run_with(cwd, name, force, prompt).await?;
         first = false;
     }
 

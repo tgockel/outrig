@@ -155,7 +155,12 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(outrig::container::add::run(&cwd, name.clone(), *force))?;
+                runtime.block_on(outrig::container::add::run(
+                    &cwd,
+                    cli.global_config.as_deref(),
+                    name.clone(),
+                    *force,
+                ))?;
                 Ok(0)
             }
         },

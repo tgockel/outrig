@@ -23,11 +23,23 @@ use crate::repo;
 /// fallback prompt to bootstrap a fresh `.agents/outrig/config.toml` if
 /// none is found) before running the interactive container-add flow. One
 /// `PromptSource` is threaded through both halves so the user sees a
-/// single conversation.
-pub async fn run(cwd: &Path, name: Option<String>, force: bool) -> Result<()> {
+/// single conversation. `global_override` plumbs `--global-config` into
+/// the bootstrap path so the model-section can list models from the
+/// right global config.
+pub async fn run(
+    cwd: &Path,
+    global_override: Option<&Path>,
+    name: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let global_path = repo::global_config_path(global_override);
     let mut prompt = prompt::auto();
-    let repo_root = init_repo::resolve_or_bootstrap(cwd, &mut prompt).await?;
-    run_with(&repo_root, name, force, &mut prompt).await
+    let (repo_root, bootstrapped_name) =
+        init_repo::resolve_or_bootstrap(cwd, &global_path, &mut prompt).await?;
+    // CLI-provided name wins; otherwise reuse whatever the bootstrap
+    // already asked for.
+    let effective = name.or(bootstrapped_name);
+    run_with(&repo_root, effective, force, &mut prompt).await
 }
 
 /// Drives the interactive flow against an arbitrary `PromptSource`.
@@ -45,7 +57,10 @@ pub async fn run_with(
 
     let name = match name_arg {
         Some(n) => n,
-        None => prompt.ask_string(&NAME_FIELD, "coding").await?,
+        None => {
+            let default = init_repo::default_container_name(repo_root);
+            prompt.ask_string(&NAME_FIELD, &default).await?
+        }
     };
 
     let dockerfile_path = repo::container_dir(repo_root, &name).join("Dockerfile");
@@ -108,8 +123,8 @@ pub async fn run_with(
 
 // ---- prompt fields --------------------------------------------------------
 
-const NAME_FIELD: Field = Field {
-    name: "Container-config name",
+pub(crate) const NAME_FIELD: Field = Field {
+    name: "Container name",
     description: "Used as the [containers.<name>] key. Must match `^[a-zA-Z][a-zA-Z0-9_-]*$`.",
     options: &[],
     doc_link: "doc/usage/container.md",
@@ -154,7 +169,7 @@ const TOOLCHAINS: &[(&str, &str)] = &[
 ];
 
 const TOOLCHAIN_FIELD: Field = Field {
-    name: "Language toolchains, comma-separated",
+    name: "Language toolchains",
     description: "Pick zero or more language toolchains to install in the image. \
                   The Dockerfile template adds the corresponding install steps; \
                   you can edit the file afterwards.",
@@ -171,7 +186,7 @@ const MCPS: &[(&str, &str)] = &[
 ];
 
 const MCP_FIELD: Field = Field {
-    name: "MCP servers, comma-separated",
+    name: "MCP servers",
     description: "Pick zero or more MCP servers to install in the image. The \
                   Dockerfile installs each server's package and the matching \
                   [containers.<name>.mcp] entry is appended to config.toml.",

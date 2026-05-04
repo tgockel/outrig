@@ -45,8 +45,8 @@ pub async fn run_with(force: bool, path: &Path, prompt: &mut impl PromptSource) 
         )));
     }
 
-    let providers = prompt_providers(prompt).await?;
-    let models = prompt_models(prompt, &providers).await?;
+    let mut providers = prompt_providers(prompt).await?;
+    let models = prompt_models(prompt, &mut providers).await?;
     let default_model = prompt_default_model(prompt, &models).await?;
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
@@ -160,9 +160,23 @@ const MODEL_IDENTIFIER_FIELD: Field = Field {
 
 const MODEL_PROVIDER_FIELD: Field = Field {
     name: "Provider for this model",
-    description: "Name of an existing [providers.<name>] entry.",
+    description: "An LLM provider is a backend that hosts the model -- e.g. \
+                  OpenAI, OpenRouter, vLLM, or a local mistralrs runtime. \
+                  Each carries its own connection details (URL, API key, \
+                  etc.). This can be the name of an existing \
+                  [providers.<name>] entry or you can give a new name to \
+                  create a new provider.",
     options: &[],
-    doc_link: "doc/reference/config.md",
+    doc_link: "doc/concepts/llm-providers.md",
+};
+
+const ADD_NEW_PROVIDER_FIELD: Field = Field {
+    name: "Add this provider now?",
+    description: "Yes: walk through the provider style + connection prompts \
+                  to define a new [providers.<name>] entry under the name \
+                  you just typed. No: re-enter the provider name.",
+    options: &[],
+    doc_link: "doc/concepts/llm-providers.md",
 };
 
 const ADD_MODEL_FIELD: Field = Field {
@@ -202,6 +216,7 @@ pub const DOC_SYNC_FIELDS: &[&Field] = &[
     &MODEL_NAME_FIELD,
     &MODEL_IDENTIFIER_FIELD,
     &MODEL_PROVIDER_FIELD,
+    &ADD_NEW_PROVIDER_FIELD,
     &ADD_MODEL_FIELD,
     &USE_DEFAULT_FIELD,
     &DEFAULT_MODEL_FIELD,
@@ -212,17 +227,8 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
     loop {
         let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
         let style = STYLES[style_idx].0;
-
         let name = prompt.ask_string(&PROVIDER_NAME_FIELD, style).await?;
-        let provider = match style {
-            "openai" => prompt_openai_provider(prompt).await?,
-            "mistralrs" => LlmProvider::Mistralrs,
-            other => {
-                return Err(OutrigError::Configuration(format!(
-                    "unknown provider style: {other}"
-                )));
-            }
-        };
+        let provider = prompt_provider_body(prompt, style).await?;
         out.insert(name, provider);
 
         if !prompt.ask_bool(&ADD_PROVIDER_FIELD, false).await? {
@@ -230,6 +236,29 @@ async fn prompt_providers(prompt: &mut impl PromptSource) -> Result<BTreeMap<Str
         }
     }
     Ok(out)
+}
+
+/// Walks just the style-specific prompts for a single provider whose name
+/// is already known. Used inline by `prompt_models_loop` when the user
+/// references a provider that doesn't exist yet -- we already have the
+/// name (what they typed at the model's provider prompt) and only need to
+/// ask the style + connection details.
+pub(crate) async fn prompt_new_provider_for_name(
+    prompt: &mut impl PromptSource,
+) -> Result<LlmProvider> {
+    let style_idx = prompt.ask_select(&STYLE_FIELD, 0).await?;
+    let style = STYLES[style_idx].0;
+    prompt_provider_body(prompt, style).await
+}
+
+async fn prompt_provider_body(prompt: &mut impl PromptSource, style: &str) -> Result<LlmProvider> {
+    match style {
+        "openai" => prompt_openai_provider(prompt).await,
+        "mistralrs" => Ok(LlmProvider::Mistralrs),
+        other => Err(OutrigError::Configuration(format!(
+            "unknown provider style: {other}"
+        ))),
+    }
 }
 
 async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
@@ -251,33 +280,66 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
 
 async fn prompt_models(
     prompt: &mut impl PromptSource,
-    providers: &BTreeMap<String, LlmProvider>,
+    providers: &mut BTreeMap<String, LlmProvider>,
 ) -> Result<BTreeMap<String, Model>> {
-    let mut out = BTreeMap::new();
     if !prompt.ask_bool(&DEFINE_MODEL_FIELD, true).await? {
-        return Ok(out);
+        return Ok(BTreeMap::new());
     }
-    let first_provider = providers
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "openai".to_string());
+    let (models, new_providers) = prompt_models_loop(prompt, providers).await?;
+    providers.extend(new_providers);
+    Ok(models)
+}
+
+/// The model-add loop without the outer `Define a model now?` gate.
+/// Returns `(models, new_providers)` -- providers added inline (when the
+/// user references one that doesn't exist yet) come back to the caller so
+/// init::repo can write them to the repo config without mutating the
+/// global providers it was passed.
+pub(crate) async fn prompt_models_loop(
+    prompt: &mut impl PromptSource,
+    existing_providers: &BTreeMap<String, LlmProvider>,
+) -> Result<(BTreeMap<String, Model>, BTreeMap<String, LlmProvider>)> {
+    let mut out = BTreeMap::new();
+    let mut new_providers: BTreeMap<String, LlmProvider> = BTreeMap::new();
 
     loop {
         let name = prompt.ask_string(&MODEL_NAME_FIELD, "fast").await?;
+
+        // Print providers defined so far (existing + any added inline) so
+        // the user has the list at hand for the next prompt.
+        let provider_names: Vec<&str> = existing_providers
+            .keys()
+            .chain(new_providers.keys())
+            .map(String::as_str)
+            .collect();
+        if !provider_names.is_empty() {
+            eprintln!("[outrig] providers defined: {}", provider_names.join(", "));
+        }
+
+        let suggestion = provider_names
+            .first()
+            .copied()
+            .unwrap_or("openai")
+            .to_string();
         let provider_name = loop {
             let answer = prompt
-                .ask_string(&MODEL_PROVIDER_FIELD, &first_provider)
+                .ask_string(&MODEL_PROVIDER_FIELD, &suggestion)
                 .await?;
-            if providers.contains_key(&answer) {
+            if existing_providers.contains_key(&answer) || new_providers.contains_key(&answer) {
                 break answer;
             }
-            eprintln!(
-                "[outrig] no provider named `{answer}`; defined: {}",
-                providers.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
+            eprintln!("[outrig] no provider named `{answer}` yet.");
+            if prompt.ask_bool(&ADD_NEW_PROVIDER_FIELD, true).await? {
+                let provider = prompt_new_provider_for_name(prompt).await?;
+                new_providers.insert(answer.clone(), provider);
+                break answer;
+            }
         };
-        let model = match providers.get(&provider_name).expect("validated above") {
+        let provider = existing_providers
+            .get(&provider_name)
+            .or_else(|| new_providers.get(&provider_name))
+            .expect("validated above");
+        let model = match provider {
             LlmProvider::OpenAi { .. } => {
                 let identifier = prompt
                     .ask_string(&MODEL_IDENTIFIER_FIELD, "gpt-4o-mini")
@@ -299,7 +361,7 @@ async fn prompt_models(
             break;
         }
     }
-    Ok(out)
+    Ok((out, new_providers))
 }
 
 async fn prompt_mistralrs_model(
@@ -337,7 +399,7 @@ async fn prompt_mistralrs_model(
     })
 }
 
-async fn prompt_default_model(
+pub(crate) async fn prompt_default_model(
     prompt: &mut impl PromptSource,
     models: &BTreeMap<String, Model>,
 ) -> Result<Option<String>> {

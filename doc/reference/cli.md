@@ -98,7 +98,7 @@ Start an interactive agent session.
 
 ```
 outrig run [--agent <name>]
-           [--container-config <name>]
+           [--container <name>]
            [--config <path>]
            [--global-config <path>]
            [--session-dir <path>]
@@ -109,7 +109,7 @@ outrig run [--agent <name>]
 | Flag                        | Default                           | Description                         |
 |-----------------------------|-----------------------------------|-------------------------------------|
 | `--agent <name>`            | `default-agent`                   | Selects an `[agents.<name>]` block. |
-| `--container-config <name>` | from agent or `default-container` | Container-config to launch.         |
+| `--container <name>` | from agent or `default-container` | Container-config to launch.         |
 | `--session-dir <path>`      | `<session-root>/<sid>` (auto)     | Specific directory for THIS run.    |
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
@@ -128,7 +128,7 @@ See [Usage -> outrig run](../usage/run.md) for REPL details.
 Build (or cache-hit) one or more container-config images, without starting an agent.
 
 ```
-outrig build [--container-config <name>]
+outrig build [--container <name>]
              [--all]
              [--no-cache]
              [--config <path>]
@@ -136,8 +136,8 @@ outrig build [--container-config <name>]
 
 | Flag                        | Default             | Description                                                                 |
 |-----------------------------|---------------------|-----------------------------------------------------------------------------|
-| `--container-config <name>` | `default-container` | Build a specific named container-config.                                    |
-| `--all`                     | off                 | Build every container-config. Mutually exclusive with `--container-config`. |
+| `--container <name>` | `default-container` | Build a specific named container-config.                                    |
+| `--all`                     | off                 | Build every container-config. Mutually exclusive with `--container`. |
 | `--no-cache`                | off                 | Force rebuild even on cache hit. Passes `--no-cache` to buildah.            |
 
 See [Usage -> outrig build](../usage/build.md).

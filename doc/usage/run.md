@@ -9,7 +9,7 @@ stdin/stdout REPL with the agent.
 
 ```
 outrig run [--agent <name>]
-           [--container-config <name>]
+           [--container <name>]
            [--config <path>]
            [--session-dir <path>]
            [--session-root <path>]
@@ -19,7 +19,7 @@ outrig run [--agent <name>]
 | Flag                        | Default                                       | Notes                                                                  |
 |-----------------------------|-----------------------------------------------|------------------------------------------------------------------------|
 | `--agent <name>`            | `default-agent`                               | Selects an `[agents.<name>]` block.                                    |
-| `--container-config <name>` | agent's `container`, else `default-container` | Pick a container.                                                      |
+| `--container <name>` | agent's `container`, else `default-container` | Pick a container.                                                      |
 | `--config <path>`           | walks up from cwd                             | Use from outside the repo or non-standard locations.                   |
 | `--session-dir <path>`      | `<session-root>/<sid>` (auto)                 | This run's specific session directory; symlinked from the root.        |
 | `--session-root <path>`     | `session-root` config, else XDG               | Root directory containing all sessions.                                |
@@ -44,7 +44,7 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 
 1. **Locate config.** Walks up from the current directory until `.agents/outrig/config.toml` is
    found, or fails.
-2. **Resolve container-config.** Uses `--container-config` if given, otherwise
+2. **Resolve container-config.** Uses `--container` if given, otherwise
    `default-container`. The selected block must exist.
 3. **Build (or cache-hit) the image.** Runs `buildah build`. If the cache hash matches an
    existing tag, no rebuild.

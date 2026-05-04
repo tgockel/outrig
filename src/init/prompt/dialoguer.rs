@@ -10,7 +10,7 @@
 
 use std::io;
 
-use dialoguer::{FuzzySelect, Input, MultiSelect};
+use dialoguer::{FuzzySelect, Input, Select};
 use tokio::io::AsyncWriteExt;
 use tokio::task;
 
@@ -140,29 +140,64 @@ impl PromptSource for DialoguerPrompt {
         .map_err(map_dialoguer_err)
     }
 
+    /// Drives multi-select via a `Select` loop with checkbox-prefixed
+    /// items and an explicit "Done" row. Each Enter toggles the
+    /// highlighted item; the user picks `Done` when finished. This
+    /// replaces dialoguer's `MultiSelect`, which uses Space-to-toggle /
+    /// Enter-to-confirm -- a binding that confused testers who expected
+    /// Enter to toggle the selection.
     async fn ask_multiselect(
         &mut self,
         field: &Field,
         default_indices: &[usize],
     ) -> Result<Vec<usize>> {
         write_description(field.description).await?;
-        let prompt = field.name.to_owned();
-        let items: Vec<&'static str> = field.options.iter().map(|(v, _)| *v).collect();
-        let mut mask = vec![false; items.len()];
+        let mut selected: Vec<bool> = vec![false; field.options.len()];
         for &i in default_indices {
-            if let Some(slot) = mask.get_mut(i) {
+            if let Some(slot) = selected.get_mut(i) {
                 *slot = true;
             }
         }
-        task::spawn_blocking(move || {
-            MultiSelect::new()
-                .with_prompt(prompt)
-                .items(&items)
-                .defaults(&mask)
-                .interact()
-        })
-        .await
-        .map_err(map_join_err)?
-        .map_err(map_dialoguer_err)
+        let done_idx = field.options.len();
+        let mut cursor: usize = 0;
+        loop {
+            let mut items: Vec<String> = field
+                .options
+                .iter()
+                .enumerate()
+                .map(|(i, (val, _))| {
+                    let mark = if selected[i] { "[x]" } else { "[ ]" };
+                    format!("{mark} {val}")
+                })
+                .collect();
+            items.push("Done".to_string());
+
+            let prompt = field.name.to_owned();
+            let cursor_now = cursor.min(items.len() - 1);
+            let idx = task::spawn_blocking(move || {
+                Select::new()
+                    .with_prompt(prompt)
+                    .items(&items)
+                    .default(cursor_now)
+                    // Suppress dialoguer's post-interaction confirmation
+                    // line so the loop redraws cleanly without leaving
+                    // breadcrumbs each iteration.
+                    .report(false)
+                    .interact()
+            })
+            .await
+            .map_err(map_join_err)?
+            .map_err(map_dialoguer_err)?;
+
+            if idx == done_idx {
+                return Ok(selected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &b)| if b { Some(i) } else { None })
+                    .collect());
+            }
+            selected[idx] = !selected[idx];
+            cursor = idx;
+        }
     }
 }

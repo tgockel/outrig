@@ -30,7 +30,7 @@ model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XD
 
 | Key                 | Type   | Required               | Where  | Description                   |
 |---------------------|--------|------------------------|--------|-------------------------------|
-| `default-container` | string | for `outrig run`       | repo   | Default `--container-config`. |
+| `default-container` | string | for `outrig run`       | repo   | Default `--container`. |
 | `default-agent`     | string | for `outrig run`       | repo   | Default `--agent`.            |
 | `default-model`     | string | if agent omits `model` | global | Fallback model name.          |
 | `session-root`      | path   | no                     | global | Sessions root dir.            |
@@ -214,7 +214,7 @@ preamble = "You are a meticulous code reviewer..."
 | `max-tokens`  | integer | no       | provider default    | Output token cap per turn.             |
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
-set. When `outrig run --agent <a>` runs, the chosen container is `--container-config` if given,
+set. When `outrig run --agent <a>` runs, the chosen container is `--container` if given,
 otherwise `agents.<a>.container` if set, otherwise `default-container`.
 
 ## `[workspace]`

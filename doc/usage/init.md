@@ -61,17 +61,49 @@ Then the repo half:
 ```
 [outrig] no repo config at .agents/outrig/config.toml -- let's create one.
 
+Configuring models
+[outrig] models available in your global config: fast (default: fast)
+? Would you like to configure LLM models specific to this repo? [Y/n]:
+? Model name [default: fast]:
+? Provider for this model [default: openai]:
+? Model identifier [default: gpt-4o-mini]:
+? Add another model? [y/N]:
+? Use this model as default-model? [Y/n]:
+
+Configuring your first agent
+? Agent name [default: coder]:
+? Preamble (one line, edit later) [default: You are a careful coding assistant.]:
+
+Configuring your first container
+? Container name [default: hello-outrig-standard]:
 ? Workspace host-path [default: .]:
 ? Workspace container-path [default: /workspace]:
-? Default agent name [default: coding]:
-? Override default-model for this agent? [y/N]:
-? Preamble (one line, edit later) [default: You are a careful coding assistant.]:
 
 [outrig] wrote .agents/outrig/config.toml
 ```
 
-The agent doesn't get its own `model` field unless you say "yes" to overriding the default --
-otherwise it inherits `default-model` from the global config.
+The default agent name is `coder` (a role-based constant). The default
+container-config name is `<repo-folder>-standard` (kebab-cased), so the container carries
+the repo's identity while the agent carries its role.
+
+The model section reads your global `~/.outrig/config.toml` and lists the available models.
+Answering "yes" walks the same model-definition prompts as `outrig config init`, except the
+new `[models.<name>]` entries land in the repo config (referencing the global providers).
+You can then optionally pin one as the repo's `default-model`. "No" inherits everything
+from the global config.
+
+If your global config has no providers, the section instead prints a hint to run
+`outrig config init` and skips the prompt -- the agent can't run without a provider.
+
+If you answer "no" to defining repo-specific models, outrig still offers to pin one of
+the global models as the repo's `default-model`. The default flips: when your global
+config has a `default-model`, declining makes sense (inherit it, default `[y/N]`); when
+it doesn't, picking is needed to avoid a config with no resolvable model (default
+`[Y/n]`).
+
+If no `default-model` is set anywhere -- globally or at the repo level -- the agent
+prompt forces an explicit `model` selection. That guarantees the resulting config
+validates and `outrig run` will work.
 
 Finally the container loop:
 
@@ -91,14 +123,14 @@ gathered.
 A minimal `.agents/outrig/config.toml` (containers will be filled in by `container add`):
 
 ```toml
-default-container = "coding"
-default-agent     = "coding"
+default-container = "hello-outrig-standard"
+default-agent     = "coder"
 
 [workspace]
 host-path      = "."
 container-path = "/workspace"
 
-[agents.coding]
+[agents.coder]
 # inherits default-model from the global config
 preamble = "You are a careful coding assistant."
 ```

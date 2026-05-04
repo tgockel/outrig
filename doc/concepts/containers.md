@@ -91,7 +91,7 @@ The `[containers.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
 ## Named container-configs
 
 You can declare multiple container-configs for the same repo and switch between them with
-`--container-config`:
+`--container`:
 
 ```toml
 default-container = "coding"
@@ -115,7 +115,7 @@ context    = ".agents/outrig/containers/planning"
 
 ```sh
 $ outrig run                              # uses default-container = "coding"
-$ outrig run --container-config planning  # different Dockerfile, different MCPs
+$ outrig run --container planning  # different Dockerfile, different MCPs
 ```
 
 This is useful when you want lighter-weight environments for different kinds of work -- e.g. a

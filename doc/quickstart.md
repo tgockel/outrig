@@ -61,21 +61,28 @@ and the available options.
 [outrig] wrote ~/.outrig/config.toml
 
 [outrig] no repo config at .agents/outrig/config.toml -- let's create one.
+
+Configuring models
+[outrig] models available in your global config: fast (default: fast)
+? Would you like to configure LLM models specific to this repo? [Y/n]: n
+? Set a default-model for this repo? [y/N]:
+
+Configuring your first agent
+? Agent name [default: coder]:
+? Preamble (one line) [default: You are a careful coding assistant.]:
+
+Configuring your first container
+? Container name [default: hello-outrig-standard]:
 ? Workspace host-path [default: .]:
 ? Workspace container-path [default: /workspace]:
-? Default agent name [default: coding]:
-? Override default-model for this agent? [y/N]:
-? Preamble (one line) [default: You are a careful coding assistant.]:
+
 [outrig] wrote .agents/outrig/config.toml
 
-[outrig] now scaffolding your first container...
-? Container-config name [default: coding]:
 ? Base image [default: debian:bookworm-slim]:
-? Language toolchains, comma-separated [default: ]: node
-? MCP servers, comma-separated [default: fs, shell]:
-[outrig] wrote .agents/outrig/containers/coding/Dockerfile
-[outrig] added [containers.coding] to .agents/outrig/config.toml
-[outrig] done -- try `outrig build` to verify.
+? Language toolchains [default: ]: node
+? MCP servers [default: fs, shell]:
+[outrig] wrote .agents/outrig/containers/hello-outrig-standard/Dockerfile
+[outrig] added [containers.hello-outrig-standard] to .agents/outrig/config.toml
 ```
 
 (In the transcript above we accepted most defaults by pressing Enter; only `node` was typed
@@ -91,7 +98,7 @@ hello-outrig/
     └── outrig/
         ├── config.toml
         └── containers/
-            └── coding/
+            └── hello-outrig-standard/
                 └── Dockerfile
 ```
 
@@ -124,27 +131,27 @@ identifier = "gpt-4o-mini"
 `.agents/outrig/config.toml`:
 
 ```toml
-default-container = "coding"
-default-agent     = "coding"
+default-container = "hello-outrig-standard"
+default-agent     = "coder"
 
 [workspace]
 host-path      = "."
 container-path = "/workspace"
 
-[agents.coding]
+[agents.coder]
 # model omitted -> falls back to default-model = "fast"
 preamble = "You are a careful coding assistant."
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[containers.hello-outrig-standard]
+dockerfile = ".agents/outrig/containers/hello-outrig-standard/Dockerfile"
+context    = ".agents/outrig/containers/hello-outrig-standard"
 
-  [containers.coding.mcp]
+  [containers.hello-outrig-standard.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec mcp-server-shell"]
 ```
 
-`.agents/outrig/containers/coding/Dockerfile` (excerpt):
+`.agents/outrig/containers/hello-outrig-standard/Dockerfile` (excerpt):
 
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
@@ -170,9 +177,9 @@ to verify and keeps the first run snappy:
 
 ```sh
 $ outrig build
-[outrig] container-config: coding
-[outrig] dockerfile:       .agents/outrig/containers/coding/Dockerfile
-[outrig] context:          .agents/outrig/containers/coding
+[outrig] container-config: hello-outrig-standard
+[outrig] dockerfile:       .agents/outrig/containers/hello-outrig-standard/Dockerfile
+[outrig] context:          .agents/outrig/containers/hello-outrig-standard
 [outrig] cache key:        outrig-cache:8c2a4f7e91d6b5a3
 [buildah] STEP 1/N: FROM docker.io/library/debian:bookworm-slim
 ...
@@ -196,8 +203,8 @@ $ OPENAI_API_KEY=sk-... outrig run
 Diagnostics arrive on stderr:
 
 ```
-[outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
-[outrig] container-config:  coding
+[outrig] agent:             coder (model: fast / provider: openai / gpt-4o-mini)
+[outrig] container-config:  hello-outrig-standard
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260502T103412-3f2a
 [outrig] mcp fs:    initialized (3 tools)
@@ -274,8 +281,8 @@ b41af3a append agent line
 12c0a99 add outrig config
 
 $ outrig ls
-ID                       STARTED              DURATION  CONTAINER  EXIT
-20260502T103412-3f2a    2026-05-02 10:34:12  2m18s     coding     0
+ID                       STARTED              DURATION  CONTAINER              EXIT
+20260502T103412-3f2a    2026-05-02 10:34:12  2m18s     hello-outrig-standard  0
 ```
 
 If you don't like what the agent did, the rollback is whatever you'd normally do with git:

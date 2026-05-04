@@ -21,33 +21,24 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Scripted stdin for an "all defaults" walk through every prompt.
 ///
 /// Phase 1 -- global config (`config::init::run_with`, 11 prompts):
-///   1.  provider style       -> openai (default)
-///   2.  provider name        -> openai (default)
-///   3.  base URL             -> https://api.openai.com/v1 (default)
-///   4.  API key env-var      -> OPENAI_API_KEY (default)
-///   5.  add another provider -> n (default)
-///   6.  define a model       -> Y (default)
-///   7.  model name           -> fast (default)
-///   8.  provider for model   -> openai (default)
-///   9.  model identifier     -> gpt-4o-mini (default)
-///   10. add another model    -> n (default)
-///   11. use as default-model -> Y (default)
+///   provider style/name/url/env-var, no extra provider,
+///   define-a-model + model name/provider/identifier, no extra model,
+///   use-as-default-model.
 ///
-/// Phase 2 -- repo config (`init::repo::ensure`, 5 prompts):
-///   12. workspace host-path  -> .             (default)
-///   13. workspace ctnr-path  -> /workspace    (default)
-///   14. default agent name   -> coding        (default)
-///   15. override default-mod -> N             (default)
-///   16. preamble             -> "..." (default)
+/// Phase 2 -- repo config (`init::repo::ensure`, 11 prompts when global
+/// has providers + models):
+///   configure-repo-models (Y) -> model name/provider/identifier,
+///   add-another-model (N), use-as-default-model (Y),
+///   agent name, preamble,
+///   container name, workspace host-path, container-path.
 ///
-/// Phase 3 -- container loop (1 + 4 + 1 prompts):
-///   17. add first container? -> Y (default)
-///   18. container name       -> coding (default)
-///   19. base image           -> debian:bookworm-slim (default)
-///   20. toolchains           -> []      (default)
-///   21. mcp servers          -> [fs]    (default)
-///   22. add another?         -> N (default)
-const ALL_DEFAULTS: &[u8] = b"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
+/// Phase 3 -- container loop (4 prompts): base image, toolchains, mcp
+/// servers, add-another (N). The container name was asked during
+/// bootstrap and threaded into `container::add::run_with`; the
+/// "add-first" gate is skipped when phase 2 bootstrapped a container.
+///
+/// Total: 11 + 11 + 4 = 26 newlines.
+const ALL_DEFAULTS: &[u8] = b"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
 
 #[tokio::test]
 async fn fresh_state_writes_global_repo_and_container() {
@@ -77,21 +68,26 @@ async fn fresh_state_writes_global_repo_and_container() {
     let repo_cfg_path = cwd.join(".agents/outrig/config.toml");
     assert!(repo_cfg_path.is_file(), "repo config not written");
 
-    let dockerfile = cwd.join(".agents/outrig/containers/coding/Dockerfile");
+    // Container name default = `<repo-folder-kebab>-standard` (== "repo-standard").
+    // Agent name default = "coder" (constant, role-based).
+    let dockerfile = cwd.join(".agents/outrig/containers/repo-standard/Dockerfile");
     assert!(dockerfile.is_file(), "container Dockerfile not written");
 
     // Merged validation (with repo_root) succeeds: containers reference
     // existing dockerfile/context paths, default-* keys resolve, etc.
     let merged = Config::load(&cwd, Some(&global)).expect("merged config must load");
-    assert_eq!(merged.default_container.as_deref(), Some("coding"));
-    assert_eq!(merged.default_agent.as_deref(), Some("coding"));
+    assert_eq!(merged.default_container.as_deref(), Some("repo-standard"));
+    assert_eq!(merged.default_agent.as_deref(), Some("coder"));
     assert_eq!(merged.default_model.as_deref(), Some("fast"));
 
     // Repo config carries the agent + workspace + container-loop output.
     let repo_text = std::fs::read_to_string(&repo_cfg_path).unwrap();
-    assert!(repo_text.contains("[agents.coding]"), "{repo_text}");
+    assert!(repo_text.contains("[agents.coder]"), "{repo_text}");
     assert!(repo_text.contains("[workspace]"), "{repo_text}");
-    assert!(repo_text.contains("[containers.coding]"), "{repo_text}");
+    assert!(
+        repo_text.contains("[containers.repo-standard]"),
+        "{repo_text}"
+    );
 }
 
 #[tokio::test]
@@ -114,7 +110,7 @@ async fn idempotent_rerun_leaves_files_untouched() {
     let global_before = std::fs::read_to_string(&global).unwrap();
     let repo_cfg_path = cwd.join(".agents/outrig/config.toml");
     let repo_before = std::fs::read_to_string(&repo_cfg_path).unwrap();
-    let dockerfile_path = cwd.join(".agents/outrig/containers/coding/Dockerfile");
+    let dockerfile_path = cwd.join(".agents/outrig/containers/repo-standard/Dockerfile");
     let dockerfile_before = std::fs::read_to_string(&dockerfile_path).unwrap();
 
     // Re-run: only the container-loop prompt fires (answer "no") -- both
@@ -167,10 +163,13 @@ async fn skips_global_phase_when_global_exists() {
                       identifier = \"gpt-4o-mini\"\n";
     std::fs::write(&global, pre_global).unwrap();
 
-    // Script: phase 1 is skipped entirely. Phase 2 takes 5 defaults; phase
-    // 3 takes 1 (add first?) + 4 (container add prompts) + 1 (add another?
-    // n) = 6 prompts. Total 11.
-    let script = b"\n\n\n\n\n\n\n\n\n\n\n";
+    // Script: phase 1 is skipped entirely. Phase 2 takes 11 defaults
+    // (configure-repo-models=Y + model name/provider/identifier +
+    // add-another=N + use-as-default=Y, agent x2, container name,
+    // workspace x2); phase 3 takes 4 (base image, toolchains, mcp,
+    // add-another -- the add-first gate is skipped after bootstrap).
+    // Total 15.
+    let script = b"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
 
     timeout(
@@ -188,7 +187,7 @@ async fn skips_global_phase_when_global_exists() {
     );
     assert!(cwd.join(".agents/outrig/config.toml").is_file());
     assert!(
-        cwd.join(".agents/outrig/containers/coding/Dockerfile")
+        cwd.join(".agents/outrig/containers/repo-standard/Dockerfile")
             .is_file()
     );
 

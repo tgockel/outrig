@@ -13,7 +13,7 @@ starting an agent session. It's useful for:
 ## Synopsis
 
 ```
-outrig build [--container-config <name>]
+outrig build [--container <name>]
              [--config <path>]
              [--no-cache]
              [--all]
@@ -21,7 +21,7 @@ outrig build [--container-config <name>]
 
 | Flag                        | Default             | Notes                                                              |
 |-----------------------------|---------------------|--------------------------------------------------------------------|
-| `--container-config <name>` | `default-container` | Build a specific named container-config.                           |
+| `--container <name>` | `default-container` | Build a specific named container-config.                           |
 | `--all`                     | off                 | Build every container-config defined in the config file.           |
 | `--config <path>`           | walks up from cwd   | Use a non-default config path.                                     |
 | `--no-cache`                | off                 | Force rebuild even on cache hit. Passes `--no-cache` to `buildah`. |
@@ -66,7 +66,7 @@ $ outrig build
 Build a specific container-config:
 
 ```sh
-$ outrig build --container-config planning
+$ outrig build --container planning
 [outrig] container-config: planning
 ...
 [outrig] image ready

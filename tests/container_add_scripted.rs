@@ -192,25 +192,32 @@ async fn force_replaces_both_atomically() {
 async fn fallback_yes_bootstraps_repo_config() {
     // tempdir lands under TMPDIR, outside any outrig-configured tree, so
     // `find_repo_root_from` walks all the way up and returns NoRepoConfig.
+    // Use a named subdirectory so the folder-derived default name is
+    // deterministic (`myproj-standard`).
     let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("myproj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
 
-    // Script: configure-now (Y) + 5 repo-config defaults + 4 container-add
-    // defaults (name "coding", base, toolchains, mcp) = 10 prompts.
-    let script = b"\n\n\n\n\n\n\n\n\n\n";
+    // Script: configure-now (Y) + 5 repo-config defaults (container name,
+    // workspace x2, agent name, preamble; the model section is
+    // informational only when the global config is missing) + 3
+    // container-add defaults (base, toolchains, mcp -- name was already
+    // asked during bootstrap) = 9 prompts.
+    let script = b"\n\n\n\n\n\n\n\n\n";
     let (mut prompt, _stderr) = scripted_prompt(script).await;
 
     timeout(TEST_TIMEOUT, async {
-        let repo_root = resolve_or_bootstrap(tmp.path(), &mut prompt).await?;
-        run_with(&repo_root, None, false, &mut prompt).await
+        let (repo_root, bootstrapped_name) =
+            resolve_or_bootstrap(&cwd, &global, &mut prompt).await?;
+        run_with(&repo_root, bootstrapped_name, false, &mut prompt).await
     })
     .await
     .expect("fallback flow must not hang")
     .expect("fallback flow must succeed");
 
-    let cfg_path = tmp.path().join(".agents/outrig/config.toml");
-    let dockerfile = tmp
-        .path()
-        .join(".agents/outrig/containers/coding/Dockerfile");
+    let cfg_path = cwd.join(".agents/outrig/config.toml");
+    let dockerfile = cwd.join(".agents/outrig/containers/myproj-standard/Dockerfile");
     assert!(cfg_path.is_file(), "repo config not bootstrapped");
     assert!(dockerfile.is_file(), "container Dockerfile not written");
 
@@ -220,24 +227,28 @@ async fn fallback_yes_bootstraps_repo_config() {
     let cfg = Config::load_from_str(&std::fs::read_to_string(&cfg_path).unwrap())
         .expect("repo config must parse");
 
-    assert_eq!(cfg.default_container.as_deref(), Some("coding"));
-    assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
-    assert!(cfg.containers.contains_key("coding"));
-    assert!(cfg.agents.contains_key("coding"));
+    assert_eq!(cfg.default_container.as_deref(), Some("myproj-standard"));
+    assert_eq!(cfg.default_agent.as_deref(), Some("coder"));
+    assert!(cfg.containers.contains_key("myproj-standard"));
+    assert!(cfg.agents.contains_key("coder"));
 }
 
 #[tokio::test]
 async fn fallback_no_returns_no_repo_config() {
     let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("global.toml");
 
     // Script: configure now? -> n. No further prompts should be consumed.
     let script = b"n\n";
     let (mut prompt, _stderr) = scripted_prompt(script).await;
 
-    let err = timeout(TEST_TIMEOUT, resolve_or_bootstrap(tmp.path(), &mut prompt))
-        .await
-        .expect("fallback must not hang")
-        .expect_err("declining the prompt must error");
+    let err = timeout(
+        TEST_TIMEOUT,
+        resolve_or_bootstrap(tmp.path(), &global, &mut prompt),
+    )
+    .await
+    .expect("fallback must not hang")
+    .expect_err("declining the prompt must error");
 
     assert!(
         matches!(err, OutrigError::NoRepoConfig),

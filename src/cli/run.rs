@@ -40,8 +40,8 @@ pub struct RunArgs {
 
     /// Pick a `[containers.<name>]` block. Overrides the agent's `container`
     /// and the top-level `default-container`.
-    #[arg(long = "container-config", value_name = "NAME")]
-    pub container_config: Option<String>,
+    #[arg(long, value_name = "NAME")]
+    pub container: Option<String>,
 
     /// Write the session into an explicit, already-existing directory. The
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
@@ -69,14 +69,13 @@ pub async fn execute(
     let resolved = llm::resolve_agent(&cfg, agent_name)?;
 
     let container_name = args
-        .container_config
+        .container
         .as_deref()
         .or(resolved.container.as_deref())
         .or(cfg.default_container.as_deref())
         .ok_or_else(|| {
             OutrigError::Configuration(
-                "no --container-config, agent.container, or default-container configured"
-                    .to_string(),
+                "no --container, agent.container, or default-container configured".to_string(),
             )
         })?;
     let container_cfg = cfg.containers.get(container_name).ok_or_else(|| {

@@ -11,8 +11,9 @@ the rest of the group (`container ls`, `container rm`) is reserved for later.
 `[containers.<name>.mcp]` blocks to your repo's `config.toml`.
 
 Run it any time you want to add a container-config -- e.g., a `planning` config alongside
-`coding`. [`outrig init`](init.md) calls `container add` in a loop for the first (and any
-further) containers you create during initial setup.
+the `<repo>-standard` one [`outrig init`](init.md) creates by default. `init` calls
+`container add` in a loop for the first (and any further) containers you create during
+initial setup.
 
 ### Bootstrapping a fresh repo
 
@@ -44,17 +45,20 @@ outrig container add [<name>] [--force]
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
 Enter at any prompt for an explanation of what's being asked plus the available options.
+The default container-config name is `<repo-folder>-standard` (kebab-cased), so the example
+below assumes a `hello-outrig` repo.
 
 ```sh
+$ cd hello-outrig
 $ outrig container add
-? Container-config name [default: coding]:
+? Container-config name [default: hello-outrig-standard]:
 ? Base image [default: debian:bookworm-slim]:
-? Language toolchains, comma-separated [default: ]: rust, node
-? MCP servers, comma-separated [default: fs]:
+? Language toolchains [default: ]: rust, node
+? MCP servers [default: fs]:
 
-[outrig] wrote .agents/outrig/containers/coding/Dockerfile
-[outrig] added [containers.coding] block to .agents/outrig/config.toml
-[outrig] added [containers.coding.mcp] entries: fs
+[outrig] wrote .agents/outrig/containers/hello-outrig-standard/Dockerfile
+[outrig] added [containers.hello-outrig-standard] block to .agents/outrig/config.toml
+[outrig] added [containers.hello-outrig-standard.mcp] entries: fs
 
 Next: try `outrig build` to verify the image builds, then `outrig run`.
 ```
@@ -65,7 +69,7 @@ by hand, not an exhaustive Dockerfile generator.
 ### Help at any prompt
 
 ```
-? Language toolchains, comma-separated [default: ]: ?
+? Language toolchains [default: ]: ?
 
   Pick zero or more language toolchains to install in the image. The Dockerfile
   template adds the corresponding install steps; you can edit the file afterwards.
@@ -78,7 +82,7 @@ by hand, not an exhaustive Dockerfile generator.
 
   See: doc/usage/container.md#known-toolchains
 
-? Language toolchains, comma-separated [default: ]:
+? Language toolchains [default: ]:
 ```
 
 ### Known toolchains
@@ -111,7 +115,7 @@ editing the `[containers.<name>.mcp]` block directly -- see
 
 ### What gets written
 
-`.agents/outrig/containers/coding/Dockerfile` (excerpt):
+`.agents/outrig/containers/hello-outrig-standard/Dockerfile` (excerpt):
 
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
@@ -146,11 +150,11 @@ matching your host UID/GID at run time (see
 Appended to `.agents/outrig/config.toml`:
 
 ```toml
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[containers.hello-outrig-standard]
+dockerfile = ".agents/outrig/containers/hello-outrig-standard/Dockerfile"
+context    = ".agents/outrig/containers/hello-outrig-standard"
 
-  [containers.coding.mcp]
+  [containers.hello-outrig-standard.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
 
@@ -160,8 +164,9 @@ Without `--force`, outrig refuses if either the Dockerfile path or the config bl
 exists for that name:
 
 ```
-$ outrig container add coding
-error: .agents/outrig/containers/coding/Dockerfile already exists; pass --force to overwrite.
+$ outrig container add hello-outrig-standard
+error: .agents/outrig/containers/hello-outrig-standard/Dockerfile
+       already exists; pass --force to overwrite.
 ```
 
 With `--force`, the Dockerfile is replaced and the `[containers.<name>]` block is rewritten in
