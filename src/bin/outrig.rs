@@ -45,8 +45,8 @@ enum Cmd {
     Config(ConfigArgs),
     /// Interactively set up global + repo config.
     Init,
-    /// Scaffold a new container-config.
-    InitContainer,
+    /// Manage container-configs.
+    Container(ContainerArgs),
     /// List sessions newest-first under the session root.
     Ls(LsArgs),
     /// Print or follow a session's MCP-server stderr.
@@ -66,6 +66,24 @@ enum ConfigCmd {
     /// Interactively write the global config (`~/.outrig/config.toml`).
     Init {
         /// Overwrite an existing global config.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct ContainerArgs {
+    #[command(subcommand)]
+    cmd: ContainerCmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum ContainerCmd {
+    /// Scaffold a new container-config (Dockerfile + `[containers.<name>]`).
+    Add {
+        /// Container-config name. Prompted if omitted.
+        name: Option<String>,
+        /// Overwrite an existing Dockerfile / config block of this name.
         #[arg(long)]
         force: bool,
     },
@@ -120,7 +138,21 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             }
         },
         Cmd::Init => Err(OutrigError::NotImplemented("init")),
-        Cmd::InitContainer => Err(OutrigError::NotImplemented("init-container")),
+        Cmd::Container(args) => match &args.cmd {
+            ContainerCmd::Add { name, force } => {
+                let cwd = std::env::current_dir()?;
+                let repo_root = repo::find_repo_root_from(&cwd)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(outrig::container::add::run(
+                    &repo_root,
+                    name.clone(),
+                    *force,
+                ))?;
+                Ok(0)
+            }
+        },
         Cmd::Ls(args) => {
             let (cwd, global, runtime) = session_cmd_ctx(cli)?;
             let session_root = cli.session_root.as_deref();

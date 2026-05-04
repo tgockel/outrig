@@ -10,11 +10,9 @@
 //! an arbitrary `PromptSource` and target path.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use tempfile::NamedTempFile;
 
 use crate::config::api_key::ApiKeyRef;
 use crate::config::{LlmProvider, Model};
@@ -52,7 +50,7 @@ pub async fn run_with(force: bool, path: &Path, prompt: &mut impl PromptSource) 
     let default_model = prompt_default_model(prompt, &models).await?;
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
-    write_atomic(path, &toml_text)?;
+    repo::write_atomic(path, &toml_text)?;
     Ok(())
 }
 
@@ -399,18 +397,6 @@ fn render(
     };
     toml::to_string_pretty(&view)
         .map_err(|e| OutrigError::Configuration(format!("rendering global config: {e}")))
-}
-
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        OutrigError::Configuration(format!("path has no parent: {}", path.display()))
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = NamedTempFile::new_in(parent)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)?;
-    Ok(())
 }
 
 fn blank_to_none(s: String) -> Option<String> {

@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase F -- interactive scaffolding
 
-- **[0031](0031-container-add.md)** `outrig container add` with Dockerfile templates.
 - **[0033](0033-init.md)** `outrig init` orchestrator (idempotent; loops `container add`).
 
 ## Phase G -- build, CI, end-to-end

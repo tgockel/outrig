@@ -4,30 +4,18 @@
 //! against a tempdir-rooted target path. Each test verifies the resulting file
 //! parses + validates with the 0005 loader.
 
+mod common;
+
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, BufReader, DuplexStream, duplex};
 use tokio::time::timeout;
 
 use outrig::config::Config;
 use outrig::config::init::run_with;
-use outrig::init::prompt::TerminalPrompt;
 
-const BUF: usize = 4096;
+use common::scripted_prompt;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-
-type ScriptedPrompt = TerminalPrompt<BufReader<DuplexStream>, DuplexStream>;
-
-async fn scripted_prompt(script: &[u8]) -> (ScriptedPrompt, DuplexStream) {
-    let (mut stdin_w, stdin_r) = duplex(BUF);
-    let (stderr_w, stderr_r) = duplex(BUF);
-    stdin_w.write_all(script).await.unwrap();
-    drop(stdin_w);
-    (
-        TerminalPrompt::new(BufReader::new(stdin_r), stderr_w),
-        stderr_r,
-    )
-}
 
 #[tokio::test]
 async fn writes_minimal_openai_config() {

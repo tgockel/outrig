@@ -1,8 +1,5 @@
 # `outrig container`
 
-> **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
-> behavior; the implementation isn't ready yet.
-
 `outrig container` groups commands that manage container-configs (the named Dockerfile +
 MCP-server bundles agents run inside). In v0 only `outrig container add` is implemented;
 the rest of the group (`container ls`, `container rm`) is reserved for later.
@@ -38,11 +35,11 @@ $ outrig container add
 ? Container-config name [default: coding]:
 ? Base image [default: debian:bookworm-slim]:
 ? Language toolchains, comma-separated [default: ]: rust, node
-? MCP servers, comma-separated [default: fs, shell]:
+? MCP servers, comma-separated [default: fs]:
 
 [outrig] wrote .agents/outrig/containers/coding/Dockerfile
 [outrig] added [containers.coding] block to .agents/outrig/config.toml
-[outrig] added [containers.coding.mcp] entries: fs, shell
+[outrig] added [containers.coding.mcp] entries: fs
 
 Next: try `outrig build` to verify the image builds, then `outrig run`.
 ```
@@ -85,14 +82,13 @@ You can pick more than one. The Dockerfile is a starting point -- edit it freely
 
 ### Known MCP servers
 
-| Choice  | Package installed                         | Default `[mcp]` entry                                      |
-|---------|-------------------------------------------|------------------------------------------------------------|
-| `fs`    | `@modelcontextprotocol/server-filesystem` | `["mcp-server-filesystem", "/workspace"]`                  |
-| `shell` | `mcp-server-shell`                        | `["bash", "-lc", "exec mcp-server-shell"]`                 |
-| `git`   | `mcp-server-git`                          | `{ command = ["mcp-server-git", "--repo", "/workspace"] }` |
+- **`fs`** -- installs `@modelcontextprotocol/server-filesystem` from npm; default
+  `[mcp]` entry: `{ command = ["mcp-server-filesystem", "/workspace"] }`.
+- **`git`** -- installs `mcp-server-git` from PyPI; default `[mcp]` entry:
+  `{ command = ["mcp-server-git", "--repo", "/workspace"] }`.
 
-Picking `fs` and `shell` covers most coding workflows. Add more later by editing the
-`[containers.<name>.mcp]` block directly -- see
+`fs` is the default. Add `git` for repo-aware tools, or wire up additional servers by
+editing the `[containers.<name>.mcp]` block directly -- see
 [Concepts -> MCP Servers](../concepts/mcp-servers.md).
 
 > **TODO: Incomplete** -- the catalogue of "known MCP servers" will grow as the ecosystem does.
@@ -112,16 +108,16 @@ RUN apt-get update \
 
 # rust toolchain
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-       | sh -s -- -y --default-toolchain stable
+       | sh -s -- -y --default-toolchain stable --profile default
+ENV PATH=/root/.cargo/bin:$PATH
 
 # node toolchain
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && apt-get install -y nodejs \
+ && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/*
 
 # MCP servers
-RUN npm install -g @modelcontextprotocol/server-filesystem \
- && npm install -g mcp-server-shell
+RUN npm install -g @modelcontextprotocol/server-filesystem
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
@@ -140,8 +136,7 @@ dockerfile = ".agents/outrig/containers/coding/Dockerfile"
 context    = ".agents/outrig/containers/coding"
 
   [containers.coding.mcp]
-  fs    = { command = ["mcp-server-filesystem", "/workspace"] }
-  shell = ["bash", "-lc", "exec mcp-server-shell"]
+  fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
 
 ### Re-running

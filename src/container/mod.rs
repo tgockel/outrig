@@ -1,4 +1,5 @@
-//! Container lifecycle: start, stop, cleanup.
+//! Container lifecycle: start, stop, cleanup. Plus the [`add`] /
+//! [`render`] submodules that scaffold new container-configs.
 //!
 //! Wraps `podman run`/`podman stop`/`podman rm` so callers get a typed
 //! [`Container`] handle instead of poking podman directly. Cleanup is
@@ -10,6 +11,11 @@
 //!    cancelled, an `?` propagated past the handle).
 //! 3. [`install_panic_hook`] -- last-resort sweep over [`TRACKED`] when
 //!    the process is unwinding from a panic and `Drop` cannot run.
+
+pub mod add;
+pub mod render;
+
+pub use add::DOC_SYNC_FIELDS;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

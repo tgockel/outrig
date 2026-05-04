@@ -1,12 +1,15 @@
 //! Repo discovery and `.agents/outrig/` path resolution.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use directories::{BaseDirs, ProjectDirs};
+use tempfile::NamedTempFile;
 
 use crate::error::{OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
+const CONTAINERS_REL: &str = ".agents/outrig/containers";
 const GLOBAL_CONFIG_FILE: &str = "config.toml";
 const GLOBAL_HOME_DIR: &str = ".outrig";
 const GLOBAL_XDG_DIR: &str = "outrig";
@@ -31,6 +34,35 @@ pub fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
 
 pub fn repo_config_path(root: &Path) -> PathBuf {
     root.join(REPO_CONFIG_REL)
+}
+
+/// Per-`container add` build directory:
+/// `<root>/.agents/outrig/containers/<name>/`. Used by `outrig container add`
+/// to compute the Dockerfile path.
+pub fn container_dir(root: &Path, name: &str) -> PathBuf {
+    root.join(CONTAINERS_REL).join(name)
+}
+
+/// Same as [`container_dir`] but relative to the repo root, suitable for
+/// embedding in `[containers.<name>]` config entries (where paths are
+/// always repo-relative).
+pub fn container_dir_rel(name: &str) -> PathBuf {
+    Path::new(CONTAINERS_REL).join(name)
+}
+
+/// Write `contents` to `path` atomically, creating parent directories as
+/// needed. Goes through `tempfile::NamedTempFile::persist` so an interrupted
+/// write never leaves a half-written file behind.
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        OutrigError::Configuration(format!("path has no parent: {}", path.display()))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    Ok(())
 }
 
 /// Inverse of [`repo_config_path`]: given the path

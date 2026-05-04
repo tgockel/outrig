@@ -58,3 +58,43 @@ repo `config.toml` while preserving the surrounding TOML.
   fragment uses `curl + sh -c rustup-init` regardless of base image.
 - The TOML append should be careful: if the user has hand-edited their `config.toml`, we don't
   want to disturb their formatting. `toml_edit` preserves whitespace and comments.
+
+## Decisions
+
+- **MCP catalogue reconciled to real packages.** The doc listed `mcp-server-shell` and
+  `mcp-server-git` as `npm install`-able, but neither package exists on npm under those
+  names. v0 ships `fs` (npm `@modelcontextprotocol/server-filesystem`) and `git`
+  (PyPI `mcp-server-git`); `shell` is dropped until a real package exists. The docs
+  table, transcript, and Dockerfile excerpt in `doc/usage/container.md` were updated
+  to match. The default selection became `[fs]` (down from `[fs, shell]`).
+- **Per-(family, toolchain) fragments** instead of toolchain-only fragments.
+  Two families -- `debian` (apt-based: debian, ubuntu, node:20-bookworm-slim,
+  python:3.12-slim) and `alpine` (apk). Even though `rust` and `go` are
+  cross-platform via `curl + script`, splitting per family keeps every fragment
+  in the same shape and avoids the lone "this one is cross-platform" exception.
+  Net 11 template files (2 headers + 4 toolchains x 2 families + 1 footer).
+- **Runtime ensure-install in the MCP block.** If the user picks an MCP server
+  whose runtime isn't already provided by the base image or selected toolchains
+  (e.g. `fs` on `debian:bookworm-slim` with no `node` toolchain), `mcp_block`
+  prepends a small `apt-get install nodejs npm` (or `apk add ...`) so the
+  resulting Dockerfile builds without the user having to also pick the toolchain.
+- **`pip install --break-system-packages`** for `git`. PEP 668 protects system
+  Python on Debian 3.11+; opting in is correct here because the entire image
+  exists to run that one binary, and a venv adds `PATH`/launcher complexity for
+  no upside.
+- **`write_atomic` extracted to `repo`**. Was private to `src/config/init.rs`;
+  hoisted to `pub(crate) fn repo::write_atomic` so `container::add` can call it
+  too. `src/config/init.rs` now delegates.
+- **`Cmd::InitContainer` removed**, replaced by `Cmd::Container(ContainerArgs)`
+  with `ContainerCmd::Add { name, force }` (mirroring `Cmd::Config`). The old
+  variant was a `NotImplemented` stub.
+- **`toml_edit` Document mutation** preserves comments and surrounding tables on
+  `--force` replacement. `tests/container_add_scripted.rs::force_preserves_unrelated_blocks_and_comments`
+  is the explicit gate.
+- **Shared `tests/common::scripted_prompt`**. The `tokio::io::duplex` helper used
+  by `container_add_scripted.rs` was identical to one in `config_init_scripted.rs`;
+  hoisted to `tests/common/mod.rs` and both call sites updated.
+- **`DEFAULT_MCP_INDEX = 0` const + `const _: ()` assertion.** The default
+  selection for the MCP multi-select (`fs`) is the first variant in
+  `McpServer::ALL`. The compile-time assertion guards against a future reorder
+  silently changing the default.

@@ -20,6 +20,7 @@ static EXAMPLE_FIELD: Field = Field {
 fn all_fields() -> Vec<&'static Field> {
     let mut v: Vec<&'static Field> = vec![&EXAMPLE_FIELD];
     v.extend(outrig::config::init::DOC_SYNC_FIELDS.iter().copied());
+    v.extend(outrig::container::DOC_SYNC_FIELDS.iter().copied());
     v
 }
 
