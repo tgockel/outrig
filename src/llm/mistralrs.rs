@@ -69,7 +69,7 @@ pub(crate) async fn load(
     model_name: &str,
     model_id: Option<&str>,
     model_path: Option<&Path>,
-    model_file: Option<&str>,
+    model_file: Option<&[String]>,
     revision: Option<&str>,
     context_length: Option<u32>,
     cache_root: &Path,
@@ -81,26 +81,26 @@ pub(crate) async fn load(
         source,
     };
 
-    let (quantized_model_id, quantized_filename, hf_revision, identifier) = match (
+    let (quantized_model_id, quantized_filenames, hf_revision, identifier) = match (
         model_id, model_path,
     ) {
         (Some(id), None) => {
-            let file = model_file.ok_or_else(|| {
+            let files = model_file.filter(|s| !s.is_empty()).ok_or_else(|| {
                 load_err(anyhow::anyhow!(
-                    "model-file is required for HF model-id loads; pick a specific GGUF \
-                         filename inside the repo"
+                    "internal: validate.rs should have required model-file when \
+                     model-id is set"
                 ))
             })?;
             info!(
                 model = model_name,
                 model_id = id,
-                model_file = file,
+                model_files = ?files,
                 revision = revision.unwrap_or("main"),
                 "downloading and loading GGUF model",
             );
             (
                 id.to_string(),
-                file.to_string(),
+                files.to_vec(),
                 revision.map(str::to_string),
                 id.to_string(),
             )
@@ -125,7 +125,7 @@ pub(crate) async fn load(
             );
             (
                 parent.to_string_lossy().into_owned(),
-                basename.to_string(),
+                vec![basename.to_string()],
                 None,
                 basename.to_string(),
             )
@@ -143,7 +143,7 @@ pub(crate) async fn load(
         None,
         None,
         quantized_model_id,
-        vec![quantized_filename],
+        quantized_filenames,
         GGUFSpecificConfig::default(),
         false,
         None,

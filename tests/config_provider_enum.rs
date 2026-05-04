@@ -24,7 +24,26 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
 }
 
 #[test]
-fn mistralrs_with_model_id_parses_and_validates() {
+fn mistralrs_with_model_id_and_file_parses_and_validates() {
+    let cfg = parse(
+        r#"
+[providers.local]
+style = "mistralrs"
+
+[models.qwen]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+"#,
+    );
+    cfg.validate(None).expect("validates");
+    let serialized = toml::to_string(&cfg).expect("serializes");
+    let again = Config::load_from_str(&serialized).expect("reserialized parses");
+    assert_eq!(cfg, again);
+}
+
+#[test]
+fn mistralrs_model_id_without_model_file_fails_validate() {
     let cfg = parse(
         r#"
 [providers.local]
@@ -35,10 +54,16 @@ provider = "local"
 model-id = "Qwen/Qwen2.5-7B-Instruct"
 "#,
     );
-    cfg.validate(None).expect("validates");
-    let serialized = toml::to_string(&cfg).expect("serializes");
-    let again = Config::load_from_str(&serialized).expect("reserialized parses");
-    assert_eq!(cfg, again);
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::MistralrsModelIdMissingFile {
+                ref model, ref model_id,
+            } if model == "qwen" && model_id == "Qwen/Qwen2.5-7B-Instruct"
+        ),
+        "got: {err:?}",
+    );
 }
 
 #[test]

@@ -130,7 +130,7 @@ srv = { command = ["bin", "arg1"] }
         );
         assert_eq!(
             phi3.model_file.as_deref(),
-            Some("Phi-3-mini-4k-instruct-q4.gguf")
+            Some(&["Phi-3-mini-4k-instruct-q4.gguf".to_string()][..])
         );
         let llama = &cfg.models["llama-local"];
         assert_eq!(llama.provider, "local");

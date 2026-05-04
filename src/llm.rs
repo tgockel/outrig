@@ -101,7 +101,7 @@ pub enum ResolvedProvider {
 pub struct MistralrsWeights {
     pub model_id: Option<String>,
     pub model_path: Option<PathBuf>,
-    pub model_file: Option<String>,
+    pub model_file: Option<Vec<String>>,
     pub revision: Option<String>,
     pub context_length: Option<u32>,
 }

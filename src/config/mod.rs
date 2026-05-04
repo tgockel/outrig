@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::ApiKeyRef;
 pub use merge::merge;
@@ -111,8 +111,12 @@ pub struct Model {
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_file: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_vec_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_file: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,4 +183,30 @@ impl McpServerSpec {
             Self::Full { command, env } => (command.clone(), env.clone()),
         }
     }
+}
+
+/// Accepts `model-file = "x.gguf"` *or* `model-file = ["a.gguf", "b.gguf"]`
+/// during deserialization, normalizing to `Vec<String>`. The single-string
+/// form keeps configs from before this field went multi (split-quantization
+/// shards) parsing without a hand edit; the array form is what the init
+/// flow writes today.
+fn deserialize_string_or_vec_string<'de, D>(
+    d: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Multi(Vec<String>),
+    }
+
+    Option::<StringOrVec>::deserialize(d).map(|opt| {
+        opt.map(|v| match v {
+            StringOrVec::Single(s) => vec![s],
+            StringOrVec::Multi(ss) => ss,
+        })
+    })
 }

@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod container;
 pub mod error;
+pub mod hf;
 pub mod image;
 pub mod init;
 pub mod llm;

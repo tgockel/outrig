@@ -81,6 +81,12 @@ pub enum ConfigValidationError {
     )]
     MistralrsExtraFieldRequiresModelId { model: String, field: &'static str },
 
+    #[error(
+        "model {model:?} (provider style=mistralrs) sets model-id={model_id:?} \
+         but no model-file; pick a specific GGUF filename inside the repo"
+    )]
+    MistralrsModelIdMissingFile { model: String, model_id: String },
+
     #[error("model {model:?} (provider style=mistralrs) model-path {path:?} does not exist")]
     MistralrsModelPathMissing { model: String, path: PathBuf },
 
@@ -269,12 +275,25 @@ fn validate_mistralrs_model(
         _ => {}
     }
 
+    if let Some(id) = model.model_id.as_deref()
+        && model.model_file.as_ref().is_none_or(|v| v.is_empty())
+    {
+        return Err(ConfigValidationError::MistralrsModelIdMissingFile {
+            model: model_name.to_string(),
+            model_id: id.to_string(),
+        });
+    }
+
     if model.model_id.is_none() {
-        for (value, field) in [
-            (model.model_file.as_deref(), "model-file"),
-            (model.revision.as_deref(), "revision"),
-        ] {
-            if value.is_some() {
+        let extras: [(bool, &'static str); 2] = [
+            (
+                model.model_file.as_ref().is_some_and(|v| !v.is_empty()),
+                "model-file",
+            ),
+            (model.revision.is_some(), "revision"),
+        ];
+        for (present, field) in extras {
+            if present {
                 return Err(ConfigValidationError::MistralrsExtraFieldRequiresModelId {
                     model: model_name.to_string(),
                     field,

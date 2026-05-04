@@ -17,6 +17,7 @@ use serde::Serialize;
 use crate::config::api_key::ApiKeyRef;
 use crate::config::{LlmProvider, Model};
 use crate::error::{OutrigError, Result};
+use crate::hf::{self, HfTreeFetcher};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::repo;
 
@@ -29,15 +30,23 @@ pub async fn run(force: bool, global_override: Option<&Path>) -> Result<()> {
     let path = repo::global_config_path(global_override);
     eprintln!("[outrig] writing global config to {}", path.display());
     let mut prompt = prompt::auto();
-    run_with(force, &path, &mut prompt).await?;
+    let mut hf = hf::auto();
+    run_with(force, &path, &mut prompt, &mut hf).await?;
     eprintln!("[outrig] wrote {}", path.display());
     Ok(())
 }
 
 /// Drives the interactive flow against an arbitrary `PromptSource`. The flow
 /// short-circuits on existing files when `force == false` so an accidental
-/// re-run doesn't burn through prompts before bailing.
-pub async fn run_with(force: bool, path: &Path, prompt: &mut impl PromptSource) -> Result<()> {
+/// re-run doesn't burn through prompts before bailing. `hf` is the
+/// HuggingFace tree-listing client used to discover GGUF files for
+/// mistralrs `model-id` configs; tests pass a stub.
+pub async fn run_with(
+    force: bool,
+    path: &Path,
+    prompt: &mut impl PromptSource,
+    hf: &mut impl HfTreeFetcher,
+) -> Result<()> {
     if path.exists() && !force {
         return Err(OutrigError::Configuration(format!(
             "{} already exists; pass --force to overwrite.",
@@ -46,7 +55,7 @@ pub async fn run_with(force: bool, path: &Path, prompt: &mut impl PromptSource) 
     }
 
     let mut providers = prompt_providers(prompt).await?;
-    let models = prompt_models(prompt, &mut providers).await?;
+    let models = prompt_models(prompt, &mut providers, hf).await?;
     let default_model = prompt_default_model(prompt, &models).await?;
 
     let toml_text = render(default_model.as_deref(), &providers, &models)?;
@@ -126,6 +135,25 @@ const REVISION_FIELD: Field = Field {
 const MODEL_PATH_FIELD: Field = Field {
     name: "Local model-path",
     description: "Filesystem path to a GGUF file.",
+    options: &[],
+    doc_link: "doc/concepts/in-process-llm.md",
+};
+
+const MODEL_FILE_FIELD: Field = Field {
+    name: "GGUF model-file",
+    description: "Filename inside the HF repo, e.g. \
+                  qwen2.5-coder-1.5b-instruct-q4_k_m.gguf. Used to pick \
+                  one quantization out of a multi-file repo.",
+    options: &[],
+    doc_link: "doc/concepts/in-process-llm.md",
+};
+
+const MODEL_FILE_PICK_FIELD: Field = Field {
+    name: "Pick GGUF file(s) from the repo",
+    description: "Comma-separated numbers (e.g. `1,3`) or filenames. Pick \
+                  multiple only when one quantization is split across \
+                  shards (model-00001-of-00003.gguf, ...). The first \
+                  option is the default.",
     options: &[],
     doc_link: "doc/concepts/in-process-llm.md",
 };
@@ -211,6 +239,8 @@ pub const DOC_SYNC_FIELDS: &[&Field] = &[
     &MODEL_ID_FIELD,
     &REVISION_FIELD,
     &MODEL_PATH_FIELD,
+    &MODEL_FILE_FIELD,
+    &MODEL_FILE_PICK_FIELD,
     &CONTEXT_LENGTH_FIELD,
     &DEFINE_MODEL_FIELD,
     &MODEL_NAME_FIELD,
@@ -281,11 +311,12 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
 async fn prompt_models(
     prompt: &mut impl PromptSource,
     providers: &mut BTreeMap<String, LlmProvider>,
+    hf: &mut impl HfTreeFetcher,
 ) -> Result<BTreeMap<String, Model>> {
     if !prompt.ask_bool(&DEFINE_MODEL_FIELD, true).await? {
         return Ok(BTreeMap::new());
     }
-    let (models, new_providers) = prompt_models_loop(prompt, providers).await?;
+    let (models, new_providers) = prompt_models_loop(prompt, providers, hf).await?;
     providers.extend(new_providers);
     Ok(models)
 }
@@ -298,6 +329,7 @@ async fn prompt_models(
 pub(crate) async fn prompt_models_loop(
     prompt: &mut impl PromptSource,
     existing_providers: &BTreeMap<String, LlmProvider>,
+    hf: &mut impl HfTreeFetcher,
 ) -> Result<(BTreeMap<String, Model>, BTreeMap<String, LlmProvider>)> {
     let mut out = BTreeMap::new();
     let mut new_providers: BTreeMap<String, LlmProvider> = BTreeMap::new();
@@ -354,7 +386,7 @@ pub(crate) async fn prompt_models_loop(
                     context_length: None,
                 }
             }
-            LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, provider_name).await?,
+            LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, hf, provider_name).await?,
         };
         out.insert(name, model);
         if !prompt.ask_bool(&ADD_MODEL_FIELD, false).await? {
@@ -366,16 +398,18 @@ pub(crate) async fn prompt_models_loop(
 
 async fn prompt_mistralrs_model(
     prompt: &mut impl PromptSource,
+    hf: &mut impl HfTreeFetcher,
     provider_name: String,
 ) -> Result<Model> {
     let auto_download = prompt.ask_bool(&AUTO_DOWNLOAD_FIELD, true).await?;
-    let (model_id, model_path, revision) = if auto_download {
+    let (model_id, model_file, model_path, revision) = if auto_download {
         let id = ask_required(prompt, &MODEL_ID_FIELD).await?;
         let rev = blank_to_none(prompt.ask_string(&REVISION_FIELD, "").await?);
-        (Some(id), None, rev)
+        let file = resolve_model_file(prompt, hf, &id, rev.as_deref()).await?;
+        (Some(id), Some(file), None, rev)
     } else {
         let path = ask_required(prompt, &MODEL_PATH_FIELD).await?;
-        (None, Some(PathBuf::from(path)), None)
+        (None, None, Some(PathBuf::from(path)), None)
     };
     let context_length = blank_to_none(prompt.ask_string(&CONTEXT_LENGTH_FIELD, "").await?)
         .map(|s| {
@@ -391,12 +425,119 @@ async fn prompt_mistralrs_model(
         identifier: None,
         model_id,
         model_path,
-        // model-file is intentionally not prompted: the typical single-file
-        // GGUF repo case doesn't need it; multi-file repos hand-edit the TOML.
-        model_file: None,
+        model_file,
         revision,
         context_length,
     })
+}
+
+/// Discover GGUF files in `model_id` via `hf` and pick one or more. On a
+/// successful query: 0 files -> error, 1 file -> auto-pick (status line,
+/// no prompt), many -> render a numbered list (with sizes) and prompt
+/// for a comma-separated choice (numbers or filenames). On any HF error
+/// (offline, build without `mistralrs`, transient outage), fall back to
+/// the free-form `MODEL_FILE_FIELD` text prompt so the flow still
+/// completes.
+///
+/// Multi-select supports split-quantization repos where one quantization
+/// is sharded across multiple `model-NNNNN-of-NNNNN.gguf` files;
+/// mistralrs's GGUF loader takes the whole list.
+async fn resolve_model_file(
+    prompt: &mut impl PromptSource,
+    hf: &mut impl HfTreeFetcher,
+    model_id: &str,
+    revision: Option<&str>,
+) -> Result<Vec<String>> {
+    let files = match hf.list_files(model_id, revision).await {
+        Ok(siblings) => crate::hf::filter_gguf(siblings),
+        Err(e) => {
+            eprintln!(
+                "[outrig] could not list files in {model_id:?} ({e}); \
+                 enter the GGUF filename manually."
+            );
+            return ask_required(prompt, &MODEL_FILE_FIELD)
+                .await
+                .map(|s| vec![s]);
+        }
+    };
+
+    match files.as_slice() {
+        [] => Err(OutrigError::Configuration(format!(
+            "HF repo {model_id:?} contains no .gguf files; pick a different model-id"
+        ))),
+        [only] => {
+            let label = format_file_label(only);
+            eprintln!("[outrig] found one GGUF in {model_id:?}: {label}; using it");
+            Ok(vec![only.path.clone()])
+        }
+        many => {
+            eprintln!("[outrig] {} GGUF files in {model_id:?}:", many.len());
+            let idx_w = (many.len() as f64).log10().floor() as usize + 1;
+            for (i, file) in many.iter().enumerate() {
+                eprintln!("  {:>idx_w$}: {}", i + 1, format_file_label(file));
+            }
+            loop {
+                let answer = prompt
+                    .ask_string(&MODEL_FILE_PICK_FIELD, many[0].path.as_str())
+                    .await?;
+                let trimmed = answer.trim();
+                if trimmed.is_empty() {
+                    return Ok(vec![many[0].path.clone()]);
+                }
+                match parse_pick_input(trimmed, many) {
+                    Ok(picked) => return Ok(picked),
+                    Err(bad) => eprintln!(
+                        "[outrig] {bad:?} is not a number 1..={} or a filename in the list",
+                        many.len()
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Render one row of the picker: filename plus a parenthesized
+/// human-readable size when known. Centralized so the auto-pick status
+/// line and the multi-line picker share a format.
+fn format_file_label(file: &crate::hf::HfFile) -> String {
+    match file.size {
+        Some(bytes) => format!("{}  ({})", file.path, crate::hf::format_size(bytes)),
+        None => file.path.clone(),
+    }
+}
+
+/// Parse a comma-separated picker answer against `files`. Each token is
+/// either a 1-based index or a literal filename match. Whitespace around
+/// tokens is ignored. Returns the unique paths in the order the user
+/// specified, deduplicated. Returns `Err(bad)` with the first
+/// unrecognized token.
+fn parse_pick_input(
+    input: &str,
+    files: &[crate::hf::HfFile],
+) -> std::result::Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in input.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let path = if let Ok(n) = t.parse::<usize>()
+            && (1..=files.len()).contains(&n)
+        {
+            files[n - 1].path.clone()
+        } else if let Some(file) = files.iter().find(|f| f.path == t) {
+            file.path.clone()
+        } else {
+            return Err(t.to_string());
+        };
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    if out.is_empty() {
+        return Err(input.trim().to_string());
+    }
+    Ok(out)
 }
 
 pub(crate) async fn prompt_default_model(

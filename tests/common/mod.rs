@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncWriteExt, BufReader, DuplexStream, duplex};
 
+use outrig::error::{OutrigError, Result};
+use outrig::hf::{HfFile, HfTreeFetcher};
 use outrig::init::prompt::TerminalPrompt;
 use outrig::session::{Session, SessionId};
 
@@ -29,6 +31,75 @@ pub async fn scripted_prompt(script: &[u8]) -> (ScriptedPrompt, DuplexStream) {
         TerminalPrompt::new(BufReader::new(stdin_r), stderr_w),
         stderr_r,
     )
+}
+
+/// `HfTreeFetcher` stub for scripted prompt tests. Returns
+/// `Ok(files.clone())` on every call unless `error_message` is set, in
+/// which case it returns a configuration error so the prompt flow takes
+/// the free-form fallback path.
+#[allow(dead_code)]
+pub struct StubHfTreeFetcher {
+    pub files: Vec<HfFile>,
+    pub error_message: Option<String>,
+}
+
+impl StubHfTreeFetcher {
+    /// Stub that always returns the given filenames (no size info). Use
+    /// `[] ` for tests that shouldn't reach the HF path; use
+    /// `["only.gguf"]` for the auto-pick path; use multiple entries for
+    /// the picker path.
+    #[allow(dead_code)]
+    pub fn with_files<I: IntoIterator<Item = S>, S: Into<String>>(files: I) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|s| HfFile {
+                    path: s.into(),
+                    size: None,
+                })
+                .collect(),
+            error_message: None,
+        }
+    }
+
+    /// Stub that always returns the given files including sizes -- exercises
+    /// the picker rendering path with human-readable sizes.
+    #[allow(dead_code)]
+    pub fn with_sized_files<I: IntoIterator<Item = (S, u64)>, S: Into<String>>(files: I) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|(s, sz)| HfFile {
+                    path: s.into(),
+                    size: Some(sz),
+                })
+                .collect(),
+            error_message: None,
+        }
+    }
+
+    /// Stub that always errors with `msg`. Use for tests that exercise
+    /// the network-fallback path through `MODEL_FILE_FIELD`.
+    #[allow(dead_code)]
+    pub fn errors_with(msg: &str) -> Self {
+        Self {
+            files: Vec::new(),
+            error_message: Some(msg.to_string()),
+        }
+    }
+}
+
+impl HfTreeFetcher for StubHfTreeFetcher {
+    async fn list_files(
+        &mut self,
+        _model_id: &str,
+        _revision: Option<&str>,
+    ) -> Result<Vec<HfFile>> {
+        if let Some(msg) = &self.error_message {
+            return Err(OutrigError::Configuration(msg.clone()));
+        }
+        Ok(self.files.clone())
+    }
 }
 
 /// Build a `Session` with sane defaults suitable for both the in-flight

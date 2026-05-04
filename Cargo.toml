@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default   = []
 e2e       = []
-mistralrs = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap"]
+mistralrs = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap", "dep:reqwest"]
 
 [dependencies]
 anyhow             = "1.0"
@@ -24,6 +24,7 @@ mistralrs-core     = { version = "=0.8.1", optional = true, default-features = f
 nix                = { version = "0.29", features = ["user"] }
 rand               = "0.8"
 regex              = "1.10"
+reqwest            = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
 rig-core           = { version = "0.36", default-features = false, features = ["reqwest", "rustls"] }
 serde              = { version = "1.0", features = ["derive"] }
 serde_json         = "1.0"

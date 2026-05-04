@@ -13,7 +13,7 @@ use tokio::time::timeout;
 use outrig::config::Config;
 use outrig::config::init::run_with;
 
-use common::scripted_prompt;
+use common::{StubHfTreeFetcher, scripted_prompt};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -27,8 +27,9 @@ async fn writes_minimal_openai_config() {
     // no extra models, use as default-model.
     let script = b"\n\n\n\n\n\n\n\n\n\n\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
-    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt))
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
         .await
         .expect("run_with must not hang")
         .expect("run_with must succeed");
@@ -71,8 +72,9 @@ async fn refuses_to_clobber_without_force() {
 
     // No prompts should be consumed; an empty script is fine.
     let (mut prompt, _stderr_r) = scripted_prompt(b"").await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
-    let err = timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt))
+    let err = timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
         .await
         .expect("run_with must not hang")
         .expect_err("run_with must error when target exists and force=false");
@@ -97,8 +99,9 @@ async fn force_overwrites_existing_file() {
 
     let script = b"\n\n\n\n\n\n\n\n\n\n\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
-    timeout(TEST_TIMEOUT, run_with(true, &target, &mut prompt))
+    timeout(TEST_TIMEOUT, run_with(true, &target, &mut prompt, &mut hf))
         .await
         .expect("run_with must not hang")
         .expect("run_with must succeed with force=true");
@@ -121,14 +124,16 @@ async fn writes_mistralrs_config_with_model_id() {
     // Add another provider? n.
     // Define a model now? (Y default).
     // Model name "phi" -> provider "local" -> auto-download (Y default) ->
-    // model-id -> revision blank -> context-length blank.
+    // model-id -> revision blank -> (HF stub returns one file -> auto-pick,
+    // no prompt consumed) -> context-length blank.
     // Add another model? n.
     // Use as default-model? (Y default).
     let script =
         b"mistralrs\nlocal\nn\n\nphi\nlocal\n\nmicrosoft/Phi-3-mini-4k-instruct-gguf\n\n\nn\n\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files(["Phi-3-mini-4k-instruct-q4.gguf"]);
 
-    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt))
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
         .await
         .expect("run_with must not hang")
         .expect("run_with must succeed");
@@ -155,10 +160,109 @@ async fn writes_mistralrs_config_with_model_id() {
         text.contains("model-id = \"microsoft/Phi-3-mini-4k-instruct-gguf\""),
         "missing model-id:\n{text}"
     );
+    // model-file always serializes as an array (single-shard configs
+    // are length-1; the deserializer accepts either form, but the
+    // writer canonicalizes).
+    assert!(
+        text.contains("model-file = [\"Phi-3-mini-4k-instruct-q4.gguf\"]"),
+        "missing auto-picked model-file:\n{text}"
+    );
     // mistralrs models don't carry `identifier`.
     assert!(
         !text.contains("identifier ="),
         "unexpected identifier on mistralrs model:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn writes_mistralrs_config_with_model_file_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Same script shape as the auto-pick test, with one extra answer
+    // ("2") between `revision` and `context-length` for the GGUF picker.
+    let script = b"mistralrs\nlocal\nn\n\nqwen\nlocal\n\nQwen/Qwen2.5-Coder-1.5B-Instruct-GGUF\n\n2\n\nn\n\n";
+    let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files([
+        "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "qwen2.5-coder-1.5b-instruct-q5_k_m.gguf",
+        "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
+    ]);
+
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+    // Picker accepts a 1-based index. "2" -> the q5_k_m file.
+    assert!(
+        text.contains("model-file = [\"qwen2.5-coder-1.5b-instruct-q5_k_m.gguf\"]"),
+        "picker didn't write the chosen file:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn writes_mistralrs_config_with_multi_shard_pick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Pick three shards via comma-separated input: "1,2,3".
+    let script = b"mistralrs\nlocal\nn\n\nllama\nlocal\n\nsplit/repo\n\n1,2,3\n\nn\n\n";
+    let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_sized_files([
+        ("llama-q4-00001-of-00003.gguf", 5_000_000_000),
+        ("llama-q4-00002-of-00003.gguf", 5_000_000_000),
+        ("llama-q4-00003-of-00003.gguf", 4_000_000_000),
+    ]);
+
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+    assert!(
+        text.contains("00001-of-00003.gguf")
+            && text.contains("00002-of-00003.gguf")
+            && text.contains("00003-of-00003.gguf"),
+        "missing all three shards in model-file:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn mistralrs_falls_back_to_free_form_when_hf_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // After model-id + blank revision, the HF query errors and the flow
+    // falls through to the free-form `MODEL_FILE_FIELD` text prompt --
+    // hence the extra `phi.gguf` answer in the script.
+    let script = b"mistralrs\nlocal\nn\n\nphi\nlocal\n\nsome/repo\n\nphi.gguf\n\nn\n\n";
+    let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::errors_with("simulated network failure");
+
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+    assert!(
+        text.contains("model-file = [\"phi.gguf\"]"),
+        "missing free-form-prompt model-file:\n{text}"
     );
 }
 
@@ -171,8 +275,9 @@ async fn no_models_writes_providers_only() {
     // no extra provider, NO model.
     let script = b"\n\n\n\n\nn\nn\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
-    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt))
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
         .await
         .expect("run_with must not hang")
         .expect("run_with must succeed");

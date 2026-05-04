@@ -169,6 +169,15 @@ model-file = "Phi-3-mini-4k-instruct-q4.gguf"
 # revision       = "main"   # optional git ref on the HF repo
 # context-length = 4096     # optional override
 
+# Multi-shard quantization (one quant split across files):
+[models.llama-70b]
+provider   = "local"
+model-id   = "MaziyarPanahi/Meta-Llama-3-70B-Instruct-GGUF"
+model-file = [
+    "Meta-Llama-3-70B-Instruct.Q4_K_M-00001-of-00002.gguf",
+    "Meta-Llama-3-70B-Instruct.Q4_K_M-00002-of-00002.gguf",
+]
+
 # Local GGUF file:
 [models.llama-local]
 provider   = "local"
@@ -180,7 +189,7 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 | `provider`       | string  | yes      | --       | Name of a `style = "mistralrs"` provider.    |
 | `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
 | `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
-| `model-file`     | string  | no       | --       | Which GGUF in a multi-file repo. With `id`.  |
+| `model-file`     | str/arr | with `id`| --       | GGUF filename(s) inside the HF repo.         |
 | `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
 | `context-length` | integer | no       | model    | Override the model's default context window. |
 
@@ -389,10 +398,14 @@ build-args = { NODE_VERSION = "20" }
   `identifier` and must not set any of `model-id`, `model-path`, `model-file`,
   `revision`, `context-length`.
 - Every `[models.<name>]` whose provider has `style = "mistralrs"` must set
-  exactly one of `model-id` / `model-path`. `model-file` and `revision` are only
-  meaningful with `model-id`. A `model-path`, if set, must exist on disk relative
-  to the repo root (or be absolute). `identifier` is not allowed on mistralrs
-  models.
+  exactly one of `model-id` / `model-path`. When `model-id` is set, `model-file`
+  is **required** -- mistralrs's GGUF loader needs a specific filename and HF
+  repos typically hold many quantizations. `model-file` accepts either a
+  single string (one GGUF file) or an array of strings (a multi-shard
+  quantization, e.g. `*-00001-of-00003.gguf`). `revision` is optional and
+  only meaningful with `model-id`. A `model-path`, if set, must exist on
+  disk relative to the repo root (or be absolute). `identifier` is not
+  allowed on mistralrs models.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.
