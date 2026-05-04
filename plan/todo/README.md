@@ -6,11 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase F-pre -- foundation gaps (run first)
-
-- **[0030](0030-fuzzy-prompt-impl.md)** Rich-TUI `PromptSource` impl
-  (FuzzySelect for picking models / agents / containers from N candidates).
-
 ## Phase F -- interactive scaffolding
 
 - **[0031](0031-container-add.md)** `outrig container add` with Dockerfile templates.

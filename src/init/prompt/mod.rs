@@ -1,15 +1,21 @@
 //! Interactive prompts with `[default: ...]` rendering and `?`-help.
 //!
 //! `PromptSource` is a trait so terminal, AI/LLM, and scripted-test answer
-//! sources are interchangeable. `TerminalPrompt` is the production impl
-//! used by `outrig init` / `config init` / `container add`.
+//! sources are interchangeable. `TerminalPrompt` is the line-based impl
+//! used for tests and non-TTY (piped/CI) callers; `DialoguerPrompt` is the
+//! rich impl that drives `dialoguer` widgets on a real terminal. The
+//! `auto()` factory picks between them based on whether stdin is a TTY.
+
+pub mod dialoguer;
 
 use std::io;
+use std::io::IsTerminal;
 
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines, Stderr, Stdin,
 };
 
+use self::dialoguer::DialoguerPrompt;
 use crate::error::{OutrigError, Result};
 
 /// Static metadata for one interactive question.
@@ -275,4 +281,61 @@ fn parse_multiselect(
         }
     }
     Ok(out)
+}
+
+/// `PromptSource` returned by [`auto`]: dialoguer-backed when stdin is a
+/// TTY, line-based otherwise.
+///
+/// `PromptSource` itself is not dyn-compatible (the trait uses
+/// `async fn`-in-trait), so `auto` returns this enum and forwards each
+/// trait method to whichever variant is live. Single-type return means
+/// no boxing and no type erasure at the call site.
+pub enum AutoPrompt {
+    Terminal(TerminalPrompt<BufReader<Stdin>, Stderr>),
+    Dialoguer(DialoguerPrompt),
+}
+
+impl PromptSource for AutoPrompt {
+    async fn ask_string(&mut self, field: &Field, default: &str) -> Result<String> {
+        match self {
+            Self::Terminal(p) => p.ask_string(field, default).await,
+            Self::Dialoguer(p) => p.ask_string(field, default).await,
+        }
+    }
+
+    async fn ask_bool(&mut self, field: &Field, default: bool) -> Result<bool> {
+        match self {
+            Self::Terminal(p) => p.ask_bool(field, default).await,
+            Self::Dialoguer(p) => p.ask_bool(field, default).await,
+        }
+    }
+
+    async fn ask_select(&mut self, field: &Field, default_idx: usize) -> Result<usize> {
+        match self {
+            Self::Terminal(p) => p.ask_select(field, default_idx).await,
+            Self::Dialoguer(p) => p.ask_select(field, default_idx).await,
+        }
+    }
+
+    async fn ask_multiselect(
+        &mut self,
+        field: &Field,
+        default_indices: &[usize],
+    ) -> Result<Vec<usize>> {
+        match self {
+            Self::Terminal(p) => p.ask_multiselect(field, default_indices).await,
+            Self::Dialoguer(p) => p.ask_multiselect(field, default_indices).await,
+        }
+    }
+}
+
+/// TTY stdin gets the rich dialoguer-backed picker; piped / CI stdin
+/// falls back to the line-based `TerminalPrompt` so scripted input keeps
+/// working.
+pub fn auto() -> AutoPrompt {
+    if std::io::stdin().is_terminal() {
+        AutoPrompt::Dialoguer(DialoguerPrompt::new())
+    } else {
+        AutoPrompt::Terminal(TerminalPrompt::from_real_io())
+    }
 }

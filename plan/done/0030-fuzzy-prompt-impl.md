@@ -104,3 +104,38 @@ abstraction already exists; this task adds a second impl alongside
 - If `dialoguer` proves too sticky (sync API, no async hooks, can't
   intercept keystrokes), fall back to building on `crossterm` directly.
   `dialoguer` is the cheap default; `crossterm` is the escape hatch.
+
+## Decisions
+
+- **`auto()` returns an enum, not `Box<dyn PromptSource>`.** `PromptSource`
+  uses bare `async fn`-in-trait (with `#[allow(async_fn_in_trait)]`), which
+  is **not** dyn-compatible. `AutoPrompt { Terminal(_), Dialoguer(_) }`
+  with a four-method forwarding impl gives a single concrete return type,
+  no allocations, no type erasure -- callers still take
+  `&mut impl PromptSource`. Variants are `pub` for now; the only construction
+  path that matters is `auto()`.
+- **`?`-help is not reimplemented inside dialoguer.** Instead, every
+  `DialoguerPrompt::ask_*` prints `field.description` to stderr before the
+  picker (option (a) from the task sketch). Option blurbs are skipped --
+  dialoguer renders the values itself -- and `field.doc_link` is dropped
+  for the rich impl: it's noise on every prompt and remains a
+  `TerminalPrompt`-only on-demand feature.
+- **`tokio::task::spawn_blocking` for every dialoguer call.** Dialoguer
+  reads `/dev/tty` synchronously; running it on the runtime worker would
+  block other tasks even in the single-task `config init` flow. The
+  per-call thread-pool overhead is irrelevant at human-paced prompt rates.
+- **`allow_empty(true)` on `Input`.** Looks redundant next to `.default(s)`
+  but isn't: dialoguer rejects an Enter on empty input when the default
+  is `""`. Setting `allow_empty(true)` matches `TerminalPrompt::ask_string`'s
+  "Enter returns the default, even if the default is empty" semantics.
+- **`dialoguer` 0.12 with the `fuzzy-select` feature.** `FuzzySelect` is
+  feature-gated; without it, only `Select` (no incremental filter) is
+  available. Adds `fuzzy-matcher` and a few transitive deps -- acceptable
+  for the UX win.
+- **`AutoPrompt` and `auto()` are wired into `config::init::run()`.** This
+  is the only live caller today; tasks 0031/0033 will use `auto()` the
+  same way without additional plumbing.
+- **No pty smoke tests added.** The trait contract is fully covered by
+  `tests/prompt_ux.rs` against `TerminalPrompt`; `DialoguerPrompt` is a
+  thin translation layer to dialoguer, and a pty crate would add weight
+  for marginal coverage. TTY behavior is verified manually.

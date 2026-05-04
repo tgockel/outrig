@@ -19,16 +19,18 @@ use tempfile::NamedTempFile;
 use crate::config::api_key::ApiKeyRef;
 use crate::config::{LlmProvider, Model};
 use crate::error::{OutrigError, Result};
-use crate::init::prompt::{Field, PromptSource, TerminalPrompt};
+use crate::init::prompt::{self, Field, PromptSource};
 use crate::repo;
 
-/// Public entry: resolve the path, build a real `TerminalPrompt`, delegate to
-/// `run_with`. `global_override` plumbs the top-level `--global-config` flag
-/// into the same resolver `repo::global_config_path` uses elsewhere.
+/// Public entry: resolve the path, pick a `PromptSource` via
+/// `prompt::auto()` (dialoguer on a TTY, line-based on piped stdin), and
+/// delegate to `run_with`. `global_override` plumbs the top-level
+/// `--global-config` flag into the same resolver `repo::global_config_path`
+/// uses elsewhere.
 pub async fn run(force: bool, global_override: Option<&Path>) -> Result<()> {
     let path = repo::global_config_path(global_override);
     eprintln!("[outrig] writing global config to {}", path.display());
-    let mut prompt = TerminalPrompt::from_real_io();
+    let mut prompt = prompt::auto();
     run_with(force, &path, &mut prompt).await?;
     eprintln!("[outrig] wrote {}", path.display());
     Ok(())
