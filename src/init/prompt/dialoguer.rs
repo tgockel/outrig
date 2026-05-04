@@ -10,12 +10,12 @@
 
 use std::io;
 
-use dialoguer::{Confirm, FuzzySelect, Input, MultiSelect};
+use dialoguer::{FuzzySelect, Input, MultiSelect};
 use tokio::io::AsyncWriteExt;
 use tokio::task;
 
 use crate::error::{OutrigError, Result};
-use crate::init::prompt::{Field, PromptSource};
+use crate::init::prompt::{self, Field, PromptSource};
 
 #[derive(Debug, Default)]
 pub struct DialoguerPrompt;
@@ -28,8 +28,29 @@ impl DialoguerPrompt {
 
 /// Print the field's `description` to stderr so the user has the same
 /// "what is this question asking?" context the line impl exposes via `?`.
+/// Empty descriptions are skipped: surrounding `[outrig]` log lines and
+/// the prompt name itself are sometimes enough.
 async fn write_description(description: &str) -> Result<()> {
+    if description.is_empty() {
+        return Ok(());
+    }
     let line = format!("\n  {description}\n");
+    let mut stderr = tokio::io::stderr();
+    stderr.write_all(line.as_bytes()).await?;
+    stderr.flush().await?;
+    Ok(())
+}
+
+async fn write_field_help(field: &Field) -> Result<()> {
+    let buf = prompt::format_field_help(field);
+    let mut stderr = tokio::io::stderr();
+    stderr.write_all(buf.as_bytes()).await?;
+    stderr.flush().await?;
+    Ok(())
+}
+
+async fn write_error(msg: &str) -> Result<()> {
+    let line = format!("[outrig] {msg}\n");
     let mut stderr = tokio::io::stderr();
     stderr.write_all(line.as_bytes()).await?;
     stderr.flush().await?;
@@ -48,36 +69,59 @@ fn map_join_err(e: task::JoinError) -> OutrigError {
 
 impl PromptSource for DialoguerPrompt {
     async fn ask_string(&mut self, field: &Field, default: &str) -> Result<String> {
-        write_description(field.description).await?;
-        let prompt = field.name.to_owned();
-        let default = default.to_owned();
-        task::spawn_blocking(move || {
-            Input::<String>::new()
-                .with_prompt(prompt)
-                .default(default)
-                // Without this, dialoguer rejects an empty default ("") on
-                // Enter; matches `TerminalPrompt`'s "Enter accepts default"
-                // semantics regardless of whether the default is empty.
-                .allow_empty(true)
-                .interact_text()
-        })
-        .await
-        .map_err(map_join_err)?
-        .map_err(map_dialoguer_err)
+        loop {
+            let prompt = field.name.to_owned();
+            let default_owned = default.to_owned();
+            let answer = task::spawn_blocking(move || {
+                Input::<String>::new()
+                    .with_prompt(prompt)
+                    .default(default_owned)
+                    // Without this, dialoguer rejects an empty default ("") on
+                    // Enter; matches `TerminalPrompt`'s "Enter accepts default"
+                    // semantics regardless of whether the default is empty.
+                    .allow_empty(true)
+                    .interact_text()
+            })
+            .await
+            .map_err(map_join_err)?
+            .map_err(map_dialoguer_err)?;
+            if answer.trim() == "?" {
+                write_field_help(field).await?;
+                continue;
+            }
+            return Ok(answer);
+        }
     }
 
+    /// Drives Y/n via `Input::<String>` rather than `Confirm` so `?` can
+    /// trigger help and bad input shows an error -- `Confirm` silently
+    /// re-prompts on anything but y/n, which reads as "nothing happened".
     async fn ask_bool(&mut self, field: &Field, default: bool) -> Result<bool> {
-        write_description(field.description).await?;
-        let prompt = field.name.to_owned();
-        task::spawn_blocking(move || {
-            Confirm::new()
-                .with_prompt(prompt)
-                .default(default)
-                .interact()
-        })
-        .await
-        .map_err(map_join_err)?
-        .map_err(map_dialoguer_err)
+        let render = if default { "Y/n" } else { "y/N" };
+        loop {
+            let prompt = format!("{} [{}]", field.name, render);
+            let answer = task::spawn_blocking(move || {
+                Input::<String>::new()
+                    .with_prompt(prompt)
+                    .allow_empty(true)
+                    .interact_text()
+            })
+            .await
+            .map_err(map_join_err)?
+            .map_err(map_dialoguer_err)?;
+            let trimmed = answer.trim();
+            if trimmed.is_empty() {
+                return Ok(default);
+            }
+            if trimmed == "?" {
+                write_field_help(field).await?;
+                continue;
+            }
+            match prompt::parse_bool(trimmed) {
+                Some(b) => return Ok(b),
+                None => write_error("expected y/yes or n/no, or `?` for help").await?,
+            }
+        }
     }
 
     async fn ask_select(&mut self, field: &Field, default_idx: usize) -> Result<usize> {

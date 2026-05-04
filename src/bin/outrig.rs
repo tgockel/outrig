@@ -9,6 +9,7 @@ use outrig::cli::ls::{self, LsArgs};
 use outrig::cli::run::{self, RunArgs};
 use outrig::config;
 use outrig::error::{OutrigError, Result};
+use outrig::init;
 use outrig::repo;
 
 #[derive(Debug, Parser)]
@@ -44,7 +45,11 @@ enum Cmd {
     /// Read or write outrig's configuration files.
     Config(ConfigArgs),
     /// Interactively set up global + repo config.
-    Init,
+    Init {
+        /// Overwrite existing files. Propagates to `config init` and `container add`.
+        #[arg(long)]
+        force: bool,
+    },
     /// Manage container-configs.
     Container(ContainerArgs),
     /// List sessions newest-first under the session root.
@@ -137,19 +142,20 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 Ok(0)
             }
         },
-        Cmd::Init => Err(OutrigError::NotImplemented("init")),
+        Cmd::Init { force } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(init::run(*force, cli.global_config.as_deref()))?;
+            Ok(0)
+        }
         Cmd::Container(args) => match &args.cmd {
             ContainerCmd::Add { name, force } => {
                 let cwd = std::env::current_dir()?;
-                let repo_root = repo::find_repo_root_from(&cwd)?;
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(outrig::container::add::run(
-                    &repo_root,
-                    name.clone(),
-                    *force,
-                ))?;
+                runtime.block_on(outrig::container::add::run(&cwd, name.clone(), *force))?;
                 Ok(0)
             }
         },

@@ -1,8 +1,5 @@
 # `outrig init`
 
-> **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
-> behavior; the implementation isn't ready yet.
-
 `outrig init` is the one-shot setup for a new repo. It's a thin orchestrator over two more
 focused commands plus one inline repo-config phase:
 

@@ -14,6 +14,21 @@ Run it any time you want to add a container-config -- e.g., a `planning` config 
 `coding`. [`outrig init`](init.md) calls `container add` in a loop for the first (and any
 further) containers you create during initial setup.
 
+### Bootstrapping a fresh repo
+
+If you run `outrig container add` in a directory without an `.agents/outrig/config.toml`
+(neither here nor in any parent), outrig prompts before scaffolding:
+
+```
+[outrig] no .agents/outrig/config.toml found in /path/to/repo or any parent.
+? Configure outrig in this directory now? [Y/n]:
+```
+
+Answering `y` walks the same repo-config prompts that [`outrig init`](init.md) uses
+(workspace, default agent, preamble), then continues with the `container add` flow.
+Answering `n` exits with the same error a strict `find` would have produced -- run
+`outrig init` later when you're ready.
+
 ### Synopsis
 
 ```

@@ -16,11 +16,18 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 use crate::container::render::{self, BaseImage, McpServer, Toolchain};
 use crate::error::{OutrigError, Result};
 use crate::init::prompt::{self, Field, PromptSource};
+use crate::init::repo as init_repo;
 use crate::repo;
 
-pub async fn run(repo_root: &Path, name: Option<String>, force: bool) -> Result<()> {
+/// CLI entry point. Resolves the repo root from `cwd` (walking up, with a
+/// fallback prompt to bootstrap a fresh `.agents/outrig/config.toml` if
+/// none is found) before running the interactive container-add flow. One
+/// `PromptSource` is threaded through both halves so the user sees a
+/// single conversation.
+pub async fn run(cwd: &Path, name: Option<String>, force: bool) -> Result<()> {
     let mut prompt = prompt::auto();
-    run_with(repo_root, name, force, &mut prompt).await
+    let repo_root = init_repo::resolve_or_bootstrap(cwd, &mut prompt).await?;
+    run_with(&repo_root, name, force, &mut prompt).await
 }
 
 /// Drives the interactive flow against an arbitrary `PromptSource`.

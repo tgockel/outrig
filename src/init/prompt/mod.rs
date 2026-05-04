@@ -110,22 +110,7 @@ where
     }
 
     async fn write_help(&mut self, field: &Field) -> Result<()> {
-        let mut buf = String::new();
-        buf.push('\n');
-        buf.push_str("  ");
-        buf.push_str(field.description);
-        buf.push('\n');
-        for (value, blurb) in field.options {
-            buf.push_str("  ");
-            buf.push_str(value);
-            buf.push_str("  ");
-            buf.push_str(blurb);
-            buf.push('\n');
-        }
-        buf.push('\n');
-        buf.push_str("  See: ");
-        buf.push_str(field.doc_link);
-        buf.push_str("\n\n");
+        let buf = format_field_help(field);
         self.stderr.write_all(buf.as_bytes()).await?;
         self.stderr.flush().await?;
         Ok(())
@@ -248,7 +233,32 @@ where
     }
 }
 
-fn parse_bool(s: &str) -> Option<bool> {
+/// Render the `?`-help block: indented description (skipped if empty),
+/// then each option's `value  blurb` row, then a `See: <doc_link>` footer.
+/// Shared between `TerminalPrompt::write_help` and the dialoguer impl.
+pub(super) fn format_field_help(field: &Field) -> String {
+    let mut buf = String::new();
+    buf.push('\n');
+    if !field.description.is_empty() {
+        buf.push_str("  ");
+        buf.push_str(field.description);
+        buf.push('\n');
+    }
+    for (value, blurb) in field.options {
+        buf.push_str("  ");
+        buf.push_str(value);
+        buf.push_str("  ");
+        buf.push_str(blurb);
+        buf.push('\n');
+    }
+    buf.push('\n');
+    buf.push_str("  See: ");
+    buf.push_str(field.doc_link);
+    buf.push_str("\n\n");
+    buf
+}
+
+pub(super) fn parse_bool(s: &str) -> Option<bool> {
     match s.trim() {
         "y" | "Y" | "yes" | "Yes" | "YES" => Some(true),
         "n" | "N" | "no" | "No" | "NO" => Some(false),

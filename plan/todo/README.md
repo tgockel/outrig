@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase F -- interactive scaffolding
-
-- **[0033](0033-init.md)** `outrig init` orchestrator (idempotent; loops `container add`).
-
 ## Phase G -- build, CI, end-to-end
 
 - **[0032](0032-build-subcommand.md)** `outrig build` subcommand.

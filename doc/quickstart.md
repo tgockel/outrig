@@ -1,8 +1,5 @@
 # Quickstart
 
-> **TODO: Incomplete** -- every command on this page describes outrig's intended behavior. The
-> implementation isn't ready yet; don't try to run these commands.
-
 This walks you from a fresh repo to your first running agent in five minutes, mostly via
 `outrig init` (which orchestrates `outrig config init` and `outrig container add` under the
 hood).
