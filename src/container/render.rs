@@ -119,7 +119,7 @@ impl McpServer {
     pub fn command_args(self) -> &'static [&'static str] {
         match self {
             Self::Fs => &["mcp-server-filesystem", "/workspace"],
-            Self::Git => &["mcp-server-git", "--repo", "/workspace"],
+            Self::Git => &["mcp-server-git", "--repository", "/workspace"],
         }
     }
 

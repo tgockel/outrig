@@ -87,7 +87,14 @@ impl McpClient {
         // `IntoTransport for (R, W)` impl. Going through
         // `rmcp::transport::TokioChildProcess::new` would spawn its own child
         // internally, leaving us no `Child` handle for graceful shutdown.
-        let service = serve_client((), (stdout, stdin)).await?;
+        let service = match serve_client((), (stdout, stdin)).await {
+            Ok(s) => s,
+            Err(source) => {
+                return Err(
+                    enrich_startup_error(name, &command, &stderr_path, &mut child, source).await,
+                );
+            }
+        };
 
         Ok(Self {
             name: name.to_string(),
@@ -110,7 +117,12 @@ impl McpClient {
     /// Issue an MCP `tools/list` (paginating internally) and project the
     /// results into our own [`McpTool`] type.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
-        let tools = self.service.list_all_tools().await?;
+        let tools = self.service.list_all_tools().await.map_err(|source| {
+            OutrigError::McpToolsListFailed {
+                name: self.name.clone(),
+                source: Box::new(source),
+            }
+        })?;
         Ok(tools
             .into_iter()
             .map(|t| {
@@ -212,6 +224,101 @@ impl McpClient {
     }
 }
 
+/// Convert rmcp's bare transport error from `serve_client` into a richer
+/// `McpStartupFailed` carrying the server name, the command we tried to run,
+/// the child's exit status (so the user sees *why* the pipe closed), and a
+/// tail of whatever the child wrote to stderr. The brief `child.wait()`
+/// timeout lets a child that crashed mid-write flush its last few bytes
+/// before we read them.
+async fn enrich_startup_error(
+    name: &str,
+    command: &[String],
+    stderr_path: &Path,
+    child: &mut Child,
+    source: std::io::Error,
+) -> OutrigError {
+    let exit_status = match tokio::time::timeout(Duration::from_millis(250), child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        _ => None,
+    };
+    let exit = format_exit(exit_status);
+    let stderr_tail = read_stderr_tail(stderr_path).await;
+
+    if !exit_status.is_some_and(|s| s.success()) {
+        tracing::error!(
+            target: "outrig::mcp",
+            server = name,
+            "mcp server {name:?} terminated before initialize ({exit}); \
+             see {} for details",
+            stderr_path.display()
+        );
+    }
+
+    OutrigError::McpStartupFailed(Box::new(crate::error::McpStartupFailure {
+        name: name.to_string(),
+        command: render_command(command),
+        exit,
+        stderr_path: stderr_path.to_path_buf(),
+        stderr_tail,
+        source,
+    }))
+}
+
+fn format_exit(status: Option<std::process::ExitStatus>) -> String {
+    let Some(status) = status else {
+        return "still running (wait timed out)".to_string();
+    };
+    if let Some(code) = status.code() {
+        return format!("code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal {sig}");
+        }
+    }
+    "terminated".to_string()
+}
+
+async fn read_stderr_tail(path: &Path) -> String {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    const MAX: u64 = 2048;
+
+    async fn inner(path: &Path) -> std::io::Result<Vec<u8>> {
+        let mut file = tokio::fs::File::open(path).await?;
+        let len = file.metadata().await?.len();
+        if len > MAX {
+            file.seek(SeekFrom::End(-(MAX as i64))).await?;
+        }
+        let mut buf = Vec::with_capacity(len.min(MAX) as usize);
+        file.read_to_end(&mut buf).await?;
+        Ok(buf)
+    }
+
+    match inner(path).await {
+        Ok(bytes) if bytes.is_empty() => "(empty)".to_string(),
+        Ok(bytes) => String::from_utf8_lossy(&bytes).trim_end().to_string(),
+        Err(_) => "(could not read stderr file)".to_string(),
+    }
+}
+
+fn render_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty()
+                || a.chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '$' | '`' | '\\'))
+            {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn kind_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -220,5 +327,122 @@ fn kind_of(v: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_command_passes_through_simple_argv() {
+        let argv = vec![
+            "mcp-server-git".to_string(),
+            "--repository".to_string(),
+            "/workspace".to_string(),
+        ];
+        assert_eq!(
+            render_command(&argv),
+            "mcp-server-git --repository /workspace"
+        );
+    }
+
+    #[test]
+    fn render_command_quotes_args_with_whitespace_or_specials() {
+        let argv = vec![
+            "echo".to_string(),
+            "hello world".to_string(),
+            "it's".to_string(),
+            "".to_string(),
+        ];
+        assert_eq!(render_command(&argv), "echo 'hello world' 'it'\\''s' ''");
+    }
+
+    #[tokio::test]
+    async fn read_stderr_tail_handles_empty_missing_and_long() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("nope.stderr");
+        assert_eq!(
+            read_stderr_tail(&missing).await,
+            "(could not read stderr file)"
+        );
+
+        let empty = dir.path().join("empty.stderr");
+        tokio::fs::write(&empty, b"").await.unwrap();
+        assert_eq!(read_stderr_tail(&empty).await, "(empty)");
+
+        let normal = dir.path().join("normal.stderr");
+        tokio::fs::write(&normal, b"line one\nline two\n")
+            .await
+            .unwrap();
+        assert_eq!(read_stderr_tail(&normal).await, "line one\nline two");
+
+        let big = dir.path().join("big.stderr");
+        let payload: Vec<u8> = (0..10_000).map(|i| b'A' + (i % 26) as u8).collect();
+        tokio::fs::write(&big, &payload).await.unwrap();
+        let tail = read_stderr_tail(&big).await;
+        assert!(tail.len() <= 2048, "tail was {} bytes", tail.len());
+        assert!(payload.ends_with(tail.trim_end().as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn enrich_startup_error_carries_name_command_and_stderr() {
+        // Spawn `false` (fast, deterministic non-zero exit) with stderr piped
+        // into a temp file, then drive the helper as if rmcp had returned EOF.
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_path = dir.path().join("svc.stderr");
+        let stderr_file = tokio::fs::File::create(&stderr_path).await.unwrap();
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "echo boom 1>&2; exit 7"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(stderr_file.into_std().await))
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo boom 1>&2; exit 7".to_string(),
+        ];
+        let source = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "expect initialize response",
+        );
+
+        let err = enrich_startup_error("svc", &argv, &stderr_path, &mut child, source).await;
+
+        let OutrigError::McpStartupFailed(payload) = &err else {
+            panic!("expected McpStartupFailed, got {err:?}");
+        };
+        assert_eq!(payload.name, "svc");
+        assert!(payload.command.contains("sh"));
+        assert_eq!(payload.exit, "code 7");
+        assert!(
+            payload.stderr_tail.contains("boom"),
+            "stderr_tail={:?}",
+            payload.stderr_tail
+        );
+
+        let display = err.to_string();
+        assert!(display.contains("svc"));
+        assert!(display.contains("expect initialize response"));
+        assert!(display.contains("code 7"));
+        assert!(display.contains("boom"));
+    }
+
+    #[test]
+    fn format_exit_renders_codes_signals_and_unknown() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        assert_eq!(format_exit(Some(ExitStatus::from_raw(0))), "code 0");
+        assert_eq!(format_exit(Some(ExitStatus::from_raw(2 << 8))), "code 2");
+        // Raw status with no exit code but a signal in the low 7 bits.
+        assert_eq!(format_exit(Some(ExitStatus::from_raw(9))), "signal 9");
+        assert_eq!(format_exit(None), "still running (wait timed out)");
     }
 }

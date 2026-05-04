@@ -104,7 +104,7 @@ You can pick more than one. The Dockerfile is a starting point -- edit it freely
 - **`fs`** -- installs `@modelcontextprotocol/server-filesystem` from npm; default
   `[mcp]` entry: `{ command = ["mcp-server-filesystem", "/workspace"] }`.
 - **`git`** -- installs `mcp-server-git` from PyPI; default `[mcp]` entry:
-  `{ command = ["mcp-server-git", "--repo", "/workspace"] }`.
+  `{ command = ["mcp-server-git", "--repository", "/workspace"] }`.
 
 `fs` is the default. Add `git` for repo-aware tools, or wire up additional servers by
 editing the `[containers.<name>.mcp]` block directly -- see
