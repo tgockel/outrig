@@ -58,8 +58,8 @@ async fn generated_alpine_image_builds() {
         .get("coding")
         .expect("coding container present");
 
-    let tag = image::ensure_image(container, tmp.path())
+    let outcome = image::ensure_image(container, tmp.path(), false)
         .await
         .expect("ensure_image must succeed against generated config");
-    assert!(!tag.0.is_empty(), "image tag must not be empty");
+    assert!(!outcome.tag.0.is_empty(), "image tag must not be empty");
 }

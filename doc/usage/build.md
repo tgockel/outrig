@@ -1,8 +1,5 @@
 # `outrig build`
 
-> **TODO: Incomplete** -- every command on this page describes outrig's intended behavior; the
-> implementation isn't ready yet.
-
 `outrig build` builds (or cache-hits) the image for one or more container-configs, without
 starting an agent session. It's useful for:
 

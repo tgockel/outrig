@@ -30,6 +30,16 @@ impl fmt::Display for ImageTag {
     }
 }
 
+/// Outcome of [`ensure_image`]: the resolved tag plus whether the buildah
+/// step was skipped (the tag was already cached). Callers use the flag to
+/// drive output -- a cache hit can print a one-line summary, a miss wants
+/// the verbose header + buildah stream.
+#[derive(Debug, Clone)]
+pub struct ImageBuildOutcome {
+    pub tag: ImageTag,
+    pub cache_hit: bool,
+}
+
 pub struct CacheKey;
 
 impl CacheKey {
@@ -63,27 +73,50 @@ impl CacheKey {
     }
 }
 
-/// Probe `outrig-cache:<key>`; on miss, run `buildah build`. Stderr from
-/// buildah is streamed to `tracing::info!` with the `[buildah]` prefix.
-pub async fn ensure_image(cfg: &ContainerConfig, repo_root: &Path) -> Result<ImageTag> {
+/// Compute the deterministic `outrig-cache:<key>` tag for `cfg` without
+/// touching buildah. Useful when a caller wants to print the tag *before*
+/// deciding whether to build (e.g. the `outrig build` CLI's verbose header
+/// in `doc/usage/build.md`).
+pub async fn compute_tag(cfg: &ContainerConfig, repo_root: &Path) -> Result<ImageTag> {
     let dockerfile = repo_root.join(&cfg.dockerfile);
     let context = repo_root.join(&cfg.context);
     let key = CacheKey::compute(&dockerfile, &cfg.build_args, &context).await?;
-    let tag = format!("{TAG_PREFIX}:{key}");
+    Ok(ImageTag(format!("{TAG_PREFIX}:{key}")))
+}
 
+/// Returns `true` iff `tag` already exists in buildah's local image store.
+/// `buildah images --quiet <tag>` prints the image id on a hit and nothing
+/// on a miss; either way exits 0, so we ignore the status and inspect
+/// stdout.
+pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
     let probe =
-        process::try_capture(Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag)).await?;
-    if probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace) {
-        tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
-        return Ok(ImageTag(tag));
-    }
+        process::try_capture(Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag.0)).await?;
+    Ok(probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
+/// Run `buildah build` for `cfg`, tagging the result `tag`. Stderr is
+/// streamed to `tracing::info!` with the `[buildah]` prefix. Pass
+/// `no_cache = true` to add `--no-cache` so buildah ignores its layer
+/// cache (independent of our project-level tag cache, which the caller
+/// controls by deciding whether to call this function at all).
+pub async fn build_image(
+    cfg: &ContainerConfig,
+    repo_root: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+) -> Result<()> {
+    let dockerfile = repo_root.join(&cfg.dockerfile);
+    let context = repo_root.join(&cfg.context);
 
     let mut cmd = Cmd::new("buildah")
         .arg("build")
         .arg("--tag")
-        .arg(&tag)
+        .arg(&tag.0)
         .arg("--file")
         .arg(&dockerfile);
+    if no_cache {
+        cmd = cmd.arg("--no-cache");
+    }
     for (k, v) in &cfg.build_args {
         cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
     }
@@ -99,8 +132,31 @@ pub async fn ensure_image(cfg: &ContainerConfig, repo_root: &Path) -> Result<Ima
             stderr_tail: String::new(),
         });
     }
+    Ok(())
+}
+
+/// Probe `outrig-cache:<key>`; on miss (or when `no_cache` is set), run
+/// `buildah build`. Stderr from buildah is streamed to `tracing::info!`
+/// with the `[buildah]` prefix.
+pub async fn ensure_image(
+    cfg: &ContainerConfig,
+    repo_root: &Path,
+    no_cache: bool,
+) -> Result<ImageBuildOutcome> {
+    let tag = compute_tag(cfg, repo_root).await?;
+    if !no_cache && probe_cached(&tag).await? {
+        tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
+        return Ok(ImageBuildOutcome {
+            tag,
+            cache_hit: true,
+        });
+    }
+    build_image(cfg, repo_root, &tag, no_cache).await?;
     tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
-    Ok(ImageTag(tag))
+    Ok(ImageBuildOutcome {
+        tag,
+        cache_hit: false,
+    })
 }
 
 async fn is_git_context(ctx: &Path) -> Result<bool> {

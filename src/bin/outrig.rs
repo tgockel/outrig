@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
+use outrig::cli::build::{self, BuildArgs};
 use outrig::cli::discard::{self, DiscardArgs};
 use outrig::cli::logs::{self, LogsArgs};
 use outrig::cli::ls::{self, LsArgs};
 use outrig::cli::run::{self, RunArgs};
 use outrig::config;
-use outrig::error::{OutrigError, Result};
+use outrig::error::Result;
 use outrig::init;
 use outrig::repo;
 
@@ -41,7 +42,7 @@ enum Cmd {
     /// Start an interactive agent session.
     Run(RunArgs),
     /// Build (or cache-hit) one or more container-config images.
-    Build,
+    Build(BuildArgs),
     /// Read or write outrig's configuration files.
     Config(ConfigArgs),
     /// Interactively set up global + repo config.
@@ -132,7 +133,15 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 args,
             ))
         }
-        Cmd::Build => Err(OutrigError::NotImplemented("build")),
+        Cmd::Build(args) => {
+            let cwd = std::env::current_dir()?;
+            let repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
+            let global_config = repo::global_config_path(cli.global_config.as_deref());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(build::execute(&repo_config, &global_config, args))
+        }
         Cmd::Config(args) => match &args.cmd {
             ConfigCmd::Init { force } => {
                 let runtime = tokio::runtime::Builder::new_current_thread()

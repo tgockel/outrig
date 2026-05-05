@@ -51,21 +51,23 @@ async fn build_then_cache_hit_under_100ms() {
         mcp: BTreeMap::new(),
     };
 
-    let tag1 = image::ensure_image(&cfg, ctx)
+    let first = image::ensure_image(&cfg, ctx, false)
         .await
         .expect("first build must succeed");
     assert!(
-        tag1.0.starts_with("outrig-cache:"),
+        first.tag.0.starts_with("outrig-cache:"),
         "tag should be outrig-cache:<key>, got {}",
-        tag1.0
+        first.tag.0
     );
+    assert!(!first.cache_hit, "first call should miss the cache");
 
     let start = Instant::now();
-    let tag2 = image::ensure_image(&cfg, ctx)
+    let second = image::ensure_image(&cfg, ctx, false)
         .await
         .expect("second call must succeed");
     let elapsed = start.elapsed();
-    assert_eq!(tag1, tag2);
+    assert_eq!(first.tag, second.tag);
+    assert!(second.cache_hit, "second call should hit the cache");
     assert!(
         elapsed.as_millis() < 100,
         "cache hit should be near-instant, took {elapsed:?}"

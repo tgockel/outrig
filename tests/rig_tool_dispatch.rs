@@ -48,9 +48,10 @@ async fn ensure_fixture_image() -> ImageTag {
         build_args: BTreeMap::new(),
         mcp: BTreeMap::new(),
     };
-    image::ensure_image(&cfg, &fixture_dir())
+    image::ensure_image(&cfg, &fixture_dir(), false)
         .await
         .expect("ensure_image for mcp-fs fixture")
+        .tag
 }
 
 async fn start_and_bootstrap(image: &ImageTag, host_ws: &Path) -> Container {

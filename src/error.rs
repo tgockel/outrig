@@ -11,9 +11,6 @@ use crate::llm::LlmResolveError;
 
 #[derive(Debug, Error)]
 pub enum OutrigError {
-    #[error("not implemented: {0}")]
-    NotImplemented(&'static str),
-
     #[error("configuration: {0}")]
     Configuration(String),
 

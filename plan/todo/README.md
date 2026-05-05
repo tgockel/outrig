@@ -8,5 +8,4 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase G -- build, CI, end-to-end
 
-- **[0032](0032-build-subcommand.md)** `outrig build` subcommand.
 - **[0034](0034-e2e-acceptance.md)** End-to-end quickstart acceptance.

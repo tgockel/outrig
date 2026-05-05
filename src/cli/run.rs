@@ -84,7 +84,9 @@ pub async fn execute(
         ))
     })?;
 
-    let image_tag = image::ensure_image(container_cfg, &repo_root).await?;
+    let image_tag = image::ensure_image(container_cfg, &repo_root, false)
+        .await?
+        .tag;
 
     let host_workspace = if cfg.workspace.host_path.is_absolute() {
         cfg.workspace.host_path.clone()

@@ -1,6 +1,7 @@
 //! CLI subcommand entry points. Each subcommand owns its arg struct and its
 //! `execute` function; `bin/outrig.rs` stays a thin dispatch table.
 
+pub mod build;
 pub mod discard;
 pub mod logs;
 pub mod ls;
