@@ -1,4 +1,4 @@
-# Wire `--verbose` global flag
+# 0043 -- Wire `--verbose` global flag
 
 ## Goal
 
