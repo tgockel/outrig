@@ -1,6 +1,8 @@
 //! Config schema, parsing, merge, and validation.
 
 pub mod api_key;
+mod env_ref;
+pub mod env_value;
 pub mod init;
 pub mod merge;
 pub mod validate;
@@ -12,6 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::ApiKeyRef;
+pub use env_value::EnvValue;
 pub use merge::merge;
 pub use validate::ConfigValidationError;
 
@@ -172,12 +175,16 @@ pub enum McpServerSpec {
     Full {
         command: Vec<String>,
         #[serde(default)]
-        env: BTreeMap<String, String>,
+        env: BTreeMap<String, EnvValue>,
     },
 }
 
 impl McpServerSpec {
-    pub fn normalize(&self) -> (Vec<String>, BTreeMap<String, String>) {
+    /// Returns the argv and the (still-unresolved) env map. Resolution of any
+    /// `EnvValue::EnvRef` entries happens at the call site that's about to
+    /// spawn the MCP server, so a missing host env var is reported as an
+    /// MCP-startup failure rather than a config-load failure.
+    pub fn normalize(&self) -> (Vec<String>, BTreeMap<String, EnvValue>) {
         match self {
             Self::Short(command) => (command.clone(), BTreeMap::new()),
             Self::Full { command, env } => (command.clone(), env.clone()),

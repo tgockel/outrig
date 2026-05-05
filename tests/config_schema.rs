@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use outrig::config::{Config, LlmProvider, McpServerSpec};
+use outrig::config::{Config, EnvValue, LlmProvider, McpServerSpec};
 use outrig::error::OutrigError;
 
 const FIXTURE: &str = include_str!("fixtures/config-full.toml");
@@ -173,7 +173,10 @@ srv = { command = ["bin", "arg1"] }
         assert!(fs_env.is_empty());
         let (build_cmd, build_env) = coding_ctr.mcp["build"].normalize();
         assert_eq!(build_cmd, vec!["cargo-mcp"]);
-        assert_eq!(build_env["CARGO_HOME"], "/workspace/.cargo");
+        assert_eq!(
+            build_env["CARGO_HOME"],
+            EnvValue::Literal("/workspace/.cargo".to_string()),
+        );
     }
 
     #[test]

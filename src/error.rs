@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::config::api_key::ApiKeyError;
+use crate::config::env_value::EnvValueError;
 use crate::config::validate::ConfigValidationError;
 use crate::llm::LlmResolveError;
 
@@ -42,6 +43,14 @@ pub enum OutrigError {
 
     #[error("mcp service: {0}")]
     McpService(#[from] rmcp::service::ServiceError),
+
+    #[error("mcp server {name:?} env key {key:?}: {source}")]
+    McpEnvResolveFailed {
+        name: String,
+        key: String,
+        #[source]
+        source: EnvValueError,
+    },
 
     #[error("{0}")]
     McpStartupFailed(Box<McpStartupFailure>),

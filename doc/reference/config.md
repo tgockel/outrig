@@ -297,6 +297,27 @@ Notes:
   `^[a-zA-Z][a-zA-Z0-9_-]*$` and be unique within a container-config.
 - The server name appears in `outrig logs <session> <server>` and as the prefix on every tool
   the server advertises (`<server>__<tool>`).
+- Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
+  resolved from the host environment at MCP startup -- see the subsection below.
+
+#### MCP `env` value syntax
+
+Each entry on the right-hand side of an `env` table is one of:
+
+```toml
+build = { command = ["cargo-mcp"], env = {
+  CARGO_HOME = "/workspace/.cargo",  # literal -- forwarded to podman as-is
+  GH_TOKEN   = "${GITHUB_TOKEN}",    # reference -- resolved from host env at MCP startup
+  STILL_LIT  = "${lower_case}",      # literal -- doesn't match ^[A-Z_][A-Z0-9_]*$
+  ALSO_LIT   = "prefix-${X}-suffix", # literal -- embedded substitution is not supported
+} }
+```
+
+The reference form is exactly `"${VAR}"`, where `VAR` matches `^[A-Z_][A-Z0-9_]*$` -- the
+same syntax `api-key` accepts. Anything else is treated as a literal and passed through
+verbatim, including malformed-looking references (lower-case names, unmatched braces, or
+embedded substitution). If the named host env var is unset when the MCP server is about to
+start, MCP startup fails with an error naming the variable, the server, and the env key.
 
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md).
 

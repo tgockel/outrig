@@ -11,6 +11,7 @@
 //! wrapper) so [`McpClient::shutdown`] can implement the close-stdin -> wait
 //! grace -> kill sequence the MCP spec calls for.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -66,7 +67,18 @@ impl McpClient {
         name: &str,
         log_dir: &Path,
     ) -> Result<Self> {
-        let (command, env) = server_cfg.normalize();
+        let (command, env_spec) = server_cfg.normalize();
+        let mut env: BTreeMap<String, String> = BTreeMap::new();
+        for (key, value) in env_spec {
+            let resolved = value
+                .resolve()
+                .map_err(|source| OutrigError::McpEnvResolveFailed {
+                    name: name.to_string(),
+                    key: key.clone(),
+                    source,
+                })?;
+            env.insert(key, resolved);
+        }
 
         tokio::fs::create_dir_all(log_dir).await?;
         let stderr_path = log_dir.join(format!("{name}.stderr"));

@@ -3,14 +3,13 @@
 //! they cannot land in committed config files.
 
 use std::env::VarError;
-use std::sync::OnceLock;
 
-use regex::Regex;
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::env_ref::parse_env_ref;
 use crate::error::Result;
 
 #[derive(Debug, Error)]
@@ -33,14 +32,10 @@ pub struct ApiKeyRef(String);
 
 impl ApiKeyRef {
     pub fn parse(raw: &str) -> Result<Self> {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| {
-            Regex::new(r"^\$\{([A-Z_][A-Z0-9_]*)\}$").expect("api-key regex compiles")
-        });
-        let caps = re.captures(raw).ok_or_else(|| ApiKeyError::InvalidSyntax {
+        let var = parse_env_ref(raw).ok_or_else(|| ApiKeyError::InvalidSyntax {
             value: raw.to_string(),
         })?;
-        Ok(Self(caps[1].to_string()))
+        Ok(Self(var.to_string()))
     }
 
     pub fn resolve(&self) -> Result<String> {
