@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase G -- build, CI, end-to-end
-
-- **[0034](0034-e2e-acceptance.md)** End-to-end quickstart acceptance.
-
 ## Phase H -- outrig mcp subcommand
 
 - **[0035](0035-outrig-mcp-session-setup.md)** Refactor: extract `SessionSetup` from
@@ -30,3 +26,4 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 - **[0043](0043-verbose-flag.md)** Wire `--verbose` global flag.
 - **[0044](0044-dedup-init-tracing.md)** Dedup `init_tracing` into `tests/common/mod.rs`.
 - **[0045](0045-bound-stderr-capture.md)** Bound stderr capture in `run_capture`.
+- **[0046](0046-pick-a-license.md)** Pick a license + ship `LICENSE`.

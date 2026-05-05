@@ -2,9 +2,6 @@
 
 ![CI](https://github.com/tgockel/outrig/actions/workflows/ci.yml/badge.svg)
 
-> **TODO: Incomplete** -- this README describes outrig's intended behavior. The implementation
-> is in progress; commands documented here are not yet available.
-
 `outrig` runs an LLM agent inside a podman-managed container, so the agent can use MCP tools
 (filesystem, shell, etc.) without those tools touching anything outside the sandbox you've set up.
 
