@@ -105,3 +105,55 @@ only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
 - `prompts/*` and `resources/*` proxying are explicitly out of scope; the trait
   defaults (empty / `method_not_found`) are correct for v0. A future task may
   generalize dispatch into `BackingNamespace<Method>`.
+
+## Decisions
+
+- **`SessionSetupArgs` gains `pub require_agent: bool`** rather than
+  reinterpreting `agent_flag: None` as "skip agent entirely." `outrig mcp`
+  has no concept of an agent at all -- not an unset flag, not a fallback to
+  `default-agent` -- so a separate signal is the cleanest seam. `outrig run`
+  passes `true` (today's behavior bit-for-bit); `outrig mcp` passes `false`,
+  which also drops `agent_container` from the container fallback chain. The
+  `// FIXME(0040)` comment in `session_setup.rs` is gone.
+
+- **`tokio-util` becomes a direct dependency** so `cli/mcp.rs` can hold a
+  `CancellationToken` alongside the consumed `RunningService`. The token is
+  passed to `rmcp::service::serve_server_with_ct(...)`; on SIGINT/SIGTERM
+  we `ct.cancel()` and then `await` the spawned `service.waiting()` so the
+  rmcp dispatcher quiesces before `session_setup::teardown` runs. The EOF
+  path (peer drops stdin) hits the same `&mut waiter` arm of the
+  `tokio::select!` and skips the explicit cancel.
+
+- **`ProxyServer::per_server_counts()` is the new banner-feeder.**
+  `iter_public_names` (added by 0039 specifically for the banner) is enough
+  for the `tools available:` line, but the per-server `(name, count)` lines
+  needed an additional helper. Keeping it on `ProxyServer` avoids a second
+  `list_tools` round-trip per server during banner construction.
+
+- **`dispatch_call`'s error path identifies the backing server.** The
+  `Err(e)` arm now formats the body as
+  `outrig: backing server `<name>` call failed: <error>` and emits a
+  matching `tracing::warn!`. The existing `backend_error_surfaces_as_...`
+  test already used `.contains` for the inner error, so the prefixed body
+  is backwards-compatible; the test gained a second assertion that pins
+  the new server-name prefix so the format stays stable.
+
+- **`#![deny(clippy::print_stdout)]` on `cli/mcp.rs` and `mcp_proxy.rs`.**
+  Tripwire per the task spec. `outrig run` does not get the same lint
+  because its banner is the only stderr-bound `print!`-shaped output and
+  it is already isolated; gating that file would force a no-op refactor.
+
+- **Banner uses `eprint!`, not `tracing::info!`.** Spec-mandated and
+  load-bearing: the banner must appear regardless of `OUTRIG_LOG`, and
+  must not interleave with rmcp's tracing emissions on the same writer
+  (both are stderr; the buffered single-write banner stays one block).
+
+- **Signal handling tested via shared code path, not signal injection.**
+  All three triggers (stdin EOF, SIGINT, SIGTERM) funnel through one of
+  three `tokio::select!` arms that converge on the same `waiter.await`
+  -> `teardown` chain. The smoke test exercises the EOF arm explicitly
+  (drops the rmcp client, asserts clean exit + container reaped); the
+  signal arms exercise the same `ct.cancel(); waiter.await; teardown`
+  sequence with no behavioral divergence. Process-level signal injection
+  in tests is fragile (race between signal delivery and the select being
+  ready); skipping it favors signal-via-code-review over a flaky test.

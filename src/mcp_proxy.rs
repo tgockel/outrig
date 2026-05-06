@@ -13,6 +13,8 @@
 //!
 //! [`McpClient`]: crate::mcp::McpClient
 
+#![deny(clippy::print_stdout)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -232,6 +234,22 @@ impl<C: BackingClient> ProxyServer<C> {
         self.inner.tools.iter().map(|t| t.public_name.as_str())
     }
 
+    /// Per-backing-client tool counts, in client registration order.
+    /// Used by the `outrig mcp` startup banner to print one
+    /// `[outrig] mcp <name>: initialized (<n> tools)` line per server.
+    pub fn per_server_counts(&self) -> Vec<(&str, usize)> {
+        let mut counts = vec![0usize; self.inner.clients.len()];
+        for entry in &self.inner.tools {
+            counts[entry.client_idx] += 1;
+        }
+        self.inner
+            .clients
+            .iter()
+            .zip(counts)
+            .map(|(c, n)| (c.name(), n))
+            .collect()
+    }
+
     /// Build a `tools/list` response: every backing server's tools, in
     /// registration order, namespaced via [`tool_name::sanitize`]. Exposed
     /// (rather than living inline in [`ServerHandler::list_tools`]) so the
@@ -269,15 +287,23 @@ impl<C: BackingClient> ProxyServer<C> {
         let entry = &self.inner.tools[idx];
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
 
-        match self.inner.clients[entry.client_idx]
-            .call_tool(&entry.backend_tool, args)
-            .await
-        {
+        let client = &self.inner.clients[entry.client_idx];
+        match client.call_tool(&entry.backend_tool, args).await {
             Ok(result) => CallToolResult {
                 content: vec![Content::text(result.content_text)],
                 is_error: Some(result.is_error),
             },
-            Err(e) => CallToolResult::error(vec![Content::text(e.to_string())]),
+            Err(e) => {
+                let server = client.name();
+                tracing::warn!(
+                    target: "outrig::mcp_proxy",
+                    "backing server {server:?} call to {tool:?} failed: {e}",
+                    tool = entry.backend_tool,
+                );
+                CallToolResult::error(vec![Content::text(format!(
+                    "outrig: backing server `{server}` call failed: {e}"
+                ))])
+            }
         }
     }
 }

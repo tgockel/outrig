@@ -60,6 +60,7 @@ pub async fn execute(
         session_root_flag,
         container_flag: args.container.as_deref(),
         agent_flag: args.agent.as_deref(),
+        require_agent: true,
         explicit_session_dir: args.session_dir.as_deref(),
     })
     .await?;

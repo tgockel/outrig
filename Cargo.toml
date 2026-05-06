@@ -34,6 +34,7 @@ toml               = "0.8"
 toml_edit          = "0.22"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio-util         = "0.7"
 walkdir            = "2.5"
 
 [dependencies.rmcp]

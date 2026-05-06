@@ -208,10 +208,17 @@ async fn backend_error_surfaces_as_call_tool_result_is_error() {
 
     let result = proxy.dispatch_call(call("fs__read_file", json!({}))).await;
     assert_eq!(result.is_error, Some(true));
+    let body = text_body(&result);
+    // Body identifies the backing server by name and carries the upstream
+    // error verbatim. The prefix lets an MCP client distinguish a proxy
+    // failure from a backend's own `is_error=true` response.
     assert!(
-        text_body(&result).contains("permission denied"),
-        "body was {:?}",
-        text_body(&result)
+        body.contains("outrig: backing server `fs`"),
+        "body should identify the backing server, was {body:?}"
+    );
+    assert!(
+        body.contains("permission denied"),
+        "body should carry the backend error, was {body:?}"
     );
 }
 
@@ -298,4 +305,22 @@ async fn iter_public_names_matches_list_tools() {
 
     assert_eq!(from_iter, vec!["fs__read_file", "fs__write_file"]);
     assert_eq!(from_iter, from_list);
+}
+
+#[tokio::test]
+async fn per_server_counts_preserves_registration_order() {
+    let fs = Arc::new(
+        FakeClient::new("fs")
+            .with_tool("read_file")
+            .with_tool("write_file"),
+    );
+    let git = Arc::new(FakeClient::new("git").with_tool("commit"));
+    let empty = Arc::new(FakeClient::new("empty"));
+
+    let proxy = ProxyServer::build(vec![fs, git, empty]).await.unwrap();
+
+    assert_eq!(
+        proxy.per_server_counts(),
+        vec![("fs", 2), ("git", 1), ("empty", 0)]
+    );
 }

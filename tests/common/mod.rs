@@ -3,9 +3,10 @@
 //! conventional shared modules (no phantom `common` test binary).
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use tokio::io::{AsyncWriteExt, BufReader, DuplexStream, duplex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
 
 use outrig::error::{OutrigError, Result};
 use outrig::hf::{HfFile, HfTreeFetcher};
@@ -119,5 +120,29 @@ pub fn sample_session(id: &SessionId) -> Session {
         session_dir: PathBuf::new(),
         exit_code: None,
         link_target: None,
+    }
+}
+
+/// Drain `reader` line-by-line, mirroring each line to the test runner's
+/// stderr (so a hang dumps everything-so-far) and into the shared `sink`
+/// buffer for later assertions. `label` distinguishes which stream a line
+/// came from in the mirrored output.
+#[allow(dead_code)]
+pub async fn stream_lines<R>(reader: R, sink: Arc<Mutex<String>>, label: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                eprintln!("[child {label}] {}", line.trim_end_matches('\n'));
+                sink.lock().unwrap().push_str(&line);
+            }
+            Err(_) => break,
+        }
     }
 }

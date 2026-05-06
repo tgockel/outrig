@@ -5,6 +5,7 @@ pub mod build;
 pub mod discard;
 pub mod logs;
 pub mod ls;
+pub mod mcp;
 pub mod run;
 pub mod session_setup;
 

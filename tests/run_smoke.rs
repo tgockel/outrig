@@ -20,10 +20,13 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::time::timeout;
+
+mod common;
+use common::stream_lines;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -291,23 +294,4 @@ async fn drain_request(sock: &mut tokio::net::TcpStream) -> Option<Value> {
 
 fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-async fn stream_lines<R>(reader: R, sink: Arc<Mutex<String>>, label: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                eprintln!("[child {label}] {}", line.trim_end_matches('\n'));
-                sink.lock().unwrap().push_str(&line);
-            }
-            Err(_) => break,
-        }
-    }
 }

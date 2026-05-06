@@ -7,6 +7,7 @@ use outrig::cli::build::{self, BuildArgs};
 use outrig::cli::discard::{self, DiscardArgs};
 use outrig::cli::logs::{self, LogsArgs};
 use outrig::cli::ls::{self, LsArgs};
+use outrig::cli::mcp::{self, McpArgs};
 use outrig::cli::run::{self, RunArgs};
 use outrig::config;
 use outrig::error::Result;
@@ -41,6 +42,8 @@ struct Cli {
 enum Cmd {
     /// Start an interactive agent session.
     Run(RunArgs),
+    /// Serve the configured backing MCPs as a single MCP server over stdio.
+    Mcp(McpArgs),
     /// Build (or cache-hit) one or more container-config images.
     Build(BuildArgs),
     /// Read or write outrig's configuration files.
@@ -120,12 +123,7 @@ fn main() -> ExitCode {
 fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.cmd {
         Cmd::Run(args) => {
-            let cwd = std::env::current_dir()?;
-            let repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
-            let global_config = repo::global_config_path(cli.global_config.as_deref());
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
             runtime.block_on(run::execute(
                 &repo_config,
                 &global_config,
@@ -133,13 +131,17 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 args,
             ))
         }
+        Cmd::Mcp(args) => {
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
+            runtime.block_on(mcp::execute(
+                &repo_config,
+                &global_config,
+                cli.session_root.as_deref(),
+                args,
+            ))
+        }
         Cmd::Build(args) => {
-            let cwd = std::env::current_dir()?;
-            let repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
-            let global_config = repo::global_config_path(cli.global_config.as_deref());
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
             runtime.block_on(build::execute(&repo_config, &global_config, args))
         }
         Cmd::Config(args) => match &args.cmd {
@@ -202,8 +204,9 @@ fn dispatch(cli: &Cli) -> Result<i32> {
 
 /// Shared preamble for `ls`/`logs`/`discard`: cwd, the resolved global
 /// config path, and a current-thread tokio runtime ready to drive the
-/// async `execute` form of each subcommand. `Cmd::Run` keeps its own
-/// preamble because it also resolves the repo config eagerly.
+/// async `execute` form of each subcommand. The repo config is resolved
+/// inside each handler because session lookups can substring-match across
+/// repos and shouldn't fail on a missing repo config.
 fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
     let cwd = std::env::current_dir()?;
     let global = repo::global_config_path(cli.global_config.as_deref());
@@ -211,4 +214,18 @@ fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runti
         .enable_all()
         .build()?;
     Ok((cwd, global, runtime))
+}
+
+/// Shared preamble for `run`/`mcp`/`build`: the resolved repo config, the
+/// resolved global config, and a current-thread tokio runtime. Errors if
+/// the repo config can't be located (the user must be inside an outrig
+/// repo for these to make sense).
+fn repo_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
+    let cwd = std::env::current_dir()?;
+    let repo_config = repo::resolve_repo_config(cli.config.as_deref(), &cwd)?;
+    let global_config = repo::global_config_path(cli.global_config.as_deref());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok((repo_config, global_config, runtime))
 }

@@ -45,10 +45,17 @@ pub struct SessionSetupArgs<'a> {
     pub global_cfg_path: &'a Path,
     pub session_root_flag: Option<&'a Path>,
     pub container_flag: Option<&'a str>,
-    /// Raw `--agent` flag. [`setup`] today errors when neither this nor
-    /// `cfg.default_agent` is set; the seam tolerates `None` so a future
-    /// caller can opt out of agent resolution.
+    /// Raw `--agent` flag. Read only when `require_agent = true`; ignored
+    /// otherwise (and `outrig mcp` always passes `None`).
     pub agent_flag: Option<&'a str>,
+    /// `true` for `outrig run`: [`setup`] resolves an agent from
+    /// `agent_flag.or(cfg.default_agent)` (errors if neither) and lets
+    /// `agent.container` participate in the container fallback.
+    /// `false` for `outrig mcp`: no agent at all -- `llm::resolve_agent` is
+    /// not called, `cfg.default_agent` is not consulted, the resulting
+    /// [`Session::agent_name`] is `None`, and the container cascade is
+    /// `container_flag -> default_container` only.
+    pub require_agent: bool,
     pub explicit_session_dir: Option<&'a Path>,
 }
 
@@ -74,28 +81,38 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let repo_root = repo::repo_root_from_config_path(args.repo_cfg_path);
     let cfg = Config::load(&repo_root, Some(args.global_cfg_path))?;
 
-    // FIXME(0040): when `outrig mcp` lands, this branch needs to tolerate
-    // `agent_flag = None && cfg.default_agent = None` (skip agent resolution
-    // entirely). For 0035 we error to preserve `outrig run`'s exact today
-    // behavior -- agent presence is checked before any container work.
-    let agent_name = args
-        .agent_flag
-        .or(cfg.default_agent.as_deref())
-        .ok_or_else(|| {
-            OutrigError::Configuration("no --agent and no default-agent configured".to_string())
-        })?;
-    let resolved_agent = llm::resolve_agent(&cfg, agent_name)?;
-    let session_agent_name = resolved_agent.agent_name.clone();
-    let agent_container = resolved_agent.container.clone();
+    // Agent presence is checked before any container work so the failure
+    // mode is identical for `outrig run` regardless of which container
+    // would have been picked. `outrig mcp` opts out via `require_agent =
+    // false` -- it has no agent concept, so `agent_flag` and
+    // `cfg.default_agent` are not consulted at all.
+    let (session_agent_name, agent_container) = if args.require_agent {
+        let agent_name = args
+            .agent_flag
+            .or(cfg.default_agent.as_deref())
+            .ok_or_else(|| {
+                OutrigError::Configuration("no --agent and no default-agent configured".to_string())
+            })?;
+        let resolved = llm::resolve_agent(&cfg, agent_name)?;
+        (
+            Some(resolved.agent_name.clone()),
+            resolved.container.clone(),
+        )
+    } else {
+        (None, None)
+    };
 
     let container_cfg_name = args
         .container_flag
         .or(agent_container.as_deref())
         .or(cfg.default_container.as_deref())
         .ok_or_else(|| {
-            OutrigError::Configuration(
-                "no --container, agent.container, or default-container configured".to_string(),
-            )
+            let msg = if args.require_agent {
+                "no --container, agent.container, or default-container configured"
+            } else {
+                "no --container or default-container configured"
+            };
+            OutrigError::Configuration(msg.to_string())
         })?
         .to_string();
     let container_cfg = cfg
@@ -143,7 +160,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         container_name: container.name.clone(),
         image_tag: image_tag.to_string(),
         container_config_name: container_cfg_name.clone(),
-        agent_name: Some(session_agent_name),
+        agent_name: session_agent_name,
         working_dir: repo_root.clone(),
         session_dir: PathBuf::new(), // set by `create` below
         exit_code: None,
