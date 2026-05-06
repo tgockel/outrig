@@ -14,3 +14,4 @@ pub mod repl;
 pub mod repo;
 pub mod rig_tool;
 pub mod session;
+pub mod tool_name;

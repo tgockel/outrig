@@ -3,14 +3,9 @@
 //! [`McpToolAdapter`] wraps an MCP-discovered tool as a [`rig::tool::ToolDyn`]
 //! so the agent loop can hand it directly to a Rig `Agent`. The original
 //! tool name (used on the MCP wire) lives next to the sanitized
-//! `<server>__<tool>` name (the form the LLM sees), so a single adapter knows
-//! both ends of the dispatch.
-//!
-//! [`sanitize`] enforces OpenAI's `^[a-zA-Z0-9_-]{1,64}$` constraint on tool
-//! names. Over-long names are truncated and tagged with a stable 6-hex blake3
-//! suffix derived from the *pre-sanitization* `<server>__<tool>` so two tools
-//! that would otherwise collide after character replacement get distinct
-//! suffixes.
+//! `<server>__<tool>` name (the form the LLM sees, produced by
+//! [`crate::tool_name::sanitize`]), so a single adapter knows both ends of
+//! the dispatch.
 
 use std::sync::Arc;
 
@@ -21,15 +16,6 @@ use serde_json::Value;
 
 use crate::error::Result;
 use crate::mcp::McpClient;
-
-/// Maximum length OpenAI accepts for a tool name. Other providers are more
-/// liberal but this is the safe lower bound.
-const MAX_NAME_LEN: usize = 64;
-
-/// Width of the truncation suffix's hex portion. The full suffix is
-/// `_` + this many hex chars.
-const HASH_HEX_LEN: usize = 6;
-const SUFFIX_LEN: usize = 1 + HASH_HEX_LEN;
 
 /// A Rig dynamic-tool view of one MCP-discovered tool.
 ///
@@ -56,7 +42,7 @@ impl McpToolAdapter {
         Ok(tools
             .into_iter()
             .map(|t| McpToolAdapter {
-                openai_name: sanitize(&server_name, &t.name),
+                openai_name: crate::tool_name::sanitize(&server_name, &t.name),
                 mcp_tool_name: t.name,
                 description: t.description.unwrap_or_default(),
                 input_schema: t.input_schema,
@@ -111,36 +97,4 @@ impl ToolDyn for McpToolAdapter {
             }
         })
     }
-}
-
-/// Build the LLM-facing name from `<server>__<tool>`, replacing any character
-/// outside `[a-zA-Z0-9_-]` with `_` and truncating with a stable 6-hex blake3
-/// suffix when the result would exceed [`MAX_NAME_LEN`].
-///
-/// The hash is over the *pre-sanitization* concatenation, so two distinct
-/// originals that would map to the same sanitized prefix get different
-/// suffixes.
-pub fn sanitize(server: &str, tool: &str) -> String {
-    let original = format!("{server}__{tool}");
-
-    let mut sanitized = String::with_capacity(original.len());
-    for c in original.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            sanitized.push(c);
-        } else {
-            sanitized.push('_');
-        }
-    }
-
-    if sanitized.len() <= MAX_NAME_LEN {
-        return sanitized;
-    }
-
-    let hash = blake3::hash(original.as_bytes());
-    let hex = hash.to_hex();
-    let suffix_hex = &hex.as_str()[..HASH_HEX_LEN];
-    sanitized.truncate(MAX_NAME_LEN - SUFFIX_LEN);
-    sanitized.push('_');
-    sanitized.push_str(suffix_hex);
-    sanitized
 }
