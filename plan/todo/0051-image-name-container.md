@@ -1,7 +1,4 @@
-# `image-name` field on `[containers.<name>]`
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/`
-> when ready.
+# 0051 -- `image-name` field on `[containers.<name>]`
 
 ## Context
 

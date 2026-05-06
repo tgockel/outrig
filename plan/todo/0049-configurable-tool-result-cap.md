@@ -1,7 +1,4 @@
-# Configurable per-tool-result truncation
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/`
-> when ready.
+# 0049 -- Configurable per-tool-result truncation
 
 ## Context
 

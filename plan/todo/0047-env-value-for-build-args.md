@@ -1,7 +1,4 @@
-# `${VAR}` substitution for `build-args`
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/`
-> when ready.
+# 0047 -- `${VAR}` substitution for `build-args`
 
 ## Context
 

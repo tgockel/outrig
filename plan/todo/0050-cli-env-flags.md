@@ -1,7 +1,4 @@
-# `--env` flags for `outrig run` and `outrig mcp`
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/`
-> when ready.
+# 0050 -- `--env` flags for `outrig run` and `outrig mcp`
 
 ## Context
 

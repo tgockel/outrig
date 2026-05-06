@@ -1,7 +1,4 @@
-# Configurable + resumable tool-call cap
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/`
-> when ready.
+# 0048 -- Configurable + resumable tool-call cap
 
 ## Context
 
