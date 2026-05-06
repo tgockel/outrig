@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase H -- outrig mcp subcommand
 
-- **[0036](0036-outrig-mcp-agent-name-option.md)** Refactor: `Session::agent_name` ->
-  `Option<String>`.
 - **[0037](0037-outrig-mcp-tool-name-extract.md)** Refactor: factor `tool_name::sanitize`
   out of `rig_tool`.
 - **[0038](0038-outrig-mcp-rmcp-features.md)** Add rmcp `server` + `transport-io`

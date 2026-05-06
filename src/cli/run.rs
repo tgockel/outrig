@@ -64,7 +64,11 @@ pub async fn execute(
     })
     .await?;
 
-    let agent_name = setup.session.agent_name.clone();
+    let agent_name = setup
+        .session
+        .agent_name
+        .clone()
+        .expect("outrig run always resolves an agent in setup");
     let SessionSetup {
         cfg,
         container_cfg_name,

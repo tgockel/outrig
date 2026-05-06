@@ -114,7 +114,7 @@ pub fn sample_session(id: &SessionId) -> Session {
         container_name: format!("outrig-{}", id.as_str()),
         image_tag: "outrig/test:abc123".to_string(),
         container_config_name: "coding".to_string(),
-        agent_name: "default".to_string(),
+        agent_name: Some("default".to_string()),
         working_dir: PathBuf::from("/some/repo"),
         session_dir: PathBuf::new(),
         exit_code: None,

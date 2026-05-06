@@ -143,7 +143,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         container_name: container.name.clone(),
         image_tag: image_tag.to_string(),
         container_config_name: container_cfg_name.clone(),
-        agent_name: session_agent_name,
+        agent_name: Some(session_agent_name),
         working_dir: repo_root.clone(),
         session_dir: PathBuf::new(), // set by `create` below
         exit_code: None,

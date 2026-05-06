@@ -48,3 +48,30 @@ None.
 - Display formatting policy ("-" placeholder for `None`) is the recommended default;
   the task author may pick a different placeholder if it reads better in
   `outrig ls`'s columnar output.
+
+## Decisions
+
+- **Writer site lives in `src/cli/session_setup.rs`, not `src/cli/run.rs`.** After
+  commit `643cfef` (`refactor: extract cli::session_setup from cli::run`), the
+  `Session` struct literal moved into `session_setup::setup`. The deliverable text
+  was written before that refactor; the wrap happens at `session_setup.rs:146`.
+- **No display sites changed.** The deliverable mentioned `src/cli/ls.rs` but the
+  current `outrig ls` table renders `ID / STARTED / DURATION / CONTAINER / EXIT`
+  -- there is no `AGENT` column today. `outrig logs` and `outrig discard` also
+  don't print agent_name. Adding a column is out of scope for a refactor task; if
+  desired, file it as a follow-up.
+- **`outrig run` reader uses `expect`, not a sibling field on `SessionSetup`.**
+  Considered exposing `resolved_agent_name: String` alongside `session: Session`
+  on `SessionSetup` so the caller wouldn't need to unwrap. Rejected: that
+  duplicates state (the agent name would live in two fields), and `outrig mcp`
+  -- the future caller -- won't thread the agent name through `run_inner` at
+  all. The `expect` is local to the run path and the invariant is enforced one
+  function up in `setup` (which errors when neither `--agent` nor
+  `default-agent` is set).
+- **On-disk compat tests build the JSON via `serde_json::Value` from
+  `sample_session`, not hand-written literals.** First pass had ~25 lines of
+  literal JSON per test; refactored to a small `write_session_json(dir, sid,
+  mutate)` helper that serializes `sample_session(&sid)` to a Value, applies the
+  caller's mutation (set or remove the `agent_name` key), and writes. Keeps the
+  tests in sync if `Session` gains/renames fields and surfaces the test's intent
+  (set vs. remove) in one line.

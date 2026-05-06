@@ -229,3 +229,48 @@ fn remove_by_path_cleans_dangling_symlink() {
         "dangling symlink should also be cleaned"
     );
 }
+
+/// Build a `session.json` from `sample_session`, then apply `mutate` so the
+/// caller can swap or remove `agent_name`. Tests the on-disk schema against
+/// shapes the current code wouldn't write itself.
+fn write_session_json(
+    dir: &std::path::Path,
+    sid: &SessionId,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut session = sample_session(sid);
+    session.session_dir = dir.to_path_buf();
+    let mut value = serde_json::to_value(&session).expect("to_value");
+    mutate(&mut value);
+    std::fs::write(dir.join("session.json"), value.to_string()).expect("write");
+}
+
+#[test]
+fn loads_legacy_agent_name_string() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = root.path().join(sid.as_str());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    write_session_json(&dir, &sid, |v| {
+        v["agent_name"] = serde_json::json!("coding");
+    });
+
+    let loaded = store.get_by_path(&dir).expect("get_by_path");
+    assert_eq!(loaded.agent_name.as_deref(), Some("coding"));
+}
+
+#[test]
+fn loads_session_with_agent_name_absent() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = root.path().join(sid.as_str());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    write_session_json(&dir, &sid, |v| {
+        v.as_object_mut().expect("object").remove("agent_name");
+    });
+
+    let loaded = store.get_by_path(&dir).expect("get_by_path");
+    assert!(loaded.agent_name.is_none());
+}
