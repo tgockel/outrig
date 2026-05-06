@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase H -- outrig mcp subcommand
 
-- **[0035](0035-outrig-mcp-session-setup.md)** Refactor: extract `SessionSetup` from
-  `cli/run.rs`.
 - **[0036](0036-outrig-mcp-agent-name-option.md)** Refactor: `Session::agent_name` ->
   `Option<String>`.
 - **[0037](0037-outrig-mcp-tool-name-extract.md)** Refactor: factor `tool_name::sanitize`

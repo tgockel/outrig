@@ -1,0 +1,231 @@
+//! Shared bootstrap for `outrig run` and (future) `outrig mcp`. Lifts the
+//! sequence of "load + merge config -> resolve container -> ensure image ->
+//! start + bootstrap container -> session row + log dir" out of [`run`]
+//! so both subcommands hit the same code path.
+//!
+//! Three pieces:
+//!
+//! - [`setup`] -- everything from config-load through "container started +
+//!   bootstrapped + session row + log dir created", returning a populated
+//!   [`SessionSetup`]. Stops *before* MCP children connect.
+//! - [`connect_mcp_clients`] -- spawns one [`McpClient`] per declared
+//!   backing MCP, in `BTreeMap` (key-sorted, deterministic) iteration order.
+//!   Adapter construction stays in the caller because only the REPL path
+//!   consumes adapters.
+//! - [`teardown`] -- mirror of the cleanup tail: graceful MCP shutdowns
+//!   (drop adapters first so [`Arc::try_unwrap`] succeeds), then stop the
+//!   container, then finalize the session row. Errors are logged and never
+//!   override the caller's outcome.
+//!
+//! The MCP children are `podman exec` processes whose stdio rides through
+//! the container; tearing the container down before shutting them down
+//! races their pipes, so the order in [`teardown`] is load-bearing.
+//!
+//! [`run`]: crate::cli::run
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use crate::config::{Config, ContainerConfig};
+use crate::container::Container;
+use crate::error::{OutrigError, Result};
+use crate::image::{self, ImageTag};
+use crate::llm;
+use crate::mcp::McpClient;
+use crate::repo;
+use crate::session::{self, Session, SessionId, SessionStore};
+
+pub(crate) const STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
+/// is the caller's stack frame.
+pub struct SessionSetupArgs<'a> {
+    pub repo_cfg_path: &'a Path,
+    pub global_cfg_path: &'a Path,
+    pub session_root_flag: Option<&'a Path>,
+    pub container_flag: Option<&'a str>,
+    /// Raw `--agent` flag. [`setup`] today errors when neither this nor
+    /// `cfg.default_agent` is set; the seam tolerates `None` so a future
+    /// caller can opt out of agent resolution.
+    pub agent_flag: Option<&'a str>,
+    pub explicit_session_dir: Option<&'a Path>,
+}
+
+/// Output of [`setup`]: every long-lived value the post-setup pipeline
+/// needs (REPL build, MCP children, teardown). The container is already
+/// started + bootstrapped; the session row is already on disk.
+pub struct SessionSetup {
+    pub cfg: Config,
+    pub container_cfg_name: String,
+    pub container_cfg: ContainerConfig,
+    pub image_tag: ImageTag,
+    pub container: Container,
+    pub sid: SessionId,
+    pub session: Session,
+    pub session_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub store: SessionStore,
+}
+
+/// Run the shared bootstrap. Returns once the container is up, the runtime
+/// user is bootstrapped, and the session directory + log dir exist.
+pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
+    let repo_root = repo::repo_root_from_config_path(args.repo_cfg_path);
+    let cfg = Config::load(&repo_root, Some(args.global_cfg_path))?;
+
+    // FIXME(0040): when `outrig mcp` lands, this branch needs to tolerate
+    // `agent_flag = None && cfg.default_agent = None` (skip agent resolution
+    // entirely). For 0035 we error to preserve `outrig run`'s exact today
+    // behavior -- agent presence is checked before any container work.
+    let agent_name = args
+        .agent_flag
+        .or(cfg.default_agent.as_deref())
+        .ok_or_else(|| {
+            OutrigError::Configuration("no --agent and no default-agent configured".to_string())
+        })?;
+    let resolved_agent = llm::resolve_agent(&cfg, agent_name)?;
+    let session_agent_name = resolved_agent.agent_name.clone();
+    let agent_container = resolved_agent.container.clone();
+
+    let container_cfg_name = args
+        .container_flag
+        .or(agent_container.as_deref())
+        .or(cfg.default_container.as_deref())
+        .ok_or_else(|| {
+            OutrigError::Configuration(
+                "no --container, agent.container, or default-container configured".to_string(),
+            )
+        })?
+        .to_string();
+    let container_cfg = cfg
+        .containers
+        .get(&container_cfg_name)
+        .ok_or_else(|| {
+            OutrigError::Configuration(format!(
+                "container-config {container_cfg_name:?} does not match any [containers.<name>]"
+            ))
+        })?
+        .clone();
+
+    let image_tag = image::ensure_image(&container_cfg, &repo_root, false)
+        .await?
+        .tag;
+
+    let host_workspace = if cfg.workspace.host_path.is_absolute() {
+        cfg.workspace.host_path.clone()
+    } else {
+        repo_root.join(&cfg.workspace.host_path)
+    };
+    let container_workspace = cfg.workspace.container_path.clone();
+
+    if let Some(p) = args.explicit_session_dir
+        && !p.is_dir()
+    {
+        return Err(OutrigError::Configuration(format!(
+            "--session-dir {} is not an existing directory (create it first or omit the flag)",
+            p.display()
+        )));
+    }
+
+    let mut container = Container::start(&image_tag, &host_workspace, &container_workspace).await?;
+    container.bootstrap_user().await?;
+
+    let sid = SessionId(container.session_suffix().to_string());
+
+    let session_root =
+        session::resolve_session_root(args.session_root_flag, &cfg, &repo::default_session_root());
+    let store = SessionStore::new(session_root);
+    let mut session = Session {
+        id: sid.clone(),
+        started_at: SystemTime::now(),
+        ended_at: None,
+        container_name: container.name.clone(),
+        image_tag: image_tag.to_string(),
+        container_config_name: container_cfg_name.clone(),
+        agent_name: session_agent_name,
+        working_dir: repo_root.clone(),
+        session_dir: PathBuf::new(), // set by `create` below
+        exit_code: None,
+        link_target: None,
+    };
+    let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
+    let log_dir = session_dir.join("logs");
+    tokio::fs::create_dir_all(&log_dir).await?;
+
+    Ok(SessionSetup {
+        cfg,
+        container_cfg_name,
+        container_cfg,
+        image_tag,
+        container,
+        sid,
+        session,
+        session_dir,
+        log_dir,
+        store,
+    })
+}
+
+/// Spawn one [`McpClient`] per backing MCP declared in `container_cfg.mcp`,
+/// in key-sorted (`BTreeMap`) iteration order. Adapter construction is the
+/// caller's job because only the REPL path consumes adapters.
+pub async fn connect_mcp_clients(
+    container: &Container,
+    container_cfg: &ContainerConfig,
+    log_dir: &Path,
+) -> Result<Vec<Arc<McpClient>>> {
+    let mut arcs = Vec::with_capacity(container_cfg.mcp.len());
+    for (mcp_name, spec) in &container_cfg.mcp {
+        let client = McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir).await?;
+        arcs.push(Arc::new(client));
+    }
+    Ok(arcs)
+}
+
+/// Cleanup tail. Order: MCP shutdowns (so their `podman exec` pipes drain
+/// before the container goes away) -> container stop -> session finalize.
+/// Each step's failure is logged but never propagated; the caller's outcome
+/// owns the process exit code.
+///
+/// Callers must drop any `Arc<McpClient>` clones (e.g. tool adapters) and
+/// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
+/// `Err` and the explicit `shutdown` is skipped in favor of `Drop`.
+pub async fn teardown(
+    mcp_arcs: Vec<Arc<McpClient>>,
+    container: Container,
+    store: &SessionStore,
+    sid: &SessionId,
+    final_exit: i32,
+) {
+    for arc in mcp_arcs {
+        match Arc::try_unwrap(arc) {
+            Ok(client) => {
+                if let Err(e) = client.shutdown().await {
+                    tracing::warn!(
+                        target: "outrig::cli::session_setup",
+                        "mcp shutdown failed: {e}"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "outrig::cli::session_setup",
+                    "mcp client still has outstanding refs at cleanup; relying on Drop"
+                );
+            }
+        }
+    }
+    if let Err(e) = container.stop(STOP_GRACE).await {
+        tracing::warn!(
+            target: "outrig::cli::session_setup",
+            "container stop failed: {e}"
+        );
+    }
+    if let Err(e) = store.finalize(sid, SystemTime::now(), final_exit) {
+        tracing::warn!(
+            target: "outrig::cli::session_setup",
+            "session finalize failed: {e}"
+        );
+    }
+}

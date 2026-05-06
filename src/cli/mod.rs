@@ -6,6 +6,7 @@ pub mod discard;
 pub mod logs;
 pub mod ls;
 pub mod run;
+pub mod session_setup;
 
 use std::path::PathBuf;
 

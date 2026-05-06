@@ -56,3 +56,44 @@ None.
   external surface (binary CLI, config TOML, on-disk session format) is unchanged.
 - Cross-references to the master spec sections "Module layout" and the `SessionSetup`
   Rust sketch (in the original `outrig-mcp.md`, now split across 0035-0041).
+
+## Decisions
+
+1. **Agent presence error stays in `setup`.** When both `agent_flag` and
+   `cfg.default_agent` are `None`, `setup` errors with `"no --agent and no
+   default-agent configured"` -- exactly today's run.rs message, and emitted
+   *before* any container work, matching today's error ordering bit-for-bit.
+   The spec's "`None` for `outrig mcp` later" gloss is deferred to 0040: the
+   future caller will need either a different code path or a relaxed check
+   here. A `// FIXME(0040)` comment marks the spot.
+2. **`SessionSetup` does not carry the resolved agent.** Matches the
+   deliverable spec literally. `run.rs` re-resolves via `llm::resolve_agent`
+   for the `build_agent` + banner step. The duplicate call is cheap (config
+   table lookups, no I/O) and keeps `llm::ResolvedAgent` out of the
+   `cli::session_setup` public type surface.
+3. **`run.rs` reads the agent name from `setup.session.agent_name`** rather
+   than re-running the `args.agent.or(cfg.default_agent)` fallback. This
+   removes a duplicate fallback chain and an `.expect("setup validated...")`
+   that would have coupled `run.rs` to setup's internal contract.
+4. **`STOP_GRACE` moves to `session_setup`** as `pub(crate) const`.
+   `teardown` is the only caller.
+5. **`connect_mcp_clients` returns `Vec<Arc<McpClient>>` only.** Adapter
+   construction (`McpToolAdapter::from_client_tools`) stays in `run.rs`
+   because the REPL is the only consumer of adapters; `outrig mcp` will
+   expose the same clients differently.
+6. **`run.rs::execute` populates `mcp_arcs` incrementally** through a
+   `&mut Vec<Arc<McpClient>>` parameter on the new `run_inner` helper.
+   This preserves today's invariant: any client that successfully connected
+   gets explicitly shut down by `teardown`, even if a later step
+   (adapter build, agent build) fails partway through.
+7. **Teardown's tracing target moves from `outrig::cli::run` to
+   `outrig::cli::session_setup`** (matches the new module path; the smoke
+   test does not filter on target).
+8. **Adapters and the agent are explicitly `drop()`ped before teardown.**
+   They each hold `Arc<McpClient>` clones; without the explicit drops,
+   `Arc::try_unwrap` in `teardown` would fail and the explicit `shutdown`
+   would be skipped in favor of `Drop`.
+9. **`run_repl` slims to two args** (`&RigAgent`, `tools_summary: String`);
+   the banner moves into the new `run_inner` helper. The new helper
+   accumulates 10 args and keeps `#[allow(clippy::too_many_arguments)]`,
+   matching the original `run_repl`'s allow.
