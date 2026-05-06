@@ -331,7 +331,7 @@ fn render_command(argv: &[String]) -> String {
         .join(" ")
 }
 
-fn kind_of(v: &Value) -> &'static str {
+pub fn kind_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "bool",

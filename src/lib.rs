@@ -9,6 +9,7 @@ pub mod image;
 pub mod init;
 pub mod llm;
 pub mod mcp;
+pub mod mcp_proxy;
 pub mod process;
 pub mod repl;
 pub mod repo;

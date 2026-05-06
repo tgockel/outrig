@@ -91,3 +91,33 @@ yet; 0040 wires it up.
 - `ServerInfo` defaults: `name = "outrig"`, `version = env!("CARGO_PKG_VERSION")`,
   one-line `instructions` mentioning the `<server>__<tool>` namespace prefix scheme
   so an LLM client sees it. Final wording can land in 0040 alongside the banner.
+
+## Decisions
+
+- **`ProxyServer<C>` is generic, not `dyn`-based.** Edition 2024 lets the
+  `BackingClient` trait use plain `impl Future` returns, which prevents
+  `dyn` trait objects -- so the proxy is parameterized by client type
+  instead. The default `C = Arc<McpClient>` keeps the production
+  `ProxyServer::build(arcs)` call site identical to the deliverable's
+  literal `Vec<Arc<McpClient>>` signature; the test substitutes
+  `Arc<FakeClient>` via the blanket `impl<T> BackingClient for Arc<T>`.
+
+- **`BackingClient` is `pub`.** The integration test in
+  `tests/mcp_proxy_dispatch.rs` is the only out-of-crate consumer for now;
+  gating to `pub(crate)` would force the test inline. `0042` revisits
+  library-surface visibility for the whole crate at once.
+
+- **Dispatch extracted to `list_tools_inner` / `dispatch_call`.** The
+  `ServerHandler::list_tools` and `call_tool` methods take a
+  `RequestContext<RoleServer>` (holding `Peer<R>`, `RequestId`,
+  `CancellationToken`) which is impractical to fabricate in a unit test.
+  The trait impls are now thin wrappers over the inner methods, which the
+  integration test drives directly.
+
+- **Duplicate `client.name()` is rejected up front in `build`.** Clearer
+  failure than letting every sanitized tool name collide -- one error,
+  one location, identifies the bad pair.
+
+- **Reused `crate::mcp::kind_of`** for the "input_schema is not an object"
+  error message; promoted from private to `pub` so the proxy doesn't
+  reimplement the same Value-variant match.
