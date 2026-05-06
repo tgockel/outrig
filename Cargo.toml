@@ -43,7 +43,9 @@ features = [
     "base64",
     "client",
     "macros",
+    "server",
     "transport-child-process",
+    "transport-io",
 ]
 
 [dependencies.tokio]
