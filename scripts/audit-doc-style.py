@@ -98,14 +98,16 @@ def main() -> int:
         help="only run the line-width check",
     )
     parser.add_argument(
-        "path",
-        nargs="?",
-        default="doc",
-        help="file or directory to audit (default: doc)",
+        "paths",
+        nargs="*",
+        default=["doc"],
+        help="files or directories to audit (default: doc)",
     )
     args = parser.parse_args()
 
-    files = list(iter_markdown(args.path))
+    files = []
+    for path in args.paths:
+        files.extend(iter_markdown(path))
     width, spelling = check_per_line(files, args.width_only)
     ok = report("Width", width)
     if not args.width_only:

@@ -6,6 +6,11 @@ speaks JSON-RPC over its stdio. outrig connects to each one by `podman exec -i`'
 container, hands the resulting stdio pair to the [rmcp](https://crates.io/crates/rmcp) client, and
 treats every tool the server advertises as a Rig dynamic tool.
 
+The same `[containers.<name>.mcp]` table is consumed by both `outrig run` and
+`outrig mcp`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
+republishes them as one stdio MCP server for an external client. See
+[Usage -> outrig mcp](../usage/mcp.md) for client setup and transport rules.
+
 ## Declaring servers
 
 MCP servers are configured per-container, as a map keyed by the server's local name:

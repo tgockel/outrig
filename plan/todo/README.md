@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase H -- outrig mcp subcommand
-
-- **[0041](0041-outrig-mcp-docs.md)** Docs for `outrig mcp`.
-
 ## Phase I -- post-acceptance v0 polish
 
 - **[0042](0042-library-surface.md)** Curated `outrig::*` library API.

@@ -123,10 +123,20 @@ Summarize the changes for the user before committing:
 
 ```bash
 git add -A
-git commit -m "chore: groom plan/todo/ -- <short summary>"
+git commit -m "$(cat <<EOF
+plan: <short summary>
+
+<Detailed description>
+EOF
+)"
 ```
 
-Conventional-commits style; `chore:` since this is plan-tree maintenance, not code.
+Conventional-commits style; `plan:` since this is plan-tree maintenance, not code.
+
+**Keep line width under 72 characters** in the commit message. This is a soft rule
+you can exceed when necessary for readability.
+
+**Do not include a co-authored-by trailer.**
 
 Do not push -- the user merges or pushes when ready.
 

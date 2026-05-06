@@ -1,9 +1,10 @@
 # Sessions
 
-A session is the on-disk record of one `outrig run` invocation: when it started and ended, which
-container-config it used, what image tag, plus per-MCP-server stderr captured to disk. Sessions
-exist so you can go back and inspect what happened -- they are *not* a staging area for workspace
-changes (outrig writes to your repo directly; see [Workspace](../concepts/workspace.md)).
+A session is the on-disk record of one `outrig run` or `outrig mcp` invocation: when it started
+and ended, which container-config it used, what image tag, plus per-MCP-server stderr captured to
+disk. Sessions exist so you can go back and inspect what happened -- they are *not* a staging area
+for workspace changes (outrig writes to your repo directly; see
+[Workspace](../concepts/workspace.md)).
 
 ## Where sessions live
 
@@ -75,6 +76,11 @@ ID                     STARTED              DURATION  CONTAINER  EXIT
 formal way for the agent to declare success or failure. A non-zero exit usually means an LLM API
 error, a container failure, or a SIGINT after the user gave up. The `-> /path` suffix marks
 sessions whose root entry is a symlink (created via `outrig run --session-dir`).
+
+`outrig mcp` sessions have no agent. Their in-memory session row has `agent_name = None`; new
+on-disk `session.json` files omit `agent_name`, and older records with `"agent_name": null`
+mean the same thing. `outrig ls` does not currently show an agent column, so these sessions appear
+with the same `ID / STARTED / DURATION / CONTAINER / EXIT` columns as `outrig run` sessions.
 
 Override the root for a single invocation with `--session-root`:
 
@@ -182,6 +188,7 @@ you're running two agents on overlapping work.
 ## See also
 
 - [outrig run](run.md) -- what produces a session in the first place.
+- [outrig mcp](mcp.md) -- stdio MCP server sessions with no agent.
 - [Concepts -> Workspace](../concepts/workspace.md) -- why there's no per-session changeset.
 - [Reference -> CLI](../reference/cli.md) -- every flag for `ls`, `logs`, and `discard`.
 - [Reference -> Config](../reference/config.md) -- the `session-root` config key.

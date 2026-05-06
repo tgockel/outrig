@@ -19,6 +19,7 @@
   - [outrig config](usage/config.md)
   - [outrig container](usage/container.md)
   - [outrig run](usage/run.md)
+  - [outrig mcp](usage/mcp.md)
   - [outrig build](usage/build.md)
   - [Sessions](usage/sessions.md)
   - [Recipes](usage/recipes.md)

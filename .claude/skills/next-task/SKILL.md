@@ -135,7 +135,12 @@ Stage all changes and commit using conventional-commits style:
 
 ```bash
 git add -A
-git commit -m "type: short description"
+git commit -m "$(cat <<EOF
+<type>: <short summary>
+
+<Detailed description>
+EOF
+)"
 ```
 
 **Keep line width under 72 characters** in the commit message. This is a soft rule

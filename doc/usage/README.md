@@ -1,10 +1,5 @@
 # Usage
 
-> **TODO: Incomplete** -- the [`outrig init`](init.md), [`outrig config`](config.md),
-> [`outrig container`](container.md), and [`outrig build`](build.md) pages describe intended
-> behavior; those subcommands are not yet wired up. [`outrig run`](run.md) and
-> [Sessions](sessions.md) document subcommands that are implemented today.
-
 This section is the day-to-day operator's guide: what each subcommand does, what the REPL looks
 like in practice, what comes back when something goes wrong.
 
@@ -15,6 +10,7 @@ like in practice, what comes back when something goes wrong.
 - **[outrig container](container.md)** -- group of commands for container-configs. v0:
   `container add` (scaffolds a Dockerfile under `.agents/outrig/containers/<name>/`).
 - **[outrig run](run.md)** -- start an interactive agent session. The main subcommand.
+- **[outrig mcp](mcp.md)** -- expose a container-config's MCP tools to an external client.
 - **[outrig build](build.md)** -- pre-warm the image cache so the next `outrig run` is instant.
 - **[Sessions](sessions.md)** -- `outrig ls`, `outrig logs`, `outrig discard`.
 - **[Recipes](recipes.md)** -- common patterns (multiple container-configs, capturing
