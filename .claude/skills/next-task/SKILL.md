@@ -143,8 +143,23 @@ EOF
 )"
 ```
 
-**Keep line width under 72 characters** in the commit message. This is a soft rule
-you can exceed when necessary for readability.
+Use the heredoc form above for multi-paragraph messages. Put real line breaks in
+the message body; do not try to fake wrapping with escaped `\n` inside `-m`
+arguments, and do not build the body from several long unwrapped `-m` arguments.
+
+Before running `git commit`, inspect recent local history:
+
+```bash
+git log --format=fuller -5
+```
+
+Match the repo's house style: a conventional subject plus wrapped body
+paragraphs with concrete behavior, design, compatibility, and verification
+notes. Avoid vague filler and one-line marketing summaries.
+
+**Keep line width under 72 characters** in the commit message body. This is a
+soft rule you can exceed when necessary for readability, but count the actual
+message lines before committing if there is any doubt.
 
 **Do not include the task number in the commit message.** The connection between commit
 and task is via the file in `plan/done/`. `git log` plus `plan/done/` searches are
