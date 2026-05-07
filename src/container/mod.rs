@@ -12,9 +12,12 @@
 //! 3. [`install_panic_hook`] -- last-resort sweep over [`TRACKED`] when
 //!    the process is unwinding from a panic and `Drop` cannot run.
 
+#[cfg(feature = "internal")]
 pub mod add;
+#[cfg(feature = "internal")]
 pub mod render;
 
+#[cfg(feature = "internal")]
 pub use add::DOC_SYNC_FIELDS;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,33 +57,43 @@ pub struct Container {
 }
 
 impl Container {
-    pub async fn start(image: &ImageTag, host_ws: &Path, ws_container: &Path) -> Result<Self> {
+    /// Start a container running `image`. When `workspace` is `Some((host,
+    /// container))`, mounts `host` at `container` (with `--userns=keep-id`)
+    /// and uses the container path as the working directory. When `None`,
+    /// neither `-v` nor `-w` is passed -- the caller gets a bare container
+    /// with no workspace bind.
+    pub async fn start(image: &ImageTag, workspace: Option<(&Path, &Path)>) -> Result<Self> {
         let name = format!("outrig-{}", SessionId::new());
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
-
-        let mount_opts = if selinux_enforcing().await {
-            "rw,Z"
-        } else {
-            "rw"
-        };
-        let mount = format!(
-            "{}:{}:{mount_opts}",
-            host_ws.display(),
-            ws_container.display()
-        );
 
         // Register before spawning so a SIGKILL between the spawn call and
         // its return can still be cleaned up by the panic hook.
         track(&name);
 
-        let cmd = Cmd::new("podman")
+        let mut cmd = Cmd::new("podman")
             .args(["run", "-d", "--rm", "--name"])
-            .arg(&name)
-            .arg("-v")
-            .arg(&mount)
-            .args(["--userns=keep-id", "-w"])
-            .arg(ws_container)
+            .arg(&name);
+        if let Some((host_ws, ws_container)) = workspace {
+            let mount_opts = if selinux_enforcing().await {
+                "rw,Z"
+            } else {
+                "rw"
+            };
+            let mount = format!(
+                "{}:{}:{mount_opts}",
+                host_ws.display(),
+                ws_container.display()
+            );
+            cmd = cmd
+                .arg("-v")
+                .arg(&mount)
+                .args(["--userns=keep-id", "-w"])
+                .arg(ws_container);
+        } else {
+            cmd = cmd.arg("--userns=keep-id");
+        }
+        cmd = cmd
             .args(["--security-opt=no-new-privileges", "--pull=never"])
             .arg(image.0.as_str())
             .args(["sleep", "infinity"]);
@@ -90,11 +103,16 @@ impl Container {
             return Err(e);
         }
 
+        let (host_workspace, container_workspace) = match workspace {
+            Some((host, container)) => (host.to_path_buf(), container.to_path_buf()),
+            None => (PathBuf::new(), PathBuf::new()),
+        };
+
         Ok(Self {
             name,
             image_tag: image.clone(),
-            host_workspace: host_ws.to_path_buf(),
-            container_workspace: ws_container.to_path_buf(),
+            host_workspace,
+            container_workspace,
             uid,
             gid,
             user_name: None,

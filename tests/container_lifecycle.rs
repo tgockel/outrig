@@ -61,7 +61,7 @@ async fn start_then_stop_leaves_no_container() {
     let host_ws = tempfile::tempdir().expect("tempdir");
     let tag = ImageTag(ALPINE.to_string());
 
-    let container = Container::start(&tag, host_ws.path(), Path::new("/workspace"))
+    let container = Container::start(&tag, Some((host_ws.path(), Path::new("/workspace"))))
         .await
         .expect("start");
     let name = container.name.clone();
@@ -94,7 +94,7 @@ async fn drop_without_stop_cleans_up() {
 
     let name;
     {
-        let container = Container::start(&tag, host_ws.path(), Path::new("/workspace"))
+        let container = Container::start(&tag, Some((host_ws.path(), Path::new("/workspace"))))
             .await
             .expect("start");
         name = container.name.clone();

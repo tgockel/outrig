@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::config::api_key::ApiKeyError;
 use crate::config::env_value::EnvValueError;
 use crate::config::validate::ConfigValidationError;
+#[cfg(feature = "internal")]
 use crate::llm::LlmResolveError;
 
 #[derive(Debug, Error)]
@@ -65,6 +66,11 @@ pub enum OutrigError {
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
     McpArgsNotObject { kind: &'static str },
 
+    // Only the binary's `outrig run` / `cli::session_setup` path resolves
+    // an LLM provider, and that path is gated under `internal`. Library
+    // callers drive their own LLM loop; they never hit this variant. So
+    // the enum stays one variant smaller in the curated build.
+    #[cfg(feature = "internal")]
     #[error("{0}")]
     LlmResolve(#[from] LlmResolveError),
 

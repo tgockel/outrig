@@ -145,7 +145,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         )));
     }
 
-    let mut container = Container::start(&image_tag, &host_workspace, &container_workspace).await?;
+    let mut container =
+        Container::start(&image_tag, Some((&host_workspace, &container_workspace))).await?;
     container.bootstrap_user().await?;
 
     let sid = SessionId(container.session_suffix().to_string());

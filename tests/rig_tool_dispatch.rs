@@ -55,7 +55,7 @@ async fn ensure_fixture_image() -> ImageTag {
 }
 
 async fn start_and_bootstrap(image: &ImageTag, host_ws: &Path) -> Container {
-    let mut container = Container::start(image, host_ws, Path::new("/workspace"))
+    let mut container = Container::start(image, Some((host_ws, Path::new("/workspace"))))
         .await
         .expect("Container::start");
     container.bootstrap_user().await.expect("bootstrap_user");

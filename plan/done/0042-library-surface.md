@@ -234,6 +234,58 @@ the curated surface keeps working when `repo::*` goes private.
 
 None.
 
+## Decisions
+
+1. **Single-pass execution.** Visibility flip + `internal` feature + new
+   `Outrig`/`LaunchSpec`/`load_project` facade all land in one commit on
+   one branch (vs. flipping first then building the facade in a follow-up).
+2. **`mcp_proxy` stays fully public.** Library callers may want to run an
+   MCP proxy programmatically. Added beyond the originally-listed curated
+   surface; the final surface is `error`, `config`, `mcp_proxy`, `Outrig`,
+   `LaunchSpec`, `WorkspaceSpec`, `ToolHandle`, `McpTool`, `McpToolResult`,
+   and `load_project`.
+3. **`tool_name` gates as internal** alongside `rig_tool`. Currently only
+   `rig_tool` and `mcp_proxy` use it; `mcp_proxy` reaches it via
+   `crate::tool_name` which is always present in the crate, so no public
+   re-export is needed today.
+4. **Dual-cfg module pattern.** `container`, `mcp`, `image`, `process`,
+   `repo`, `session`, `tool_name` use
+   `#[cfg(feature = "internal")] pub mod foo; #[cfg(not(feature = "internal"))] mod foo;`
+   so existing integration tests (which call `outrig::container::*`,
+   `outrig::session::*`, etc.) keep working under default features while
+   the curated surface stays clean with `--no-default-features`.
+5. **`Container::start` takes `Option<(&Path, &Path)>`.** Considered
+   threading the new public `WorkspaceSpec` into the private `container`
+   module; rejected to keep public types out of crate-private modules.
+   The tuple is fine for two args.
+6. **`Outrig::launch` build path** constructs a synthetic
+   `ContainerConfig` and calls `image::ensure_image(&cfg, Path::new(""), false)`.
+   `Path::new("").join(absolute) == absolute`, so callers passing absolute
+   `dockerfile`/`context` get the cache key they'd expect. Refactoring
+   `image::ensure_image` to accept raw paths was deferred -- nothing else
+   in the crate wants that signature today.
+7. **`OutrigError::LlmResolve` is `#[cfg(feature = "internal")]`-gated.**
+   The enum varies its variant set across feature configs. Acceptable
+   because the variant is only produced by `cli::session_setup` (binary
+   path), which is itself gated; library callers cannot reach it. Comment
+   in `error.rs` records the rationale.
+8. **`bin/outrig` requires `internal`.** Set via
+   `[[bin]] required-features = ["internal"]` rather than wrapping
+   `bin/outrig.rs` in `#[cfg]`. Cleaner, and `cargo build
+   --no-default-features` skips the binary as intended.
+9. **`#![cfg_attr(not(feature = "internal"), allow(dead_code))]`** in
+   `src/lib.rs` masks ~35 dead-code warnings that fire when `internal` is
+   off (items exist for the binary path; library users never see them).
+   Per-item allows would be more honest but vastly more scattered.
+10. **`config::init` and `container::{add, render}` gated under
+    `internal`.** They depend on `hf` and `init::prompt` (also gated), so
+    they only compile when `internal` is on. `config` itself stays
+    public.
+11. **`Outrig::shutdown` is sequential**, matching the existing
+    `cli::session_setup::teardown` pattern. Parallelizing MCP shutdowns
+    via `JoinSet` would shave 2-5 s off e2e tests but introduces
+    concurrency where teardown ordering is load-bearing; deferred.
+
 ## Notes
 
 - **Non-goals (out of scope):**

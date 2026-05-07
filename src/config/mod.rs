@@ -3,6 +3,7 @@
 pub mod api_key;
 mod env_ref;
 pub mod env_value;
+#[cfg(feature = "internal")]
 pub mod init;
 pub mod merge;
 pub mod validate;

@@ -4,9 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default   = []
+default   = ["internal"]
+internal  = []
 e2e       = []
 mistralrs = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap", "dep:reqwest"]
+
+[[bin]]
+name              = "outrig"
+required-features = ["internal"]
+
+[[test]]
+name              = "library_surface"
+required-features = ["e2e"]
 
 [dependencies]
 anyhow             = "1.0"

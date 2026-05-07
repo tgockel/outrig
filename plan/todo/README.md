@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase I -- post-acceptance v0 polish
 
-- **[0042](0042-library-surface.md)** Curated `outrig::*` library API.
 - **[0043](0043-verbose-flag.md)** Wire `--verbose` global flag.
 - **[0044](0044-dedup-init-tracing.md)** Dedup `init_tracing` into `tests/common/mod.rs`.
 - **[0045](0045-bound-stderr-capture.md)** Bound stderr capture in `run_capture`.

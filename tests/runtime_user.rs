@@ -46,7 +46,7 @@ async fn install_shadow(name: &str) {
 
 async fn start_alpine(host_ws: &Path) -> Container {
     let tag = ImageTag(ALPINE.to_string());
-    Container::start(&tag, host_ws, Path::new("/workspace"))
+    Container::start(&tag, Some((host_ws, Path::new("/workspace"))))
         .await
         .expect("start")
 }
