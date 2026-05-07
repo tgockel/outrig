@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::ContainerConfig;
 use crate::error::{OutrigError, Result};
-use crate::process::{self, Cmd};
+use crate::process::{self, Cmd, Transcript};
 
 const TAG_PREFIX: &str = "outrig-cache";
 const KEY_HEX_LEN: usize = 16;
@@ -94,6 +94,18 @@ pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
     Ok(probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace))
 }
 
+/// Logged sibling of [`probe_cached`]. Used by session startup so verbose
+/// mode records the cache probe alongside build/start lifecycle commands.
+pub async fn probe_cached_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
+    let probe = process::try_capture_logged(
+        Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag.0),
+        "buildah",
+        transcript,
+    )
+    .await?;
+    Ok(probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
 /// Run `buildah build` for `cfg`, tagging the result `tag`. Stderr is
 /// streamed to `tracing::info!` with the `[buildah]` prefix. Pass
 /// `no_cache = true` to add `--no-cache` so buildah ignores its layer
@@ -105,23 +117,7 @@ pub async fn build_image(
     tag: &ImageTag,
     no_cache: bool,
 ) -> Result<()> {
-    let dockerfile = repo_root.join(&cfg.dockerfile);
-    let context = repo_root.join(&cfg.context);
-
-    let mut cmd = Cmd::new("buildah")
-        .arg("build")
-        .arg("--tag")
-        .arg(&tag.0)
-        .arg("--file")
-        .arg(&dockerfile);
-    if no_cache {
-        cmd = cmd.arg("--no-cache");
-    }
-    for (k, v) in &cfg.build_args {
-        cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
-    }
-    cmd = cmd.arg(&context);
-
+    let cmd = build_image_cmd(cfg, repo_root, tag, no_cache);
     let argv_for_error = cmd.args.clone();
     let status = process::run_streamed(cmd, "buildah").await?;
     if !status.success() {
@@ -132,6 +128,26 @@ pub async fn build_image(
             stderr_tail: String::new(),
         });
     }
+    Ok(())
+}
+
+/// Build variant for session startup. With `transcript = Some`, the buildah
+/// command line and output are mirrored to stderr and `container.log`; with
+/// `None`, output is captured silently and appears only in the process error
+/// tail if buildah fails.
+pub async fn build_image_logged(
+    cfg: &ContainerConfig,
+    repo_root: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+    transcript: Option<&Transcript>,
+) -> Result<()> {
+    process::run_capture_logged(
+        build_image_cmd(cfg, repo_root, tag, no_cache),
+        "buildah",
+        transcript,
+    )
+    .await?;
     Ok(())
 }
 
@@ -157,6 +173,50 @@ pub async fn ensure_image(
         tag,
         cache_hit: false,
     })
+}
+
+/// Ensure an already-computed tag exists. This lets session startup write a
+/// complete `session.json` and open `logs/container.log` before the buildah
+/// probe/build begins, without hashing the Dockerfile/context twice.
+pub async fn ensure_tagged_image(
+    cfg: &ContainerConfig,
+    repo_root: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+    transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    if !no_cache && probe_cached_logged(tag, transcript).await? {
+        tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
+        return Ok(ImageBuildOutcome {
+            tag: tag.clone(),
+            cache_hit: true,
+        });
+    }
+    build_image_logged(cfg, repo_root, tag, no_cache, transcript).await?;
+    tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
+    Ok(ImageBuildOutcome {
+        tag: tag.clone(),
+        cache_hit: false,
+    })
+}
+
+fn build_image_cmd(cfg: &ContainerConfig, repo_root: &Path, tag: &ImageTag, no_cache: bool) -> Cmd {
+    let dockerfile = repo_root.join(&cfg.dockerfile);
+    let context = repo_root.join(&cfg.context);
+
+    let mut cmd = Cmd::new("buildah")
+        .arg("build")
+        .arg("--tag")
+        .arg(&tag.0)
+        .arg("--file")
+        .arg(&dockerfile);
+    if no_cache {
+        cmd = cmd.arg("--no-cache");
+    }
+    for (k, v) in &cfg.build_args {
+        cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
+    }
+    cmd.arg(&context)
 }
 
 async fn is_git_context(ctx: &Path) -> Result<bool> {

@@ -85,7 +85,14 @@ impl McpClient {
         let stderr_file = tokio::fs::File::create(&stderr_path).await?;
         let stderr_std = stderr_file.into_std().await;
 
-        let mut cmd = container.build_exec_argv(&command, &env).to_tokio_command();
+        let exec_cmd = container.build_exec_argv(&command, &env);
+        if let Some(transcript) = container.transcript() {
+            transcript
+                .line("podman", &format!("$ {}", exec_cmd.render()))
+                .await?;
+        }
+
+        let mut cmd = exec_cmd.to_tokio_command();
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr_std))

@@ -1,8 +1,5 @@
 # CLI Reference
 
-> **TODO: Incomplete** -- `--verbose` is design-only. It is noted below where relevant, but
-> the flag is not yet accepted by the CLI.
-
 ## Synopsis
 
 ```
@@ -20,6 +17,7 @@ These are accepted by every subcommand.
 | `--config <path>`        | Path to repo `config.toml`. Default: walk up from cwd.      |
 | `--global-config <path>` | Path to global config. Default: `~/.outrig/config.toml`.    |
 | `--session-root <path>`  | Root directory containing sessions. Overrides config + XDG. |
+| `-v`, `--verbose`        | Print buildah/podman transcripts; repeat for trace logs.    |
 | `--help`                 | Print subcommand help.                                      |
 
 `--config` resolves in this order: this flag (used verbatim -- no walk-up, no existence check),
@@ -34,8 +32,10 @@ note this is `~/.outrig/`, not `~/.config/outrig/`).
 `--session-root` resolves in this order: this flag, then `session-root` in the repo or global
 config, then `<XDG_DATA_HOME>/outrig/sessions/`.
 
-Future `--verbose` support will add buildah/podman command transcripts to stderr and to
-`<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. It will not change behavior.
+`--verbose` adds buildah/podman command transcripts to stderr and to
+`<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
+enable trace-level logs from outrig's own modules for that invocation. It does not change
+container, MCP, or agent behavior.
 
 ## Subcommands
 
@@ -109,6 +109,7 @@ outrig run [--agent <name>]
 | `--agent <name>`       | `default-agent`                   | Selects an `[agents.<name>]` block. |
 | `--container <name>`   | from agent or `default-container` | Container-config to launch.         |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto)     | Specific directory for this run.    |
+| `-v`, `--verbose`      | off                               | Print container lifecycle traces.   |
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
 under `<path>`, and additionally creates a symlink `<session-root>/<sid> -> <path>` so
@@ -131,12 +132,14 @@ outrig mcp [--container <name>]
            [--config <path>]
            [--global-config <path>]
            [--session-root <path>]
+           [--verbose]
 ```
 
 | Flag                   | Default                       | Description                         |
 |------------------------|-------------------------------|-------------------------------------|
 | `--container <name>`   | `default-container`           | Container-config to launch.         |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto) | Specific directory for this server. |
+| `-v`, `--verbose`      | off                           | Print container lifecycle traces.   |
 
 There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does not let
 `agent.container` participate in container selection, and does not read provider API keys.
@@ -174,11 +177,12 @@ outrig build [--container <name>]
              [--config <path>]
 ```
 
-| Flag                 | Default             | Description                                                          |
-|----------------------|---------------------|----------------------------------------------------------------------|
-| `--container <name>` | `default-container` | Build a specific named container-config.                             |
-| `--all`              | off                 | Build every container-config. Mutually exclusive with `--container`. |
-| `--no-cache`         | off                 | Force rebuild even on cache hit. Passes `--no-cache` to buildah.     |
+- `--container <name>` (default: `default-container`): build a specific named
+  container-config.
+- `--all` (default: off): build every container-config. Mutually exclusive with
+  `--container`.
+- `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
+  to buildah.
 
 See [Usage -> outrig build](../usage/build.md).
 
@@ -248,12 +252,10 @@ still running. Discards the session directory only -- your repository is untouch
 
 ## Environment variables
 
-| Variable                                             | Effect                                                        |
-|------------------------------------------------------|---------------------------------------------------------------|
-| `[providers.<name>].api-key` references via `${VAR}` | Provider API key.                                             |
-| `OUTRIG_LOG`                                         | `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`.         |
-| `XDG_DATA_HOME`                                      | Default base for `session-root` if not set in config.         |
-| `XDG_CONFIG_HOME`                                    | Global config is checked here before `~/.outrig/config.toml`. |
+- `[providers.<name>].api-key` references via `${VAR}`: provider API key.
+- `OUTRIG_LOG`: `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`.
+- `XDG_DATA_HOME`: default base for `session-root` if not set in config.
+- `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
 
 ## See also
 

@@ -55,3 +55,21 @@ trace level.
 - This was deferred during the Phase A-E doc/code reconciliation pass: the docs
   promised the flag before the CLI accepted it, and the audit chose to mark it
   TODO rather than implement it inside a doc-cleanup task.
+
+## Decisions
+
+- **Session setup now preallocates the session id before image build.** That
+  lets `session.json`, `logs/container.log`, and the podman container name all
+  use the same id while buildah/podman transcripts are emitted. Failed startup
+  after the session row exists finalizes the session with exit `1`.
+- **`outrig build` keeps the old streamed build output path.** The run/mcp
+  startup path uses the new transcript-aware capture helpers so no-verbose runs
+  stay quiet on success, while `outrig build` continues to show buildah progress
+  as a build-focused command.
+- **MCP server stdout is not copied into `container.log`.** Verbose mode records
+  the backing `podman exec` command line, but the MCP protocol stream remains
+  owned by rmcp so transcripts cannot corrupt stdio protocol traffic.
+- **Doc style cleanup included adjacent wide tables.** The full
+  `scripts/audit-doc-style.py` check was failing on existing wide tables, so
+  those tables were converted to definition-list bullets while the verbose docs
+  were updated.

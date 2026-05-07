@@ -4,10 +4,14 @@
 //! program name in.
 
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
+use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 use crate::error::{OutrigError, Result};
 
@@ -51,6 +55,62 @@ impl Cmd {
         c.args(&self.args);
         c
     }
+
+    /// Render the argv as a shell-like command line for diagnostics. This is
+    /// display-only; callers must still spawn via `Command` so no quoting
+    /// participates in execution.
+    pub fn render(&self) -> String {
+        std::iter::once(OsStr::new(self.program))
+            .chain(self.args.iter().map(OsString::as_os_str))
+            .map(render_arg)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Transcript {
+    file: Arc<Mutex<tokio::fs::File>>,
+    stderr: bool,
+}
+
+impl Transcript {
+    /// Create a new transcript file, truncating any stale content at `path`.
+    /// When `stderr` is true, every transcript line is also mirrored to the
+    /// process's stderr.
+    pub async fn create(path: &Path, stderr: bool) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .await?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            stderr,
+        })
+    }
+
+    /// Record one already-rendered logical line with the conventional
+    /// `[prefix]` marker.
+    pub async fn line(&self, prefix: &'static str, line: &str) -> std::io::Result<()> {
+        let rendered = format!("[{prefix}] {line}\n");
+        self.write_all(rendered.as_bytes()).await
+    }
+
+    async fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.stderr {
+            let mut stderr = tokio::io::stderr();
+            stderr.write_all(bytes).await?;
+            stderr.flush().await?;
+        }
+        let mut file = self.file.lock().await;
+        file.write_all(bytes).await?;
+        file.flush().await
+    }
 }
 
 /// Spawn the command, capture stdout and stderr, and return the `Output`
@@ -63,12 +123,74 @@ pub async fn try_capture(cmd: Cmd) -> Result<Output> {
     Ok(cmd.to_tokio_command().output().await?)
 }
 
+/// Spawn the command, capture stdout and stderr, and optionally tee a
+/// transcript of the command line plus both output streams. Non-zero exit is
+/// returned in the `Output`, matching [`try_capture`].
+pub async fn try_capture_logged(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+) -> Result<Output> {
+    let transcript = transcript.cloned();
+    if let Some(t) = &transcript {
+        t.line(prefix, &format!("$ {}", cmd.render())).await?;
+    }
+
+    let mut child = cmd
+        .to_tokio_command()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout was configured as piped above");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr was configured as piped above");
+
+    let stdout_task = tokio::spawn(capture_stream(stdout, prefix, transcript.clone()));
+    let stderr_task = tokio::spawn(capture_stream(stderr, prefix, transcript));
+
+    let status = child.wait().await?;
+    let stdout = stdout_task.await.expect("stdout capture task panicked")?;
+    let stderr = stderr_task.await.expect("stderr capture task panicked")?;
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Spawn the command, capture stdout and stderr, and return the `Output` on
 /// success. On non-zero (or signal) exit, return [`OutrigError::Process`] with
 /// the program, argv, exit code, and the last `STDERR_TAIL_LIMIT` bytes of
 /// stderr (lossy UTF-8, prefixed with a truncation marker if elision occurred).
 pub async fn run_capture(cmd: Cmd) -> Result<Output> {
     let output = try_capture(cmd.clone()).await?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(OutrigError::Process {
+            program: cmd.program,
+            argv: cmd.args,
+            exit_code: output.status.code(),
+            stderr_tail: tail_string(&output.stderr, STDERR_TAIL_LIMIT),
+        })
+    }
+}
+
+/// Logged sibling of [`run_capture`]. On success, returns captured output;
+/// on non-zero, returns the same structured process error with a stderr tail.
+pub async fn run_capture_logged(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+) -> Result<Output> {
+    let output = try_capture_logged(cmd.clone(), prefix, transcript).await?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -134,4 +256,51 @@ fn tail_string(bytes: &[u8], limit: usize) -> String {
         out.push_str(&String::from_utf8_lossy(&bytes[start..]));
         out
     }
+}
+
+async fn capture_stream<R>(
+    stream: R,
+    prefix: &'static str,
+    transcript: Option<Transcript>,
+) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    let mut captured = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).await?;
+        if n == 0 {
+            break;
+        }
+        captured.extend_from_slice(&line);
+        if let Some(t) = &transcript {
+            let rendered = String::from_utf8_lossy(&line);
+            t.line(prefix, rendered.trim_end_matches(['\r', '\n']))
+                .await?;
+        }
+    }
+    Ok(captured)
+}
+
+fn render_arg(arg: &OsStr) -> String {
+    let s = arg.to_string_lossy();
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.bytes().all(is_shell_safe_byte) {
+        s.into_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+fn is_shell_safe_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'/' | b'.' | b'-' | b'_' | b':' | b'=' | b',' | b'+' | b'@' | b'%'
+        )
 }

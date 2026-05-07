@@ -17,15 +17,17 @@ outrig mcp [--container <name>]
            [--config <path>]
            [--global-config <path>]
            [--session-root <path>]
+           [--verbose]
 ```
 
-| Flag                     | Default                         | Notes                                  |
-|--------------------------|---------------------------------|----------------------------------------|
-| `--container <name>`     | `default-container`             | Selects a `[containers.<name>]` block. |
-| `--session-dir <path>`   | `<session-root>/<sid>` (auto)   | Writes to a known path.                |
-| `--config <path>`        | walks up from cwd               | Path to repo `config.toml`.            |
-| `--global-config <path>` | `~/.outrig/config.toml`         | Path to global config.                 |
-| `--session-root <path>`  | config, then XDG data directory | Root for all sessions.                 |
+- `--container <name>` (default: `default-container`): selects a
+  `[containers.<name>]` block.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
+- `--config <path>` (default: walks up from cwd): path to repo `config.toml`.
+- `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
+- `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
+- `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
+  `container.log`.
 
 There is no `--agent` flag. `outrig mcp` has no agent, so it never consults
 `default-agent`, `agent.container`, `[agents]`, `[models]`, `[providers]`, or provider

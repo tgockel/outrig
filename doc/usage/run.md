@@ -16,17 +16,20 @@ outrig run [--agent <name>]
            [--verbose]
 ```
 
-| Flag                        | Default                                       | Notes                                                                  |
-|-----------------------------|-----------------------------------------------|------------------------------------------------------------------------|
-| `--agent <name>`            | `default-agent`                               | Selects an `[agents.<name>]` block.                                    |
-| `--container <name>` | agent's `container`, else `default-container` | Pick a container.                                                      |
-| `--config <path>`           | walks up from cwd                             | Use from outside the repo or non-standard locations.                   |
-| `--session-dir <path>`      | `<session-root>/<sid>` (auto)                 | This run's specific session directory; symlinked from the root.        |
-| `--session-root <path>`     | `session-root` config, else XDG               | Root directory containing all sessions.                                |
-| `--verbose`                 | off                                           | Adds buildah/podman command transcripts to stderr and `container.log`. |
+- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
+- `--container <name>` (default: agent's `container`, else `default-container`): pick a
+  container.
+- `--config <path>` (default: walks up from cwd): use from outside the repo or
+  non-standard locations.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
+  directory; symlinked from the root.
+- `--session-root <path>` (default: `session-root` config, else XDG): root directory
+  containing all sessions.
+- `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
+  `container.log`.
 
-> **TODO: Incomplete** -- `--verbose` is design-only; the flag is not yet accepted by
-> `outrig run`.
+Repeat `--verbose` (`-vv`) to also enable trace-level logs from outrig's own modules for that
+invocation.
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
 `<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`

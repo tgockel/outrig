@@ -10,7 +10,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::fmt::MakeWriter;
 
 use outrig::error::OutrigError;
-use outrig::process::{self, Cmd};
+use outrig::process::{self, Cmd, Transcript};
+
+#[test]
+fn cmd_render_quotes_args_for_display() {
+    let rendered = Cmd::new("podman")
+        .arg("exec")
+        .arg("hello world")
+        .arg("it's")
+        .arg("")
+        .render();
+    assert_eq!(rendered, "podman exec 'hello world' 'it'\\''s' ''");
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn run_capture_echo_succeeds() {
@@ -61,6 +72,31 @@ async fn try_capture_returns_output_on_nonzero_exit() {
         .expect("try_capture must not error on non-zero exit");
     assert!(!out.status.success());
     assert_eq!(out.status.code(), Some(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logged_capture_tees_command_and_output_to_transcript() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("container.log");
+    let transcript = Transcript::create(&path, false)
+        .await
+        .expect("create transcript");
+
+    let output = process::run_capture_logged(
+        Cmd::new("/bin/sh").args(["-c", "echo out; echo err 1>&2"]),
+        "test",
+        Some(&transcript),
+    )
+    .await
+    .expect("logged command succeeds");
+
+    assert_eq!(output.stdout, b"out\n");
+    assert_eq!(output.stderr, b"err\n");
+
+    let log = std::fs::read_to_string(&path).expect("read transcript");
+    assert!(log.contains("[test] $ /bin/sh -c"), "log was:\n{log}");
+    assert!(log.contains("[test] out"), "log was:\n{log}");
+    assert!(log.contains("[test] err"), "log was:\n{log}");
 }
 
 #[tokio::test(flavor = "current_thread")]

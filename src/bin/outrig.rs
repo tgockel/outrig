@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -33,6 +33,10 @@ struct Cli {
     /// flag > config's `session-root` > `<XDG_DATA_HOME>/outrig/sessions/`.
     #[arg(long = "session-root", global = true, value_name = "PATH")]
     session_root: Option<PathBuf>,
+
+    /// Show buildah/podman transcripts. Repeat for trace-level outrig logs.
+    #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
+    verbose: u8,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -99,17 +103,12 @@ enum ContainerCmd {
 }
 
 fn main() -> ExitCode {
-    let filter = EnvFilter::try_from_env("OUTRIG_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
 
     outrig::container::install_panic_hook();
 
     tracing::debug!("outrig starting");
-
-    let cli = Cli::parse();
     match dispatch(&cli) {
         Ok(0) => ExitCode::SUCCESS,
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -129,6 +128,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 &global_config,
                 cli.session_root.as_deref(),
                 args,
+                cli.verbose,
             ))
         }
         Cmd::Mcp(args) => {
@@ -138,6 +138,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 &global_config,
                 cli.session_root.as_deref(),
                 args,
+                cli.verbose,
             ))
         }
         Cmd::Build(args) => {
@@ -199,6 +200,25 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 &cwd,
             ))
         }
+    }
+}
+
+fn init_tracing(verbose: u8) {
+    let mut filter =
+        EnvFilter::try_from_env("OUTRIG_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    if verbose >= 2 {
+        filter = filter.add_directive(
+            "outrig=trace"
+                .parse()
+                .expect("hard-coded outrig trace directive must parse"),
+        );
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+    if verbose >= 2 {
+        tracing::trace!(target: "outrig", "verbose tracing enabled");
     }
 }
 

@@ -33,6 +33,7 @@ use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::llm;
 use crate::mcp::McpClient;
+use crate::process::Transcript;
 use crate::repo;
 use crate::session::{self, Session, SessionId, SessionStore};
 
@@ -57,6 +58,7 @@ pub struct SessionSetupArgs<'a> {
     /// `container_flag -> default_container` only.
     pub require_agent: bool,
     pub explicit_session_dir: Option<&'a Path>,
+    pub verbose: u8,
 }
 
 /// Output of [`setup`]: every long-lived value the post-setup pipeline
@@ -125,9 +127,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         })?
         .clone();
 
-    let image_tag = image::ensure_image(&container_cfg, &repo_root, false)
-        .await?
-        .tag;
+    let image_tag = image::compute_tag(&container_cfg, &repo_root).await?;
 
     let host_workspace = if cfg.workspace.host_path.is_absolute() {
         cfg.workspace.host_path.clone()
@@ -145,12 +145,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         )));
     }
 
-    let mut container =
-        Container::start(&image_tag, Some((&host_workspace, &container_workspace))).await?;
-    container.bootstrap_user().await?;
-
-    let sid = SessionId(container.session_suffix().to_string());
-
+    let sid = SessionId::new();
+    let container_name = format!("outrig-{sid}");
     let session_root =
         session::resolve_session_root(args.session_root_flag, &cfg, &repo::default_session_root());
     let store = SessionStore::new(session_root);
@@ -158,7 +154,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         id: sid.clone(),
         started_at: SystemTime::now(),
         ended_at: None,
-        container_name: container.name.clone(),
+        container_name: container_name.clone(),
         image_tag: image_tag.to_string(),
         container_config_name: container_cfg_name.clone(),
         agent_name: session_agent_name,
@@ -169,7 +165,56 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
     let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
     let log_dir = session_dir.join("logs");
-    tokio::fs::create_dir_all(&log_dir).await?;
+    if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
+        let _ = store.finalize(&sid, SystemTime::now(), 1);
+        return Err(e.into());
+    }
+
+    let transcript = if args.verbose > 0 {
+        match Transcript::create(&log_dir.join("container.log"), true).await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                let _ = store.finalize(&sid, SystemTime::now(), 1);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Err(e) = image::ensure_tagged_image(
+        &container_cfg,
+        &repo_root,
+        &image_tag,
+        false,
+        transcript.as_ref(),
+    )
+    .await
+    {
+        let _ = store.finalize(&sid, SystemTime::now(), 1);
+        return Err(e);
+    }
+
+    let mut container = match Container::start_named(
+        &image_tag,
+        Some((&host_workspace, &container_workspace)),
+        container_name,
+        transcript,
+    )
+    .await
+    {
+        Ok(container) => container,
+        Err(e) => {
+            let _ = store.finalize(&sid, SystemTime::now(), 1);
+            return Err(e);
+        }
+    };
+
+    if let Err(e) = container.bootstrap_user().await {
+        let _ = container.stop(STOP_GRACE).await;
+        let _ = store.finalize(&sid, SystemTime::now(), 1);
+        return Err(e);
+    }
 
     Ok(SessionSetup {
         cfg,

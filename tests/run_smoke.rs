@@ -8,7 +8,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo test --features e2e run_smoke -- --nocapture
+//! cargo test --features e2e --test run_smoke -- --nocapture
 //! ```
 
 #![cfg(feature = "e2e")]
@@ -18,15 +18,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
-
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::time::timeout;
-
-mod common;
-use common::stream_lines;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -34,22 +29,8 @@ fn fixture_mcp_fs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_drives_one_tool_call_and_prints_reply() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
-
-    // 1. Spin up the mock OpenAI server.
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
-    let mock_addr = listener.local_addr().expect("mock addr");
-    let server_handle = tokio::spawn(run_mock_openai(listener));
-
-    // 2. Build the fixture repo in a tempdir.
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
-    let agents_dir = repo_dir.path().join(".agents/outrig");
+fn write_smoke_config(repo: &Path, mock_addr: &str) {
+    let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
     let dockerfile = fixture_mcp_fs_dir().join("Dockerfile");
@@ -85,65 +66,46 @@ context = "{context}"
         context = context.display(),
     );
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
+}
 
-    // 3. Spawn the binary.
-    let bin = env!("CARGO_BIN_EXE_outrig");
-    let mut child = Command::new(bin)
-        .arg("run")
-        .current_dir(repo_dir.path())
-        .env("OUTRIG_TEST_KEY", "test-key")
-        .env("OUTRIG_LOG", "info")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn outrig");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_drives_one_tool_call_and_prints_reply() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
 
-    let mut stdin = child.stdin.take().expect("stdin piped");
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    // 1. Spin up the mock OpenAI server.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = listener.local_addr().expect("mock addr");
+    let server_handle = tokio::spawn(run_mock_openai(listener));
 
-    // Stream stdout and stderr line-by-line into shared buffers so a hang
-    // dumps everything-so-far instead of a silent timeout.
-    let stdout_buf = Arc::new(Mutex::new(String::new()));
-    let stderr_buf = Arc::new(Mutex::new(String::new()));
-    let stdout_task = tokio::spawn(stream_lines(stdout, stdout_buf.clone(), "stdout"));
-    let stderr_task = tokio::spawn(stream_lines(stderr, stderr_buf.clone(), "stderr"));
+    // 2. Build the fixture repo in a tempdir.
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_smoke_config(repo_dir.path(), &mock_addr.to_string());
 
-    // Send one prompt, then close stdin so the REPL hits EOF after the reply.
-    // (Drop, not shutdown(): tokio's ChildStdin::poll_shutdown is a no-op on
-    // Unix; only Drop closes the pipe.)
-    stdin.write_all(b"hello\n").await.expect("write prompt");
-    stdin.flush().await.expect("flush stdin");
-    drop(stdin);
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
 
-    // 4. Wait for everything with a wall-clock bound.
-    let wait_result = timeout(TEST_TIMEOUT, child.wait()).await;
-    let _ = server_handle.abort();
-    let status = match wait_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => panic!("child.wait() failed: {e}"),
-        Err(_) => {
-            eprintln!(
-                "--- subprocess stderr (before timeout kill) ---\n{}",
-                stderr_buf.lock().unwrap()
-            );
-            eprintln!(
-                "--- subprocess stdout (before timeout kill) ---\n{}",
-                stdout_buf.lock().unwrap()
-            );
-            let _ = child.kill().await;
-            panic!("subprocess did not exit within {TEST_TIMEOUT:?}");
-        }
-    };
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    let stderr_str = stderr_buf.lock().unwrap().clone();
-    let stdout_str = stdout_buf.lock().unwrap().clone();
-    eprintln!("--- subprocess stderr ---\n{stderr_str}");
-    eprintln!("--- subprocess stdout ---\n{stdout_str}");
+    let Captured {
+        status,
+        stdout: stdout_str,
+        stderr: stderr_str,
+    } = run_child(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+        ],
+        repo_dir.path(),
+    )
+    .await;
+    server_handle.abort();
 
     assert!(
         status.success(),
@@ -158,8 +120,20 @@ context = "{context}"
         "stderr lacked tool-call trace: {stderr_str}"
     );
     assert!(
+        !stderr_str.contains("[buildah] $"),
+        "plain run should not print buildah command transcripts: {stderr_str}"
+    );
+    assert!(
+        !stderr_str.contains("[podman] $"),
+        "plain run should not print podman command transcripts: {stderr_str}"
+    );
+    assert!(
         stdout_str.contains("listed the workspace"),
         "stdout lacked canned reply: {stdout_str}"
+    );
+    assert!(
+        !session_dir.path().join("logs/container.log").exists(),
+        "plain run should not create container.log"
     );
 
     // Verify our specific container was cleaned up (other tests / external
@@ -186,6 +160,147 @@ context = "{context}"
         leftovers.trim().is_empty(),
         "this run's container `{our_container}` is still alive: {leftovers}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verbose_run_writes_container_log_and_enables_trace() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = listener.local_addr().expect("mock addr");
+    let server_handle = tokio::spawn(run_mock_openai(listener));
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_smoke_config(repo_dir.path(), &mock_addr.to_string());
+
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
+
+    let captured = run_child(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+            "-vv",
+        ],
+        repo_dir.path(),
+    )
+    .await;
+    server_handle.abort();
+
+    assert!(
+        captured.status.success(),
+        "outrig run -vv exited with {:?}; stderr was: {}",
+        captured.status,
+        captured.stderr
+    );
+    assert!(
+        captured.stdout.contains("listed the workspace"),
+        "stdout lacked canned reply: {}",
+        captured.stdout
+    );
+    assert!(
+        captured.stderr.contains("verbose tracing enabled"),
+        "-vv should enable trace-level outrig logs: {}",
+        captured.stderr
+    );
+    assert!(
+        captured.stderr.contains("[buildah] $ buildah images"),
+        "stderr lacked buildah command transcript: {}",
+        captured.stderr
+    );
+    assert!(
+        captured.stderr.contains("[podman] $ podman run"),
+        "stderr lacked podman run transcript: {}",
+        captured.stderr
+    );
+
+    let log_path = session_dir.path().join("logs/container.log");
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", log_path.display()));
+    assert!(
+        log.contains("[buildah] $ buildah images"),
+        "container.log lacked buildah probe: {log}"
+    );
+    assert!(
+        log.contains("[podman] $ podman run"),
+        "container.log lacked podman run: {log}"
+    );
+    assert!(
+        log.contains("[podman] $ podman exec"),
+        "container.log lacked podman exec: {log}"
+    );
+
+    let session_line = captured
+        .stderr
+        .lines()
+        .find(|l| l.contains("[outrig] container started:"))
+        .expect("banner must include `container started` line");
+    let our_container = session_line
+        .split("started:")
+        .nth(1)
+        .expect("container name after `started:`")
+        .trim();
+    let ps = Command::new("podman")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("name={our_container}"))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        leftovers.trim().is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers}"
+    );
+}
+
+struct Captured {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+async fn run_child(args: &[&str], repo: &Path) -> Captured {
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(repo)
+        .env("OUTRIG_TEST_KEY", "test-key")
+        .env("OUTRIG_LOG", "info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig");
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    stdin.write_all(b"hello\n").await.expect("write prompt");
+    stdin.flush().await.expect("flush stdin");
+    drop(stdin);
+
+    let output = timeout(TEST_TIMEOUT, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .expect("wait_with_output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    eprintln!("--- subprocess stdout ---\n{stdout}");
+    Captured {
+        status: output.status,
+        stdout,
+        stderr,
+    }
 }
 
 /// Hand-rolled mock OpenAI server. Reads HTTP/1.1 requests, parses

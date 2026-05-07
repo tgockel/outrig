@@ -16,12 +16,12 @@ outrig build [--container <name>]
              [--all]
 ```
 
-| Flag                        | Default             | Notes                                                              |
-|-----------------------------|---------------------|--------------------------------------------------------------------|
-| `--container <name>` | `default-container` | Build a specific named container-config.                           |
-| `--all`                     | off                 | Build every container-config defined in the config file.           |
-| `--config <path>`           | walks up from cwd   | Use a non-default config path.                                     |
-| `--no-cache`                | off                 | Force rebuild even on cache hit. Passes `--no-cache` to `buildah`. |
+- `--container <name>` (default: `default-container`): build a specific named
+  container-config.
+- `--all` (default: off): build every container-config defined in the config file.
+- `--config <path>` (default: walks up from cwd): use a non-default config path.
+- `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
+  to `buildah`.
 
 ## What it does
 

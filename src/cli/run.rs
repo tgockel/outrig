@@ -53,6 +53,7 @@ pub async fn execute(
     global_cfg_path: &Path,
     session_root_flag: Option<&Path>,
     args: &RunArgs,
+    verbose: u8,
 ) -> Result<i32> {
     let setup = session_setup::setup(SessionSetupArgs {
         repo_cfg_path,
@@ -62,6 +63,7 @@ pub async fn execute(
         agent_flag: args.agent.as_deref(),
         require_agent: true,
         explicit_session_dir: args.session_dir.as_deref(),
+        verbose,
     })
     .await?;
 

@@ -31,7 +31,7 @@ use tokio::process::Child;
 
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
-use crate::process::{self, Cmd};
+use crate::process::{self, Cmd, Transcript};
 use crate::session::SessionId;
 
 /// Maximum `_`-suffix retries before bootstrap gives up.
@@ -53,6 +53,7 @@ pub struct Container {
     /// In-container group name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
     pub group_name: Option<String>,
+    transcript: Option<Transcript>,
     disposed: bool,
 }
 
@@ -64,6 +65,18 @@ impl Container {
     /// with no workspace bind.
     pub async fn start(image: &ImageTag, workspace: Option<(&Path, &Path)>) -> Result<Self> {
         let name = format!("outrig-{}", SessionId::new());
+        Self::start_named(image, workspace, name, None).await
+    }
+
+    /// Start with a caller-supplied container name. Session setup uses this
+    /// so `session.json`, `container.log`, and the podman name all share one
+    /// preallocated session id.
+    pub(crate) async fn start_named(
+        image: &ImageTag,
+        workspace: Option<(&Path, &Path)>,
+        name: String,
+        transcript: Option<Transcript>,
+    ) -> Result<Self> {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
 
@@ -98,7 +111,7 @@ impl Container {
             .arg(image.0.as_str())
             .args(["sleep", "infinity"]);
 
-        if let Err(e) = process::run_capture(cmd).await {
+        if let Err(e) = process::run_capture_logged(cmd, "podman", transcript.as_ref()).await {
             untrack(&name);
             return Err(e);
         }
@@ -117,6 +130,7 @@ impl Container {
             gid,
             user_name: None,
             group_name: None,
+            transcript,
             disposed: false,
         })
     }
@@ -147,18 +161,22 @@ impl Container {
         let user_name = self.resolve_or_create_user(&host_user, &group_name).await?;
 
         let home = format!("/home/{user_name}");
-        process::run_capture(
+        process::run_capture_logged(
             podman_exec_root(&self.name)
                 .arg("mkdir")
                 .arg("-p")
                 .arg(&home),
+            "podman",
+            self.transcript.as_ref(),
         )
         .await?;
-        process::run_capture(
+        process::run_capture_logged(
             podman_exec_root(&self.name)
                 .arg("chown")
                 .arg(format!("{user_name}:{group_name}"))
                 .arg(&home),
+            "podman",
+            self.transcript.as_ref(),
         )
         .await?;
 
@@ -201,11 +219,13 @@ impl Container {
     /// (`group` or `passwd`) by id. Returns the first `:`-field of the first
     /// matching line, or `None` if `getent` exited non-zero (no match).
     async fn probe_entry(&self, db: &str, id: u32) -> Result<Option<String>> {
-        let probe = process::try_capture(
+        let probe = process::try_capture_logged(
             podman_exec_root(&self.name)
                 .arg("getent")
                 .arg(db)
                 .arg(id.to_string()),
+            "podman",
+            self.transcript.as_ref(),
         )
         .await?;
         if !probe.status.success() {
@@ -228,7 +248,9 @@ impl Container {
     {
         let mut name = candidate.to_string();
         for _ in 0..BOOTSTRAP_RETRIES {
-            let attempt = process::try_capture(build(&name)).await?;
+            let attempt =
+                process::try_capture_logged(build(&name), "podman", self.transcript.as_ref())
+                    .await?;
             if attempt.status.success() {
                 return Ok(name);
             }
@@ -285,21 +307,32 @@ impl Container {
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
         let secs = grace.as_secs().to_string();
-        process::run_capture(
+        process::run_capture_logged(
             Cmd::new("podman")
                 .args(["stop", "-t"])
                 .arg(&secs)
                 .arg(&self.name),
+            "podman",
+            self.transcript.as_ref(),
         )
         .await?;
         // `--rm` in start() makes this redundant on the success path, but
         // run it defensively in case `--rm` got disabled or the daemon
         // failed to honor it. try_capture so "no such container" doesn't
         // turn into an error.
-        let _ = process::try_capture(Cmd::new("podman").args(["rm", "-f"]).arg(&self.name)).await;
+        let _ = process::try_capture_logged(
+            Cmd::new("podman").args(["rm", "-f"]).arg(&self.name),
+            "podman",
+            self.transcript.as_ref(),
+        )
+        .await;
         untrack(&self.name);
         self.disposed = true;
         Ok(())
+    }
+
+    pub(crate) fn transcript(&self) -> Option<Transcript> {
+        self.transcript.clone()
     }
 }
 

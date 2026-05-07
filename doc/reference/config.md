@@ -214,13 +214,13 @@ model    = "smart"        # explicit override of default-model
 preamble = "You are a meticulous code reviewer..."
 ```
 
-| Key           | Type    | Required | Default             | Description                            |
-|---------------|---------|----------|---------------------|----------------------------------------|
-| `model`       | string  | no       | `default-model`     | Name of an entry in `[models.<name>]`. |
-| `preamble`    | string  | no       | minimal default     | System prompt for this agent.          |
-| `container`   | string  | no       | `default-container` | Default container-config to launch.    |
-| `temperature` | float   | no       | provider default    | Sampling temperature.                  |
-| `max-tokens`  | integer | no       | provider default    | Output token cap per turn.             |
+- `model` (string, optional, default: `default-model`): name of an entry in
+  `[models.<name>]`.
+- `preamble` (string, optional, default: minimal default): system prompt for this agent.
+- `container` (string, optional, default: `default-container`): default container-config
+  to launch.
+- `temperature` (float, optional, default: provider default): sampling temperature.
+- `max-tokens` (integer, optional, default: provider default): output token cap per turn.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set. When `outrig run --agent <a>` runs, the chosen container is `--container` if given,
@@ -234,10 +234,10 @@ host-path      = "."
 container-path = "/workspace"
 ```
 
-| Key              | Type | Required | Default        | Description                                         |
-|------------------|------|----------|----------------|-----------------------------------------------------|
-| `host-path`      | path | no       | `"."`          | Host path to bind-mount, relative to the repo root. |
-| `container-path` | path | no       | `"/workspace"` | Where `host-path` is mounted in the container.      |
+- `host-path` (path, optional, default: `"."`): host path to bind-mount, relative to
+  the repo root.
+- `container-path` (path, optional, default: `"/workspace"`): where `host-path` is
+  mounted in the container.
 
 The bind-mount is read-write and uses `--userns=keep-id` so files written inside the container
 appear with your host UID/GID. See [Concepts -> Workspace](../concepts/workspace.md).
@@ -253,11 +253,10 @@ context    = ".agents/outrig/containers/coding"
 build-args = { NODE_VERSION = "20" }
 ```
 
-| Key          | Type           | Required | Default | Description                                           |
-|--------------|----------------|----------|---------|-------------------------------------------------------|
-| `dockerfile` | path           | yes      | --      | Path to the Dockerfile, relative to the repo root.    |
-| `context`    | path           | yes      | --      | Path to the build context, relative to the repo root. |
-| `build-args` | table str->str | no       | `{}`    | Extra Dockerfile `ARG`s; keys are ARG names.          |
+- `dockerfile` (path, required): path to the Dockerfile, relative to the repo root.
+- `context` (path, required): path to the build context, relative to the repo root.
+- `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s;
+  keys are ARG names.
 
 Notes:
 
@@ -285,10 +284,9 @@ fs = { command = ["mcp-server-filesystem", "/workspace"] }
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
 
-| Field     | Type             | Required            | Default | Description                                   |
-|-----------|------------------|---------------------|---------|-----------------------------------------------|
-| `command` | array of strings | yes (or short form) | --      | Argv of the MCP server.                       |
-| `env`     | table str->str   | no                  | `{}`    | Env vars set on the `podman exec` invocation. |
+- `command` (array of strings, required unless using short form): argv of the MCP server.
+- `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
+  invocation.
 
 Notes:
 
