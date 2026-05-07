@@ -13,6 +13,8 @@
 
 #![cfg(feature = "e2e")]
 
+mod common;
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -45,17 +47,9 @@ async fn podman_ps_lists(name: &str, include_stopped: bool) -> bool {
         .any(|l| l.trim() == name)
 }
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
-}
-
 #[tokio::test]
 async fn start_then_stop_leaves_no_container() {
-    init_tracing();
+    common::init_tracing();
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");
@@ -86,7 +80,7 @@ async fn start_then_stop_leaves_no_container() {
 
 #[tokio::test]
 async fn drop_without_stop_cleans_up() {
-    init_tracing();
+    common::init_tracing();
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");

@@ -14,6 +14,8 @@
 
 #![cfg(feature = "e2e")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -65,17 +67,9 @@ async fn read_stdout(child: &mut tokio::process::Child) -> String {
     out
 }
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
-}
-
 #[tokio::test]
 async fn bootstrap_then_id_matches_host() {
-    init_tracing();
+    common::init_tracing();
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");
@@ -108,7 +102,7 @@ async fn bootstrap_then_id_matches_host() {
 
 #[tokio::test]
 async fn workspace_writes_have_host_ownership() {
-    init_tracing();
+    common::init_tracing();
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");
@@ -175,7 +169,7 @@ async fn first_name_in_db(name: &str, db: &str, id: u32) -> Option<String> {
 
 #[tokio::test]
 async fn bootstrap_reuses_existing_entry() {
-    init_tracing();
+    common::init_tracing();
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");

@@ -33,3 +33,14 @@ e2e task as we landed them. Time to consolidate before a fifth lands.
 ## Dependencies
 
 None.
+
+## Decisions
+
+- `tests/common/mod.rs` already existed, so the tracing helper was added to
+  the existing shared integration-test module instead of creating a new file.
+- `tests/image_build_smoke.rs` now writes a per-run cache-bust comment into
+  its temporary Dockerfile so the first `ensure_image` call is a real miss
+  even when a previous local run left the old `outrig-cache:*` tag behind.
+- `tests/mcp_handshake.rs` now expects the structured `McpStartupFailed`
+  startup error and uses the fixture image's Node runtime for the crash
+  server so stderr capture remains deterministic under `podman exec`.

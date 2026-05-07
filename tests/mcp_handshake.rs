@@ -16,6 +16,8 @@
 
 #![cfg(feature = "e2e")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -28,14 +30,6 @@ use outrig::mcp::McpClient;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
 }
 
 async fn ensure_fixture_image() -> ImageTag {
@@ -61,7 +55,7 @@ async fn start_and_bootstrap(image: &ImageTag, host_ws: &Path) -> Container {
 
 #[tokio::test]
 async fn lists_tools_and_calls_list_directory() {
-    init_tracing();
+    common::init_tracing();
 
     let image = ensure_fixture_image().await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
@@ -120,7 +114,7 @@ async fn lists_tools_and_calls_list_directory() {
 
 #[tokio::test]
 async fn stderr_captured_on_crash() {
-    init_tracing();
+    common::init_tracing();
 
     let image = ensure_fixture_image().await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
@@ -130,15 +124,18 @@ async fn stderr_captured_on_crash() {
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
     let spec = McpServerSpec::Short(vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        "echo boom-from-mcp >&2; exit 1".to_string(),
+        "node".to_string(),
+        "-e".to_string(),
+        "console.error('boom-from-mcp'); process.exit(1)".to_string(),
     ]);
     let result = McpClient::connect_via_podman_exec(&container, &spec, "crashy", &log_dir).await;
 
     match result {
-        Err(OutrigError::McpService(_)) | Err(OutrigError::Io(_)) => {}
-        Err(other) => panic!("expected McpService/Io error, got: {other:?}"),
+        Err(OutrigError::McpStartupFailed(payload)) => {
+            assert_eq!(payload.name, "crashy");
+            assert_eq!(payload.stderr_path, log_dir.join("crashy.stderr"));
+        }
+        Err(other) => panic!("expected McpStartupFailed error, got: {other:?}"),
         Ok(_) => panic!("connect should have failed (server exits before initialize)"),
     }
 

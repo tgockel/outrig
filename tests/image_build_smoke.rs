@@ -18,6 +18,8 @@
 
 #![cfg(feature = "e2e")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -26,21 +28,19 @@ use outrig::image;
 
 #[tokio::test]
 async fn build_then_cache_hit_under_100ms() {
-    // Install a tracing subscriber so the `[buildah]` stderr lines emitted by
-    // `process::run_streamed` are visible under `--nocapture`. Best-effort:
-    // ignore the error if a subscriber is already set (e.g. a future test
-    // sets a global one).
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
+    common::init_tracing();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let ctx = dir.path();
+    let marker = ctx
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("tempdir path should have a UTF-8 filename");
     std::fs::write(
         ctx.join("Dockerfile"),
-        "FROM docker.io/library/alpine:latest\nRUN apk add --no-cache shadow\n",
+        format!(
+            "FROM docker.io/library/alpine:latest\n# cache-bust: {marker}\nRUN apk add --no-cache shadow\n",
+        ),
     )
     .expect("write Dockerfile");
 

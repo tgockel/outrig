@@ -13,6 +13,17 @@ use outrig::hf::{HfFile, HfTreeFetcher};
 use outrig::init::prompt::TerminalPrompt;
 use outrig::session::{Session, SessionId};
 
+/// Install a best-effort tracing subscriber for integration tests that
+/// surface process output under `--nocapture`.
+#[allow(dead_code)]
+pub fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+}
+
 /// `TerminalPrompt` wired to in-memory `tokio::io::duplex` streams so
 /// tests can replay scripted stdin and inspect stderr.
 #[allow(dead_code)]
