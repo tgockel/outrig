@@ -211,8 +211,11 @@ fn dispatch(cli: &Cli) -> Result<i32> {
 }
 
 fn init_tracing(verbose: u8) {
+    let outrig_log = std::env::var("OUTRIG_LOG").ok();
+    let rust_log = std::env::var("RUST_LOG").ok();
     let mut filter =
-        EnvFilter::try_from_env("OUTRIG_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+        EnvFilter::try_new(log_filter_spec(outrig_log.as_deref(), rust_log.as_deref()))
+            .unwrap_or_else(|_| EnvFilter::new("info"));
     if verbose >= 2 {
         filter = filter.add_directive(
             "outrig=trace"
@@ -227,6 +230,10 @@ fn init_tracing(verbose: u8) {
     if verbose >= 2 {
         tracing::trace!(target: "outrig", "verbose tracing enabled");
     }
+}
+
+fn log_filter_spec<'a>(outrig_log: Option<&'a str>, rust_log: Option<&'a str>) -> &'a str {
+    outrig_log.or(rust_log).unwrap_or("info")
 }
 
 /// Shared preamble for `ls`/`logs`/`discard`: cwd, the resolved global
@@ -255,4 +262,27 @@ fn repo_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)
         .enable_all()
         .build()?;
     Ok((repo_config, global_config, runtime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_filter_spec;
+
+    #[test]
+    fn outrig_log_wins_over_rust_log() {
+        assert_eq!(
+            log_filter_spec(Some("outrig=trace"), Some("debug")),
+            "outrig=trace"
+        );
+    }
+
+    #[test]
+    fn rust_log_is_used_when_outrig_log_is_unset() {
+        assert_eq!(log_filter_spec(None, Some("debug")), "debug");
+    }
+
+    #[test]
+    fn log_filter_defaults_to_info() {
+        assert_eq!(log_filter_spec(None, None), "info");
+    }
 }

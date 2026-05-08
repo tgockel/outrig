@@ -116,6 +116,33 @@ async fn run_drives_one_tool_call_and_prints_reply() {
         stderr_str.contains("[outrig] agent:"),
         "stderr lacked banner: {stderr_str}"
     );
+    assert_stderr_lines_in_order(
+        &stderr_str,
+        &[
+            "[outrig] loading config",
+            "[outrig] config loaded",
+            "[outrig] resolving agent and container",
+            "[outrig] agent/container resolved",
+            "[outrig] computing image tag",
+            "[outrig] image tag computed",
+            "[outrig] ensuring image",
+            "[outrig] image ready:",
+            "[outrig] starting container",
+            "[outrig] container ready:",
+            "[outrig] bootstrapping container user",
+            "[outrig] container user ready",
+            "[outrig] reading and merging MCP configuration",
+            "[outrig] MCP configuration ready",
+            "[outrig] MCP fs: initializing",
+            "[outrig] MCP fs: initialized",
+            "[outrig] MCP fs: listing tools",
+            "[outrig] MCP fs: tools ready",
+            "[outrig] building agent",
+            "[outrig] agent ready",
+            "[outrig] agent:",
+            "[outrig] entering REPL",
+        ],
+    );
     assert!(
         stderr_str.contains("[outrig] tool call: fs__list_directory"),
         "stderr lacked tool-call trace: {stderr_str}"
@@ -366,6 +393,17 @@ struct Captured {
     status: std::process::ExitStatus,
     stdout: String,
     stderr: String,
+}
+
+fn assert_stderr_lines_in_order(stderr: &str, needles: &[&str]) {
+    let mut offset = 0;
+    for needle in needles {
+        let haystack = &stderr[offset..];
+        let Some(pos) = haystack.find(needle) else {
+            panic!("stderr lacked ordered startup line {needle:?}: {stderr}");
+        };
+        offset += pos + needle.len();
+    }
 }
 
 async fn run_child(args: &[&str], repo: &Path) -> Captured {

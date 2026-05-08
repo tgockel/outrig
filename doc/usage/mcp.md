@@ -200,7 +200,7 @@ bytes only.
 the client; all other process output goes somewhere else:
 
 - startup banner: stderr
-- outrig tracing controlled by `OUTRIG_LOG`: stderr
+- outrig tracing controlled by `OUTRIG_LOG`, or `RUST_LOG` when unset: stderr
 - top-level startup errors: stderr
 - backing server stderr: `<session_dir>/logs/<server>.stderr`
 

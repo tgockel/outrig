@@ -37,6 +37,11 @@ outrig run [--agent <name>]
 Repeat `--verbose` (`-vv`) to also enable trace-level logs from outrig's own modules for that
 invocation.
 
+Normal startup progress is always printed to stderr so slow container or MCP startup is visible.
+`--verbose` adds the underlying buildah/podman command transcript; it is not required for the
+progress lines. Tracing filters come from `OUTRIG_LOG` first, then `RUST_LOG` if `OUTRIG_LOG`
+is unset.
+
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
 `<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`
 keep working. This lets you launch with a known path and read `session.json` immediately without
@@ -85,6 +90,26 @@ without starting the REPL.
 A typical startup looks like:
 
 ```
+[outrig] loading config
+[outrig] config loaded (1ms)
+[outrig] resolving agent and container
+[outrig] agent/container resolved: agent coding, container coding (0ms)
+[outrig] computing image tag
+[outrig] image tag computed: outrig-cache:8c2a4f7e91d6b5a3 (32ms)
+[outrig] ensuring image outrig-cache:8c2a4f7e91d6b5a3
+[outrig] image ready: outrig-cache:8c2a4f7e91d6b5a3 (cache hit) (18ms)
+[outrig] starting container outrig-20260502T103412-3f2a
+[outrig] container ready: outrig-20260502T103412-3f2a (620ms)
+[outrig] bootstrapping container user
+[outrig] container user ready (141ms)
+[outrig] reading and merging MCP configuration
+[outrig] MCP configuration ready: 2 servers (74ms)
+[outrig] MCP fs: initializing
+[outrig] MCP fs: initialized (188ms)
+[outrig] MCP fs: listing tools
+[outrig] MCP fs: tools ready: 3 tools (11ms)
+[outrig] building agent
+[outrig] agent ready (0ms)
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
 [outrig] tool-call cap:     50
 [outrig] tool-result cap:   262144 bytes
@@ -95,11 +120,13 @@ A typical startup looks like:
 [outrig] mcp shell: initialized (1 tool)
 [outrig] tools available: fs__read_file, fs__list_directory, fs__write_file, shell__exec
 [outrig] session id: 20260502T103412-3f2a   (Ctrl-D to exit, /help for slash commands)
+[outrig] entering REPL
 >
 ```
 
-All of that is on **stderr**. The only thing that ever goes to stdout is the assistant's
-natural-language reply. This separation makes it easy to capture just the model output:
+All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
+the assistant's natural-language reply. This separation makes it easy to capture just the model
+output:
 
 ```sh
 $ echo "summarise this repo" | outrig run > summary.txt

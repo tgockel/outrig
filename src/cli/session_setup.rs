@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{Config, ContainerConfig, McpServerSpec};
 use crate::container::{Container, embedded};
@@ -40,6 +40,44 @@ use crate::repo;
 use crate::session::{self, Session, SessionId, SessionStore};
 
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(2);
+
+pub(crate) struct ProgressSpan {
+    started: Instant,
+}
+
+impl ProgressSpan {
+    pub(crate) fn start(label: impl Into<String>) -> Self {
+        let label = label.into();
+        eprintln!("[outrig] {label}");
+        Self {
+            started: Instant::now(),
+        }
+    }
+
+    pub(crate) fn done(self, message: impl AsRef<str>) {
+        eprintln!(
+            "[outrig] {} ({})",
+            message.as_ref(),
+            format_elapsed(self.started.elapsed())
+        );
+    }
+}
+
+pub(crate) fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1_000 {
+        return format!("{millis}ms");
+    }
+    let secs = duration.as_secs();
+    if secs < 60 {
+        return format!("{:.1}s", duration.as_secs_f64());
+    }
+    format!("{}m{:02}s", secs / 60, secs % 60)
+}
 
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
 /// is the caller's stack frame.
@@ -83,13 +121,16 @@ pub struct SessionSetup {
 /// user is bootstrapped, and the session directory + log dir exist.
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let repo_root = repo::repo_root_from_config_path(args.repo_cfg_path);
+    let span = ProgressSpan::start("loading config");
     let cfg = Config::load(&repo_root, Some(args.global_cfg_path))?;
+    span.done("config loaded");
 
     // Agent presence is checked before any container work so the failure
     // mode is identical for `outrig run` regardless of which container
     // would have been picked. `outrig mcp` opts out via `require_agent =
     // false` -- it has no agent concept, so `agent_flag` and
     // `cfg.default_agent` are not consulted at all.
+    let span = ProgressSpan::start("resolving agent and container");
     let (session_agent_name, agent_container) = if args.require_agent {
         let agent_name = args
             .agent_flag
@@ -128,8 +169,17 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             ))
         })?
         .clone();
+    if let Some(agent) = &session_agent_name {
+        span.done(format!(
+            "agent/container resolved: agent {agent}, container {container_cfg_name}"
+        ));
+    } else {
+        span.done(format!("container resolved: {container_cfg_name}"));
+    }
 
+    let span = ProgressSpan::start("computing image tag");
     let image_tag = image::compute_tag_for(&container_cfg_name, &container_cfg, &repo_root).await?;
+    span.done(format!("image tag computed: {image_tag}"));
 
     let host_workspace = if cfg.workspace.host_path.is_absolute() {
         cfg.workspace.host_path.clone()
@@ -184,7 +234,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None
     };
 
-    if let Err(e) = image::ensure_tagged_image_for(
+    let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
+    let image_outcome = match image::ensure_tagged_image_for(
         &container_cfg_name,
         &container_cfg,
         &repo_root,
@@ -194,10 +245,23 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     )
     .await
     {
-        let _ = store.finalize(&sid, SystemTime::now(), 1);
-        return Err(e);
-    }
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = store.finalize(&sid, SystemTime::now(), 1);
+            return Err(e);
+        }
+    };
+    let cache_status = if image_outcome.cache_hit {
+        "cache hit"
+    } else {
+        "built"
+    };
+    span.done(format!(
+        "image ready: {} ({cache_status})",
+        image_outcome.tag
+    ));
 
+    let span = ProgressSpan::start(format!("starting container {container_name}"));
     let mut container = match Container::start_named(
         &image_tag,
         Some((&host_workspace, &container_workspace)),
@@ -206,18 +270,23 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     )
     .await
     {
-        Ok(container) => container,
+        Ok(container) => {
+            span.done(format!("container ready: {}", container.name));
+            container
+        }
         Err(e) => {
             let _ = store.finalize(&sid, SystemTime::now(), 1);
             return Err(e);
         }
     };
 
+    let span = ProgressSpan::start("bootstrapping container user");
     if let Err(e) = container.bootstrap_user().await {
         let _ = container.stop(STOP_GRACE).await;
         let _ = store.finalize(&sid, SystemTime::now(), 1);
         return Err(e);
     }
+    span.done("container user ready");
 
     Ok(SessionSetup {
         cfg,
@@ -238,7 +307,14 @@ pub async fn merged_mcp(
     container: &Container,
     container_cfg: &ContainerConfig,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
-    embedded::merged_mcp(container, &container_cfg.mcp).await
+    let span = ProgressSpan::start("reading and merging MCP configuration");
+    let mcp = embedded::merged_mcp(container, &container_cfg.mcp).await?;
+    let server_word = plural(mcp.len(), "server", "servers");
+    span.done(format!(
+        "MCP configuration ready: {} {server_word}",
+        mcp.len()
+    ));
+    Ok(mcp)
 }
 
 /// Spawn one [`McpClient`] per backing MCP declared in `mcp`, in key-sorted
@@ -251,7 +327,9 @@ pub async fn connect_mcp_clients(
 ) -> Result<Vec<Arc<McpClient>>> {
     let mut arcs = Vec::with_capacity(mcp.len());
     for (mcp_name, spec) in mcp {
+        let span = ProgressSpan::start(format!("MCP {mcp_name}: initializing"));
         let client = McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir).await?;
+        span.done(format!("MCP {mcp_name}: initialized"));
         arcs.push(Arc::new(client));
     }
     Ok(arcs)

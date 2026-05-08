@@ -19,7 +19,7 @@ use std::sync::Arc;
 use clap::Parser;
 use rig::completion::Message;
 
-use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
+use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
 use crate::config::{
     Config, ContainerConfig, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
     MIN_TOOL_RESULT_CAP_BYTES,
@@ -148,15 +148,23 @@ async fn run_inner(
     let mut all_tools: Vec<McpToolAdapter> = Vec::new();
     let mut per_server_counts: Vec<(String, usize)> = Vec::new();
     for arc in mcp_arcs.iter() {
+        let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
         let adapters =
             McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_cap_bytes).await?;
-        per_server_counts.push((arc.name().to_string(), adapters.len()));
+        let tool_count = adapters.len();
+        let tool_word = plural(tool_count, "tool", "tools");
+        span.done(format!(
+            "MCP {}: tools ready: {tool_count} {tool_word}",
+            arc.name()
+        ));
+        per_server_counts.push((arc.name().to_string(), tool_count));
         all_tools.extend(adapters);
     }
 
     #[cfg(feature = "mistralrs")]
     let registry = llm::LlmRegistry::new();
 
+    let span = ProgressSpan::start("building agent");
     let agent = llm::build_agent(
         &resolved,
         all_tools.clone(),
@@ -165,6 +173,7 @@ async fn run_inner(
         &registry,
     )
     .await?;
+    span.done("agent ready");
 
     print_banner(
         &resolved,
@@ -177,6 +186,7 @@ async fn run_inner(
     );
 
     let tools_summary = build_tools_summary(&all_tools);
+    eprintln!("[outrig] entering REPL");
     let result = run_repl(&agent, tools_summary).await;
 
     // Drop adapters and the agent before returning so teardown's

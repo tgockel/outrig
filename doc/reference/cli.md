@@ -35,7 +35,8 @@ config, then `<XDG_DATA_HOME>/outrig/sessions/`.
 `--verbose` adds buildah/podman command transcripts to stderr and to
 `<session_dir>/logs/container.log` for `outrig run` / `outrig mcp`. Repeat it (`-vv`) to also
 enable trace-level logs from outrig's own modules for that invocation. It does not change
-container, MCP, or agent behavior.
+container, MCP, or agent behavior. Normal startup progress is printed to stderr without
+`--verbose`.
 
 ## Subcommands
 
@@ -183,7 +184,8 @@ Environment variables used by `outrig mcp`:
 
 | Variable          | Effect                                                          |
 |-------------------|-----------------------------------------------------------------|
-| `OUTRIG_LOG`      | `tracing-subscriber` filter. Trace output still goes to stderr. |
+| `OUTRIG_LOG`      | Preferred `tracing-subscriber` filter.                          |
+| `RUST_LOG`        | Fallback tracing filter when `OUTRIG_LOG` is unset.             |
 | `XDG_DATA_HOME`   | Default base for `session-root` if not set in config.           |
 | `XDG_CONFIG_HOME` | Global config is checked before `~/.outrig/config.toml`.        |
 
@@ -276,7 +278,8 @@ still running. Discards the session directory only -- your repository is untouch
 ## Environment variables
 
 - `[providers.<name>].api-key` references via `${VAR}`: provider API key.
-- `OUTRIG_LOG`: `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`.
+- `OUTRIG_LOG`: preferred `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`.
+- `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset.
 - `XDG_DATA_HOME`: default base for `session-root` if not set in config.
 - `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
 
