@@ -156,7 +156,7 @@ const BASES: &[(&str, &str)] = &[
 
 const BASE_FIELD: Field = Field {
     name: "Base image",
-    description: "The Dockerfile's `FROM` line. Pick one of the presets.",
+    description: "The Dockerfile's `FROM` line. Pick one of the curated starting points.",
     options: BASES,
     doc_link: "doc/usage/container.md",
 };

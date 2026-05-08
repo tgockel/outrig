@@ -2,8 +2,9 @@
 
 When the built-in templates do not fit, attach `outrig mcp self` to an MCP-capable AI tool and
 ask it to design a container-config. The server exposes OutRig's docs, config schema, curated
-presets, and advisory validators over stdio. It cannot write files, run builds, or mutate your
-repo; the AI proposes the Dockerfile and TOML, and you install them.
+suggestions, and advisory validators over stdio. It cannot write files, run builds, or mutate your
+repo; the AI can use those read-only tools before writing through its own client, or it can return
+the exact file contents for you to install.
 
 ## Run the server
 
@@ -67,19 +68,21 @@ Cursor:
 
 The server exposes these tools:
 
-| Tool                  | What it returns                                                |
-|-----------------------|----------------------------------------------------------------|
-| `list_docs`           | Embedded doc pages with titles and summaries.                  |
-| `get_doc`             | Markdown for one embedded page.                                |
-| `get_config_schema`   | JSON Schema for container config and MCP server entries.       |
-| `list_base_images`    | Curated base-image suggestions, explicitly non-exhaustive.     |
-| `list_mcp_presets`    | Curated MCP preset suggestions, explicitly non-exhaustive.     |
-| `validate_dockerfile` | Advisory warnings about OutRig Dockerfile conventions.         |
-| `validate_config`     | TOML parse and config validation results for container blocks. |
+| Tool                          | What it returns                                                |
+|-------------------------------|----------------------------------------------------------------|
+| `list_docs`                   | Embedded doc pages with titles and summaries.                  |
+| `get_doc`                     | Markdown for one embedded page.                                |
+| `get_config_schema`           | JSON Schema for container config and MCP server entries.       |
+| `list_base_images`            | Base-image suggestions, explicitly non-exhaustive.             |
+| `list_mcp_server_suggestions` | MCP server suggestions and shell guidance.                     |
+| `validate_dockerfile`         | Advisory warnings about OutRig Dockerfile conventions.         |
+| `validate_config`             | TOML parse and config validation results for container blocks. |
 
-The preset tools are suggestions, not a registry. The AI can pick any base image, package set, or
-MCP server that fits the job. The Dockerfile validator is advisory for the same reason: it warns
-about common OutRig conventions without rejecting custom images.
+The suggestion tools are not a registry. The AI can pick any base image, package set, or MCP
+server command that fits the job. In particular, OutRig supports shell MCP servers even when the
+suggestion list does not name a single maintained package recipe. The Dockerfile validator is
+advisory for the same reason: it warns about common OutRig conventions without rejecting custom
+images.
 
 ## Suggested prompt
 
@@ -89,11 +92,12 @@ Ask for the files you want and tell the AI to validate both artifacts before it 
 Design an OutRig container-config for a Rust and Postgres development environment.
 Use the filesystem MCP server at /workspace and add a custom MCP server that runs pg-dump-mcp.
 Read the OutRig docs and schema first, then validate the proposed Dockerfile and TOML.
-Return the Dockerfile and the [containers.<name>] block.
+If your client can edit this repo, write the Dockerfile and [containers.<name>] block directly.
+Otherwise return the exact file paths and file contents.
 ```
 
-After review, place the Dockerfile under `.agents/outrig/containers/<name>/Dockerfile` and add the
-matching `[containers.<name>]` block to `.agents/outrig/config.toml`.
+If an AI client is not allowed to write under `.agents/outrig`, have it return the exact file
+contents rather than staging files elsewhere and asking for a blind copy into the repo.
 
 ## Trust model
 

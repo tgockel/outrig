@@ -50,7 +50,7 @@ context    = ".agents/outrig/containers/coding"
 
   [containers.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
-  shell = ["bash", "-lc", "exec mcp-server-shell"]
+  shell = ["bash", "-lc", "exec shell-mcp-command"]
 
 [containers.planning]
 dockerfile = ".agents/outrig/containers/planning/Dockerfile"

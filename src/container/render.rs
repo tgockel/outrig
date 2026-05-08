@@ -16,7 +16,7 @@ pub enum Family {
     Alpine,
 }
 
-/// One of the preset base images offered by `container add`. Each carries
+/// One of the curated base images offered by `container add`. Each carries
 /// the family discriminant and the full image string used in `FROM
 /// docker.io/library/<image>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +76,7 @@ impl BaseImage {
     }
 }
 
-/// One of the preset language toolchains offered by the toolchain
+/// One of the curated language toolchains offered by the toolchain
 /// multi-select. Canonical render order: `Rust, Node, Python, Go`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Toolchain {
@@ -104,8 +104,9 @@ impl Toolchain {
     }
 }
 
-/// Real MCP servers offered by the v0 catalogue. `shell` was dropped
-/// because no `mcp-server-shell` package exists; `git` reroutes to PyPI.
+/// Curated MCP server package recipes rendered by `container add`.
+/// Config can still declare any MCP command, including shell servers; this
+/// enum only covers recipes OutRig can install without more user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum McpServer {
     Fs,

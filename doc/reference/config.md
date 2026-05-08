@@ -304,12 +304,15 @@ serde-untagged dispatch:
 ```toml
 [containers.coding.mcp]
 # Short form -- array of strings, becomes { command = [...] }
-shell = ["bash", "-lc", "exec mcp-server-shell"]
+shell = ["bash", "-lc", "exec shell-mcp-command"]
 
 # Full form -- table with command + optional env
 fs = { command = ["mcp-server-filesystem", "/workspace"] }
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
+
+`shell-mcp-command` is a placeholder. Replace it with the shell MCP server you install in the
+image, or declare any other MCP command that should run inside the container.
 
 - `command` (array of strings, required unless using short form): argv of the MCP server.
 - `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
@@ -429,7 +432,7 @@ build-args = { NODE_VERSION = "20" }
 
   [containers.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
-  shell = ["bash", "-lc", "exec mcp-server-shell"]
+  shell = ["bash", "-lc", "exec shell-mcp-command"]
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
 

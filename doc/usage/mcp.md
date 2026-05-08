@@ -34,7 +34,7 @@ outrig mcp self
   `container.log`.
 
 `outrig mcp self` is different from the session MCP server. It does not resolve a repo config,
-start a container, or create a session. It serves OutRig's own docs, schema, preset suggestions,
+start a container, or create a session. It serves OutRig's own docs, schema, suggestions,
 and advisory validators so an external AI tool can design a container-config. See
 [AI-assisted design](ai-assisted-design.md).
 
@@ -72,11 +72,12 @@ context    = ".agents/outrig/containers/coding"
 
 [containers.coding.mcp]
 fs    = ["mcp-server-filesystem", "/workspace"]
-shell = ["bash", "-lc", "exec mcp-server-shell"]
+shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
 
 The MCP server binaries still have to exist inside the image. Install them in the
-container Dockerfile just as you would for `outrig run`.
+container Dockerfile just as you would for `outrig run`. In the example above,
+`shell-mcp-command` stands for whichever shell MCP server package you choose to install.
 
 An image can also carry the same `[mcp]` table at `/etc/outrig/container.toml`.
 Use that when a shared image owns the default tool set, then keep only repo-specific

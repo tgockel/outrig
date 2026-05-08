@@ -87,7 +87,7 @@ by hand, not an exhaustive Dockerfile generator.
 
 ### Known toolchains
 
-The toolchain prompt offers presets that cover the common cases:
+The toolchain prompt offers curated options that cover the common cases:
 
 | Choice   | What gets installed                                               |
 |----------|-------------------------------------------------------------------|
@@ -109,8 +109,10 @@ You can pick more than one. The Dockerfile is a starting point -- edit it freely
 `fs` is the default. Add `git` for repo-aware tools, or wire up additional servers by
 editing the `[containers.<name>.mcp]` block directly -- see
 [Concepts -> MCP Servers](../concepts/mcp-servers.md).
+A shell MCP server is the usual next tool for coding containers; choose a package, install it in
+the Dockerfile, and declare its command in `[containers.<name>.mcp]`.
 
-> **TODO: Incomplete** -- the catalogue of "known MCP servers" will grow as the ecosystem does.
+> **TODO: Incomplete** -- the list of "known MCP servers" will grow as the ecosystem does.
 > Anything not listed here you install in the Dockerfile by hand.
 
 ### When templates do not fit
@@ -118,7 +120,7 @@ editing the `[containers.<name>.mcp]` block directly -- see
 The prompt flow is intentionally small. If you need a container with a database, internal SDK,
 unlisted MCP server, or other custom package set, use
 [`outrig mcp self`](ai-assisted-design.md). It gives an MCP-capable AI tool the OutRig docs,
-config schema, curated suggestions, and advisory validators so it can propose a Dockerfile and
+config schema, suggested tools, and advisory validators so it can propose a Dockerfile and
 matching `[containers.<name>]` block without being limited to the built-in template menu.
 
 ### What gets written

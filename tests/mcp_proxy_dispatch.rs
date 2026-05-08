@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use outrig::error::OutrigError;
 use outrig::mcp::{McpTool, McpToolResult};
 use outrig::mcp_proxy::{BackingClient, ProxyServer};
-use rmcp::model::{CallToolRequestParam, RawContent};
+use rmcp::model::{CallToolRequestParams, RawContent};
 use serde_json::{Value, json};
 
-/// Per-tool preset response. `Ok` becomes a successful `CallToolResult`;
+/// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
 /// `Err` becomes the "backing client failed" path that surfaces as
 /// `CallToolResult { is_error: Some(true), ... }` carrying the error text.
 type CallResponse = Result<McpToolResult, OutrigError>;
@@ -22,7 +22,7 @@ struct FakeClient {
     tools: Vec<McpTool>,
     /// Recorded `(tool_name, args)` for every `call_tool` invocation.
     received: Mutex<Vec<(String, Value)>>,
-    /// Preset response per backend tool name.
+    /// Canned response per backend tool name.
     responses: HashMap<String, CallResponse>,
 }
 
@@ -78,7 +78,7 @@ impl BackingClient for FakeClient {
             Some(Ok(r)) => Ok(r.clone()),
             Some(Err(e)) => Err(OutrigError::Configuration(e.to_string())),
             None => Err(OutrigError::Configuration(format!(
-                "FakeClient({}) has no preset for {name:?}",
+                "FakeClient({}) has no response for {name:?}",
                 self.name
             ))),
         }
@@ -98,16 +98,17 @@ fn text_body(result: &rmcp::model::CallToolResult) -> String {
     out
 }
 
-fn call(name: &str, args: Value) -> CallToolRequestParam {
+fn call(name: &str, args: Value) -> CallToolRequestParams {
     let arguments = match args {
         Value::Object(m) => Some(m),
         Value::Null => None,
         other => panic!("test args must be object or null, got {other:?}"),
     };
-    CallToolRequestParam {
-        name: name.to_string().into(),
-        arguments,
+    let mut request = CallToolRequestParams::new(name.to_string());
+    if let Some(arguments) = arguments {
+        request = request.with_arguments(arguments);
     }
+    request
 }
 
 #[tokio::test]
@@ -132,7 +133,7 @@ async fn list_tools_unions_namespaces_and_preserves_order() {
 
     // Description and schema pass through unchanged.
     let read_file = &listing.tools[0];
-    assert_eq!(read_file.description.as_ref(), "desc for read_file");
+    assert_eq!(read_file.description.as_deref(), Some("desc for read_file"));
     assert_eq!(
         Value::Object(read_file.input_schema.as_ref().clone()),
         json!({"type": "object"})
@@ -185,10 +186,7 @@ async fn null_arguments_become_value_null() {
     let proxy = ProxyServer::build(vec![fs]).await.unwrap();
 
     // `arguments: None` on the request becomes `Value::Null` on the wire.
-    let req = CallToolRequestParam {
-        name: "fs__ping".to_string().into(),
-        arguments: None,
-    };
+    let req = CallToolRequestParams::new("fs__ping".to_string());
     let result = proxy.dispatch_call(req).await;
     assert_eq!(result.is_error, Some(false));
 

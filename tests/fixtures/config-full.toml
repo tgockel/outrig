@@ -67,6 +67,6 @@ context    = ".agents/outrig/containers/coding"
 build-args = { NODE_VERSION = "20" }
 
   [containers.coding.mcp]
-  shell = ["bash", "-lc", "exec mcp-server-shell"]
+  shell = ["bash", "-lc", "exec shell-mcp-command"]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }

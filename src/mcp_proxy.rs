@@ -1,28 +1,26 @@
-//! MCP server fronting a pool of [`McpClient`]s.
+//! MCP server fronting a pool of MCP clients.
 //!
 //! [`ProxyServer`] implements [`rmcp::ServerHandler`] over `Vec<C>` where
 //! each `C` is a [`BackingClient`] -- in production, `Arc<McpClient>`. The
 //! union of every backing server's tools is exposed as a single namespaced
-//! surface (`<server>__<tool>`, via [`crate::tool_name::sanitize`]) so an
+//! surface (`<server>__<tool>`, through `tool_name::sanitize`) so an
 //! external MCP client sees one server with many tools instead of *N* servers
 //! with overlapping names.
 //!
 //! The dynamic-handler form (override `list_tools` / `call_tool`) is used
 //! rather than the `#[tool]` macros, because the tool set is unknown until
 //! runtime.
-//!
-//! [`McpClient`]: crate::mcp::McpClient
 
 #![deny(clippy::print_stdout)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rmcp::Error as McpError;
+use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, Implementation, JsonObject, ListToolsResult,
-    PaginatedRequestParam, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, Content, Implementation, JsonObject, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
@@ -32,23 +30,21 @@ use crate::mcp::{self, McpClient, McpTool, McpToolResult};
 use crate::tool_name;
 
 /// Abstraction over the MCP client surface the proxy actually depends on:
-/// a name, a `tools/list`, and a `tools/call`. [`McpClient`] is the
-/// production impl; the integration test in `tests/mcp_proxy_dispatch.rs`
+/// a name, a `tools/list`, and a `tools/call`. `McpClient` is the production
+/// impl; the integration test in `tests/mcp_proxy_dispatch.rs`
 /// supplies an in-process fake.
 ///
 /// The blanket `impl<T> BackingClient for Arc<T>` lets the proxy work with
 /// `Vec<Arc<McpClient>>` directly -- no manual upcast at the call site.
-///
-/// [`McpClient`]: crate::mcp::McpClient
 pub trait BackingClient: Send + Sync + 'static {
     /// The local config name of this server (the prefix half of
     /// `<server>__<tool>`).
     fn name(&self) -> &str;
 
-    /// Mirror of [`McpClient::list_tools`](crate::mcp::McpClient::list_tools).
+    /// Mirror of `McpClient::list_tools`.
     fn list_tools(&self) -> impl Future<Output = Result<Vec<McpTool>>> + Send;
 
-    /// Mirror of [`McpClient::call_tool`](crate::mcp::McpClient::call_tool).
+    /// Mirror of `McpClient::call_tool`.
     fn call_tool(
         &self,
         name: &str,
@@ -117,12 +113,10 @@ struct ProxyInner<C> {
 
 /// MCP server fronting a pool of backing clients. Generic over the client
 /// type so tests can drive the same dispatch path with in-process fakes;
-/// production uses the default `C = Arc<`[`McpClient`]`>`.
+/// production uses the default `C = Arc<McpClient>`.
 ///
 /// `Clone` is hand-rolled (no `where C: Clone` bound) so [`ServerHandler`]'s
 /// `Self: Clone` requirement is satisfied for any `C`.
-///
-/// [`McpClient`]: crate::mcp::McpClient
 pub struct ProxyServer<C = Arc<McpClient>> {
     inner: Arc<ProxyInner<C>>,
 }
@@ -203,19 +197,12 @@ impl<C: BackingClient> ProxyServer<C> {
             }
         }
 
-        let server_info = ServerInfo {
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "outrig".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            instructions: Some(
+        let server_info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("outrig", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
                 "Tools are namespaced as <server>__<tool>; the prefix identifies which \
-                 backing MCP server hosts the tool."
-                    .to_string(),
-            ),
-        };
+                 backing MCP server hosts the tool.",
+            );
 
         Ok(Self {
             inner: Arc::new(ProxyInner {
@@ -251,7 +238,7 @@ impl<C: BackingClient> ProxyServer<C> {
     }
 
     /// Build a `tools/list` response: every backing server's tools, in
-    /// registration order, namespaced via [`tool_name::sanitize`]. Exposed
+    /// registration order, namespaced through `tool_name::sanitize`. Exposed
     /// (rather than living inline in [`ServerHandler::list_tools`]) so the
     /// dispatch can be exercised in `tests/mcp_proxy_dispatch.rs` without
     /// fabricating an rmcp [`RequestContext`].
@@ -260,14 +247,17 @@ impl<C: BackingClient> ProxyServer<C> {
             .inner
             .tools
             .iter()
-            .map(|entry| Tool {
-                name: entry.public_name.clone().into(),
-                description: entry.description.clone().into(),
-                input_schema: entry.input_schema.clone(),
+            .map(|entry| {
+                Tool::new(
+                    entry.public_name.clone(),
+                    entry.description.clone(),
+                    entry.input_schema.clone(),
+                )
             })
             .collect();
         ListToolsResult {
             next_cursor: None,
+            meta: None,
             tools,
         }
     }
@@ -277,7 +267,7 @@ impl<C: BackingClient> ProxyServer<C> {
     /// backing-client errors surface as `is_error: Some(true)` results, not
     /// rmcp protocol errors. Exposed for the same testability reason as
     /// [`Self::list_tools_inner`].
-    pub async fn dispatch_call(&self, request: CallToolRequestParam) -> CallToolResult {
+    pub async fn dispatch_call(&self, request: CallToolRequestParams) -> CallToolResult {
         let public_name = request.name.as_ref();
         let Some(&idx) = self.inner.by_public_name.get(public_name) else {
             return CallToolResult::error(vec![Content::text(format!(
@@ -289,10 +279,10 @@ impl<C: BackingClient> ProxyServer<C> {
 
         let client = &self.inner.clients[entry.client_idx];
         match client.call_tool(&entry.backend_tool, args).await {
-            Ok(result) => CallToolResult {
-                content: vec![Content::text(result.content_text)],
-                is_error: Some(result.is_error),
-            },
+            Ok(result) if result.is_error => {
+                CallToolResult::error(vec![Content::text(result.content_text)])
+            }
+            Ok(result) => CallToolResult::success(vec![Content::text(result.content_text)]),
             Err(e) => {
                 let server = client.name();
                 tracing::warn!(
@@ -315,7 +305,7 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
 
     async fn list_tools(
         &self,
-        _request: PaginatedRequestParam,
+        _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         Ok(self.list_tools_inner())
@@ -323,7 +313,7 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         Ok(self.dispatch_call(request).await)

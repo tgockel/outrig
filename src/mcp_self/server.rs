@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use rmcp::Error as McpError;
+use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, Implementation, JsonObject, ListToolsResult,
-    PaginatedRequestParam, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, Content, Implementation, JsonObject, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use schemars::JsonSchema;
@@ -13,13 +13,13 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{OutrigError, Result};
-use crate::mcp_self::{docs, presets, schema, validate};
+use crate::mcp_self::{docs, schema, suggestions, validate};
 
 const LIST_DOCS: &str = "list_docs";
 const GET_DOC: &str = "get_doc";
 const GET_CONFIG_SCHEMA: &str = "get_config_schema";
 const LIST_BASE_IMAGES: &str = "list_base_images";
-const LIST_MCP_PRESETS: &str = "list_mcp_presets";
+const LIST_MCP_SERVER_SUGGESTIONS: &str = "list_mcp_server_suggestions";
 const VALIDATE_DOCKERFILE: &str = "validate_dockerfile";
 const VALIDATE_CONFIG: &str = "validate_config";
 
@@ -65,36 +65,43 @@ impl SelfServer {
         vec![
             tool::<EmptyArgs>(
                 LIST_DOCS,
+                "List Docs",
                 "List embedded OutRig documentation pages with one-line summaries.",
             ),
             tool::<GetDocArgs>(
                 GET_DOC,
+                "Get Doc",
                 "Return the markdown for one embedded documentation page.",
             ),
             tool::<EmptyArgs>(
                 GET_CONFIG_SCHEMA,
+                "Get Config Schema",
                 "Return JSON Schema for container config and MCP server entries.",
             ),
             tool::<EmptyArgs>(
                 LIST_BASE_IMAGES,
-                "List curated base-image suggestions used by outrig container add.",
+                "List Base Image Suggestions",
+                "List base-image suggestions used by outrig container add.",
             ),
             tool::<EmptyArgs>(
-                LIST_MCP_PRESETS,
-                "List curated MCP server preset suggestions used by outrig container add.",
+                LIST_MCP_SERVER_SUGGESTIONS,
+                "List MCP Server Suggestions",
+                "List MCP server suggestions and shell guidance for OutRig containers.",
             ),
             tool::<ValidateDockerfileArgs>(
                 VALIDATE_DOCKERFILE,
+                "Validate Dockerfile",
                 "Return advisory warnings for a proposed OutRig container Dockerfile.",
             ),
             tool::<ValidateConfigArgs>(
                 VALIDATE_CONFIG,
+                "Validate Config",
                 "Parse and validate a TOML fragment containing [containers.<name>] entries.",
             ),
         ]
     }
 
-    fn dispatch(request: CallToolRequestParam) -> std::result::Result<CallToolResult, McpError> {
+    fn dispatch(request: CallToolRequestParams) -> std::result::Result<CallToolResult, McpError> {
         match request.name.as_ref() {
             LIST_DOCS => json_result(docs::list_docs()),
             GET_DOC => {
@@ -111,8 +118,8 @@ impl SelfServer {
                 }
             }
             GET_CONFIG_SCHEMA => json_result(schema::get_config_schema()),
-            LIST_BASE_IMAGES => json_result(presets::list_base_images()),
-            LIST_MCP_PRESETS => json_result(presets::list_mcp_presets()),
+            LIST_BASE_IMAGES => json_result(suggestions::list_base_images()),
+            LIST_MCP_SERVER_SUGGESTIONS => json_result(suggestions::list_mcp_server_suggestions()),
             VALIDATE_DOCKERFILE => {
                 let args: ValidateDockerfileArgs = match parse_args(request.arguments) {
                     Ok(args) => args,
@@ -136,38 +143,44 @@ impl SelfServer {
 
 impl ServerHandler for SelfServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "outrig-self".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            instructions: Some(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "outrig-self",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
                 "Read OutRig docs and schema, then validate proposed container artifacts. \
-                 This server never writes files or builds images."
-                    .to_string(),
-            ),
-        }
+                 This server never writes files or builds images. If your client permits normal \
+                 repo edits, write the validated artifacts directly; otherwise return exact file \
+                 contents and paths for the user to install. Do not stage files in /tmp and ask \
+                 for an opaque copy into .agents/outrig.",
+            )
     }
 
     async fn list_tools(
         &self,
-        _request: PaginatedRequestParam,
+        _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         Ok(ListToolsResult {
             next_cursor: None,
+            meta: None,
             tools: Self::tools(),
         })
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
         Self::dispatch(request)
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        Self::tools()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == name)
     }
 }
 
@@ -175,8 +188,16 @@ impl ServerHandler for SelfServer {
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
-fn tool<T: JsonSchema>(name: &'static str, description: &'static str) -> Tool {
+fn tool<T: JsonSchema>(name: &'static str, title: &'static str, description: &'static str) -> Tool {
     Tool::new(name, description, input_schema::<T>())
+        .with_title(title)
+        .with_annotations(read_only_annotations(title))
+}
+
+fn read_only_annotations(title: &'static str) -> ToolAnnotations {
+    ToolAnnotations::with_title(title)
+        .read_only(true)
+        .open_world(false)
 }
 
 fn input_schema<T: JsonSchema>() -> Arc<JsonObject> {
@@ -211,11 +232,11 @@ mod tests {
             serde_json::Value::Null => None,
             other => panic!("test args must be object or null, got {other:?}"),
         };
-        SelfServer::dispatch(CallToolRequestParam {
-            name: name.to_string().into(),
-            arguments,
-        })
-        .expect("dispatch")
+        let mut request = CallToolRequestParams::new(name.to_string());
+        if let Some(arguments) = arguments {
+            request = request.with_arguments(arguments);
+        }
+        SelfServer::dispatch(request).expect("dispatch")
     }
 
     fn text(result: &CallToolResult) -> &str {
@@ -238,11 +259,24 @@ mod tests {
                 GET_DOC,
                 GET_CONFIG_SCHEMA,
                 LIST_BASE_IMAGES,
-                LIST_MCP_PRESETS,
+                LIST_MCP_SERVER_SUGGESTIONS,
                 VALIDATE_DOCKERFILE,
                 VALIDATE_CONFIG,
             ],
         );
+    }
+
+    #[test]
+    fn tool_list_is_read_only_and_closed_world() {
+        for tool in SelfServer::tools() {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} should have annotations", tool.name));
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(false));
+            assert!(annotations.title.is_some());
+        }
     }
 
     #[test]

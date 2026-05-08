@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParam, RawContent};
+use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::service::serve_client;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -21,7 +21,7 @@ use common::{init_tracing, stream_lines};
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_self_serves_docs_schema_presets_and_validators() {
+async fn mcp_self_serves_docs_schema_suggestions_and_validators() {
     init_tracing();
 
     let cwd = tempfile::tempdir().expect("tempdir");
@@ -62,7 +62,7 @@ async fn mcp_self_serves_docs_schema_presets_and_validators() {
             "get_doc",
             "get_config_schema",
             "list_base_images",
-            "list_mcp_presets",
+            "list_mcp_server_suggestions",
             "validate_dockerfile",
             "validate_config",
         ] {
@@ -70,6 +70,14 @@ async fn mcp_self_serves_docs_schema_presets_and_validators() {
                 names.iter().any(|name| name == expected),
                 "missing tool {expected:?} in {names:?}",
             );
+        }
+        for tool in &listing.tools {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} should have annotations", tool.name));
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(false));
         }
 
         let docs: Value = call_json(&service, "list_docs", serde_json::json!({})).await;
@@ -108,13 +116,29 @@ async fn mcp_self_serves_docs_schema_presets_and_validators() {
                 .contains("suggestions only"),
             "base image response should carry suggestions-only note: {bases}",
         );
-        let presets: Value = call_json(&service, "list_mcp_presets", serde_json::json!({})).await;
+        let suggestions: Value = call_json(
+            &service,
+            "list_mcp_server_suggestions",
+            serde_json::json!({}),
+        )
+        .await;
         assert!(
-            presets["note"]
+            suggestions["note"]
                 .as_str()
-                .expect("preset note")
+                .expect("suggestion note")
                 .contains("suggestions only"),
-            "preset response should carry suggestions-only note: {presets}",
+            "suggestion response should carry suggestions-only note: {suggestions}",
+        );
+        assert!(
+            suggestions["items"]
+                .as_array()
+                .expect("suggestion items")
+                .iter()
+                .any(|item| item["name"] == "shell"
+                    && item["guidance"]
+                        .as_str()
+                        .is_some_and(|guidance| guidance.contains("arbitrary MCP"))),
+            "suggestions should include shell guidance: {suggestions}",
         );
 
         let dockerfile = include_str!("fixtures/self/user.Dockerfile");
@@ -178,11 +202,12 @@ where
     T: DeserializeOwned,
 {
     let arguments = Some(args.as_object().expect("object args").clone());
+    let mut request = CallToolRequestParams::new(name.to_string());
+    if let Some(arguments) = arguments {
+        request = request.with_arguments(arguments);
+    }
     let result = service
-        .call_tool(CallToolRequestParam {
-            name: name.to_string().into(),
-            arguments,
-        })
+        .call_tool(request)
         .await
         .unwrap_or_else(|err| panic!("tools/call {name}: {err}"));
     assert!(

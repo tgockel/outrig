@@ -117,8 +117,8 @@ Follow a still-running session's log:
 
 ```sh
 $ outrig logs 20260501T141907-9b1c shell --follow
-[mcp-server-shell] starting
-[mcp-server-shell] exec: cargo check
+[shell-mcp-command] starting
+[shell-mcp-command] exec: cargo check
 warning: unused import: `std::collections::HashMap`
    --> src/lib.rs:3:5
     |

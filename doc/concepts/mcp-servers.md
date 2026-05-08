@@ -18,9 +18,13 @@ MCP servers are configured per-container, as a map keyed by the server's local n
 ```toml
 [containers.coding.mcp]
 fs    = { command = ["mcp-server-filesystem", "/workspace"] }
-shell = ["bash", "-lc", "exec mcp-server-shell"]
+shell = ["bash", "-lc", "exec shell-mcp-command"]
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
+
+`shell-mcp-command` is a placeholder for the shell MCP package you choose and install in the
+image. OutRig supports arbitrary MCP commands; `outrig container add` only renders package recipes
+for the MCP servers it can install without more input.
 
 Each entry is one of:
 
@@ -41,7 +45,7 @@ An image can also ship its MCP declarations at `/etc/outrig/container.toml`:
 # /etc/outrig/container.toml
 [mcp]
 fs    = { command = ["mcp-server-filesystem", "/workspace"] }
-shell = ["bash", "-lc", "exec mcp-server-shell"]
+shell = ["bash", "-lc", "exec shell-mcp-command"]
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
 

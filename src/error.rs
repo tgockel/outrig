@@ -46,6 +46,9 @@ pub enum OutrigError {
     #[error("mcp service: {0}")]
     McpService(#[from] rmcp::service::ServiceError),
 
+    #[error("mcp server initialize: {0}")]
+    McpServerInitialize(#[source] Box<rmcp::service::ServerInitializeError>),
+
     #[error("mcp server {name:?} env key {key:?}: {source}")]
     McpEnvResolveFailed {
         name: String,
@@ -100,6 +103,12 @@ impl From<tempfile::PersistError> for OutrigError {
     }
 }
 
+impl From<rmcp::service::ServerInitializeError> for OutrigError {
+    fn from(e: rmcp::service::ServerInitializeError) -> Self {
+        OutrigError::McpServerInitialize(Box::new(e))
+    }
+}
+
 /// Boxed payload for [`OutrigError::McpStartupFailed`]. Carried behind a `Box`
 /// so the variant doesn't bloat the size of `OutrigError` (which is what
 /// `clippy::result_large_err` watches).
@@ -118,7 +127,7 @@ pub struct McpStartupFailure {
     pub stderr_path: PathBuf,
     pub stderr_tail: String,
     #[source]
-    pub source: std::io::Error,
+    pub source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

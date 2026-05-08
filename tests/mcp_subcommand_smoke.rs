@@ -25,7 +25,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -123,16 +123,15 @@ context = "{context}"
             "every tool should be namespaced under `fs__`, got {names:?}"
         );
 
+        let call_args = serde_json::json!({"path": "/workspace"})
+            .as_object()
+            .unwrap()
+            .clone();
         let call = service
-            .call_tool(CallToolRequestParam {
-                name: "fs__list_directory".to_string().into(),
-                arguments: Some(
-                    serde_json::json!({"path": "/workspace"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            })
+            .call_tool(
+                CallToolRequestParams::new("fs__list_directory".to_string())
+                    .with_arguments(call_args),
+            )
             .await
             .expect("tools/call fs__list_directory");
         assert!(

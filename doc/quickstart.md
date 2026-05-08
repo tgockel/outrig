@@ -80,7 +80,7 @@ Configuring your first container
 
 ? Base image [default: debian:bookworm-slim]:
 ? Language toolchains [default: ]: node
-? MCP servers [default: fs, shell]:
+? MCP servers [default: fs]:
 [outrig] wrote .agents/outrig/containers/hello-outrig-standard/Dockerfile
 [outrig] added [containers.hello-outrig-standard] to .agents/outrig/config.toml
 ```
@@ -101,6 +101,10 @@ hello-outrig/
             └── hello-outrig-standard/
                 └── Dockerfile
 ```
+
+The generated MCP table starts with `fs`. The run transcript below also uses shell execution,
+so the example config includes a manual `shell` entry. Replace `shell-mcp-command` with the
+shell MCP server you install in the image.
 
 Commit the agent config so it travels with the repo:
 
@@ -148,7 +152,7 @@ context    = ".agents/outrig/containers/hello-outrig-standard"
 
   [containers.hello-outrig-standard.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
-  shell = ["bash", "-lc", "exec mcp-server-shell"]
+  shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
 
 `.agents/outrig/containers/hello-outrig-standard/Dockerfile` (excerpt):
@@ -159,7 +163,9 @@ FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm passwd \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g @modelcontextprotocol/server-filesystem mcp-server-shell
+ && npm install -g @modelcontextprotocol/server-filesystem
+
+# Add the shell MCP package you chose, matching shell-mcp-command in config.toml.
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

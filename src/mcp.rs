@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParam, RawContent, ResourceContents};
+use rmcp::model::{CallToolRequestParams, RawContent, ResourceContents};
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use serde_json::Value;
 use tokio::process::Child;
@@ -146,11 +146,9 @@ impl McpClient {
             .into_iter()
             .map(|t| {
                 let input_schema = t.schema_as_json_value();
-                let description = if t.description.is_empty() {
-                    None
-                } else {
-                    Some(t.description.into_owned())
-                };
+                let description = t.description.and_then(|description| {
+                    (!description.is_empty()).then(|| description.into_owned())
+                });
                 McpTool {
                     name: t.name.into_owned(),
                     description,
@@ -176,13 +174,11 @@ impl McpClient {
             }
         };
 
-        let result = self
-            .service
-            .call_tool(CallToolRequestParam {
-                name: name.to_string().into(),
-                arguments,
-            })
-            .await?;
+        let mut request = CallToolRequestParams::new(name.to_string());
+        if let Some(arguments) = arguments {
+            request = request.with_arguments(arguments);
+        }
+        let result = self.service.call_tool(request).await?;
 
         let mut content_text = String::new();
         for (i, content) in result.content.iter().enumerate() {
@@ -210,6 +206,17 @@ impl McpClient {
                         let _ = write!(content_text, "[blob: {mime}, {} base64 bytes]", blob.len());
                     }
                 },
+                RawContent::Audio(audio) => {
+                    let _ = write!(
+                        content_text,
+                        "[audio: {}, {} base64 bytes]",
+                        audio.mime_type,
+                        audio.data.len()
+                    );
+                }
+                RawContent::ResourceLink(link) => {
+                    let _ = write!(content_text, "[resource link: {}]", link.uri);
+                }
             }
         }
 
@@ -254,7 +261,7 @@ async fn enrich_startup_error(
     command: &[String],
     stderr_path: &Path,
     child: &mut Child,
-    source: std::io::Error,
+    source: rmcp::service::ClientInitializeError,
 ) -> OutrigError {
     let exit_status = match tokio::time::timeout(Duration::from_millis(250), child.wait()).await {
         Ok(Ok(status)) => Some(status),
@@ -279,7 +286,7 @@ async fn enrich_startup_error(
         exit,
         stderr_path: stderr_path.to_path_buf(),
         stderr_tail,
-        source,
+        source: Box::new(source),
     }))
 }
 
@@ -427,9 +434,8 @@ mod tests {
             "-c".to_string(),
             "echo boom 1>&2; exit 7".to_string(),
         ];
-        let source = std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "expect initialize response",
+        let source = rmcp::service::ClientInitializeError::ConnectionClosed(
+            "expect initialize response".to_string(),
         );
 
         let err = enrich_startup_error("svc", &argv, &stderr_path, &mut child, source).await;
