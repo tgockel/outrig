@@ -374,19 +374,78 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
         .get("messages")
         .and_then(Value::as_array)
         .expect("third request has messages array");
-    let third_messages = serde_json::to_string(third_messages).expect("messages serialize");
+    let third_messages_json = serde_json::to_string(third_messages).expect("messages serialize");
     assert!(
-        third_messages.contains("continue"),
-        "third request lacked follow-up prompt: {third_messages}",
+        third_messages_json.contains("fs__list_directory"),
+        "third request lacked prior completed tool call: {third_messages_json}",
+    );
+
+    let cancelled_tool_call_index =
+        assistant_tool_call_index(third_messages, "call_2", "fs__read_text_file").unwrap_or_else(
+            || panic!("third request lacked cancelled tool call: {third_messages_json}"),
+        );
+    let synthetic_tool_result_index = cancelled_tool_call_index + 1;
+    let synthetic_tool_result = third_messages
+        .get(synthetic_tool_result_index)
+        .unwrap_or_else(|| panic!("cancelled tool call had no following message"));
+    assert!(
+        synthetic_tool_result.get("role").and_then(Value::as_str) == Some("tool"),
+        "cancelled tool call was not followed by a tool result: {third_messages_json}",
     );
     assert!(
-        third_messages.contains("fs__list_directory"),
-        "third request lacked prior completed tool call: {third_messages}",
+        synthetic_tool_result
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            == Some("call_2"),
+        "synthetic tool result did not match cancelled tool call: {third_messages_json}",
     );
     assert!(
-        third_messages.contains("fs__read_text_file"),
-        "third request lacked cancelled turn's tool-call message: {third_messages}",
+        synthetic_tool_result
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("per-turn tool-call cap (1)")),
+        "synthetic tool result lacked cap marker: {third_messages_json}",
     );
+
+    let continue_index = third_messages
+        .iter()
+        .position(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && json_contains_str(message, "continue")
+        })
+        .unwrap_or_else(|| panic!("third request lacked follow-up prompt: {third_messages_json}"));
+    assert!(
+        continue_index > synthetic_tool_result_index,
+        "follow-up prompt did not come after synthetic tool result: {third_messages_json}",
+    );
+}
+
+fn assistant_tool_call_index(messages: &[Value], call_id: &str, tool_name: &str) -> Option<usize> {
+    messages.iter().position(|message| {
+        message.get("role").and_then(Value::as_str) == Some("assistant")
+            && message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|tool_calls| {
+                    tool_calls.iter().any(|tool_call| {
+                        tool_call.get("id").and_then(Value::as_str) == Some(call_id)
+                            && tool_call
+                                .get("function")
+                                .and_then(|function| function.get("name"))
+                                .and_then(Value::as_str)
+                                == Some(tool_name)
+                    })
+                })
+    })
+}
+
+fn json_contains_str(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(s) => s.contains(needle),
+        Value::Array(items) => items.iter().any(|item| json_contains_str(item, needle)),
+        Value::Object(map) => map.values().any(|item| json_contains_str(item, needle)),
+        _ => false,
+    }
 }
 
 struct Captured {

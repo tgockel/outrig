@@ -166,8 +166,9 @@ for one agent, and `outrig run --max-tool-result-bytes <n>` overrides both for t
 If a tool returns more than the cap, outrig keeps the head of the result and appends a marker
 that includes the original size, the cap, and a hint to narrow the next query.
 
-When the tool-call cap fires, outrig ends the current turn and keeps the partial conversation
-history:
+When the tool-call cap fires, outrig ends the current turn and keeps protocol-valid partial
+conversation history. If the model had already asked for the next tool call, outrig records a
+tool result saying that call was not executed because the cap was reached:
 
 ```
 [outrig] tool-call iteration cap (50) reached; ending turn
@@ -176,7 +177,8 @@ history:
 ```
 
 Type `continue`, or any more specific instruction, to let the next turn pick up from the retained
-tool calls. Use `/reset` first when you want to drop that history.
+tool calls with a fresh cap. If the skipped tool call is still needed, the model can ask for it
+again. Use `/reset` first when you want to drop that history.
 
 The REPL is line-buffered. Multi-line input is not supported in v0.
 

@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use rig::agent::{PromptHook, ToolCallHookAction};
+use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, Message, Prompt};
 use thiserror::Error;
 
@@ -439,12 +439,13 @@ fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Mess
     }
 }
 
-/// Per-request hook that traces every tool call to stderr and terminates the
-/// agent loop after `cap` calls. Cloned by rig per request; the `counter` is
-/// shared via `Arc` so a single turn's calls all count against the same cap.
+/// Per-request hook that traces every tool call to stderr and stops the agent
+/// loop after `cap` calls. Cloned by rig per request; shared atomics keep a
+/// single turn's calls counting against the same cap.
 #[derive(Clone)]
 pub struct OutrigPromptHook {
     counter: Arc<AtomicUsize>,
+    cap_reached: Arc<AtomicBool>,
     cap: usize,
 }
 
@@ -452,12 +453,23 @@ impl OutrigPromptHook {
     pub fn new(cap: usize) -> Self {
         Self {
             counter: Arc::new(AtomicUsize::new(0)),
+            cap_reached: Arc::new(AtomicBool::new(false)),
             cap,
         }
     }
 }
 
 impl<M: CompletionModel> PromptHook<M> for OutrigPromptHook {
+    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
+        if self.cap_reached.load(Ordering::SeqCst) {
+            return HookAction::terminate(format!(
+                "tool-call iteration cap ({}) reached; ending turn",
+                self.cap
+            ));
+        }
+        HookAction::cont()
+    }
+
     async fn on_tool_call(
         &self,
         tool_name: &str,
@@ -467,8 +479,11 @@ impl<M: CompletionModel> PromptHook<M> for OutrigPromptHook {
     ) -> ToolCallHookAction {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
         if n > self.cap {
-            return ToolCallHookAction::terminate(format!(
-                "tool-call iteration cap ({}) reached; ending turn",
+            self.cap_reached.store(true, Ordering::SeqCst);
+            return ToolCallHookAction::skip(format!(
+                "[outrig] tool call not executed: per-turn tool-call cap ({}) \
+                 was reached before this call could run. The user may continue \
+                 with a fresh cap; repeat the tool call if still needed.",
                 self.cap
             ));
         }
