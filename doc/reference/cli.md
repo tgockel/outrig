@@ -99,6 +99,7 @@ outrig run [--agent <name>]
            [--container <name>]
            [--config <path>]
            [--global-config <path>]
+           [--max-tool-calls <n>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
@@ -108,6 +109,7 @@ outrig run [--agent <name>]
 |------------------------|-----------------------------------|-------------------------------------|
 | `--agent <name>`       | `default-agent`                   | Selects an `[agents.<name>]` block. |
 | `--container <name>`   | from agent or `default-container` | Container-config to launch.         |
+| `--max-tool-calls <n>` | resolved `tool-call-cap`, else 50 | Per-turn tool-call cap.             |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto)     | Specific directory for this run.    |
 | `-v`, `--verbose`      | off                               | Print container lifecycle traces.   |
 

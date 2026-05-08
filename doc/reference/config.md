@@ -26,20 +26,22 @@ default-agent     = "coding"
 default-model     = "fast"
 session-root      = "/var/lib/outrig/sessions"        # optional; defaults to XDG data dir
 model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XDG cache dir
+tool-call-cap     = 100                               # optional; defaults to 50
 ```
 
-| Key                 | Type   | Required               | Where  | Description                   |
-|---------------------|--------|------------------------|--------|-------------------------------|
-| `default-container` | string | for `outrig run`       | repo   | Default `--container`. |
-| `default-agent`     | string | for `outrig run`       | repo   | Default `--agent`.            |
-| `default-model`     | string | if agent omits `model` | global | Fallback model name.          |
-| `session-root`      | path   | no                     | global | Sessions root dir.            |
-| `model-cache-root`  | path   | no                     | global | GGUF download cache dir.      |
+| Key                 | Type    | Required               | Where  | Description                  |
+|---------------------|---------|------------------------|--------|------------------------------|
+| `default-container` | string  | for `outrig run`       | repo   | Default `--container`.       |
+| `default-agent`     | string  | for `outrig run`       | repo   | Default `--agent`.           |
+| `default-model`     | string  | if agent omits `model` | global | Fallback model name.         |
+| `session-root`      | path    | no                     | global | Sessions root dir.           |
+| `model-cache-root`  | path    | no                     | global | GGUF download cache dir.     |
+| `tool-call-cap`     | integer | no                     | global | Per-turn tool-call cap.      |
 
 `default-container` and `default-agent` belong in the repo config -- containers and agents are
-project-scoped. `default-model`, `session-root`, and `model-cache-root` belong in the global
-config since they're user/machine-level. Each may also appear in the other file; repo entries
-override global by name.
+project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-cap`
+belong in the global config since they're user/machine-level. Each may also appear in the
+other file; repo entries override global by name.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -50,6 +52,11 @@ points at one specific session directory. See [Sessions](../usage/sessions.md).
 `~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` models configured
 with `model-id` -- that's where the auto-downloaded GGUFs land. See
 [Concepts -> In-process LLMs](../concepts/in-process-llm.md).
+
+`tool-call-cap` is the default maximum number of tool calls in one user turn. The compiled-in
+default is `50`; config may set any value from `1` through `2000`.
+`[agents.<name>].tool-call-cap` overrides the top-level value for one agent, and
+`outrig run --max-tool-calls <n>` overrides both for one invocation.
 
 ## `[providers.<name>]`
 
@@ -208,6 +215,7 @@ container = "coding"
 preamble  = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 max-tokens  = 4096
+tool-call-cap = 300
 
 [agents.review]
 model    = "smart"        # explicit override of default-model
@@ -221,10 +229,12 @@ preamble = "You are a meticulous code reviewer..."
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
 - `max-tokens` (integer, optional, default: provider default): output token cap per turn.
+- `tool-call-cap` (integer, optional, default: top-level value or `50`): tool calls per turn.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set. When `outrig run --agent <a>` runs, the chosen container is `--container` if given,
 otherwise `agents.<a>.container` if set, otherwise `default-container`.
+`tool-call-cap` is per turn, not per session; follow-up prompts start a fresh count.
 
 ## `[workspace]`
 
@@ -346,6 +356,7 @@ before the REPL starts.
 default-model    = "fast"
 session-root     = "/var/lib/outrig/sessions"   # optional; default = XDG data dir
 model-cache-root = "/var/cache/outrig/models"   # optional; default = XDG cache dir
+tool-call-cap    = 100                           # optional; default = 50
 
 [providers.openai]
 style    = "openai"
@@ -385,6 +396,7 @@ container-path = "/workspace"
 container   = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
+tool-call-cap = 300
 
 [agents.review]
 model    = "smart"        # explicit override
@@ -428,6 +440,7 @@ build-args = { NODE_VERSION = "20" }
   disk relative to the repo root (or be absolute). `identifier` is not
   allowed on mistralrs models.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
+- `tool-call-cap`, if set at the top level or on an agent, must be between `1` and `2000`.
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.
 - Every `command` array must be non-empty.

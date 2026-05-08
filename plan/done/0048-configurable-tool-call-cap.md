@@ -202,6 +202,19 @@ state machine, no flag, no special prompt. The REPL keeps prompting at
   (`src/cli/run.rs:272+`, `print_banner`). Helpful for debugging when
   someone overrides it; cheap to add. Worth doing in the same task.
 
+## Decisions
+
+- Rig 0.36 returns full history (`input history + partial turn`) on
+  `PromptCancelled`, not only the new partial turn. `outrig` therefore
+  appends only the returned suffix when the prefix matches existing
+  history, avoiding duplicate prior turns while still accepting a
+  partial-only history defensively if Rig changes shape later.
+- `--max-tool-calls` is applied after normal agent resolution. The
+  resolved agent still carries the config-derived value, and the CLI
+  override mutates that one runtime value before the Rig agent is built.
+- The startup banner always prints the resolved cap. This makes config
+  and CLI precedence visible without adding a separate debug mode.
+
 ## Files
 
 - `src/llm.rs` -- `ResolvedAgent` gains `tool_call_cap`; `run_turn` and

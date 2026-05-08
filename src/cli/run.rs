@@ -20,7 +20,7 @@ use clap::Parser;
 use rig::completion::Message;
 
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
-use crate::config::{Config, ContainerConfig};
+use crate::config::{Config, ContainerConfig, MAX_TOOL_CALL_CAP};
 use crate::container::Container;
 use crate::error::Result;
 use crate::image::ImageTag;
@@ -45,6 +45,10 @@ pub struct RunArgs {
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
+
+    /// Override the per-turn tool-call cap for this run.
+    #[arg(long = "max-tool-calls", value_name = "N", value_parser = parse_tool_call_cap)]
+    pub max_tool_calls: Option<u32>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
@@ -98,6 +102,7 @@ pub async fn execute(
         sid.as_str(),
         &cache_root,
         &mut mcp_arcs,
+        args.max_tool_calls,
     )
     .await;
 
@@ -118,11 +123,13 @@ async fn run_inner(
     session_id: &str,
     cache_root: &Path,
     mcp_arcs: &mut Vec<Arc<McpClient>>,
+    max_tool_calls: Option<u32>,
 ) -> Result<i32> {
     // `setup` already validated presence and used the resolved `.container`
     // for the container fallback. We re-resolve here for `build_agent` +
     // banner; cheap (config table lookups, no I/O).
-    let resolved = llm::resolve_agent(cfg, agent_name)?;
+    let mut resolved = llm::resolve_agent(cfg, agent_name)?;
+    apply_tool_call_cap_override(&mut resolved, max_tool_calls);
 
     let connected = session_setup::connect_mcp_clients(container, container_cfg, log_dir).await?;
     mcp_arcs.extend(connected);
@@ -179,8 +186,8 @@ async fn run_repl(agent: &llm::RigAgent, tools_summary: String) -> Result<i32> {
         let history = history_for_prompt.clone();
         async move {
             // Move the vec out so the RefCell isn't borrowed across the
-            // await; restore it on completion. Cancellation drops `h`,
-            // losing this turn's partial history -- acceptable for v0.
+            // await; restore it on completion. Prompt cancellation may add
+            // partial history to `h`, so it must always be written back.
             let mut h = std::mem::take(&mut *history.borrow_mut());
             let result = agent.run_turn(&line, &mut h).await;
             *history.borrow_mut() = h;
@@ -225,6 +232,11 @@ fn print_banner(
         "[outrig] agent:             {} (model: {} / provider: {} / {})",
         resolved.agent_name, resolved.model_name, provider_label, resolved.model_identifier
     );
+    let _ = writeln!(
+        buf,
+        "[outrig] tool-call cap:     {}",
+        resolved.tool_call_cap
+    );
     let _ = writeln!(buf, "[outrig] container-config:  {container_name}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
@@ -263,5 +275,66 @@ fn truncate_description(desc: &str, max: usize) -> String {
             .map(|(i, _)| i)
             .unwrap_or(cleaned.len());
         format!("{}...", &cleaned[..cut])
+    }
+}
+
+fn apply_tool_call_cap_override(resolved: &mut llm::ResolvedAgent, max_tool_calls: Option<u32>) {
+    if let Some(max_tool_calls) = max_tool_calls {
+        resolved.tool_call_cap = max_tool_calls as usize;
+    }
+}
+
+fn parse_tool_call_cap(s: &str) -> std::result::Result<u32, String> {
+    let value = s
+        .parse::<u32>()
+        .map_err(|_| format!("must be an integer between 1 and {MAX_TOOL_CALL_CAP}"))?;
+    if !(1..=MAX_TOOL_CALL_CAP).contains(&value) {
+        return Err(format!(
+            "must be between 1 and {MAX_TOOL_CALL_CAP}; got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_tool_calls_arg_accepts_in_range_value() {
+        let args = RunArgs::try_parse_from(["run", "--max-tool-calls", "200"]).expect("arg parses");
+        assert_eq!(args.max_tool_calls, Some(200));
+    }
+
+    #[test]
+    fn max_tool_calls_arg_rejects_out_of_range_value() {
+        let err =
+            RunArgs::try_parse_from(["run", "--max-tool-calls", "0"]).expect_err("zero is invalid");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be between 1 and 2000"),
+            "unexpected clap error: {msg}",
+        );
+    }
+
+    #[test]
+    fn cli_override_replaces_resolved_tool_call_cap() {
+        let mut resolved = llm::ResolvedAgent {
+            agent_name: "coding".to_string(),
+            model_name: "fast".to_string(),
+            model_identifier: "gpt-4o-mini".to_string(),
+            provider_name: "local".to_string(),
+            provider: llm::ResolvedProvider::Mistralrs,
+            model_weights: None,
+            preamble: "test".to_string(),
+            temperature: None,
+            max_tokens: None,
+            tool_call_cap: 100,
+            container: None,
+        };
+
+        apply_tool_call_cap_override(&mut resolved, Some(50));
+
+        assert_eq!(resolved.tool_call_cap, 50);
     }
 }

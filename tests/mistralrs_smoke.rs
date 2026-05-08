@@ -64,7 +64,7 @@ preamble = "You are a terse assistant."
 }
 
 async fn one_shot(agent: &RigAgent, prompt: &str) -> String {
-    let RigAgent::Mistralrs(inner) = agent else {
+    let RigAgent::Mistralrs { agent: inner, .. } = agent else {
         panic!("expected Mistralrs-backed agent");
     };
     timeout(PROMPT_TIMEOUT, inner.prompt(prompt).into_future())

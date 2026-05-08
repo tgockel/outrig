@@ -8,14 +8,14 @@ use rig::agent::{PromptHook, ToolCallHookAction};
 use rig::completion::{CompletionModel, Message, Prompt};
 use thiserror::Error;
 
-use crate::config::{Config, LlmProvider};
+use crate::config::{Config, DEFAULT_TOOL_CALL_CAP, LlmProvider};
 use crate::error::{OutrigError, Result};
 use crate::rig_tool::McpToolAdapter;
 
 /// Hard cap on tool calls per turn. The hook below trips this; rig's own
 /// `max_turns` is set to the same value as a defense in depth, so whichever
 /// fires first surfaces a controllable message.
-pub const MAX_TOOL_CALLS: usize = 50;
+pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_CAP as usize;
 
 #[cfg(feature = "mistralrs")]
 pub mod mistralrs;
@@ -125,6 +125,7 @@ pub struct ResolvedAgent {
     pub preamble: String,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub tool_call_cap: usize,
     pub container: Option<String>,
 }
 
@@ -235,6 +236,10 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
             .unwrap_or_else(|| DEFAULT_PREAMBLE.to_string()),
         temperature: agent.temperature,
         max_tokens: agent.max_tokens,
+        tool_call_cap: agent
+            .tool_call_cap
+            .or(cfg.tool_call_cap)
+            .unwrap_or(DEFAULT_TOOL_CALL_CAP) as usize,
         container: agent.container.clone(),
     })
 }
@@ -244,9 +249,15 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
 /// (Rig's trait carries associated types, so a single concrete `RigAgent`
 /// can't carry both). Callers (the agent loop) match on the variant.
 pub enum RigAgent {
-    OpenAi(rig::agent::Agent<rig::providers::openai::CompletionModel>),
+    OpenAi {
+        agent: rig::agent::Agent<rig::providers::openai::CompletionModel>,
+        tool_call_cap: usize,
+    },
     #[cfg(feature = "mistralrs")]
-    Mistralrs(rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>),
+    Mistralrs {
+        agent: rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
+        tool_call_cap: usize,
+    },
 }
 
 /// Build a Rig `Agent` ready to receive a turn. Preamble, sampling params,
@@ -279,7 +290,10 @@ pub async fn build_agent(
                 .build()
                 .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
             let model = client.completion_model(&resolved.model_identifier);
-            Ok(RigAgent::OpenAi(finish_agent(model, resolved, tools)))
+            Ok(RigAgent::OpenAi {
+                agent: finish_agent(model, resolved, tools),
+                tool_call_cap: resolved.tool_call_cap,
+            })
         }
         ResolvedProvider::Mistralrs => {
             #[cfg(not(feature = "mistralrs"))]
@@ -319,11 +333,10 @@ pub async fn build_agent(
                         .await
                     })
                     .await?;
-                Ok(RigAgent::Mistralrs(finish_agent(
-                    (*model).clone(),
-                    resolved,
-                    tools,
-                )))
+                Ok(RigAgent::Mistralrs {
+                    agent: finish_agent((*model).clone(), resolved, tools),
+                    tool_call_cap: resolved.tool_call_cap,
+                })
             }
         }
     }
@@ -336,15 +349,20 @@ impl RigAgent {
     ///
     /// The per-turn [`OutrigPromptHook`] prints `[outrig] tool call: ...` to
     /// stderr for every tool invocation and terminates the loop after
-    /// [`MAX_TOOL_CALLS`] calls. On termination, history is left untouched
-    /// for that turn -- splicing partial mid-turn state cleanly is a
-    /// correctness rabbit hole; the next user turn just re-grounds.
+    /// the resolved tool-call cap. If the hook terminates the loop, Rig
+    /// returns the partial chat history it had accumulated; outrig splices in
+    /// that new suffix so the user can send a follow-up prompt to continue.
     pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
-        let hook = OutrigPromptHook::new(MAX_TOOL_CALLS);
         match self {
-            RigAgent::OpenAi(a) => run_turn_inner(a, prompt, history, hook).await,
+            RigAgent::OpenAi {
+                agent,
+                tool_call_cap,
+            } => run_turn_inner(agent, prompt, history, *tool_call_cap).await,
             #[cfg(feature = "mistralrs")]
-            RigAgent::Mistralrs(a) => run_turn_inner(a, prompt, history, hook).await,
+            RigAgent::Mistralrs {
+                agent,
+                tool_call_cap,
+            } => run_turn_inner(agent, prompt, history, *tool_call_cap).await,
         }
     }
 }
@@ -353,12 +371,13 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
     history: &mut Vec<Message>,
-    hook: OutrigPromptHook,
+    tool_call_cap: usize,
 ) -> Result<String> {
+    let hook = OutrigPromptHook::new(tool_call_cap);
     let result = agent
         .prompt(prompt.to_string())
         .with_history(history.clone())
-        .max_turns(MAX_TOOL_CALLS)
+        .max_turns(tool_call_cap)
         .with_hook(hook)
         .extended_details()
         .await;
@@ -371,11 +390,41 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
             history.extend(messages);
             Ok(response.output)
         }
-        Err(rig::completion::PromptError::PromptCancelled { reason, .. }) => {
+        Err(rig::completion::PromptError::PromptCancelled {
+            reason,
+            chat_history,
+        }) => {
             eprintln!("[outrig] {reason}");
+            eprintln!(
+                "[outrig] partial history retained -- send another prompt \
+                 (e.g. \"continue\") to keep going, or \"/reset\" to drop it."
+            );
+            extend_history_with_new_suffix(history, chat_history);
+            Ok("(turn ended; tool-call cap reached)".to_string())
+        }
+        Err(rig::completion::PromptError::MaxTurnsError {
+            max_turns,
+            chat_history,
+            ..
+        }) => {
+            eprintln!("[outrig] tool-call iteration cap ({max_turns}) reached; ending turn");
+            eprintln!(
+                "[outrig] partial history retained -- send another prompt \
+                 (e.g. \"continue\") to keep going, or \"/reset\" to drop it."
+            );
+            extend_history_with_new_suffix(history, *chat_history);
             Ok("(turn ended; tool-call cap reached)".to_string())
         }
         Err(other) => Err(OutrigError::Prompt(other)),
+    }
+}
+
+fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Message>) {
+    let existing_len = history.len();
+    if returned.len() >= existing_len && returned[..existing_len] == history[..] {
+        history.extend(returned.into_iter().skip(existing_len));
+    } else {
+        history.extend(returned);
     }
 }
 
@@ -437,4 +486,43 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
         .map(|t| Box::new(t) as Box<dyn ToolDyn>)
         .collect();
     builder.tools(boxed).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_history_retains_only_new_suffix_when_full_history_returned() {
+        let original = vec![Message::user("first"), Message::assistant("done")];
+        let mut history = original.clone();
+        let mut returned = original;
+        returned.push(Message::user("second"));
+        returned.push(Message::assistant("partial"));
+
+        extend_history_with_new_suffix(&mut history, returned);
+
+        assert_eq!(
+            history,
+            vec![
+                Message::user("first"),
+                Message::assistant("done"),
+                Message::user("second"),
+                Message::assistant("partial"),
+            ],
+        );
+    }
+
+    #[test]
+    fn cancelled_history_appends_when_returned_history_is_only_partial() {
+        let mut history = vec![Message::user("first")];
+        let returned = vec![Message::assistant("partial")];
+
+        extend_history_with_new_suffix(&mut history, returned);
+
+        assert_eq!(
+            history,
+            vec![Message::user("first"), Message::assistant("partial")],
+        );
+    }
 }

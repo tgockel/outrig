@@ -6,6 +6,7 @@ default-agent     = "coding"
 default-model     = "fast"
 session-root      = "/var/lib/outrig/sessions"
 model-cache-root  = "/var/cache/outrig/models"
+tool-call-cap     = 100
 
 [providers.openai]
 style                = "openai"
@@ -48,6 +49,7 @@ container   = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 max-tokens  = 4096
+tool-call-cap = 300
 
 [agents.review]
 model    = "smart"

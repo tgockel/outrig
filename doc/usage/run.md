@@ -11,6 +11,7 @@ stdin/stdout REPL with the agent.
 outrig run [--agent <name>]
            [--container <name>]
            [--config <path>]
+           [--max-tool-calls <n>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
@@ -21,6 +22,8 @@ outrig run [--agent <name>]
   container.
 - `--config <path>` (default: walks up from cwd): use from outside the repo or
   non-standard locations.
+- `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): override the
+  per-turn tool-call cap for this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
   directory; symlinked from the root.
 - `--session-root <path>` (default: `session-root` config, else XDG): root directory
@@ -63,8 +66,9 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
    handshake, and discover tools via `tools/list`.
 7. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), look up
    `[agents.<a>].model` -- if unset, fall back to top-level `default-model`. Then
-   `[models.<m>].provider`, then `[providers.<p>]`. Read the API key from the env var named in
-   the provider's `api-key`. Build the Rig provider client.
+   `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call cap from
+   `tool-call-cap`, then read the API key from the env var named in the provider's `api-key`.
+   Build the Rig provider client.
 8. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
    `AgentBuilder`.
@@ -79,6 +83,7 @@ A typical startup looks like:
 
 ```
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
+[outrig] tool-call cap:     50
 [outrig] container-config:  coding
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3
 [outrig] container started: outrig-20260502T103412-3f2a
@@ -117,6 +122,22 @@ TOML keys it expects. `cargo check` passed with no warnings. Diff:
 Behind the scenes the agent may make many tool calls per turn -- Rig drives the
 model-tool-model loop until the model emits a normal text reply with no tool calls. Tool-call
 traces appear on stderr; the final text reply is printed on stdout.
+
+Each turn has a tool-call cap. The compiled-in default is `50`; a top-level
+`tool-call-cap` in config changes the default, `[agents.<name>].tool-call-cap` overrides it for
+one agent, and `outrig run --max-tool-calls <n>` overrides both for the current run. The cap is
+per turn, so a follow-up prompt starts a fresh count.
+
+When the cap fires, outrig ends the current turn and keeps the partial conversation history:
+
+```
+[outrig] tool-call iteration cap (50) reached; ending turn
+[outrig] partial history retained -- send another prompt (e.g. "continue")
+        to keep going, or "/reset" to drop it.
+```
+
+Type `continue`, or any more specific instruction, to let the next turn pick up from the retained
+tool calls. Use `/reset` first when you want to drop that history.
 
 The REPL is line-buffered. Multi-line input is not supported in v0.
 

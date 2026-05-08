@@ -93,6 +93,7 @@ srv = { command = ["bin", "arg1"] }
             cfg.model_cache_root.as_deref(),
             Some(std::path::Path::new("/var/cache/outrig/models")),
         );
+        assert_eq!(cfg.tool_call_cap, Some(100));
 
         let LlmProvider::OpenAi {
             base_url,
@@ -149,6 +150,7 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding.container.as_deref(), Some("coding"));
         assert_eq!(coding.temperature, Some(0.2));
         assert_eq!(coding.max_tokens, Some(4096));
+        assert_eq!(coding.tool_call_cap, Some(300));
         assert_eq!(cfg.agents["review"].model.as_deref(), Some("smart"));
 
         assert_eq!(cfg.workspace.host_path, PathBuf::from("."));

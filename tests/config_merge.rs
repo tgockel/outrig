@@ -330,6 +330,54 @@ context    = "does/not/exist"
         cfg.validate(None)
             .expect("structural-only validate ignores disk paths");
     }
+
+    #[test]
+    fn top_level_tool_call_cap_zero_errors() {
+        let cfg = parse(
+            r#"
+tool-call-cap = 0
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::ToolCallCapOutOfRange { path, value, max } => {
+                assert_eq!(path, "top-level tool-call-cap");
+                assert_eq!(value, 0);
+                assert_eq!(max, 2000);
+            }
+            other => panic!("expected ToolCallCapOutOfRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_tool_call_cap_too_large_errors() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+tool-call-cap = 5000
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::ToolCallCapOutOfRange { path, value, max } => {
+                assert_eq!(path, "agents.coding.tool-call-cap");
+                assert_eq!(value, 5000);
+                assert_eq!(max, 2000);
+            }
+            other => panic!("expected ToolCallCapOutOfRange, got: {other:?}"),
+        }
+    }
 }
 
 mod config_merge {
@@ -455,6 +503,34 @@ session-root = "/var/lib/outrig/sessions"
             merged.session_root.as_deref(),
             Some(Path::new("/var/lib/outrig/sessions")),
         );
+    }
+
+    #[test]
+    fn tool_call_cap_repo_overrides_global() {
+        let global = parse(
+            r#"
+tool-call-cap = 100
+"#,
+        );
+        let repo = parse(
+            r#"
+tool-call-cap = 300
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(merged.tool_call_cap, Some(300));
+    }
+
+    #[test]
+    fn tool_call_cap_global_used_when_repo_unset() {
+        let global = parse(
+            r#"
+tool-call-cap = 100
+"#,
+        );
+        let repo = parse("");
+        let merged = merge(global, repo);
+        assert_eq!(merged.tool_call_cap, Some(100));
     }
 }
 

@@ -9,7 +9,7 @@ use outrig::config::Config;
 use outrig::error::OutrigError;
 #[cfg(not(feature = "mistralrs"))]
 use outrig::llm::build_agent;
-use outrig::llm::{LlmResolveError, ResolvedProvider, resolve_agent};
+use outrig::llm::{LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider, resolve_agent};
 
 fn parse(s: &str) -> Config {
     Config::load_from_str(s).expect("config parses")
@@ -90,6 +90,7 @@ max-tokens  = 4096
     assert_eq!(r.preamble, "you are a careful coder");
     assert_eq!(r.temperature, Some(0.2));
     assert_eq!(r.max_tokens, Some(4096));
+    assert_eq!(r.tool_call_cap, MAX_TOOL_CALLS);
 
     unset_env(var);
 }
@@ -111,6 +112,35 @@ preamble = "be meticulous"
     let r = resolve_agent(&cfg, "review").expect("resolves");
     assert_eq!(r.model_name, "smart");
     assert_eq!(r.model_identifier, "gpt-4o");
+
+    unset_env(var);
+}
+
+#[test]
+fn tool_call_cap_resolves_from_top_level_then_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_CAP";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"
+default-model = "fast"
+tool-call-cap = 100
+"#,
+        r#"
+[agents.coding]
+preamble = "code"
+
+[agents.review]
+preamble = "review"
+tool-call-cap = 300
+"#,
+    ));
+
+    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    assert_eq!(coding.tool_call_cap, 100);
+
+    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    assert_eq!(review.tool_call_cap, 300);
 
     unset_env(var);
 }

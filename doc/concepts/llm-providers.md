@@ -86,6 +86,7 @@ An agent ties a model to a system preamble and (optionally) a default container.
 container   = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
+tool-call-cap = 300
 
 [agents.review]
 model    = "smart"      # explicit override of default-model
@@ -101,6 +102,10 @@ under -- the place to encode role, scope, voice.
 `temperature` and `max-tokens` live on the agent because the same underlying model is often used
 with different sampling for different tasks (e.g. low temperature for code, higher for
 brainstorming).
+
+`tool-call-cap` also lives on the agent when a role needs longer tool loops. If unset, the agent
+uses the top-level `tool-call-cap`, then the compiled-in default of `50`. The cap is per user
+turn, so typing a follow-up prompt starts a fresh count while keeping conversation history.
 
 ### `default-model` at the top level
 

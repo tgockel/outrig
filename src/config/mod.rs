@@ -21,6 +21,9 @@ pub use validate::ConfigValidationError;
 
 use crate::error::Result;
 
+pub const DEFAULT_TOOL_CALL_CAP: u32 = 50;
+pub const MAX_TOOL_CALL_CAP: u32 = 2000;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -34,6 +37,8 @@ pub struct Config {
     pub session_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_cache_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_cap: Option<u32>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -140,6 +145,8 @@ pub struct Agent {
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_cap: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
