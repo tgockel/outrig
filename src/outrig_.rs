@@ -196,9 +196,14 @@ impl Outrig {
         let mut clients: BTreeMap<String, Arc<McpClient>> = BTreeMap::new();
         let mut tools: Vec<ToolHandle> = Vec::new();
         for (name, server_cfg) in &mcp {
-            let client =
-                McpClient::connect_via_podman_exec(&container, server_cfg, name, &spec.log_dir)
-                    .await?;
+            let client = McpClient::connect_via_podman_exec(
+                &container,
+                server_cfg,
+                name,
+                &spec.log_dir,
+                &BTreeMap::new(),
+            )
+            .await?;
             for t in client.list_tools().await? {
                 tools.push(ToolHandle {
                     server: name.clone(),

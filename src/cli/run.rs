@@ -16,16 +16,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use rig::completion::Message;
 
+use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
 use crate::config::{
-    Config, ContainerConfig, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
-    MIN_TOOL_RESULT_CAP_BYTES,
+    Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
 };
 use crate::container::Container;
-use crate::error::Result;
+use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::llm;
 use crate::mcp::McpClient;
@@ -56,6 +56,11 @@ pub struct RunArgs {
     /// Override the per-result truncation cap for this run.
     #[arg(long = "max-tool-result-bytes", value_name = "N", value_parser = parse_tool_result_cap)]
     pub max_tool_result_bytes: Option<u32>,
+
+    /// Add or override env vars for MCP servers. Repeatable.
+    /// `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one.
+    #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+    pub env: Vec<String>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
@@ -66,6 +71,9 @@ pub async fn execute(
     args: &RunArgs,
     verbose: u8,
 ) -> Result<i32> {
+    let cli_env =
+        CliEnvEntries::parse(&args.env).map_err(|e| OutrigError::Configuration(e.to_string()))?;
+
     let setup = session_setup::setup(SessionSetupArgs {
         repo_cfg_path,
         global_cfg_path,
@@ -97,12 +105,22 @@ pub async fn execute(
     } = setup;
     let cache_root = repo::model_cache_root(cfg.model_cache_root.as_deref());
 
+    // Validate per-server env entries against the resolved MCP map.
+    let mcp = session_setup::merged_mcp(&container, &container_cfg).await?;
+    for name in cli_env.per_server_names() {
+        if !mcp.contains_key(name) {
+            return Err(OutrigError::Configuration(format!(
+                "--env {name}:...: container '{}' has no MCP server '{name}'",
+                container_cfg_name
+            )));
+        }
+    }
+
     let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
     let outcome: Result<i32> = run_inner(
         &cfg,
         &agent_name,
         &container_cfg_name,
-        &container_cfg,
         &image_tag,
         &container,
         &log_dir,
@@ -111,6 +129,8 @@ pub async fn execute(
         &mut mcp_arcs,
         args.max_tool_calls,
         args.max_tool_result_bytes,
+        &mcp,
+        &cli_env,
     )
     .await;
 
@@ -124,7 +144,6 @@ async fn run_inner(
     cfg: &Config,
     agent_name: &str,
     container_cfg_name: &str,
-    container_cfg: &ContainerConfig,
     image_tag: &ImageTag,
     container: &Container,
     log_dir: &Path,
@@ -133,6 +152,8 @@ async fn run_inner(
     mcp_arcs: &mut Vec<Arc<McpClient>>,
     max_tool_calls: Option<u32>,
     max_tool_result_bytes: Option<u32>,
+    mcp: &std::collections::BTreeMap<String, crate::config::McpServerSpec>,
+    cli_env: &CliEnvEntries,
 ) -> Result<i32> {
     // `setup` already validated presence and used the resolved `.container`
     // for the container fallback. We re-resolve here for `build_agent` +
@@ -141,8 +162,7 @@ async fn run_inner(
     apply_tool_call_cap_override(&mut resolved, max_tool_calls);
     apply_tool_result_cap_override(&mut resolved, max_tool_result_bytes);
 
-    let mcp = session_setup::merged_mcp(container, container_cfg).await?;
-    let connected = session_setup::connect_mcp_clients(container, &mcp, log_dir).await?;
+    let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
     mcp_arcs.extend(connected);
 
     let mut all_tools: Vec<McpToolAdapter> = Vec::new();
@@ -429,5 +449,18 @@ mod tests {
         apply_tool_result_cap_override(&mut resolved, Some(65_536));
 
         assert_eq!(resolved.tool_result_cap_bytes, 65_536);
+    }
+
+    #[test]
+    fn env_flag_collects_multiple_values() {
+        let args = RunArgs::try_parse_from(["run", "--env", "FOO=bar", "--env", "BAZ=quux"])
+            .expect("arg parses");
+        assert_eq!(args.env, vec!["FOO=bar", "BAZ=quux"]);
+    }
+
+    #[test]
+    fn env_flag_absent_yields_empty_vec() {
+        let args = RunArgs::try_parse_from(["run"]).expect("arg parses");
+        assert!(args.env.is_empty());
     }
 }

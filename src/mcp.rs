@@ -22,7 +22,7 @@ use rmcp::service::{RoleClient, RunningService, serve_client};
 use serde_json::Value;
 use tokio::process::Child;
 
-use crate::config::McpServerSpec;
+use crate::config::{EnvValue, McpServerSpec};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 
@@ -57,6 +57,10 @@ impl McpClient {
     /// redirect its stderr to `<log_dir>/<name>.stderr`, and drive the MCP
     /// `initialize` handshake. Returns the live client on success.
     ///
+    /// `extra_env` carries `--env` CLI overlay entries already merged for this
+    /// specific server (global + per-server). They are layered on top of the
+    /// config-file env (overriding on key conflict) before resolution.
+    ///
     /// `log_dir` is created (and any missing parents) if it doesn't exist.
     /// The `name` is used both for the stderr filename and for diagnostic
     /// messages; callers should pass the server's local config name (e.g.
@@ -66,8 +70,13 @@ impl McpClient {
         server_cfg: &McpServerSpec,
         name: &str,
         log_dir: &Path,
+        extra_env: &BTreeMap<String, EnvValue>,
     ) -> Result<Self> {
-        let (command, env_spec) = server_cfg.normalize();
+        let (command, mut env_spec) = server_cfg.normalize();
+        // Merge CLI overlay on top of config-file env (last-wins).
+        for (key, value) in extra_env {
+            env_spec.insert(key.clone(), value.clone());
+        }
         let mut env: BTreeMap<String, String> = BTreeMap::new();
         for (key, value) in env_spec {
             let resolved = value

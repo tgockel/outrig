@@ -234,3 +234,25 @@ These are deliberately left for the task author who picks this up:
   which gains the same `--env` flag once it lands. (This task can ship
   for `outrig run` first and extend to `outrig mcp` in a follow-on if
   ordering matters.)
+
+## Decisions
+
+- **Per-server syntax**: Chose Option 1 from the task spec -- encode
+  the server name in the value as `SERVER:KEY=VALUE`. A single
+  `--env` flag handles both shapes; no clap pre-parsing or dynamic
+  long-name registration needed. The first colon in the key-side
+  splits `SERVER` from `KEY`.
+- **Merge site**: The overlay is merged in `McpClient::connect_via_podman_exec`
+  via a new `extra_env: &BTreeMap<String, EnvValue>` parameter. Entries
+  are inserted into the config-file `env_spec` map *before* the
+  resolve loop runs, so `${VAR}` references in CLI values resolve
+  identically to config-file references.
+- **Validation timing**: Per-server entries naming unknown MCP servers
+  are rejected after `merged_mcp` returns but before any `connect_`
+  call, in the orchestrator (`cli/run.rs` and `cli/mcp.rs`). This
+  gives a clear error before the container starts doing MCP work.
+- **`outrig mcp` support**: Shipped in the same commit; both `McpArgs`
+  and `RunArgs` carry the identical `--env` flag surface.
+- **`show-merged` not affected**: `outrig mcp show-merged` does not
+  apply `--env` entries (it shows the merged config table, not the
+  runtime state). `--env` applies only to the live serve/run path.

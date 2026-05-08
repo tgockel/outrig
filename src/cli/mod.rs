@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod discard;
+pub mod env_arg;
 pub mod logs;
 pub mod ls;
 pub mod mcp;

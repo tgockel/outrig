@@ -18,11 +18,12 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
 use crate::config::{ContainerConfig, McpServerSpec};
 use crate::container::Container;
@@ -46,6 +47,11 @@ pub struct McpArgs {
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", global = true, value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
+
+    /// Add or override env vars for MCP servers. Repeatable.
+    /// `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one.
+    #[arg(long = "env", global = true, value_name = "KEY=VALUE", action = ArgAction::Append)]
+    pub env: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -71,6 +77,9 @@ pub async fn execute(
     args: &McpArgs,
     verbose: u8,
 ) -> Result<i32> {
+    let cli_env =
+        CliEnvEntries::parse(&args.env).map_err(|e| OutrigError::Configuration(e.to_string()))?;
+
     let setup = session_setup::setup(SessionSetupArgs {
         repo_cfg_path,
         global_cfg_path,
@@ -85,12 +94,12 @@ pub async fn execute(
 
     match &args.cmd {
         Some(McpCommand::SelfDescription) => unreachable!("handled before repo context"),
-        None => serve(setup).await,
+        None => serve(setup, cli_env).await,
         Some(McpCommand::ShowMerged) => show_merged(setup).await,
     }
 }
 
-async fn serve(setup: SessionSetup) -> Result<i32> {
+async fn serve(setup: SessionSetup, cli_env: CliEnvEntries) -> Result<i32> {
     let SessionSetup {
         container_cfg_name,
         container_cfg,
@@ -104,15 +113,27 @@ async fn serve(setup: SessionSetup) -> Result<i32> {
         session_dir: _,
     } = setup;
 
+    // Validate per-server env entries against the resolved MCP map.
+    let mcp = session_setup::merged_mcp(&container, &container_cfg).await?;
+    for name in cli_env.per_server_names() {
+        if !mcp.contains_key(name) {
+            return Err(OutrigError::Configuration(format!(
+                "--env {name}:...: container '{}' has no MCP server '{name}'",
+                container_cfg_name
+            )));
+        }
+    }
+
     let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
     let outcome: Result<i32> = serve_inner(
         &container_cfg_name,
-        &container_cfg,
         &image_tag,
         &container,
         &log_dir,
         sid.as_str(),
         &mut mcp_arcs,
+        &mcp,
+        &cli_env,
     )
     .await;
 
@@ -144,15 +165,15 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
 #[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     container_cfg_name: &str,
-    container_cfg: &ContainerConfig,
     image_tag: &ImageTag,
     container: &Container,
     log_dir: &Path,
     session_id: &str,
     mcp_arcs: &mut Vec<Arc<McpClient>>,
+    mcp: &BTreeMap<String, McpServerSpec>,
+    cli_env: &CliEnvEntries,
 ) -> Result<i32> {
-    let mcp = session_setup::merged_mcp(container, container_cfg).await?;
-    let connected = session_setup::connect_mcp_clients(container, &mcp, log_dir).await?;
+    let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
     if connected.is_empty() {
         return Err(OutrigError::Configuration(
             "outrig mcp with no merged MCP entries has nothing to proxy".to_string(),

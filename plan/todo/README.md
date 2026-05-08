@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0050](0050-cli-env-flags.md)** `--env` flags on `outrig run` /
-  `outrig mcp`.
 - **[0051](0051-image-name-container.md)** `image-name` field on
   `[containers.<name>]` (skip `buildah build`).
 - **[0052](0052-cargo-doc-private-link-warnings.md)** `cargo doc

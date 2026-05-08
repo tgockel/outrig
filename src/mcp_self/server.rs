@@ -208,6 +208,7 @@ fn input_schema<T: JsonSchema>() -> Arc<JsonObject> {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_args<T: DeserializeOwned>(
     arguments: Option<JsonObject>,
 ) -> std::result::Result<T, CallToolResult> {

@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::cli::env_arg::CliEnvEntries;
 use crate::config::{Config, ContainerConfig, McpServerSpec};
 use crate::container::{Container, embedded};
 use crate::error::{OutrigError, Result};
@@ -318,17 +319,22 @@ pub async fn merged_mcp(
 }
 
 /// Spawn one [`McpClient`] per backing MCP declared in `mcp`, in key-sorted
-/// (`BTreeMap`) iteration order. Adapter construction is the caller's job
+/// (`BTreeMap`) iteration order. `cli_env` provides any `--env` overlay
+/// entries to merge per server. Adapter construction is the caller's job
 /// because only the REPL path consumes adapters.
 pub async fn connect_mcp_clients(
     container: &Container,
     mcp: &BTreeMap<String, McpServerSpec>,
     log_dir: &Path,
+    cli_env: &CliEnvEntries,
 ) -> Result<Vec<Arc<McpClient>>> {
     let mut arcs = Vec::with_capacity(mcp.len());
     for (mcp_name, spec) in mcp {
         let span = ProgressSpan::start(format!("MCP {mcp_name}: initializing"));
-        let client = McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir).await?;
+        let extra_env = cli_env.for_server(mcp_name);
+        let client =
+            McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir, &extra_env)
+                .await?;
         span.done(format!("MCP {mcp_name}: initialized"));
         arcs.push(Arc::new(client));
     }

@@ -99,6 +99,7 @@ Start an interactive agent session.
 outrig run [--agent <name>]
            [--container <name>]
            [--config <path>]
+           [--env <KEY=VALUE>]
            [--global-config <path>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
@@ -110,6 +111,11 @@ outrig run [--agent <name>]
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
 - `--container <name>` (default: from agent or `default-container`): container-config to
   launch.
+- `--env <KEY=VALUE>` (repeatable): add or override env vars for MCP servers. `KEY=VALUE`
+  applies to every server; `SERVER:KEY=VALUE` targets a single server by name. Values support
+  the `${VAR}` host-env-reference syntax described in
+  [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax). Within a scope, last wins
+  on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): per-turn tool-call
   cap.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
@@ -134,6 +140,7 @@ Serve the selected container-config's backing MCP servers as one MCP server over
 
 ```
 outrig mcp [--container <name>]
+           [--env <KEY=VALUE>]
            [--session-dir <path>]
            [--config <path>]
            [--global-config <path>]
@@ -150,11 +157,12 @@ outrig mcp show-merged [--container <name>]
 outrig mcp self
 ```
 
-| Flag                   | Default                       | Description                         |
-|------------------------|-------------------------------|-------------------------------------|
-| `--container <name>`   | `default-container`           | Container-config to launch.         |
-| `--session-dir <path>` | `<session-root>/<sid>` (auto) | Specific directory for this server. |
-| `-v`, `--verbose`      | off                           | Print container lifecycle traces.   |
+| Flag                   | Default                      | Description                           |
+|------------------------|------------------------------|---------------------------------------|
+| `--container <name>`   | `default-container`          | Container-config to launch.           |
+| `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
+| `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
+| `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
 
 There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does not let
 `agent.container` participate in container selection, and does not read provider API keys.
