@@ -1,0 +1,6 @@
+[containers.c]
+dockerfile = "Dockerfile"
+context = "."
+
+[containers.c.mcp]
+"bad.name" = ["mcp"]

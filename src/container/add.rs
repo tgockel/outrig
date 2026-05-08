@@ -133,21 +133,24 @@ pub(crate) const NAME_FIELD: Field = Field {
 
 const BASES: &[(&str, &str)] = &[
     (
-        "debian:bookworm-slim",
-        "Debian 12 slim. Apt-based; small but full-featured.",
+        BaseImage::DebianBookwormSlim.as_str(),
+        BaseImage::DebianBookwormSlim.description(),
     ),
     (
-        "ubuntu:24.04",
-        "Ubuntu 24.04 LTS. Apt-based; superset of Debian.",
-    ),
-    ("alpine:latest", "Alpine. Apk + musl; smallest footprint."),
-    (
-        "node:20-bookworm-slim",
-        "Debian-slim with Node 20 LTS preinstalled.",
+        BaseImage::Ubuntu24_04.as_str(),
+        BaseImage::Ubuntu24_04.description(),
     ),
     (
-        "python:3.12-slim",
-        "Debian-slim with CPython 3.12 + pip preinstalled.",
+        BaseImage::AlpineLatest.as_str(),
+        BaseImage::AlpineLatest.description(),
+    ),
+    (
+        BaseImage::Node20BookwormSlim.as_str(),
+        BaseImage::Node20BookwormSlim.description(),
+    ),
+    (
+        BaseImage::Python3_12Slim.as_str(),
+        BaseImage::Python3_12Slim.description(),
     ),
 ];
 
@@ -179,11 +182,8 @@ const TOOLCHAIN_FIELD: Field = Field {
 };
 
 const MCPS: &[(&str, &str)] = &[
-    (
-        "fs",
-        "Filesystem MCP server (npm @modelcontextprotocol/server-filesystem).",
-    ),
-    ("git", "Git MCP server (PyPI mcp-server-git)."),
+    (McpServer::Fs.as_str(), McpServer::Fs.description()),
+    (McpServer::Git.as_str(), McpServer::Git.description()),
 ];
 
 const MCP_FIELD: Field = Field {

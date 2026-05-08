@@ -92,6 +92,8 @@ pub mod init;
 #[cfg(feature = "internal")]
 pub mod llm;
 #[cfg(feature = "internal")]
+pub mod mcp_self;
+#[cfg(feature = "internal")]
 pub mod repl;
 #[cfg(feature = "internal")]
 pub mod rig_tool;

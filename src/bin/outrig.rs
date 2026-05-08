@@ -8,6 +8,7 @@ use outrig::cli::discard::{self, DiscardArgs};
 use outrig::cli::logs::{self, LogsArgs};
 use outrig::cli::ls::{self, LsArgs};
 use outrig::cli::mcp::{self, McpArgs};
+use outrig::cli::mcp_self;
 use outrig::cli::run::{self, RunArgs};
 use outrig::config;
 use outrig::error::Result;
@@ -132,6 +133,12 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             ))
         }
         Cmd::Mcp(args) => {
+            if args.is_self_description() {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                return runtime.block_on(mcp_self::execute(args));
+            }
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
             runtime.block_on(mcp::execute(
                 &repo_config,

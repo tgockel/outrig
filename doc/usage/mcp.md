@@ -20,6 +20,8 @@ outrig mcp [--container <name>]
            [--verbose]
 
 outrig mcp show-merged [--container <name>]
+
+outrig mcp self
 ```
 
 - `--container <name>` (default: `default-container`): selects a
@@ -30,6 +32,11 @@ outrig mcp show-merged [--container <name>]
 - `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
+
+`outrig mcp self` is different from the session MCP server. It does not resolve a repo config,
+start a container, or create a session. It serves OutRig's own docs, schema, preset suggestions,
+and advisory validators so an external AI tool can design a container-config. See
+[AI-assisted design](ai-assisted-design.md).
 
 There is no `--agent` flag. `outrig mcp` has no agent, so it never consults
 `default-agent`, `agent.container`, `[agents]`, `[models]`, `[providers]`, or provider

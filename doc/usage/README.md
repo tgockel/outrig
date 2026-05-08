@@ -9,6 +9,8 @@ like in practice, what comes back when something goes wrong.
   `config init` (writes the global `~/.outrig/config.toml`).
 - **[outrig container](container.md)** -- group of commands for container-configs. v0:
   `container add` (scaffolds a Dockerfile under `.agents/outrig/containers/<name>/`).
+- **[AI-assisted design](ai-assisted-design.md)** -- use `outrig mcp self` when the
+  built-in container templates do not fit.
 - **[outrig run](run.md)** -- start an interactive agent session. The main subcommand.
 - **[outrig mcp](mcp.md)** -- expose a container-config's MCP tools to an external client.
 - **[outrig build](build.md)** -- pre-warm the image cache so the next `outrig run` is instant.

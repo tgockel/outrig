@@ -16,7 +16,5 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
   --no-deps` private-link warnings cleanup.
 - **[0054](0054-outrig-mcp-attach.md)** `outrig mcp --attach` to an
   existing container.
-- **[0055](0055-outrig-mcp-self.md)** `outrig mcp self` --
-  self-description MCP server.
 - **[0056](0056-outrig-design-prompt.md)** `outrig design prompt` --
   one-shot prompt printer.

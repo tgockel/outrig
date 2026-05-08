@@ -152,5 +152,9 @@ post-install, fork-heavy shells), so the v0 floor is the default podman cap set 
   scaffold a new container-config.
 - [MCP Servers](mcp-servers.md) -- declaring and invoking the tools that run inside the
   container.
+- [MCP Trust Model](mcp-trust-model.md) -- why MCP tools can be configured liberally inside the
+  container boundary.
+- [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` when the
+  templates do not fit.
 - [Workspace](workspace.md) -- what the container sees of your repo.
 - [Reference -> Config](../reference/config.md) -- every supported `[containers.<name>]` key.

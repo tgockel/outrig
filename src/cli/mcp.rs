@@ -50,8 +50,17 @@ pub struct McpArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum McpCommand {
+    /// Serve OutRig's self-description tools over stdio.
+    #[command(name = "self")]
+    SelfDescription,
     /// Print the image/config merged MCP table and exit.
     ShowMerged,
+}
+
+impl McpArgs {
+    pub fn is_self_description(&self) -> bool {
+        matches!(self.cmd, Some(McpCommand::SelfDescription))
+    }
 }
 
 /// Run one `outrig mcp` invocation end-to-end. Returns the process exit code.
@@ -75,6 +84,7 @@ pub async fn execute(
     .await?;
 
     match &args.cmd {
+        Some(McpCommand::SelfDescription) => unreachable!("handled before repo context"),
         None => serve(setup).await,
         Some(McpCommand::ShowMerged) => show_merged(setup).await,
     }

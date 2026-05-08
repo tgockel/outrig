@@ -113,6 +113,14 @@ editing the `[containers.<name>.mcp]` block directly -- see
 > **TODO: Incomplete** -- the catalogue of "known MCP servers" will grow as the ecosystem does.
 > Anything not listed here you install in the Dockerfile by hand.
 
+### When templates do not fit
+
+The prompt flow is intentionally small. If you need a container with a database, internal SDK,
+unlisted MCP server, or other custom package set, use
+[`outrig mcp self`](ai-assisted-design.md). It gives an MCP-capable AI tool the OutRig docs,
+config schema, curated suggestions, and advisory validators so it can propose a Dockerfile and
+matching `[containers.<name>]` block without being limited to the built-in template menu.
+
 ### What gets written
 
 `.agents/outrig/containers/hello-outrig-standard/Dockerfile` (excerpt):
@@ -179,4 +187,6 @@ place (preserving surrounding TOML).
   container-configs.
 - [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- the MCP servers `container add`
   scaffolds.
+- [AI-assisted design](ai-assisted-design.md) -- design a custom container-config with
+  `outrig mcp self`.
 - [Reference -> Config](../reference/config.md) -- the `[containers.<name>]` schema.

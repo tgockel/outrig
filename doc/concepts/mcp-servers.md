@@ -151,6 +151,10 @@ Two practical guidelines:
 ## See also
 
 - [Containers](containers.md) -- the Dockerfile that has to install the server binaries.
+- [MCP Trust Model](mcp-trust-model.md) -- the container boundary that makes broad MCP tools
+  practical.
+- [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` to design custom
+  MCP-enabled container-configs.
 - [Sessions](../usage/sessions.md) -- `outrig logs <session> <server>` for stderr.
 - [Reference -> Config](../reference/config.md) -- full schema for the `[containers.<name>.mcp]`
   block.

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::ApiKeyRef;
@@ -172,7 +173,7 @@ impl Default for Workspace {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ContainerConfig {
     pub dockerfile: PathBuf,
@@ -183,7 +184,7 @@ pub struct ContainerConfig {
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum McpServerSpec {
     Short(Vec<String>),

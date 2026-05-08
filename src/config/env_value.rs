@@ -8,6 +8,9 @@
 
 use std::env::VarError;
 
+use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::{InstanceType, Schema, SchemaObject};
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
@@ -70,5 +73,23 @@ impl<'de> Deserialize<'de> for EnvValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         Ok(Self::from_raw(raw))
+    }
+}
+
+impl JsonSchema for EnvValue {
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn schema_name() -> String {
+        "EnvValue".to_string()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            ..Default::default()
+        }
+        .into()
     }
 }

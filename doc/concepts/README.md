@@ -9,6 +9,8 @@ where they're spelled out.
   and the UID/GID convention that keeps file ownership sane.
 - **[MCP Servers](mcp-servers.md)** -- how outrig discovers and routes tool calls, the
   `<server>__<tool>` name prefix, lifecycle and crash behavior, stderr capture.
+- **[MCP Trust Model](mcp-trust-model.md)** -- why the container is the MCP trust boundary and
+  why tools can be configured liberally inside it.
 - **[Workspace](workspace.md)** -- what the agent can reach on your filesystem, the direct
   bind-mount model, why outrig doesn't stage changes, how to review with git.
 - **[Providers, Models, and Agents](llm-providers.md)** -- the three-layer LLM config:

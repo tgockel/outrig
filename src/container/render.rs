@@ -37,13 +37,23 @@ impl BaseImage {
         Self::Python3_12Slim,
     ];
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::DebianBookwormSlim => "debian:bookworm-slim",
             Self::Ubuntu24_04 => "ubuntu:24.04",
             Self::AlpineLatest => "alpine:latest",
             Self::Node20BookwormSlim => "node:20-bookworm-slim",
             Self::Python3_12Slim => "python:3.12-slim",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::DebianBookwormSlim => "Debian 12 slim. Apt-based; small but full-featured.",
+            Self::Ubuntu24_04 => "Ubuntu 24.04 LTS. Apt-based; superset of Debian.",
+            Self::AlpineLatest => "Alpine. Apk + musl; smallest footprint.",
+            Self::Node20BookwormSlim => "Debian-slim with Node 20 LTS preinstalled.",
+            Self::Python3_12Slim => "Debian-slim with CPython 3.12 + pip preinstalled.",
         }
     }
 
@@ -106,10 +116,17 @@ impl McpServer {
     /// Canonical render order matches prompt order.
     pub const ALL: &'static [McpServer] = &[Self::Fs, Self::Git];
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Fs => "fs",
             Self::Git => "git",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Fs => "Filesystem MCP server (npm @modelcontextprotocol/server-filesystem).",
+            Self::Git => "Git MCP server (PyPI mcp-server-git).",
         }
     }
 
@@ -137,7 +154,7 @@ impl McpServer {
 
     /// The bare `<package-manager> install ...` line for this server. The
     /// caller is responsible for ensuring the package manager is available.
-    fn install_cmd(self) -> &'static str {
+    pub(crate) fn install_cmd(self) -> &'static str {
         match self {
             Self::Fs => "npm install -g @modelcontextprotocol/server-filesystem",
             // `--break-system-packages` lets pip write into the system

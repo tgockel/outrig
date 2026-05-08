@@ -145,6 +145,8 @@ outrig mcp show-merged [--container <name>]
                        [--global-config <path>]
                        [--session-root <path>]
                        [--verbose]
+
+outrig mcp self
 ```
 
 | Flag                   | Default                       | Description                         |
@@ -165,6 +167,10 @@ on stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
 `outrig mcp show-merged` uses the same container selection and setup path, but exits after
 printing the effective `[mcp]` table to stdout. It is for debugging embedded image config and
 repo-local overrides, not for serving MCP JSON-RPC.
+
+`outrig mcp self` serves host-side self-description tools over stdio. It does not start a
+container or require a repo config. Use it from an external MCP-capable AI tool when the built-in
+container templates do not fit.
 
 | Trigger or failure                               | Exit |
 |--------------------------------------------------|------|

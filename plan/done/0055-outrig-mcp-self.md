@@ -107,14 +107,13 @@ required; `outrig container add` keeps using its inline match arms.
 
 | Tool                  | Purpose                                                                            |
 |-----------------------|------------------------------------------------------------------------------------|
-| `validate_dockerfile` | Apply the conventions check (`CMD ["sleep", "infinity"]`, no `USER`, presence of a package providing `useradd`/`groupadd`, MCP server binaries installed for any servers the paired config references). Return structured warnings/errors. |
+| `validate_dockerfile` | Apply advisory convention checks (`CMD ["sleep", "infinity"]`, no `USER`, presence of a package providing `useradd`/`groupadd`). Return structured warnings. |
 | `validate_config`     | Parse a TOML fragment as a `[containers.<name>]` block; return parse errors and schema violations from the existing config loader. |
 
 Kept as separate tools so the agent can validate incrementally (it'll
 often have a config block ready before the Dockerfile, or vice versa).
-A future `validate_pair` helper that calls both and additionally
-cross-checks "every MCP server named in the config has its binary
-installed in the Dockerfile" is a natural follow-up; not v0.
+No paired Dockerfile/config validator is planned for v0 because MCP
+binary-install inference is too prone to false positives.
 
 ### Out of scope (deliberately)
 
@@ -178,19 +177,20 @@ checker:
 
 - Parse line-by-line. Detect `CMD` / `ENTRYPOINT`, check the final
   `CMD` is `["sleep", "infinity"]`.
-- Reject any `USER` directive.
+- Warn on any `USER` directive. OutRig bootstraps and runs as the host
+  UID/GID, so image users are not respected.
 - Detect the base image (`FROM`); for known-Debian / known-Alpine
-  bases, require the install line for the package providing
+  bases, warn if there is no install line for the package providing
   `useradd`/`groupadd` (`passwd` on Debian, `shadow` on Alpine).
-  Unknown bases get a softer "couldn't infer base; ensure useradd /
-  groupadd are present" warning rather than an error.
-- If a config TOML is supplied alongside (optional second arg), check
-  that every server name in `[containers.*.mcp]` has *some* install
-  line in the Dockerfile that mentions a plausible binary name. This
-  is a heuristic, not a proof; flagged as a warning.
+  Unknown bases do not warn -- the tool should not pretend to know
+  every image family.
+- Do not inspect paired config or try to prove MCP server binaries are
+  installed. That check is too likely to produce false positives and
+  reintroduce the rigid template gate this feature is meant to avoid.
 
-The output shape is structured (`{ errors: [...], warnings: [...] }`)
-rather than free text, so the agent can branch on severity.
+The output shape is structured (`{ warnings: [...] }`) rather than free
+text, so the agent can show the user actionable notes without blocking
+creative Dockerfiles.
 
 ### MCP server registration
 
@@ -289,9 +289,9 @@ This task owns the `outrig mcp self` half:
   page set including `concepts/mcp-trust-model`;
   `get_config_schema` returns valid JSON Schema with the `paths`
   block; `list_base_images` and `list_mcp_presets` responses include
-  the suggestions-only disclaimer; `validate_dockerfile` flags the
-  expected errors on a deliberately broken fixture; `validate_config`
-  does the same.
+  the suggestions-only disclaimer; `validate_dockerfile` returns
+  advisory warnings on deliberately imperfect fixtures;
+  `validate_config` reports expected parse/schema errors.
 - A small fixture set under `tests/fixtures/self/` -- one good
   Dockerfile + config pair, one Dockerfile missing
   `CMD sleep infinity`, one with a `USER` directive, one config with
@@ -308,7 +308,7 @@ This task owns the `outrig mcp self` half:
   explicit suggestions-only disclaimer field.
 - `list_docs` includes `concepts/mcp-trust-model`; `get_doc` returns
   its content.
-- Manual integration: `claude mcp add outrig-self outrig mcp self`,
+- Manual integration: `claude mcp add outrig-self -- outrig mcp self`,
   prompt "design me a container for a Rust + Postgres dev environment
   with the fs MCP server pointed at /workspace and a custom MCP
   server that runs `pg-dump-mcp`". The agent calls `list_docs`,
@@ -321,7 +321,7 @@ This task owns the `outrig mcp self` half:
 - `outrig container add` (the existing wizard) is unchanged in
   behavior; its tests still pass.
 
-## Sub-decisions
+## Decisions
 
 - **Subcommand naming.** `outrig mcp self` chosen as a peer of
   `outrig mcp run`. Alternative `outrig design` (top-level) was
@@ -333,9 +333,9 @@ This task owns the `outrig mcp self` half:
   disclaimer in the response itself ensures it's visible at use time.
 - **`try_build`** -- punted from v0. Useful but expensive; gate behind
   a future `--max-build-attempts=N` flag if it ships.
-- **`validate_pair`** combining the two validators with cross-checks
-  -- natural follow-up; not v0. Keep validators separate first; add
-  the combiner once the cross-check rules settle.
+- **Paired validation** -- not v0. MCP binary-install inference is too
+  likely to false-positive, so `validate_dockerfile` and
+  `validate_config` remain separate.
 - **Doc bundle freshness.** `include_str!` from the in-tree `.md`
   files is the floor. Deferred: a build-script step that injects the
   version string and the build SHA into the bundle so the agent can
@@ -348,6 +348,11 @@ This task owns the `outrig mcp self` half:
   the obvious extension point (agents, providers, MCP-server
   authoring). v0 scopes to containers; the topic flag isn't
   introduced yet to avoid shipping a degenerate single-value enum.
+- **Dockerfile validation is advisory.** `USER`, non-forever `CMD`,
+  and missing known-base user-bootstrap packages are warnings only.
+  Unknown base images are silent, and MCP command-binary inference is
+  not implemented because the false-positive risk would make the
+  server too rigid.
 
 ## Dependencies
 

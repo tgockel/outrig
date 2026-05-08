@@ -1,0 +1,6 @@
+[containers.c]
+dockerfile = ".agents/outrig/containers/c/Dockerfile"
+context = ".agents/outrig/containers/c"
+
+[containers.c.mcp]
+fs = { command = ["mcp-server-filesystem", "/workspace"] }
