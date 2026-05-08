@@ -2,6 +2,11 @@
 name = "outrig"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "Run LLM agents with podman-isolated MCP servers"
+documentation = "https://tgockel.github.io/outrig/"
+homepage = "https://tgockel.github.io/outrig/"
+repository = "https://github.com/tgockel/outrig"
 
 [features]
 default   = ["internal"]

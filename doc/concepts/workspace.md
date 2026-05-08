@@ -1,8 +1,8 @@
 # Workspace
 
-The workspace is what the agent gets to read and write. By default it's your repository, mounted
-live into the container at `/workspace`. Read this page before you run outrig on anything you
-can't easily roll back.
+The workspace is what the agent's tools get to read and write. By default it's your repository,
+mounted live into the container at `/workspace`. Read this page before you run outrig on anything
+you can't easily roll back.
 
 ## Direct bind-mount, no staging
 
@@ -12,7 +12,7 @@ outrig mounts the host workspace directly:
 podman run -v <repo>:/workspace:rw --userns=keep-id ...
 ```
 
-That means **changes the agent makes inside the container appear on your host filesystem
+That means **changes made by tools inside the container appear on your host filesystem
 immediately**. There is no staging directory, no overlay, no per-session shadow copy. If the agent
 runs `rm -rf /workspace/*`, your repo is gone -- recoverable only via git or whatever backup you
 have.

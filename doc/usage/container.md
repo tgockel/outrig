@@ -1,7 +1,7 @@
 # `outrig container`
 
 `outrig container` groups commands that manage container-configs (the named Dockerfile +
-MCP-server bundles agents run inside). In v0 only `outrig container add` is implemented;
+MCP-server bundles that host the agent's tools). In v0 only `outrig container add` is implemented;
 the rest of the group (`container ls`, `container rm`) is reserved for later.
 
 ## `outrig container add`

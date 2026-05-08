@@ -32,3 +32,13 @@ None. Can run any time.
 
 - Tracked here because task 0034 dropped the README's "implementation in progress"
   disclaimer but explicitly left the License `Incomplete` row alone.
+
+## Decisions
+
+- Use Apache-2.0 as OutRig's license.
+- Keep the root `LICENSE` file to the plain Apache License 2.0 text, without an added
+  project-specific copyright holder line.
+- Add the missing Cargo package metadata that `cargo publish --dry-run` warns about:
+  description, documentation, homepage, and repository.
+- Correct existing public summary text and the default preamble to say that MCP servers and tools,
+  not the LLM agent loop, run inside the container.

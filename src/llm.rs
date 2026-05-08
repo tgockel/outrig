@@ -28,7 +28,7 @@ pub use registry::LlmRegistry;
 /// Default preamble used when an agent leaves the field unset. Deliberately
 /// generic; agents that need anything specific spell it out themselves.
 const DEFAULT_PREAMBLE: &str =
-    "You are a careful assistant operating inside a sandboxed container.";
+    "You are a careful assistant whose tools run inside a sandboxed container.";
 
 /// Failures that surface while walking `agents -> models -> providers` or
 /// constructing the Rig client. Wrapped into [`crate::error::OutrigError`]

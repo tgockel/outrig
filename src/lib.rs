@@ -1,4 +1,4 @@
-//! outrig: run LLM agents inside podman-managed containers.
+//! outrig: run LLM agents with podman-isolated MCP servers.
 //!
 //! With default features (`internal` on), every subsystem is `pub` so the
 //! `outrig` binary, the integration tests, and any in-tree consumer can

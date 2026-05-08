@@ -6,10 +6,6 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase I -- post-acceptance v0 polish
-
-- **[0046](0046-pick-a-license.md)** Pick a license + ship `LICENSE`.
-
 ## Phase J -- post-v0 features and fixes
 
 - **[0047](0047-env-value-for-build-args.md)** `${VAR}` substitution for

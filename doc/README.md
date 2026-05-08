@@ -1,8 +1,8 @@
 # Introduction
 
-`outrig` is a command-line tool for running LLM agents against your repository, where every tool
-the agent invokes runs inside a [podman](https://podman.io)-managed container that you describe
-with a `Dockerfile`. You stay in control of the environment the agent gets to play in: which
+`outrig` is a command-line tool for running LLM agents against your repository with MCP tools
+isolated inside a [podman](https://podman.io)-managed container that you describe with a
+`Dockerfile`. You stay in control of the environment those tools run in: which
 language toolchains are available, which MCP servers are wired up, what the agent's view of the
 filesystem looks like.
 
@@ -16,8 +16,9 @@ human-approval prompt. That works, but it defeats the point of letting the agent
 prompt is a context switch back to the human.
 
 outrig takes a different trade. Instead of approving each call, you set up a sandbox once: a
-Dockerfile, a config file, a network policy. The agent then operates autonomously inside that
-sandbox. The blast radius of a wrong tool call is bounded by the container.
+Dockerfile, a config file, a network policy. The agent loop stays in the host outrig process, but
+the tool calls it can make go through MCP servers inside that sandbox. The blast radius of a wrong
+tool call is bounded by the container.
 
 ## How it fits together
 

@@ -154,8 +154,12 @@ git log --format=fuller -5
 ```
 
 Match the repo's house style: a conventional subject plus wrapped body
-paragraphs with concrete behavior, design, compatibility, and verification
-notes. Avoid vague filler and one-line marketing summaries.
+paragraphs with concrete behavior, design, and compatibility notes. Avoid
+vague filler and one-line marketing summaries.
+
+Mention verification only when it records non-obvious evidence or a
+compatibility constraint that future readers may need. Do not include routine
+command checklists or test-pass boilerplate.
 
 **Keep line width under 72 characters** in the commit message body. This is a
 soft rule you can exceed when necessary for readability, but count the actual

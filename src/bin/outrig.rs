@@ -18,7 +18,7 @@ use outrig::repo;
 #[command(
     name = "outrig",
     version,
-    about = "Run LLM agents inside podman-managed containers."
+    about = "Run LLM agents with podman-isolated MCP servers."
 )]
 struct Cli {
     /// Path to the repo `config.toml`. Defaults to walking up from cwd.
