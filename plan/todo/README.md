@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase I -- post-acceptance v0 polish
 
-- **[0045](0045-bound-stderr-capture.md)** Bound stderr capture in `run_capture`.
 - **[0046](0046-pick-a-license.md)** Pick a license + ship `LICENSE`.
 
 ## Phase J -- post-v0 features and fixes

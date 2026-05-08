@@ -24,9 +24,8 @@ is robustness rather than fixing observed pain.
   4. Join both reader tasks.
   5. On failure, materialize the ring into a `String` with the same
      `... (truncated) ...` marker semantics as `tail_string` today. On
-     success, return an `Output`-shaped result (we already do this; the
-     stderr field on success can stay full, since it travels nowhere --
-     callers don't read it).
+     success, return an `Output`-shaped result. The stderr field carries the
+     same bounded tail so stderr intake stays capped on every exit path.
 - The ring buffer can be a `VecDeque<u8>` with an explicit byte cap, or a
   fixed `[u8; N]` with a wrap pointer. `VecDeque` is simpler; the `[u8; N]`
   form avoids any heap allocs on the hot path. Pick whichever reads
@@ -42,7 +41,7 @@ is robustness rather than fixing observed pain.
   through tracing with no buffering.
 - `tests/process.rs` -- add a test that pipes ~10 MB of stderr and asserts
   peak memory stays bounded. Use a heuristic length-of-buffer assertion (the
-  *observed* tail is still ~2 KiB; that's what's testable). A
+  *observed* tail is still capped at 1 MiB; that's what's testable). A
   `/proc/self/status:VmHWM` check is overkill.
 
 ### Files
@@ -55,7 +54,7 @@ is robustness rather than fixing observed pain.
 ## Acceptance
 
 - A child writing >10 MB of stderr produces an error whose `stderr_tail` is
-  still ~2 KiB and starts with the truncation marker, with no measurable
+  still at most 1 MiB and starts with the truncation marker, with no measurable
   memory hump on the host process.
 - Existing five tests in `tests/process.rs` still pass unchanged.
 - `cargo test process` passes.
@@ -65,13 +64,25 @@ is robustness rather than fixing observed pain.
 
 None.
 
+## Decisions
+
+- `run_capture` now keeps only the bounded stderr tail even when the child
+  exits successfully. Current callers inspect stdout on success, and retaining
+  full success-path stderr would violate the goal that stderr intake stays
+  capped regardless of how much the child writes.
+- `try_capture` and `run_capture_logged` keep their existing full-output
+  behavior; this task is scoped to `run_capture` and its structured process
+  error surface.
+- The stderr tail limit is now 1 MiB instead of the original 2 KiB. Buildah
+  and podman failures can need more than a few final lines of context, and
+  1 MiB remains a small, explicit bound for process-error diagnostics.
+
 ## Notes
 
-- v0 accepted the unbounded behavior. The contract -- "the error contains
-  the last ~2 KiB of stderr" -- is honest about the *output*; it just
-  doesn't cap *intake*. Real callers are buildah and podman, neither of
-  which routinely emit hundreds of MB, so the v0 stance was "no observed
-  pain yet."
+- v0 accepted the unbounded behavior. The old contract -- "the error contains
+  the last ~2 KiB of stderr" -- was honest about the *output*; it just
+  didn't cap *intake*. Real callers are buildah and podman, neither of which
+  routinely emit hundreds of MB, so the v0 stance was "no observed pain yet."
 - Keep the change scoped: don't expand the `Cmd` API or the `Process` error
   variant. This is a behind-the-back robustness improvement.
 - Single self-contained task. No dependencies beyond 0006 (which is `done/`).

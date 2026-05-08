@@ -101,10 +101,13 @@ async fn logged_capture_tees_command_and_output_to_transcript() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn run_capture_truncates_long_stderr_with_marker() {
-    // Emit 5000 lines to stderr; each line is short, total exceeds 2 KiB.
+    // Emit enough stderr to exceed the process tail limit.
     let cmd = Cmd::new("/bin/sh").args([
         "-c",
-        "for i in $(seq 1 5000); do echo line-$i 1>&2; done; exit 1",
+        "printf 'line-1\\n' 1>&2; \
+         dd if=/dev/zero bs=1024 count=1025 1>&2 2>/dev/null; \
+         printf 'line-5000\\n' 1>&2; \
+         exit 1",
     ]);
     let err = process::run_capture(cmd)
         .await
@@ -125,6 +128,60 @@ async fn run_capture_truncates_long_stderr_with_marker() {
         stderr_tail.contains("line-5000"),
         "latest line must be retained, got: {stderr_tail}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_capture_keeps_large_stderr_tail_bounded() {
+    let marker = "... (truncated) ...\n";
+    let cmd = Cmd::new("/bin/sh").args([
+        "-c",
+        "dd if=/dev/zero bs=1024 count=10240 1>&2 2>/dev/null; \
+         printf 'the-end\\n' 1>&2; \
+         exit 1",
+    ]);
+    let err = process::run_capture(cmd)
+        .await
+        .expect_err("non-zero exit must fail");
+    let OutrigError::Process { stderr_tail, .. } = &err else {
+        panic!("expected OutrigError::Process, got: {err:?}");
+    };
+
+    assert!(
+        stderr_tail.starts_with(marker),
+        "tail must announce truncation, got start: {:?}",
+        &stderr_tail[..stderr_tail.len().min(40)]
+    );
+    assert!(
+        stderr_tail.len() <= marker.len() + 1024 * 1024,
+        "tail should stay bounded near 1 MiB, got {} bytes",
+        stderr_tail.len()
+    );
+    assert!(
+        stderr_tail.contains("the-end"),
+        "latest stderr must be retained, got tail length {}",
+        stderr_tail.len()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_capture_does_not_mark_exact_limit_stderr_truncated() {
+    let marker = "... (truncated) ...\n";
+    let cmd = Cmd::new("/bin/sh").args([
+        "-c",
+        "dd if=/dev/zero bs=1024 count=1024 1>&2 2>/dev/null; exit 1",
+    ]);
+    let err = process::run_capture(cmd)
+        .await
+        .expect_err("non-zero exit must fail");
+    let OutrigError::Process { stderr_tail, .. } = &err else {
+        panic!("expected OutrigError::Process, got: {err:?}");
+    };
+
+    assert!(
+        !stderr_tail.starts_with(marker),
+        "exact-limit stderr should not be marked truncated"
+    );
+    assert_eq!(stderr_tail.len(), 1024 * 1024);
 }
 
 #[test]

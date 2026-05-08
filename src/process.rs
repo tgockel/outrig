@@ -3,20 +3,22 @@
 //! streamed output. Knows nothing about buildah or podman -- callers pass the
 //! program name in.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::Arc;
 
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::error::{OutrigError, Result};
 
-const STDERR_TAIL_LIMIT: usize = 2 * 1024;
+const STDERR_TAIL_LIMIT: usize = 1024 * 1024;
 const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
+const STREAM_READ_CHUNK: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Cmd {
@@ -170,15 +172,40 @@ pub async fn try_capture_logged(
 /// the program, argv, exit code, and the last `STDERR_TAIL_LIMIT` bytes of
 /// stderr (lossy UTF-8, prefixed with a truncation marker if elision occurred).
 pub async fn run_capture(cmd: Cmd) -> Result<Output> {
-    let output = try_capture(cmd.clone()).await?;
-    if output.status.success() {
-        Ok(output)
+    let mut child = cmd
+        .to_tokio_command()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout was configured as piped above");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr was configured as piped above");
+
+    let stdout_task = tokio::spawn(capture_all(stdout));
+    let stderr_task = tokio::spawn(capture_stderr_tail(stderr));
+
+    let status = child.wait().await?;
+    let stdout = stdout_task.await.expect("stdout capture task panicked")?;
+    let stderr_tail = stderr_task.await.expect("stderr capture task panicked")?;
+
+    if status.success() {
+        Ok(Output {
+            status,
+            stdout,
+            stderr: stderr_tail.into_bytes(),
+        })
     } else {
         Err(OutrigError::Process {
             program: cmd.program,
             argv: cmd.args,
-            exit_code: output.status.code(),
-            stderr_tail: tail_string(&output.stderr, STDERR_TAIL_LIMIT),
+            exit_code: status.code(),
+            stderr_tail: stderr_tail.into_tail_string(),
         })
     }
 }
@@ -255,6 +282,82 @@ fn tail_string(bytes: &[u8], limit: usize) -> String {
         out.push_str(TRUNCATED_MARKER);
         out.push_str(&String::from_utf8_lossy(&bytes[start..]));
         out
+    }
+}
+
+async fn capture_all<R>(stream: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut captured = Vec::new();
+    reader.read_to_end(&mut captured).await?;
+    Ok(captured)
+}
+
+async fn capture_stderr_tail<R>(stream: R) -> std::io::Result<BoundedStderrTail>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut captured = BoundedStderrTail::new();
+    let mut chunk = [0_u8; STREAM_READ_CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        captured.push(&chunk[..n]);
+    }
+    Ok(captured)
+}
+
+#[derive(Debug)]
+struct BoundedStderrTail {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
+
+impl BoundedStderrTail {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(STDERR_TAIL_LIMIT),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.len() > STDERR_TAIL_LIMIT {
+            self.bytes.clear();
+            self.bytes
+                .extend(chunk[chunk.len() - STDERR_TAIL_LIMIT..].iter().copied());
+            self.truncated = true;
+            return;
+        }
+
+        let overflow = self.bytes.len() + chunk.len();
+        if overflow > STDERR_TAIL_LIMIT {
+            self.bytes.drain(..overflow - STDERR_TAIL_LIMIT);
+            self.truncated = true;
+        }
+        self.bytes.extend(chunk.iter().copied());
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes.into_iter().collect()
+    }
+
+    fn into_tail_string(self) -> String {
+        let truncated = self.truncated;
+        let bytes = self.into_bytes();
+        if truncated {
+            let mut out = String::with_capacity(bytes.len() + TRUNCATED_MARKER.len());
+            out.push_str(TRUNCATED_MARKER);
+            out.push_str(&String::from_utf8_lossy(&bytes));
+            out
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
     }
 }
 
