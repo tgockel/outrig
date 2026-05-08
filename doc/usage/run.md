@@ -12,6 +12,7 @@ outrig run [--agent <name>]
            [--container <name>]
            [--config <path>]
            [--max-tool-calls <n>]
+           [--max-tool-result-bytes <n>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
@@ -24,6 +25,8 @@ outrig run [--agent <name>]
   non-standard locations.
 - `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): override the
   per-turn tool-call cap for this run.
+- `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
+  override the per-tool-result byte cap for this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
   directory; symlinked from the root.
 - `--session-root <path>` (default: `session-root` config, else XDG): root directory
@@ -67,8 +70,8 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 7. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), look up
    `[agents.<a>].model` -- if unset, fall back to top-level `default-model`. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call cap from
-   `tool-call-cap`, then read the API key from the env var named in the provider's `api-key`.
-   Build the Rig provider client.
+   `tool-call-cap` and the per-result byte cap from `tool-result-cap`, then read the API key
+   from the env var named in the provider's `api-key`. Build the Rig provider client.
 8. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
    `AgentBuilder`.
@@ -84,6 +87,7 @@ A typical startup looks like:
 ```
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
 [outrig] tool-call cap:     50
+[outrig] tool-result cap:   262144 bytes
 [outrig] container-config:  coding
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3
 [outrig] container started: outrig-20260502T103412-3f2a
@@ -128,7 +132,15 @@ Each turn has a tool-call cap. The compiled-in default is `50`; a top-level
 one agent, and `outrig run --max-tool-calls <n>` overrides both for the current run. The cap is
 per turn, so a follow-up prompt starts a fresh count.
 
-When the cap fires, outrig ends the current turn and keeps the partial conversation history:
+Each individual tool result also has a byte cap before it is appended to the LLM-visible
+conversation history. The compiled-in default is `262144` bytes (256 KiB); a top-level
+`tool-result-cap` in config changes the default, `[agents.<name>].tool-result-cap` overrides it
+for one agent, and `outrig run --max-tool-result-bytes <n>` overrides both for the current run.
+If a tool returns more than the cap, outrig keeps the head of the result and appends a marker
+that includes the original size, the cap, and a hint to narrow the next query.
+
+When the tool-call cap fires, outrig ends the current turn and keeps the partial conversation
+history:
 
 ```
 [outrig] tool-call iteration cap (50) reached; ending turn

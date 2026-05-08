@@ -17,6 +17,11 @@ use crate::rig_tool::McpToolAdapter;
 /// fires first surfaces a controllable message.
 pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_CAP as usize;
 
+/// Default byte ceiling applied to each individual MCP tool result before it
+/// is handed to Rig and appended to model-visible chat history.
+pub const DEFAULT_TOOL_RESULT_CAP_BYTES: usize =
+    crate::config::DEFAULT_TOOL_RESULT_CAP_BYTES as usize;
+
 #[cfg(feature = "mistralrs")]
 pub mod mistralrs;
 #[cfg(feature = "mistralrs")]
@@ -126,6 +131,7 @@ pub struct ResolvedAgent {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub tool_call_cap: usize,
+    pub tool_result_cap_bytes: usize,
     pub container: Option<String>,
 }
 
@@ -240,6 +246,11 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
             .tool_call_cap
             .or(cfg.tool_call_cap)
             .unwrap_or(DEFAULT_TOOL_CALL_CAP) as usize,
+        tool_result_cap_bytes: agent
+            .tool_result_cap
+            .or(cfg.tool_result_cap)
+            .unwrap_or(crate::config::DEFAULT_TOOL_RESULT_CAP_BYTES)
+            as usize,
         container: agent.container.clone(),
     })
 }

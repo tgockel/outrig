@@ -27,21 +27,24 @@ default-model     = "fast"
 session-root      = "/var/lib/outrig/sessions"        # optional; defaults to XDG data dir
 model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XDG cache dir
 tool-call-cap     = 100                               # optional; defaults to 50
+tool-result-cap   = 262144                            # optional; defaults to 256 KiB
 ```
 
-| Key                 | Type    | Required               | Where  | Description                  |
-|---------------------|---------|------------------------|--------|------------------------------|
-| `default-container` | string  | for `outrig run`       | repo   | Default `--container`.       |
-| `default-agent`     | string  | for `outrig run`       | repo   | Default `--agent`.           |
-| `default-model`     | string  | if agent omits `model` | global | Fallback model name.         |
-| `session-root`      | path    | no                     | global | Sessions root dir.           |
-| `model-cache-root`  | path    | no                     | global | GGUF download cache dir.     |
-| `tool-call-cap`     | integer | no                     | global | Per-turn tool-call cap.      |
+| Key                 | Type    | Required               | Where  | Description                    |
+|---------------------|---------|------------------------|--------|--------------------------------|
+| `default-container` | string  | for `outrig run`       | repo   | Default `--container`.         |
+| `default-agent`     | string  | for `outrig run`       | repo   | Default `--agent`.             |
+| `default-model`     | string  | if agent omits `model` | global | Fallback model name.           |
+| `session-root`      | path    | no                     | global | Sessions root dir.             |
+| `model-cache-root`  | path    | no                     | global | GGUF download cache dir.       |
+| `tool-call-cap`     | integer | no                     | global | Per-turn tool-call cap.        |
+| `tool-result-cap`   | integer | no                     | global | Per-tool-result byte cap.      |
 
 `default-container` and `default-agent` belong in the repo config -- containers and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-cap`
-belong in the global config since they're user/machine-level. Each may also appear in the
-other file; repo entries override global by name.
+belong in the global config since they're user/machine-level. `tool-result-cap` usually belongs
+there too, although repo or agent config can tighten it for a noisy project. Each may also
+appear in the other file; repo entries override global by name.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -57,6 +60,14 @@ with `model-id` -- that's where the auto-downloaded GGUFs land. See
 default is `50`; config may set any value from `1` through `2000`.
 `[agents.<name>].tool-call-cap` overrides the top-level value for one agent, and
 `outrig run --max-tool-calls <n>` overrides both for one invocation.
+
+`tool-result-cap` is the default maximum byte size for one MCP tool result before it is added to
+the LLM-visible conversation history. The compiled-in default is `262144` bytes (256 KiB);
+config may set any value from `1024` through `16777216` bytes.
+`[agents.<name>].tool-result-cap` overrides the top-level value for one agent, and
+`outrig run --max-tool-result-bytes <n>` overrides both for one invocation. Results larger than
+the cap are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
+marker that reports the original size and cap.
 
 ## `[providers.<name>]`
 
@@ -216,6 +227,7 @@ preamble  = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 max-tokens  = 4096
 tool-call-cap = 300
+tool-result-cap = 1048576
 
 [agents.review]
 model    = "smart"        # explicit override of default-model
@@ -230,11 +242,14 @@ preamble = "You are a meticulous code reviewer..."
 - `temperature` (float, optional, default: provider default): sampling temperature.
 - `max-tokens` (integer, optional, default: provider default): output token cap per turn.
 - `tool-call-cap` (integer, optional, default: top-level value or `50`): tool calls per turn.
+- `tool-result-cap` (integer, optional, default: top-level value or `262144`): bytes per result.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set. When `outrig run --agent <a>` runs, the chosen container is `--container` if given,
 otherwise `agents.<a>.container` if set, otherwise `default-container`.
 `tool-call-cap` is per turn, not per session; follow-up prompts start a fresh count.
+`tool-result-cap` is per result and applies equally to successful MCP results and MCP error
+messages.
 
 ## `[workspace]`
 
@@ -357,6 +372,7 @@ default-model    = "fast"
 session-root     = "/var/lib/outrig/sessions"   # optional; default = XDG data dir
 model-cache-root = "/var/cache/outrig/models"   # optional; default = XDG cache dir
 tool-call-cap    = 100                           # optional; default = 50
+tool-result-cap  = 262144                        # optional; default = 256 KiB
 
 [providers.openai]
 style    = "openai"
@@ -397,6 +413,7 @@ container   = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 tool-call-cap = 300
+tool-result-cap = 1048576
 
 [agents.review]
 model    = "smart"        # explicit override
@@ -441,6 +458,8 @@ build-args = { NODE_VERSION = "20" }
   allowed on mistralrs models.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
 - `tool-call-cap`, if set at the top level or on an agent, must be between `1` and `2000`.
+- `tool-result-cap`, if set at the top level or on an agent, must be between `1024` and
+  `16777216` bytes.
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.
 - Every `command` array must be non-empty.

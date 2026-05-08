@@ -366,6 +366,7 @@ fn render(
             temperature: None,
             max_tokens: None,
             tool_call_cap: None,
+            tool_result_cap: None,
         },
     );
     let cfg = Config {
@@ -373,6 +374,7 @@ fn render(
         default_agent: Some(agent_name),
         default_model: model_choices.default_model,
         tool_call_cap: None,
+        tool_result_cap: None,
         workspace: Workspace {
             host_path: PathBuf::from(host_path),
             container_path: PathBuf::from(container_path),

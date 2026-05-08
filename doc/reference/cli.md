@@ -100,18 +100,21 @@ outrig run [--agent <name>]
            [--config <path>]
            [--global-config <path>]
            [--max-tool-calls <n>]
+           [--max-tool-result-bytes <n>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
 ```
 
-| Flag                   | Default                           | Description                         |
-|------------------------|-----------------------------------|-------------------------------------|
-| `--agent <name>`       | `default-agent`                   | Selects an `[agents.<name>]` block. |
-| `--container <name>`   | from agent or `default-container` | Container-config to launch.         |
-| `--max-tool-calls <n>` | resolved `tool-call-cap`, else 50 | Per-turn tool-call cap.             |
-| `--session-dir <path>` | `<session-root>/<sid>` (auto)     | Specific directory for this run.    |
-| `-v`, `--verbose`      | off                               | Print container lifecycle traces.   |
+- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
+- `--container <name>` (default: from agent or `default-container`): container-config to
+  launch.
+- `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): per-turn tool-call
+  cap.
+- `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
+  per-tool-result byte cap.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run.
+- `-v`, `--verbose` (default: off): print container lifecycle traces.
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
 under `<path>`, and additionally creates a symlink `<session-root>/<sid> -> <path>` so

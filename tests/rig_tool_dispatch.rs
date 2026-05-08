@@ -85,7 +85,7 @@ async fn adapter_dispatches_tool_call_into_container() {
         .expect("connect_via_podman_exec");
     let client = Arc::new(client);
 
-    let adapters = McpToolAdapter::from_client_tools(client.clone())
+    let adapters = McpToolAdapter::from_client_tools(client.clone(), usize::MAX)
         .await
         .expect("from_client_tools");
     assert!(

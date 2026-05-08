@@ -20,7 +20,10 @@ use clap::Parser;
 use rig::completion::Message;
 
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
-use crate::config::{Config, ContainerConfig, MAX_TOOL_CALL_CAP};
+use crate::config::{
+    Config, ContainerConfig, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
+    MIN_TOOL_RESULT_CAP_BYTES,
+};
 use crate::container::Container;
 use crate::error::Result;
 use crate::image::ImageTag;
@@ -49,6 +52,10 @@ pub struct RunArgs {
     /// Override the per-turn tool-call cap for this run.
     #[arg(long = "max-tool-calls", value_name = "N", value_parser = parse_tool_call_cap)]
     pub max_tool_calls: Option<u32>,
+
+    /// Override the per-result truncation cap for this run.
+    #[arg(long = "max-tool-result-bytes", value_name = "N", value_parser = parse_tool_result_cap)]
+    pub max_tool_result_bytes: Option<u32>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
@@ -103,6 +110,7 @@ pub async fn execute(
         &cache_root,
         &mut mcp_arcs,
         args.max_tool_calls,
+        args.max_tool_result_bytes,
     )
     .await;
 
@@ -124,12 +132,14 @@ async fn run_inner(
     cache_root: &Path,
     mcp_arcs: &mut Vec<Arc<McpClient>>,
     max_tool_calls: Option<u32>,
+    max_tool_result_bytes: Option<u32>,
 ) -> Result<i32> {
     // `setup` already validated presence and used the resolved `.container`
     // for the container fallback. We re-resolve here for `build_agent` +
     // banner; cheap (config table lookups, no I/O).
     let mut resolved = llm::resolve_agent(cfg, agent_name)?;
     apply_tool_call_cap_override(&mut resolved, max_tool_calls);
+    apply_tool_result_cap_override(&mut resolved, max_tool_result_bytes);
 
     let connected = session_setup::connect_mcp_clients(container, container_cfg, log_dir).await?;
     mcp_arcs.extend(connected);
@@ -137,7 +147,8 @@ async fn run_inner(
     let mut all_tools: Vec<McpToolAdapter> = Vec::new();
     let mut per_server_counts: Vec<(String, usize)> = Vec::new();
     for arc in mcp_arcs.iter() {
-        let adapters = McpToolAdapter::from_client_tools(arc.clone()).await?;
+        let adapters =
+            McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_cap_bytes).await?;
         per_server_counts.push((arc.name().to_string(), adapters.len()));
         all_tools.extend(adapters);
     }
@@ -237,6 +248,11 @@ fn print_banner(
         "[outrig] tool-call cap:     {}",
         resolved.tool_call_cap
     );
+    let _ = writeln!(
+        buf,
+        "[outrig] tool-result cap:   {} bytes",
+        resolved.tool_result_cap_bytes
+    );
     let _ = writeln!(buf, "[outrig] container-config:  {container_name}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
@@ -284,6 +300,15 @@ fn apply_tool_call_cap_override(resolved: &mut llm::ResolvedAgent, max_tool_call
     }
 }
 
+fn apply_tool_result_cap_override(
+    resolved: &mut llm::ResolvedAgent,
+    max_tool_result_bytes: Option<u32>,
+) {
+    if let Some(max_tool_result_bytes) = max_tool_result_bytes {
+        resolved.tool_result_cap_bytes = max_tool_result_bytes as usize;
+    }
+}
+
 fn parse_tool_call_cap(s: &str) -> std::result::Result<u32, String> {
     let value = s
         .parse::<u32>()
@@ -291,6 +316,22 @@ fn parse_tool_call_cap(s: &str) -> std::result::Result<u32, String> {
     if !(1..=MAX_TOOL_CALL_CAP).contains(&value) {
         return Err(format!(
             "must be between 1 and {MAX_TOOL_CALL_CAP}; got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_tool_result_cap(s: &str) -> std::result::Result<u32, String> {
+    let value = s.parse::<u32>().map_err(|_| {
+        format!(
+            "must be an integer between {MIN_TOOL_RESULT_CAP_BYTES} and \
+             {MAX_TOOL_RESULT_CAP_BYTES}"
+        )
+    })?;
+    if !(MIN_TOOL_RESULT_CAP_BYTES..=MAX_TOOL_RESULT_CAP_BYTES).contains(&value) {
+        return Err(format!(
+            "must be between {MIN_TOOL_RESULT_CAP_BYTES} and \
+             {MAX_TOOL_RESULT_CAP_BYTES}; got {value}"
         ));
     }
     Ok(value)
@@ -318,6 +359,24 @@ mod tests {
     }
 
     #[test]
+    fn max_tool_result_bytes_arg_accepts_in_range_value() {
+        let args = RunArgs::try_parse_from(["run", "--max-tool-result-bytes", "65536"])
+            .expect("arg parses");
+        assert_eq!(args.max_tool_result_bytes, Some(65536));
+    }
+
+    #[test]
+    fn max_tool_result_bytes_arg_rejects_out_of_range_value() {
+        let err = RunArgs::try_parse_from(["run", "--max-tool-result-bytes", "0"])
+            .expect_err("zero is invalid");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be between 1024 and 16777216"),
+            "unexpected clap error: {msg}",
+        );
+    }
+
+    #[test]
     fn cli_override_replaces_resolved_tool_call_cap() {
         let mut resolved = llm::ResolvedAgent {
             agent_name: "coding".to_string(),
@@ -330,11 +389,34 @@ mod tests {
             temperature: None,
             max_tokens: None,
             tool_call_cap: 100,
+            tool_result_cap_bytes: llm::DEFAULT_TOOL_RESULT_CAP_BYTES,
             container: None,
         };
 
         apply_tool_call_cap_override(&mut resolved, Some(50));
 
         assert_eq!(resolved.tool_call_cap, 50);
+    }
+
+    #[test]
+    fn cli_override_replaces_resolved_tool_result_cap() {
+        let mut resolved = llm::ResolvedAgent {
+            agent_name: "coding".to_string(),
+            model_name: "fast".to_string(),
+            model_identifier: "gpt-4o-mini".to_string(),
+            provider_name: "local".to_string(),
+            provider: llm::ResolvedProvider::Mistralrs,
+            model_weights: None,
+            preamble: "test".to_string(),
+            temperature: None,
+            max_tokens: None,
+            tool_call_cap: 100,
+            tool_result_cap_bytes: 262_144,
+            container: None,
+        };
+
+        apply_tool_result_cap_override(&mut resolved, Some(65_536));
+
+        assert_eq!(resolved.tool_result_cap_bytes, 65_536);
     }
 }

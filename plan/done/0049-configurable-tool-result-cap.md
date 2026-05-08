@@ -394,6 +394,18 @@ CLI validation rejects the same range with a clap-time error.
   `src/llm.rs` so a future banner-print or `outrig config show`-style
   command can reference it.
 
+## Decisions
+
+- The resolved result cap is printed in the `outrig run` banner next
+  to the existing tool-call cap. This keeps both runtime safety limits
+  visible after config and CLI overrides resolve.
+- Config validation keeps path-qualified errors (`top-level
+  tool-result-cap`, `agents.<name>.tool-result-cap`) like the existing
+  `tool-call-cap` validator, rather than using pathless cap errors.
+- Unit coverage checks the adapter's underlying MCP-error payload
+  directly. Rig's `ToolError` display adds its own `ToolCallError:`
+  prefix, so the adapter payload is the precise value outrig controls.
+
 ## Out of scope
 
 These were considered and intentionally deferred:

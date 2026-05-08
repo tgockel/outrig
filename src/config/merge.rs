@@ -10,7 +10,8 @@ use super::Config;
 ///   are preserved as-is.
 /// - For top-level scalars (`default-container`, `default-agent`,
 ///   `default-model`, `session-root`, `model-cache-root`,
-///   `tool-call-cap`): repo's value wins if set, else global's.
+///   `tool-call-cap`, `tool-result-cap`): repo's value wins if set,
+///   else global's.
 /// - `[workspace]` is repo-only at the block level. Since `Workspace` has serde
 ///   defaults, an absent block in the repo file deserializes to those defaults
 ///   -- so taking `repo.workspace` unconditionally matches the documented
@@ -35,6 +36,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         session_root: repo.session_root.or(global.session_root),
         model_cache_root: repo.model_cache_root.or(global.model_cache_root),
         tool_call_cap: repo.tool_call_cap.or(global.tool_call_cap),
+        tool_result_cap: repo.tool_result_cap.or(global.tool_result_cap),
         providers,
         models,
         agents,

@@ -378,6 +378,54 @@ tool-call-cap = 5000
             other => panic!("expected ToolCallCapOutOfRange, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn top_level_tool_result_cap_too_small_errors() {
+        let cfg = parse(
+            r#"
+tool-result-cap = 0
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::ToolResultCapTooSmall { path, value, min } => {
+                assert_eq!(path, "top-level tool-result-cap");
+                assert_eq!(value, 0);
+                assert_eq!(min, 1024);
+            }
+            other => panic!("expected ToolResultCapTooSmall, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_tool_result_cap_too_large_errors() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+tool-result-cap = 100000000
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::ToolResultCapTooLarge { path, value, max } => {
+                assert_eq!(path, "agents.coding.tool-result-cap");
+                assert_eq!(value, 100000000);
+                assert_eq!(max, 16 * 1024 * 1024);
+            }
+            other => panic!("expected ToolResultCapTooLarge, got: {other:?}"),
+        }
+    }
 }
 
 mod config_merge {
@@ -531,6 +579,34 @@ tool-call-cap = 100
         let repo = parse("");
         let merged = merge(global, repo);
         assert_eq!(merged.tool_call_cap, Some(100));
+    }
+
+    #[test]
+    fn tool_result_cap_repo_overrides_global() {
+        let global = parse(
+            r#"
+tool-result-cap = 262144
+"#,
+        );
+        let repo = parse(
+            r#"
+tool-result-cap = 524288
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(merged.tool_result_cap, Some(524288));
+    }
+
+    #[test]
+    fn tool_result_cap_global_used_when_repo_unset() {
+        let global = parse(
+            r#"
+tool-result-cap = 262144
+"#,
+        );
+        let repo = parse("");
+        let merged = merge(global, repo);
+        assert_eq!(merged.tool_result_cap, Some(262144));
     }
 }
 

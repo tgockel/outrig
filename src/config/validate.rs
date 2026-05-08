@@ -11,7 +11,10 @@ use std::sync::OnceLock;
 use regex::Regex;
 use thiserror::Error;
 
-use super::{Config, LlmProvider, MAX_TOOL_CALL_CAP, McpServerSpec, Model};
+use super::{
+    Config, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
+    McpServerSpec, Model,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigValidationError {
@@ -65,6 +68,12 @@ pub enum ConfigValidationError {
 
     #[error("{path} must be between 1 and {max}; got {value}")]
     ToolCallCapOutOfRange { path: String, value: u32, max: u32 },
+
+    #[error("{path} must be at least {min} bytes; got {value}")]
+    ToolResultCapTooSmall { path: String, value: u32, min: u32 },
+
+    #[error("{path} must be at most {max} bytes; got {value}")]
+    ToolResultCapTooLarge { path: String, value: u32, max: u32 },
 
     #[error(
         "model {model:?} (provider style=mistralrs) must set exactly one of \
@@ -216,10 +225,16 @@ pub(super) fn validate(
     if let Some(value) = cfg.tool_call_cap {
         validate_tool_call_cap("top-level tool-call-cap", value)?;
     }
+    if let Some(value) = cfg.tool_result_cap {
+        validate_tool_result_cap("top-level tool-result-cap", value)?;
+    }
 
     for (agent_name, agent) in &cfg.agents {
         if let Some(value) = agent.tool_call_cap {
             validate_tool_call_cap(&format!("agents.{agent_name}.tool-call-cap"), value)?;
+        }
+        if let Some(value) = agent.tool_result_cap {
+            validate_tool_result_cap(&format!("agents.{agent_name}.tool-result-cap"), value)?;
         }
     }
 
@@ -245,6 +260,24 @@ fn validate_tool_call_cap(path: &str, value: u32) -> Result<(), ConfigValidation
             path: path.to_string(),
             value,
             max: MAX_TOOL_CALL_CAP,
+        });
+    }
+    Ok(())
+}
+
+fn validate_tool_result_cap(path: &str, value: u32) -> Result<(), ConfigValidationError> {
+    if value < MIN_TOOL_RESULT_CAP_BYTES {
+        return Err(ConfigValidationError::ToolResultCapTooSmall {
+            path: path.to_string(),
+            value,
+            min: MIN_TOOL_RESULT_CAP_BYTES,
+        });
+    }
+    if value > MAX_TOOL_RESULT_CAP_BYTES {
+        return Err(ConfigValidationError::ToolResultCapTooLarge {
+            path: path.to_string(),
+            value,
+            max: MAX_TOOL_RESULT_CAP_BYTES,
         });
     }
     Ok(())

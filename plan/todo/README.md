@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0049](0049-configurable-tool-result-cap.md)** Configurable per-tool-result
-  truncation cap.
 - **[0050](0050-cli-env-flags.md)** `--env` flags on `outrig run` /
   `outrig mcp`.
 - **[0051](0051-image-name-container.md)** `image-name` field on

@@ -87,6 +87,7 @@ container   = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 tool-call-cap = 300
+tool-result-cap = 1048576
 
 [agents.review]
 model    = "smart"      # explicit override of default-model
@@ -106,6 +107,8 @@ brainstorming).
 `tool-call-cap` also lives on the agent when a role needs longer tool loops. If unset, the agent
 uses the top-level `tool-call-cap`, then the compiled-in default of `50`. The cap is per user
 turn, so typing a follow-up prompt starts a fresh count while keeping conversation history.
+`tool-result-cap` works the same way for oversized MCP output: an agent can inherit the
+top-level cap or set its own byte cap when a role regularly reads larger files or logs.
 
 ### `default-model` at the top level
 

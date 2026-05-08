@@ -9,7 +9,9 @@ use outrig::config::Config;
 use outrig::error::OutrigError;
 #[cfg(not(feature = "mistralrs"))]
 use outrig::llm::build_agent;
-use outrig::llm::{LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider, resolve_agent};
+use outrig::llm::{
+    DEFAULT_TOOL_RESULT_CAP_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider, resolve_agent,
+};
 
 fn parse(s: &str) -> Config {
     Config::load_from_str(s).expect("config parses")
@@ -91,6 +93,7 @@ max-tokens  = 4096
     assert_eq!(r.temperature, Some(0.2));
     assert_eq!(r.max_tokens, Some(4096));
     assert_eq!(r.tool_call_cap, MAX_TOOL_CALLS);
+    assert_eq!(r.tool_result_cap_bytes, DEFAULT_TOOL_RESULT_CAP_BYTES);
 
     unset_env(var);
 }
@@ -141,6 +144,35 @@ tool-call-cap = 300
 
     let review = resolve_agent(&cfg, "review").expect("review resolves");
     assert_eq!(review.tool_call_cap, 300);
+
+    unset_env(var);
+}
+
+#[test]
+fn tool_result_cap_resolves_from_top_level_then_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_RESULT_CAP";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"
+default-model = "fast"
+tool-result-cap = 524288
+"#,
+        r#"
+[agents.coding]
+preamble = "code"
+
+[agents.review]
+preamble = "review"
+tool-result-cap = 1048576
+"#,
+    ));
+
+    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    assert_eq!(coding.tool_result_cap_bytes, 524288);
+
+    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    assert_eq!(review.tool_result_cap_bytes, 1048576);
 
     unset_env(var);
 }
