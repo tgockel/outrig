@@ -1,10 +1,8 @@
-# `outrig mcp` -- Attach to Existing Container
-
-> **Status:** preliminary spec. Builds on `plan/next/outrig-mcp.md`.
+# 0054 -- `outrig mcp --attach` to an existing container
 
 ## Context
 
-`plan/next/outrig-mcp.md` ships `outrig mcp` with one container per
+`plan/done/0035-0041` shipped `outrig mcp` with one container per
 invocation. The killer feature it skips: pointing `outrig mcp` at a
 container *already* started by an `outrig run` session, so the human's IDE
 and the agent share live workspace state.
@@ -16,6 +14,12 @@ attaching, `outrig mcp` spawns its own `podman exec -i` MCP children inside
 the running container, alongside the agent's. The container is shared at
 the filesystem / process tree layer (workspace, installed tools, env);
 MCP-protocol state is per-attacher.
+
+## Goal
+
+Let `outrig mcp` attach to a container started by an `outrig run` session,
+sharing the workspace, installed tools, and environment while running its
+own MCP children alongside the agent's.
 
 ## User surface
 
@@ -71,8 +75,53 @@ outrig mcp --attach <session-id-or-container-name> [--container <name>]
 - **Visibility into the agent's MCP tool calls.** Stretch goal; out of
   scope here.
 
+## Deliverables
+
+- New `Container::attach(name) -> Self` constructor that populates the
+  fields downstream code reads (exec-argv builder primarily) without
+  taking lifecycle ownership.
+- `Drop for Container` distinguishes owned from attached: only owned
+  containers `podman stop` on drop.
+- `session_setup::setup` gains an "attach" branch that skips
+  `image::ensure_image` and `Container::start`, probes the container
+  via `podman inspect`, and validates it's running.
+- `--attach <session-id-or-name>` flag on the `outrig mcp` subcommand,
+  with optional `--container <name>` for cases where the session row
+  doesn't carry a config name.
+- Session-row write path used by the attacher writes a fresh row in its
+  own `session_dir` -- distinct from the host session's so MCP child
+  stderr files don't collide.
+- Doc update: `doc/concepts/mcp-servers.md` (attach mode + the
+  reentrant-safe MCP server expectation), and the existing
+  `outrig mcp` docs (`doc/usage/mcp.md` or wherever 0041 placed them)
+  pick up the `--attach` flag.
+- Tests: integration coverage for attach-by-session-id, attach-by-name,
+  attach-when-host-stops-container (clean exit), and the
+  Drop-doesn't-stop semantic.
+
+## Acceptance
+
+- `outrig mcp --attach <session-id>` resolves the session row, reuses
+  its container, and spawns the resolved `[containers.<name>.mcp]` set
+  inside it. The agent's existing MCP children keep running.
+- `outrig mcp --attach <podman-name> --container <cfg>` works against a
+  container that wasn't started by `outrig run`.
+- When the attacher exits cleanly, the container is unaffected -- the
+  host `outrig run` session keeps running.
+- When the host session stops the container while an attacher is live,
+  the attacher's MCP children die and the attacher exits with a clear
+  error rather than hanging.
+- `outrig logs <attached-session> <server>` works against the
+  attacher's session dir just like any other session.
+
+## Dependencies
+
+None hard. The session-MCP `outrig mcp` subcommand has shipped
+(`plan/done/0035-0041`); this task builds on it.
+
 ## See also
 
-- `plan/next/outrig-mcp.md` -- the v0 fresh-container version.
+- `plan/done/0035-0041` -- the v0 fresh-container `outrig mcp` this
+  builds on.
 - `src/container/mod.rs:288-296` -- the existing `Drop for Container`.
 - `src/cli/run.rs:155-174` -- the existing teardown order this respects.

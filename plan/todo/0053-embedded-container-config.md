@@ -1,7 +1,4 @@
-# Embedded `container.toml` -- image-side MCP config
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/`
-> when ready.
+# 0053 -- Embedded `container.toml` -- image-side MCP config
 
 ## Context
 
@@ -132,10 +129,10 @@ for (mcp_name, spec) in &merged {
 shape; the merge produces a freshly-allocated `BTreeMap<String,
 McpServerSpec>` for the loop to consume.
 
-`outrig mcp` (planned in `plan/todo/0040-outrig-mcp-wire-subcommand.md`)
-inherits the same merge automatically because it'll use the same MCP startup
-path. If 0040 lands first, this task threads the read+merge into the `outrig
-mcp` startup as well.
+`outrig mcp` (`plan/done/0040-outrig-mcp-wire-subcommand.md`, shipped)
+inherits the same merge automatically because it uses the same MCP startup
+path. This task threads the read+merge into the `outrig mcp` startup as
+well as `outrig run`.
 
 ### Errors
 
@@ -198,7 +195,7 @@ mcp` startup as well.
   startup line lists the merged set.
 - An existing image with no `/etc/outrig/container.toml` continues to work
   unchanged -- backward compat by construction.
-- `outrig mcp` (once 0040 lands) inherits the merged view.
+- `outrig mcp` (shipped in `plan/done/0040`) inherits the merged view.
 
 ## Sub-decisions
 
@@ -223,8 +220,8 @@ mcp` startup as well.
 
 ## Dependencies
 
-- None hard. `plan/todo/0040-outrig-mcp-wire-subcommand.md` and
-  `plan/next/outrig-mcp-attach.md` will both inherit the merged behavior
-  automatically once they land, because they reuse the same MCP startup
-  path. If 0040 lands before this task, this task additionally threads the
-  read+merge through the `outrig mcp` entry point.
+- None hard. `plan/done/0040-outrig-mcp-wire-subcommand.md` has shipped,
+  so this task threads the read+merge through both `outrig run` and
+  `outrig mcp`. `plan/todo/0054-outrig-mcp-attach.md` will inherit the
+  merged behavior automatically when it lands, because it reuses the same
+  MCP startup path.

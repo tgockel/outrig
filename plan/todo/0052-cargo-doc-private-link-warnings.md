@@ -1,4 +1,4 @@
-# Clean up `cargo doc --no-deps` private-link warnings
+# 0052 -- Clean up `cargo doc --no-deps` private-link warnings
 
 ## Goal
 
@@ -41,3 +41,8 @@ afterwards.
   feature change.
 - Touching `MAX_NAME_LEN` should not change `tool_name::sanitize` behaviour --
   it is a documentation-only edit.
+
+## Dependencies
+
+None. Independent of any in-flight task; mentioned during 0038 but not
+blocked on anything in `plan/todo/`.
