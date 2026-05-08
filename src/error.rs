@@ -53,6 +53,14 @@ pub enum OutrigError {
         source: EnvValueError,
     },
 
+    #[error("container {container:?} build-arg {key:?}: {source}")]
+    BuildArgResolveFailed {
+        container: String,
+        key: String,
+        #[source]
+        source: EnvValueError,
+    },
+
     #[error("{0}")]
     McpStartupFailed(Box<McpStartupFailure>),
 

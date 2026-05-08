@@ -27,7 +27,8 @@ outrig build [--container <name>]
 
 1. Loads `.agents/outrig/config.toml`.
 2. For each selected container-config:
-   - Computes the cache key (blake3 over Dockerfile content + build-args + context content hash).
+   - Computes the cache key (blake3 over Dockerfile content + resolved build-args +
+     context content hash).
    - If a tag matching that key exists and `--no-cache` is not set, prints
      `image ready (cache hit)` and skips.
    - Otherwise runs:

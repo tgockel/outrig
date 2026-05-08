@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0047](0047-env-value-for-build-args.md)** `${VAR}` substitution for
-  `build-args` values.
 - **[0048](0048-configurable-tool-call-cap.md)** Configurable + resumable
   per-turn tool-call cap.
 - **[0049](0049-configurable-tool-result-cap.md)** Configurable per-tool-result

@@ -83,7 +83,7 @@ async fn build_single(
     repo_root: &Path,
     no_cache: bool,
 ) -> Result<i32> {
-    let tag = image::compute_tag(cc, repo_root).await?;
+    let tag = image::compute_tag_for(name, cc, repo_root).await?;
     let cache_hit = !no_cache && image::probe_cached(&tag).await?;
 
     if cache_hit {
@@ -92,7 +92,7 @@ async fn build_single(
     }
 
     print_build_header(name, cc, &tag);
-    image::build_image(cc, repo_root, &tag, no_cache).await?;
+    image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
     eprintln!("[outrig] image ready");
     Ok(0)
 }
@@ -110,13 +110,13 @@ async fn build_all(
                 "container-config {name:?} does not match any [containers.<name>]"
             ))
         })?;
-        let tag = image::compute_tag(cc, repo_root).await?;
+        let tag = image::compute_tag_for(name, cc, repo_root).await?;
         let cache_hit = !no_cache && image::probe_cached(&tag).await?;
         let suffix = if cache_hit {
             "(cache hit)".to_string()
         } else {
             let started = Instant::now();
-            image::build_image(cc, repo_root, &tag, no_cache).await?;
+            image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
             format!("(built in {}s)", started.elapsed().as_secs())
         };
         eprintln!("[outrig] container-config: {name:<pad$} -> {tag} {suffix}");

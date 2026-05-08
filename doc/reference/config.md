@@ -255,8 +255,10 @@ build-args = { NODE_VERSION = "20" }
 
 - `dockerfile` (path, required): path to the Dockerfile, relative to the repo root.
 - `context` (path, required): path to the build context, relative to the repo root.
-- `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s;
-  keys are ARG names.
+- `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
+  Keys are ARG names. Values are either literal strings or `${VAR}` references resolved
+  from the host environment at `outrig build` time; see the MCP `env` value syntax
+  below.
 
 Notes:
 

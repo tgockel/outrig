@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::config::{ContainerConfig, McpServerSpec, Workspace};
+use crate::config::{ContainerConfig, EnvValue, McpServerSpec, Workspace};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
@@ -25,7 +25,7 @@ pub(crate) enum LaunchSource {
     Build {
         dockerfile: PathBuf,
         context: PathBuf,
-        build_args: BTreeMap<String, String>,
+        build_args: BTreeMap<String, EnvValue>,
     },
     Image {
         tag: String,
@@ -63,6 +63,10 @@ impl LaunchSpec {
         mcp: BTreeMap<String, McpServerSpec>,
         log_dir: PathBuf,
     ) -> Self {
+        let build_args = build_args
+            .into_iter()
+            .map(|(key, value)| (key, EnvValue::Literal(value)))
+            .collect();
         Self {
             source: LaunchSource::Build {
                 dockerfile,

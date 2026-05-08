@@ -165,7 +165,10 @@ srv = { command = ["bin", "arg1"] }
         );
         // Inner map keys (build-args ARG names, mcp env-var names) keep user
         // casing -- they're not subject to the outer `rename_all = kebab-case`.
-        assert_eq!(coding_ctr.build_args["NODE_VERSION"], "20");
+        assert_eq!(
+            coding_ctr.build_args["NODE_VERSION"],
+            EnvValue::Literal("20".to_string()),
+        );
 
         assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
         let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].normalize();

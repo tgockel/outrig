@@ -127,7 +127,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         })?
         .clone();
 
-    let image_tag = image::compute_tag(&container_cfg, &repo_root).await?;
+    let image_tag = image::compute_tag_for(&container_cfg_name, &container_cfg, &repo_root).await?;
 
     let host_workspace = if cfg.workspace.host_path.is_absolute() {
         cfg.workspace.host_path.clone()
@@ -182,7 +182,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None
     };
 
-    if let Err(e) = image::ensure_tagged_image(
+    if let Err(e) = image::ensure_tagged_image_for(
+        &container_cfg_name,
         &container_cfg,
         &repo_root,
         &image_tag,

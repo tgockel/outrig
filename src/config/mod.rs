@@ -164,7 +164,7 @@ pub struct ContainerConfig {
     pub dockerfile: PathBuf,
     pub context: PathBuf,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub build_args: BTreeMap<String, String>,
+    pub build_args: BTreeMap<String, EnvValue>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
 }

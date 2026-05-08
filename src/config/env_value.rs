@@ -1,9 +1,10 @@
-//! Env-var values for MCP server `env` tables. Each value is either a literal
-//! string, used as-is, or a `${VAR}` reference resolved from the host
-//! environment when the MCP server is about to start. Unlike `ApiKeyRef`,
-//! literals are accepted -- existing configs use them for in-container paths
-//! like `CARGO_HOME = "/workspace/.cargo"`. The `${VAR}` form uses the same
-//! syntax as `api-key` for consistency.
+//! Env-var values for config tables such as MCP server `env` entries and
+//! Dockerfile `build-args`. Each value is either a literal string, used as-is,
+//! or a `${VAR}` reference resolved from the host environment at the call site.
+//! Unlike `ApiKeyRef`, literals are accepted -- existing configs use them for
+//! in-container paths like `CARGO_HOME = "/workspace/.cargo"` and Dockerfile
+//! args like `NODE_VERSION = "20"`. The `${VAR}` form uses the same syntax as
+//! `api-key` for consistency.
 
 use std::env::VarError;
 
@@ -23,9 +24,9 @@ pub enum EnvValueError {
     NotUnicode { var: String },
 }
 
-/// A single entry of an MCP server's `env` table -- either a literal value
-/// passed through verbatim, or a reference to a host env var resolved at
-/// MCP-startup time.
+/// A single entry of a config value table -- either a literal value passed
+/// through verbatim, or a reference to a host env var resolved at the call
+/// site that needs the concrete string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvValue {
     Literal(String),

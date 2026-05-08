@@ -54,3 +54,16 @@ time, surfaced to `buildah` as `--build-arg KEY=resolved-value`.
 
 - `feat/mcp-env-substitution` -- introduces `EnvValue`, `EnvValueError`,
   the shared `parse_env_ref`, and the framing pattern this task copies.
+
+## Decisions
+
+- `build-args` resolution lives in `image::resolve_build_args`, before both
+  cache-key computation and `buildah build` command construction, so cache
+  tags and `--build-arg` values use the same concrete strings.
+- The CLI build and session-startup paths use named image helpers so missing
+  host env vars report `BuildArgResolveFailed` with the container-config name
+  and build-arg key. The existing unnamed image helpers stay available for
+  lower-level callers.
+- `LaunchSpec::build` still accepts literal `BTreeMap<String, String>` values
+  and wraps them as `EnvValue::Literal`, preserving the curated facade while
+  `LaunchSpec::from_container_config` carries parsed `${VAR}` references.
