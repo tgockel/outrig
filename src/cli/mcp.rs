@@ -12,16 +12,19 @@
 
 #![deny(clippy::print_stdout)]
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use serde::Serialize;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
-use crate::config::ContainerConfig;
+use crate::config::{ContainerConfig, McpServerSpec};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
@@ -30,16 +33,25 @@ use crate::mcp_proxy::ProxyServer;
 
 #[derive(Debug, Parser)]
 pub struct McpArgs {
+    #[command(subcommand)]
+    pub cmd: Option<McpCommand>,
+
     /// Pick a `[containers.<name>]` block. Falls back to top-level
     /// `default-container` only -- `outrig mcp` has no agent, so there is no
     /// `agent.container` to consult.
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME")]
     pub container: Option<String>,
 
     /// Write the session into an explicit, already-existing directory. The
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
-    #[arg(long = "session-dir", value_name = "PATH")]
+    #[arg(long = "session-dir", global = true, value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// Print the image/config merged MCP table and exit.
+    ShowMerged,
 }
 
 /// Run one `outrig mcp` invocation end-to-end. Returns the process exit code.
@@ -62,6 +74,13 @@ pub async fn execute(
     })
     .await?;
 
+    match &args.cmd {
+        None => serve(setup).await,
+        Some(McpCommand::ShowMerged) => show_merged(setup).await,
+    }
+}
+
+async fn serve(setup: SessionSetup) -> Result<i32> {
     let SessionSetup {
         container_cfg_name,
         container_cfg,
@@ -92,6 +111,26 @@ pub async fn execute(
     outcome
 }
 
+async fn show_merged(setup: SessionSetup) -> Result<i32> {
+    let SessionSetup {
+        container_cfg,
+        container,
+        sid,
+        store,
+        cfg: _,
+        container_cfg_name: _,
+        image_tag: _,
+        session: _,
+        session_dir: _,
+        log_dir: _,
+    } = setup;
+
+    let outcome = show_merged_inner(&container_cfg, &container).await;
+    let final_exit = outcome.as_ref().copied().unwrap_or(1);
+    session_setup::teardown(Vec::new(), container, &store, &sid, final_exit).await;
+    outcome
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     container_cfg_name: &str,
@@ -102,10 +141,11 @@ async fn serve_inner(
     session_id: &str,
     mcp_arcs: &mut Vec<Arc<McpClient>>,
 ) -> Result<i32> {
-    let connected = session_setup::connect_mcp_clients(container, container_cfg, log_dir).await?;
+    let mcp = session_setup::merged_mcp(container, container_cfg).await?;
+    let connected = session_setup::connect_mcp_clients(container, &mcp, log_dir).await?;
     if connected.is_empty() {
         return Err(OutrigError::Configuration(
-            "outrig mcp with no `[containers.<name>.mcp]` entries has nothing to proxy".to_string(),
+            "outrig mcp with no merged MCP entries has nothing to proxy".to_string(),
         ));
     }
     mcp_arcs.extend(connected);
@@ -159,6 +199,32 @@ async fn serve_inner(
     let result = waiter.await;
     log_waiter_result(result);
     Ok(0)
+}
+
+async fn show_merged_inner(container_cfg: &ContainerConfig, container: &Container) -> Result<i32> {
+    let mcp = session_setup::merged_mcp(container, container_cfg).await?;
+    write_merged_mcp(&mcp)?;
+    Ok(0)
+}
+
+fn write_merged_mcp(mcp: &BTreeMap<String, McpServerSpec>) -> Result<()> {
+    #[derive(Serialize)]
+    struct MergedMcpView<'a> {
+        mcp: &'a BTreeMap<String, McpServerSpec>,
+    }
+
+    let rendered = if mcp.is_empty() {
+        "[mcp]\n".to_string()
+    } else {
+        toml::to_string_pretty(&MergedMcpView { mcp }).map_err(|source| {
+            OutrigError::Configuration(format!("serialize merged MCP TOML: {source}"))
+        })?
+    };
+
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(rendered.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
 }
 
 fn log_waiter_result(

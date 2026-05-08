@@ -138,6 +138,13 @@ outrig mcp [--container <name>]
            [--global-config <path>]
            [--session-root <path>]
            [--verbose]
+
+outrig mcp show-merged [--container <name>]
+                       [--session-dir <path>]
+                       [--config <path>]
+                       [--global-config <path>]
+                       [--session-root <path>]
+                       [--verbose]
 ```
 
 | Flag                   | Default                       | Description                         |
@@ -151,8 +158,13 @@ There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does 
 Container selection is `--container`, then top-level `default-container`, then an error.
 
 Startup builds or cache-hits the image, starts the container, initializes every entry in
-`[containers.<name>.mcp]`, lists their tools, prints a banner to stderr, and then speaks MCP
-JSON-RPC on stdout/stdin. All non-protocol output stays off stdout.
+the merged MCP table, lists their tools, prints a banner to stderr, and then speaks MCP JSON-RPC
+on stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
+`[containers.<name>.mcp]` overrides. All non-protocol output stays off stdout.
+
+`outrig mcp show-merged` uses the same container selection and setup path, but exits after
+printing the effective `[mcp]` table to stdout. It is for debugging embedded image config and
+repo-local overrides, not for serving MCP JSON-RPC.
 
 | Trigger or failure                               | Exit |
 |--------------------------------------------------|------|

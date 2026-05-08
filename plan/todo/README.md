@@ -14,8 +14,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
   `[containers.<name>]` (skip `buildah build`).
 - **[0052](0052-cargo-doc-private-link-warnings.md)** `cargo doc
   --no-deps` private-link warnings cleanup.
-- **[0053](0053-embedded-container-config.md)** Embedded
-  `container.toml` -- image-side MCP config.
 - **[0054](0054-outrig-mcp-attach.md)** `outrig mcp --attach` to an
   existing container.
 - **[0055](0055-outrig-mcp-self.md)** `outrig mcp self` --

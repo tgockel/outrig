@@ -33,6 +33,45 @@ Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within a c
 Names are how you reference servers elsewhere -- in `outrig logs <session> <server>`, in tool-call
 traces, in the prefix that gets attached to every tool the server exposes.
 
+## Embedding MCP config in the image
+
+An image can also ship its MCP declarations at `/etc/outrig/container.toml`:
+
+```toml
+# /etc/outrig/container.toml
+[mcp]
+fs    = { command = ["mcp-server-filesystem", "/workspace"] }
+shell = ["bash", "-lc", "exec mcp-server-shell"]
+build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
+```
+
+The `[mcp]` table uses the same short and full entry shapes as
+`[containers.<name>.mcp]`. At session startup, outrig reads the image file after
+the container starts, then overlays entries from `config.toml`. If both sources
+define the same server name, the `config.toml` entry replaces the image entry in
+full; fields are not deep-merged. Servers that appear in only one source remain
+in the merged set.
+
+Use embedded MCP config when a shared image owns the tool binaries and their
+default commands. Use `config.toml` for repo-local additions or overrides. A
+repo that wants to delegate completely to the image can omit
+`[containers.<name>.mcp]`.
+
+An `/etc/outrig/container.toml` is not required; this allows a shared container
+to be used with different configurations via `config.toml`. Malformed TOML,
+invalid server names, and empty command arrays are startup errors because they
+mean the image metadata is broken.
+
+To inspect what will actually start, run:
+
+```sh
+outrig mcp show-merged --container coding
+```
+
+The command starts the selected container, reads the embedded file, applies
+`config.toml` overrides, prints the effective `[mcp]` table to stdout, and
+then stops the container.
+
 ## Lifecycle
 
 When `outrig run` starts, the sequence per MCP server is:
@@ -85,7 +124,7 @@ You can list every tool currently registered with the agent from inside the REPL
   fs__read_file        Read the contents of a file.
   fs__write_file       Write contents to a file (overwrites).
   shell__exec          Run a shell command and return its stdout/stderr.
-> 
+>
 ```
 
 ## What if a server crashes mid-session?

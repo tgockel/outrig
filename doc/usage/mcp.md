@@ -18,6 +18,8 @@ outrig mcp [--container <name>]
            [--global-config <path>]
            [--session-root <path>]
            [--verbose]
+
+outrig mcp show-merged [--container <name>]
 ```
 
 - `--container <name>` (default: `default-container`): selects a
@@ -42,9 +44,10 @@ If neither is set, startup fails with:
 error: no --container or default-container configured
 ```
 
-The selected container must define at least one backing MCP server. A container-config
-with no `[containers.<name>.mcp]` entries has nothing to proxy, so `outrig mcp` exits
-before the client sees an MCP `initialize` response.
+The selected container must expose at least one backing MCP server after image
+`/etc/outrig/container.toml` entries and `[containers.<name>.mcp]` overrides are merged. A
+container-config with no merged entries has nothing to proxy, so `outrig mcp` exits before the
+client sees an MCP `initialize` response.
 
 ## Minimal Config
 
@@ -67,6 +70,21 @@ shell = ["bash", "-lc", "exec mcp-server-shell"]
 
 The MCP server binaries still have to exist inside the image. Install them in the
 container Dockerfile just as you would for `outrig run`.
+
+An image can also carry the same `[mcp]` table at `/etc/outrig/container.toml`.
+Use that when a shared image owns the default tool set, then keep only repo-specific
+overrides in `.agents/outrig/config.toml`. See
+[Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
+
+To inspect the effective table without serving MCP:
+
+```sh
+outrig mcp show-merged --container coding
+```
+
+This starts the selected container, reads `/etc/outrig/container.toml`, applies
+`config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops the
+container.
 
 ## Client Configuration
 
@@ -135,15 +153,17 @@ Zed uses `context_servers` in its settings:
    agent.
 3. **Build (or cache-hit) the image.** Same buildah path as `outrig run`.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> ...`.
-5. **Connect MCP servers.** For each entry in `[containers.<name>.mcp]`,
-   `podman exec -i` the configured command and run the MCP `initialize` handshake.
-6. **Build the proxy.** outrig advertises one merged tool list to its client, with
+5. **Merge MCP config.** Read `/etc/outrig/container.toml` from the image if present,
+   then overlay `[containers.<name>.mcp]` from config by server name.
+6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
+   command and run the MCP `initialize` handshake.
+7. **Build the proxy.** outrig advertises one merged tool list to its client, with
    each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
-7. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
+8. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
    the process stdin and writes responses to stdout. The proxy dispatches `tools/call`
    to the right backing server.
 
-If anything before step 7 fails, `outrig mcp` prints the error on stderr and exits
+If anything before step 8 fails, `outrig mcp` prints the error on stderr and exits
 non-zero without ever advertising a tool list.
 
 ## Startup Banner

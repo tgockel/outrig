@@ -14,6 +14,7 @@
 
 #[cfg(feature = "internal")]
 pub mod add;
+pub mod embedded;
 #[cfg(feature = "internal")]
 pub mod render;
 
@@ -353,7 +354,7 @@ impl Drop for Container {
 /// `groupadd` / write to `/home`. Forcing `--user=0:0` explicitly puts us
 /// at in-container UID 0, which is what we need before any host user
 /// exists inside the container.
-fn podman_exec_root(name: &str) -> Cmd {
+pub(super) fn podman_exec_root(name: &str) -> Cmd {
     Cmd::new("podman").args(["exec", "--user=0:0"]).arg(name)
 }
 

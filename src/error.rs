@@ -8,6 +8,7 @@ use thiserror::Error;
 use crate::config::api_key::ApiKeyError;
 use crate::config::env_value::EnvValueError;
 use crate::config::validate::ConfigValidationError;
+use crate::container::embedded::EmbeddedContainerConfigError;
 #[cfg(feature = "internal")]
 use crate::llm::LlmResolveError;
 
@@ -59,6 +60,13 @@ pub enum OutrigError {
         key: String,
         #[source]
         source: EnvValueError,
+    },
+
+    #[error("container {container:?} embedded config: {source}")]
+    EmbeddedContainerParse {
+        container: String,
+        #[source]
+        source: Box<EmbeddedContainerConfigError>,
     },
 
     #[error("{0}")]

@@ -8,10 +8,11 @@
 //! - [`setup`] -- everything from config-load through "container started +
 //!   bootstrapped + session row + log dir created", returning a populated
 //!   [`SessionSetup`]. Stops *before* MCP children connect.
-//! - [`connect_mcp_clients`] -- spawns one [`McpClient`] per declared
-//!   backing MCP, in `BTreeMap` (key-sorted, deterministic) iteration order.
-//!   Adapter construction stays in the caller because only the REPL path
-//!   consumes adapters.
+//! - [`merged_mcp`] + [`connect_mcp_clients`] -- reads any image-embedded MCP
+//!   config, applies repo-config overrides, and spawns one [`McpClient`] per
+//!   merged backing MCP in `BTreeMap` (key-sorted, deterministic) iteration
+//!   order. Adapter construction stays in the caller because only the REPL
+//!   path consumes adapters.
 //! - [`teardown`] -- mirror of the cleanup tail: graceful MCP shutdowns
 //!   (drop adapters first so [`Arc::try_unwrap`] succeeds), then stop the
 //!   container, then finalize the session row. Errors are logged and never
@@ -23,12 +24,13 @@
 //!
 //! [`run`]: crate::cli::run
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::config::{Config, ContainerConfig};
-use crate::container::Container;
+use crate::config::{Config, ContainerConfig, McpServerSpec};
+use crate::container::{Container, embedded};
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::llm;
@@ -231,16 +233,24 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     })
 }
 
-/// Spawn one [`McpClient`] per backing MCP declared in `container_cfg.mcp`,
-/// in key-sorted (`BTreeMap`) iteration order. Adapter construction is the
-/// caller's job because only the REPL path consumes adapters.
-pub async fn connect_mcp_clients(
+/// Read image-embedded MCP config and overlay explicit `config.toml` entries.
+pub async fn merged_mcp(
     container: &Container,
     container_cfg: &ContainerConfig,
+) -> Result<BTreeMap<String, McpServerSpec>> {
+    embedded::merged_mcp(container, &container_cfg.mcp).await
+}
+
+/// Spawn one [`McpClient`] per backing MCP declared in `mcp`, in key-sorted
+/// (`BTreeMap`) iteration order. Adapter construction is the caller's job
+/// because only the REPL path consumes adapters.
+pub async fn connect_mcp_clients(
+    container: &Container,
+    mcp: &BTreeMap<String, McpServerSpec>,
     log_dir: &Path,
 ) -> Result<Vec<Arc<McpClient>>> {
-    let mut arcs = Vec::with_capacity(container_cfg.mcp.len());
-    for (mcp_name, spec) in &container_cfg.mcp {
+    let mut arcs = Vec::with_capacity(mcp.len());
+    for (mcp_name, spec) in mcp {
         let client = McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir).await?;
         arcs.push(Arc::new(client));
     }

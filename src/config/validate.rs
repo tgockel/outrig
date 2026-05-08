@@ -171,20 +171,15 @@ pub(super) fn validate(
         }
     }
 
-    let server_name_re = mcp_server_name_re();
     for (container_name, container) in &cfg.containers {
         for (server_name, spec) in &container.mcp {
-            if !server_name_re.is_match(server_name) {
+            if !is_valid_mcp_server_name(server_name) {
                 return Err(ConfigValidationError::InvalidMcpServerName {
                     container: container_name.clone(),
                     server: server_name.clone(),
                 });
             }
-            let command_empty = match spec {
-                McpServerSpec::Short(cmd) => cmd.is_empty(),
-                McpServerSpec::Full { command, .. } => command.is_empty(),
-            };
-            if command_empty {
+            if mcp_command_is_empty(spec) {
                 return Err(ConfigValidationError::EmptyMcpCommand {
                     container: container_name.clone(),
                     server: server_name.clone(),
@@ -252,6 +247,17 @@ pub(super) fn validate(
     }
 
     Ok(())
+}
+
+pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
+    mcp_server_name_re().is_match(server)
+}
+
+pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
+    match spec {
+        McpServerSpec::Short(cmd) => cmd.is_empty(),
+        McpServerSpec::Full { command, .. } => command.is_empty(),
+    }
 }
 
 fn validate_tool_call_cap(path: &str, value: u32) -> Result<(), ConfigValidationError> {

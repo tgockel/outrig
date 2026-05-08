@@ -324,6 +324,9 @@ Notes:
   the server advertises (`<server>__<tool>`).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
   resolved from the host environment at MCP startup -- see the subsection below.
+- Images can provide the same table at `/etc/outrig/container.toml`. Repo config entries
+  override image entries by server name; see
+  [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
 
 #### MCP `env` value syntax
 

@@ -230,6 +230,15 @@ pub async fn run_capture_logged(
     }
 }
 
+pub(crate) fn process_error_from_output(cmd: Cmd, output: Output) -> OutrigError {
+    OutrigError::Process {
+        program: cmd.program,
+        argv: cmd.args,
+        exit_code: output.status.code(),
+        stderr_tail: tail_string(&output.stderr, STDERR_TAIL_LIMIT),
+    }
+}
+
 /// Spawn the command with stderr piped, forwarding each stderr line to
 /// `tracing::info!` as `[<prefix>] <line>` (target `outrig::process`). stdout
 /// inherits the parent's; stdin is null. Returns the [`ExitStatus`] -- a

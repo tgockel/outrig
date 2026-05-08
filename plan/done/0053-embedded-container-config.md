@@ -218,6 +218,18 @@ well as `outrig run`.
   v0; revisit only if a feature lands that needs the merged view earlier
   (e.g. a `--show-config` subcommand).
 
+## Decisions
+
+- Implement the debug surface as `outrig mcp show-merged`, not a
+  `--show-merged-mcp` flag. Bare `outrig mcp` remains the stdio server; the
+  nested command is an inspect-and-exit mode that prints TOML to stdout.
+- Put the embedded read and config overlay behind one shared helper so
+  `outrig run`, bare `outrig mcp`, `outrig mcp show-merged`, and
+  `Outrig::launch` all see the same effective MCP map.
+- Keep missing `/etc/outrig/container.toml` as an empty image map for backward
+  compatibility, but validate embedded server names and empty commands at read
+  time so image metadata errors are surfaced before MCP startup.
+
 ## Dependencies
 
 - None hard. `plan/done/0040-outrig-mcp-wire-subcommand.md` has shipped,

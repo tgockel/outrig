@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::{ContainerConfig, EnvValue, McpServerSpec, Workspace};
-use crate::container::Container;
+use crate::container::{Container, embedded};
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::mcp::{McpClient, McpToolResult};
@@ -160,7 +160,8 @@ pub struct Outrig {
 
 impl Outrig {
     /// Acquire the image, start the container, bootstrap the runtime user,
-    /// connect every MCP server in `spec.mcp`, and index their tools.
+    /// merge image-embedded MCP config with `spec.mcp`, connect every merged
+    /// MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
         let image_tag = match &spec.source {
@@ -190,9 +191,11 @@ impl Outrig {
         let mut container = Container::start(&image_tag, workspace).await?;
         container.bootstrap_user().await?;
 
+        let mcp = embedded::merged_mcp(&container, &spec.mcp).await?;
+
         let mut clients: BTreeMap<String, Arc<McpClient>> = BTreeMap::new();
         let mut tools: Vec<ToolHandle> = Vec::new();
-        for (name, server_cfg) in &spec.mcp {
+        for (name, server_cfg) in &mcp {
             let client =
                 McpClient::connect_via_podman_exec(&container, server_cfg, name, &spec.log_dir)
                     .await?;

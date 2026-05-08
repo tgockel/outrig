@@ -141,7 +141,8 @@ async fn run_inner(
     apply_tool_call_cap_override(&mut resolved, max_tool_calls);
     apply_tool_result_cap_override(&mut resolved, max_tool_result_bytes);
 
-    let connected = session_setup::connect_mcp_clients(container, container_cfg, log_dir).await?;
+    let mcp = session_setup::merged_mcp(container, container_cfg).await?;
+    let connected = session_setup::connect_mcp_clients(container, &mcp, log_dir).await?;
     mcp_arcs.extend(connected);
 
     let mut all_tools: Vec<McpToolAdapter> = Vec::new();
