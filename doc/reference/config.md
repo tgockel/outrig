@@ -270,6 +270,9 @@ appear with your host UID/GID. See [Concepts -> Workspace](../concepts/workspace
 ## `[containers.<name>]`
 
 You declare one or more container-configs. The selected one becomes the agent's environment.
+Each block takes exactly one of two shapes:
+
+### Build-from-Dockerfile (existing form)
 
 ```toml
 [containers.coding]
@@ -278,12 +281,25 @@ context    = ".agents/outrig/containers/coding"
 build-args = { NODE_VERSION = "20" }
 ```
 
-- `dockerfile` (path, required): path to the Dockerfile, relative to the repo root.
-- `context` (path, required): path to the build context, relative to the repo root.
+- `dockerfile` (path, required\*): path to the Dockerfile, relative to the repo root.
+- `context` (path, required\*): path to the build context, relative to the repo root.
 - `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
   Keys are ARG names. Values are either literal strings or `${VAR}` references resolved
   from the host environment at `outrig build` time; see the MCP `env` value syntax
   below.
+
+### Use-existing-image (new form)
+
+```toml
+[containers.scratch]
+image-name = "docker.io/library/ubuntu:24.04"
+```
+
+- `image-name` (string, required\*): image reference passed to `podman pull` / `podman run`.
+  Accepts any ref form podman supports: `name:tag`, `registry/name:tag`, `name@sha256:...`.
+
+\* Exactly one of the two shapes must be set. Setting `image-name` alongside `dockerfile`,
+`context`, or `build-args` is an error. Setting neither is also an error.
 
 Notes:
 
@@ -469,7 +485,11 @@ build-args = { NODE_VERSION = "20" }
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.
 - Every `command` array must be non-empty.
-- `dockerfile` and `context` must exist on disk relative to the repo root.
+- `dockerfile` and `context` must exist on disk relative to the repo root (build path only).
+- Each `[containers.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
+  Setting both shapes, neither, `image-name` with `build-args`, or only one of
+  `dockerfile`/`context` without the other is an error.
+- `image-name` must not be empty.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
 - Unknown keys at any level are rejected.
 

@@ -689,4 +689,125 @@ preamble = "hi"
         assert!(cfg.agents.contains_key("coding"));
         assert!(cfg.models.contains_key("fast"));
     }
+
+    #[test]
+    fn image_name_only_validates_clean() {
+        let cfg = parse(
+            r#"
+[containers.scratch]
+image-name = "docker.io/library/ubuntu:24.04"
+"#,
+        );
+        cfg.validate(None)
+            .expect("image-name-only container validates");
+    }
+
+    #[test]
+    fn image_name_with_mcp_validates_clean() {
+        let cfg = parse(
+            r#"
+[containers.scratch]
+image-name = "docker.io/library/ubuntu:24.04"
+
+  [containers.scratch.mcp]
+  fs = { command = ["mcp-server-filesystem", "/workspace"] }
+"#,
+        );
+        cfg.validate(None).expect("image-name with mcp validates");
+    }
+
+    #[test]
+    fn container_source_missing_errors() {
+        let cfg = parse(
+            r#"
+[containers.empty]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::ContainerSourceMissing { .. }),
+            "expected ContainerSourceMissing, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn image_name_with_dockerfile_errors() {
+        let cfg = parse(
+            r#"
+[containers.bad]
+image-name = "alpine:3.20"
+dockerfile = "Dockerfile"
+context    = "."
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::ContainerSourceConflict { .. }),
+            "expected ContainerSourceConflict, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn image_name_with_build_args_errors() {
+        let cfg = parse(
+            r#"
+[containers.bad]
+image-name = "alpine:3.20"
+build-args = { FOO = "bar" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::ContainerImageNameWithBuildArgs { .. }
+            ),
+            "expected ContainerImageNameWithBuildArgs, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_image_name_errors() {
+        let cfg = parse(
+            r#"
+[containers.bad]
+image-name = ""
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::ContainerImageNameEmpty { .. }),
+            "expected ContainerImageNameEmpty, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_without_context_errors() {
+        let cfg = parse(
+            r#"
+[containers.bad]
+dockerfile = "Dockerfile"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::ContainerHalfBuilt { .. }),
+            "expected ContainerHalfBuilt, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn context_without_dockerfile_errors() {
+        let cfg = parse(
+            r#"
+[containers.bad]
+context = "."
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::ContainerHalfBuilt { .. }),
+            "expected ContainerHalfBuilt, got: {err:?}"
+        );
+    }
 }

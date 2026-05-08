@@ -43,8 +43,9 @@ fn init_tracing() {
 
 async fn ensure_fixture_image() -> ImageTag {
     let cfg = ContainerConfig {
-        dockerfile: "Dockerfile".into(),
-        context: ".".into(),
+        image_name: None,
+        dockerfile: Some("Dockerfile".into()),
+        context: Some(".".into()),
         build_args: BTreeMap::new(),
         mcp: BTreeMap::new(),
     };

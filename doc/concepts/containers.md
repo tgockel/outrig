@@ -88,6 +88,44 @@ parameterized at build time.
 
 The `[containers.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
 
+### Using a pre-built image
+
+If you already have an image (from a registry, CI pipeline, or local build), set
+`image-name` instead of `dockerfile` + `context`:
+
+```toml
+[containers.scratch]
+image-name = "docker.io/library/ubuntu:24.04"
+
+  [containers.scratch.mcp]
+  fs = { command = ["mcp-server-filesystem", "/workspace"] }
+```
+
+Exactly one of these two shapes must be set on each block:
+
+- `dockerfile` + `context` (with optional `build-args`) -- build path.
+- `image-name` -- use-existing-image path.
+
+Setting both, neither, or `image-name` alongside `build-args` is a config-validation error.
+
+`outrig build --container scratch` pulls the image if not already local:
+
+```sh
+$ outrig build --container scratch
+[outrig] container-config: scratch
+[outrig] image:            docker.io/library/ubuntu:24.04
+[outrig] image ready
+```
+
+On subsequent runs when the image is already present:
+
+```sh
+$ outrig build --container scratch
+[outrig] image ready (already pulled: docker.io/library/ubuntu:24.04)
+```
+
+`outrig run --container scratch` starts the container directly -- no buildah invocation.
+
 ## Named container-configs
 
 You can declare multiple container-configs for the same repo and switch between them with
@@ -135,6 +173,10 @@ context is in a git repo, otherwise a tarball hash).
 A change to the `Dockerfile` or any file in the context causes a rebuild on the next `outrig run`
 or `outrig build`. Otherwise the cache hit is immediate. To force a rebuild without changing
 files, run `outrig build --no-cache`.
+
+Image-name configs use podman's local image store directly; there is no `outrig-cache:<hash>`
+tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the
+image is already present locally.
 
 ## What outrig does *not* set in the run
 

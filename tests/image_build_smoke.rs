@@ -45,8 +45,9 @@ async fn build_then_cache_hit_under_100ms() {
     .expect("write Dockerfile");
 
     let cfg = ContainerConfig {
-        dockerfile: "Dockerfile".into(),
-        context: ".".into(),
+        image_name: None,
+        dockerfile: Some("Dockerfile".into()),
+        context: Some(".".into()),
         build_args: BTreeMap::new(),
         mcp: BTreeMap::new(),
     };

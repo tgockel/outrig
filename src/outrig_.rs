@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::config::{ContainerConfig, EnvValue, McpServerSpec, Workspace};
+use crate::config::{ContainerConfig, ContainerSourceRef, EnvValue, McpServerSpec, Workspace};
 use crate::container::{Container, embedded};
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
@@ -104,25 +104,38 @@ impl LaunchSpec {
         repo_root: &Path,
         log_dir: PathBuf,
     ) -> Self {
-        let dockerfile = repo_root.join(&cfg.dockerfile);
-        let context = repo_root.join(&cfg.context);
         let host = if workspace.host_path.is_absolute() {
             workspace.host_path.clone()
         } else {
             repo_root.join(&workspace.host_path)
         };
-        Self {
-            source: LaunchSource::Build {
+        let ws = WorkspaceSpec {
+            host,
+            container: workspace.container_path.clone(),
+        };
+        match cfg.source() {
+            ContainerSourceRef::Build {
                 dockerfile,
                 context,
-                build_args: cfg.build_args.clone(),
+                build_args,
+            } => Self {
+                source: LaunchSource::Build {
+                    dockerfile: repo_root.join(dockerfile),
+                    context: repo_root.join(context),
+                    build_args: build_args.clone(),
+                },
+                workspace: Some(ws),
+                mcp: cfg.mcp.clone(),
+                log_dir,
             },
-            workspace: Some(WorkspaceSpec {
-                host,
-                container: workspace.container_path.clone(),
-            }),
-            mcp: cfg.mcp.clone(),
-            log_dir,
+            ContainerSourceRef::Image { image_name } => Self {
+                source: LaunchSource::Image {
+                    tag: image_name.to_string(),
+                },
+                workspace: Some(ws),
+                mcp: cfg.mcp.clone(),
+                log_dir,
+            },
         }
     }
 
@@ -174,8 +187,9 @@ impl Outrig {
                 // `ContainerConfig`. Passing an empty `repo_root` makes
                 // its `repo_root.join(absolute)` calls no-ops.
                 let cfg = ContainerConfig {
-                    dockerfile: dockerfile.clone(),
-                    context: context.clone(),
+                    image_name: None,
+                    dockerfile: Some(dockerfile.clone()),
+                    context: Some(context.clone()),
                     build_args: build_args.clone(),
                     mcp: BTreeMap::new(),
                 };

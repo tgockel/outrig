@@ -285,3 +285,24 @@ inside `ensure_image` covers both shapes.
 ## Dependencies
 
 None. This is a self-contained change against current `trunk`.
+
+## Decisions
+
+- **Flat struct + XOR validation** (as recommended by the spec). The
+  `ContainerConfig` struct stays flat with all fields `Option`, and a
+  `ContainerSourceRef` enum is derived by `source()` after validation.
+  This keeps `deny_unknown_fields` working cleanly and avoids serde
+  `untagged`/`flatten` footguns.
+- **`source()` panics on unvalidated configs.** Every real call path goes
+  through `Config::load` which validates first. The panic catches misuse
+  in tests that construct `ContainerConfig` directly without setting a
+  valid shape.
+- **Pull probe uses `podman image exists`.** Mirrors the shape of
+  `probe_cached` (which uses `buildah images --quiet`). Exits 0 iff the
+  image is present; no stdout parsing needed.
+- **`--no-cache` for image-name configs skips the probe and re-runs
+  `podman pull`.** Does not `podman rmi` first (matches the spec's
+  deferral of the `rmi-first` option).
+- **Pre-existing e2e test breakage** (missing 5th arg to
+  `connect_via_podman_exec`) is unrelated to this task; those tests were
+  already broken on trunk and are gated behind `--features e2e`.

@@ -12,8 +12,8 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
-    McpServerSpec, Model,
+    Config, ContainerConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
+    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, Model,
 };
 
 #[derive(Debug, Error)]
@@ -53,6 +53,31 @@ pub enum ConfigValidationError {
 
     #[error("container {container:?} mcp server {server:?} has empty command")]
     EmptyMcpCommand { container: String, server: String },
+
+    #[error("container {container:?}: neither `image-name` nor `dockerfile`+`context` is set")]
+    ContainerSourceMissing { container: String },
+
+    #[error(
+        "container {container:?}: conflicting fields {fields:?} -- set either `image-name` \
+         or `dockerfile`+`context`, not both"
+    )]
+    ContainerSourceConflict {
+        container: String,
+        fields: Vec<&'static str>,
+    },
+
+    #[error("container {container:?}: `image-name` must not be empty")]
+    ContainerImageNameEmpty { container: String },
+
+    #[error("container {container:?}: `{missing}` is required when `{present}` is set")]
+    ContainerHalfBuilt {
+        container: String,
+        present: &'static str,
+        missing: &'static str,
+    },
+
+    #[error("container {container:?}: `build-args` cannot be used with `image-name`")]
+    ContainerImageNameWithBuildArgs { container: String },
 
     #[error("container {container:?} dockerfile path {path:?} does not exist")]
     DockerfileMissing { container: String, path: PathBuf },
@@ -172,6 +197,8 @@ pub(super) fn validate(
     }
 
     for (container_name, container) in &cfg.containers {
+        validate_container_source(container_name, container, repo_root)?;
+
         for (server_name, spec) in &container.mcp {
             if !is_valid_mcp_server_name(server_name) {
                 return Err(ConfigValidationError::InvalidMcpServerName {
@@ -183,23 +210,6 @@ pub(super) fn validate(
                 return Err(ConfigValidationError::EmptyMcpCommand {
                     container: container_name.clone(),
                     server: server_name.clone(),
-                });
-            }
-        }
-
-        if let Some(root) = repo_root {
-            let dockerfile = root.join(&container.dockerfile);
-            if !dockerfile.exists() {
-                return Err(ConfigValidationError::DockerfileMissing {
-                    container: container_name.clone(),
-                    path: container.dockerfile.clone(),
-                });
-            }
-            let context = root.join(&container.context);
-            if !context.exists() {
-                return Err(ConfigValidationError::ContextMissing {
-                    container: container_name.clone(),
-                    path: container.context.clone(),
                 });
             }
         }
@@ -389,4 +399,90 @@ fn mcp_server_name_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(r"^[a-zA-Z][a-zA-Z0-9_-]*$").expect("mcp server-name regex compiles")
     })
+}
+
+/// Validate the XOR constraint on container source fields: exactly one of
+/// `image-name` or `dockerfile`+`context` must be set.
+fn validate_container_source(
+    container_name: &str,
+    container: &ContainerConfig,
+    repo_root: Option<&Path>,
+) -> Result<(), ConfigValidationError> {
+    let has_image_name = container.image_name.is_some();
+    let has_dockerfile = container.dockerfile.is_some();
+    let has_context = container.context.is_some();
+
+    if has_image_name {
+        // image-name path: reject any build-path fields.
+        let mut conflicts: Vec<&'static str> = vec!["image-name"];
+        if has_dockerfile {
+            conflicts.push("dockerfile");
+        }
+        if has_context {
+            conflicts.push("context");
+        }
+        if conflicts.len() > 1 {
+            return Err(ConfigValidationError::ContainerSourceConflict {
+                container: container_name.to_string(),
+                fields: conflicts,
+            });
+        }
+        if !container.build_args.is_empty() {
+            return Err(ConfigValidationError::ContainerImageNameWithBuildArgs {
+                container: container_name.to_string(),
+            });
+        }
+        let name = container.image_name.as_deref().unwrap();
+        if name.is_empty() {
+            return Err(ConfigValidationError::ContainerImageNameEmpty {
+                container: container_name.to_string(),
+            });
+        }
+    } else {
+        // Build path: require both dockerfile and context.
+        match (has_dockerfile, has_context) {
+            (false, false) => {
+                return Err(ConfigValidationError::ContainerSourceMissing {
+                    container: container_name.to_string(),
+                });
+            }
+            (true, false) => {
+                return Err(ConfigValidationError::ContainerHalfBuilt {
+                    container: container_name.to_string(),
+                    present: "dockerfile",
+                    missing: "context",
+                });
+            }
+            (false, true) => {
+                return Err(ConfigValidationError::ContainerHalfBuilt {
+                    container: container_name.to_string(),
+                    present: "context",
+                    missing: "dockerfile",
+                });
+            }
+            (true, true) => {}
+        }
+
+        // On-disk existence checks for the build path.
+        if let Some(root) = repo_root {
+            let dockerfile = container.dockerfile.as_ref().unwrap();
+            let df_path = root.join(dockerfile);
+            if !df_path.exists() {
+                return Err(ConfigValidationError::DockerfileMissing {
+                    container: container_name.to_string(),
+                    path: dockerfile.clone(),
+                });
+            }
+            let context = container.context.as_ref().unwrap();
+            let ctx_path = root.join(context);
+            if !ctx_path.exists() {
+                return Err(ConfigValidationError::ContextMissing {
+                    container: container_name.to_string(),
+                    path: context.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }

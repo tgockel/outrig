@@ -13,7 +13,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::ContainerConfig;
+use crate::config::{ContainerConfig, ContainerSourceRef};
 use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
@@ -97,7 +97,8 @@ pub fn resolve_build_args(
 }
 
 /// Compute the deterministic `outrig-cache:<key>` tag for `cfg` without
-/// touching buildah. This resolves `build-args` first because the cache key
+/// touching buildah. For image-name configs, the tag is the literal
+/// `image-name` value. This resolves `build-args` first because the cache key
 /// tracks the concrete values passed to buildah. Useful when a caller wants
 /// to print the tag *before* deciding whether to build (e.g. the
 /// `outrig build` CLI's verbose header in `doc/usage/build.md`).
@@ -113,8 +114,13 @@ pub async fn compute_tag_for(
     cfg: &ContainerConfig,
     repo_root: &Path,
 ) -> Result<ImageTag> {
-    let build_args = resolve_build_args(container, cfg)?;
-    compute_tag_with_build_args(cfg, repo_root, &build_args).await
+    match cfg.source() {
+        ContainerSourceRef::Image { image_name } => Ok(ImageTag(image_name.to_string())),
+        ContainerSourceRef::Build { .. } => {
+            let build_args = resolve_build_args(container, cfg)?;
+            compute_tag_with_build_args(cfg, repo_root, &build_args).await
+        }
+    }
 }
 
 async fn compute_tag_with_build_args(
@@ -122,8 +128,8 @@ async fn compute_tag_with_build_args(
     repo_root: &Path,
     build_args: &BTreeMap<String, String>,
 ) -> Result<ImageTag> {
-    let dockerfile = repo_root.join(&cfg.dockerfile);
-    let context = repo_root.join(&cfg.context);
+    let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
+    let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
     let key = CacheKey::compute(&dockerfile, build_args, &context).await?;
     Ok(ImageTag(format!("{TAG_PREFIX}:{key}")))
 }
@@ -148,6 +154,53 @@ pub async fn probe_cached_logged(tag: &ImageTag, transcript: Option<&Transcript>
     )
     .await?;
     Ok(probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
+/// Returns `true` iff `tag` (an image ref) already exists in podman's local
+/// image store. Uses `podman image exists <ref>`.
+pub async fn probe_pulled(tag: &ImageTag) -> Result<bool> {
+    let probe =
+        process::try_capture(Cmd::new("podman").args(["image", "exists"]).arg(&tag.0)).await?;
+    Ok(probe.status.success())
+}
+
+/// Logged sibling of [`probe_pulled`].
+pub async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
+    let probe = process::try_capture_logged(
+        Cmd::new("podman").args(["image", "exists"]).arg(&tag.0),
+        "podman",
+        transcript,
+    )
+    .await?;
+    Ok(probe.status.success())
+}
+
+/// Pull an image by ref via `podman pull`. Stderr is streamed to
+/// `tracing::info!` with the `[podman]` prefix.
+pub async fn pull_image(tag: &ImageTag) -> Result<()> {
+    let cmd = Cmd::new("podman").arg("pull").arg(&tag.0);
+    let argv_for_error = cmd.args.clone();
+    let status = process::run_streamed(cmd, "podman").await?;
+    if !status.success() {
+        return Err(OutrigError::Process {
+            program: "podman",
+            argv: argv_for_error,
+            exit_code: status.code(),
+            stderr_tail: String::new(),
+        });
+    }
+    Ok(())
+}
+
+/// Logged sibling of [`pull_image`] for session startup.
+pub async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<()> {
+    process::run_capture_logged(
+        Cmd::new("podman").arg("pull").arg(&tag.0),
+        "podman",
+        transcript,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Run `buildah build` for `cfg`, tagging the result `tag`. Stderr is
@@ -262,21 +315,41 @@ pub async fn ensure_image_for(
     repo_root: &Path,
     no_cache: bool,
 ) -> Result<ImageBuildOutcome> {
-    let build_args = resolve_build_args(container, cfg)?;
-    let tag = compute_tag_with_build_args(cfg, repo_root, &build_args).await?;
-    if !no_cache && probe_cached(&tag).await? {
-        tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
-        return Ok(ImageBuildOutcome {
-            tag,
-            cache_hit: true,
-        });
+    match cfg.source() {
+        ContainerSourceRef::Image { image_name } => {
+            let tag = ImageTag(image_name.to_string());
+            if !no_cache && probe_pulled(&tag).await? {
+                tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
+                return Ok(ImageBuildOutcome {
+                    tag,
+                    cache_hit: true,
+                });
+            }
+            pull_image(&tag).await?;
+            tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
+            Ok(ImageBuildOutcome {
+                tag,
+                cache_hit: false,
+            })
+        }
+        ContainerSourceRef::Build { .. } => {
+            let build_args = resolve_build_args(container, cfg)?;
+            let tag = compute_tag_with_build_args(cfg, repo_root, &build_args).await?;
+            if !no_cache && probe_cached(&tag).await? {
+                tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
+                return Ok(ImageBuildOutcome {
+                    tag,
+                    cache_hit: true,
+                });
+            }
+            build_image_with_build_args(cfg, repo_root, &tag, no_cache, &build_args).await?;
+            tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
+            Ok(ImageBuildOutcome {
+                tag,
+                cache_hit: false,
+            })
+        }
     }
-    build_image_with_build_args(cfg, repo_root, &tag, no_cache, &build_args).await?;
-    tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
-    Ok(ImageBuildOutcome {
-        tag,
-        cache_hit: false,
-    })
 }
 
 /// Ensure an already-computed tag exists. This lets session startup write a
@@ -302,21 +375,47 @@ pub async fn ensure_tagged_image_for(
     no_cache: bool,
     transcript: Option<&Transcript>,
 ) -> Result<ImageBuildOutcome> {
-    let build_args = resolve_build_args(container, cfg)?;
-    if !no_cache && probe_cached_logged(tag, transcript).await? {
-        tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
-        return Ok(ImageBuildOutcome {
-            tag: tag.clone(),
-            cache_hit: true,
-        });
+    match cfg.source() {
+        ContainerSourceRef::Image { .. } => {
+            if !no_cache && probe_pulled_logged(tag, transcript).await? {
+                tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
+                return Ok(ImageBuildOutcome {
+                    tag: tag.clone(),
+                    cache_hit: true,
+                });
+            }
+            pull_image_logged(tag, transcript).await?;
+            tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
+            Ok(ImageBuildOutcome {
+                tag: tag.clone(),
+                cache_hit: false,
+            })
+        }
+        ContainerSourceRef::Build { .. } => {
+            let build_args = resolve_build_args(container, cfg)?;
+            if !no_cache && probe_cached_logged(tag, transcript).await? {
+                tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
+                return Ok(ImageBuildOutcome {
+                    tag: tag.clone(),
+                    cache_hit: true,
+                });
+            }
+            build_image_logged_with_build_args(
+                cfg,
+                repo_root,
+                tag,
+                no_cache,
+                transcript,
+                &build_args,
+            )
+            .await?;
+            tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
+            Ok(ImageBuildOutcome {
+                tag: tag.clone(),
+                cache_hit: false,
+            })
+        }
     }
-    build_image_logged_with_build_args(cfg, repo_root, tag, no_cache, transcript, &build_args)
-        .await?;
-    tracing::info!(target: "outrig::image", cache_hit = false, "ensured image {tag}");
-    Ok(ImageBuildOutcome {
-        tag: tag.clone(),
-        cache_hit: false,
-    })
 }
 
 fn build_image_cmd(
@@ -326,8 +425,8 @@ fn build_image_cmd(
     no_cache: bool,
     build_args: &BTreeMap<String, String>,
 ) -> Cmd {
-    let dockerfile = repo_root.join(&cfg.dockerfile);
-    let context = repo_root.join(&cfg.context);
+    let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
+    let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
 
     let mut cmd = Cmd::new("buildah")
         .arg("build")
@@ -488,8 +587,9 @@ mod tests {
     #[test]
     fn build_image_cmd_uses_resolved_build_args() {
         let cfg = ContainerConfig {
-            dockerfile: PathBuf::from("Dockerfile"),
-            context: PathBuf::from("."),
+            image_name: None,
+            dockerfile: Some(PathBuf::from("Dockerfile")),
+            context: Some(PathBuf::from(".")),
             build_args: BTreeMap::from([(
                 "GH_TOKEN".to_string(),
                 EnvValue::EnvRef("GITHUB_TOKEN".to_string()),

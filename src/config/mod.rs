@@ -176,12 +176,49 @@ impl Default for Workspace {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ContainerConfig {
-    pub dockerfile: PathBuf,
-    pub context: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, EnvValue>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
+}
+
+/// Discriminated view of the container source -- build-from-Dockerfile or
+/// use-existing-image. Returned by [`ContainerConfig::source`].
+pub enum ContainerSourceRef<'a> {
+    Build {
+        dockerfile: &'a Path,
+        context: &'a Path,
+        build_args: &'a BTreeMap<String, EnvValue>,
+    },
+    Image {
+        image_name: &'a str,
+    },
+}
+
+impl ContainerConfig {
+    /// Return the discriminated source variant. Panics if validation has not
+    /// run (i.e. both or neither shape is set). Every real call path goes
+    /// through `Config::load` which validates first.
+    pub fn source(&self) -> ContainerSourceRef<'_> {
+        match (&self.image_name, &self.dockerfile, &self.context) {
+            (Some(name), None, None) => ContainerSourceRef::Image { image_name: name },
+            (None, Some(df), Some(ctx)) => ContainerSourceRef::Build {
+                dockerfile: df,
+                context: ctx,
+                build_args: &self.build_args,
+            },
+            _ => panic!(
+                "ContainerConfig::source() called on an unvalidated config; \
+                 call Config::validate() first"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

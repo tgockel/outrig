@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use clap::{ArgGroup, Parser};
 
-use crate::config::{Config, ContainerConfig};
+use crate::config::{Config, ContainerConfig, ContainerSourceRef};
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::repo;
@@ -83,18 +83,32 @@ async fn build_single(
     repo_root: &Path,
     no_cache: bool,
 ) -> Result<i32> {
-    let tag = image::compute_tag_for(name, cc, repo_root).await?;
-    let cache_hit = !no_cache && image::probe_cached(&tag).await?;
-
-    if cache_hit {
-        eprintln!("[outrig] image ready (cache hit: {tag})");
-        return Ok(0);
+    match cc.source() {
+        ContainerSourceRef::Image { image_name } => {
+            let tag = image::ImageTag(image_name.to_string());
+            let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
+            if already_pulled {
+                eprintln!("[outrig] image ready (already pulled: {tag})");
+                return Ok(0);
+            }
+            print_image_header(name, &tag);
+            image::pull_image(&tag).await?;
+            eprintln!("[outrig] image ready");
+            Ok(0)
+        }
+        ContainerSourceRef::Build { .. } => {
+            let tag = image::compute_tag_for(name, cc, repo_root).await?;
+            let cache_hit = !no_cache && image::probe_cached(&tag).await?;
+            if cache_hit {
+                eprintln!("[outrig] image ready (cache hit: {tag})");
+                return Ok(0);
+            }
+            print_build_header(name, cc, &tag);
+            image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
+            eprintln!("[outrig] image ready");
+            Ok(0)
+        }
     }
-
-    print_build_header(name, cc, &tag);
-    image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
-    eprintln!("[outrig] image ready");
-    Ok(0)
 }
 
 async fn build_all(
@@ -110,16 +124,32 @@ async fn build_all(
                 "container-config {name:?} does not match any [containers.<name>]"
             ))
         })?;
-        let tag = image::compute_tag_for(name, cc, repo_root).await?;
-        let cache_hit = !no_cache && image::probe_cached(&tag).await?;
-        let suffix = if cache_hit {
-            "(cache hit)".to_string()
-        } else {
-            let started = Instant::now();
-            image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
-            format!("(built in {}s)", started.elapsed().as_secs())
-        };
-        eprintln!("[outrig] container-config: {name:<pad$} -> {tag} {suffix}");
+        match cc.source() {
+            ContainerSourceRef::Image { image_name } => {
+                let tag = image::ImageTag(image_name.to_string());
+                let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
+                let suffix = if already_pulled {
+                    "(already pulled)".to_string()
+                } else {
+                    let started = Instant::now();
+                    image::pull_image(&tag).await?;
+                    format!("(pulled in {}s)", started.elapsed().as_secs())
+                };
+                eprintln!("[outrig] container-config: {name:<pad$} -> {tag} {suffix}");
+            }
+            ContainerSourceRef::Build { .. } => {
+                let tag = image::compute_tag_for(name, cc, repo_root).await?;
+                let cache_hit = !no_cache && image::probe_cached(&tag).await?;
+                let suffix = if cache_hit {
+                    "(cache hit)".to_string()
+                } else {
+                    let started = Instant::now();
+                    image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
+                    format!("(built in {}s)", started.elapsed().as_secs())
+                };
+                eprintln!("[outrig] container-config: {name:<pad$} -> {tag} {suffix}");
+            }
+        }
     }
     eprintln!("[outrig] all images ready");
     Ok(0)
@@ -131,9 +161,20 @@ fn print_build_header(name: &str, cc: &ContainerConfig, tag: &ImageTag) {
     let _ = writeln!(
         buf,
         "[outrig] dockerfile:       {}",
-        cc.dockerfile.display()
+        cc.dockerfile.as_ref().expect("build path").display()
     );
-    let _ = writeln!(buf, "[outrig] context:          {}", cc.context.display());
+    let _ = writeln!(
+        buf,
+        "[outrig] context:          {}",
+        cc.context.as_ref().expect("build path").display()
+    );
     let _ = writeln!(buf, "[outrig] cache key:        {tag}");
+    eprint!("{buf}");
+}
+
+fn print_image_header(name: &str, tag: &ImageTag) {
+    let mut buf = String::new();
+    let _ = writeln!(buf, "[outrig] container-config: {name}");
+    let _ = writeln!(buf, "[outrig] image:            {tag}");
     eprint!("{buf}");
 }

@@ -161,11 +161,11 @@ srv = { command = ["bin", "arg1"] }
         let coding_ctr = &cfg.containers["coding"];
         assert_eq!(
             coding_ctr.dockerfile,
-            PathBuf::from(".agents/outrig/containers/coding/Dockerfile"),
+            Some(PathBuf::from(".agents/outrig/containers/coding/Dockerfile")),
         );
         assert_eq!(
             coding_ctr.context,
-            PathBuf::from(".agents/outrig/containers/coding"),
+            Some(PathBuf::from(".agents/outrig/containers/coding")),
         );
         // Inner map keys (build-args ARG names, mcp env-var names) keep user
         // casing -- they're not subject to the outer `rename_all = kebab-case`.
