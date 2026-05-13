@@ -71,6 +71,7 @@ features = [
     "macros",
     "io-util",
     "io-std",
+    "net",
     "process",
     "signal",
     "fs",

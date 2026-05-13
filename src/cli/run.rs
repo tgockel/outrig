@@ -22,7 +22,7 @@ use rig::completion::Message;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
 use crate::config::{
-    Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
+    Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES, NetworkMode,
 };
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
@@ -61,6 +61,10 @@ pub struct RunArgs {
     /// `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one.
     #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
     pub env: Vec<String>,
+
+    /// Override network monitoring for this session.
+    #[arg(long = "network", value_name = "MODE", value_parser = parse_network_mode)]
+    pub network: Option<NetworkMode>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
@@ -83,6 +87,7 @@ pub async fn execute(
         agent_flag: args.agent.as_deref(),
         require_agent: true,
         explicit_session_dir: args.session_dir.as_deref(),
+        network_mode_override: args.network,
         verbose,
     })
     .await?;
@@ -101,6 +106,7 @@ pub async fn execute(
         sid,
         log_dir,
         store,
+        network,
         attached: _,
         session: _,
         session_dir: _,
@@ -137,8 +143,12 @@ pub async fn execute(
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(mcp_arcs, container, &store, &sid, final_exit).await;
+    session_setup::teardown(mcp_arcs, network, container, &store, &sid, final_exit).await;
     outcome
+}
+
+fn parse_network_mode(s: &str) -> std::result::Result<NetworkMode, String> {
+    s.parse()
 }
 
 #[allow(clippy::too_many_arguments)]

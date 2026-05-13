@@ -33,6 +33,7 @@ random hex digits -- sortable, unambiguous across concurrent runs):
     ├── session.json              # id, timestamps, container, image, exit status
     └── logs/
         ├── container.log         # buildah/podman transcripts when --verbose is set
+        ├── network.jsonl         # network audit records when audit mode is enabled
         ├── fs.stderr             # MCP "fs" server's captured stderr
         └── shell.stderr          # MCP "shell" server's captured stderr
 ```
@@ -128,6 +129,22 @@ warning: unused import: `std::collections::HashMap`
 
 `--follow` (`-f`) tails the file with `tail -F`-style behavior: continues when the file rotates,
 returns when EOF is reached and no further writes are expected.
+
+When network audit mode is enabled, `logs/network.jsonl` contains one Zeek `conn.log`-style JSON
+object per outbound connection. It is not selected with the server-name argument because it is not
+an MCP stderr log; read it directly from the session directory:
+
+```sh
+$ jq . /tmp/my-debug-run/logs/network.jsonl
+```
+
+The log uses Zeek field names where OutRig has equivalent data: `ts` is Unix epoch seconds,
+`uid` is a per-connection id, `id.orig_h` / `id.orig_p` identify the container-side socket,
+`id.resp_h` / `id.resp_p` identify the remote endpoint, `proto` is the transport, `service` is
+the sniffed application (`http`, `ssl`, `ssh`, or `-`), `duration` is seconds, and
+`orig_bytes` / `resp_bytes` count bytes sent and received by the container. OutRig-specific
+metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`, and
+`outrig.host`.
 
 ## `outrig discard`
 

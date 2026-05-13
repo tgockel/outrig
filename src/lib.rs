@@ -21,10 +21,11 @@ pub mod mcp_proxy;
 
 mod outrig_;
 
-pub use config::{CapabilityProfile, MountAccess};
+pub use config::{CapabilityProfile, MountAccess, NetworkMode};
 pub use mcp::{McpTool, McpToolResult};
 pub use outrig_::{
-    CapabilitySpec, LaunchSpec, MountSpec, Outrig, SecuritySpec, ToolHandle, WorkspaceSpec,
+    CapabilitySpec, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec, ToolHandle,
+    WorkspaceSpec,
 };
 
 /// Load the project config rooted at `dir`. Walks up from `dir` looking
@@ -63,6 +64,11 @@ mod image;
 pub mod mcp;
 #[cfg(not(feature = "internal"))]
 mod mcp;
+
+#[cfg(feature = "internal")]
+pub mod network;
+#[cfg(not(feature = "internal"))]
+mod network;
 
 #[cfg(feature = "internal")]
 pub mod process;

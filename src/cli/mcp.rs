@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
-use crate::config::{ContainerConfig, McpServerSpec};
+use crate::config::{ContainerConfig, McpServerSpec, NetworkMode};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
@@ -61,6 +61,10 @@ pub struct McpArgs {
     /// `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one.
     #[arg(long = "env", global = true, value_name = "KEY=VALUE", action = ArgAction::Append)]
     pub env: Vec<String>,
+
+    /// Override network monitoring for this session.
+    #[arg(long = "network", global = true, value_name = "MODE", value_parser = parse_network_mode)]
+    pub network: Option<NetworkMode>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,6 +102,7 @@ pub async fn execute(
         agent_flag: None,
         require_agent: false,
         explicit_session_dir: args.session_dir.as_deref(),
+        network_mode_override: args.network,
         verbose,
     })
     .await?;
@@ -119,6 +124,7 @@ async fn serve(setup: SessionSetup, cli_env: CliEnvEntries) -> Result<i32> {
         log_dir,
         store,
         attached,
+        network,
         cfg: _,
         session: _,
         session_dir: _,
@@ -150,7 +156,7 @@ async fn serve(setup: SessionSetup, cli_env: CliEnvEntries) -> Result<i32> {
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(mcp_arcs, container, &store, &sid, final_exit).await;
+    session_setup::teardown(mcp_arcs, network, container, &store, &sid, final_exit).await;
     if attached
         && outcome
             .as_ref()
@@ -177,6 +183,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         sid,
         store,
         attached: _,
+        network,
         cfg: _,
         container_cfg_name: _,
         image_tag: _,
@@ -187,8 +194,12 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
 
     let outcome = show_merged_inner(&container_cfg, &container).await;
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(Vec::new(), container, &store, &sid, final_exit).await;
+    session_setup::teardown(Vec::new(), network, container, &store, &sid, final_exit).await;
     outcome
+}
+
+fn parse_network_mode(s: &str) -> std::result::Result<NetworkMode, String> {
+    s.parse()
 }
 
 #[allow(clippy::too_many_arguments)]

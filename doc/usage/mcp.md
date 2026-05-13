@@ -15,6 +15,7 @@ and you want that program to drive the tools inside your outrig container.
 ```
 outrig mcp [--container <name>]
            [--attach <session-id-or-container-name>]
+           [--network <default|audit>]
            [--session-dir <path>]
            [--config <path>]
            [--global-config <path>]
@@ -31,6 +32,8 @@ outrig mcp self
   `[containers.<name>]` block. Required with `--attach <podman-name>`.
 - `--attach <session-id-or-container-name>` (default: off): reuse an existing
   container instead of starting one.
+- `--network <default|audit>` (default: config `[network].mode`, else `default`): choose
+  Podman's default networking or enable network audit logging for this fresh session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
 - `--config <path>` (default: walks up from cwd): path to repo `config.toml`.
 - `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
@@ -64,6 +67,9 @@ With `--attach`, container-config selection is different:
    `container_config_name`.
 3. If the attach value is not a known session id, outrig treats it as a podman
    container name and requires `--container <name>`.
+
+`--network audit` is rejected with `--attach`; borrowed containers are not retrofitted with a
+new interceptor.
 
 The selected container must expose at least one backing MCP server after image
 `/etc/outrig/container.toml` entries and `[containers.<name>.mcp]` overrides are merged. A
@@ -204,17 +210,19 @@ Zed uses `context_servers` in its settings:
    `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
    container with `podman inspect`, verifies that it is running, and does not build,
    start, stop, or remove it.
-4. **Merge MCP config.** Read `/etc/outrig/container.toml` from the image if present,
+4. **Start network audit mode, if enabled.** Fresh sessions can write
+   `<session_dir>/logs/network.jsonl`; attach mode cannot install a new interceptor.
+5. **Merge MCP config.** Read `/etc/outrig/container.toml` from the image if present,
    then overlay `[containers.<name>.mcp]` from config by server name.
-5. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
+6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command and run the MCP `initialize` handshake.
-6. **Build the proxy.** outrig advertises one merged tool list to its client, with
+7. **Build the proxy.** outrig advertises one merged tool list to its client, with
    each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
-7. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
+8. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
    the process stdin and writes responses to stdout. The proxy dispatches `tools/call`
    to the right backing server.
 
-If anything before step 7 fails, `outrig mcp` prints the error on stderr and exits
+If anything before step 8 fails, `outrig mcp` prints the error on stderr and exits
 non-zero without ever advertising a tool list.
 
 ## Startup Banner

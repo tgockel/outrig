@@ -103,6 +103,7 @@ outrig run [--agent <name>]
            [--global-config <path>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
+           [--network <default|audit>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
@@ -120,6 +121,8 @@ outrig run [--agent <name>]
   cap.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
   per-tool-result byte cap.
+- `--network <default|audit>` (default: config `[network].mode`, else `default`): choose
+  Podman's default networking or enable network audit logging for this session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run.
 - `-v`, `--verbose` (default: off): print container lifecycle traces.
 
@@ -142,6 +145,7 @@ Serve the selected container-config's backing MCP servers as one MCP server over
 outrig mcp [--container <name>]
            [--attach <session-id-or-container-name>]
            [--env <KEY=VALUE>]
+           [--network <default|audit>]
            [--session-dir <path>]
            [--config <path>]
            [--global-config <path>]
@@ -164,6 +168,7 @@ outrig mcp self
 | `--container <name>`   | `default-container`          | Container-config to launch.           |
 | `--attach <id-or-name>`| off                          | Reuse an existing container.          |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
+| `--network <default|audit>`| config, else `default`   | Network monitoring mode.              |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
 | `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
 
@@ -182,6 +187,9 @@ stopping or removing it during teardown. Both modes initialize every entry in th
 MCP table, list their tools, print a banner to stderr, and then speak MCP JSON-RPC on
 stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
 `[containers.<name>.mcp]` overrides. All non-protocol output stays off stdout.
+
+`--network audit` is supported only for fresh-container `outrig mcp` sessions. Attach mode
+cannot retrofit a borrowed container with a new interceptor.
 
 `outrig mcp show-merged` uses the same container selection and setup path, but exits after
 printing the effective `[mcp]` table to stdout. It is for debugging embedded image config and

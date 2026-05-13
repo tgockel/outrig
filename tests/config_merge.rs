@@ -8,7 +8,7 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, merge,
+    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, NetworkMode, merge,
 };
 use outrig::error::OutrigError;
 
@@ -874,6 +874,37 @@ access         = "read-write"
         );
         assert_eq!(merged.workspace.mounts[1].access, MountAccess::ReadWrite);
     }
+
+    #[test]
+    fn repo_network_config_overrides_global_during_merge() {
+        let global = parse(
+            r#"
+[network]
+mode = "audit"
+"#,
+        );
+        let repo = parse(
+            r#"
+[network]
+mode = "default"
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.mode, NetworkMode::Default);
+    }
+
+    #[test]
+    fn absent_repo_network_keeps_global_during_merge() {
+        let global = parse(
+            r#"
+[network]
+mode = "audit"
+"#,
+        );
+        let repo = parse("");
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.mode, NetworkMode::Audit);
+    }
 }
 
 mod config_load {
@@ -957,6 +988,64 @@ preamble = "hi"
             .expect("repo agent resolves through global default-model");
         assert!(cfg.agents.contains_key("coding"));
         assert!(cfg.models.contains_key("fast"));
+    }
+
+    #[test]
+    fn global_network_mode_loads() {
+        let tmp = tempdir().unwrap();
+        let global_cfg = tmp.path().join("global.toml");
+        fs::write(
+            &global_cfg,
+            r#"
+[network]
+mode = "audit"
+"#,
+        )
+        .unwrap();
+        write_repo_cfg(tmp.path(), "");
+
+        let cfg = Config::load(tmp.path(), Some(&global_cfg)).expect("global network loads");
+        assert_eq!(cfg.network.mode, NetworkMode::Audit);
+    }
+
+    #[test]
+    fn repo_network_mode_loads() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[network]
+mode = "audit"
+"#,
+        );
+
+        let cfg = Config::load(tmp.path(), None).expect("repo network should load");
+        assert_eq!(cfg.network.mode, NetworkMode::Audit);
+    }
+
+    #[test]
+    fn repo_network_mode_overrides_global() {
+        let tmp = tempdir().unwrap();
+        let global_cfg = tmp.path().join("global.toml");
+        fs::write(
+            &global_cfg,
+            r#"
+[network]
+mode = "audit"
+"#,
+        )
+        .unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[network]
+mode = "default"
+"#,
+        );
+
+        let cfg = Config::load(tmp.path(), Some(&global_cfg))
+            .expect("repo network should override global network");
+        assert_eq!(cfg.network.mode, NetworkMode::Default);
     }
 
     #[test]

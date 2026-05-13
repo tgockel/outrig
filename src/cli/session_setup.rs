@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::env_arg::CliEnvEntries;
-use crate::config::{Config, ContainerConfig, McpServerSpec};
+use crate::config::{Config, ContainerConfig, McpServerSpec, NetworkMode};
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     embedded,
@@ -40,6 +40,7 @@ use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::llm;
 use crate::mcp::McpClient;
+use crate::network::NetworkInterceptor;
 use crate::process::Transcript;
 use crate::repo;
 use crate::session::{self, Session, SessionId, SessionStore};
@@ -114,6 +115,7 @@ pub struct SessionSetupArgs<'a> {
     /// `container_flag -> default_container` only.
     pub require_agent: bool,
     pub explicit_session_dir: Option<&'a Path>,
+    pub network_mode_override: Option<NetworkMode>,
     pub verbose: u8,
 }
 
@@ -132,6 +134,7 @@ pub struct SessionSetup {
     pub log_dir: PathBuf,
     pub store: SessionStore,
     pub attached: bool,
+    pub network: Option<NetworkInterceptor>,
 }
 
 #[derive(Debug)]
@@ -160,6 +163,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         Some(target) => Some(resolve_attach_target(target, args.container_flag, &store)?),
         None => None,
     };
+    let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode);
+    if attach.is_some() && network_mode == NetworkMode::Audit {
+        return Err(OutrigError::Configuration(
+            "`--network audit` cannot be used with `outrig mcp --attach`; \
+             start a fresh session to install network monitoring"
+                .to_string(),
+        ));
+    }
 
     // Agent presence is checked before any container work so the failure
     // mode is identical for `outrig run` regardless of which container
@@ -391,6 +402,24 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     }
     span.done("container user ready");
 
+    let network = match network_mode {
+        NetworkMode::Default => None,
+        NetworkMode::Audit => {
+            let span = ProgressSpan::start("starting network audit interceptor");
+            match NetworkInterceptor::start(&container, &log_dir, sid.as_str()).await {
+                Ok(interceptor) => {
+                    span.done("network audit interceptor ready");
+                    Some(interceptor)
+                }
+                Err(e) => {
+                    let _ = container.stop(STOP_GRACE).await;
+                    let _ = store.finalize(&sid, SystemTime::now(), 1);
+                    return Err(e);
+                }
+            }
+        }
+    };
+
     Ok(SessionSetup {
         cfg,
         container_cfg_name,
@@ -403,6 +432,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         log_dir,
         store,
         attached: attach.is_some(),
+        network,
     })
 }
 
@@ -487,6 +517,7 @@ pub async fn connect_mcp_clients(
 /// `Err` and the explicit `shutdown` is skipped in favor of `Drop`.
 pub async fn teardown(
     mcp_arcs: Vec<Arc<McpClient>>,
+    network: Option<NetworkInterceptor>,
     container: Container,
     store: &SessionStore,
     sid: &SessionId,
@@ -509,6 +540,9 @@ pub async fn teardown(
                 );
             }
         }
+    }
+    if let Some(network) = network {
+        network.shutdown().await;
     }
     if let Err(e) = container.stop(STOP_GRACE).await {
         tracing::warn!(

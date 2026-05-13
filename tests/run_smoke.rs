@@ -163,6 +163,10 @@ async fn run_drives_one_tool_call_and_prints_reply() {
         !session_dir.path().join("logs/container.log").exists(),
         "plain run should not create container.log"
     );
+    assert!(
+        !session_dir.path().join("logs/network.jsonl").exists(),
+        "network audit is opt-in and should be absent on a plain run"
+    );
 
     // Verify our specific container was cleaned up (other tests / external
     // processes may have unrelated outrig-* containers running, so we only

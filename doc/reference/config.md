@@ -28,6 +28,9 @@ session-root      = "/var/lib/outrig/sessions"        # optional; defaults to XD
 model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XDG cache dir
 tool-call-cap     = 100                               # optional; defaults to 50
 tool-result-cap   = 262144                            # optional; defaults to 256 KiB
+
+[network]
+mode = "default"                                      # optional; "audit" enables network.jsonl
 ```
 
 | Key                 | Type    | Required               | Where  | Description                    |
@@ -39,12 +42,14 @@ tool-result-cap   = 262144                            # optional; defaults to 25
 | `model-cache-root`  | path    | no                     | global | GGUF download cache dir.       |
 | `tool-call-cap`     | integer | no                     | global | Per-turn tool-call cap.        |
 | `tool-result-cap`   | integer | no                     | global | Per-tool-result byte cap.      |
+| `network.mode`      | string  | no                     | either | Network mode.                  |
 
 `default-container` and `default-agent` belong in the repo config -- containers and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-cap`
 belong in the global config since they're user/machine-level. `tool-result-cap` usually belongs
-there too, although repo or agent config can tighten it for a noisy project. Each may also
-appear in the other file; repo entries override global by name.
+there too, although repo or agent config can tighten it for a noisy project. `[network]` can
+live in either file; when both set it, the repo value wins for that repo. Each may also appear
+in the other file; repo entries override global by name.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -68,6 +73,32 @@ config may set any value from `1024` through `16777216` bytes.
 `outrig run --max-tool-result-bytes <n>` overrides both for one invocation. Results larger than
 the cap are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
 marker that reports the original size and cap.
+
+## `[network]`
+
+Network audit is disabled by default:
+
+```toml
+[network]
+mode = "default"
+```
+
+Accepted modes:
+
+- `default`: use Podman's configured default networking, do not install the interceptor, and do
+  not write `logs/network.jsonl`.
+- `audit`: allow all outbound session-container traffic, but write Zeek `conn.log`-style
+  records to `<session_dir>/logs/network.jsonl`.
+
+Audit mode requires host `nft` and `nsenter` plus permission to enter the rootless podman
+container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
+send DNS to the per-session in-namespace DNS listener, installs nftables redirection for
+outbound TCP and UDP/53, and removes the nftables table during teardown. If audit mode is
+requested and setup fails, the session fails before MCP servers launch.
+
+`outrig run --network default|audit` and `outrig mcp --network default|audit` override this
+setting for one fresh session. `--network audit` is rejected with `outrig mcp --attach` because
+borrowed containers are not retrofitted with a new interceptor.
 
 ## `[providers.<name>]`
 
@@ -433,6 +464,10 @@ before the REPL starts.
 global mounts are kept first, followed by repo mounts. Duplicate final `container-path` values
 are rejected during validation.
 
+`[network]` follows repo precedence when the repo config declares the table. If the repo omits
+`[network]`, the global value remains in effect. This matters when global config enables audit
+mode and a repo explicitly sets `mode = "default"`.
+
 ## Full examples
 
 ### Global `~/.outrig/config.toml`
@@ -443,6 +478,9 @@ session-root     = "/var/lib/outrig/sessions"   # optional; default = XDG data d
 model-cache-root = "/var/cache/outrig/models"   # optional; default = XDG cache dir
 tool-call-cap    = 100                           # optional; default = 50
 tool-result-cap  = 262144                        # optional; default = 256 KiB
+
+[network]
+mode = "default"                                 # optional; use "audit" for network.jsonl
 
 [providers.openai]
 style    = "openai"
@@ -544,6 +582,7 @@ build-args = { NODE_VERSION = "20" }
 - `tool-call-cap`, if set at the top level or on an agent, must be between `1` and `2000`.
 - `tool-result-cap`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.
+- `[network].mode`, if set, must be `default` or `audit`.
 - Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its container-config.
 - Every `command` array must be non-empty.

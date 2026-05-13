@@ -45,6 +45,8 @@ pub struct Config {
     pub tool_call_cap: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
+    pub network: NetworkConfig,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -62,7 +64,9 @@ pub struct Config {
 
 impl Config {
     pub fn load_from_str(s: &str) -> Result<Self> {
-        Ok(toml::from_str(s)?)
+        let mut cfg: Self = toml::from_str(s)?;
+        cfg.network.declared = declares_top_level_network(s)?;
+        Ok(cfg)
     }
 
     /// Read repo + (optional) global config files, merge with repo precedence,
@@ -94,6 +98,13 @@ impl Config {
         validate::validate(self, repo_root)?;
         Ok(())
     }
+}
+
+fn declares_top_level_network(text: &str) -> Result<bool> {
+    let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
+        crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
+    })?;
+    Ok(value.as_table().contains_key("network"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +202,73 @@ pub enum MountAccess {
     #[default]
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMode {
+    #[default]
+    Default,
+    Audit,
+}
+
+impl std::str::FromStr for NetworkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(Self::Default),
+            "audit" => Ok(Self::Audit),
+            _ => Err("expected one of: default, audit".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str("default"),
+            Self::Audit => f.write_str("audit"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NetworkConfig {
+    pub mode: NetworkMode,
+    #[serde(skip)]
+    #[schemars(skip)]
+    declared: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            mode: NetworkMode::Default,
+            declared: false,
+        }
+    }
+}
+
+impl PartialEq for NetworkConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl Eq for NetworkConfig {}
+
+impl NetworkConfig {
+    pub(crate) fn is_declared(&self) -> bool {
+        self.declared
+    }
+}
+
+impl NetworkConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -13,6 +13,7 @@ outrig run [--agent <name>]
            [--config <path>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
+           [--network <default|audit>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
@@ -27,6 +28,8 @@ outrig run [--agent <name>]
   per-turn tool-call cap for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
   override the per-tool-result byte cap for this run.
+- `--network <default|audit>` (default: config `[network].mode`, else `default`): choose
+  Podman's default networking or enable network audit logging for this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
   directory; symlinked from the root.
 - `--session-root <path>` (default: `session-root` config, else XDG): root directory
@@ -69,20 +72,23 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
    `/home/<user>` exists and is owned by them. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
-6. **Connect MCP servers.** For each entry in `[containers.<name>.mcp]`,
+6. **Start network audit mode, if enabled.** `--network audit` or
+   `[network].mode = "audit"` installs the per-session interceptor and opens
+   `<session_dir>/logs/network.jsonl`. The default mode skips this step entirely.
+7. **Connect MCP servers.** For each entry in `[containers.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`.
-7. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), look up
+8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), look up
    `[agents.<a>].model` -- if unset, fall back to top-level `default-model`. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call cap from
    `tool-call-cap` and the per-result byte cap from `tool-result-cap`, then read the API key
    from the env var named in the provider's `api-key`. Build the Rig provider client.
-8. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
+9. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
    `AgentBuilder`.
-9. **Open the REPL.** Banner on stderr, `> ` prompt, ready for input.
+10. **Open the REPL.** Banner on stderr, `> ` prompt, ready for input.
 
-If anything before step 9 fails, `outrig run` reports the error on stderr and exits non-zero
+If anything before step 10 fails, `outrig run` reports the error on stderr and exits non-zero
 without starting the REPL.
 
 ## REPL banner

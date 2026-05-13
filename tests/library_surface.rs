@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use outrig::config::McpServerSpec;
-use outrig::{CapabilityProfile, CapabilitySpec, LaunchSpec, MountAccess, MountSpec, Outrig};
+use outrig::{
+    CapabilityProfile, CapabilitySpec, LaunchSpec, MountAccess, MountSpec, NetworkMode, Outrig,
+};
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -160,7 +162,8 @@ async fn from_image_launches_with_extra_read_only_mount() {
             profile: CapabilityProfile::NoNetRaw,
             cap_drop: Vec::new(),
             cap_add: Vec::new(),
-        });
+        })
+        .with_network_mode(NetworkMode::Default);
 
     let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
     let result = outrig

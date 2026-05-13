@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::config::{
     CapabilityProfile, ContainerConfig, ContainerSecurity, ContainerSourceRef, EnvValue,
-    McpServerSpec, MountAccess, Workspace,
+    McpServerSpec, MountAccess, NetworkMode, Workspace,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -21,6 +21,7 @@ use crate::container::{
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::mcp::{McpClient, McpToolResult};
+use crate::network::NetworkInterceptor;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -68,6 +69,12 @@ pub struct CapabilitySpec {
     pub cap_add: Vec<String>,
 }
 
+/// Network monitoring policy applied at launch.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkSpec {
+    pub mode: NetworkMode,
+}
+
 impl From<&ContainerSecurity> for SecuritySpec {
     fn from(security: &ContainerSecurity) -> Self {
         Self {
@@ -98,6 +105,7 @@ pub struct LaunchSpec {
     pub workspace: Option<WorkspaceSpec>,
     pub mounts: Vec<MountSpec>,
     pub security: SecuritySpec,
+    pub network: NetworkSpec,
     pub mcp: BTreeMap<String, McpServerSpec>,
     pub log_dir: PathBuf,
 }
@@ -128,6 +136,7 @@ impl LaunchSpec {
             workspace: Some(workspace),
             mounts: Vec::new(),
             security: SecuritySpec::default(),
+            network: NetworkSpec::default(),
             mcp,
             log_dir,
         }
@@ -145,6 +154,7 @@ impl LaunchSpec {
             workspace: None,
             mounts: Vec::new(),
             security: SecuritySpec::default(),
+            network: NetworkSpec::default(),
             mcp,
             log_dir,
         }
@@ -188,6 +198,7 @@ impl LaunchSpec {
                 workspace: Some(ws),
                 mounts,
                 security: SecuritySpec::from(&cfg.security),
+                network: NetworkSpec::default(),
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -198,6 +209,7 @@ impl LaunchSpec {
                 workspace: Some(ws),
                 mounts,
                 security: SecuritySpec::from(&cfg.security),
+                network: NetworkSpec::default(),
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -233,6 +245,11 @@ impl LaunchSpec {
         self.security.capabilities = capabilities;
         self
     }
+
+    pub fn with_network_mode(mut self, mode: NetworkMode) -> Self {
+        self.network.mode = mode;
+        self
+    }
 }
 
 fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
@@ -262,6 +279,7 @@ pub struct Outrig {
     container: Container,
     clients: BTreeMap<String, Arc<McpClient>>,
     tools: Vec<ToolHandle>,
+    network: Option<NetworkInterceptor>,
 }
 
 impl Outrig {
@@ -311,6 +329,14 @@ impl Outrig {
         let mut container = Container::start(&image_tag, launch).await?;
         container.bootstrap_user().await?;
 
+        let network = match spec.network.mode {
+            NetworkMode::Default => None,
+            NetworkMode::Audit => Some(
+                NetworkInterceptor::start(&container, &spec.log_dir, container.session_suffix())
+                    .await?,
+            ),
+        };
+
         let mcp = embedded::merged_mcp(&container, &spec.mcp).await?;
 
         let mut clients: BTreeMap<String, Arc<McpClient>> = BTreeMap::new();
@@ -339,6 +365,7 @@ impl Outrig {
             container,
             clients,
             tools,
+            network,
         })
     }
 
@@ -366,7 +393,10 @@ impl Outrig {
     /// container; the container `stop` error, if any, propagates.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
-            container, clients, ..
+            container,
+            clients,
+            network,
+            ..
         } = self;
         for (name, arc) in clients {
             match Arc::try_unwrap(arc) {
@@ -385,6 +415,9 @@ impl Outrig {
                     );
                 }
             }
+        }
+        if let Some(network) = network {
+            network.shutdown().await;
         }
         container.stop(SHUTDOWN_GRACE).await
     }

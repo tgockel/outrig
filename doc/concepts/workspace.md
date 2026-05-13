@@ -131,18 +131,35 @@ onto the host filesystem are the primary workspace and the extra mounts you decl
 
 ## Network is *not* part of the workspace
 
-v0 outrig grants the container full outbound network access. This means an agent with shell
-access can run `curl`, `git push`, `npm publish`, etc. -- anything that talks to the outside
-world.
+By default, outrig grants the container full outbound network access. This means an agent with
+shell access can run `curl`, `git push`, `npm publish`, etc. -- anything that talks to the
+outside world.
 
-> **TODO: Incomplete** -- egress interception (CONNECT proxy + per-host allowlist + per-session
-> log) is deferred. The eventual filter will lean on an [in-process LLM](in-process-llm.md) so
-> the question being filtered never leaves the host process.
+Network audit mode is opt-in. Set it in config, or override one fresh session with
+`--network audit`, to put a host-side interceptor in the path of outbound container traffic:
 
-If the consequences of free network access matter for your repo, gate the agent at the MCP-server
-level for now: don't include a `shell` MCP, only include MCP servers whose tools are scoped (a
-filesystem MCP, a code-search MCP, a tightly-defined custom MCP). The agent then can't shell out
-to arbitrary network calls because the tool surface doesn't expose any.
+```toml
+[network]
+mode = "audit"
+```
+
+Audit mode writes one Zeek `conn.log`-style JSON object per connection to
+`<session_dir>/logs/network.jsonl`. This phase is allow-and-log only: every connection is still
+allowed, but records include the best known host, destination IP and port, transport, service,
+byte counts, and duration. HTTPS remains opaque except for TLS SNI. URL, method, status, and
+body inspection are deferred.
+
+When network mode is `default`, outrig leaves Podman's configured default networking in place,
+does not install nftables rules, does not rewrite container DNS, and does not create
+`network.jsonl`. Systems without nftables or namespace support therefore keep running normal
+sessions. If audit mode is explicitly enabled and the host cannot install the interceptor,
+startup fails before MCP servers launch.
+
+Network policy enforcement is not part of this phase. If the consequences of free network
+access matter for your repo, still gate the agent at the MCP-server level: don't include a
+`shell` MCP, only include MCP servers whose tools are scoped (a filesystem MCP, a code-search
+MCP, a tightly-defined custom MCP). The agent then can't shell out to arbitrary network calls
+because the tool surface doesn't expose any.
 
 ## See also
 
