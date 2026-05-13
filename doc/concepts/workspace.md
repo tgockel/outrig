@@ -135,8 +135,9 @@ By default, outrig grants the container full outbound network access. This means
 shell access can run `curl`, `git push`, `npm publish`, etc. -- anything that talks to the
 outside world.
 
-Network audit mode is opt-in. Set it in config, or override one fresh session with
-`--network audit`, to put a host-side interceptor in the path of outbound container traffic:
+Network audit and filter modes are opt-in. Set one in config, or override one fresh session
+with `--network audit` or `--network filter`, to put a host-side interceptor in the path of
+outbound container traffic:
 
 ```toml
 [network]
@@ -144,22 +145,33 @@ mode = "audit"
 ```
 
 Audit mode writes one Zeek `conn.log`-style JSON object per connection to
-`<session_dir>/logs/network.jsonl`. This phase is allow-and-log only: every connection is still
+`<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only: every connection is still
 allowed, but records include the best known host, destination IP and port, transport, service,
 byte counts, and duration. HTTPS remains opaque except for TLS SNI. URL, method, status, and
 body inspection are deferred.
 
+Filter mode uses the same interceptor and audit log, then applies global host/port policy
+before opening upstream TCP connections:
+
+```toml
+[network]
+mode    = "filter"
+default = "deny"
+allow   = ["github.com:443", "*.npmjs.org"]
+deny    = ["*:22"]
+```
+
+Policy is global-only because it belongs to the machine running the agent. Repo config may
+choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Deny entries win over
+allow entries, and unmatched connections use `default`. A denied connection is closed
+immediately and still writes a `network.jsonl` record with `outrig.action = "deny"` and zero
+byte counts, so the audit log is the place to diagnose network policy failures.
+
 When network mode is `default`, outrig leaves Podman's configured default networking in place,
 does not install nftables rules, does not rewrite container DNS, and does not create
 `network.jsonl`. Systems without nftables or namespace support therefore keep running normal
-sessions. If audit mode is explicitly enabled and the host cannot install the interceptor,
-startup fails before MCP servers launch.
-
-Network policy enforcement is not part of this phase. If the consequences of free network
-access matter for your repo, still gate the agent at the MCP-server level: don't include a
-`shell` MCP, only include MCP servers whose tools are scoped (a filesystem MCP, a code-search
-MCP, a tightly-defined custom MCP). The agent then can't shell out to arbitrary network calls
-because the tool surface doesn't expose any.
+sessions. If audit or filter mode is explicitly enabled and the host cannot install the
+interceptor, startup fails before MCP servers launch.
 
 ## See also
 

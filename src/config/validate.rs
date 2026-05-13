@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use super::{
     Config, ContainerConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
-    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, Model, normalize_capability_name,
+    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, Model, NetworkMode, normalize_capability_name,
 };
 
 #[derive(Debug, Error)]
@@ -149,6 +149,9 @@ pub enum ConfigValidationError {
 
     #[error("{path} must be at most {max} bytes; got {value}")]
     ToolResultCapTooLarge { path: String, value: u32, max: u32 },
+
+    #[error("{message}")]
+    NetworkPolicyInvalid { message: String },
 
     #[error(
         "model {model:?} (provider style=mistralrs) must set exactly one of \
@@ -286,6 +289,7 @@ pub(super) fn validate(
     if let Some(value) = cfg.tool_result_cap {
         validate_tool_result_cap("top-level tool-result-cap", value)?;
     }
+    validate_network_policy(cfg)?;
 
     for (agent_name, agent) in &cfg.agents {
         if let Some(value) = agent.tool_call_cap {
@@ -310,6 +314,13 @@ pub(super) fn validate(
     }
 
     Ok(())
+}
+
+fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {
+    cfg.network
+        .policy()
+        .validate(cfg.network.mode == NetworkMode::Filter)
+        .map_err(|message| ConfigValidationError::NetworkPolicyInvalid { message })
 }
 
 fn validate_container_security(

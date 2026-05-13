@@ -315,4 +315,40 @@ access         = "write-mostly"
             "error should explain invalid mount access, got: {msg}",
         );
     }
+
+    #[test]
+    fn network_action_values_are_validated_by_schema() {
+        let bad = r#"
+[network]
+default = "ask"
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        let OutrigError::Config(toml_err) = err else {
+            panic!("expected OutrigError::Config, got: {err:?}");
+        };
+        let msg = toml_err.to_string();
+        assert!(
+            msg.contains("ask") || msg.contains("unknown variant"),
+            "error should explain invalid network action, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn network_entry_unknown_fields_are_rejected() {
+        let bad = r#"
+[network]
+allow = [{ host = "example.com", method = "GET" }]
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        let OutrigError::Config(toml_err) = err else {
+            panic!("expected OutrigError::Config, got: {err:?}");
+        };
+        let msg = toml_err.to_string();
+        assert!(
+            msg.contains("method")
+                || msg.contains("unknown field")
+                || msg.contains("did not match any variant"),
+            "error should reject unknown network entry field, got: {msg}",
+        );
+    }
 }

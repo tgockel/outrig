@@ -8,7 +8,8 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, NetworkMode, merge,
+    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, NetworkAction,
+    NetworkEntry, NetworkMode, merge,
 };
 use outrig::error::OutrigError;
 
@@ -33,6 +34,82 @@ mod config_validate {
     fn all_good_validates_clean() {
         let cfg = parse(FIXTURE_FULL);
         cfg.validate(None).expect("fixture validates structurally");
+    }
+
+    #[test]
+    fn network_filter_policy_validates_clean() {
+        let cfg = parse(
+            r#"
+[network]
+mode    = "filter"
+default = "allow"
+allow   = ["github.com:443", "*.npmjs.org", "10.0.0.0/8", "[2001:db8::1]:443"]
+deny    = ["*:22", { host = "169.254.169.254", port = 80 }]
+"#,
+        );
+        cfg.validate(None).expect("network filter policy validates");
+        assert_eq!(cfg.network.mode, NetworkMode::Filter);
+        assert_eq!(cfg.network.default, NetworkAction::Allow);
+        assert_eq!(
+            cfg.network.allow[0],
+            NetworkEntry::with_port("github.com", 443),
+        );
+        assert_eq!(cfg.network.allow[1], NetworkEntry::new("*.npmjs.org"));
+        assert_eq!(cfg.network.allow[2], NetworkEntry::new("10.0.0.0/8"));
+        assert_eq!(
+            cfg.network.allow[3],
+            NetworkEntry::with_port("2001:db8::1", 443),
+        );
+        assert_eq!(cfg.network.deny[0], NetworkEntry::with_port("*", 22),);
+        assert_eq!(
+            cfg.network.deny[1],
+            NetworkEntry::with_port("169.254.169.254", 80),
+        );
+    }
+
+    #[test]
+    fn network_filter_requires_at_least_one_entry() {
+        let cfg = parse(
+            r#"
+[network]
+mode = "filter"
+default = "allow"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::NetworkPolicyInvalid { ref message } if message.contains("requires at least one")),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn network_policy_rejects_malformed_host_and_zero_port() {
+        let malformed = parse(
+            r#"
+[network]
+mode  = "filter"
+allow = ["bad host"]
+"#,
+        );
+        let err = expect_validation_err(&malformed, None);
+        assert!(
+            matches!(err, ConfigValidationError::NetworkPolicyInvalid { ref message } if message.contains("whitespace")),
+            "got: {err:?}",
+        );
+
+        let zero_port = parse(
+            r#"
+[network]
+mode  = "filter"
+allow = [{ host = "example.com", port = 0 }]
+"#,
+        );
+        let err = expect_validation_err(&zero_port, None);
+        assert!(
+            matches!(err, ConfigValidationError::NetworkPolicyInvalid { ref message } if message.contains("between 1 and 65535")),
+            "got: {err:?}",
+        );
     }
 
     #[test]
@@ -881,6 +958,7 @@ access         = "read-write"
             r#"
 [network]
 mode = "audit"
+allow = ["github.com:443"]
 "#,
         );
         let repo = parse(
@@ -891,6 +969,10 @@ mode = "default"
         );
         let merged = merge(global, repo);
         assert_eq!(merged.network.mode, NetworkMode::Default);
+        assert_eq!(
+            merged.network.allow,
+            vec![NetworkEntry::with_port("github.com", 443)],
+        );
     }
 
     #[test]
@@ -1046,6 +1128,56 @@ mode = "default"
         let cfg = Config::load(tmp.path(), Some(&global_cfg))
             .expect("repo network should override global network");
         assert_eq!(cfg.network.mode, NetworkMode::Default);
+    }
+
+    #[test]
+    fn repo_network_filter_mode_uses_global_policy() {
+        let tmp = tempdir().unwrap();
+        let global_cfg = tmp.path().join("global.toml");
+        fs::write(
+            &global_cfg,
+            r#"
+[network]
+default = "deny"
+allow = ["github.com:443"]
+"#,
+        )
+        .unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[network]
+mode = "filter"
+"#,
+        );
+
+        let cfg = Config::load(tmp.path(), Some(&global_cfg))
+            .expect("repo mode should combine with global policy");
+        assert_eq!(cfg.network.mode, NetworkMode::Filter);
+        assert_eq!(
+            cfg.network.allow,
+            vec![NetworkEntry::with_port("github.com", 443)],
+        );
+    }
+
+    #[test]
+    fn repo_network_policy_keys_are_rejected() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+[network]
+mode = "filter"
+allow = ["github.com:443"]
+"#,
+        );
+
+        let err = Config::load(tmp.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[network].allow belongs in global config"),
+            "got: {err:?}",
+        );
     }
 
     #[test]

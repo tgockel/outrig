@@ -37,37 +37,30 @@ running the agent.
 
 ```toml
 [network]
-default = "allow"   # or "deny"; default-of-default is "allow"
-
-[[network.rules]]
-host   = "*.npmjs.org"
-action = "allow"
-
-[[network.rules]]
-host   = "github.com"
-port   = 443
-action = "allow"
-
-[[network.rules]]
-host   = "*"
-port   = 22
-action = "deny"
+mode    = "filter"
+default = "deny"   # or "allow"; filter mode defaults to "deny"
+allow   = ["*.npmjs.org", "github.com:443"]
+deny    = ["*:22", { host = "169.254.169.254", port = 80 }]
 ```
 
-| Key               | Type   | Required | Default   | Description                               |
-|-------------------|--------|----------|-----------|-------------------------------------------|
-| `default`         | string | no       | `"allow"` | Action when no rule matches.              |
-| `rules`           | array  | no       | `[]`      | Rules evaluated top-to-bottom.            |
-| `rules[*].host`   | string | yes      | --        | Host glob, IP, or CIDR pattern.           |
-| `rules[*].port`   | int    | no       | any       | TCP port; omitted means any.              |
-| `rules[*].action` | string | yes      | --        | `"allow"` or `"deny"`.                    |
+| Key       | Type   | Required | Default | Description                         |
+|-----------|--------|----------|---------|-------------------------------------|
+| `mode`    | string | no       | default | `default`, `audit`, or `filter`.    |
+| `default` | string | no       | `deny`  | Action when no entry matches.       |
+| `allow`   | array  | no       | `[]`    | Host/CIDR entries to allow.         |
+| `deny`    | array  | no       | `[]`    | Host/CIDR entries to deny.          |
 
-When `[network]` is absent, behavior matches `default = "allow"` with no rules:
-every connection is allowed and logged.
+`allow` and `deny` accept compact string entries such as `"github.com:443"`,
+`"*.npmjs.org"`, `"*:22"`, `"10.0.0.0/8"`, and `"[2001:db8::1]:443"`.
+They also accept inline tables shaped as `{ host = "...", port = 443 }`.
+
+When `[network]` is absent, behavior matches 0059: normal sessions use
+Podman's default networking, and audit mode allows every connection and logs
+it. Filtering is enabled only with `mode = "filter"`.
 
 ## Runtime Behavior
 
-Rules are evaluated top-to-bottom; the first match wins. If no rule matches,
+Deny entries are evaluated before allow entries. If neither list matches,
 `default` applies. The matcher uses DNS cache entries, HTTP `Host` headers,
 HTTPS SNI, IP address, and port as available from 0059.
 
@@ -95,3 +88,19 @@ finds the reason in the audit log.
 - `0059-network-interceptor-plumbing.md` -- traffic capture and audit logging.
 - `0064-network-interceptor-mitm.md` -- later URL/body-aware HTTPS policy.
 - `doc/reference/config.md` -- formatting model for the `[network]` schema.
+
+## Decisions
+
+- Preserve the existing `default` and `audit` modes. Add `filter` for sessions
+  that install the interceptor and enforce policy.
+- Keep network policy global-only, but continue allowing repo config to set
+  `network.mode`. Repo-local `default`, `allow`, or `deny` entries are invalid.
+- Replace ordered `[[network.rules]]` with compact `allow` and `deny` lists.
+  Both string entries and inline `{ host, port }` tables are accepted; string
+  entries map to the same typed host/port form.
+- Deny wins when a destination matches both lists. If neither list matches,
+  the configured `default` action applies.
+- `mode = "filter"` requires at least one `allow` or `deny` entry, even when
+  `default = "allow"`, so filter mode cannot silently behave like audit mode.
+- The public Rust launch API gets a typed `NetworkPolicy` builder and
+  `LaunchSpec::with_network_filter(policy)`, which selects `filter` mode.

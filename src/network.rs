@@ -1,11 +1,11 @@
-//! Per-session network audit plumbing.
+//! Per-session network audit and filtering plumbing.
 //!
-//! Audit mode is intentionally opt-in. When enabled, OutRig installs a small
-//! nftables nat table in the session container's network namespace and keeps
-//! host-side listener sockets in that namespace. The accepted sockets carry
-//! the original destination metadata; upstream connections are opened from the
-//! host namespace, so OutRig's own traffic is not routed back through the
-//! interceptor.
+//! Interception is intentionally opt-in. When enabled, OutRig installs a
+//! small nftables nat table in the session container's network namespace and
+//! keeps host-side listener sockets in that namespace. The accepted sockets
+//! carry the original destination metadata; upstream connections are opened
+//! from the host namespace, so OutRig's own traffic is not routed back
+//! through the interceptor.
 
 use std::collections::BTreeMap;
 use std::fs::File as StdFile;
@@ -27,6 +27,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::{
+    NetworkAction, NetworkEntry, NetworkHostPattern, NetworkPolicy, parse_network_host_pattern,
+};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
@@ -40,6 +43,159 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 type DnsCache = Arc<Mutex<BTreeMap<IpAddr, String>>>;
 
+#[derive(Debug, Clone)]
+struct PolicyDecision {
+    action: NetworkAction,
+    rule: String,
+}
+
+impl PolicyDecision {
+    #[cfg(test)]
+    fn allow_default() -> Self {
+        Self {
+            action: NetworkAction::Allow,
+            rule: "default".to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompiledNetworkPolicy {
+    default: NetworkAction,
+    allow: Vec<CompiledNetworkEntry>,
+    deny: Vec<CompiledNetworkEntry>,
+}
+
+#[derive(Debug)]
+struct CompiledNetworkEntry {
+    pattern: NetworkHostPattern,
+    port: Option<u16>,
+}
+
+impl CompiledNetworkPolicy {
+    fn new(policy: NetworkPolicy) -> Result<Self> {
+        policy.validate(false).map_err(OutrigError::Configuration)?;
+        Ok(Self {
+            default: policy.default,
+            allow: compile_network_entries(policy.allow)?,
+            deny: compile_network_entries(policy.deny)?,
+        })
+    }
+
+    fn decide(&self, dst: SocketAddr, sniff: &Sniff) -> PolicyDecision {
+        for (idx, entry) in self.deny.iter().enumerate() {
+            if entry.matches(dst, sniff) {
+                return PolicyDecision {
+                    action: NetworkAction::Deny,
+                    rule: format!("deny[{idx}]"),
+                };
+            }
+        }
+        for (idx, entry) in self.allow.iter().enumerate() {
+            if entry.matches(dst, sniff) {
+                return PolicyDecision {
+                    action: NetworkAction::Allow,
+                    rule: format!("allow[{idx}]"),
+                };
+            }
+        }
+        PolicyDecision {
+            action: self.default,
+            rule: "default".to_string(),
+        }
+    }
+}
+
+impl CompiledNetworkEntry {
+    fn matches(&self, dst: SocketAddr, sniff: &Sniff) -> bool {
+        if self.port.is_some_and(|port| port != dst.port()) {
+            return false;
+        }
+        match &self.pattern {
+            NetworkHostPattern::Ip(ip) => *ip == dst.ip() || sniff.host_ip() == Some(*ip),
+            NetworkHostPattern::Cidr { base, prefix } => {
+                ip_in_cidr(dst.ip(), *base, *prefix)
+                    || sniff
+                        .host_ip()
+                        .is_some_and(|ip| ip_in_cidr(ip, *base, *prefix))
+            }
+            NetworkHostPattern::HostGlob(pattern) => {
+                glob_matches(pattern, &dst.ip().to_string())
+                    || sniff
+                        .host
+                        .as_deref()
+                        .is_some_and(|host| glob_matches(pattern, &host.to_ascii_lowercase()))
+            }
+        }
+    }
+}
+
+fn compile_network_entries(entries: Vec<NetworkEntry>) -> Result<Vec<CompiledNetworkEntry>> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            Ok(CompiledNetworkEntry {
+                pattern: parse_network_host_pattern(&entry.host)
+                    .map_err(OutrigError::Configuration)?,
+                port: entry.port,
+            })
+        })
+        .collect()
+}
+
+fn ip_in_cidr(ip: IpAddr, base: IpAddr, prefix: u8) -> bool {
+    match (ip, base) {
+        (IpAddr::V4(ip), IpAddr::V4(base)) => {
+            let ip = u32::from(ip);
+            let base = u32::from(base);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (ip & mask) == (base & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(base)) => {
+            let ip = u128::from(ip);
+            let base = u128::from(base);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (ip & mask) == (base & mask)
+        }
+        _ => false,
+    }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut rest = value;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            first = false;
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(stripped) = rest.strip_prefix(part) else {
+                return false;
+            };
+            rest = stripped;
+        } else {
+            let Some(idx) = rest.find(part) else {
+                return false;
+            };
+            rest = &rest[idx + part.len()..];
+        }
+        first = false;
+    }
+    pattern.ends_with('*') || rest.is_empty()
+}
+
 #[derive(Debug)]
 pub struct NetworkInterceptor {
     cancel: CancellationToken,
@@ -50,8 +206,18 @@ pub struct NetworkInterceptor {
 
 impl NetworkInterceptor {
     pub async fn start(container: &Container, log_dir: &Path, session_id: &str) -> Result<Self> {
+        Self::start_with_policy(container, log_dir, session_id, NetworkPolicy::allow_all()).await
+    }
+
+    pub async fn start_with_policy(
+        container: &Container,
+        log_dir: &Path,
+        session_id: &str,
+        policy: NetworkPolicy,
+    ) -> Result<Self> {
         require_tool("nft")?;
         require_tool("nsenter")?;
+        let policy = Arc::new(CompiledNetworkPolicy::new(policy)?);
 
         let pid = container_pid(container).await?;
         let sockets = bind_interceptor_sockets(pid)?;
@@ -81,6 +247,7 @@ impl NetworkInterceptor {
                 sockets.tcp,
                 audit.clone(),
                 dns_cache.clone(),
+                policy.clone(),
                 cancel.clone(),
             )),
             tokio::spawn(dns_loop(sockets.dns, dns_cache, cancel.clone())),
@@ -224,7 +391,7 @@ struct AuditRecord {
     #[serde(rename = "outrig.action")]
     outrig_action: &'static str,
     #[serde(rename = "outrig.rule")]
-    outrig_rule: &'static str,
+    outrig_rule: String,
 }
 
 impl AuditRecord {
@@ -250,8 +417,8 @@ impl AuditRecord {
             outrig_session_id: session_id.to_string(),
             outrig_container: container.to_string(),
             outrig_host: host,
-            outrig_action: "allow",
-            outrig_rule: "default",
+            outrig_action: event.decision.action.as_str(),
+            outrig_rule: event.decision.rule,
         }
     }
 }
@@ -265,6 +432,7 @@ struct AuditEvent {
     sniff: Sniff,
     bytes_tx: u64,
     bytes_rx: u64,
+    decision: PolicyDecision,
 }
 
 fn zeek_timestamp(ts: SystemTime) -> f64 {
@@ -304,10 +472,17 @@ struct Sniff {
     sni: Option<String>,
 }
 
+impl Sniff {
+    fn host_ip(&self) -> Option<IpAddr> {
+        self.host.as_deref()?.parse().ok()
+    }
+}
+
 async fn tcp_accept_loop(
     listener: TcpListener,
     audit: AuditSink,
     dns_cache: DnsCache,
+    policy: Arc<CompiledNetworkPolicy>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -316,7 +491,13 @@ async fn tcp_accept_loop(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
-                        tokio::spawn(handle_tcp(stream, peer, audit.clone(), dns_cache.clone()));
+                        tokio::spawn(handle_tcp(
+                            stream,
+                            peer,
+                            audit.clone(),
+                            dns_cache.clone(),
+                            policy.clone(),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(target: "outrig::network", "tcp accept failed: {e}");
@@ -333,6 +514,7 @@ async fn handle_tcp(
     orig: SocketAddr,
     audit: AuditSink,
     dns_cache: DnsCache,
+    policy: Arc<CompiledNetworkPolicy>,
 ) {
     let opened = SystemTime::now();
     let started = Instant::now();
@@ -350,6 +532,40 @@ async fn handle_tcp(
         host: cached_host(&dns_cache, dst.ip()),
         sni: None,
     };
+    let mut initial_client_bytes = Vec::new();
+
+    if dst.port() != 22 {
+        let mut buf = vec![0; 16 * 1024];
+        if let Ok(Ok(n)) = tokio::time::timeout(SNIFF_TIMEOUT, client.read(&mut buf)).await
+            && n > 0
+        {
+            initial_client_bytes.extend_from_slice(&buf[..n]);
+            sniff = sniff_client_bytes(&buf[..n]).unwrap_or(sniff);
+            if sniff.host.is_none() {
+                sniff.host = cached_host(&dns_cache, dst.ip());
+            }
+        }
+    }
+
+    let decision = policy.decide(dst, &sniff);
+    if decision.action == NetworkAction::Deny {
+        write_audit(
+            &audit,
+            AuditEvent {
+                opened,
+                duration: started.elapsed(),
+                orig,
+                dst,
+                sniff,
+                bytes_tx: 0,
+                bytes_rx: 0,
+                decision,
+            },
+        )
+        .await;
+        let _ = client.shutdown().await;
+        return;
+    }
 
     let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
         Ok(Ok(upstream)) => upstream,
@@ -365,6 +581,7 @@ async fn handle_tcp(
                     sniff,
                     bytes_tx,
                     bytes_rx,
+                    decision: decision.clone(),
                 },
             )
             .await;
@@ -382,6 +599,7 @@ async fn handle_tcp(
                     sniff,
                     bytes_tx,
                     bytes_rx,
+                    decision: decision.clone(),
                 },
             )
             .await;
@@ -410,39 +628,32 @@ async fn handle_tcp(
                         sniff,
                         bytes_tx,
                         bytes_rx,
+                        decision: decision.clone(),
                     },
                 )
                 .await;
                 return;
             }
         }
-    } else {
-        let mut buf = vec![0; 16 * 1024];
-        if let Ok(Ok(n)) = tokio::time::timeout(SNIFF_TIMEOUT, client.read(&mut buf)).await
-            && n > 0
-        {
-            sniff = sniff_client_bytes(&buf[..n]).unwrap_or(sniff);
-            if sniff.host.is_none() {
-                sniff.host = cached_host(&dns_cache, dst.ip());
-            }
-            bytes_tx += n as u64;
-            if let Err(e) = upstream.write_all(&buf[..n]).await {
-                tracing::debug!(target: "outrig::network", "initial upstream write failed: {e}");
-                write_audit(
-                    &audit,
-                    AuditEvent {
-                        opened,
-                        duration: started.elapsed(),
-                        orig,
-                        dst,
-                        sniff,
-                        bytes_tx,
-                        bytes_rx,
-                    },
-                )
-                .await;
-                return;
-            }
+    } else if !initial_client_bytes.is_empty() {
+        bytes_tx += initial_client_bytes.len() as u64;
+        if let Err(e) = upstream.write_all(&initial_client_bytes).await {
+            tracing::debug!(target: "outrig::network", "initial upstream write failed: {e}");
+            write_audit(
+                &audit,
+                AuditEvent {
+                    opened,
+                    duration: started.elapsed(),
+                    orig,
+                    dst,
+                    sniff,
+                    bytes_tx,
+                    bytes_rx,
+                    decision: decision.clone(),
+                },
+            )
+            .await;
+            return;
         }
     }
 
@@ -466,6 +677,7 @@ async fn handle_tcp(
             sniff,
             bytes_tx,
             bytes_rx,
+            decision,
         },
     )
     .await;
@@ -611,7 +823,7 @@ fn require_tool(name: &str) -> Result<()> {
         }
     }
     Err(OutrigError::Configuration(format!(
-        "network audit mode requires `{name}` on PATH"
+        "network interception requires `{name}` on PATH"
     )))
 }
 
@@ -1168,6 +1380,7 @@ mod tests {
                 },
                 bytes_tx: 517,
                 bytes_rx: 1298,
+                decision: PolicyDecision::allow_default(),
             },
         );
         let json = serde_json::to_value(record).expect("record json");
@@ -1194,6 +1407,118 @@ mod tests {
         assert!(json.get("host").is_none());
         assert!(json.get("bytes_tx").is_none());
         assert!(json.get("duration_ms").is_none());
+    }
+
+    #[test]
+    fn audit_record_writes_deny_decision_with_zero_bytes() {
+        let record = AuditRecord::new(
+            "20260513T000000-abcd",
+            "outrig-test",
+            AuditEvent {
+                opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                duration: Duration::from_millis(1),
+                orig: "10.0.2.100:50123".parse().expect("orig addr"),
+                dst: "93.184.216.34:443".parse().expect("dst addr"),
+                sniff: Sniff {
+                    service: "ssl",
+                    host: Some("example.com".to_string()),
+                    sni: Some("example.com".to_string()),
+                },
+                bytes_tx: 0,
+                bytes_rx: 0,
+                decision: PolicyDecision {
+                    action: NetworkAction::Deny,
+                    rule: "deny[0]".to_string(),
+                },
+            },
+        );
+        let json = serde_json::to_value(record).expect("record json");
+
+        assert_eq!(json["orig_bytes"], 0);
+        assert_eq!(json["resp_bytes"], 0);
+        assert_eq!(json["conn_state"], "S0");
+        assert_eq!(json["outrig.action"], "deny");
+        assert_eq!(json["outrig.rule"], "deny[0]");
+    }
+
+    #[test]
+    fn policy_deny_wins_over_allow() {
+        let policy = CompiledNetworkPolicy::new(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .allow_host("*")
+                .deny_host("example.com")
+                .build()
+                .expect("policy"),
+        )
+        .expect("compile policy");
+        let decision = policy.decide(
+            "93.184.216.34:443".parse().expect("dst"),
+            &Sniff {
+                service: "ssl",
+                host: Some("example.com".to_string()),
+                sni: Some("example.com".to_string()),
+            },
+        );
+
+        assert_eq!(decision.action, NetworkAction::Deny);
+        assert_eq!(decision.rule, "deny[0]");
+    }
+
+    #[test]
+    fn policy_matches_host_glob_ip_cidr_and_ports() {
+        let policy = CompiledNetworkPolicy::new(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .allow_host("*.npmjs.org")
+                .allow_host("10.0.0.0/8")
+                .allow_host_port("2001:db8::1", 443)
+                .build()
+                .expect("policy"),
+        )
+        .expect("compile policy");
+
+        let npm = policy.decide(
+            "104.16.0.1:443".parse().expect("dst"),
+            &Sniff {
+                service: "ssl",
+                host: Some("registry.npmjs.org".to_string()),
+                sni: Some("registry.npmjs.org".to_string()),
+            },
+        );
+        let cidr = policy.decide(
+            "10.2.3.4:22".parse().expect("dst"),
+            &Sniff {
+                service: "-",
+                host: None,
+                sni: None,
+            },
+        );
+        let ipv6 = policy.decide(
+            "[2001:db8::1]:443".parse().expect("dst"),
+            &Sniff {
+                service: "ssl",
+                host: None,
+                sni: None,
+            },
+        );
+        let ipv6_wrong_port = policy.decide(
+            "[2001:db8::1]:80".parse().expect("dst"),
+            &Sniff {
+                service: "http",
+                host: None,
+                sni: None,
+            },
+        );
+
+        assert_eq!(npm.action, NetworkAction::Allow);
+        assert_eq!(npm.rule, "allow[0]");
+        assert_eq!(cidr.action, NetworkAction::Allow);
+        assert_eq!(cidr.rule, "allow[1]");
+        assert_eq!(ipv6.action, NetworkAction::Allow);
+        assert_eq!(ipv6.rule, "allow[2]");
+        assert_eq!(ipv6_wrong_port.action, NetworkAction::Deny);
+        assert_eq!(ipv6_wrong_port.rule, "default");
     }
 
     #[test]

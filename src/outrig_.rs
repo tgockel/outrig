@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::config::{
     CapabilityProfile, ContainerConfig, ContainerSecurity, ContainerSourceRef, EnvValue,
-    McpServerSpec, MountAccess, NetworkMode, Workspace,
+    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, Workspace,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -73,6 +73,7 @@ pub struct CapabilitySpec {
 #[derive(Debug, Clone, Default)]
 pub struct NetworkSpec {
     pub mode: NetworkMode,
+    pub policy: Option<NetworkPolicy>,
 }
 
 impl From<&ContainerSecurity> for SecuritySpec {
@@ -250,6 +251,12 @@ impl LaunchSpec {
         self.network.mode = mode;
         self
     }
+
+    pub fn with_network_filter(mut self, policy: NetworkPolicy) -> Self {
+        self.network.mode = NetworkMode::Filter;
+        self.network.policy = Some(policy);
+        self
+    }
 }
 
 fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
@@ -335,6 +342,27 @@ impl Outrig {
                 NetworkInterceptor::start(&container, &spec.log_dir, container.session_suffix())
                     .await?,
             ),
+            NetworkMode::Filter => {
+                let policy = spec.network.policy.clone().ok_or_else(|| {
+                    crate::error::OutrigError::Configuration(
+                        "network filter mode requires a NetworkPolicy; use \
+                         LaunchSpec::with_network_filter(policy)"
+                            .to_string(),
+                    )
+                })?;
+                policy
+                    .validate(true)
+                    .map_err(crate::error::OutrigError::Configuration)?;
+                Some(
+                    NetworkInterceptor::start_with_policy(
+                        &container,
+                        &spec.log_dir,
+                        container.session_suffix(),
+                        policy,
+                    )
+                    .await?,
+                )
+            }
         };
 
         let mcp = embedded::merged_mcp(&container, &spec.mcp).await?;

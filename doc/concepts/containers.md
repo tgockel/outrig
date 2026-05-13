@@ -215,8 +215,8 @@ bind-mount, any configured extra workspace mounts, and the runtime user-mapping 
 config opts into a capability profile or explicit `cap-drop` / `cap-add` entries.
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
-filesystems, or network egress policy in this container launch path. Network audit mode is a
-separate session-level interceptor; see
+filesystems, or network egress policy in this container launch path. Network audit/filter mode
+is a separate session-level interceptor; see
 [Workspace](workspace.md#network-is-not-part-of-the-workspace).
 
 ## See also

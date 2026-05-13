@@ -164,10 +164,16 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None => None,
     };
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode);
-    if attach.is_some() && network_mode == NetworkMode::Audit {
+    if attach.is_some() && matches!(network_mode, NetworkMode::Audit | NetworkMode::Filter) {
         return Err(OutrigError::Configuration(
-            "`--network audit` cannot be used with `outrig mcp --attach`; \
-             start a fresh session to install network monitoring"
+            "`--network audit` and `--network filter` cannot be used with \
+             `outrig mcp --attach`; start a fresh session to install network monitoring"
+                .to_string(),
+        ));
+    }
+    if network_mode == NetworkMode::Filter && !cfg.network.has_policy_entries() {
+        return Err(OutrigError::Configuration(
+            "network filter mode requires at least one global [network] allow or deny entry"
                 .to_string(),
         ));
     }
@@ -409,6 +415,27 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             match NetworkInterceptor::start(&container, &log_dir, sid.as_str()).await {
                 Ok(interceptor) => {
                     span.done("network audit interceptor ready");
+                    Some(interceptor)
+                }
+                Err(e) => {
+                    let _ = container.stop(STOP_GRACE).await;
+                    let _ = store.finalize(&sid, SystemTime::now(), 1);
+                    return Err(e);
+                }
+            }
+        }
+        NetworkMode::Filter => {
+            let span = ProgressSpan::start("starting network filter interceptor");
+            match NetworkInterceptor::start_with_policy(
+                &container,
+                &log_dir,
+                sid.as_str(),
+                cfg.network.policy(),
+            )
+            .await
+            {
+                Ok(interceptor) => {
+                    span.done("network filter interceptor ready");
                     Some(interceptor)
                 }
                 Err(e) => {

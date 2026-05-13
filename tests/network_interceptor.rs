@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use outrig::config::ContainerConfig;
+use outrig::config::{ContainerConfig, NetworkAction, NetworkPolicy};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig::network::NetworkInterceptor;
@@ -161,4 +161,80 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
 
     interceptor.shutdown().await;
     container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+#[tokio::test]
+async fn filter_mode_denies_matching_host_before_upstream_bytes() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let mut container = Container::start(
+        &image,
+        ContainerLaunchSpec::workspace(workspace.path(), PathBuf::from("/workspace")),
+    )
+    .await
+    .expect("start container");
+    container.bootstrap_user().await.expect("bootstrap user");
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Allow)
+        .deny_host("example.com")
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let output = process::try_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+        "curl",
+        "-fsS",
+        "--connect-timeout",
+        "5",
+        "https://example.com",
+    ]))
+    .await
+    .expect("curl through interceptor");
+    assert!(
+        !output.status.success(),
+        "curl should fail when example.com is denied"
+    );
+
+    let records = read_audit_records(&log_dir).await;
+    let record = records
+        .iter()
+        .find(|record| {
+            record.get("outrig.host").and_then(Value::as_str) == Some("example.com")
+                && record.get("id.resp_p").and_then(Value::as_u64) == Some(443)
+        })
+        .unwrap_or_else(|| panic!("no denied example.com:443 audit record in {records:#?}"));
+
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("deny")
+    );
+    assert_eq!(
+        record.get("outrig.rule").and_then(Value::as_str),
+        Some("deny[0]")
+    );
+    assert_eq!(record.get("orig_bytes").and_then(Value::as_u64), Some(0));
+    assert_eq!(record.get("resp_bytes").and_then(Value::as_u64), Some(0));
+
+    interceptor.shutdown().await;
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
 }

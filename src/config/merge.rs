@@ -13,9 +13,9 @@ use super::Config;
 ///   `default-model`, `session-root`, `model-cache-root`,
 ///   `tool-call-cap`, `tool-result-cap`): repo's value wins if set,
 ///   else global's.
-/// - `[network]` follows repo precedence when the repo file declares the
-///   table. An absent repo table keeps the global value so global audit mode
-///   is not accidentally reset to the default mode.
+/// - `[network].mode` follows repo precedence when the repo file declares the
+///   table. Policy keys (`default`, `allow`, `deny`) are global-only and are
+///   always taken from the global config.
 /// - `[workspace]` primary fields are repo-owned. Since `Workspace` has serde
 ///   defaults, an absent block in the repo file deserializes to those defaults
 ///   -- so taking repo `host-path`/`container-path` unconditionally matches
@@ -40,11 +40,13 @@ pub fn merge(global: Config, repo: Config) -> Config {
     mounts.extend(workspace.mounts);
     workspace.mounts = mounts;
 
-    let network = if repo.network.is_declared() {
-        repo.network
+    let mut network = global.network;
+    if repo.network.is_declared() {
+        network.mode = repo.network.mode;
+        network.set_declared(true);
     } else {
-        global.network
-    };
+        network.set_declared(false);
+    }
 
     Config {
         default_container: repo.default_container.or(global.default_container),

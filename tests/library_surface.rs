@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 use outrig::config::McpServerSpec;
 use outrig::{
-    CapabilityProfile, CapabilitySpec, LaunchSpec, MountAccess, MountSpec, NetworkMode, Outrig,
+    CapabilityProfile, CapabilitySpec, LaunchSpec, MountAccess, MountSpec, NetworkAction,
+    NetworkMode, NetworkPolicy, Outrig,
 };
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -48,6 +49,25 @@ fn build_fixture_image(tag: &str) {
         .status()
         .expect("spawn podman build");
     assert!(status.success(), "podman build exited non-zero: {status:?}");
+}
+
+#[test]
+fn network_filter_builder_is_on_curated_surface() {
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("github.com", 443)
+        .deny_host_port("*", 22)
+        .build()
+        .expect("policy builds");
+    let spec = LaunchSpec::from_image(
+        "localhost/outrig-unused:latest",
+        BTreeMap::new(),
+        tempfile::tempdir().expect("session").path().join("logs"),
+    )
+    .with_network_filter(policy);
+
+    assert_eq!(spec.network.mode, NetworkMode::Filter);
+    assert!(spec.network.policy.is_some());
 }
 
 #[tokio::test]

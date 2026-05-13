@@ -30,7 +30,10 @@ tool-call-cap     = 100                               # optional; defaults to 50
 tool-result-cap   = 262144                            # optional; defaults to 256 KiB
 
 [network]
-mode = "default"                                      # optional; "audit" enables network.jsonl
+mode = "default"                                      # optional: default, audit, or filter
+default = "deny"                                      # optional for filter mode
+allow = ["github.com:443", "*.npmjs.org"]             # optional; global only
+deny  = ["*:22"]                                      # optional; global only
 ```
 
 | Key                 | Type    | Required               | Where  | Description                    |
@@ -43,13 +46,18 @@ mode = "default"                                      # optional; "audit" enable
 | `tool-call-cap`     | integer | no                     | global | Per-turn tool-call cap.        |
 | `tool-result-cap`   | integer | no                     | global | Per-tool-result byte cap.      |
 | `network.mode`      | string  | no                     | either | Network mode.                  |
+| `network.default`   | string  | no                     | global | Filter fallback action.        |
+| `network.allow`     | array   | no                     | global | Filter allow entries.          |
+| `network.deny`      | array   | no                     | global | Filter deny entries.           |
 
 `default-container` and `default-agent` belong in the repo config -- containers and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-cap`
 belong in the global config since they're user/machine-level. `tool-result-cap` usually belongs
-there too, although repo or agent config can tighten it for a noisy project. `[network]` can
-live in either file; when both set it, the repo value wins for that repo. Each may also appear
-in the other file; repo entries override global by name.
+there too, although repo or agent config can tighten it for a noisy project. `[network].mode`
+can live in either file; when both set it, the repo value wins for that repo. Network policy
+keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
+egress policy, not a project preference. Each may also appear in the other file; repo entries
+override global by name.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -76,7 +84,7 @@ marker that reports the original size and cap.
 
 ## `[network]`
 
-Network audit is disabled by default:
+Network interception is disabled by default:
 
 ```toml
 [network]
@@ -89,16 +97,40 @@ Accepted modes:
   not write `logs/network.jsonl`.
 - `audit`: allow all outbound session-container traffic, but write Zeek `conn.log`-style
   records to `<session_dir>/logs/network.jsonl`.
+- `filter`: install the same interceptor as audit mode, write the same audit log, and enforce
+  global allow/deny policy before opening upstream TCP connections.
 
-Audit mode requires host `nft` and `nsenter` plus permission to enter the rootless podman
+Audit and filter mode require host `nft` and `nsenter` plus permission to enter the rootless podman
 container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
 send DNS to the per-session in-namespace DNS listener, installs nftables redirection for
-outbound TCP and UDP/53, and removes the nftables table during teardown. If audit mode is
+outbound TCP and UDP/53, and removes the nftables table during teardown. If either mode is
 requested and setup fails, the session fails before MCP servers launch.
 
-`outrig run --network default|audit` and `outrig mcp --network default|audit` override this
-setting for one fresh session. `--network audit` is rejected with `outrig mcp --attach` because
-borrowed containers are not retrofitted with a new interceptor.
+Filter policy lives in the global config only:
+
+```toml
+[network]
+mode    = "filter"
+default = "deny"              # optional; absent means "deny" in filter mode
+allow   = ["github.com:443", "*.npmjs.org", "10.0.0.0/8"]
+deny    = ["*:22", { host = "169.254.169.254", port = 80 }]
+```
+
+`allow` and `deny` entries can be compact strings or inline tables. The string `"host"` maps
+to `{ host = "host" }`; `"host:443"` maps to `{ host = "host", port = 443 }`; `"*:22"` maps
+to `{ host = "*", port = 22 }`; `"[2001:db8::1]:443"` maps to an IPv6 host plus port; and
+CIDRs such as `"10.0.0.0/8"` or `"2001:db8::/32"` match IP destinations. Inline tables use
+`{ host = "...", port = 443 }`, with `port` optional.
+
+Filter evaluation checks `deny` entries first, then `allow` entries, then `default`. Denied
+connections are closed immediately and still write an audit record with
+`outrig.action = "deny"`, `outrig.rule`, and zero byte counts. `mode = "filter"` requires at
+least one `allow` or `deny` entry, even when `default = "allow"`.
+
+`outrig run --network default|audit|filter` and `outrig mcp --network default|audit|filter`
+override this setting for one fresh session. `--network audit` and `--network filter` are
+rejected with `outrig mcp --attach` because borrowed containers are not retrofitted with a new
+interceptor.
 
 ## `[providers.<name>]`
 
@@ -464,9 +496,10 @@ before the REPL starts.
 global mounts are kept first, followed by repo mounts. Duplicate final `container-path` values
 are rejected during validation.
 
-`[network]` follows repo precedence when the repo config declares the table. If the repo omits
-`[network]`, the global value remains in effect. This matters when global config enables audit
-mode and a repo explicitly sets `mode = "default"`.
+`[network].mode` follows repo precedence when the repo config declares the table. If the repo
+omits `[network]`, the global mode remains in effect. This matters when global config enables
+audit or filter mode and a repo explicitly sets `mode = "default"`. Network policy keys are
+global-only; repo config cannot set `network.default`, `network.allow`, or `network.deny`.
 
 ## Full examples
 
@@ -480,7 +513,10 @@ tool-call-cap    = 100                           # optional; default = 50
 tool-result-cap  = 262144                        # optional; default = 256 KiB
 
 [network]
-mode = "default"                                 # optional; use "audit" for network.jsonl
+mode = "default"                                 # optional; default, audit, or filter
+default = "deny"                                 # optional for filter mode
+allow = ["github.com:443", "*.npmjs.org"]        # optional; global only
+deny  = ["*:22"]                                 # optional; global only
 
 [providers.openai]
 style    = "openai"

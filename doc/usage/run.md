@@ -13,7 +13,7 @@ outrig run [--agent <name>]
            [--config <path>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
-           [--network <default|audit>]
+           [--network <default|audit|filter>]
            [--session-dir <path>]
            [--session-root <path>]
            [--verbose]
@@ -28,8 +28,9 @@ outrig run [--agent <name>]
   per-turn tool-call cap for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
   override the per-tool-result byte cap for this run.
-- `--network <default|audit>` (default: config `[network].mode`, else `default`): choose
-  Podman's default networking or enable network audit logging for this run.
+- `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
+  choose Podman's default networking, network audit logging, or global network filtering for
+  this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
   directory; symlinked from the root.
 - `--session-root <path>` (default: `session-root` config, else XDG): root directory
@@ -72,9 +73,10 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
    `/home/<user>` exists and is owned by them. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
-6. **Start network audit mode, if enabled.** `--network audit` or
-   `[network].mode = "audit"` installs the per-session interceptor and opens
-   `<session_dir>/logs/network.jsonl`. The default mode skips this step entirely.
+6. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
+   matching `[network].mode` config installs the per-session interceptor and opens
+   `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.
+   The default mode skips this step entirely.
 7. **Connect MCP servers.** For each entry in `[containers.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`.

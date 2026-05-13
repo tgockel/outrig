@@ -10,6 +10,7 @@ pub mod validate;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
@@ -117,6 +118,7 @@ impl Config {
         let repo_path = crate::repo::repo_config_path(repo_root);
         let repo_text = fs::read_to_string(&repo_path)?;
         let repo_cfg = Self::load_from_str(&repo_text)?;
+        reject_repo_network_policy(&repo_text)?;
 
         let global_cfg = match global_path {
             Some(g) => match fs::read_to_string(g) {
@@ -146,6 +148,23 @@ fn declares_top_level_network(text: &str) -> Result<bool> {
         crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
     })?;
     Ok(value.as_table().contains_key("network"))
+}
+
+fn reject_repo_network_policy(text: &str) -> Result<()> {
+    let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
+        crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
+    })?;
+    let Some(network) = value.get("network").and_then(toml_edit::Item::as_table) else {
+        return Ok(());
+    };
+    for key in ["default", "allow", "deny"] {
+        if network.contains_key(key) {
+            return Err(OutrigError::Configuration(format!(
+                "repo config may set [network].mode only; [network].{key} belongs in global config"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,6 +270,7 @@ pub enum NetworkMode {
     #[default]
     Default,
     Audit,
+    Filter,
 }
 
 impl std::str::FromStr for NetworkMode {
@@ -260,7 +280,8 @@ impl std::str::FromStr for NetworkMode {
         match s {
             "default" => Ok(Self::Default),
             "audit" => Ok(Self::Audit),
-            _ => Err("expected one of: default, audit".to_string()),
+            "filter" => Ok(Self::Filter),
+            _ => Err("expected one of: default, audit, filter".to_string()),
         }
     }
 }
@@ -270,7 +291,250 @@ impl std::fmt::Display for NetworkMode {
         match self {
             Self::Default => f.write_str("default"),
             Self::Audit => f.write_str("audit"),
+            Self::Filter => f.write_str("filter"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkAction {
+    Allow,
+    #[default]
+    Deny,
+}
+
+impl NetworkAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    fn is_deny(action: &Self) -> bool {
+        *action == Self::Deny
+    }
+}
+
+impl std::fmt::Display for NetworkAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NetworkEntry {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+impl NetworkEntry {
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: None,
+        }
+    }
+
+    pub fn with_port(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port: Some(port),
+        }
+    }
+
+    pub(crate) fn validate(&self, path: &str) -> std::result::Result<(), String> {
+        if self.port == Some(0) {
+            return Err(format!("{path}.port must be between 1 and 65535"));
+        }
+        parse_network_host_pattern(&self.host)
+            .map(|_| ())
+            .map_err(|e| format!("{path}.host {e}"))
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+        struct Table {
+            host: String,
+            #[serde(default)]
+            port: Option<u16>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            String(String),
+            Table(Table),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::String(s) => parse_network_entry_string(&s).map_err(serde::de::Error::custom),
+            Repr::Table(t) => Ok(Self {
+                host: t.host,
+                port: t.port,
+            }),
+        }
+    }
+}
+
+fn parse_network_entry_string(s: &str) -> std::result::Result<NetworkEntry, String> {
+    if s.is_empty() {
+        return Err("network entry must not be empty".to_string());
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err("bracketed IPv6 network entry is missing `]`".to_string());
+        };
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let Some(raw) = suffix.strip_prefix(':') else {
+                return Err("bracketed network entry may only be followed by `:<port>`".to_string());
+            };
+            Some(parse_network_port(raw)?)
+        };
+        return Ok(NetworkEntry {
+            host: host.to_string(),
+            port,
+        });
+    }
+
+    if s.matches(':').count() == 1 {
+        let (host, raw_port) = s
+            .rsplit_once(':')
+            .expect("single colon implies split_once succeeds");
+        if raw_port.is_empty() {
+            return Err("network entry port must not be empty".to_string());
+        }
+        if raw_port.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(NetworkEntry {
+                host: host.to_string(),
+                port: Some(parse_network_port(raw_port)?),
+            });
+        }
+        return Err("network entry port must be an integer".to_string());
+    }
+
+    Ok(NetworkEntry {
+        host: s.to_string(),
+        port: None,
+    })
+}
+
+fn parse_network_port(raw: &str) -> std::result::Result<u16, String> {
+    if raw.is_empty() {
+        return Err("network entry port must not be empty".to_string());
+    }
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| "network entry port must be between 1 and 65535".to_string())?;
+    if port == 0 {
+        return Err("network entry port must be between 1 and 65535".to_string());
+    }
+    Ok(port)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NetworkPolicy {
+    #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
+    pub default: NetworkAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<NetworkEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<NetworkEntry>,
+}
+
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self {
+            default: NetworkAction::Deny,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+impl NetworkPolicy {
+    pub fn builder() -> NetworkPolicyBuilder {
+        NetworkPolicyBuilder::default()
+    }
+
+    pub(crate) fn allow_all() -> Self {
+        Self {
+            default: NetworkAction::Allow,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.allow.is_empty() || !self.deny.is_empty()
+    }
+
+    pub(crate) fn validate(&self, require_entries: bool) -> std::result::Result<(), String> {
+        if require_entries && !self.has_entries() {
+            return Err(
+                "network filter mode requires at least one allow or deny entry".to_string(),
+            );
+        }
+        for (idx, entry) in self.allow.iter().enumerate() {
+            entry.validate(&format!("network.allow[{idx}]"))?;
+        }
+        for (idx, entry) in self.deny.iter().enumerate() {
+            entry.validate(&format!("network.deny[{idx}]"))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPolicyBuilder {
+    policy: NetworkPolicy,
+}
+
+impl NetworkPolicyBuilder {
+    pub fn default_action(mut self, action: NetworkAction) -> Self {
+        self.policy.default = action;
+        self
+    }
+
+    pub fn allow_host(mut self, host: impl Into<String>) -> Self {
+        self.policy.allow.push(NetworkEntry::new(host));
+        self
+    }
+
+    pub fn allow_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.policy.allow.push(NetworkEntry::with_port(host, port));
+        self
+    }
+
+    pub fn deny_host(mut self, host: impl Into<String>) -> Self {
+        self.policy.deny.push(NetworkEntry::new(host));
+        self
+    }
+
+    pub fn deny_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.policy.deny.push(NetworkEntry::with_port(host, port));
+        self
+    }
+
+    pub fn build(self) -> Result<NetworkPolicy> {
+        self.policy
+            .validate(true)
+            .map_err(OutrigError::Configuration)?;
+        Ok(self.policy)
     }
 }
 
@@ -278,6 +542,12 @@ impl std::fmt::Display for NetworkMode {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct NetworkConfig {
     pub mode: NetworkMode,
+    #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
+    pub default: NetworkAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<NetworkEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<NetworkEntry>,
     #[serde(skip)]
     #[schemars(skip)]
     declared: bool,
@@ -287,6 +557,9 @@ impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
             mode: NetworkMode::Default,
+            default: NetworkAction::Deny,
+            allow: Vec::new(),
+            deny: Vec::new(),
             declared: false,
         }
     }
@@ -295,6 +568,9 @@ impl Default for NetworkConfig {
 impl PartialEq for NetworkConfig {
     fn eq(&self, other: &Self) -> bool {
         self.mode == other.mode
+            && self.default == other.default
+            && self.allow == other.allow
+            && self.deny == other.deny
     }
 }
 
@@ -304,12 +580,86 @@ impl NetworkConfig {
     pub(crate) fn is_declared(&self) -> bool {
         self.declared
     }
+
+    pub(crate) fn set_declared(&mut self, declared: bool) {
+        self.declared = declared;
+    }
+
+    pub fn policy(&self) -> NetworkPolicy {
+        NetworkPolicy {
+            default: self.default,
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+        }
+    }
+
+    pub(crate) fn has_policy_entries(&self) -> bool {
+        !self.allow.is_empty() || !self.deny.is_empty()
+    }
 }
 
 impl NetworkConfig {
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkHostPattern {
+    Ip(IpAddr),
+    Cidr { base: IpAddr, prefix: u8 },
+    HostGlob(String),
+}
+
+pub(crate) fn parse_network_host_pattern(
+    host: &str,
+) -> std::result::Result<NetworkHostPattern, String> {
+    if host.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err("must not contain whitespace".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(NetworkHostPattern::Ip(ip));
+    }
+    if let Some((raw_ip, raw_prefix)) = host.split_once('/') {
+        let ip = raw_ip
+            .parse::<IpAddr>()
+            .map_err(|_| "has an invalid CIDR address".to_string())?;
+        let prefix = raw_prefix
+            .parse::<u8>()
+            .map_err(|_| "has an invalid CIDR prefix".to_string())?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(format!(
+                "has CIDR prefix {prefix}, maximum for this address is {max}"
+            ));
+        }
+        return Ok(NetworkHostPattern::Cidr { base: ip, prefix });
+    }
+    if host.contains('/') || host.contains(':') {
+        return Err("must be a hostname glob, IP address, or CIDR".to_string());
+    }
+    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return Err("has an invalid hostname glob".to_string());
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '*')
+    {
+        return Err("has an invalid hostname glob".to_string());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("has an invalid hostname glob".to_string());
+        }
+        if label != "*" && !label.contains('*') && (label.starts_with('-') || label.ends_with('-'))
+        {
+            return Err("has an invalid hostname glob".to_string());
+        }
+    }
+    Ok(NetworkHostPattern::HostGlob(host.to_ascii_lowercase()))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
