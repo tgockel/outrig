@@ -33,8 +33,9 @@ use outrig::mcp::McpClient;
 use outrig::session::{Session, SessionId, SessionStore};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
+use serde_json::Value;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 mod common;
 use common::stream_lines;
@@ -203,6 +204,141 @@ fn stderr_value<'a>(stderr: &'a str, prefix: &str) -> &'a str {
         .unwrap_or_else(|| panic!("stderr lacked {prefix:?}: {stderr}"))
 }
 
+async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            {
+                let snapshot = stderr.lock().unwrap().clone();
+                if let Some(value) = snapshot
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+                {
+                    return value.to_string();
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
+}
+
+async fn initialize_http_session(client: &reqwest::Client, url: &str, id: u64) -> String {
+    let response = client
+        .post(url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "outrig-test",
+                    "version": "1.0.0"
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("POST initialize");
+    assert!(
+        response.status().is_success(),
+        "initialize failed with status {}",
+        response.status()
+    );
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("mcp-session-id header")
+        .to_str()
+        .expect("session id utf-8")
+        .to_string();
+    let _ = response.text().await.expect("initialize body");
+
+    let response = client
+        .post(url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("mcp-session-id", &session_id)
+        .header("Mcp-Protocol-Version", "2025-06-18")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .expect("POST notifications/initialized");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "initialized notification should be accepted"
+    );
+
+    session_id
+}
+
+async fn post_http_mcp(
+    client: &reqwest::Client,
+    url: &str,
+    session_id: &str,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let response = client
+        .post(url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .header("mcp-session-id", session_id)
+        .header("Mcp-Protocol-Version", "2025-06-18")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST {method}: {e}"));
+    assert!(
+        response.status().is_success(),
+        "{method} failed with status {}",
+        response.status()
+    );
+    let body = response.text().await.expect("response body");
+    json_rpc_response(&body, id)
+}
+
+fn json_rpc_response(body: &str, id: u64) -> Value {
+    if let Ok(value) = serde_json::from_str::<Value>(body)
+        && value.get("id").and_then(Value::as_u64) == Some(id)
+    {
+        return value;
+    }
+
+    for event in body.split("\n\n") {
+        let data = event
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data.trim())
+            && value.get("id").and_then(Value::as_u64) == Some(id)
+        {
+            return value;
+        }
+    }
+
+    panic!("no JSON-RPC response id {id} in body: {body}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
     let _ = tracing_subscriber::fmt()
@@ -344,6 +480,147 @@ async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
     );
 
     // Verify our specific container was cleaned up.
+    let session_line = stderr_str
+        .lines()
+        .find(|l| l.contains("[outrig] container started:"))
+        .expect("banner must include `container started` line");
+    let our_container = session_line
+        .split("started:")
+        .nth(1)
+        .expect("container name after `started:`")
+        .trim();
+    let ps = Command::new("podman")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("name={our_container}"))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        leftovers.trim().is_empty(),
+        "this run's container `{our_container}` is still alive: {leftovers}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_listen_http_serves_multiple_independent_sessions() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut child = Command::new(bin)
+        .args(["mcp", "--listen", "127.0.0.1:0"])
+        .current_dir(repo_dir.path())
+        .env("OUTRIG_LOG", "info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig mcp --listen");
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_task = tokio::spawn(stream_lines(stderr, stderr_buf.clone(), "stderr"));
+
+    let url = wait_for_stderr_value(stderr_buf.clone(), "[outrig] listen: ").await;
+    assert!(
+        url.starts_with("http://127.0.0.1:") && url.ends_with("/mcp"),
+        "unexpected listen URL: {url}"
+    );
+    wait_for_stderr_value(stderr_buf.clone(), "[outrig] mcp server ready").await;
+
+    let client = reqwest::Client::new();
+    let session_a = initialize_http_session(&client, &url, 1).await;
+    let session_b = initialize_http_session(&client, &url, 2).await;
+    assert_ne!(
+        session_a, session_b,
+        "each HTTP client should get a distinct MCP session"
+    );
+
+    for (idx, session_id) in [session_a.as_str(), session_b.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        let list = post_http_mcp(
+            &client,
+            &url,
+            session_id,
+            10 + idx as u64,
+            "tools/list",
+            serde_json::json!({}),
+        )
+        .await;
+        let tool_names = list["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            tool_names.iter().any(|name| *name == "fs__list_directory"),
+            "tools/list should include fs__list_directory: {list}"
+        );
+
+        let call = post_http_mcp(
+            &client,
+            &url,
+            session_id,
+            20 + idx as u64,
+            "tools/call",
+            serde_json::json!({
+                "name": "fs__list_directory",
+                "arguments": { "path": "/workspace" }
+            }),
+        )
+        .await;
+        assert!(
+            call["result"]["isError"] != Value::Bool(true),
+            "fs__list_directory should not error: {call}"
+        );
+        assert!(
+            call.to_string().contains("HELLO.txt"),
+            "list_directory should see HELLO.txt: {call}"
+        );
+    }
+
+    let pid = child.id().expect("child pid").to_string();
+    let term = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .await
+        .expect("send SIGTERM");
+    assert!(term.success(), "kill -TERM failed with {term}");
+
+    let status = timeout(TEST_TIMEOUT, child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = stderr_task.await;
+    let stderr_str = stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr_str}");
+
+    assert!(
+        status.success(),
+        "outrig mcp --listen exited with {status:?}; stderr was: {stderr_str}"
+    );
+    assert!(
+        stderr_str.contains("[outrig] transport: streamable-http"),
+        "stderr lacked streamable transport banner: {stderr_str}"
+    );
+    assert!(
+        !stderr_str.contains("outstanding refs"),
+        "HTTP shutdown should release MCP client refs before teardown: {stderr_str}"
+    );
+
     let session_line = stderr_str
         .lines()
         .find(|l| l.contains("[outrig] container started:"))

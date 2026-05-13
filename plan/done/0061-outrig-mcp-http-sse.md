@@ -84,3 +84,19 @@ to expose it broadly should put a reverse proxy with auth in front.
 
 None hard. The session-MCP `outrig mcp` subcommand has shipped in `plan/done/0040`
 and `plan/done/0041`.
+
+## Decisions
+
+- The implementation uses the repo's current `rmcp 1.6` Streamable HTTP server
+  API (`StreamableHttpService` / `StreamableHttpServerConfig`) instead of the
+  older `rmcp 0.1.5` `sse_server` API named in the original task.
+- `--listen` keeps one shared `ProxyServer` and one shared backing
+  `Arc<McpClient>` pool. Each HTTP MCP client gets an independent rmcp session
+  from `LocalSessionManager`, while upstream tool calls multiplex over the
+  existing backing MCP JSON-RPC connections.
+- Auth remains out of scope. Loopback TCP keeps rmcp's default host checks;
+  non-loopback TCP binds warn and disable those host checks so remote clients
+  can connect; Unix sockets rely on filesystem permissions.
+- HTTP/SSE mode is daemon-shaped: disconnecting one client closes that MCP
+  session only. The process exits on SIGINT, SIGTERM, or attached-container
+  shutdown.

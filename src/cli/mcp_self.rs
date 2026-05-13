@@ -19,6 +19,11 @@ pub async fn execute(args: &McpArgs) -> Result<i32> {
             "`outrig mcp self` does not attach to a container; remove --attach".to_string(),
         ));
     }
+    if args.listen.is_some() {
+        return Err(OutrigError::Configuration(
+            "`outrig mcp self` serves stdio only; remove --listen".to_string(),
+        ));
+    }
 
     crate::mcp_self::serve_stdio().await
 }

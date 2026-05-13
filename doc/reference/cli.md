@@ -145,6 +145,7 @@ Serve the selected container-config's backing MCP servers as one MCP server over
 ```
 outrig mcp [--container <name>]
            [--attach <session-id-or-container-name>]
+           [--listen <addr>]
            [--env <KEY=VALUE>]
            [--network <default|audit|filter>]
            [--session-dir <path>]
@@ -168,6 +169,7 @@ outrig mcp self
 |------------------------|------------------------------|---------------------------------------|
 | `--container <name>`   | `default-container`          | Container-config to launch.           |
 | `--attach <id-or-name>`| off                          | Reuse an existing container.          |
+| `--listen <addr>`      | off                          | Serve Streamable HTTP at `/mcp`.      |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
 | `--network <default|audit|filter>`| config, else `default` | Network monitoring mode.       |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
@@ -189,6 +191,14 @@ MCP table, list their tools, print a banner to stderr, and then speak MCP JSON-R
 stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
 `[containers.<name>.mcp]` overrides. All non-protocol output stays off stdout.
 
+When `--listen <addr>` is set, `outrig mcp` serves Streamable HTTP instead of stdio.
+TCP addresses are socket addresses such as `127.0.0.1:7331` or `0.0.0.0:7331`;
+Unix sockets use `unix:/tmp/outrig.sock`. The HTTP MCP endpoint is always `/mcp`.
+Loopback TCP is local-only by default. Non-loopback TCP binds are allowed but print a
+warning because this v1 surface has no built-in auth; use an authenticated reverse proxy
+before exposing it broadly. Each HTTP MCP client gets its own rmcp session backed by the
+same shared outrig proxy and backing MCP processes.
+
 `--network audit` and `--network filter` are supported only for fresh-container `outrig mcp`
 sessions. Attach mode cannot retrofit a borrowed container with a new interceptor.
 
@@ -202,7 +212,7 @@ container templates do not fit.
 
 | Trigger or failure                               | Exit |
 |--------------------------------------------------|------|
-| Client closes stdin after successful startup     | `0`  |
+| Stdio client closes stdin after successful startup | `0` |
 | SIGINT or SIGTERM after successful startup       | `0`  |
 | Config, image, container, or MCP startup failure | `1`  |
 | Bad flags or missing required args               | `2`  |

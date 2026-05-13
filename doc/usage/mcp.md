@@ -3,7 +3,7 @@
 `outrig mcp` turns an outrig container-config into one MCP server for an external
 client. It starts or attaches to the selected container, launches every
 `[containers.<name>.mcp]` backing server inside it, and republishes their tools over this
-process's stdio.
+process's stdio by default, or over Streamable HTTP when `--listen` is set.
 
 Use `outrig run` when you want outrig to be the LLM client: it resolves an agent,
 builds a Rig agent, and opens the built-in REPL. Use `outrig mcp` when another
@@ -15,6 +15,7 @@ and you want that program to drive the tools inside your outrig container.
 ```
 outrig mcp [--container <name>]
            [--attach <session-id-or-container-name>]
+           [--listen <addr>]
            [--network <default|audit|filter>]
            [--session-dir <path>]
            [--config <path>]
@@ -32,6 +33,9 @@ outrig mcp self
   `[containers.<name>]` block. Required with `--attach <podman-name>`.
 - `--attach <session-id-or-container-name>` (default: off): reuse an existing
   container instead of starting one.
+- `--listen <addr>` (default: off): serve Streamable HTTP at `/mcp` instead of
+  stdio. Accepts TCP socket addresses such as `127.0.0.1:7331` or
+  `0.0.0.0:7331`, plus Unix sockets as `unix:/tmp/outrig.sock`.
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this fresh session.
@@ -199,6 +203,36 @@ Zed uses `context_servers` in its settings:
 }
 ```
 
+### Streamable HTTP
+
+Use `--listen` when you want one long-lived `outrig mcp` process that multiple
+MCP clients can connect to:
+
+```sh
+outrig mcp --listen 127.0.0.1:7331 --container coding
+```
+
+The MCP endpoint is `/mcp`, so clients should connect to:
+
+```text
+http://127.0.0.1:7331/mcp
+```
+
+Loopback TCP is the intended default deployment shape. Binding `0.0.0.0:7331`
+or any other non-loopback address is allowed, but `outrig` prints a warning because
+v1 has no built-in authentication and anything that can reach the port can call the
+container's tools. Put an authenticated reverse proxy in front if you expose it beyond
+the local machine.
+
+For local multi-process access without a TCP port, use a Unix socket:
+
+```sh
+outrig mcp --listen unix:/tmp/outrig.sock --container coding
+```
+
+Socket filesystem permissions are the access boundary. HTTP clients still use the
+Streamable HTTP protocol and the `/mcp` path over that socket.
+
 ## What Happens, in Order
 
 1. **Locate config.** Walks up from the current directory until
@@ -220,9 +254,10 @@ Zed uses `context_servers` in its settings:
    command and run the MCP `initialize` handshake.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with
    each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
-8. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
-   the process stdin and writes responses to stdout. The proxy dispatches `tools/call`
-   to the right backing server.
+8. **Serve MCP.** Without `--listen`, rmcp's stdio transport reads JSON-RPC frames
+   from the process stdin and writes responses to stdout. With `--listen`, rmcp's
+   Streamable HTTP service accepts POST/SSE traffic at `/mcp`. The proxy dispatches
+   `tools/call` to the right backing server in both modes.
 
 If anything before step 8 fails, `outrig mcp` prints the error on stderr and exits
 non-zero without ever advertising a tool list.
@@ -245,14 +280,23 @@ answered `tools/list`, `outrig mcp` prints one banner to stderr:
 ```
 
 Everything in that banner is on stderr. The client should treat stdout as protocol
-bytes only.
+bytes only for stdio transport.
 
 Attach mode prints `container attached:` in the same position.
 
+With `--listen`, the banner says `transport: streamable-http`, then prints the bound
+endpoint before the ready line:
+
+```text
+[outrig] transport: streamable-http
+[outrig] listen: http://127.0.0.1:7331/mcp
+[outrig] mcp server ready
+```
+
 ## Transport Discipline
 
-`outrig mcp` serves MCP over stdio. Its stdout is reserved for JSON-RPC messages to
-the client; all other process output goes somewhere else:
+By default, `outrig mcp` serves MCP over stdio. Its stdout is reserved for JSON-RPC
+messages to the client; all other process output goes somewhere else:
 
 - startup banner: stderr
 - outrig tracing controlled by `OUTRIG_LOG`, or `RUST_LOG` when unset: stderr
@@ -262,6 +306,9 @@ the client; all other process output goes somewhere else:
 This split is load-bearing. If a wrapper, shell hook, or debug print writes anything
 non-JSON to stdout before or during the MCP exchange, the external client may fail
 the handshake or drop the server.
+
+With `--listen`, stdout is not the protocol channel, but `outrig` keeps the same
+stderr-first discipline so wrapper behavior remains predictable.
 
 ## Tool Names
 
@@ -283,13 +330,17 @@ collision and sanitization rules.
 
 `outrig mcp` has three graceful shutdown triggers:
 
-- stdin EOF, which usually means the external MCP client disconnected
+- stdio stdin EOF, which usually means the external MCP client disconnected
 - SIGINT, such as Ctrl-C in the terminal that launched the process
 - SIGTERM, such as a supervisor asking the process to stop
 
-All three paths cancel the rmcp service, wait for the dispatcher to settle, shut down
-each backing MCP server, and finalize the session record. Fresh-container mode then stops
-the container. Attach mode leaves the borrowed container running.
+All paths cancel the rmcp service, wait for the dispatcher to settle, shut down each
+backing MCP server, and finalize the session record. Fresh-container mode then stops the
+container. Attach mode leaves the borrowed container running.
+
+HTTP/SSE mode is daemon-shaped: client disconnects close only that MCP session. The
+`outrig mcp --listen` process stays alive until SIGINT, SIGTERM, or attached-container
+shutdown.
 
 If an attached host session stops the container while `outrig mcp --attach` is live, the
 attacher cancels its proxy, shuts down its MCP children, finalizes its session with a
@@ -320,12 +371,8 @@ inspection.
 
 ## Future Work
 
-The v0 surface is intentionally minimal. One transport extension is tracked but deferred:
-
-- **HTTP / SSE transport** (`--listen <addr>`) -- run as a long-lived daemon serving
-  multiple clients over TCP or Unix-socket MCP. v0 is stdio-only; one process per client.
-
-Also deferred: exposing a tool-call audit log, proxying MCP `prompts/*` and
+The v0 HTTP surface is intentionally unauthenticated and minimal. Deferred work includes
+adding built-in auth, exposing a tool-call audit log, proxying MCP `prompts/*` and
 `resources/*`, surfacing backing-server stderr as MCP resources, and paginating
 `tools/list`.
 

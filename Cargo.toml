@@ -24,6 +24,7 @@ required-features = ["e2e"]
 
 [dependencies]
 anyhow             = "1.0"
+axum               = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 blake3             = "1.5"
 candle-core        = { version = "=0.10.2", optional = true, default-features = false }
 clap               = { version = "4.5", features = ["derive"] }
@@ -62,6 +63,7 @@ features = [
     "server",
     "transport-child-process",
     "transport-io",
+    "transport-streamable-http-server",
 ]
 
 [dependencies.tokio]
@@ -78,3 +80,6 @@ features = [
     "time",
     "sync",
 ]
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
