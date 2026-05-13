@@ -42,6 +42,12 @@ afterwards.
 - Touching `MAX_NAME_LEN` should not change `tool_name::sanitize` behaviour --
   it is a documentation-only edit.
 
+## Decisions
+
+- Demoted all five private-item intra-doc links to code-formatted text because
+  the referenced symbols are implementation details, not reader-facing API
+  anchors. No visibility changes were needed.
+
 ## Dependencies
 
 None. Independent of any in-flight task; mentioned during 0038 but not

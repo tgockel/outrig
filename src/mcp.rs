@@ -236,7 +236,7 @@ impl McpClient {
     }
 
     /// Cancel the rmcp service (which closes the child's stdin -- the MCP
-    /// spec's normal shutdown signal), wait up to [`SHUTDOWN_GRACE`] for the
+    /// spec's normal shutdown signal), wait up to `SHUTDOWN_GRACE` for the
     /// server to exit on its own, then SIGKILL if it doesn't.
     pub async fn shutdown(self) -> Result<()> {
         let Self {

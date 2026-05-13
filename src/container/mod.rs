@@ -9,7 +9,7 @@
 //! 2. [`Drop`] -- best-effort detached `podman rm -f` if a `Container`
 //!    falls out of scope without `stop` being called (e.g. a future was
 //!    cancelled, an `?` propagated past the handle).
-//! 3. [`install_panic_hook`] -- last-resort sweep over [`TRACKED`] when
+//! 3. [`install_panic_hook`] -- last-resort sweep over `TRACKED` when
 //!    the process is unwinding from a panic and `Drop` cannot run.
 
 #[cfg(feature = "internal")]
@@ -384,7 +384,7 @@ fn spawn_detached_rm(name: &str) {
         .spawn();
 }
 
-/// Install a process-wide panic hook that sweeps [`TRACKED`] with
+/// Install a process-wide panic hook that sweeps `TRACKED` with
 /// `podman rm -f` before delegating to the previous hook. Idempotent --
 /// safe to call from multiple `main`s or test setups.
 pub fn install_panic_hook() {

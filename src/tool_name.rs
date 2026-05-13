@@ -21,7 +21,7 @@ const SUFFIX_LEN: usize = 1 + HASH_HEX_LEN;
 
 /// Build the LLM-facing name from `<server>__<tool>`, replacing any character
 /// outside `[a-zA-Z0-9_-]` with `_` and truncating with a stable 6-hex blake3
-/// suffix when the result would exceed [`MAX_NAME_LEN`].
+/// suffix when the result would exceed `MAX_NAME_LEN`.
 ///
 /// The hash is over the *pre-sanitization* concatenation, so two distinct
 /// originals that would map to the same sanitized prefix get different

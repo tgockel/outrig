@@ -8,10 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0051](0051-image-name-container.md)** `image-name` field on
-  `[containers.<name>]` (skip `buildah build`).
-- **[0052](0052-cargo-doc-private-link-warnings.md)** `cargo doc
-  --no-deps` private-link warnings cleanup.
 - **[0054](0054-outrig-mcp-attach.md)** `outrig mcp --attach` to an
   existing container.
 - **[0056](0056-outrig-design-prompt.md)** `outrig design prompt` --

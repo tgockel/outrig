@@ -331,7 +331,7 @@ fn read_session_root(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// `2026-05-01 14:19:07` (UTC). Display-only; the on-disk format is
-/// ISO 8601 via [`iso_systime`]. Returns `?` if the timestamp can't be
+/// ISO 8601 via `iso_systime`. Returns `?` if the timestamp can't be
 /// converted (only happens for SystemTimes outside jiff's representable
 /// range -- effectively never in practice).
 pub fn format_started_at(t: SystemTime) -> String {
