@@ -33,7 +33,8 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cli::env_arg::CliEnvEntries;
 use crate::config::{Config, ContainerConfig, McpServerSpec};
 use crate::container::{
-    Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace, embedded,
+    Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+    embedded,
 };
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
@@ -264,6 +265,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                 access: mount.access,
             })
             .collect(),
+        capabilities: ContainerCapabilities {
+            profile: container_cfg.security.capability_profile,
+            cap_drop: container_cfg.security.cap_drop.clone(),
+            cap_add: container_cfg.security.cap_add.clone(),
+        },
     };
 
     if let Some(p) = args.explicit_session_dir

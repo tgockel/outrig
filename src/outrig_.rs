@@ -11,10 +11,12 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::{
-    ContainerConfig, ContainerSourceRef, EnvValue, McpServerSpec, MountAccess, Workspace,
+    CapabilityProfile, ContainerConfig, ContainerSecurity, ContainerSourceRef, EnvValue,
+    McpServerSpec, MountAccess, Workspace,
 };
 use crate::container::{
-    Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace, embedded,
+    Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+    embedded,
 };
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
@@ -52,6 +54,42 @@ pub struct MountSpec {
     pub access: MountAccess,
 }
 
+/// Container security policy applied at launch.
+#[derive(Debug, Clone, Default)]
+pub struct SecuritySpec {
+    pub capabilities: CapabilitySpec,
+}
+
+/// Linux capability profile plus explicit capability overrides.
+#[derive(Debug, Clone, Default)]
+pub struct CapabilitySpec {
+    pub profile: CapabilityProfile,
+    pub cap_drop: Vec<String>,
+    pub cap_add: Vec<String>,
+}
+
+impl From<&ContainerSecurity> for SecuritySpec {
+    fn from(security: &ContainerSecurity) -> Self {
+        Self {
+            capabilities: CapabilitySpec {
+                profile: security.capability_profile,
+                cap_drop: security.cap_drop.clone(),
+                cap_add: security.cap_add.clone(),
+            },
+        }
+    }
+}
+
+impl From<&CapabilitySpec> for ContainerCapabilities {
+    fn from(capabilities: &CapabilitySpec) -> Self {
+        Self {
+            profile: capabilities.profile,
+            cap_drop: capabilities.cap_drop.clone(),
+            cap_add: capabilities.cap_add.clone(),
+        }
+    }
+}
+
 /// Description of one container launch: image source, optional workspace
 /// mount, MCP servers to start inside, and the directory to land per-server
 /// stderr in.
@@ -59,6 +97,7 @@ pub struct LaunchSpec {
     pub(crate) source: LaunchSource,
     pub workspace: Option<WorkspaceSpec>,
     pub mounts: Vec<MountSpec>,
+    pub security: SecuritySpec,
     pub mcp: BTreeMap<String, McpServerSpec>,
     pub log_dir: PathBuf,
 }
@@ -88,6 +127,7 @@ impl LaunchSpec {
             },
             workspace: Some(workspace),
             mounts: Vec::new(),
+            security: SecuritySpec::default(),
             mcp,
             log_dir,
         }
@@ -104,6 +144,7 @@ impl LaunchSpec {
             source: LaunchSource::Image { tag: image.into() },
             workspace: None,
             mounts: Vec::new(),
+            security: SecuritySpec::default(),
             mcp,
             log_dir,
         }
@@ -146,6 +187,7 @@ impl LaunchSpec {
                 },
                 workspace: Some(ws),
                 mounts,
+                security: SecuritySpec::from(&cfg.security),
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -155,6 +197,7 @@ impl LaunchSpec {
                 },
                 workspace: Some(ws),
                 mounts,
+                security: SecuritySpec::from(&cfg.security),
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -178,6 +221,16 @@ impl LaunchSpec {
 
     pub fn with_mounts(mut self, mounts: impl IntoIterator<Item = MountSpec>) -> Self {
         self.mounts.extend(mounts);
+        self
+    }
+
+    pub fn with_security(mut self, security: SecuritySpec) -> Self {
+        self.security = security;
+        self
+    }
+
+    pub fn with_capabilities(mut self, capabilities: CapabilitySpec) -> Self {
+        self.security.capabilities = capabilities;
         self
     }
 }
@@ -231,6 +284,7 @@ impl Outrig {
                     dockerfile: Some(dockerfile.clone()),
                     context: Some(context.clone()),
                     build_args: build_args.clone(),
+                    security: ContainerSecurity::default(),
                     mcp: BTreeMap::new(),
                 };
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
@@ -252,6 +306,7 @@ impl Outrig {
                     access: mount.access,
                 })
                 .collect(),
+            capabilities: ContainerCapabilities::from(&spec.security.capabilities),
         };
         let mut container = Container::start(&image_tag, launch).await?;
         container.bootstrap_user().await?;

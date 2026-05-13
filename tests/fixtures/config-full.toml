@@ -75,6 +75,11 @@ dockerfile = ".agents/outrig/containers/coding/Dockerfile"
 context    = ".agents/outrig/containers/coding"
 build-args = { NODE_VERSION = "20" }
 
+  [containers.coding.security]
+  capability-profile = "no-net-raw"
+  cap-drop = ["MKNOD", "SETFCAP"]
+  cap-add  = ["NET_BIND_SERVICE"]
+
   [containers.coding.mcp]
   shell = ["bash", "-lc", "exec shell-mcp-command"]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }

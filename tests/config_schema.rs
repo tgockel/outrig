@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use outrig::config::{Config, EnvValue, LlmProvider, McpServerSpec, MountAccess};
+use outrig::config::{
+    CapabilityProfile, Config, EnvValue, LlmProvider, McpServerSpec, MountAccess,
+};
 use outrig::error::OutrigError;
 
 const FIXTURE: &str = include_str!("fixtures/config-full.toml");
@@ -192,6 +194,12 @@ srv = { command = ["bin", "arg1"] }
             coding_ctr.build_args["NODE_VERSION"],
             EnvValue::Literal("20".to_string()),
         );
+        assert_eq!(
+            coding_ctr.security.capability_profile,
+            CapabilityProfile::NoNetRaw,
+        );
+        assert_eq!(coding_ctr.security.cap_drop, ["MKNOD", "SETFCAP"]);
+        assert_eq!(coding_ctr.security.cap_add, ["NET_BIND_SERVICE"]);
 
         assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
         let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].normalize();
@@ -211,6 +219,43 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
         assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
         assert!(cfg.workspace.mounts.is_empty());
+    }
+
+    #[test]
+    fn container_security_absent_yields_documented_defaults() {
+        let cfg = Config::load_from_str(
+            r#"
+[containers.coding]
+dockerfile = "D"
+context    = "ctx"
+"#,
+        )
+        .expect("config parses");
+        let security = &cfg.containers["coding"].security;
+        assert_eq!(security.capability_profile, CapabilityProfile::Default);
+        assert!(security.cap_drop.is_empty());
+        assert!(security.cap_add.is_empty());
+    }
+
+    #[test]
+    fn capability_profile_values_are_validated_by_schema() {
+        let bad = r#"
+[containers.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.coding.security]
+capability-profile = "wide-open"
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        let OutrigError::Config(toml_err) = err else {
+            panic!("expected OutrigError::Config, got: {err:?}");
+        };
+        let msg = toml_err.to_string();
+        assert!(
+            msg.contains("wide-open") || msg.contains("unknown variant"),
+            "error should explain invalid capability profile, got: {msg}",
+        );
     }
 
     #[test]

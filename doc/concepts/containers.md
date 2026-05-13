@@ -88,6 +88,35 @@ parameterized at build time.
 
 The `[containers.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
 
+### Capability profiles
+
+By default, outrig preserves podman's default Linux capability set. That keeps existing
+toolchains and MCP servers working while still applying `--security-opt=no-new-privileges`.
+When a container can run with less privilege, add a security block:
+
+```toml
+[containers.coding.security]
+capability-profile = "no-net-raw"
+```
+
+The supported profiles are:
+
+- `default`: keep podman's default capability set.
+- `no-net-raw`: drop `NET_RAW`, which blocks raw sockets without breaking most development
+  tooling.
+- `drop-all`: start from `--cap-drop=ALL`.
+
+You can combine a profile with explicit overrides:
+
+```toml
+[containers.web.security]
+capability-profile = "drop-all"
+cap-add = ["NET_BIND_SERVICE"]
+```
+
+Explicit `cap-add` values are rendered last, so a container can start from `drop-all` and add
+back one narrow capability. Capability names may include or omit the `CAP_` prefix.
+
 ### Using a pre-built image
 
 If you already have an image (from a registry, CI pipeline, or local build), set
@@ -178,15 +207,15 @@ Image-name configs use podman's local image store directly; there is no `outrig-
 tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the
 image is already present locally.
 
-## What outrig does *not* set in the run
+## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, `--security-opt=no-new-privileges`, the primary workspace
 bind-mount, any configured extra workspace mounts, and the runtime user-mapping bootstrap
-(see [Workspace](workspace.md)). It does *not* drop capabilities aggressively in v0 --
-`--cap-drop=ALL` breaks many real MCP servers (npm post-install, fork-heavy shells), so the v0
-floor is the default podman cap set plus `no-new-privileges`. Tightening that is deferred.
+(see [Workspace](workspace.md)). Capability flags are emitted only when the selected container
+config opts into a capability profile or explicit `cap-drop` / `cap-add` entries.
 
-> **TODO: Incomplete** -- `--cap-drop` profile and seccomp policy aren't implemented yet.
+outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
+filesystems, or network egress filtering in this container launch path.
 
 ## See also
 

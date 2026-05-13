@@ -38,6 +38,7 @@ async fn ensure_fixture_image() -> ImageTag {
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
         build_args: BTreeMap::new(),
+        security: Default::default(),
         mcp: BTreeMap::new(),
     };
     image::ensure_image(&cfg, &fixture_dir(), false)

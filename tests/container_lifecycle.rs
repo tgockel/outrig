@@ -18,10 +18,14 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use outrig::MountAccess;
-use outrig::container::{self, Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace};
+use serde_json::Value;
+
+use outrig::container::{
+    self, Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+};
 use outrig::image::ImageTag;
 use outrig::process::{self, Cmd};
+use outrig::{CapabilityProfile, MountAccess};
 
 const ALPINE: &str = "docker.io/library/alpine:latest";
 
@@ -46,6 +50,33 @@ async fn podman_ps_lists(name: &str, include_stopped: bool) -> bool {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|l| l.trim() == name)
+}
+
+async fn podman_inspect_json(name: &str) -> Value {
+    let out = process::run_capture(Cmd::new("podman").arg("inspect").arg(name))
+        .await
+        .expect("podman inspect");
+    let value: Value = serde_json::from_slice(&out.stdout).expect("podman inspect JSON");
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned()
+        .expect("podman inspect should return a non-empty array")
+}
+
+fn inspect_string_array(value: &Value, paths: &[&[&str]]) -> Option<Vec<String>> {
+    paths.iter().find_map(|path| {
+        let mut current = value;
+        for segment in *path {
+            current = current.get(*segment)?;
+        }
+        current.as_array().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+    })
 }
 
 #[tokio::test]
@@ -113,6 +144,7 @@ async fn extra_mounts_enforce_access_modes() {
                     access: MountAccess::ReadWrite,
                 },
             ],
+            capabilities: ContainerCapabilities::default(),
         },
     )
     .await
@@ -155,6 +187,45 @@ async fn extra_mounts_enforce_access_modes() {
     assert_eq!(
         std::fs::read_to_string(rw_dir.path().join("out.txt")).expect("read rw output"),
         "yes\n"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+#[tokio::test]
+async fn capability_flags_are_recorded_in_podman_create_command() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    let tag = ImageTag(ALPINE.to_string());
+    let container = Container::start(
+        &tag,
+        ContainerLaunchSpec {
+            workspace: None,
+            mounts: Vec::new(),
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::DropAll,
+                cap_drop: Vec::new(),
+                cap_add: vec!["NET_BIND_SERVICE".to_string()],
+            },
+        },
+    )
+    .await
+    .expect("start");
+
+    let inspect = podman_inspect_json(&container.name).await;
+    let create_command = inspect_string_array(&inspect, &[&["Config", "CreateCommand"]])
+        .expect("podman inspect should expose Config.CreateCommand");
+
+    assert!(
+        create_command.iter().any(|arg| arg == "--cap-drop=ALL"),
+        "create command should contain --cap-drop=ALL, got {create_command:?}",
+    );
+    assert!(
+        create_command
+            .iter()
+            .any(|arg| arg == "--cap-add=NET_BIND_SERVICE"),
+        "create command should contain --cap-add=NET_BIND_SERVICE, got {create_command:?}",
     );
 
     container.stop(Duration::from_secs(2)).await.expect("stop");

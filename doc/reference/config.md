@@ -329,6 +329,32 @@ Notes:
   run time, not baked into the image. See
   [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping).
 
+### `[containers.<name>.security]`
+
+Optional runtime security controls for the selected container:
+
+```toml
+[containers.coding.security]
+capability-profile = "no-net-raw"
+cap-drop = ["MKNOD", "SETFCAP"]
+cap-add  = ["NET_BIND_SERVICE"]
+```
+
+- `capability-profile` (string, optional, default: `"default"`): named Linux capability
+  profile. Accepted values are:
+  - `"default"`: preserve podman's default capability set and emit no capability flags unless
+    `cap-drop` or `cap-add` is set.
+  - `"no-net-raw"`: emit `--cap-drop=NET_RAW`.
+  - `"drop-all"`: emit `--cap-drop=ALL`.
+- `cap-drop` (array, optional, default: `[]`): extra Linux capabilities to drop.
+- `cap-add` (array, optional, default: `[]`): Linux capabilities to add after profile and
+  explicit drops are rendered.
+
+Capability names may be written as `NET_RAW` or `CAP_NET_RAW`; outrig normalizes to the
+podman form without the `CAP_` prefix. The existing `--security-opt=no-new-privileges`
+setting is always applied. This section does not configure seccomp, AppArmor, SELinux,
+read-only roots, mount policy, or network egress filtering.
+
 ### `[containers.<name>.mcp]`
 
 Map of MCP server entries, **keyed on server name**. Each entry is one of two shapes via a
@@ -477,6 +503,11 @@ dockerfile = ".agents/outrig/containers/coding/Dockerfile"
 context    = ".agents/outrig/containers/coding"
 build-args = { NODE_VERSION = "20" }
 
+  [containers.coding.security]
+  capability-profile = "no-net-raw"
+  cap-drop = ["MKNOD", "SETFCAP"]
+  cap-add  = ["NET_BIND_SERVICE"]
+
   [containers.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
@@ -521,6 +552,13 @@ build-args = { NODE_VERSION = "20" }
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
 - `image-name` must not be empty.
+- Every `[containers.<name>.security].capability-profile`, if set, must be one of
+  `default`, `no-net-raw`, or `drop-all`.
+- Every capability name in `cap-drop` or `cap-add` must be non-empty and match
+  `^[A-Z0-9_]+$` after optional `CAP_` stripping.
+- Capability names must not be duplicated within `cap-drop` or within `cap-add`, after
+  optional `CAP_` stripping.
+- The same normalized capability name must not appear in both `cap-drop` and `cap-add`.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
   directory. Relative host paths resolve against the repo root.

@@ -65,6 +65,7 @@ async fn ensure_image_with_container_toml(container_toml: Option<&str>) -> Image
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
         build_args: BTreeMap::new(),
+        security: Default::default(),
         mcp: BTreeMap::new(),
     };
     image::ensure_image(&cfg, ctx.path(), false)
@@ -79,6 +80,7 @@ async fn ensure_missing_file_image() -> ImageTag {
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
         build_args: BTreeMap::new(),
+        security: Default::default(),
         mcp: BTreeMap::new(),
     };
     image::ensure_image(&cfg, &fixture_mcp_fs_dir(), false)

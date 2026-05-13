@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0058](0058-capability-profiles.md)** Capability profiles.
 - **[0059](0059-network-interceptor-plumbing.md)** Network interceptor
   plumbing.
 - **[0060](0060-network-interceptor-enforcement.md)** Network interceptor

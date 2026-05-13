@@ -196,3 +196,16 @@ cargo test --no-default-features --features e2e --test library_surface -- --noca
 
 - **Hard: 0057**. Reuses the podman-run argument builder extracted for runtime bind
   mounts so capability rendering has unit coverage without needing podman.
+
+## Decisions
+
+- Reuse one `CapabilityProfile` enum across config, container launch, and the curated public API
+  so accepted profile names cannot drift.
+- Keep config capability lists as written and normalize only for validation and podman rendering;
+  this preserves user input while still accepting both `NET_RAW` and `CAP_NET_RAW`.
+- Treat unknown `capability-profile` values as schema/parse errors, matching the existing enum
+  behavior for `MountAccess`.
+- Inspect podman's `Config.CreateCommand` in e2e coverage rather than depending on
+  kernel-specific raw-socket behavior inside the container. This podman version leaves
+  `HostConfig.CapAdd` / `HostConfig.CapDrop` empty for direct flags, while `CreateCommand`
+  records the actual launch argv.

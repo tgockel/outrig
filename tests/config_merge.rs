@@ -451,6 +451,108 @@ container-path = "/workspace"
     }
 
     #[test]
+    fn malformed_capability_name_errors() {
+        let cfg = parse(
+            r#"
+[containers.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.coding.security]
+cap-drop = ["net_raw"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::CapabilityNameInvalid {
+                container,
+                field,
+                capability,
+            } => {
+                assert_eq!(container, "coding");
+                assert_eq!(field, "cap-drop");
+                assert_eq!(capability, "net_raw");
+            }
+            other => panic!("expected CapabilityNameInvalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_capability_name_errors() {
+        let cfg = parse(
+            r#"
+[containers.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.coding.security]
+cap-add = ["CAP_"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::CapabilityNameEmpty { container, field } => {
+                assert_eq!(container, "coding");
+                assert_eq!(field, "cap-add");
+            }
+            other => panic!("expected CapabilityNameEmpty, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_capability_names_error_after_prefix_stripping() {
+        let cfg = parse(
+            r#"
+[containers.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.coding.security]
+cap-drop = ["NET_RAW", "CAP_NET_RAW"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::CapabilityNameDuplicate {
+                container,
+                field,
+                capability,
+            } => {
+                assert_eq!(container, "coding");
+                assert_eq!(field, "cap-drop");
+                assert_eq!(capability, "NET_RAW");
+            }
+            other => panic!("expected CapabilityNameDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_capability_drop_add_overlap_errors() {
+        let cfg = parse(
+            r#"
+[containers.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[containers.coding.security]
+cap-drop = ["MKNOD"]
+cap-add  = ["CAP_MKNOD"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::CapabilityDropAddConflict {
+                container,
+                capability,
+            } => {
+                assert_eq!(container, "coding");
+                assert_eq!(capability, "MKNOD");
+            }
+            other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn top_level_tool_call_cap_zero_errors() {
         let cfg = parse(
             r#"

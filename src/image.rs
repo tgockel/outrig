@@ -594,6 +594,7 @@ mod tests {
                 "GH_TOKEN".to_string(),
                 EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
             )]),
+            security: Default::default(),
             mcp: BTreeMap::new(),
         };
         let resolved = BTreeMap::from([("GH_TOKEN".to_string(), "secret-token".to_string())]);

@@ -31,7 +31,7 @@ use nix::unistd::{Gid, Group, Uid, User};
 use serde_json::Value;
 use tokio::process::Child;
 
-use crate::config::MountAccess;
+use crate::config::{CapabilityProfile, MountAccess, capability_name_without_prefix};
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd, Transcript};
@@ -73,11 +73,12 @@ pub struct ContainerInspect {
     pub running: bool,
 }
 
-/// Complete mount-related inputs for a `podman run`.
+/// Complete inputs for a `podman run`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerLaunchSpec {
     pub workspace: Option<ContainerWorkspace>,
     pub mounts: Vec<ContainerMount>,
+    pub capabilities: ContainerCapabilities,
 }
 
 impl ContainerLaunchSpec {
@@ -88,6 +89,7 @@ impl ContainerLaunchSpec {
                 container: container.into(),
             }),
             mounts: Vec::new(),
+            capabilities: ContainerCapabilities::default(),
         }
     }
 }
@@ -105,6 +107,14 @@ pub struct ContainerMount {
     pub host: PathBuf,
     pub container: PathBuf,
     pub access: MountAccess,
+}
+
+/// Linux capability policy applied to the container at startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerCapabilities {
+    pub profile: CapabilityProfile,
+    pub cap_drop: Vec<String>,
+    pub cap_add: Vec<String>,
 }
 
 impl Container {
@@ -501,9 +511,38 @@ fn build_podman_run_cmd(
         cmd = cmd.arg("-w").arg(&workspace.container);
     }
 
+    cmd = append_capability_flags(cmd, &launch.capabilities);
+
     cmd.args(["--security-opt=no-new-privileges", "--pull=never"])
         .arg(image.0.as_str())
         .args(["sleep", "infinity"])
+}
+
+fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -> Cmd {
+    match capabilities.profile {
+        CapabilityProfile::Default => {}
+        CapabilityProfile::NoNetRaw => {
+            cmd = cmd.arg("--cap-drop=NET_RAW");
+        }
+        CapabilityProfile::DropAll => {
+            cmd = cmd.arg("--cap-drop=ALL");
+        }
+    }
+
+    for capability in &capabilities.cap_drop {
+        cmd = cmd.arg(format!(
+            "--cap-drop={}",
+            capability_name_without_prefix(capability)
+        ));
+    }
+    for capability in &capabilities.cap_add {
+        cmd = cmd.arg(format!(
+            "--cap-add={}",
+            capability_name_without_prefix(capability)
+        ));
+    }
+
+    cmd
 }
 
 fn append_bind_mount(
@@ -644,6 +683,7 @@ mod tests {
                     access: MountAccess::ReadWrite,
                 },
             ],
+            capabilities: ContainerCapabilities::default(),
         };
 
         let args = argv(build_podman_run_cmd(
@@ -689,6 +729,7 @@ mod tests {
                 container: "/resources/docs".into(),
                 access: MountAccess::ReadOnly,
             }],
+            capabilities: ContainerCapabilities::default(),
         };
 
         let args = argv(build_podman_run_cmd(
@@ -710,6 +751,86 @@ mod tests {
                 "-v",
                 "/host/docs:/resources/docs:ro,Z",
                 "--userns=keep-id",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_run_args_include_no_net_raw_profile() {
+        let launch = ContainerLaunchSpec {
+            workspace: None,
+            mounts: Vec::new(),
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::NoNetRaw,
+                cap_drop: Vec::new(),
+                cap_add: Vec::new(),
+            },
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--cap-drop=NET_RAW",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_run_args_render_drop_all_before_explicit_adds() {
+        let launch = ContainerLaunchSpec {
+            workspace: None,
+            mounts: Vec::new(),
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::DropAll,
+                cap_drop: vec!["CAP_MKNOD".to_string()],
+                cap_add: vec!["CAP_NET_BIND_SERVICE".to_string()],
+            },
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--cap-drop=ALL",
+                "--cap-drop=MKNOD",
+                "--cap-add=NET_BIND_SERVICE",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
                 "local:test",

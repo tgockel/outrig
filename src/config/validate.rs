@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use super::{
     Config, ContainerConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
-    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, Model,
+    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, Model, normalize_capability_name,
 };
 
 #[derive(Debug, Error)]
@@ -106,6 +106,40 @@ pub enum ConfigValidationError {
 
     #[error("workspace mount container-path {path:?} is declared more than once")]
     WorkspaceMountContainerDuplicate { path: PathBuf },
+
+    #[error("container {container:?}: `{field}` capability name must not be empty")]
+    CapabilityNameEmpty {
+        container: String,
+        field: &'static str,
+    },
+
+    #[error(
+        "container {container:?}: `{field}` capability {capability:?} must match \
+         ^[A-Z0-9_]+$ after optional CAP_ stripping"
+    )]
+    CapabilityNameInvalid {
+        container: String,
+        field: &'static str,
+        capability: String,
+    },
+
+    #[error(
+        "container {container:?}: `{field}` capability {capability:?} is declared more than once"
+    )]
+    CapabilityNameDuplicate {
+        container: String,
+        field: &'static str,
+        capability: String,
+    },
+
+    #[error(
+        "container {container:?}: capability {capability:?} is listed in both `cap-drop` \
+         and `cap-add`"
+    )]
+    CapabilityDropAddConflict {
+        container: String,
+        capability: String,
+    },
 
     #[error("{path} must be between 1 and {max}; got {value}")]
     ToolCallCapOutOfRange { path: String, value: u32, max: u32 },
@@ -216,6 +250,7 @@ pub(super) fn validate(
 
     for (container_name, container) in &cfg.containers {
         validate_container_source(container_name, container, repo_root)?;
+        validate_container_security(container_name, container)?;
 
         for (server_name, spec) in &container.mcp {
             if !is_valid_mcp_server_name(server_name) {
@@ -275,6 +310,57 @@ pub(super) fn validate(
     }
 
     Ok(())
+}
+
+fn validate_container_security(
+    container_name: &str,
+    container: &ContainerConfig,
+) -> Result<(), ConfigValidationError> {
+    let drops = validate_capability_list(container_name, "cap-drop", &container.security.cap_drop)?;
+    let adds = validate_capability_list(container_name, "cap-add", &container.security.cap_add)?;
+
+    if let Some(capability) = drops.intersection(&adds).next() {
+        return Err(ConfigValidationError::CapabilityDropAddConflict {
+            container: container_name.to_string(),
+            capability: capability.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_capability_list(
+    container_name: &str,
+    field: &'static str,
+    capabilities: &[String],
+) -> Result<BTreeSet<String>, ConfigValidationError> {
+    let mut seen = BTreeSet::new();
+
+    for capability in capabilities {
+        let Some(normalized) = normalize_capability_name(capability) else {
+            if super::capability_name_without_prefix(capability).is_empty() {
+                return Err(ConfigValidationError::CapabilityNameEmpty {
+                    container: container_name.to_string(),
+                    field,
+                });
+            }
+            return Err(ConfigValidationError::CapabilityNameInvalid {
+                container: container_name.to_string(),
+                field,
+                capability: capability.clone(),
+            });
+        };
+
+        if !seen.insert(normalized.clone()) {
+            return Err(ConfigValidationError::CapabilityNameDuplicate {
+                container: container_name.to_string(),
+                field,
+                capability: normalized,
+            });
+        }
+    }
+
+    Ok(seen)
 }
 
 fn validate_workspace_mounts(

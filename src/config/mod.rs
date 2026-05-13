@@ -193,6 +193,50 @@ pub enum MountAccess {
     ReadWrite,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ContainerSecurity {
+    pub capability_profile: CapabilityProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+}
+
+impl ContainerSecurity {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityProfile {
+    #[default]
+    Default,
+    NoNetRaw,
+    DropAll,
+}
+
+pub(crate) fn capability_name_without_prefix(name: &str) -> &str {
+    name.strip_prefix("CAP_").unwrap_or(name)
+}
+
+pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
+    let name = capability_name_without_prefix(name);
+    if name.is_empty() {
+        return None;
+    }
+    if name
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ContainerConfig {
@@ -204,6 +248,8 @@ pub struct ContainerConfig {
     pub context: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, EnvValue>,
+    #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
+    pub security: ContainerSecurity,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
 }

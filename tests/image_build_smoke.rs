@@ -49,6 +49,7 @@ async fn build_then_cache_hit_under_100ms() {
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
         build_args: BTreeMap::new(),
+        security: Default::default(),
         mcp: BTreeMap::new(),
     };
 
