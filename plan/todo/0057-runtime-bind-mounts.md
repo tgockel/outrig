@@ -1,6 +1,4 @@
-# Runtime bind mounts
-
-> **Status:** preliminary spec. Carved into numbered tasks in `plan/todo/` when ready.
+# 0057 -- Runtime bind mounts
 
 ## Context
 
@@ -25,6 +23,11 @@ it. The common desired shape is:
 This feature is separate from capability profiles. Mount policy controls what parts of the host
 filesystem the container can see and mutate. Capability policy controls kernel privileges inside
 the container. They should be queued and implemented independently.
+
+## Goal
+
+Support multiple runtime bind mounts for `outrig run`, `outrig mcp`, and public
+`LaunchSpec` callers while preserving the existing read-write primary workspace.
 
 ## Goals and non-goals
 
@@ -171,7 +174,7 @@ Nested container paths are allowed in v1 as long as they are not exact duplicate
 rendered in declared order after the primary workspace. A later task can add stricter overlap
 policy if real use shows it is needed.
 
-## Implementation notes
+## Deliverables
 
 - `src/config/mod.rs`: add `Workspace.mounts: Vec<MountConfig>` and
   `MountAccess`.
@@ -208,7 +211,11 @@ cargo test --no-default-features --features e2e --test library_surface -- --noca
 
 ## See also
 
-- `plan/next/capability-profiles.md` -- kernel capability controls for the same container
+- `0058-capability-profiles.md` -- kernel capability controls for the same container
   launch path.
-- `plan/next/network-interceptor.md` -- network egress controls; deliberately separate from
+- `0059-network-interceptor-plumbing.md` -- network egress controls; deliberately separate from
   filesystem mount policy.
+
+## Dependencies
+
+None.

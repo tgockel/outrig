@@ -1,6 +1,4 @@
-# Streaming output for the in-process mistralrs path
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/` when ready.
+# 0062 -- Streaming output for the in-process mistralrs path
 
 ## Context
 
@@ -18,6 +16,12 @@ with no signal that anything is happening. Bigger models are worse.
 The fix is to stream the assistant's reply token-by-token to stderr (or
 the REPL's transcript buffer) as it's generated, so the user sees
 progress and can hit Ctrl-C if the model wanders.
+
+## Goal
+
+Implement streaming output for the in-process mistralrs backend so slow local
+models show assistant tokens while they decode instead of blocking the REPL until
+the full reply is complete.
 
 ## Goals and non-goals
 
@@ -74,7 +78,7 @@ Today `MistralrsModel::completion` collects them all then returns once
    already-printed text or empty (the REPL re-prints it today, so we'd
    want it empty to avoid duplication). Decide which.
 
-## Files
+## Deliverables
 
 - `src/llm/mistralrs.rs` -- replace the `stream()` placeholder with a
   real implementation. Lift the channel-collection loop from
@@ -106,6 +110,11 @@ Today `MistralrsModel::completion` collects them all then returns once
 - Tool calls happen at `[outrig] tool call: ...` boundaries today;
   stream-aware printing must flush text *before* the call line.
 - This task is independent of GPU support
-  (`mistralrs-gpu-device.md`) but combined they make the in-process
+  (`0063-mistralrs-gpu-device.md`) but combined they make the in-process
   path actually pleasant to use; a 7B Q4_K_M on a CUDA GPU streams at
   100+ tok/s and the user sees output instantly.
+
+## Dependencies
+
+None hard. Builds on the shipped mistralrs shim and registry work in
+`plan/done/0015-0017`.

@@ -1,6 +1,4 @@
-# Capability profiles
-
-> **Status:** preliminary spec. Carved into numbered tasks in `plan/todo/` when ready.
+# 0058 -- Capability profiles
 
 ## Context
 
@@ -18,6 +16,11 @@ profile and then override it when a specific container needs more or less.
 This feature is separate from runtime bind mounts. Capability policy changes the kernel
 privilege set available inside the container. Bind-mount policy changes which host paths are
 visible and whether they are writable.
+
+## Goal
+
+Add container-scoped Linux capability profiles and explicit capability overrides without
+changing the default container privileges.
 
 ## Goals and non-goals
 
@@ -148,7 +151,7 @@ the form podman accepts without the `CAP_` prefix before rendering. Do not hard-
 capability enum in v1; podman and kernels vary, and unknown-but-well-formed names should produce
 podman's native error if unsupported.
 
-## Implementation notes
+## Deliverables
 
 - `src/config/mod.rs`: add `ContainerSecurity`, `CapabilityProfile`, and capability list fields
   under `ContainerConfig`.
@@ -184,7 +187,12 @@ cargo test --no-default-features --features e2e --test library_surface -- --noca
 
 ## See also
 
-- `plan/next/runtime-bind-mounts.md` -- host filesystem exposure controls for the same container
+- `0057-runtime-bind-mounts.md` -- host filesystem exposure controls for the same container
   launch path.
-- `plan/next/network-interceptor.md` -- network egress controls; deliberately separate from
+- `0059-network-interceptor-plumbing.md` -- network egress controls; deliberately separate from
   kernel capability policy.
+
+## Dependencies
+
+- **Hard: 0057**. Reuses the podman-run argument builder extracted for runtime bind
+  mounts so capability rendering has unit coverage without needing podman.

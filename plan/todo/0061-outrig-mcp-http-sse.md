@@ -1,10 +1,8 @@
-# `outrig mcp` -- HTTP / SSE Transport
-
-> **Status:** preliminary spec. Builds on `plan/next/outrig-mcp.md`.
+# 0061 -- `outrig mcp` HTTP / SSE transport
 
 ## Context
 
-`plan/next/outrig-mcp.md` ships `outrig mcp` with stdio transport only. Stdio
+`plan/done/0040-0041` shipped `outrig mcp` with stdio transport only. Stdio
 suits IDEs that spawn the server as a subprocess (Claude Code's default model)
 but doesn't help when the user wants:
 
@@ -15,6 +13,11 @@ but doesn't help when the user wants:
 rmcp v0.1.5 already supports the server side of streamable HTTP / SSE via the
 `transport-sse-server` feature (axum-based). The protocol is the same; only
 the transport changes.
+
+## Goal
+
+Let `outrig mcp` serve the same session MCP protocol over opt-in streamable HTTP /
+SSE while keeping stdio as the default transport.
 
 ## User surface
 
@@ -32,7 +35,7 @@ outrig mcp [--listen <addr>] [--container <name>] [--session-dir <path>]
 Auth: out of scope for the first cut. Local-only by default; callers who want
 to expose it broadly should put a reverse proxy with auth in front.
 
-## Architecture deltas vs. stdio
+## Deliverables
 
 - The shared bootstrap in `src/cli/session_setup.rs` is unchanged.
 - `ProxyServer` is unchanged -- it's transport-agnostic.
@@ -46,6 +49,17 @@ to expose it broadly should put a reverse proxy with auth in front.
   `McpClient`s are still single-connection JSON-RPC pipes -- need to decide
   whether to mux requests over one upstream pipe (likely fine; rmcp client
   handles request IDs) or spawn per-connection clients. Lean toward muxing.
+
+## Acceptance
+
+- `outrig mcp` without `--listen` preserves the current stdio behavior.
+- `outrig mcp --listen 127.0.0.1:7331` binds an HTTP / SSE server and serves
+  MCP requests through the existing `ProxyServer`.
+- `outrig mcp --listen 0.0.0.0:7331` warns loudly about exposing the container
+  tool surface beyond loopback.
+- Each connecting client gets an independent rmcp service instance backed by the
+  shared session proxy.
+- Docs describe the listen forms, local-only default, and no-auth v1 stance.
 
 ## Open sub-decisions
 
@@ -61,6 +75,12 @@ to expose it broadly should put a reverse proxy with auth in front.
 
 ## See also
 
-- `plan/next/outrig-mcp.md` -- the v0 stdio version this builds on.
+- `plan/done/0040-outrig-mcp-wire-subcommand.md` -- the v0 stdio version this builds on.
+- `plan/done/0041-outrig-mcp-docs.md` -- existing `outrig mcp` documentation.
 - `~/.cargo/registry/.../rmcp-0.1.5/src/transport/sse_server.rs` -- the axum
   integration point.
+
+## Dependencies
+
+None hard. The session-MCP `outrig mcp` subcommand has shipped in `plan/done/0040`
+and `plan/done/0041`.

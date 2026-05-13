@@ -12,3 +12,16 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
   existing container.
 - **[0056](0056-outrig-design-prompt.md)** `outrig design prompt` --
   one-shot prompt printer.
+- **[0057](0057-runtime-bind-mounts.md)** Runtime bind mounts.
+- **[0058](0058-capability-profiles.md)** Capability profiles.
+- **[0059](0059-network-interceptor-plumbing.md)** Network interceptor
+  plumbing.
+- **[0060](0060-network-interceptor-enforcement.md)** Network interceptor
+  enforcement.
+- **[0061](0061-outrig-mcp-http-sse.md)** `outrig mcp` HTTP / SSE
+  transport.
+- **[0062](0062-streaming-mistralrs-output.md)** Streaming output for the
+  in-process mistralrs path.
+- **[0063](0063-mistralrs-gpu-device.md)** GPU / non-CPU device support for the
+  in-process mistralrs path.
+- **[0064](0064-network-interceptor-mitm.md)** Network interceptor MITM.

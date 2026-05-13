@@ -1,6 +1,4 @@
-# GPU / non-CPU device support for the in-process mistralrs path
-
-> **Status:** preliminary spec. Carved into a numbered task in `plan/todo/` when ready.
+# 0063 -- GPU / non-CPU device support for the in-process mistralrs path
 
 ## Context
 
@@ -25,6 +23,11 @@ becomes genuinely useful only when those devices are reachable.
 and (via feature flags) Vulkan-capable backends. mistralrs-core
 forwards through; the work is in outrig's wrapper plus the build
 matrix.
+
+## Goal
+
+Add explicit non-CPU device selection for mistralrs-backed models so users can run
+the in-process backend on CUDA or Metal builds without changing CPU-only defaults.
 
 ## Goals and non-goals
 
@@ -81,7 +84,7 @@ matrix.
    `doc/reference/config.md` get a section on the `device` field plus
    the new feature flags.
 
-## Files
+## Deliverables
 
 - `src/config/mod.rs` -- new `device` field on `Model`.
 - `src/config/validate.rs` -- reject `device` on openai-style models;
@@ -134,3 +137,9 @@ matrix.
   users want truly in-process for the policy-oracle use case
   documented in `doc/concepts/in-process-llm.md` -- the same use case
   motivates running on a fast device.
+
+## Dependencies
+
+- **Hard: 0062**. Streaming is needed first so GPU-class decode speed is visible
+  during normal `outrig run` usage and the GPU acceptance path can verify token
+  output incrementally.
