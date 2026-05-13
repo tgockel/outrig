@@ -81,9 +81,10 @@ async fn adapter_dispatches_tool_call_into_container() {
         "mcp-server-filesystem".to_string(),
         "/workspace".to_string(),
     ]);
-    let client = McpClient::connect_via_podman_exec(&container, &spec, "fs", &log_dir)
-        .await
-        .expect("connect_via_podman_exec");
+    let client =
+        McpClient::connect_via_podman_exec(&container, &spec, "fs", &log_dir, &BTreeMap::new())
+            .await
+            .expect("connect_via_podman_exec");
     let client = Arc::new(client);
 
     let adapters = McpToolAdapter::from_client_tools(client.clone(), usize::MAX)

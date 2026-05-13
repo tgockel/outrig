@@ -28,6 +28,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use nix::unistd::{Gid, Group, Uid, User};
+use serde_json::Value;
 use tokio::process::Child;
 
 use crate::error::{OutrigError, Result};
@@ -55,7 +56,20 @@ pub struct Container {
     /// `None` until bootstrap has run.
     pub group_name: Option<String>,
     transcript: Option<Transcript>,
+    ownership: ContainerOwnership,
     disposed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerOwnership {
+    Owned,
+    Attached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerInspect {
+    pub image_tag: ImageTag,
+    pub running: bool,
 }
 
 impl Container {
@@ -132,8 +146,69 @@ impl Container {
             user_name: None,
             group_name: None,
             transcript,
+            ownership: ContainerOwnership::Owned,
             disposed: false,
         })
+    }
+
+    /// Build a handle for an already-running container that outrig does not
+    /// own. The caller is responsible for probing that the container exists
+    /// and is running before constructing the handle.
+    pub fn attach(
+        name: impl Into<String>,
+        image_tag: ImageTag,
+        workspace: Option<(&Path, &Path)>,
+        transcript: Option<Transcript>,
+    ) -> Self {
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let (host_workspace, container_workspace) = match workspace {
+            Some((host, container)) => (host.to_path_buf(), container.to_path_buf()),
+            None => (PathBuf::new(), PathBuf::new()),
+        };
+
+        Self {
+            name: name.into(),
+            image_tag,
+            host_workspace,
+            container_workspace,
+            uid,
+            gid,
+            user_name: None,
+            group_name: None,
+            transcript,
+            ownership: ContainerOwnership::Attached,
+            disposed: false,
+        }
+    }
+
+    /// Inspect an existing podman container by name. This is intentionally
+    /// separate from [`Self::attach`] so callers can create session/log state
+    /// before deciding whether to borrow the container.
+    pub async fn inspect_existing(
+        name: &str,
+        transcript: Option<&Transcript>,
+    ) -> Result<ContainerInspect> {
+        let cmd = Cmd::new("podman").arg("inspect").arg(name);
+        let output = process::run_capture_logged(cmd, "podman", transcript).await?;
+        parse_container_inspect(name, &output.stdout)
+    }
+
+    /// Lightweight running-state probe used by attach-mode monitoring.
+    /// A missing container is reported as `Ok(false)`; I/O failures still
+    /// propagate because the caller cannot distinguish them from a broken
+    /// podman environment.
+    pub async fn is_running(name: &str) -> Result<bool> {
+        let output = process::try_capture(
+            Cmd::new("podman")
+                .args(["inspect", "--format", "{{.State.Running}}"])
+                .arg(name),
+        )
+        .await?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
     }
 
     /// Materialize an in-container user+group matching the host UID/GID,
@@ -307,6 +382,11 @@ impl Container {
     }
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
+        if self.ownership == ContainerOwnership::Attached {
+            self.disposed = true;
+            return Ok(());
+        }
+
         let secs = grace.as_secs().to_string();
         process::run_capture_logged(
             Cmd::new("podman")
@@ -339,7 +419,7 @@ impl Container {
 
 impl Drop for Container {
     fn drop(&mut self) {
-        if self.disposed {
+        if self.disposed || self.ownership == ContainerOwnership::Attached {
             return;
         }
         spawn_detached_rm(&self.name);
@@ -412,6 +492,46 @@ fn untrack(name: &str) {
     if let Ok(mut g) = TRACKED.lock() {
         g.remove(name);
     }
+}
+
+fn parse_container_inspect(name: &str, stdout: &[u8]) -> Result<ContainerInspect> {
+    let value: Value = serde_json::from_slice(stdout).map_err(|source| {
+        OutrigError::Configuration(format!("podman inspect {name:?}: invalid JSON: {source}"))
+    })?;
+    let object = value
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            OutrigError::Configuration(format!(
+                "podman inspect {name:?}: expected a non-empty JSON array"
+            ))
+        })?;
+
+    let running = object
+        .get("State")
+        .and_then(|state| state.get("Running"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let image = object
+        .get("ImageName")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            object
+                .get("Config")
+                .and_then(|config| config.get("Image"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| object.get("Image").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            OutrigError::Configuration(format!("podman inspect {name:?}: missing image name"))
+        })?;
+
+    Ok(ContainerInspect {
+        image_tag: ImageTag(image.to_string()),
+        running,
+    })
 }
 
 #[cfg(any(test, feature = "e2e"))]

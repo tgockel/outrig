@@ -140,6 +140,7 @@ Serve the selected container-config's backing MCP servers as one MCP server over
 
 ```
 outrig mcp [--container <name>]
+           [--attach <session-id-or-container-name>]
            [--env <KEY=VALUE>]
            [--session-dir <path>]
            [--config <path>]
@@ -148,6 +149,7 @@ outrig mcp [--container <name>]
            [--verbose]
 
 outrig mcp show-merged [--container <name>]
+                       [--attach <session-id-or-container-name>]
                        [--session-dir <path>]
                        [--config <path>]
                        [--global-config <path>]
@@ -160,6 +162,7 @@ outrig mcp self
 | Flag                   | Default                      | Description                           |
 |------------------------|------------------------------|---------------------------------------|
 | `--container <name>`   | `default-container`          | Container-config to launch.           |
+| `--attach <id-or-name>`| off                          | Reuse an existing container.          |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
 | `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
@@ -168,9 +171,16 @@ There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does 
 `agent.container` participate in container selection, and does not read provider API keys.
 Container selection is `--container`, then top-level `default-container`, then an error.
 
-Startup builds or cache-hits the image, starts the container, initializes every entry in
-the merged MCP table, lists their tools, prints a banner to stderr, and then speaks MCP JSON-RPC
-on stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
+With `--attach`, the value is resolved first as an exact session id under the resolved
+session root. A session match supplies the podman container name and default
+container-config. If there is no session match, the value is treated as a podman
+container name and `--container <name>` is required.
+
+Startup builds or cache-hits the image and starts the container unless `--attach` is set.
+Attach mode validates the existing container with `podman inspect` and borrows it without
+stopping or removing it during teardown. Both modes initialize every entry in the merged
+MCP table, list their tools, print a banner to stderr, and then speak MCP JSON-RPC on
+stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
 `[containers.<name>.mcp]` overrides. All non-protocol output stays off stdout.
 
 `outrig mcp show-merged` uses the same container selection and setup path, but exits after

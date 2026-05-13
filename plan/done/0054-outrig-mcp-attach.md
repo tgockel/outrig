@@ -119,6 +119,23 @@ outrig mcp --attach <session-id-or-container-name> [--container <name>]
 None hard. The session-MCP `outrig mcp` subcommand has shipped
 (`plan/done/0035-0041`); this task builds on it.
 
+## Decisions
+
+- `--attach` resolves exact session ids only. If no session row exists
+  at `<session-root>/<id>`, the value is treated as a podman container
+  name and `--container <name>` is required.
+- Attached containers are borrowed lifecycle handles. `Container::stop`
+  and `Drop` are no-ops for attached handles, and attached handles are
+  not registered in the panic-hook cleanup tracker.
+- Attach mode writes a fresh attacher session row whose
+  `container_name` points at the borrowed podman container. Its log dir
+  is independent from the host session, so `outrig logs` works normally
+  for attacher MCP stderr.
+- Attach mode monitors the borrowed container while serving stdio MCP.
+  If the owner stops or removes it, the attacher cancels its proxy,
+  finalizes with a non-zero exit, and reports that the attached
+  container stopped.
+
 ## See also
 
 - `plan/done/0035-0041` -- the v0 fresh-container `outrig mcp` this

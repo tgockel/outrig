@@ -16,7 +16,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
@@ -31,6 +33,8 @@ use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::mcp::McpClient;
 use crate::mcp_proxy::ProxyServer;
+
+const ATTACH_MONITOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 pub struct McpArgs {
@@ -47,6 +51,11 @@ pub struct McpArgs {
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", global = true, value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
+
+    /// Attach to an existing outrig session id or podman container name
+    /// instead of starting a fresh container.
+    #[arg(long, global = true, value_name = "SESSION_OR_CONTAINER")]
+    pub attach: Option<String>,
 
     /// Add or override env vars for MCP servers. Repeatable.
     /// `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one.
@@ -85,6 +94,7 @@ pub async fn execute(
         global_cfg_path,
         session_root_flag,
         container_flag: args.container.as_deref(),
+        attach_target: args.attach.as_deref(),
         agent_flag: None,
         require_agent: false,
         explicit_session_dir: args.session_dir.as_deref(),
@@ -108,6 +118,7 @@ async fn serve(setup: SessionSetup, cli_env: CliEnvEntries) -> Result<i32> {
         sid,
         log_dir,
         store,
+        attached,
         cfg: _,
         session: _,
         session_dir: _,
@@ -134,12 +145,29 @@ async fn serve(setup: SessionSetup, cli_env: CliEnvEntries) -> Result<i32> {
         &mut mcp_arcs,
         &mcp,
         &cli_env,
+        attached,
     )
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
     session_setup::teardown(mcp_arcs, container, &store, &sid, final_exit).await;
+    if attached
+        && outcome
+            .as_ref()
+            .err()
+            .is_some_and(is_attached_container_stopped)
+    {
+        eprintln!(
+            "error: {}",
+            outcome.as_ref().expect_err("checked err above")
+        );
+        std::process::exit(final_exit.clamp(0, 255));
+    }
     outcome
+}
+
+fn is_attached_container_stopped(err: &OutrigError) -> bool {
+    matches!(err, OutrigError::Configuration(msg) if msg.contains("attached container") && msg.contains("stopped"))
 }
 
 async fn show_merged(setup: SessionSetup) -> Result<i32> {
@@ -148,6 +176,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         container,
         sid,
         store,
+        attached: _,
         cfg: _,
         container_cfg_name: _,
         image_tag: _,
@@ -172,6 +201,7 @@ async fn serve_inner(
     mcp_arcs: &mut Vec<Arc<McpClient>>,
     mcp: &BTreeMap<String, McpServerSpec>,
     cli_env: &CliEnvEntries,
+    attached: bool,
 ) -> Result<i32> {
     let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
     if connected.is_empty() {
@@ -196,6 +226,7 @@ async fn serve_inner(
         &per_server_counts,
         &public_names,
         session_id,
+        attached,
     );
 
     // `serve_server_with_ct` lets us hold the cancellation token outside the
@@ -206,9 +237,15 @@ async fn serve_inner(
         rmcp::service::serve_server_with_ct(proxy, rmcp::transport::stdio(), ct.clone()).await?;
     eprintln!("[outrig] mcp server ready");
 
-    let waiter = tokio::spawn(service.waiting());
+    let mut waiter = tokio::spawn(service.waiting());
     let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
-    tokio::pin!(waiter);
+    let mut monitor = Box::pin(async {
+        if attached {
+            wait_for_attached_container_stop(container.name.clone()).await
+        } else {
+            std::future::pending::<Result<()>>().await
+        }
+    });
 
     tokio::select! {
         biased;
@@ -224,12 +261,52 @@ async fn serve_inner(
             log_waiter_result(result);
             return Ok(0);
         }
+        result = &mut monitor => {
+            ct.cancel();
+            match tokio::time::timeout(ATTACH_MONITOR_SHUTDOWN_GRACE, &mut waiter).await {
+                Ok(waiter_result) => log_waiter_result(waiter_result),
+                Err(_) => {
+                    waiter.abort();
+                    tracing::warn!(
+                        target: "outrig::cli::mcp",
+                        "rmcp service did not stop after attached container disappeared"
+                    );
+                }
+            }
+            return match result {
+                Ok(()) => Err(OutrigError::Configuration(
+                    "attached container monitor ended unexpectedly".to_string(),
+                )),
+                Err(e) => Err(e),
+            };
+        }
     }
 
     // Signal path: wait for the service to wind down after cancellation.
     let result = waiter.await;
     log_waiter_result(result);
     Ok(0)
+}
+
+async fn wait_for_attached_container_stop(container_name: String) -> Result<()> {
+    let mut child = tokio::process::Command::new("podman")
+        .arg("wait")
+        .arg(&container_name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let status = child.wait().await?;
+    if !status.success() {
+        tracing::warn!(
+            target: "outrig::cli::mcp",
+            "podman wait for attached container {container_name:?} exited with {status}"
+        );
+    }
+    Err(OutrigError::Configuration(format!(
+        "attached container {container_name:?} stopped while `outrig mcp` was attached"
+    )))
 }
 
 async fn show_merged_inner(container_cfg: &ContainerConfig, container: &Container) -> Result<i32> {
@@ -293,11 +370,16 @@ fn print_banner(
     per_server_counts: &[(String, usize)],
     public_names: &[String],
     session_id: &str,
+    attached: bool,
 ) {
     let mut buf = String::new();
     let _ = writeln!(buf, "[outrig] container-config:  {container_name}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
-    let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
+    let container_action = if attached { "attached" } else { "started" };
+    let _ = writeln!(
+        buf,
+        "[outrig] container {container_action}: {container_pod_name}"
+    );
     for (name, count) in per_server_counts {
         let plural = if *count == 1 { "tool" } else { "tools" };
         let _ = writeln!(buf, "[outrig] mcp {name}: initialized ({count} {plural})");

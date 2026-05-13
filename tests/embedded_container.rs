@@ -106,9 +106,10 @@ async fn assert_servers_boot(
 
     for name in expected {
         let spec = mcp.get(*name).expect("expected merged server");
-        let client = McpClient::connect_via_podman_exec(container, spec, name, &log_dir)
-            .await
-            .unwrap_or_else(|e| panic!("connect {name}: {e:?}"));
+        let client =
+            McpClient::connect_via_podman_exec(container, spec, name, &log_dir, &BTreeMap::new())
+                .await
+                .unwrap_or_else(|e| panic!("connect {name}: {e:?}"));
         let tools = client
             .list_tools()
             .await

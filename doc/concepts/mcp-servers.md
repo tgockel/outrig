@@ -10,6 +10,9 @@ The same `[containers.<name>.mcp]` table is consumed by both `outrig run` and
 `outrig mcp`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
 republishes them as one stdio MCP server for an external client. See
 [Usage -> outrig mcp](../usage/mcp.md) for client setup and transport rules.
+When `outrig mcp --attach` points at an existing container, it still starts its own
+MCP child processes inside that container; it does not share or proxy the host
+session's existing MCP protocol state.
 
 ## Declaring servers
 
@@ -98,6 +101,11 @@ turn, waits up to 5 seconds for the process to exit, then `podman stop`'s the co
 don't see SIGTERM directly; they see EOF on stdin, which the MCP spec defines as the normal
 shutdown signal.
 
+In attach mode, `outrig mcp --attach` borrows a container that something else owns. It
+shuts down only the MCP children it started and leaves the borrowed container running.
+If the owner stops the container while the attacher is live, the attacher exits instead
+of trying to relaunch it.
+
 ## Tool name prefixing
 
 Two different MCP servers can have a tool with the same name (e.g. both `fs` and `archive` might
@@ -141,6 +149,12 @@ in v0 -- the server is gone for the rest of the session.
 
 The server's stderr, captured to `<session_dir>/logs/<server>.stderr`, usually has the actual
 error. See [Sessions](../usage/sessions.md) for how to view it.
+
+Attach mode can run more than one copy of the same MCP server in one container. Prefer
+servers that are reentrant-safe: no fixed listening port, global pidfile, or exclusive
+lock unless the server is explicitly designed to coordinate multiple copies. If a server
+cannot run twice, the second copy should fail clearly during startup and its stderr log
+will show the underlying conflict.
 
 ## Picking which servers to include
 

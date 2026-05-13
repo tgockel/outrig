@@ -14,6 +14,11 @@ pub async fn execute(args: &McpArgs) -> Result<i32> {
             "`outrig mcp self` does not create a session; remove --session-dir".to_string(),
         ));
     }
+    if args.attach.is_some() {
+        return Err(OutrigError::Configuration(
+            "`outrig mcp self` does not attach to a container; remove --attach".to_string(),
+        ));
+    }
 
     crate::mcp_self::serve_stdio().await
 }

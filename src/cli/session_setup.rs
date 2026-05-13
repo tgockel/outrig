@@ -25,6 +25,7 @@
 //! [`run`]: crate::cli::run
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -87,6 +88,9 @@ pub struct SessionSetupArgs<'a> {
     pub global_cfg_path: &'a Path,
     pub session_root_flag: Option<&'a Path>,
     pub container_flag: Option<&'a str>,
+    /// Existing session id or podman container name to attach to instead of
+    /// starting a fresh container. Used by `outrig mcp --attach`.
+    pub attach_target: Option<&'a str>,
     /// Raw `--agent` flag. Read only when `require_agent = true`; ignored
     /// otherwise (and `outrig mcp` always passes `None`).
     pub agent_flag: Option<&'a str>,
@@ -116,6 +120,13 @@ pub struct SessionSetup {
     pub session_dir: PathBuf,
     pub log_dir: PathBuf,
     pub store: SessionStore,
+    pub attached: bool,
+}
+
+#[derive(Debug)]
+struct AttachResolution {
+    container_name: String,
+    container_cfg_name: String,
 }
 
 /// Run the shared bootstrap. Returns once the container is up, the runtime
@@ -126,13 +137,28 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let cfg = Config::load(&repo_root, Some(args.global_cfg_path))?;
     span.done("config loaded");
 
+    let session_root =
+        session::resolve_session_root(args.session_root_flag, &cfg, &repo::default_session_root());
+    let store = SessionStore::new(session_root);
+    let attach = match args.attach_target {
+        Some(target) if args.require_agent => {
+            return Err(OutrigError::Configuration(format!(
+                "--attach {target:?} is only supported by `outrig mcp`"
+            )));
+        }
+        Some(target) => Some(resolve_attach_target(target, args.container_flag, &store)?),
+        None => None,
+    };
+
     // Agent presence is checked before any container work so the failure
     // mode is identical for `outrig run` regardless of which container
     // would have been picked. `outrig mcp` opts out via `require_agent =
     // false` -- it has no agent concept, so `agent_flag` and
     // `cfg.default_agent` are not consulted at all.
     let span = ProgressSpan::start("resolving agent and container");
-    let (session_agent_name, agent_container) = if args.require_agent {
+    let (session_agent_name, agent_container) = if attach.is_some() {
+        (None, None)
+    } else if args.require_agent {
         let agent_name = args
             .agent_flag
             .or(cfg.default_agent.as_deref())
@@ -148,19 +174,22 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         (None, None)
     };
 
-    let container_cfg_name = args
-        .container_flag
-        .or(agent_container.as_deref())
-        .or(cfg.default_container.as_deref())
-        .ok_or_else(|| {
-            let msg = if args.require_agent {
-                "no --container, agent.container, or default-container configured"
-            } else {
-                "no --container or default-container configured"
-            };
-            OutrigError::Configuration(msg.to_string())
-        })?
-        .to_string();
+    let container_cfg_name = match &attach {
+        Some(attach) => attach.container_cfg_name.clone(),
+        None => args
+            .container_flag
+            .or(agent_container.as_deref())
+            .or(cfg.default_container.as_deref())
+            .ok_or_else(|| {
+                let msg = if args.require_agent {
+                    "no --container, agent.container, or default-container configured"
+                } else {
+                    "no --container or default-container configured"
+                };
+                OutrigError::Configuration(msg.to_string())
+            })?
+            .to_string(),
+    };
     let container_cfg = cfg
         .containers
         .get(&container_cfg_name)
@@ -170,7 +199,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             ))
         })?
         .clone();
-    if let Some(agent) = &session_agent_name {
+    if let Some(attach) = &attach {
+        span.done(format!(
+            "attach target resolved: container {}, container-config {}",
+            attach.container_name, container_cfg_name
+        ));
+    } else if let Some(agent) = &session_agent_name {
         span.done(format!(
             "agent/container resolved: agent {agent}, container {container_cfg_name}"
         ));
@@ -178,9 +212,30 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         span.done(format!("container resolved: {container_cfg_name}"));
     }
 
-    let span = ProgressSpan::start("computing image tag");
-    let image_tag = image::compute_tag_for(&container_cfg_name, &container_cfg, &repo_root).await?;
-    span.done(format!("image tag computed: {image_tag}"));
+    let image_tag = if let Some(attach) = &attach {
+        let span = ProgressSpan::start(format!(
+            "inspecting attached container {}",
+            attach.container_name
+        ));
+        let inspect = Container::inspect_existing(&attach.container_name, None).await?;
+        if !inspect.running {
+            return Err(OutrigError::Configuration(format!(
+                "attached container {:?} is not running",
+                attach.container_name
+            )));
+        }
+        span.done(format!(
+            "attached container ready: {}",
+            attach.container_name
+        ));
+        inspect.image_tag
+    } else {
+        let span = ProgressSpan::start("computing image tag");
+        let image_tag =
+            image::compute_tag_for(&container_cfg_name, &container_cfg, &repo_root).await?;
+        span.done(format!("image tag computed: {image_tag}"));
+        image_tag
+    };
 
     let host_workspace = if cfg.workspace.host_path.is_absolute() {
         cfg.workspace.host_path.clone()
@@ -199,10 +254,10 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     }
 
     let sid = SessionId::new();
-    let container_name = format!("outrig-{sid}");
-    let session_root =
-        session::resolve_session_root(args.session_root_flag, &cfg, &repo::default_session_root());
-    let store = SessionStore::new(session_root);
+    let container_name = attach
+        .as_ref()
+        .map(|attach| attach.container_name.clone())
+        .unwrap_or_else(|| format!("outrig-{sid}"));
     let mut session = Session {
         id: sid.clone(),
         started_at: SystemTime::now(),
@@ -235,49 +290,75 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         None
     };
 
-    let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
-    let image_outcome = match image::ensure_tagged_image_for(
-        &container_cfg_name,
-        &container_cfg,
-        &repo_root,
-        &image_tag,
-        false,
-        transcript.as_ref(),
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            let _ = store.finalize(&sid, SystemTime::now(), 1);
-            return Err(e);
+    let mut container = if let Some(attach) = &attach {
+        let span = ProgressSpan::start(format!("attaching to container {}", attach.container_name));
+        match Container::is_running(&attach.container_name).await {
+            Ok(true) => {
+                span.done(format!("attached to container: {}", attach.container_name));
+                Container::attach(
+                    attach.container_name.clone(),
+                    image_tag.clone(),
+                    Some((&host_workspace, &container_workspace)),
+                    transcript,
+                )
+            }
+            Ok(false) => {
+                let _ = store.finalize(&sid, SystemTime::now(), 1);
+                return Err(OutrigError::Configuration(format!(
+                    "attached container {:?} is not running",
+                    attach.container_name
+                )));
+            }
+            Err(e) => {
+                let _ = store.finalize(&sid, SystemTime::now(), 1);
+                return Err(e);
+            }
         }
-    };
-    let cache_status = if image_outcome.cache_hit {
-        "cache hit"
     } else {
-        "built"
-    };
-    span.done(format!(
-        "image ready: {} ({cache_status})",
-        image_outcome.tag
-    ));
+        let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
+        let image_outcome = match image::ensure_tagged_image_for(
+            &container_cfg_name,
+            &container_cfg,
+            &repo_root,
+            &image_tag,
+            false,
+            transcript.as_ref(),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let _ = store.finalize(&sid, SystemTime::now(), 1);
+                return Err(e);
+            }
+        };
+        let cache_status = if image_outcome.cache_hit {
+            "cache hit"
+        } else {
+            "built"
+        };
+        span.done(format!(
+            "image ready: {} ({cache_status})",
+            image_outcome.tag
+        ));
 
-    let span = ProgressSpan::start(format!("starting container {container_name}"));
-    let mut container = match Container::start_named(
-        &image_tag,
-        Some((&host_workspace, &container_workspace)),
-        container_name,
-        transcript,
-    )
-    .await
-    {
-        Ok(container) => {
-            span.done(format!("container ready: {}", container.name));
-            container
-        }
-        Err(e) => {
-            let _ = store.finalize(&sid, SystemTime::now(), 1);
-            return Err(e);
+        let span = ProgressSpan::start(format!("starting container {container_name}"));
+        match Container::start_named(
+            &image_tag,
+            Some((&host_workspace, &container_workspace)),
+            container_name,
+            transcript,
+        )
+        .await
+        {
+            Ok(container) => {
+                span.done(format!("container ready: {}", container.name));
+                container
+            }
+            Err(e) => {
+                let _ = store.finalize(&sid, SystemTime::now(), 1);
+                return Err(e);
+            }
         }
     };
 
@@ -300,7 +381,41 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         session_dir,
         log_dir,
         store,
+        attached: attach.is_some(),
     })
+}
+
+fn resolve_attach_target(
+    raw: &str,
+    container_flag: Option<&str>,
+    store: &SessionStore,
+) -> Result<AttachResolution> {
+    let sid = SessionId::from(raw.to_string());
+    let session_entry = store.symlink_path(&sid);
+    match fs::symlink_metadata(&session_entry) {
+        Ok(_) => {
+            let (_, session) = store.get_by_id(&sid)?;
+            Ok(AttachResolution {
+                container_name: session.container_name,
+                container_cfg_name: container_flag
+                    .unwrap_or(&session.container_config_name)
+                    .to_string(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let container_cfg_name = container_flag.ok_or_else(|| {
+                OutrigError::Configuration(format!(
+                    "--attach {raw:?} did not match a session; pass --container <name> \
+                     to treat it as a podman container name"
+                ))
+            })?;
+            Ok(AttachResolution {
+                container_name: raw.to_string(),
+                container_cfg_name: container_cfg_name.to_string(),
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Read image-embedded MCP config and overlay explicit `config.toml` entries.

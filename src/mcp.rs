@@ -244,15 +244,17 @@ impl McpClient {
         } = self;
 
         // A `JoinError` here just means the rmcp task panicked, which doesn't
-        // affect our ability to clean up the child below.
-        let _ = service.cancel().await;
+        // affect our ability to clean up the child below. Bound cancellation
+        // too: if the owning container disappeared, the transport task can be
+        // wedged behind already-broken podman exec pipes.
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, service.cancel()).await;
 
         match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => {
                 let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
                 Ok(())
             }
         }

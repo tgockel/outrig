@@ -72,9 +72,10 @@ async fn lists_tools_and_calls_list_directory() {
         "mcp-server-filesystem".to_string(),
         "/workspace".to_string(),
     ]);
-    let client = McpClient::connect_via_podman_exec(&container, &spec, "fs", &log_dir)
-        .await
-        .expect("connect_via_podman_exec");
+    let client =
+        McpClient::connect_via_podman_exec(&container, &spec, "fs", &log_dir, &BTreeMap::new())
+            .await
+            .expect("connect_via_podman_exec");
 
     let tools = client.list_tools().await.expect("list_tools");
     assert!(
@@ -129,7 +130,9 @@ async fn stderr_captured_on_crash() {
         "-e".to_string(),
         "console.error('boom-from-mcp'); process.exit(1)".to_string(),
     ]);
-    let result = McpClient::connect_via_podman_exec(&container, &spec, "crashy", &log_dir).await;
+    let result =
+        McpClient::connect_via_podman_exec(&container, &spec, "crashy", &log_dir, &BTreeMap::new())
+            .await;
 
     match result {
         Err(OutrigError::McpStartupFailed(payload)) => {

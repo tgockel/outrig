@@ -20,11 +20,17 @@
 
 #![cfg(feature = "e2e")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use outrig::config::{ContainerConfig, McpServerSpec};
+use outrig::container::Container;
+use outrig::image::{self, ImageTag};
+use outrig::mcp::McpClient;
+use outrig::session::{Session, SessionId, SessionStore};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
 use tokio::process::Command;
@@ -39,17 +45,29 @@ fn fixture_mcp_fs_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
+fn fs_spec() -> McpServerSpec {
+    McpServerSpec::Short(vec![
+        "mcp-server-filesystem".to_string(),
+        "/workspace".to_string(),
+    ])
+}
 
-    // 1. Build the fixture repo: container-only config, no agent surface.
-    let repo_dir = tempfile::tempdir().expect("tempdir repo");
-    let agents_dir = repo_dir.path().join(".agents/outrig");
+async fn ensure_fixture_image() -> ImageTag {
+    let cfg = ContainerConfig {
+        image_name: None,
+        dockerfile: Some("Dockerfile".into()),
+        context: Some(".".into()),
+        build_args: BTreeMap::new(),
+        mcp: BTreeMap::new(),
+    };
+    image::ensure_image(&cfg, &fixture_mcp_fs_dir(), false)
+        .await
+        .expect("ensure mcp-fs fixture image")
+        .tag
+}
+
+fn write_mcp_config(repo: &Path) {
+    let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
     let dockerfile = fixture_mcp_fs_dir().join("Dockerfile");
@@ -69,6 +87,129 @@ context = "{context}"
         context = context.display(),
     );
     std::fs::write(agents_dir.join("config.toml"), config_toml).expect("write config");
+}
+
+async fn start_fixture_container(image: &ImageTag, repo: &Path) -> Container {
+    let mut container = Container::start(image, Some((repo, Path::new("/workspace"))))
+        .await
+        .expect("start fixture container");
+    container.bootstrap_user().await.expect("bootstrap user");
+    container
+}
+
+fn create_host_session(
+    session_root: &Path,
+    repo: &Path,
+    container: &Container,
+    image: &ImageTag,
+) -> SessionId {
+    let store = SessionStore::new(session_root.to_path_buf());
+    let sid = SessionId(container.session_suffix().to_string());
+    let mut session = Session {
+        id: sid.clone(),
+        started_at: SystemTime::now(),
+        ended_at: None,
+        container_name: container.name.clone(),
+        image_tag: image.to_string(),
+        container_config_name: "smoke".to_string(),
+        agent_name: Some("smoke".to_string()),
+        working_dir: repo.to_path_buf(),
+        session_dir: PathBuf::new(),
+        exit_code: None,
+        link_target: None,
+    };
+    store
+        .create(&sid, None, &mut session)
+        .expect("host session");
+    sid
+}
+
+struct McpRun {
+    status: std::process::ExitStatus,
+    stderr: String,
+}
+
+async fn run_mcp_client(args: &[String], repo: &Path) -> McpRun {
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(repo)
+        .env("OUTRIG_LOG", "info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig mcp");
+
+    let child_stdin = child.stdin.take().expect("stdin piped");
+    let child_stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_task = tokio::spawn(stream_lines(stderr, stderr_buf.clone(), "stderr"));
+
+    let service = serve_client((), (child_stdout, child_stdin))
+        .await
+        .expect("serve_client (initialize handshake)");
+    let listing = service
+        .list_tools(Default::default())
+        .await
+        .expect("tools/list");
+    let names: Vec<String> = listing
+        .tools
+        .iter()
+        .map(|t| t.name.as_ref().to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "fs__list_directory"),
+        "expected `fs__list_directory` in {names:?}"
+    );
+
+    let call_args = serde_json::json!({"path": "/workspace"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let call = service
+        .call_tool(
+            CallToolRequestParams::new("fs__list_directory".to_string()).with_arguments(call_args),
+        )
+        .await
+        .expect("tools/call fs__list_directory");
+    assert!(
+        call.is_error != Some(true),
+        "fs__list_directory should not be an error: {call:?}"
+    );
+
+    let _ = service.cancel().await;
+
+    let status = timeout(TEST_TIMEOUT, child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = stderr_task.await;
+    let stderr = stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    McpRun { status, stderr }
+}
+
+fn stderr_value<'a>(stderr: &'a str, prefix: &str) -> &'a str {
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+        .unwrap_or_else(|| panic!("stderr lacked {prefix:?}: {stderr}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_subcommand_serves_namespaced_tools_and_exits_clean() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    // 1. Build the fixture repo: container-only config, no agent surface.
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
 
     // The default workspace mount is `repo_root -> /workspace`; planting the
     // file at the repo root makes it visible inside the container.
@@ -219,5 +360,222 @@ context = "{context}"
     assert!(
         leftovers.trim().is_empty(),
         "this run's container `{our_container}` is still alive: {leftovers}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_attach_by_session_id_reuses_container_and_writes_own_logs() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+
+    let image = ensure_fixture_image().await;
+    let container = start_fixture_container(&image, repo_dir.path()).await;
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let host_sid = create_host_session(sessions.path(), repo_dir.path(), &container, &image);
+
+    let host_log_dir = sessions.path().join(host_sid.as_str()).join("logs");
+    let host_client = McpClient::connect_via_podman_exec(
+        &container,
+        &fs_spec(),
+        "fs",
+        &host_log_dir,
+        &BTreeMap::new(),
+    )
+    .await
+    .expect("host MCP client");
+
+    let args = vec![
+        "--session-root".to_string(),
+        sessions.path().display().to_string(),
+        "mcp".to_string(),
+        "--attach".to_string(),
+        host_sid.to_string(),
+    ];
+    let run = run_mcp_client(&args, repo_dir.path()).await;
+    assert!(
+        run.status.success(),
+        "outrig mcp --attach exited with {:?}; stderr was: {}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("[outrig] container attached:"),
+        "stderr lacked attached banner: {}",
+        run.stderr
+    );
+
+    let attached_sid = stderr_value(&run.stderr, "[outrig] session id:");
+    assert_ne!(
+        attached_sid,
+        host_sid.as_str(),
+        "attacher should write a fresh session row"
+    );
+    let attached_log = sessions
+        .path()
+        .join(attached_sid)
+        .join("logs")
+        .join("fs.stderr");
+    assert!(
+        attached_log.exists(),
+        "attached MCP stderr should land at {}",
+        attached_log.display()
+    );
+
+    let host_result = host_client
+        .call_tool("list_directory", serde_json::json!({"path": "/workspace"}))
+        .await
+        .expect("host MCP still answers after attach exits");
+    assert!(
+        !host_result.is_error && host_result.content_text.contains("HELLO.txt"),
+        "host MCP child should remain usable: {host_result:?}"
+    );
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let logs = Command::new(bin)
+        .args([
+            "--session-root",
+            sessions.path().to_str().expect("session root utf-8"),
+            "logs",
+            attached_sid,
+            "fs",
+        ])
+        .output()
+        .await
+        .expect("outrig logs attached session");
+    assert!(
+        logs.status.success(),
+        "`outrig logs` for attached session failed: stderr={}",
+        String::from_utf8_lossy(&logs.stderr)
+    );
+
+    host_client.shutdown().await.expect("shutdown host mcp");
+    assert!(
+        Container::is_running(&container.name)
+            .await
+            .expect("podman inspect"),
+        "attacher shutdown must leave host container running"
+    );
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_attach_by_podman_name_requires_container_config_and_borrows_lifecycle() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+
+    let image = ensure_fixture_image().await;
+    let container = start_fixture_container(&image, repo_dir.path()).await;
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let args = vec![
+        "--session-root".to_string(),
+        sessions.path().display().to_string(),
+        "mcp".to_string(),
+        "--attach".to_string(),
+        container.name.clone(),
+        "--container".to_string(),
+        "smoke".to_string(),
+    ];
+    let run = run_mcp_client(&args, repo_dir.path()).await;
+    assert!(
+        run.status.success(),
+        "direct attach exited with {:?}; stderr was: {}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        Container::is_running(&container.name)
+            .await
+            .expect("podman inspect"),
+        "direct attacher must not stop the borrowed container"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_attach_exits_when_host_stops_container() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+
+    let image = ensure_fixture_image().await;
+    let container = start_fixture_container(&image, repo_dir.path()).await;
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let host_sid = create_host_session(sessions.path(), repo_dir.path(), &container, &image);
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut child = Command::new(bin)
+        .args([
+            "--session-root",
+            sessions.path().to_str().expect("session root utf-8"),
+            "mcp",
+            "--attach",
+            host_sid.as_str(),
+        ])
+        .current_dir(repo_dir.path())
+        .env("OUTRIG_LOG", "info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig mcp --attach");
+
+    let child_stdin = child.stdin.take().expect("stdin piped");
+    let child_stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_task = tokio::spawn(stream_lines(stderr, stderr_buf.clone(), "stderr"));
+
+    let service = serve_client((), (child_stdout, child_stdin))
+        .await
+        .expect("serve_client (initialize handshake)");
+    service
+        .list_tools(Default::default())
+        .await
+        .expect("tools/list before host stop");
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("host stop");
+
+    let status = timeout(TEST_TIMEOUT, child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    drop(service);
+    let _ = stderr_task.await;
+    let stderr = stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+
+    assert!(
+        !status.success(),
+        "attacher should exit non-zero when host stops container; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("attached container") && stderr.contains("stopped"),
+        "stderr should explain host container stop: {stderr}"
     );
 }

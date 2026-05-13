@@ -1,8 +1,9 @@
 # `outrig mcp`
 
 `outrig mcp` turns an outrig container-config into one MCP server for an external
-client. It starts the selected container, launches every `[containers.<name>.mcp]`
-backing server inside it, and republishes their tools over this process's stdio.
+client. It starts or attaches to the selected container, launches every
+`[containers.<name>.mcp]` backing server inside it, and republishes their tools over this
+process's stdio.
 
 Use `outrig run` when you want outrig to be the LLM client: it resolves an agent,
 builds a Rig agent, and opens the built-in REPL. Use `outrig mcp` when another
@@ -13,6 +14,7 @@ and you want that program to drive the tools inside your outrig container.
 
 ```
 outrig mcp [--container <name>]
+           [--attach <session-id-or-container-name>]
            [--session-dir <path>]
            [--config <path>]
            [--global-config <path>]
@@ -20,12 +22,15 @@ outrig mcp [--container <name>]
            [--verbose]
 
 outrig mcp show-merged [--container <name>]
+                       [--attach <session-id-or-container-name>]
 
 outrig mcp self
 ```
 
 - `--container <name>` (default: `default-container`): selects a
-  `[containers.<name>]` block.
+  `[containers.<name>]` block. Required with `--attach <podman-name>`.
+- `--attach <session-id-or-container-name>` (default: off): reuse an existing
+  container instead of starting one.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
 - `--config <path>` (default: walks up from cwd): path to repo `config.toml`.
 - `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
@@ -50,6 +55,15 @@ If neither is set, startup fails with:
 ```
 error: no --container or default-container configured
 ```
+
+With `--attach`, container-config selection is different:
+
+1. If the attach value matches an exact session id under the resolved session root,
+   outrig reuses that session row's `container_name` and `container_config_name`.
+2. If `--container <name>` is also passed, it overrides the session row's
+   `container_config_name`.
+3. If the attach value is not a known session id, outrig treats it as a podman
+   container name and requires `--container <name>`.
 
 The selected container must expose at least one backing MCP server after image
 `/etc/outrig/container.toml` entries and `[containers.<name>.mcp]` overrides are merged. A
@@ -90,9 +104,36 @@ To inspect the effective table without serving MCP:
 outrig mcp show-merged --container coding
 ```
 
-This starts the selected container, reads `/etc/outrig/container.toml`, applies
-`config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops the
-container.
+In fresh mode this starts the selected container, reads `/etc/outrig/container.toml`,
+applies `config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops
+the container. With `--attach`, it borrows the existing container for the same read and
+leaves it running.
+
+## Attach Mode
+
+Use attach mode when a container is already running and you want an external MCP client
+to share its workspace, installed tools, and environment:
+
+```sh
+outrig mcp --attach 20260504T141907-a83f
+outrig mcp --attach outrig-20260504T141907-a83f --container coding
+```
+
+The first form resolves an existing outrig session id. The second form borrows a
+podman container directly, which is useful for containers not started by `outrig run`.
+
+Attach mode shares the container, not the MCP protocol processes. The attacher starts
+its own `podman exec -i` children for each merged MCP server, so the external client
+has independent MCP state and independent stderr logs. Existing MCP children from the
+host session keep running.
+
+Every attach invocation writes its own fresh session row and log directory. `outrig logs
+<attached-session> <server>` therefore works the same as it does for a fresh-container
+`outrig mcp` session.
+
+MCP servers used with attach mode should be reentrant-safe. Servers that bind a fixed
+port, write a global pidfile, or take an exclusive lock can conflict with the host
+session's copy or with another attacher.
 
 ## Client Configuration
 
@@ -159,19 +200,21 @@ Zed uses `context_servers` in its settings:
 2. **Resolve container-config.** Uses `--container` if given, otherwise top-level
    `default-container`. There is no `agent.container` step -- this subcommand has no
    agent.
-3. **Build (or cache-hit) the image.** Same buildah path as `outrig run`.
-4. **Start the container.** `podman run -d --rm --name outrig-<sid> ...`.
-5. **Merge MCP config.** Read `/etc/outrig/container.toml` from the image if present,
+3. **Prepare the container.** Fresh mode builds or cache-hits the image and starts
+   `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
+   container with `podman inspect`, verifies that it is running, and does not build,
+   start, stop, or remove it.
+4. **Merge MCP config.** Read `/etc/outrig/container.toml` from the image if present,
    then overlay `[containers.<name>.mcp]` from config by server name.
-6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
+5. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command and run the MCP `initialize` handshake.
-7. **Build the proxy.** outrig advertises one merged tool list to its client, with
+6. **Build the proxy.** outrig advertises one merged tool list to its client, with
    each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
-8. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
+7. **Serve JSON-RPC over stdio.** rmcp's stdio transport reads JSON-RPC frames from
    the process stdin and writes responses to stdout. The proxy dispatches `tools/call`
    to the right backing server.
 
-If anything before step 8 fails, `outrig mcp` prints the error on stderr and exits
+If anything before step 7 fails, `outrig mcp` prints the error on stderr and exits
 non-zero without ever advertising a tool list.
 
 ## Startup Banner
@@ -193,6 +236,8 @@ answered `tools/list`, `outrig mcp` prints one banner to stderr:
 
 Everything in that banner is on stderr. The client should treat stdout as protocol
 bytes only.
+
+Attach mode prints `container attached:` in the same position.
 
 ## Transport Discipline
 
@@ -233,12 +278,17 @@ collision and sanitization rules.
 - SIGTERM, such as a supervisor asking the process to stop
 
 All three paths cancel the rmcp service, wait for the dispatcher to settle, shut down
-each backing MCP server, stop the container, and finalize the session record.
+each backing MCP server, and finalize the session record. Fresh-container mode then stops
+the container. Attach mode leaves the borrowed container running.
+
+If an attached host session stops the container while `outrig mcp --attach` is live, the
+attacher cancels its proxy, shuts down its MCP children, finalizes its session with a
+non-zero exit, and reports that the attached container stopped.
 
 ## Sessions and Logs
 
-Every `outrig mcp` invocation creates a normal outrig session. It appears in
-`outrig ls`, its backing-server stderr is readable with `outrig logs`, and
+Every `outrig mcp` invocation creates a normal outrig session, including attach mode.
+It appears in `outrig ls`, its backing-server stderr is readable with `outrig logs`, and
 `outrig discard` removes it like any other session.
 
 Because no agent participates, the in-memory session row has `agent_name = None`.
@@ -260,13 +310,10 @@ inspection.
 
 ## Future Work
 
-The v0 surface is intentionally minimal. Two extensions are tracked but deferred:
+The v0 surface is intentionally minimal. One transport extension is tracked but deferred:
 
 - **HTTP / SSE transport** (`--listen <addr>`) -- run as a long-lived daemon serving
   multiple clients over TCP or Unix-socket MCP. v0 is stdio-only; one process per client.
-- **Attach to an existing container** (`--attach <session-id>`) -- share a running
-  `outrig run` session's container instead of starting a new one. v0 always launches its
-  own container.
 
 Also deferred: exposing a tool-call audit log, proxying MCP `prompts/*` and
 `resources/*`, surfacing backing-server stderr as MCP resources, and paginating

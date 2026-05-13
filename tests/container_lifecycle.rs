@@ -117,3 +117,58 @@ async fn drop_without_stop_cleans_up() {
         "name should be untracked after Drop"
     );
 }
+
+#[tokio::test]
+async fn attached_handle_does_not_stop_or_cleanup_container() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let tag = ImageTag(ALPINE.to_string());
+
+    let container = Container::start(&tag, Some((host_ws.path(), Path::new("/workspace"))))
+        .await
+        .expect("start");
+    let name = container.name.clone();
+
+    {
+        let _attached = Container::attach(
+            name.clone(),
+            tag.clone(),
+            Some((host_ws.path(), Path::new("/workspace"))),
+            None,
+        );
+    }
+    assert!(
+        podman_ps_lists(&name, false).await,
+        "attached drop must leave the borrowed container running"
+    );
+
+    {
+        let attached = Container::attach(
+            name.clone(),
+            tag.clone(),
+            Some((host_ws.path(), Path::new("/workspace"))),
+            None,
+        );
+        attached
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("attached stop is no-op");
+    }
+
+    assert!(
+        podman_ps_lists(&name, false).await,
+        "attached stop/drop must leave the borrowed container running"
+    );
+    assert!(
+        container::is_tracked(&name),
+        "owned handle should still track the container"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+    assert!(
+        !podman_ps_lists(&name, true).await,
+        "owned stop should remove the container"
+    );
+}

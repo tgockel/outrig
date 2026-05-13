@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0054](0054-outrig-mcp-attach.md)** `outrig mcp --attach` to an
-  existing container.
 - **[0056](0056-outrig-design-prompt.md)** `outrig design prompt` --
   one-shot prompt printer.
 - **[0057](0057-runtime-bind-mounts.md)** Runtime bind mounts.

@@ -79,6 +79,7 @@ pub async fn execute(
         global_cfg_path,
         session_root_flag,
         container_flag: args.container.as_deref(),
+        attach_target: None,
         agent_flag: args.agent.as_deref(),
         require_agent: true,
         explicit_session_dir: args.session_dir.as_deref(),
@@ -100,6 +101,7 @@ pub async fn execute(
         sid,
         log_dir,
         store,
+        attached: _,
         session: _,
         session_dir: _,
     } = setup;
