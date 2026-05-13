@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use outrig::config::{ContainerConfig, McpServerSpec};
-use outrig::container::Container;
+use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig::mcp::McpClient;
 use outrig::session::{Session, SessionId, SessionStore};
@@ -90,9 +90,12 @@ context = "{context}"
 }
 
 async fn start_fixture_container(image: &ImageTag, repo: &Path) -> Container {
-    let mut container = Container::start(image, Some((repo, Path::new("/workspace"))))
-        .await
-        .expect("start fixture container");
+    let mut container = Container::start(
+        image,
+        ContainerLaunchSpec::workspace(repo, Path::new("/workspace")),
+    )
+    .await
+    .expect("start fixture container");
     container.bootstrap_user().await.expect("bootstrap user");
     container
 }

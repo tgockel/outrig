@@ -7,7 +7,9 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use outrig::config::{Config, ConfigValidationError, LlmProvider, McpServerSpec, merge};
+use outrig::config::{
+    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, merge,
+};
 use outrig::error::OutrigError;
 
 const FIXTURE_FULL: &str = include_str!("fixtures/config-full.toml");
@@ -332,6 +334,123 @@ context    = "does/not/exist"
     }
 
     #[test]
+    fn workspace_mount_missing_host_errors() {
+        let tmp = tempdir().unwrap();
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "missing-docs"
+container-path = "/resources/docs"
+"#,
+        );
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        match err {
+            ConfigValidationError::WorkspaceMountHostMissing { path } => {
+                assert_eq!(path, std::path::PathBuf::from("missing-docs"));
+            }
+            other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_file_host_errors() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("docs.txt"), "not a directory").unwrap();
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs.txt"
+container-path = "/resources/docs"
+"#,
+        );
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        match err {
+            ConfigValidationError::WorkspaceMountHostNotDirectory { path } => {
+                assert_eq!(path, std::path::PathBuf::from("docs.txt"));
+            }
+            other => panic!("expected WorkspaceMountHostNotDirectory, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_container_path_must_be_absolute() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "resources/docs"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::WorkspaceMountContainerNotAbsolute { path } => {
+                assert_eq!(path, std::path::PathBuf::from("resources/docs"));
+            }
+            other => panic!("expected WorkspaceMountContainerNotAbsolute, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_container_path_must_not_be_root() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::WorkspaceMountContainerRoot),
+            "expected WorkspaceMountContainerRoot, got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn workspace_mount_duplicate_container_path_errors() {
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "docs-a"
+container-path = "/resources/docs"
+
+[[workspace.mounts]]
+host-path      = "docs-b"
+container-path = "/resources/docs"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path } => {
+                assert_eq!(path, std::path::PathBuf::from("/resources/docs"));
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mount_cannot_shadow_primary_workspace() {
+        let cfg = parse(
+            r#"
+[workspace]
+host-path      = "."
+container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/workspace"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path } => {
+                assert_eq!(path, std::path::PathBuf::from("/workspace"));
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn top_level_tool_call_cap_zero_errors() {
         let cfg = parse(
             r#"
@@ -608,6 +727,51 @@ tool-result-cap = 262144
         let merged = merge(global, repo);
         assert_eq!(merged.tool_result_cap, Some(262144));
     }
+
+    #[test]
+    fn workspace_mounts_concatenate_global_then_repo() {
+        let global = parse(
+            r#"
+[workspace]
+host-path      = "/ignored/global/workspace"
+container-path = "/ignored-global"
+
+[[workspace.mounts]]
+host-path      = "/global/docs"
+container-path = "/resources/global-docs"
+"#,
+        );
+        let repo = parse(
+            r#"
+[workspace]
+host-path      = "."
+container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "repo-cache"
+container-path = "/resources/repo-cache"
+access         = "read-write"
+"#,
+        );
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.workspace.host_path, std::path::PathBuf::from("."));
+        assert_eq!(
+            merged.workspace.container_path,
+            std::path::PathBuf::from("/workspace"),
+        );
+        assert_eq!(merged.workspace.mounts.len(), 2);
+        assert_eq!(
+            merged.workspace.mounts[0].container_path,
+            std::path::PathBuf::from("/resources/global-docs"),
+        );
+        assert_eq!(merged.workspace.mounts[0].access, MountAccess::ReadOnly);
+        assert_eq!(
+            merged.workspace.mounts[1].container_path,
+            std::path::PathBuf::from("/resources/repo-cache"),
+        );
+        assert_eq!(merged.workspace.mounts[1].access, MountAccess::ReadWrite);
+    }
 }
 
 mod config_load {
@@ -637,6 +801,9 @@ mod config_load {
         let model_dir = tmp.path().join(".agents/outrig/models");
         fs::create_dir_all(&model_dir).unwrap();
         fs::write(model_dir.join("llama-3-8b-instruct.q4.gguf"), b"\0").unwrap();
+
+        fs::create_dir_all(tmp.path().join(".agents/outrig/resources/docs")).unwrap();
+        fs::create_dir_all(tmp.path().join(".agents/outrig/resources/cache")).unwrap();
 
         let cfg = Config::load(tmp.path(), None).expect("fixture loads end-to-end");
         assert_eq!(cfg.default_container.as_deref(), Some("coding"));

@@ -219,3 +219,14 @@ cargo test --no-default-features --features e2e --test library_surface -- --noca
 ## Dependencies
 
 None.
+
+## Decisions
+
+- Use one shared `MountAccess` enum for config and the public launch API so TOML parsing,
+  direct callers, and container rendering cannot drift.
+- Keep the primary workspace separate from extra mounts in `ContainerLaunchSpec`; it is still
+  always read-write and is the only mount that sets the container workdir.
+- Treat validation with no repo root as structural-only: container-path rules and duplicates are
+  checked, while host filesystem existence checks wait for repo-root-aware loading.
+- Attach mode does not try to apply mounts to an already-running container; extra mounts only
+  affect fresh `podman run` launches.

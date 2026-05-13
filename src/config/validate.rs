@@ -5,6 +5,7 @@
 //! only checks cross-references, MCP server-name shape, and disk-existence of
 //! container `dockerfile` / `context` paths.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -91,6 +92,21 @@ pub enum ConfigValidationError {
     #[error("model-cache-root {path:?} must be an absolute path")]
     ModelCacheRootNotAbsolute { path: PathBuf },
 
+    #[error("workspace mount host-path {path:?} does not exist")]
+    WorkspaceMountHostMissing { path: PathBuf },
+
+    #[error("workspace mount host-path {path:?} is not a directory")]
+    WorkspaceMountHostNotDirectory { path: PathBuf },
+
+    #[error("workspace mount container-path {path:?} must be absolute")]
+    WorkspaceMountContainerNotAbsolute { path: PathBuf },
+
+    #[error("workspace mount container-path must not be /")]
+    WorkspaceMountContainerRoot,
+
+    #[error("workspace mount container-path {path:?} is declared more than once")]
+    WorkspaceMountContainerDuplicate { path: PathBuf },
+
     #[error("{path} must be between 1 and {max}; got {value}")]
     ToolCallCapOutOfRange { path: String, value: u32, max: u32 },
 
@@ -150,6 +166,8 @@ pub(super) fn validate(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
+    validate_workspace_mounts(cfg, repo_root)?;
+
     if let Some(name) = &cfg.default_container
         && !cfg.containers.contains_key(name)
     {
@@ -253,6 +271,50 @@ pub(super) fn validate(
         match provider {
             LlmProvider::OpenAi { .. } => validate_openai_model(model_name, model)?,
             LlmProvider::Mistralrs => validate_mistralrs_model(model_name, model, repo_root)?,
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_workspace_mounts(
+    cfg: &Config,
+    repo_root: Option<&Path>,
+) -> Result<(), ConfigValidationError> {
+    let mut container_paths = BTreeSet::new();
+    container_paths.insert(cfg.workspace.container_path.clone());
+
+    for mount in &cfg.workspace.mounts {
+        if !mount.container_path.is_absolute() {
+            return Err(ConfigValidationError::WorkspaceMountContainerNotAbsolute {
+                path: mount.container_path.clone(),
+            });
+        }
+        if mount.container_path == Path::new("/") {
+            return Err(ConfigValidationError::WorkspaceMountContainerRoot);
+        }
+        if !container_paths.insert(mount.container_path.clone()) {
+            return Err(ConfigValidationError::WorkspaceMountContainerDuplicate {
+                path: mount.container_path.clone(),
+            });
+        }
+
+        if let Some(root) = repo_root {
+            let resolved = if mount.host_path.is_absolute() {
+                mount.host_path.clone()
+            } else {
+                root.join(&mount.host_path)
+            };
+            if !resolved.exists() {
+                return Err(ConfigValidationError::WorkspaceMountHostMissing {
+                    path: mount.host_path.clone(),
+                });
+            }
+            if !resolved.is_dir() {
+                return Err(ConfigValidationError::WorkspaceMountHostNotDirectory {
+                    path: mount.host_path.clone(),
+                });
+            }
         }
     }
 

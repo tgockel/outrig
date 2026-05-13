@@ -10,8 +10,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::config::{ContainerConfig, ContainerSourceRef, EnvValue, McpServerSpec, Workspace};
-use crate::container::{Container, embedded};
+use crate::config::{
+    ContainerConfig, ContainerSourceRef, EnvValue, McpServerSpec, MountAccess, Workspace,
+};
+use crate::container::{
+    Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace, embedded,
+};
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::mcp::{McpClient, McpToolResult};
@@ -40,12 +44,21 @@ pub struct WorkspaceSpec {
     pub container: PathBuf,
 }
 
+/// Extra host directory mounted into the container.
+#[derive(Debug, Clone)]
+pub struct MountSpec {
+    pub host: PathBuf,
+    pub container: PathBuf,
+    pub access: MountAccess,
+}
+
 /// Description of one container launch: image source, optional workspace
 /// mount, MCP servers to start inside, and the directory to land per-server
 /// stderr in.
 pub struct LaunchSpec {
     pub(crate) source: LaunchSource,
     pub workspace: Option<WorkspaceSpec>,
+    pub mounts: Vec<MountSpec>,
     pub mcp: BTreeMap<String, McpServerSpec>,
     pub log_dir: PathBuf,
 }
@@ -74,6 +87,7 @@ impl LaunchSpec {
                 build_args,
             },
             workspace: Some(workspace),
+            mounts: Vec::new(),
             mcp,
             log_dir,
         }
@@ -89,6 +103,7 @@ impl LaunchSpec {
         Self {
             source: LaunchSource::Image { tag: image.into() },
             workspace: None,
+            mounts: Vec::new(),
             mcp,
             log_dir,
         }
@@ -104,15 +119,20 @@ impl LaunchSpec {
         repo_root: &Path,
         log_dir: PathBuf,
     ) -> Self {
-        let host = if workspace.host_path.is_absolute() {
-            workspace.host_path.clone()
-        } else {
-            repo_root.join(&workspace.host_path)
-        };
+        let host = resolve_workspace_host(repo_root, &workspace.host_path);
         let ws = WorkspaceSpec {
             host,
             container: workspace.container_path.clone(),
         };
+        let mounts = workspace
+            .mounts
+            .iter()
+            .map(|mount| MountSpec {
+                host: resolve_workspace_host(repo_root, &mount.host_path),
+                container: mount.container_path.clone(),
+                access: mount.access,
+            })
+            .collect();
         match cfg.source() {
             ContainerSourceRef::Build {
                 dockerfile,
@@ -125,6 +145,7 @@ impl LaunchSpec {
                     build_args: build_args.clone(),
                 },
                 workspace: Some(ws),
+                mounts,
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -133,6 +154,7 @@ impl LaunchSpec {
                     tag: image_name.to_string(),
                 },
                 workspace: Some(ws),
+                mounts,
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -147,6 +169,24 @@ impl LaunchSpec {
     pub fn without_workspace(mut self) -> Self {
         self.workspace = None;
         self
+    }
+
+    pub fn with_mount(mut self, mount: MountSpec) -> Self {
+        self.mounts.push(mount);
+        self
+    }
+
+    pub fn with_mounts(mut self, mounts: impl IntoIterator<Item = MountSpec>) -> Self {
+        self.mounts.extend(mounts);
+        self
+    }
+}
+
+fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
     }
 }
 
@@ -198,11 +238,22 @@ impl Outrig {
             LaunchSource::Image { tag } => ImageTag(tag.clone()),
         };
 
-        let workspace = spec
-            .workspace
-            .as_ref()
-            .map(|w| (w.host.as_path(), w.container.as_path()));
-        let mut container = Container::start(&image_tag, workspace).await?;
+        let launch = ContainerLaunchSpec {
+            workspace: spec.workspace.as_ref().map(|workspace| ContainerWorkspace {
+                host: workspace.host.clone(),
+                container: workspace.container.clone(),
+            }),
+            mounts: spec
+                .mounts
+                .iter()
+                .map(|mount| ContainerMount {
+                    host: mount.host.clone(),
+                    container: mount.container.clone(),
+                    access: mount.access,
+                })
+                .collect(),
+        };
+        let mut container = Container::start(&image_tag, launch).await?;
         container.bootstrap_user().await?;
 
         let mcp = embedded::merged_mcp(&container, &spec.mcp).await?;

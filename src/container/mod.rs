@@ -31,6 +31,7 @@ use nix::unistd::{Gid, Group, Uid, User};
 use serde_json::Value;
 use tokio::process::Child;
 
+use crate::config::MountAccess;
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd, Transcript};
@@ -72,15 +73,48 @@ pub struct ContainerInspect {
     pub running: bool,
 }
 
+/// Complete mount-related inputs for a `podman run`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerLaunchSpec {
+    pub workspace: Option<ContainerWorkspace>,
+    pub mounts: Vec<ContainerMount>,
+}
+
+impl ContainerLaunchSpec {
+    pub fn workspace(host: impl Into<PathBuf>, container: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: Some(ContainerWorkspace {
+                host: host.into(),
+                container: container.into(),
+            }),
+            mounts: Vec::new(),
+        }
+    }
+}
+
+/// Primary read-write workspace mount. When present, this also sets `-w`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerWorkspace {
+    pub host: PathBuf,
+    pub container: PathBuf,
+}
+
+/// Extra bind mount. These do not affect the container working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerMount {
+    pub host: PathBuf,
+    pub container: PathBuf,
+    pub access: MountAccess,
+}
+
 impl Container {
-    /// Start a container running `image`. When `workspace` is `Some((host,
-    /// container))`, mounts `host` at `container` (with `--userns=keep-id`)
-    /// and uses the container path as the working directory. When `None`,
-    /// neither `-v` nor `-w` is passed -- the caller gets a bare container
-    /// with no workspace bind.
-    pub async fn start(image: &ImageTag, workspace: Option<(&Path, &Path)>) -> Result<Self> {
+    /// Start a container running `image`, applying the primary workspace and
+    /// extra bind mounts from `launch`. A primary workspace is mounted
+    /// read-write and used as the working directory; extra mounts never
+    /// affect `-w`.
+    pub async fn start(image: &ImageTag, launch: ContainerLaunchSpec) -> Result<Self> {
         let name = format!("outrig-{}", SessionId::new());
-        Self::start_named(image, workspace, name, None).await
+        Self::start_named(image, launch, name, None).await
     }
 
     /// Start with a caller-supplied container name. Session setup uses this
@@ -88,7 +122,7 @@ impl Container {
     /// preallocated session id.
     pub(crate) async fn start_named(
         image: &ImageTag,
-        workspace: Option<(&Path, &Path)>,
+        launch: ContainerLaunchSpec,
         name: String,
         transcript: Option<Transcript>,
     ) -> Result<Self> {
@@ -99,40 +133,15 @@ impl Container {
         // its return can still be cleaned up by the panic hook.
         track(&name);
 
-        let mut cmd = Cmd::new("podman")
-            .args(["run", "-d", "--rm", "--name"])
-            .arg(&name);
-        if let Some((host_ws, ws_container)) = workspace {
-            let mount_opts = if selinux_enforcing().await {
-                "rw,Z"
-            } else {
-                "rw"
-            };
-            let mount = format!(
-                "{}:{}:{mount_opts}",
-                host_ws.display(),
-                ws_container.display()
-            );
-            cmd = cmd
-                .arg("-v")
-                .arg(&mount)
-                .args(["--userns=keep-id", "-w"])
-                .arg(ws_container);
-        } else {
-            cmd = cmd.arg("--userns=keep-id");
-        }
-        cmd = cmd
-            .args(["--security-opt=no-new-privileges", "--pull=never"])
-            .arg(image.0.as_str())
-            .args(["sleep", "infinity"]);
+        let cmd = build_podman_run_cmd(image, &name, &launch, selinux_enforcing().await);
 
         if let Err(e) = process::run_capture_logged(cmd, "podman", transcript.as_ref()).await {
             untrack(&name);
             return Err(e);
         }
 
-        let (host_workspace, container_workspace) = match workspace {
-            Some((host, container)) => (host.to_path_buf(), container.to_path_buf()),
+        let (host_workspace, container_workspace) = match &launch.workspace {
+            Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
             None => (PathBuf::new(), PathBuf::new()),
         };
 
@@ -464,6 +473,57 @@ fn spawn_detached_rm(name: &str) {
         .spawn();
 }
 
+fn build_podman_run_cmd(
+    image: &ImageTag,
+    name: &str,
+    launch: &ContainerLaunchSpec,
+    selinux: bool,
+) -> Cmd {
+    let mut cmd = Cmd::new("podman")
+        .args(["run", "-d", "--rm", "--name"])
+        .arg(name);
+
+    if let Some(workspace) = &launch.workspace {
+        cmd = append_bind_mount(
+            cmd,
+            &workspace.host,
+            &workspace.container,
+            MountAccess::ReadWrite,
+            selinux,
+        );
+    }
+    for mount in &launch.mounts {
+        cmd = append_bind_mount(cmd, &mount.host, &mount.container, mount.access, selinux);
+    }
+
+    cmd = cmd.arg("--userns=keep-id");
+    if let Some(workspace) = &launch.workspace {
+        cmd = cmd.arg("-w").arg(&workspace.container);
+    }
+
+    cmd.args(["--security-opt=no-new-privileges", "--pull=never"])
+        .arg(image.0.as_str())
+        .args(["sleep", "infinity"])
+}
+
+fn append_bind_mount(
+    cmd: Cmd,
+    host: &Path,
+    container: &Path,
+    access: MountAccess,
+    selinux: bool,
+) -> Cmd {
+    let mut opts = match access {
+        MountAccess::ReadOnly => "ro".to_string(),
+        MountAccess::ReadWrite => "rw".to_string(),
+    };
+    if selinux {
+        opts.push_str(",Z");
+    }
+    cmd.arg("-v")
+        .arg(format!("{}:{}:{opts}", host.display(), container.display()))
+}
+
 /// Install a process-wide panic hook that sweeps `TRACKED` with
 /// `podman rm -f` before delegating to the previous hook. Idempotent --
 /// safe to call from multiple `main`s or test setups.
@@ -548,5 +608,114 @@ async fn selinux_enforcing() -> bool {
     match tokio::fs::read_to_string("/sys/fs/selinux/enforce").await {
         Ok(s) => s.trim() == "1",
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(cmd: Cmd) -> Vec<String> {
+        std::iter::once(cmd.program.to_string())
+            .chain(
+                cmd.args
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn podman_run_args_include_workspace_then_extra_mounts() {
+        let launch = ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace {
+                host: "/host/repo".into(),
+                container: "/workspace".into(),
+            }),
+            mounts: vec![
+                ContainerMount {
+                    host: "/host/docs".into(),
+                    container: "/resources/docs".into(),
+                    access: MountAccess::ReadOnly,
+                },
+                ContainerMount {
+                    host: "/host/cache".into(),
+                    container: "/resources/cache".into(),
+                    access: MountAccess::ReadWrite,
+                },
+            ],
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "-v",
+                "/host/repo:/workspace:rw",
+                "-v",
+                "/host/docs:/resources/docs:ro",
+                "-v",
+                "/host/cache:/resources/cache:rw",
+                "--userns=keep-id",
+                "-w",
+                "/workspace",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_run_args_apply_selinux_to_every_mount_without_workdir() {
+        let launch = ContainerLaunchSpec {
+            workspace: None,
+            mounts: vec![ContainerMount {
+                host: "/host/docs".into(),
+                container: "/resources/docs".into(),
+                access: MountAccess::ReadOnly,
+            }],
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            true,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "-v",
+                "/host/docs:/resources/docs:ro,Z",
+                "--userns=keep-id",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
     }
 }

@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use outrig::config::{ContainerConfig, McpServerSpec};
-use outrig::container::{Container, embedded};
+use outrig::container::{Container, ContainerLaunchSpec, embedded};
 use outrig::error::OutrigError;
 use outrig::image::{self, ImageTag};
 use outrig::mcp::McpClient;
@@ -88,9 +88,12 @@ async fn ensure_missing_file_image() -> ImageTag {
 }
 
 async fn start_and_bootstrap(image: &ImageTag, host_ws: &Path) -> Container {
-    let mut container = Container::start(image, Some((host_ws, Path::new("/workspace"))))
-        .await
-        .expect("Container::start");
+    let mut container = Container::start(
+        image,
+        ContainerLaunchSpec::workspace(host_ws, Path::new("/workspace")),
+    )
+    .await
+    .expect("Container::start");
     container.bootstrap_user().await.expect("bootstrap_user");
     container
 }

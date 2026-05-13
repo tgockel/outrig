@@ -22,7 +22,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
 
-use outrig::container::Container;
+use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::ImageTag;
 use outrig::process::{self, Cmd};
 use tokio::io::AsyncReadExt;
@@ -48,9 +48,12 @@ async fn install_shadow(name: &str) {
 
 async fn start_alpine(host_ws: &Path) -> Container {
     let tag = ImageTag(ALPINE.to_string());
-    Container::start(&tag, Some((host_ws, Path::new("/workspace"))))
-        .await
-        .expect("start")
+    Container::start(
+        &tag,
+        ContainerLaunchSpec::workspace(host_ws, Path::new("/workspace")),
+    )
+    .await
+    .expect("start")
 }
 
 async fn read_stdout(child: &mut tokio::process::Child) -> String {

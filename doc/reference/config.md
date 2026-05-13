@@ -257,15 +257,32 @@ messages.
 [workspace]
 host-path      = "."
 container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "../shared-docs"
+container-path = "/resources/shared-docs"
+
+[[workspace.mounts]]
+host-path      = "/var/tmp/outrig-cache"
+container-path = "/resources/cache"
+access         = "read-write"
 ```
 
-- `host-path` (path, optional, default: `"."`): host path to bind-mount, relative to
-  the repo root.
-- `container-path` (path, optional, default: `"/workspace"`): where `host-path` is
-  mounted in the container.
+- `host-path` (path, optional, default: `"."`): primary workspace host path,
+  relative to the repo root.
+- `container-path` (path, optional, default: `"/workspace"`): where the primary
+  workspace is mounted in the container.
+- `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
+- `mounts[*].host-path` (path, required): host directory to mount. Relative paths
+  resolve against the repo root.
+- `mounts[*].container-path` (path, required): absolute in-container mount point.
+- `mounts[*].access` (string, optional, default: `"read-only"`): either
+  `"read-only"` or `"read-write"`.
 
-The bind-mount is read-write and uses `--userns=keep-id` so files written inside the container
-appear with your host UID/GID. See [Concepts -> Workspace](../concepts/workspace.md).
+The primary workspace bind-mount is always read-write and uses `--userns=keep-id` so files
+written inside the container appear with your host UID/GID. Extra mounts default to read-only;
+set `access = "read-write"` only for directories the agent should be able to modify. See
+[Concepts -> Workspace](../concepts/workspace.md).
 
 ## `[containers.<name>]`
 
@@ -385,6 +402,11 @@ used in full (no per-key merging).
 -> resolved api-key from env. Anything that fails to resolve is an error printed to stderr
 before the REPL starts.
 
+`[workspace]` primary fields are repo-owned: the repo config's `host-path` and
+`container-path` win as a block. Extra `workspace.mounts` are combined instead of replaced:
+global mounts are kept first, followed by repo mounts. Duplicate final `container-path` values
+are rejected during validation.
+
 ## Full examples
 
 ### Global `~/.outrig/config.toml`
@@ -428,6 +450,15 @@ default-agent     = "coding"
 [workspace]
 host-path      = "."
 container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "../shared-docs"
+container-path = "/resources/shared-docs"
+
+[[workspace.mounts]]
+host-path      = "/var/tmp/outrig-cache"
+container-path = "/resources/cache"
+access         = "read-write"
 
 [agents.coding]
 # model omitted -> uses global default-model = "fast"
@@ -491,6 +522,12 @@ build-args = { NODE_VERSION = "20" }
   `dockerfile`/`context` without the other is an error.
 - `image-name` must not be empty.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
+- Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
+  directory. Relative host paths resolve against the repo root.
+- Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
+- Extra workspace mount `container-path` values must be unique, including no collision with the
+  primary workspace `container-path`.
+- Every `workspace.mounts[*].access`, if set, must be either `read-only` or `read-write`.
 - Unknown keys at any level are rejected.
 
 ## See also

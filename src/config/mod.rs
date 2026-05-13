@@ -162,6 +162,8 @@ pub struct Agent {
 pub struct Workspace {
     pub host_path: PathBuf,
     pub container_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountConfig>,
 }
 
 impl Default for Workspace {
@@ -169,8 +171,26 @@ impl Default for Workspace {
         Self {
             host_path: PathBuf::from("."),
             container_path: PathBuf::from("/workspace"),
+            mounts: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MountConfig {
+    pub host_path: PathBuf,
+    pub container_path: PathBuf,
+    #[serde(default)]
+    pub access: MountAccess,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountAccess {
+    #[default]
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

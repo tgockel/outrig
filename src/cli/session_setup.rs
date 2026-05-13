@@ -32,7 +32,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::config::{Config, ContainerConfig, McpServerSpec};
-use crate::container::{Container, embedded};
+use crate::container::{
+    Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace, embedded,
+};
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::llm;
@@ -79,6 +81,14 @@ fn format_elapsed(duration: Duration) -> String {
         return format!("{:.1}s", duration.as_secs_f64());
     }
     format!("{}m{:02}s", secs / 60, secs % 60)
+}
+
+fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
 }
 
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
@@ -237,12 +247,24 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         image_tag
     };
 
-    let host_workspace = if cfg.workspace.host_path.is_absolute() {
-        cfg.workspace.host_path.clone()
-    } else {
-        repo_root.join(&cfg.workspace.host_path)
-    };
+    let host_workspace = resolve_workspace_host(&repo_root, &cfg.workspace.host_path);
     let container_workspace = cfg.workspace.container_path.clone();
+    let launch = ContainerLaunchSpec {
+        workspace: Some(ContainerWorkspace {
+            host: host_workspace.clone(),
+            container: container_workspace.clone(),
+        }),
+        mounts: cfg
+            .workspace
+            .mounts
+            .iter()
+            .map(|mount| ContainerMount {
+                host: resolve_workspace_host(&repo_root, &mount.host_path),
+                container: mount.container_path.clone(),
+                access: mount.access,
+            })
+            .collect(),
+    };
 
     if let Some(p) = args.explicit_session_dir
         && !p.is_dir()
@@ -343,14 +365,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         ));
 
         let span = ProgressSpan::start(format!("starting container {container_name}"));
-        match Container::start_named(
-            &image_tag,
-            Some((&host_workspace, &container_workspace)),
-            container_name,
-            transcript,
-        )
-        .await
-        {
+        match Container::start_named(&image_tag, launch, container_name, transcript).await {
             Ok(container) => {
                 span.done(format!("container ready: {}", container.name));
                 container

@@ -180,11 +180,11 @@ image is already present locally.
 
 ## What outrig does *not* set in the run
 
-outrig adds `--userns=keep-id`, `--security-opt=no-new-privileges`, the workspace bind-mount,
-and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). It does *not* drop
-capabilities aggressively in v0 -- `--cap-drop=ALL` breaks many real MCP servers (npm
-post-install, fork-heavy shells), so the v0 floor is the default podman cap set plus
-`no-new-privileges`. Tightening that is deferred.
+outrig adds `--userns=keep-id`, `--security-opt=no-new-privileges`, the primary workspace
+bind-mount, any configured extra workspace mounts, and the runtime user-mapping bootstrap
+(see [Workspace](workspace.md)). It does *not* drop capabilities aggressively in v0 --
+`--cap-drop=ALL` breaks many real MCP servers (npm post-install, fork-heavy shells), so the v0
+floor is the default podman cap set plus `no-new-privileges`. Tightening that is deferred.
 
 > **TODO: Incomplete** -- `--cap-drop` profile and seccomp policy aren't implemented yet.
 

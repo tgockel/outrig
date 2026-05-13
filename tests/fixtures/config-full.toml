@@ -61,6 +61,15 @@ preamble = "You are a meticulous code reviewer."
 host-path      = "."
 container-path = "/workspace"
 
+[[workspace.mounts]]
+host-path      = ".agents/outrig/resources/docs"
+container-path = "/resources/docs"
+
+[[workspace.mounts]]
+host-path      = ".agents/outrig/resources/cache"
+container-path = "/resources/cache"
+access         = "read-write"
+
 [containers.coding]
 dockerfile = ".agents/outrig/containers/coding/Dockerfile"
 context    = ".agents/outrig/containers/coding"

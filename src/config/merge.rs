@@ -1,5 +1,6 @@
 //! Merge global + repo `Config` values. Repo entries replace global entries
-//! with the same key (no per-key merging within an entry).
+//! with the same key (no per-key merging within an entry), except extra
+//! workspace mounts which are concatenated in global-then-repo order.
 
 use super::Config;
 
@@ -12,10 +13,12 @@ use super::Config;
 ///   `default-model`, `session-root`, `model-cache-root`,
 ///   `tool-call-cap`, `tool-result-cap`): repo's value wins if set,
 ///   else global's.
-/// - `[workspace]` is repo-only at the block level. Since `Workspace` has serde
+/// - `[workspace]` primary fields are repo-owned. Since `Workspace` has serde
 ///   defaults, an absent block in the repo file deserializes to those defaults
-///   -- so taking `repo.workspace` unconditionally matches the documented
-///   "rare to set globally; repo still wins block-level" rule.
+///   -- so taking repo `host-path`/`container-path` unconditionally matches
+///   the documented "rare to set globally; repo still wins block-level" rule.
+///   Extra `workspace.mounts` are concatenated so user-level resource mounts
+///   and repo-level resource mounts both participate.
 pub fn merge(global: Config, repo: Config) -> Config {
     let mut providers = global.providers;
     providers.extend(repo.providers);
@@ -29,6 +32,11 @@ pub fn merge(global: Config, repo: Config) -> Config {
     let mut containers = global.containers;
     containers.extend(repo.containers);
 
+    let mut workspace = repo.workspace;
+    let mut mounts = global.workspace.mounts;
+    mounts.extend(workspace.mounts);
+    workspace.mounts = mounts;
+
     Config {
         default_container: repo.default_container.or(global.default_container),
         default_agent: repo.default_agent.or(global.default_agent),
@@ -40,7 +48,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         providers,
         models,
         agents,
-        workspace: repo.workspace,
+        workspace,
         containers,
     }
 }

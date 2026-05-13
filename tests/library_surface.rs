@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use outrig::config::McpServerSpec;
-use outrig::{LaunchSpec, Outrig};
+use outrig::{LaunchSpec, MountAccess, MountSpec, Outrig};
+
+static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
@@ -35,8 +37,20 @@ fn init_tracing() {
         .try_init();
 }
 
+fn build_fixture_image(tag: &str) {
+    let status = std::process::Command::new("podman")
+        .arg("build")
+        .arg("-t")
+        .arg(tag)
+        .arg(fixture_dir())
+        .status()
+        .expect("spawn podman build");
+    assert!(status.success(), "podman build exited non-zero: {status:?}");
+}
+
 #[tokio::test]
 async fn launch_lists_tools_calls_one_and_shuts_down() {
+    let _guard = E2E_LOCK.lock().await;
     init_tracing();
 
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
@@ -104,6 +118,56 @@ async fn launch_lists_tools_calls_one_and_shuts_down() {
     assert!(
         result.content_text.contains("MARKER.txt"),
         "list_directory output should mention MARKER.txt, got: {}",
+        result.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn from_image_launches_with_extra_read_only_mount() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-mounts-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let resources = tempfile::tempdir().expect("tempdir resources");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let log_dir = session_dir.path().join("logs");
+    std::fs::write(resources.path().join("REFERENCE.txt"), "mounted\n")
+        .expect("write REFERENCE.txt");
+
+    let mut mcp = BTreeMap::new();
+    mcp.insert(
+        "fs".to_string(),
+        McpServerSpec::Short(vec![
+            "mcp-server-filesystem".to_string(),
+            "/resources/readonly".to_string(),
+        ]),
+    );
+
+    let spec = LaunchSpec::from_image(tag, mcp, log_dir).with_mount(MountSpec {
+        host: resources.path().to_path_buf(),
+        container: PathBuf::from("/resources/readonly"),
+        access: MountAccess::ReadOnly,
+    });
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let result = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/resources/readonly" }),
+        )
+        .await
+        .expect("call_tool list_directory");
+    assert!(
+        result.content_text.contains("REFERENCE.txt"),
+        "list_directory output should mention REFERENCE.txt, got: {}",
         result.content_text,
     );
 

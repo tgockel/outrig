@@ -378,6 +378,7 @@ fn render(
         workspace: Workspace {
             host_path: PathBuf::from(host_path),
             container_path: PathBuf::from(container_path),
+            mounts: Vec::new(),
         },
         providers: model_choices.providers,
         models: model_choices.models,

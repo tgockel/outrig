@@ -21,8 +21,9 @@ pub mod mcp_proxy;
 
 mod outrig_;
 
+pub use config::MountAccess;
 pub use mcp::{McpTool, McpToolResult};
-pub use outrig_::{LaunchSpec, Outrig, ToolHandle, WorkspaceSpec};
+pub use outrig_::{LaunchSpec, MountSpec, Outrig, ToolHandle, WorkspaceSpec};
 
 /// Load the project config rooted at `dir`. Walks up from `dir` looking
 /// for `.agents/outrig/config.toml`, then merges in the optional `global`

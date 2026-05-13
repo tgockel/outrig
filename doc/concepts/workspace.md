@@ -1,21 +1,23 @@
 # Workspace
 
-The workspace is what the agent's tools get to read and write. By default it's your repository,
-mounted live into the container at `/workspace`. Read this page before you run outrig on anything
-you can't easily roll back.
+The workspace is what the agent's tools get to read and write. By default, your repository is
+mounted live into the container at `/workspace`. You can also mount extra resource directories,
+read-only by default, when the agent needs supporting material outside the repo. Read this page
+before you run outrig on anything you can't easily roll back.
 
 ## Direct bind-mount, no staging
 
-outrig mounts the host workspace directly:
+outrig mounts the primary host workspace directly:
 
 ```
 podman run -v <repo>:/workspace:rw --userns=keep-id ...
 ```
 
 That means **changes made by tools inside the container appear on your host filesystem
-immediately**. There is no staging directory, no overlay, no per-session shadow copy. If the agent
-runs `rm -rf /workspace/*`, your repo is gone -- recoverable only via git or whatever backup you
-have.
+immediately** for any read-write bind mount. There is no staging directory, no overlay, no
+per-session shadow copy. If the agent runs `rm -rf /workspace/*`, your repo is gone --
+recoverable only via git or whatever backup you have. Extra mounts default to read-only, but an
+extra `access = "read-write"` mount has the same immediate-write behavior.
 
 This is intentional. The alternative -- staging changes in a sandbox and asking you to "apply"
 them after the session -- has a few real costs:
@@ -87,26 +89,45 @@ outrig reuses the existing entry rather than creating a duplicate.
 
 ## What's mounted, what isn't
 
-The `[workspace]` block controls what the container sees:
+The `[workspace]` block controls what host directories the container sees:
 
 ```toml
 [workspace]
 host-path      = "."          # relative to the repo root containing .agents/outrig/
 container-path = "/workspace"
+
+[[workspace.mounts]]
+host-path      = "../shared-docs"
+container-path = "/resources/shared-docs"
+
+[[workspace.mounts]]
+host-path      = "/var/tmp/outrig-cache"
+container-path = "/resources/cache"
+access         = "read-write"
 ```
 
 `host-path = "."` (the default) mounts your whole repo. You can narrow this -- e.g.
-`host-path = "src"` mounts only the source dir. Anything outside `host-path` is invisible to the
-container.
+`host-path = "src"` mounts only the source dir. The primary workspace is always read-write and
+becomes the container workdir.
 
-Files outside the bind-mount are *not* reachable from the container under any circumstances:
+Extra `workspace.mounts` entries are for supporting directories: sibling repos, generated docs,
+SDK checkouts, model artifacts, or caches. Relative extra host paths resolve against the repo
+root, just like the primary workspace. Their container paths must be absolute, cannot be `/`, and
+must not duplicate the primary workspace or another extra mount. Exact duplicates fail during
+config validation instead of relying on podman mount ordering.
+
+Extra mounts default to `access = "read-only"`. Use `access = "read-write"` only when the agent
+really should mutate that host directory, such as a scratch cache under `/var/tmp`.
+
+Files outside the declared bind-mounts are *not* reachable from the container under any
+circumstances:
 
 - `~/.ssh` -- not mounted, agent can't read your keys.
 - `~/.config` -- not mounted.
 - `/etc/passwd` on the host -- not mounted; the container has its own.
 
-The container has its own `/etc`, `/home`, `/tmp`, etc. coming from the image. The only window
-onto the host filesystem is the workspace mount.
+The container has its own `/etc`, `/home`, `/tmp`, etc. coming from the image. The only windows
+onto the host filesystem are the primary workspace and the extra mounts you declare.
 
 ## Network is *not* part of the workspace
 

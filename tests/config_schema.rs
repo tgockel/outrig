@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use outrig::config::{Config, EnvValue, LlmProvider, McpServerSpec};
+use outrig::config::{Config, EnvValue, LlmProvider, McpServerSpec, MountAccess};
 use outrig::error::OutrigError;
 
 const FIXTURE: &str = include_str!("fixtures/config-full.toml");
@@ -157,6 +157,25 @@ srv = { command = ["bin", "arg1"] }
 
         assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
         assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+        assert_eq!(cfg.workspace.mounts.len(), 2);
+        assert_eq!(
+            cfg.workspace.mounts[0].host_path,
+            PathBuf::from(".agents/outrig/resources/docs"),
+        );
+        assert_eq!(
+            cfg.workspace.mounts[0].container_path,
+            PathBuf::from("/resources/docs"),
+        );
+        assert_eq!(cfg.workspace.mounts[0].access, MountAccess::ReadOnly);
+        assert_eq!(
+            cfg.workspace.mounts[1].host_path,
+            PathBuf::from(".agents/outrig/resources/cache"),
+        );
+        assert_eq!(
+            cfg.workspace.mounts[1].container_path,
+            PathBuf::from("/resources/cache"),
+        );
+        assert_eq!(cfg.workspace.mounts[1].access, MountAccess::ReadWrite);
 
         let coding_ctr = &cfg.containers["coding"];
         assert_eq!(
@@ -191,5 +210,25 @@ srv = { command = ["bin", "arg1"] }
         let cfg = Config::load_from_str("").expect("empty config parses");
         assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
         assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+        assert!(cfg.workspace.mounts.is_empty());
+    }
+
+    #[test]
+    fn workspace_mount_access_values_are_validated_by_schema() {
+        let bad = r#"
+[[workspace.mounts]]
+host-path      = "docs"
+container-path = "/resources/docs"
+access         = "write-mostly"
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        let OutrigError::Config(toml_err) = err else {
+            panic!("expected OutrigError::Config, got: {err:?}");
+        };
+        let msg = toml_err.to_string();
+        assert!(
+            msg.contains("write-mostly") || msg.contains("unknown variant"),
+            "error should explain invalid mount access, got: {msg}",
+        );
     }
 }

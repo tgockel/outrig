@@ -15,10 +15,11 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use outrig::container::{self, Container};
+use outrig::MountAccess;
+use outrig::container::{self, Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace};
 use outrig::image::ImageTag;
 use outrig::process::{self, Cmd};
 
@@ -55,9 +56,12 @@ async fn start_then_stop_leaves_no_container() {
     let host_ws = tempfile::tempdir().expect("tempdir");
     let tag = ImageTag(ALPINE.to_string());
 
-    let container = Container::start(&tag, Some((host_ws.path(), Path::new("/workspace"))))
-        .await
-        .expect("start");
+    let container = Container::start(
+        &tag,
+        ContainerLaunchSpec::workspace(host_ws.path(), Path::new("/workspace")),
+    )
+    .await
+    .expect("start");
     let name = container.name.clone();
 
     assert!(
@@ -79,6 +83,84 @@ async fn start_then_stop_leaves_no_container() {
 }
 
 #[tokio::test]
+async fn extra_mounts_enforce_access_modes() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    let host_ws = tempfile::tempdir().expect("tempdir workspace");
+    let ro_dir = tempfile::tempdir().expect("tempdir ro");
+    let rw_dir = tempfile::tempdir().expect("tempdir rw");
+    std::fs::write(ro_dir.path().join("MARKER.txt"), "read-only marker\n")
+        .expect("write ro marker");
+    let tag = ImageTag(ALPINE.to_string());
+
+    let container = Container::start(
+        &tag,
+        ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace {
+                host: host_ws.path().to_path_buf(),
+                container: PathBuf::from("/workspace"),
+            }),
+            mounts: vec![
+                ContainerMount {
+                    host: ro_dir.path().to_path_buf(),
+                    container: PathBuf::from("/resources/ro"),
+                    access: MountAccess::ReadOnly,
+                },
+                ContainerMount {
+                    host: rw_dir.path().to_path_buf(),
+                    container: PathBuf::from("/resources/rw"),
+                    access: MountAccess::ReadWrite,
+                },
+            ],
+        },
+    )
+    .await
+    .expect("start");
+
+    let read = process::run_capture(
+        Cmd::new("podman")
+            .arg("exec")
+            .arg(&container.name)
+            .args(["cat", "/resources/ro/MARKER.txt"]),
+    )
+    .await
+    .expect("cat read-only marker");
+    assert_eq!(String::from_utf8_lossy(&read.stdout), "read-only marker\n");
+
+    let ro_write =
+        process::try_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+            "sh",
+            "-c",
+            "echo nope > /resources/ro/out.txt",
+        ]))
+        .await
+        .expect("attempt write to read-only mount");
+    assert!(
+        !ro_write.status.success(),
+        "read-only mount write should fail"
+    );
+    assert!(
+        !ro_dir.path().join("out.txt").exists(),
+        "read-only write must not create a host file"
+    );
+
+    process::run_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+        "sh",
+        "-c",
+        "echo yes > /resources/rw/out.txt",
+    ]))
+    .await
+    .expect("write to read-write mount");
+    assert_eq!(
+        std::fs::read_to_string(rw_dir.path().join("out.txt")).expect("read rw output"),
+        "yes\n"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+#[tokio::test]
 async fn drop_without_stop_cleans_up() {
     common::init_tracing();
     pull_alpine().await;
@@ -88,9 +170,12 @@ async fn drop_without_stop_cleans_up() {
 
     let name;
     {
-        let container = Container::start(&tag, Some((host_ws.path(), Path::new("/workspace"))))
-            .await
-            .expect("start");
+        let container = Container::start(
+            &tag,
+            ContainerLaunchSpec::workspace(host_ws.path(), Path::new("/workspace")),
+        )
+        .await
+        .expect("start");
         name = container.name.clone();
         assert!(
             podman_ps_lists(&name, false).await,
@@ -126,9 +211,12 @@ async fn attached_handle_does_not_stop_or_cleanup_container() {
     let host_ws = tempfile::tempdir().expect("tempdir");
     let tag = ImageTag(ALPINE.to_string());
 
-    let container = Container::start(&tag, Some((host_ws.path(), Path::new("/workspace"))))
-        .await
-        .expect("start");
+    let container = Container::start(
+        &tag,
+        ContainerLaunchSpec::workspace(host_ws.path(), Path::new("/workspace")),
+    )
+    .await
+    .expect("start");
     let name = container.name.clone();
 
     {
