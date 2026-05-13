@@ -17,7 +17,10 @@ pub enum OutrigError {
     #[error("configuration: {0}")]
     Configuration(String),
 
-    #[error("no .agents/outrig/config.toml found in current directory or any parent")]
+    #[error(
+        "no .agents/outrig/config.toml found in current directory or any parent\n\
+         help: run `outrig init` to initialize"
+    )]
     NoRepoConfig,
 
     #[error("{0}")]
@@ -25,6 +28,15 @@ pub enum OutrigError {
 
     #[error("{0}")]
     Config(#[from] toml::de::Error),
+
+    #[error(
+        "{source}\n\
+         help: key names containing `.` must be quoted, e.g. `[models.\"opus-4.7\"]` instead of `[models.opus-4.7]`"
+    )]
+    ConfigDottedKey {
+        #[source]
+        source: toml::de::Error,
+    },
 
     #[error("{0}")]
     ApiKey(#[from] ApiKeyError),

@@ -236,6 +236,7 @@ Common failures and what they look like:
 ```
 $ outrig run
 error: no .agents/outrig/config.toml found in current directory or any parent
+help: run `outrig init` to initialize
 ```
 
 You're not inside an outrig-configured repo. Either `cd` into one or pass `--config <path>`.

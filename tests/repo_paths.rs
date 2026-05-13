@@ -28,7 +28,8 @@ mod repo_paths {
         assert!(matches!(err, OutrigError::NoRepoConfig));
         assert_eq!(
             err.to_string(),
-            "no .agents/outrig/config.toml found in current directory or any parent",
+            "no .agents/outrig/config.toml found in current directory or any parent\n\
+             help: run `outrig init` to initialize",
         );
     }
 

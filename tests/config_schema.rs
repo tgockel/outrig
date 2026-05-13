@@ -40,6 +40,45 @@ oops          = "this key is not in the schema"
     }
 
     #[test]
+    fn dotted_model_name_gets_quoting_hint() {
+        let bad = r#"
+[models.opus-4.7]
+provider   = "anthropic"
+identifier = "claude-opus-4-7"
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        let OutrigError::ConfigDottedKey { source } = &err else {
+            panic!("expected OutrigError::ConfigDottedKey, got: {err:?}");
+        };
+        let inner = source.to_string();
+        assert!(
+            inner.contains("opus-4"),
+            "inner toml error should still point at the offending header, got: {inner}",
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("help: key names containing `.` must be quoted"),
+            "rendered error should carry the quoting hint, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn dotted_container_name_also_gets_quoting_hint() {
+        // Same heuristic must fire for sections other than `[models]` --
+        // here, a container whose name was meant to be `my.thing`.
+        let bad = r#"
+[containers.my.thing]
+dockerfile = "D"
+context    = "ctx"
+"#;
+        let err = Config::load_from_str(bad).unwrap_err();
+        assert!(
+            matches!(err, OutrigError::ConfigDottedKey { .. }),
+            "expected OutrigError::ConfigDottedKey, got: {err:?}",
+        );
+    }
+
+    #[test]
     fn mcp_short_and_full_normalize_equal() {
         let short_toml = r#"
 [containers.c]

@@ -20,7 +20,42 @@ pub use env_value::EnvValue;
 pub use merge::merge;
 pub use validate::ConfigValidationError;
 
-use crate::error::Result;
+use crate::error::{OutrigError, Result};
+
+/// True when the parse error is an "unknown field" complaint and its span
+/// lands on a `[<dotted.path>]` header whose path has an unquoted `.`. That's
+/// the shape that makes TOML treat a name like `opus-4.7` as nested keys
+/// (`opus-4` table with field `7`) and is the cue to suggest quoting.
+/// Restricting to unknown-field errors avoids hinting on legitimate dotted
+/// headers like `[providers.openai]` whose values fail validation.
+fn error_lands_on_unquoted_dotted_header(err: &toml::de::Error, input: &str) -> bool {
+    if !err.message().contains("unknown field") {
+        return false;
+    }
+    let Some(span) = err.span() else {
+        return false;
+    };
+    let line_start = input[..span.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = input[span.start..]
+        .find('\n')
+        .map_or(input.len(), |i| span.start + i);
+    let line = input[line_start..line_end].trim();
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    let mut in_quote = false;
+    for c in rest[..end].chars() {
+        match c {
+            '"' => in_quote = !in_quote,
+            '.' if !in_quote => return true,
+            _ => {}
+        }
+    }
+    false
+}
 
 pub const DEFAULT_TOOL_CALL_CAP: u32 = 50;
 pub const MAX_TOOL_CALL_CAP: u32 = 2000;
@@ -64,7 +99,13 @@ pub struct Config {
 
 impl Config {
     pub fn load_from_str(s: &str) -> Result<Self> {
-        let mut cfg: Self = toml::from_str(s)?;
+        let mut cfg: Self = match toml::from_str(s) {
+            Ok(c) => c,
+            Err(e) if error_lands_on_unquoted_dotted_header(&e, s) => {
+                return Err(OutrigError::ConfigDottedKey { source: e });
+            }
+            Err(e) => return Err(e.into()),
+        };
         cfg.network.declared = declares_top_level_network(s)?;
         Ok(cfg)
     }
