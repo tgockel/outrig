@@ -64,6 +64,14 @@ Cursor:
 }
 ```
 
+Regenerate any of these snippets with:
+
+```sh
+outrig design prompt --print-mcp-config <tool>
+```
+
+The valid `<tool>` names are `claude-code`, `claude-desktop`, `codex`, and `cursor`.
+
 ## What the AI sees
 
 The server exposes these tools:
@@ -108,4 +116,25 @@ boundary this relies on.
 
 ## Without MCP
 
-The no-MCP prompt path is reserved for `outrig design prompt`.
+When your AI tool cannot attach MCP servers, print the same design context as a single prompt:
+
+```sh
+outrig design prompt | pbcopy
+
+# Linux:
+outrig design prompt | xclip -selection clipboard
+```
+
+Paste that prompt into ChatGPT, Claude.ai, or any chat UI, followed by what you want the
+container-config to do. The output is intentionally self-contained: OutRig's version, embedded
+docs, conventions, and worked examples are all in the prompt.
+
+To inspect or edit the prompt before sending it:
+
+```sh
+outrig design prompt > prompt.txt
+```
+
+Prefer the MCP path when your tool supports it. `outrig mcp self` lets the AI read docs and run
+validators as it iterates; `outrig design prompt` is a one-shot fallback for clients that only
+accept pasted text.

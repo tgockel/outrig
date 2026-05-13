@@ -6,7 +6,7 @@
 
 #![deny(clippy::print_stdout)]
 
-mod docs;
+pub(crate) mod docs;
 mod schema;
 mod server;
 mod suggestions;

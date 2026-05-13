@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
 use outrig::cli::build::{self, BuildArgs};
+use outrig::cli::design_prompt::{self, DesignArgs};
 use outrig::cli::discard::{self, DiscardArgs};
 use outrig::cli::logs::{self, LogsArgs};
 use outrig::cli::ls::{self, LsArgs};
@@ -49,6 +50,8 @@ enum Cmd {
     Run(RunArgs),
     /// Serve the configured backing MCPs as a single MCP server over stdio.
     Mcp(McpArgs),
+    /// Generate prompts and setup snippets for AI-assisted design.
+    Design(DesignArgs),
     /// Build (or cache-hit) one or more container-config images.
     Build(BuildArgs),
     /// Read or write outrig's configuration files.
@@ -148,6 +151,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 cli.verbose,
             ))
         }
+        Cmd::Design(args) => design_prompt::execute(args),
         Cmd::Build(args) => {
             let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
             runtime.block_on(build::execute(&repo_config, &global_config, args))

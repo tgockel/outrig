@@ -47,6 +47,12 @@ already exists), then the repo config (workspace, default agent), then offers to
 `[default: ...]`; press Enter to accept. Type `?` and Enter at any prompt for an explanation
 and the available options.
 
+If the built-in container prompts do not cover the environment you need, still start with
+`outrig init` for the provider, workspace, and agent scaffolding. Then use
+[AI-assisted design](usage/ai-assisted-design.md) to have an AI tool generate or refine the
+Dockerfile and `[containers.<name>]` block. The MCP path gives the AI validators;
+`outrig design prompt` is the no-MCP fallback.
+
 ```
 [outrig] no global config found at ~/.outrig/config.toml -- let's create one.
 ? Provider style [default: openai]:
@@ -303,6 +309,8 @@ work back from you.
   LLM config and how to add more models or agents.
 - [Concepts -> Containers](concepts/containers.md) -- the Dockerfile conventions in detail.
 - [Concepts -> MCP Servers](concepts/mcp-servers.md) -- how to add more tools.
+- [Usage -> AI-assisted design](usage/ai-assisted-design.md) -- AI-guided container-config
+  design after `outrig init`.
 - [Usage -> outrig run](usage/run.md) -- REPL behavior, slash commands, multiple
   container-configs.
 - [Reference -> Config](reference/config.md) -- every key in `config.toml`.

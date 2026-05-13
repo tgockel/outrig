@@ -2,6 +2,7 @@
 //! `execute` function; `bin/outrig.rs` stays a thin dispatch table.
 
 pub mod build;
+pub mod design_prompt;
 pub mod discard;
 pub mod env_arg;
 pub mod logs;

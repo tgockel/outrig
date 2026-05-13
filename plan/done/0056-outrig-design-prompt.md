@@ -180,6 +180,17 @@ No new entry needed -- `doc/usage/ai-assisted-design.md` was added by
   Embed them. Cheap to maintain; lets the binary work offline; users
   who want fresh snippets re-pull the binary.
 
+## Decisions
+
+- Reuse the 0055 doc bundle by making `src/mcp_self/docs.rs`
+  crate-visible instead of duplicating the `include_str!` list in the
+  design-prompt module.
+- Emit Codex setup as TOML, matching the existing
+  `doc/usage/ai-assisted-design.md` snippet. Claude Desktop and Cursor
+  remain JSON snippets.
+- Treat the quickstart's "AI-guided init" note as documentation for the
+  post-`outrig init` refinement path, not as a new `outrig init` flag.
+
 ## Dependencies
 
 - **Hard: 0055** (`outrig mcp self`). Reuses the doc bundle from
