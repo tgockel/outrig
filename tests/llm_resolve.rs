@@ -5,12 +5,13 @@
 #[cfg(not(feature = "mistralrs"))]
 use std::path::Path;
 
-use outrig::config::Config;
+use outrig::config::{Config, MistralrsDeviceSpec};
 use outrig::error::OutrigError;
 #[cfg(not(feature = "mistralrs"))]
 use outrig::llm::build_agent;
 use outrig::llm::{
-    DEFAULT_TOOL_RESULT_CAP_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider, resolve_agent,
+    DEFAULT_TOOL_RESULT_CAP_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider,
+    resolve_agent, resolve_agent_with_device_override,
 };
 
 fn parse(s: &str) -> Config {
@@ -53,12 +54,36 @@ provider   = "openai"
 identifier = "gpt-4o"
 
 [models.claude]
-provider = "local"
-model-id = "Qwen/Qwen2.5-7B-Instruct"
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
 
 {agents}
 "#,
     )
+}
+
+fn local_mistralrs_cfg(device: Option<&str>) -> Config {
+    let device = device
+        .map(|value| format!("device     = {value:?}\n"))
+        .unwrap_or_default();
+    parse(&format!(
+        r#"
+default-model = "local"
+
+[providers.local]
+style = "mistralrs"
+
+[models.local]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+{device}
+
+[agents.smoke]
+preamble = "hi"
+"#,
+    ))
 }
 
 #[test]
@@ -197,6 +222,128 @@ fn missing_preamble_falls_back_to_default() {
     );
 
     unset_env(var);
+}
+
+#[test]
+fn mistralrs_device_defaults_to_cpu() {
+    let cfg = local_mistralrs_cfg(None);
+    let r = resolve_agent(&cfg, "smoke").expect("resolves");
+    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
+}
+
+#[test]
+fn mistralrs_cpu_device_resolves_to_weights() {
+    let cfg = local_mistralrs_cfg(Some("cpu"));
+    let r = resolve_agent(&cfg, "smoke").expect("resolves");
+    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
+}
+
+#[test]
+fn mistralrs_invalid_device_errors_during_resolve() {
+    let cfg = local_mistralrs_cfg(Some("cuda:"));
+    let err = resolve_agent(&cfg, "smoke").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            OutrigError::LlmResolve(LlmResolveError::MistralrsDeviceInvalid {
+                model,
+                device,
+            }) if model == "local" && device == "cuda:"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
+fn mistralrs_device_override_replaces_model_device() {
+    let cfg = local_mistralrs_cfg(Some("cuda"));
+    let r = resolve_agent_with_device_override(&cfg, "smoke", Some(MistralrsDeviceSpec::Cpu))
+        .expect("resolves");
+    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
+}
+
+#[test]
+fn device_override_rejects_openai_models() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_DEVICE_OVERRIDE_OPENAI";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.coding]
+preamble = "hi"
+"#,
+    ));
+
+    let err = resolve_agent_with_device_override(&cfg, "coding", Some(MistralrsDeviceSpec::Cpu))
+        .unwrap_err();
+    unset_env(var);
+    assert!(
+        matches!(
+            &err,
+            OutrigError::LlmResolve(LlmResolveError::MistralrsDeviceOverrideUnsupported {
+                model,
+                provider,
+            }) if model == "fast" && provider == "openai"
+        ),
+        "got: {err:?}",
+    );
+    assert!(
+        err.to_string()
+            .contains("--device only applies to mistralrs models"),
+        "got: {err}",
+    );
+}
+
+#[cfg(all(feature = "mistralrs", not(feature = "cuda")))]
+#[test]
+fn mistralrs_cuda_device_feature_off_explains_clearly() {
+    let cfg = local_mistralrs_cfg(Some("cuda:2"));
+    let err = resolve_agent(&cfg, "smoke").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            OutrigError::LlmResolve(LlmResolveError::MistralrsDeviceUnavailable {
+                model,
+                device,
+                feature,
+            }) if model == "local" && device == "cuda:2" && *feature == "cuda"
+        ),
+        "got: {err:?}",
+    );
+    assert_eq!(
+        err.to_string(),
+        "mistralrs model \"local\" requested device \"cuda:2\" but this \
+         build of outrig does not include the 'cuda' feature; \
+         rebuild with --features cuda to enable",
+    );
+}
+
+#[cfg(all(feature = "mistralrs", not(feature = "metal")))]
+#[test]
+fn mistralrs_metal_device_feature_off_explains_clearly() {
+    let cfg = local_mistralrs_cfg(Some("metal"));
+    let err = resolve_agent(&cfg, "smoke").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            OutrigError::LlmResolve(LlmResolveError::MistralrsDeviceUnavailable {
+                model,
+                device,
+                feature,
+            }) if model == "local" && device == "metal" && *feature == "metal"
+        ),
+        "got: {err:?}",
+    );
+    assert_eq!(
+        err.to_string(),
+        "mistralrs model \"local\" requested device \"metal\" but this \
+         build of outrig does not include the 'metal' feature; \
+         rebuild with --features metal to enable",
+    );
 }
 
 #[test]

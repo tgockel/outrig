@@ -14,7 +14,8 @@ use thiserror::Error;
 
 use super::{
     Config, ContainerConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
-    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, Model, NetworkMode, normalize_capability_name,
+    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, MistralrsDeviceSpec, Model, NetworkMode,
+    normalize_capability_name,
 };
 
 #[derive(Debug, Error)]
@@ -179,6 +180,12 @@ pub enum ConfigValidationError {
 
     #[error("model {model:?} (provider style=mistralrs) model-path {path:?} does not exist")]
     MistralrsModelPathMissing { model: String, path: PathBuf },
+
+    #[error(
+        "model {model:?} (provider style=mistralrs) has invalid device {device:?}; \
+         expected one of: cpu, cuda, cuda:N, metal"
+    )]
+    MistralrsDeviceInvalid { model: String, device: String },
 
     #[error(
         "model {model:?} (provider style=mistralrs) must not set {field:?} -- \
@@ -464,12 +471,13 @@ fn validate_openai_model(model_name: &str, model: &Model) -> Result<(), ConfigVa
             model: model_name.to_string(),
         });
     }
-    let weight_fields: [(bool, &'static str); 5] = [
+    let weight_fields: [(bool, &'static str); 6] = [
         (model.model_id.is_some(), "model-id"),
         (model.model_path.is_some(), "model-path"),
         (model.model_file.is_some(), "model-file"),
         (model.revision.is_some(), "revision"),
         (model.context_length.is_some(), "context-length"),
+        (model.device.is_some(), "device"),
     ];
     for (present, field) in weight_fields {
         if present {
@@ -532,6 +540,15 @@ fn validate_mistralrs_model(
                 });
             }
         }
+    }
+
+    if let Some(device) = model.device.as_deref()
+        && device.parse::<MistralrsDeviceSpec>().is_err()
+    {
+        return Err(ConfigValidationError::MistralrsDeviceInvalid {
+            model: model_name.to_string(),
+            device: device.to_string(),
+        });
     }
 
     if let Some(path) = model.model_path.as_deref()

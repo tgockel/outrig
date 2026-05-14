@@ -207,6 +207,66 @@ pub struct Model {
     pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MistralrsDeviceSpec {
+    #[default]
+    Cpu,
+    Cuda(usize),
+    Metal,
+}
+
+impl MistralrsDeviceSpec {
+    pub const EXPECTED: &'static str = "expected one of: cpu, cuda, cuda:N, metal";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MistralrsDeviceParseError;
+
+impl std::fmt::Display for MistralrsDeviceParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MistralrsDeviceSpec::EXPECTED)
+    }
+}
+
+impl std::error::Error for MistralrsDeviceParseError {}
+
+impl std::str::FromStr for MistralrsDeviceSpec {
+    type Err = MistralrsDeviceParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda(0)),
+            "metal" => Ok(Self::Metal),
+            _ => {
+                let Some(ordinal) = s.strip_prefix("cuda:") else {
+                    return Err(MistralrsDeviceParseError);
+                };
+                if ordinal.is_empty() || !ordinal.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(MistralrsDeviceParseError);
+                }
+                ordinal
+                    .parse::<usize>()
+                    .map(Self::Cuda)
+                    .map_err(|_| MistralrsDeviceParseError)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MistralrsDeviceSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::Cuda(0) => f.write_str("cuda"),
+            Self::Cuda(ordinal) => write!(f, "cuda:{ordinal}"),
+            Self::Metal => f.write_str("metal"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

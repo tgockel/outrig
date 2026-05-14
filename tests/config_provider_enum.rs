@@ -43,6 +43,78 @@ model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
 }
 
 #[test]
+fn mistralrs_device_forms_parse_validate_and_round_trip() {
+    let cfg = parse(
+        r#"
+[providers.local]
+style = "mistralrs"
+
+[models.cpu]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+device     = "cpu"
+
+[models.cuda_default]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+device     = "cuda"
+
+[models.cuda_indexed]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+device     = "cuda:1"
+
+[models.metal]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+device     = "metal"
+"#,
+    );
+    cfg.validate(None).expect("all documented forms validate");
+    assert_eq!(cfg.models["cpu"].device.as_deref(), Some("cpu"));
+    assert_eq!(cfg.models["cuda_default"].device.as_deref(), Some("cuda"));
+    assert_eq!(cfg.models["cuda_indexed"].device.as_deref(), Some("cuda:1"));
+    assert_eq!(cfg.models["metal"].device.as_deref(), Some("metal"));
+
+    let serialized = toml::to_string(&cfg).expect("serializes");
+    let again = Config::load_from_str(&serialized).expect("reserialized parses");
+    assert_eq!(cfg, again);
+}
+
+#[test]
+fn mistralrs_invalid_device_fails_validate() {
+    for device in ["gpu", "cuda:", "cuda:abc", "metal:0"] {
+        let cfg = parse(&format!(
+            r#"
+[providers.local]
+style = "mistralrs"
+
+[models.qwen]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+device     = "{device}"
+"#,
+        ));
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::MistralrsDeviceInvalid {
+                    ref model,
+                    device: ref got,
+                } if model == "qwen" && got.as_str() == device
+            ),
+            "device {device:?} got: {err:?}",
+        );
+    }
+}
+
+#[test]
 fn mistralrs_model_id_without_model_file_fails_validate() {
     let cfg = parse(
         r#"
@@ -206,6 +278,32 @@ model-id   = "should-not-be-here"
             err,
             ConfigValidationError::OpenAiModelHasMistralrsField { ref model, field }
                 if model == "fast" && field == "model-id"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
+fn openai_model_with_device_fails_validate() {
+    let cfg = parse(
+        r#"
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+device     = "cuda"
+"#,
+    );
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::OpenAiModelHasMistralrsField { ref model, field }
+                if model == "fast" && field == "device"
         ),
         "got: {err:?}",
     );

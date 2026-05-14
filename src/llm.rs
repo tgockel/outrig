@@ -16,7 +16,7 @@ use thiserror::Error;
 #[cfg(feature = "mistralrs")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::config::{Config, DEFAULT_TOOL_CALL_CAP, LlmProvider};
+use crate::config::{Config, DEFAULT_TOOL_CALL_CAP, LlmProvider, MistralrsDeviceSpec};
 use crate::error::{OutrigError, Result};
 use crate::rig_tool::McpToolAdapter;
 
@@ -70,6 +70,29 @@ pub enum LlmResolveError {
     )]
     MistralrsFeatureDisabled { name: String },
 
+    #[error(
+        "mistralrs model {model:?} has invalid device {device:?}; \
+         expected one of: cpu, cuda, cuda:N, metal"
+    )]
+    MistralrsDeviceInvalid { model: String, device: String },
+
+    #[error(
+        "mistralrs model {model:?} requested device {device:?} but this \
+         build of outrig does not include the '{feature}' feature; rebuild \
+         with --features {feature} to enable"
+    )]
+    MistralrsDeviceUnavailable {
+        model: String,
+        device: String,
+        feature: &'static str,
+    },
+
+    #[error(
+        "model {model:?} uses provider {provider:?}, which is not \
+         style=mistralrs; --device only applies to mistralrs models"
+    )]
+    MistralrsDeviceOverrideUnsupported { model: String, provider: String },
+
     #[cfg(feature = "mistralrs")]
     #[error(
         "mistralrs model {model:?}: requested context-length \
@@ -117,6 +140,7 @@ pub struct MistralrsWeights {
     pub model_file: Option<Vec<String>>,
     pub revision: Option<String>,
     pub context_length: Option<u32>,
+    pub device: MistralrsDeviceSpec,
 }
 
 /// Fully-resolved view of one agent: every knob the agent loop needs to
@@ -151,6 +175,14 @@ pub struct ResolvedAgent {
 /// `cfg.validate()` was called -- so errors carry the resolution context
 /// (which agent, which model) regardless.
 pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
+    resolve_agent_with_device_override(cfg, agent_name, None)
+}
+
+pub fn resolve_agent_with_device_override(
+    cfg: &Config,
+    agent_name: &str,
+    device_override: Option<MistralrsDeviceSpec>,
+) -> Result<ResolvedAgent> {
     let agent = cfg.agents.get(agent_name).ok_or_else(|| {
         let known = if cfg.agents.is_empty() {
             "(none)".to_string()
@@ -195,6 +227,13 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
             api_key,
             request_timeout_secs,
         } => {
+            if device_override.is_some() {
+                return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
+                    model: model_name.to_string(),
+                    provider: model.provider.clone(),
+                }
+                .into());
+            }
             let identifier = model
                 .identifier
                 .clone()
@@ -210,12 +249,17 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
             )
         }
         LlmProvider::Mistralrs => {
+            let device = match device_override {
+                Some(device) => validate_mistralrs_device(model_name, device)?,
+                None => parse_mistralrs_device(model_name, model.device.as_deref())?,
+            };
             let weights = MistralrsWeights {
                 model_id: model.model_id.clone(),
                 model_path: model.model_path.clone(),
                 model_file: model.model_file.clone(),
                 revision: model.revision.clone(),
                 context_length: model.context_length,
+                device,
             };
             // For display: prefer the HF model-id, fall back to the GGUF
             // basename, then the model name. mistralrs's own `load()`
@@ -261,6 +305,53 @@ pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
             as usize,
         container: agent.container.clone(),
     })
+}
+
+fn parse_mistralrs_device(
+    model_name: &str,
+    device: Option<&str>,
+) -> std::result::Result<MistralrsDeviceSpec, LlmResolveError> {
+    let spec = match device {
+        Some(value) => value
+            .parse()
+            .map_err(|_| LlmResolveError::MistralrsDeviceInvalid {
+                model: model_name.to_string(),
+                device: value.to_string(),
+            })?,
+        None => MistralrsDeviceSpec::Cpu,
+    };
+    if !cfg!(feature = "mistralrs") {
+        return Ok(spec);
+    }
+
+    validate_mistralrs_device(model_name, spec)
+}
+
+fn validate_mistralrs_device(
+    model_name: &str,
+    spec: MistralrsDeviceSpec,
+) -> std::result::Result<MistralrsDeviceSpec, LlmResolveError> {
+    if !cfg!(feature = "mistralrs") {
+        return Ok(spec);
+    }
+
+    match spec {
+        MistralrsDeviceSpec::Cuda(_) if !cfg!(feature = "cuda") => {
+            Err(LlmResolveError::MistralrsDeviceUnavailable {
+                model: model_name.to_string(),
+                device: spec.to_string(),
+                feature: "cuda",
+            })
+        }
+        MistralrsDeviceSpec::Metal if !cfg!(feature = "metal") => {
+            Err(LlmResolveError::MistralrsDeviceUnavailable {
+                model: model_name.to_string(),
+                device: spec.to_string(),
+                feature: "metal",
+            })
+        }
+        _ => Ok(spec),
+    }
 }
 
 /// Runtime-dispatched Rig agent. The OpenAi-backed and mistralrs-backed
@@ -338,6 +429,7 @@ pub async fn build_agent(
                 let model_file = weights.model_file.as_deref();
                 let revision = weights.revision.as_deref();
                 let context_length = weights.context_length;
+                let device = weights.device;
                 let model = registry
                     .get_or_init(model_name, || async move {
                         crate::llm::mistralrs::load(
@@ -347,6 +439,7 @@ pub async fn build_agent(
                             model_file,
                             revision,
                             context_length,
+                            device,
                             cache_root,
                         )
                         .await

@@ -22,7 +22,8 @@ use rig::completion::Message;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
 use crate::config::{
-    Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES, NetworkMode,
+    Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
+    MistralrsDeviceSpec, NetworkMode,
 };
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
@@ -65,6 +66,10 @@ pub struct RunArgs {
     /// Override network monitoring for this session.
     #[arg(long = "network", value_name = "MODE", value_parser = parse_network_mode)]
     pub network: Option<NetworkMode>,
+
+    /// Override the mistralrs model device for this run.
+    #[arg(long = "device", value_name = "DEVICE", value_parser = parse_mistralrs_device)]
+    pub device: Option<MistralrsDeviceSpec>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
@@ -88,6 +93,7 @@ pub async fn execute(
         require_agent: true,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
+        device_override: args.device,
         verbose,
     })
     .await?;
@@ -137,6 +143,7 @@ pub async fn execute(
         &mut mcp_arcs,
         args.max_tool_calls,
         args.max_tool_result_bytes,
+        args.device,
         &mcp,
         &cli_env,
     )
@@ -149,6 +156,10 @@ pub async fn execute(
 
 fn parse_network_mode(s: &str) -> std::result::Result<NetworkMode, String> {
     s.parse()
+}
+
+fn parse_mistralrs_device(s: &str) -> std::result::Result<MistralrsDeviceSpec, String> {
+    s.parse::<MistralrsDeviceSpec>().map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,13 +175,14 @@ async fn run_inner(
     mcp_arcs: &mut Vec<Arc<McpClient>>,
     max_tool_calls: Option<u32>,
     max_tool_result_bytes: Option<u32>,
+    device_override: Option<MistralrsDeviceSpec>,
     mcp: &std::collections::BTreeMap<String, crate::config::McpServerSpec>,
     cli_env: &CliEnvEntries,
 ) -> Result<i32> {
     // `setup` already validated presence and used the resolved `.container`
     // for the container fallback. We re-resolve here for `build_agent` +
     // banner; cheap (config table lookups, no I/O).
-    let mut resolved = llm::resolve_agent(cfg, agent_name)?;
+    let mut resolved = llm::resolve_agent_with_device_override(cfg, agent_name, device_override)?;
     apply_tool_call_cap_override(&mut resolved, max_tool_calls);
     apply_tool_result_cap_override(&mut resolved, max_tool_result_bytes);
 
@@ -296,6 +308,9 @@ fn print_banner(
         "[outrig] tool-result cap:   {} bytes",
         resolved.tool_result_cap_bytes
     );
+    if let Some(weights) = &resolved.model_weights {
+        let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
+    }
     let _ = writeln!(buf, "[outrig] container-config:  {container_name}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
@@ -415,6 +430,23 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("must be between 1024 and 16777216"),
+            "unexpected clap error: {msg}",
+        );
+    }
+
+    #[test]
+    fn device_arg_accepts_mistralrs_device_forms() {
+        let args = RunArgs::try_parse_from(["run", "--device", "cuda:2"]).expect("arg parses");
+        assert_eq!(args.device, Some(MistralrsDeviceSpec::Cuda(2)));
+    }
+
+    #[test]
+    fn device_arg_rejects_unknown_device() {
+        let err = RunArgs::try_parse_from(["run", "--device", "gpu"])
+            .expect_err("unknown device is invalid");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(MistralrsDeviceSpec::EXPECTED),
             "unexpected clap error: {msg}",
         );
     }

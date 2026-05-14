@@ -99,6 +99,7 @@ Start an interactive agent session.
 outrig run [--agent <name>]
            [--container <name>]
            [--config <path>]
+           [--device <cpu|cuda|cuda:N|metal>]
            [--env <KEY=VALUE>]
            [--global-config <path>]
            [--max-tool-calls <n>]
@@ -117,6 +118,8 @@ outrig run [--agent <name>]
   the `${VAR}` host-env-reference syntax described in
   [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax). Within a scope, last wins
   on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
+- `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`): override
+  the in-process mistralrs model device for this run. Rejected for OpenAI-style models.
 - `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): per-turn tool-call
   cap.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):

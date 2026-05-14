@@ -37,10 +37,11 @@ the in-process backend on CUDA or Metal builds without changing CPU-only default
   config; see Open Questions below). Accepts `cpu`, `cuda`, `metal`,
   with `cuda:N` selecting a specific GPU index.
 - `Default` is `cpu` -- nobody loses behavior on upgrade.
-- Build-time feature gates: `mistralrs-cuda`, `mistralrs-metal`. Each
-  is additive on top of `mistralrs` and brings in candle's matching
-  feature.
-- Validation: pick `cuda` without `mistralrs-cuda` compiled in -> the
+- Build-time feature gates: `cuda`, `metal`. Each weakly enables the
+  matching candle/mistralrs backend only when `mistralrs` is also
+  enabled. Turning on `cuda` or `metal` alone emits a build warning and
+  has no effect.
+- Validation: pick `cuda` without the `cuda` feature compiled in -> the
   same kind of friendly "rebuild with --features ..." error
   `MistralrsFeatureDisabled` produces today.
 - Update CI matrix to exercise at least the `cuda` feature on the GPU
@@ -69,15 +70,16 @@ the in-process backend on CUDA or Metal builds without changing CPU-only default
    time.
 2. **Cargo features**:
    ```toml
-   mistralrs-cuda  = ["mistralrs", "candle-core/cuda",  "mistralrs-core/cuda"]
-   mistralrs-metal = ["mistralrs", "candle-core/metal", "mistralrs-core/metal"]
+   cuda  = ["candle-core?/cuda",  "mistralrs-core?/cuda"]
+   metal = ["candle-core?/metal", "mistralrs-core?/metal"]
    ```
-   (Confirm the exact `mistralrs-core` feature names against the 0.8.1
-   manifest; the candle ones are stable.)
+   These intentionally do not enable `mistralrs` themselves, so a user
+   must build with `--features "mistralrs cuda"` or
+   `--features "mistralrs metal"` to activate a GPU backend.
 3. **Loader**: `load(...)` learns to map `DeviceSpec` to a real
    `candle_core::Device`. Wrap construction in `#[cfg(feature = ...)]`
    blocks so a non-feature build that somehow gets `cuda` returns the
-   same friendly "rebuild with --features mistralrs-cuda" error.
+   same friendly "rebuild with --features cuda" error.
 4. **Validation**: a new `LlmResolveError::MistralrsDeviceUnavailable {
    model, device, build }` mirroring `MistralrsFeatureDisabled`.
 5. **Doc**: `doc/concepts/in-process-llm.md` and
@@ -93,18 +95,19 @@ the in-process backend on CUDA or Metal builds without changing CPU-only default
   `MistralrsWeights` and into `load`.
 - `src/llm/mistralrs.rs` -- accept the device, construct the candle
   `Device`, pass to `load_model_from_hf`.
-- `Cargo.toml` -- new `mistralrs-cuda` / `mistralrs-metal` features.
+- `Cargo.toml` -- new `cuda` / `metal` feature toggles plus warnings
+  when they are used without `mistralrs`.
 - `doc/concepts/in-process-llm.md`, `doc/reference/config.md` -- field
   + feature documentation.
 - `.github/workflows/*.yml` (or wherever CI lives) -- add at least a
-  build-only matrix entry for `--features mistralrs-cuda` so the
+  build-only matrix entry for `--features "mistralrs cuda"` so the
   feature flag stays buildable.
 - `tests/config_provider_enum.rs` -- new validation test cases.
 
 ## Acceptance
 
-- A config with `device = "cuda"` loads on a `--features
-  mistralrs-cuda` build with a CUDA GPU present, and the model runs at
+- A config with `device = "cuda"` loads on a build with
+  `--features "mistralrs cuda"` and a CUDA GPU present, and the model runs at
   GPU-class tok/s (verifiable via streaming -- depends on
   `streaming-mistralrs-output.md`).
 - The same config on a non-CUDA build produces a friendly error at
@@ -137,6 +140,27 @@ the in-process backend on CUDA or Metal builds without changing CPU-only default
   users want truly in-process for the policy-oracle use case
   documented in `doc/concepts/in-process-llm.md` -- the same use case
   motivates running on a fast device.
+
+## Decisions
+
+- Keep `device` on `[models.<name>]`, matching the existing weight-source
+  fields and allowing a small model to stay on CPU while a larger one uses
+  a GPU.
+- Keep mistralrs's `DeviceMapSetting::Auto` behavior. `cuda:N` selects the
+  base CUDA device, but it is not an exclusive-device sharding directive;
+  mistralrs may use other same-kind devices when its automatic mapper needs
+  them.
+- Limit v1 syntax to `cpu`, `cuda`, `cuda:N`, and `metal`. Do not add
+  `metal:N`, Vulkan, or ROCm syntax in this task.
+- No GPU-labeled GitHub Actions runner exists in the current workflow, so
+  CI cannot honestly exercise a CUDA build here. Real GPU validation remains
+  env-gated through the mistralrs smoke test.
+- Use the short Cargo feature names `cuda` and `metal`, matching the
+  backend names users put in config. The features are weak optional
+  dependency feature forwards, so they only affect candle/mistralrs when
+  `mistralrs` is enabled. A `build.rs` warning calls out `cuda`/`metal`
+  used alone because that combination compiles but cannot select a GPU
+  backend at run time.
 
 ## Dependencies
 

@@ -177,9 +177,9 @@ style = "mistralrs"
 |---------|--------|----------|---------|-------------------------------------|
 | `style` | string | yes      | --      | Must be `"mistralrs"` for this row. |
 
-`base-url` and `api-key` are not allowed on `style = "mistralrs"`. The weight-source
-fields (`model-id`, `model-path`, `model-file`, `revision`, `context-length`) live
-on `[models.<name>]` -- see the
+`base-url` and `api-key` are not allowed on `style = "mistralrs"`. The model-specific
+fields (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `device`)
+live on `[models.<name>]` -- see the
 [mistralrs models](#mistralrs-models) subsection.
 
 #### Always parses, even without `--features mistralrs`
@@ -249,6 +249,7 @@ model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
 model-file = "Phi-3-mini-4k-instruct-q4.gguf"
 # revision       = "main"   # optional git ref on the HF repo
 # context-length = 4096     # optional override
+# device         = "cuda"  # optional; defaults to "cpu"
 
 # Multi-shard quantization (one quant split across files):
 [models.llama-70b]
@@ -263,6 +264,7 @@ model-file = [
 [models.llama-local]
 provider   = "local"
 model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
+# device     = "metal" # optional; defaults to "cpu"
 ```
 
 | Key              | Type    | Required | Default  | Description                                  |
@@ -273,9 +275,19 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 | `model-file`     | str/arr | with `id`| --       | GGUF filename(s) inside the HF repo.         |
 | `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
 | `context-length` | integer | no       | model    | Override the model's default context window. |
+| `device`         | string  | no       | `"cpu"`  | One of `cpu`, `cuda`, `cuda:N`, `metal`.     |
 
 \* Exactly one of `model-id` / `model-path` must be set; setting both, or neither,
 is an error.
+
+`device = "cuda"` and `device = "cuda:N"` require a binary built with
+`--features "mistralrs cuda"`; `device = "metal"` requires
+`--features "mistralrs metal"`. The feature check happens when an agent resolves the
+model. Enabling `cuda` or `metal` without `mistralrs` emits a build warning and has no
+effect. outrig does not fall back to CPU if the requested backend is unavailable. With
+CUDA, `cuda:N` selects the base device for mistralrs's automatic mapper; it is not an
+exclusive single-device sharding directive. `outrig run --device <device>` overrides this
+field for one run without editing config.
 
 ## `[agents.<name>]`
 
@@ -539,6 +551,7 @@ identifier = "gpt-4o"
 provider   = "local"
 model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
 model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+device     = "cpu"
 ```
 
 ### Repo `.agents/outrig/config.toml`
@@ -604,7 +617,7 @@ build-args = { NODE_VERSION = "20" }
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - Every `[models.<name>]` whose provider has `style = "openai"` must set
   `identifier` and must not set any of `model-id`, `model-path`, `model-file`,
-  `revision`, `context-length`.
+  `revision`, `context-length`, `device`.
 - Every `[models.<name>]` whose provider has `style = "mistralrs"` must set
   exactly one of `model-id` / `model-path`. When `model-id` is set, `model-file`
   is **required** -- mistralrs's GGUF loader needs a specific filename and HF
@@ -613,7 +626,8 @@ build-args = { NODE_VERSION = "20" }
   quantization, e.g. `*-00001-of-00003.gguf`). `revision` is optional and
   only meaningful with `model-id`. A `model-path`, if set, must exist on
   disk relative to the repo root (or be absolute). `identifier` is not
-  allowed on mistralrs models.
+  allowed on mistralrs models. `device`, if set, must be one of `cpu`, `cuda`,
+  `cuda:N`, or `metal`.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
 - `tool-call-cap`, if set at the top level or on an agent, must be between `1` and `2000`.
 - `tool-result-cap`, if set at the top level or on an agent, must be between `1024` and

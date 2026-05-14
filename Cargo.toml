@@ -13,6 +13,8 @@ default   = ["internal"]
 internal  = []
 e2e       = []
 mistralrs = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap", "dep:reqwest"]
+cuda      = ["candle-core?/cuda", "mistralrs-core?/cuda"]
+metal     = ["candle-core?/metal", "mistralrs-core?/metal"]
 
 [[bin]]
 name              = "outrig"

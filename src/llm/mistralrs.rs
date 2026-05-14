@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::info;
 
+use crate::config::MistralrsDeviceSpec;
 use crate::error::Result;
 use crate::llm::LlmResolveError;
 
@@ -86,6 +87,7 @@ pub(crate) async fn load(
     model_file: Option<&[String]>,
     revision: Option<&str>,
     context_length: Option<u32>,
+    device_spec: MistralrsDeviceSpec,
     cache_root: &Path,
 ) -> Result<MistralrsModel> {
     let _ = GLOBAL_HF_CACHE.set(hf_hub::Cache::new(cache_root.to_path_buf()));
@@ -153,6 +155,7 @@ pub(crate) async fn load(
     };
 
     let started = Instant::now();
+    let device = candle_device(model_name, device_spec)?;
     let loader = GGUFLoaderBuilder::new(
         None,
         None,
@@ -168,7 +171,7 @@ pub(crate) async fn load(
             hf_revision,
             TokenSource::CacheToken,
             &ModelDType::Auto,
-            &candle_core::Device::Cpu,
+            &device,
             false,
             DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
@@ -178,6 +181,7 @@ pub(crate) async fn load(
 
     info!(
         model = model_name,
+        device = %device_spec,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "model loaded",
     );
@@ -203,6 +207,55 @@ pub(crate) async fn load(
         engine,
         model_identifier: identifier,
     })
+}
+
+fn candle_device(model_name: &str, spec: MistralrsDeviceSpec) -> Result<candle_core::Device> {
+    match spec {
+        MistralrsDeviceSpec::Cpu => Ok(candle_core::Device::Cpu),
+        MistralrsDeviceSpec::Cuda(ordinal) => {
+            #[cfg(feature = "cuda")]
+            {
+                candle_core::Device::new_cuda(ordinal).map_err(|source| {
+                    LlmResolveError::MistralrsLoad {
+                        model: model_name.to_string(),
+                        source: anyhow::anyhow!("cuda device {ordinal} init: {source}"),
+                    }
+                    .into()
+                })
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = ordinal;
+                Err(LlmResolveError::MistralrsDeviceUnavailable {
+                    model: model_name.to_string(),
+                    device: spec.to_string(),
+                    feature: "cuda",
+                }
+                .into())
+            }
+        }
+        MistralrsDeviceSpec::Metal => {
+            #[cfg(feature = "metal")]
+            {
+                candle_core::Device::new_metal(0).map_err(|source| {
+                    LlmResolveError::MistralrsLoad {
+                        model: model_name.to_string(),
+                        source: anyhow::anyhow!("metal device 0 init: {source}"),
+                    }
+                    .into()
+                })
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Err(LlmResolveError::MistralrsDeviceUnavailable {
+                    model: model_name.to_string(),
+                    device: spec.to_string(),
+                    feature: "metal",
+                }
+                .into())
+            }
+        }
+    }
 }
 
 fn scheduler_config() -> SchedulerConfig {

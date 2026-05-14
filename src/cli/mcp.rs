@@ -130,6 +130,7 @@ pub async fn execute(
         require_agent: false,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
+        device_override: None,
         verbose,
     })
     .await?;

@@ -384,6 +384,7 @@ pub(crate) async fn prompt_models_loop(
                     model_file: None,
                     revision: None,
                     context_length: None,
+                    device: None,
                 }
             }
             LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, hf, provider_name).await?,
@@ -428,6 +429,7 @@ async fn prompt_mistralrs_model(
         model_file,
         revision,
         context_length,
+        device: None,
     })
 }
 

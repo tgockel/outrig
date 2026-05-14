@@ -75,6 +75,7 @@ model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
 model-file = "Phi-3-mini-4k-instruct-q4.gguf"   # required when the repo has multiple GGUFs
 # revision      = "main"   # optional; pin a git ref for reproducibility
 # context-length = 4096    # optional; override the model's default context window
+# device         = "cuda"  # optional; defaults to "cpu"
 ```
 
 On first use, outrig downloads the named GGUF file from `https://huggingface.co/<model-id>`
@@ -92,6 +93,7 @@ several quantizations (`-q4`, `-q5_k_m`, `-f16`, etc.) require an explicit pick.
 provider   = "local"
 model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 # context-length = 4096    # optional
+# device         = "metal" # optional; defaults to "cpu"
 ```
 
 Use this when you want to pre-stage the model yourself -- in CI, in air-gapped environments,
@@ -110,12 +112,37 @@ models use is not allowed on mistralrs models -- the weights *are* the model.
 v0 supports GGUF model files only. `mistralrs` can also load raw HuggingFace `safetensors`
 directories, but outrig doesn't expose that path -- if you need it, file an issue.
 
-### CPU only
+### Device selection
 
-v0 runs the model on CPU. There's no `device` field in the config and no GPU support
-yet -- `mistralrs` itself supports BLAS / CUDA / Metal builds, but outrig hasn't wired
-them through. Pick a model size that fits in RAM and on cores you can spare while the
-agent runs.
+By default, mistralrs models run on CPU:
+
+```toml
+device = "cpu"
+```
+
+GPU builds can opt into CUDA or Metal per model:
+
+```toml
+device = "cuda"    # CUDA device 0
+device = "cuda:1"  # CUDA device 1 as the base device
+device = "metal"   # Metal device 0
+```
+
+`cuda` requires a binary built with `--features "mistralrs cuda"`; `metal` requires
+`--features "mistralrs metal"`. A config that asks for an unavailable backend fails
+loudly when the agent is resolved, with a rebuild hint. Enabling `cuda` or `metal`
+without `mistralrs` emits a build warning and has no effect. outrig does not silently
+fall back to CPU, because that would hide the performance and policy properties the
+user asked for.
+
+For one-off runs, `outrig run --device cuda`, `--device cuda:1`, `--device metal`, or
+`--device cpu` overrides the model's configured `device` without editing the config file.
+The override only applies to `style = "mistralrs"` models.
+
+outrig still passes mistralrs's automatic device map through to the loader. For
+`cuda:N`, `N` is the selected base device; mistralrs may use other same-kind devices if
+its auto mapper decides the model needs them. Explicit sharding controls and ROCm/AMD GPU
+support are not part of this surface yet.
 
 ### Build flag and the "still parses" rule
 
@@ -123,6 +150,8 @@ The in-process backend is gated behind a Cargo feature:
 
 ```
 cargo build --features mistralrs
+cargo build --features "mistralrs cuda"
+cargo build --features "mistralrs metal"
 ```
 
 A build *without* `--features mistralrs` still **recognizes** `style = "mistralrs"` in
@@ -131,7 +160,7 @@ display configs that contain `mistralrs`-style providers and models without comp
 The error fires only when an agent actually tries to use one of those models -- at
 agent-resolve time, when outrig walks `agent -> model -> provider` and tries to
 instantiate a client. The message names the missing feature flag so the fix ("rebuild
-with `--features mistralrs`") is one shot.
+with `--features mistralrs`", `--features cuda`, or `--features metal`) is one shot.
 
 The point of this design is portability: a repo's `.agents/outrig/config.toml` can declare
 both an OpenAI-style provider and a `mistralrs`-style provider, and the same checked-in

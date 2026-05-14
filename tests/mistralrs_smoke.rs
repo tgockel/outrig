@@ -18,13 +18,22 @@ use walkdir::WalkDir;
 const TEST_MODEL: &str = "OUTRIG_MISTRALRS_TEST_MODEL";
 const TEST_MODEL_ID: &str = "OUTRIG_MISTRALRS_TEST_MODEL_ID";
 const TEST_MODEL_FILE: &str = "OUTRIG_MISTRALRS_TEST_MODEL_FILE";
+const TEST_DEVICE: &str = "OUTRIG_MISTRALRS_TEST_DEVICE";
 
 /// Generous wall-clock cap on the prompt round-trip. Anything slower than
 /// this is almost certainly a hang -- the test environment chooses a model
 /// small enough to fit comfortably.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
 
+fn optional_device_line() -> String {
+    std::env::var(TEST_DEVICE)
+        .ok()
+        .map(|device| format!("device     = {device:?}\n"))
+        .unwrap_or_default()
+}
+
 fn cfg_with_model_path(path: &str) -> String {
+    let device = optional_device_line();
     format!(
         r#"
 default-model = "local"
@@ -35,6 +44,7 @@ style = "mistralrs"
 [models.local]
 provider   = "local"
 model-path = "{}"
+{device}
 
 [agents.smoke]
 preamble = "You are a terse assistant."
@@ -44,6 +54,7 @@ preamble = "You are a terse assistant."
 }
 
 fn cfg_with_model_id(id: &str, file: &str) -> String {
+    let device = optional_device_line();
     format!(
         r#"
 default-model = "local"
@@ -55,6 +66,7 @@ style = "mistralrs"
 provider   = "local"
 model-id   = "{}"
 model-file = "{}"
+{device}
 
 [agents.smoke]
 preamble = "You are a terse assistant."

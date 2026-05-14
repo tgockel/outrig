@@ -11,6 +11,7 @@ stdin/stdout REPL with the agent.
 outrig run [--agent <name>]
            [--container <name>]
            [--config <path>]
+           [--device <cpu|cuda|cuda:N|metal>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
            [--network <default|audit|filter>]
@@ -24,6 +25,8 @@ outrig run [--agent <name>]
   container.
 - `--config <path>` (default: walks up from cwd): use from outside the repo or
   non-standard locations.
+- `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
+  override the in-process mistralrs model device for this run.
 - `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): override the
   per-turn tool-call cap for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
@@ -83,8 +86,10 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), look up
    `[agents.<a>].model` -- if unset, fall back to top-level `default-model`. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call cap from
-   `tool-call-cap` and the per-result byte cap from `tool-result-cap`, then read the API key
-   from the env var named in the provider's `api-key`. Build the Rig provider client.
+   `tool-call-cap` and the per-result byte cap from `tool-result-cap`. For in-process
+   mistralrs models, `--device` overrides the model's configured `device` for this run. For
+   OpenAI-style models, `--device` is rejected. Then read the API key from the env var named in
+   the provider's `api-key`. Build the Rig provider client.
 9. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
    `AgentBuilder`.

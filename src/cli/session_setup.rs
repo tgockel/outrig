@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::env_arg::CliEnvEntries;
-use crate::config::{Config, ContainerConfig, McpServerSpec, NetworkMode};
+use crate::config::{Config, ContainerConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     embedded,
@@ -116,6 +116,7 @@ pub struct SessionSetupArgs<'a> {
     pub require_agent: bool,
     pub explicit_session_dir: Option<&'a Path>,
     pub network_mode_override: Option<NetworkMode>,
+    pub device_override: Option<MistralrsDeviceSpec>,
     pub verbose: u8,
 }
 
@@ -193,7 +194,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             .ok_or_else(|| {
                 OutrigError::Configuration("no --agent and no default-agent configured".to_string())
             })?;
-        let resolved = llm::resolve_agent(&cfg, agent_name)?;
+        let resolved =
+            llm::resolve_agent_with_device_override(&cfg, agent_name, args.device_override)?;
         (
             Some(resolved.agent_name.clone()),
             resolved.container.clone(),

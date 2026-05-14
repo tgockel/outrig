@@ -175,6 +175,7 @@ srv = { command = ["bin", "arg1"] }
             phi3.model_file.as_deref(),
             Some(&["Phi-3-mini-4k-instruct-q4.gguf".to_string()][..])
         );
+        assert_eq!(phi3.device.as_deref(), Some("cpu"));
         let llama = &cfg.models["llama-local"];
         assert_eq!(llama.provider, "local");
         assert_eq!(llama.identifier, None);
