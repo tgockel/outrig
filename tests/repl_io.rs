@@ -194,6 +194,45 @@ async fn empty_line_is_ignored() {
 }
 
 #[tokio::test]
+async fn empty_prompt_reply_produces_no_stdout() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w.write_all(b"hello\n").await.unwrap();
+    drop(stdin_w);
+    let (stdout_w, mut stdout_r) = duplex(BUF);
+    let (stderr_w, _stderr_r) = duplex(BUF);
+
+    let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        on_prompt,
+        noop_tools(),
+        noop_reset(),
+    );
+
+    let read_out = async {
+        let mut buf = Vec::new();
+        stdout_r.read_to_end(&mut buf).await.unwrap();
+        buf
+    };
+
+    let (run_res, stdout_buf) = timeout(TEST_TIMEOUT, async { tokio::join!(run, read_out) })
+        .await
+        .expect("test must not hang");
+    run_res.expect("run_with must succeed");
+
+    assert!(
+        stdout_buf.is_empty(),
+        "empty prompt reply must not write a newline, got: {:?}",
+        String::from_utf8_lossy(&stdout_buf)
+    );
+}
+
+#[tokio::test]
 async fn sigint_mid_callback_returns_to_prompt() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
     stdin_w.write_all(b"slow\n").await.unwrap();

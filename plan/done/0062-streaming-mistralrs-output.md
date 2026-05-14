@@ -13,9 +13,11 @@ the math is brutal: a 1.5B Q4_K_M on a modern AMD core decodes at roughly
 15 tok/s, so a 4000-token reply is a four-minute stare at a blank prompt
 with no signal that anything is happening. Bigger models are worse.
 
-The fix is to stream the assistant's reply token-by-token to stderr (or
-the REPL's transcript buffer) as it's generated, so the user sees
-progress and can hit Ctrl-C if the model wanders.
+The fix is to stream the assistant's reply token-by-token to stdout as
+it's generated, so the user sees progress and can hit Ctrl-C if the model
+wanders. stdout preserves the existing `outrig run > file` contract that
+captures assistant replies only; prompts, banners, and tool-call traces
+stay on stderr.
 
 ## Goal
 
@@ -33,7 +35,7 @@ the full reply is complete.
   mpsc receiver -- the v0 implementation just collected all chunks
   before returning.
 - Plumb the stream through `RigAgent::run_turn` so each emitted token
-  is printed to stderr as it arrives. Final history bookkeeping
+  is printed to stdout as it arrives. Final history bookkeeping
   (`history.extend(response.messages)`) stays at end-of-turn.
 - Same `OutrigPromptHook` tool-call cap and trace-line behavior: tool
   calls still print `[outrig] tool call: ...` between streamed
@@ -68,7 +70,7 @@ Today `MistralrsModel::completion` collects them all then returns once
    args incrementally; rig wants a complete `ToolCall` object on the
    stream, so buffer until the tool call is fully formed.
 3. `run_turn_inner` (`src/llm.rs:352`) becomes two-phase: poll the
-   stream, write text chunks to stderr as they arrive, accumulate the
+   stream, write text chunks to stdout as they arrive, accumulate the
    final `messages` for history. Use `extended_details()` after the
    stream completes to collect the same metadata it does today (tool
    calls, etc.).
@@ -97,7 +99,7 @@ Today `MistralrsModel::completion` collects them all then returns once
 ## Acceptance
 
 - `outrig run` against a mistralrs agent prints assistant tokens to
-  stderr as they're decoded. A 100-token reply produces ~100 stderr
+  stdout as they're decoded. A 100-token reply produces ~100 stdout
   writes spread across the decode wall-clock.
 - A model still working but slow (5+ tok/s) produces visible output
   every few seconds rather than dead silence.
@@ -118,3 +120,10 @@ Today `MistralrsModel::completion` collects them all then returns once
 
 None hard. Builds on the shipped mistralrs shim and registry work in
 `plan/done/0015-0017`.
+
+## Decisions
+
+- Stream assistant text to stdout, not stderr. This preserves the
+  documented REPL contract that stdout is only assistant text, so shell
+  redirection continues to capture complete replies while streaming makes
+  slow local decoding visible.

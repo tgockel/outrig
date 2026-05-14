@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-v0 features and fixes
 
-- **[0062](0062-streaming-mistralrs-output.md)** Streaming output for the
-  in-process mistralrs path.
 - **[0063](0063-mistralrs-gpu-device.md)** GPU / non-CPU device support for the
   in-process mistralrs path.
 - **[0064](0064-network-interceptor-mitm.md)** Network interceptor MITM.

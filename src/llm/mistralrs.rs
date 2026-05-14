@@ -21,9 +21,9 @@ use mistralrs_core::{Function as MistralrsFunction, GLOBAL_HF_CACHE};
 use rig::OneOrMany;
 use rig::completion::message::{AssistantContent, Message, ToolCall, ToolFunction, UserContent};
 use rig::completion::{
-    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Usage,
+    CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
-use rig::streaming::StreamingCompletionResponse;
+use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -55,6 +55,20 @@ pub struct MistralrsModel {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MistralrsRawResponse {
     pub raw: Value,
+}
+
+/// Final metadata surfaced by Rig's streaming interface. mistralrs sends
+/// usage on the final chunk, so the stream can preserve token accounting even
+/// though chunk response types themselves are serialize-only.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MistralrsStreamResponse {
+    pub usage: Option<Usage>,
+}
+
+impl GetTokenUsage for MistralrsStreamResponse {
+    fn token_usage(&self) -> Option<Usage> {
+        self.usage
+    }
 }
 
 /// Load a mistralrs engine. Exactly one of `model_id` / `model_path` must
@@ -202,7 +216,7 @@ fn scheduler_config() -> SchedulerConfig {
 
 impl CompletionModel for MistralrsModel {
     type Response = MistralrsRawResponse;
-    type StreamingResponse = ();
+    type StreamingResponse = MistralrsStreamResponse;
     type Client = MistralrsClient;
 
     fn make(client: &Self::Client, model: impl Into<String>) -> Self {
@@ -217,14 +231,10 @@ impl CompletionModel for MistralrsModel {
         request: CompletionRequest,
     ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
         let (tx, mut rx) = mpsc::channel::<Response>(1);
-        let normal = build_normal_request(&self.model_identifier, request, tx)?;
+        let normal = build_normal_request(&self.model_identifier, request, tx, false)?;
         let request_for_engine = Request::Normal(Box::new(normal));
 
-        let engine = self.engine.clone();
-        tokio::task::spawn_blocking(move || engine.send_request(request_for_engine))
-            .await
-            .map_err(|e| CompletionError::ProviderError(format!("mistralrs join error: {e}")))?
-            .map_err(|e| CompletionError::ProviderError(format!("mistralrs send_request: {e}")))?;
+        dispatch_request(self.engine.clone(), request_for_engine).await?;
 
         let response = rx.recv().await.ok_or_else(|| {
             CompletionError::ProviderError(
@@ -237,18 +247,50 @@ impl CompletionModel for MistralrsModel {
 
     async fn stream(
         &self,
-        _request: CompletionRequest,
-    ) -> std::result::Result<StreamingCompletionResponse<()>, CompletionError> {
-        Err(CompletionError::ProviderError(
-            "streaming not supported by the mistralrs in-process backend".into(),
-        ))
+        request: CompletionRequest,
+    ) -> std::result::Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
+    {
+        let (tx, mut rx) = mpsc::channel::<Response>(1);
+        let normal = build_normal_request(&self.model_identifier, request, tx, true)?;
+        let request_for_engine = Request::Normal(Box::new(normal));
+
+        dispatch_request(self.engine.clone(), request_for_engine).await?;
+
+        let stream = async_stream::try_stream! {
+            let mut saw_response = false;
+            let mut state = MistralrsStreamState::default();
+            while let Some(response) = rx.recv().await {
+                saw_response = true;
+                for item in state.translate(response)? {
+                    yield item;
+                }
+            }
+            if !saw_response {
+                Err(CompletionError::ProviderError(
+                    "mistralrs engine closed the response channel without replying".into(),
+                ))?;
+            }
+        };
+
+        Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
     }
+}
+
+async fn dispatch_request(
+    engine: Arc<MistralRs>,
+    request_for_engine: Request,
+) -> std::result::Result<(), CompletionError> {
+    tokio::task::spawn_blocking(move || engine.send_request(request_for_engine))
+        .await
+        .map_err(|e| CompletionError::ProviderError(format!("mistralrs join error: {e}")))?
+        .map_err(|e| CompletionError::ProviderError(format!("mistralrs send_request: {e}")))
 }
 
 fn build_normal_request(
     model_identifier: &str,
     req: CompletionRequest,
     response_tx: mpsc::Sender<Response>,
+    is_streaming: bool,
 ) -> std::result::Result<NormalRequest, CompletionError> {
     let messages = translate_messages(req.preamble.as_deref(), &req.chat_history);
     let tools = translate_tools(&req.tools)?;
@@ -267,7 +309,7 @@ fn build_normal_request(
         sampling_params,
         response: response_tx,
         return_logprobs: false,
-        is_streaming: false,
+        is_streaming,
         id: 0,
         constraint: mistralrs_core::Constraint::None,
         suffix: None,
@@ -504,6 +546,151 @@ fn translate_response(
     }
 }
 
+fn translate_stream_response(
+    response: Response,
+) -> std::result::Result<Vec<RawStreamingChoice<MistralrsStreamResponse>>, CompletionError> {
+    match response {
+        Response::Chunk(chunk) => Ok(translate_stream_chunk(chunk)),
+        Response::Done(chat) => translate_stream_done(chat),
+        Response::ModelError(msg, _partial) => Err(CompletionError::ProviderError(format!(
+            "mistralrs model error: {msg}"
+        ))),
+        Response::InternalError(err) => Err(CompletionError::ProviderError(format!(
+            "mistralrs internal error: {err}"
+        ))),
+        Response::ValidationError(err) => Err(CompletionError::ProviderError(format!(
+            "mistralrs validation error: {err}"
+        ))),
+        Response::CompletionChunk(_)
+        | Response::CompletionDone(_)
+        | Response::CompletionModelError(_, _) => Err(CompletionError::ProviderError(
+            "mistralrs returned a non-chat response".into(),
+        )),
+        Response::ImageGeneration(_)
+        | Response::Speech { .. }
+        | Response::Raw { .. }
+        | Response::Embeddings { .. } => Err(CompletionError::ProviderError(
+            "mistralrs returned an unexpected response variant for a chat request".into(),
+        )),
+    }
+}
+
+#[derive(Debug, Default)]
+struct MistralrsStreamState {
+    saw_chunk: bool,
+    saw_final_response: bool,
+}
+
+impl MistralrsStreamState {
+    fn translate(
+        &mut self,
+        response: Response,
+    ) -> std::result::Result<Vec<RawStreamingChoice<MistralrsStreamResponse>>, CompletionError>
+    {
+        let items = match response {
+            Response::Chunk(chunk) => {
+                self.saw_chunk = true;
+                translate_stream_chunk(chunk)
+            }
+            Response::Done(chat) if self.saw_chunk => {
+                if self.saw_final_response {
+                    Vec::new()
+                } else {
+                    vec![RawStreamingChoice::FinalResponse(MistralrsStreamResponse {
+                        usage: Some(translate_usage(&chat.usage)),
+                    })]
+                }
+            }
+            other => translate_stream_response(other)?,
+        };
+
+        if items
+            .iter()
+            .any(|item| matches!(item, RawStreamingChoice::FinalResponse(_)))
+        {
+            self.saw_final_response = true;
+        }
+
+        Ok(items)
+    }
+}
+
+fn translate_stream_chunk(
+    chunk: mistralrs_core::ChatCompletionChunkResponse,
+) -> Vec<RawStreamingChoice<MistralrsStreamResponse>> {
+    let mut out = Vec::new();
+    if !chunk.id.is_empty() {
+        out.push(RawStreamingChoice::MessageId(chunk.id.clone()));
+    }
+
+    let usage = chunk.usage.as_ref().map(translate_usage);
+    let mut final_chunk = usage.is_some();
+
+    for choice in chunk.choices {
+        if choice.finish_reason.is_some() {
+            final_chunk = true;
+        }
+        if let Some(text) = choice.delta.content
+            && !text.is_empty()
+        {
+            out.push(RawStreamingChoice::Message(text));
+        }
+        if let Some(calls) = choice.delta.tool_calls {
+            for call in calls {
+                out.push(RawStreamingChoice::ToolCall(raw_streaming_tool_call(call)));
+            }
+        }
+    }
+
+    if final_chunk {
+        out.push(RawStreamingChoice::FinalResponse(MistralrsStreamResponse {
+            usage,
+        }));
+    }
+
+    out
+}
+
+fn translate_stream_done(
+    chat: mistralrs_core::ChatCompletionResponse,
+) -> std::result::Result<Vec<RawStreamingChoice<MistralrsStreamResponse>>, CompletionError> {
+    let usage = translate_usage(&chat.usage);
+    let message_id = chat.id.clone();
+    let choice = translate_choice(&chat)?;
+    let mut out = vec![RawStreamingChoice::MessageId(message_id)];
+
+    for item in choice.iter() {
+        match item {
+            AssistantContent::Text(text) if !text.text.is_empty() => {
+                out.push(RawStreamingChoice::Message(text.text.clone()));
+            }
+            AssistantContent::ToolCall(call) => {
+                out.push(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+                    call.id.clone(),
+                    call.function.name.clone(),
+                    call.function.arguments.clone(),
+                )));
+            }
+            AssistantContent::Text(_)
+            | AssistantContent::Reasoning(_)
+            | AssistantContent::Image(_) => {}
+        }
+    }
+
+    out.push(RawStreamingChoice::FinalResponse(MistralrsStreamResponse {
+        usage: Some(usage),
+    }));
+    Ok(out)
+}
+
+fn raw_streaming_tool_call(call: ToolCallResponse) -> RawStreamingToolCall {
+    RawStreamingToolCall::new(
+        call.id,
+        call.function.name,
+        parse_tool_arguments(&call.function.arguments),
+    )
+}
+
 fn translate_choice(
     chat: &mistralrs_core::ChatCompletionResponse,
 ) -> std::result::Result<OneOrMany<AssistantContent>, CompletionError> {
@@ -538,12 +725,18 @@ fn translate_choice(
 }
 
 fn translate_tool_call(call: &ToolCallResponse) -> ToolCall {
-    let arguments = serde_json::from_str::<Value>(&call.function.arguments)
-        .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
     ToolCall::new(
         call.id.clone(),
-        ToolFunction::new(call.function.name.clone(), arguments),
+        ToolFunction::new(
+            call.function.name.clone(),
+            parse_tool_arguments(&call.function.arguments),
+        ),
     )
+}
+
+fn parse_tool_arguments(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments)
+        .unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
 fn translate_usage(usage: &mistralrs_core::Usage) -> Usage {
@@ -559,7 +752,7 @@ fn translate_usage(usage: &mistralrs_core::Usage) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mistralrs_core::{Choice, ResponseMessage, ToolCallType};
+    use mistralrs_core::{Choice, ChunkChoice, Delta, ResponseMessage, ToolCallType};
 
     fn chat_done(content: Option<&str>, calls: Option<Vec<ToolCallResponse>>) -> Response {
         Response::Done(mistralrs_core::ChatCompletionResponse {
@@ -603,6 +796,47 @@ mod tests {
                 arguments: args.into(),
             },
         }
+    }
+
+    fn usage() -> mistralrs_core::Usage {
+        mistralrs_core::Usage {
+            completion_tokens: 1,
+            prompt_tokens: 2,
+            total_tokens: 3,
+            avg_tok_per_sec: 0.0,
+            avg_prompt_tok_per_sec: 0.0,
+            avg_compl_tok_per_sec: 0.0,
+            total_time_sec: 0.0,
+            total_prompt_time_sec: 0.0,
+            total_completion_time_sec: 0.0,
+        }
+    }
+
+    fn stream_chunk(
+        content: Option<&str>,
+        calls: Option<Vec<ToolCallResponse>>,
+        finish_reason: Option<&str>,
+        usage: Option<mistralrs_core::Usage>,
+    ) -> Response {
+        Response::Chunk(mistralrs_core::ChatCompletionChunkResponse {
+            id: "chunk-test".into(),
+            choices: vec![ChunkChoice {
+                finish_reason: finish_reason.map(str::to_string),
+                index: 0,
+                delta: Delta {
+                    content: content.map(str::to_string),
+                    role: "assistant".into(),
+                    tool_calls: calls,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+            }],
+            created: 0,
+            model: "test".into(),
+            system_fingerprint: "local".into(),
+            object: "chat.completion.chunk".into(),
+            usage,
+        })
     }
 
     #[test]
@@ -661,6 +895,113 @@ mod tests {
         let err = translate_response(Response::Chunk(chunk)).unwrap_err();
         assert!(
             matches!(err, CompletionError::ProviderError(ref msg) if msg.contains("streaming chunk")),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn streaming_text_chunks_translate_in_order() {
+        let first = translate_stream_response(stream_chunk(Some("hel"), None, None, None))
+            .expect("first chunk translates");
+        let second =
+            translate_stream_response(stream_chunk(Some("lo"), None, Some("stop"), Some(usage())))
+                .expect("second chunk translates");
+
+        let RawStreamingChoice::Message(text) = &first[1] else {
+            panic!("expected text message, got {:?}", first[1]);
+        };
+        assert_eq!(text, "hel");
+
+        let RawStreamingChoice::Message(text) = &second[1] else {
+            panic!("expected text message, got {:?}", second[1]);
+        };
+        assert_eq!(text, "lo");
+
+        let RawStreamingChoice::FinalResponse(final_response) = &second[2] else {
+            panic!("expected final response, got {:?}", second[2]);
+        };
+        assert_eq!(
+            final_response.usage.expect("usage"),
+            translate_usage(&usage())
+        );
+    }
+
+    #[test]
+    fn streaming_tool_call_chunk_translates_to_complete_tool_call() {
+        let items = translate_stream_response(stream_chunk(
+            None,
+            Some(vec![tool_call("foo", r#"{"a":1}"#)]),
+            Some("tool_calls"),
+            Some(usage()),
+        ))
+        .expect("tool chunk translates");
+
+        let RawStreamingChoice::ToolCall(call) = &items[1] else {
+            panic!("expected tool call, got {:?}", items[1]);
+        };
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.name, "foo");
+        assert_eq!(call.arguments, serde_json::json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn streaming_done_after_final_chunk_does_not_duplicate_text() {
+        let mut state = MistralrsStreamState::default();
+
+        let first = state
+            .translate(stream_chunk(Some("hel"), None, None, None))
+            .expect("first chunk translates");
+        let second = state
+            .translate(stream_chunk(Some("lo"), None, Some("stop"), Some(usage())))
+            .expect("final chunk translates");
+        let done = state
+            .translate(chat_done(Some("hello"), None))
+            .expect("done translates");
+
+        assert!(
+            matches!(&first[1], RawStreamingChoice::Message(text) if text == "hel"),
+            "got: {first:?}",
+        );
+        assert!(
+            matches!(&second[1], RawStreamingChoice::Message(text) if text == "lo"),
+            "got: {second:?}",
+        );
+        assert!(
+            matches!(&second[2], RawStreamingChoice::FinalResponse(_)),
+            "got: {second:?}",
+        );
+        assert!(done.is_empty(), "got: {done:?}");
+    }
+
+    #[test]
+    fn streaming_done_after_unfinalized_chunk_supplies_usage_only() {
+        let mut state = MistralrsStreamState::default();
+
+        state
+            .translate(stream_chunk(Some("hello"), None, None, None))
+            .expect("chunk translates");
+        let done = state
+            .translate(chat_done(Some("hello"), None))
+            .expect("done translates");
+
+        assert_eq!(done.len(), 1);
+        let RawStreamingChoice::FinalResponse(final_response) = &done[0] else {
+            panic!("expected final response, got {done:?}");
+        };
+        assert_eq!(
+            final_response.usage.expect("usage"),
+            translate_usage(&usage())
+        );
+    }
+
+    #[test]
+    fn streaming_provider_errors_map_to_completion_errors() {
+        let err = translate_stream_response(Response::InternalError(Box::new(
+            std::io::Error::other("boom"),
+        )))
+        .unwrap_err();
+        assert!(
+            matches!(err, CompletionError::ProviderError(ref msg) if msg.contains("boom")),
             "got: {err:?}",
         );
     }

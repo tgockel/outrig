@@ -133,8 +133,9 @@ A typical startup looks like:
 ```
 
 All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
-the assistant's natural-language reply. This separation makes it easy to capture just the model
-output:
+the assistant's natural-language reply. For in-process `mistralrs` models, that reply is flushed
+as chunks while the model decodes; OpenAI-compatible providers print the reply when the turn
+finishes. The stream separation makes it easy to capture just the model output:
 
 ```sh
 $ echo "summarise this repo" | outrig run > summary.txt
@@ -160,7 +161,7 @@ TOML keys it expects. `cargo check` passed with no warnings. Diff:
 
 Behind the scenes the agent may make many tool calls per turn -- Rig drives the
 model-tool-model loop until the model emits a normal text reply with no tool calls. Tool-call
-traces appear on stderr; the final text reply is printed on stdout.
+traces appear on stderr; assistant text is printed on stdout.
 
 Each turn has a tool-call cap. The compiled-in default is `50`; a top-level
 `tool-call-cap` in config changes the default, `[agents.<name>].tool-call-cap` overrides it for

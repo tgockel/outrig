@@ -4,9 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+#[cfg(feature = "mistralrs")]
+use futures_util::StreamExt;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
+#[cfg(feature = "mistralrs")]
+use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
+#[cfg(feature = "mistralrs")]
+use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use thiserror::Error;
+#[cfg(feature = "mistralrs")]
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::config::{Config, DEFAULT_TOOL_CALL_CAP, LlmProvider};
 use crate::error::{OutrigError, Result};
@@ -373,7 +381,7 @@ impl RigAgent {
             RigAgent::Mistralrs {
                 agent,
                 tool_call_cap,
-            } => run_turn_inner(agent, prompt, history, *tool_call_cap).await,
+            } => run_turn_streaming_mistralrs(agent, prompt, history, *tool_call_cap).await,
         }
     }
 }
@@ -401,10 +409,97 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
             history.extend(messages);
             Ok(response.output)
         }
-        Err(rig::completion::PromptError::PromptCancelled {
+        Err(other) => handle_prompt_error(other, history),
+    }
+}
+
+#[cfg(feature = "mistralrs")]
+async fn run_turn_streaming_mistralrs(
+    agent: &rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
+    prompt: &str,
+    history: &mut Vec<Message>,
+    tool_call_cap: usize,
+) -> Result<String> {
+    let mut stdout = tokio::io::stdout();
+    run_turn_streaming_inner(agent, prompt, history, tool_call_cap, &mut stdout).await
+}
+
+#[cfg(feature = "mistralrs")]
+async fn run_turn_streaming_inner<M, W>(
+    agent: &rig::agent::Agent<M>,
+    prompt: &str,
+    history: &mut Vec<Message>,
+    tool_call_cap: usize,
+    stdout: &mut W,
+) -> Result<String>
+where
+    M: CompletionModel + 'static,
+    W: AsyncWrite + Unpin,
+{
+    let hook = OutrigPromptHook::new(tool_call_cap);
+    let mut stream = agent
+        .stream_prompt(prompt.to_string())
+        .with_history(history.clone())
+        .multi_turn(tool_call_cap)
+        .with_hook(hook)
+        .await;
+
+    let mut streamed_reply = String::new();
+    let mut final_history: Option<Vec<Message>> = None;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                stdout.write_all(text.text.as_bytes()).await?;
+                stdout.flush().await?;
+                streamed_reply.push_str(&text.text);
+            }
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                ..
+            })) => {
+                stdout.flush().await?;
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(response)) => {
+                final_history = response.history().map(|messages| messages.to_vec());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return handle_streaming_error(err, history);
+            }
+        }
+    }
+
+    if let Some(messages) = final_history {
+        extend_history_with_new_suffix(history, messages);
+    }
+
+    if !streamed_reply.is_empty() && !streamed_reply.ends_with('\n') {
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+    }
+
+    Ok(String::new())
+}
+
+#[cfg(feature = "mistralrs")]
+fn handle_streaming_error(err: StreamingError, history: &mut Vec<Message>) -> Result<String> {
+    let prompt_error = match err {
+        StreamingError::Completion(err) => rig::completion::PromptError::CompletionError(err),
+        StreamingError::Prompt(err) => *err,
+        StreamingError::Tool(err) => rig::completion::PromptError::ToolError(err),
+    };
+    handle_prompt_error(prompt_error, history)
+}
+
+fn handle_prompt_error(
+    err: rig::completion::PromptError,
+    history: &mut Vec<Message>,
+) -> Result<String> {
+    match err {
+        rig::completion::PromptError::PromptCancelled {
             reason,
             chat_history,
-        }) => {
+        } => {
             eprintln!("[outrig] {reason}");
             eprintln!(
                 "[outrig] partial history retained -- send another prompt \
@@ -413,11 +508,11 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
             extend_history_with_new_suffix(history, chat_history);
             Ok("(turn ended; tool-call cap reached)".to_string())
         }
-        Err(rig::completion::PromptError::MaxTurnsError {
+        rig::completion::PromptError::MaxTurnsError {
             max_turns,
             chat_history,
             ..
-        }) => {
+        } => {
             eprintln!("[outrig] tool-call iteration cap ({max_turns}) reached; ending turn");
             eprintln!(
                 "[outrig] partial history retained -- send another prompt \
@@ -426,7 +521,7 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
             extend_history_with_new_suffix(history, *chat_history);
             Ok("(turn ended; tool-call cap reached)".to_string())
         }
-        Err(other) => Err(OutrigError::Prompt(other)),
+        other => Err(OutrigError::Prompt(other)),
     }
 }
 
@@ -517,6 +612,10 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "mistralrs")]
+    use rig::completion::{CompletionError, CompletionRequest, CompletionResponse, Usage};
+    #[cfg(feature = "mistralrs")]
+    use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
 
     #[test]
     fn cancelled_history_retains_only_new_suffix_when_full_history_returned() {
@@ -549,6 +648,86 @@ mod tests {
         assert_eq!(
             history,
             vec![Message::user("first"), Message::assistant("partial")],
+        );
+    }
+
+    #[cfg(feature = "mistralrs")]
+    #[derive(Clone)]
+    struct ScriptedStreamingModel {
+        chunks: Arc<Vec<RawStreamingChoice<()>>>,
+    }
+
+    #[cfg(feature = "mistralrs")]
+    impl ScriptedStreamingModel {
+        fn new(chunks: Vec<RawStreamingChoice<()>>) -> Self {
+            Self {
+                chunks: Arc::new(chunks),
+            }
+        }
+    }
+
+    #[cfg(feature = "mistralrs")]
+    impl CompletionModel for ScriptedStreamingModel {
+        type Response = ();
+        type StreamingResponse = ();
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self::new(Vec::new())
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
+            Ok(CompletionResponse {
+                choice: rig::OneOrMany::one(rig::completion::AssistantContent::text("")),
+                usage: Usage::new(),
+                raw_response: (),
+                message_id: None,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<
+            StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            let chunks = self.chunks.clone();
+            let stream = async_stream::try_stream! {
+                for chunk in chunks.iter().cloned() {
+                    yield chunk;
+                }
+            };
+            Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
+        }
+    }
+
+    #[cfg(feature = "mistralrs")]
+    #[tokio::test]
+    async fn streaming_turn_writes_chunks_once_and_retains_history() {
+        let model = ScriptedStreamingModel::new(vec![
+            RawStreamingChoice::Message("hello ".to_string()),
+            RawStreamingChoice::Message("world".to_string()),
+        ]);
+        let agent = rig::agent::AgentBuilder::new(model).build();
+        let mut history = Vec::new();
+        let mut stdout = Vec::new();
+
+        let reply = run_turn_streaming_inner(&agent, "hi", &mut history, 50, &mut stdout)
+            .await
+            .expect("streaming turn succeeds");
+
+        assert_eq!(reply, "");
+        assert_eq!(
+            String::from_utf8(stdout).expect("stdout utf-8"),
+            "hello world\n"
+        );
+        assert_eq!(
+            history,
+            vec![Message::user("hi"), Message::assistant("hello world")],
         );
     }
 }

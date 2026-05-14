@@ -40,10 +40,12 @@ impl Repl {
     /// Run the REPL against real stdin/stdout/stderr, treating
     /// `tokio::signal::ctrl_c()` as the interrupt source. The `banner` is
     /// printed once to stderr before the first prompt; `on_prompt` is invoked
-    /// for every non-slash, non-empty input line and its returned text is
-    /// printed to stdout. `on_tools` and `on_reset` produce the stderr text
-    /// for `/tools` and `/reset` respectively (and `on_reset` is the side-
-    /// effect site for clearing whatever conversation state the caller owns).
+    /// for every non-slash, non-empty input line and its non-empty returned
+    /// text is printed to stdout. Streaming callers may write incrementally
+    /// during the callback and return an empty string to suppress trailing
+    /// reprint. `on_tools` and `on_reset` produce the stderr text for `/tools`
+    /// and `/reset` respectively (and `on_reset` is the side-effect site for
+    /// clearing whatever conversation state the caller owns).
     pub async fn run<P, PFut, T, TFut, R, RFut>(
         banner: &str,
         on_prompt: P,
@@ -171,11 +173,13 @@ impl Repl {
             tokio::select! {
                 res = on_prompt(trimmed.to_string()) => {
                     let reply = res?;
-                    stdout.write_all(reply.as_bytes()).await?;
-                    if !reply.ends_with('\n') {
-                        stdout.write_all(b"\n").await?;
+                    if !reply.is_empty() {
+                        stdout.write_all(reply.as_bytes()).await?;
+                        if !reply.ends_with('\n') {
+                            stdout.write_all(b"\n").await?;
+                        }
+                        stdout.flush().await?;
                     }
-                    stdout.flush().await?;
                 }
                 _ = interrupt() => {
                     stderr.write_all(INTERRUPT_NOTICE).await?;

@@ -147,6 +147,13 @@ take minutes. There is no progress UI in v0; the run looks idle until the downlo
 completes. Pre-warm by running outrig once with a short prompt before relying on it for
 real work, or use the local-path form and place the file yourself.
 
+### Decode streaming
+
+After the model is loaded, assistant replies stream to stdout while `mistralrs` decodes them.
+This matters most on CPU, where a long local reply can take minutes if you wait for the full
+completion. Tool-call traces and prompts remain on stderr, so `outrig run > reply.txt` still
+captures only assistant text.
+
 ## Model lifecycle
 
 Loading a GGUF is expensive (seconds, sometimes tens of seconds, sometimes gigabytes of

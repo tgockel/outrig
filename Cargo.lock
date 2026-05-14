@@ -3355,12 +3355,14 @@ name = "outrig"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "blake3",
  "candle-core",
  "clap",
  "dialoguer",
  "directories",
+ "futures-util",
  "heck",
  "hf-hub",
  "ignore",
