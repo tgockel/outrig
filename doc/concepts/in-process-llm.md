@@ -128,12 +128,16 @@ device = "cuda:1"  # CUDA device 1 as the base device
 device = "metal"   # Metal device 0
 ```
 
-`cuda` requires a binary built with `--features "mistralrs cuda"`; `metal` requires
-`--features "mistralrs metal"`. A config that asks for an unavailable backend fails
+`cuda` requires a binary built with `--features "local-llm cuda"`; `metal` requires
+`--features "local-llm metal"`. A config that asks for an unavailable backend fails
 loudly when the agent is resolved, with a rebuild hint. Enabling `cuda` or `metal`
-without `mistralrs` emits a build warning and has no effect. outrig does not silently
+without `local-llm` emits a build warning and has no effect. outrig does not silently
 fall back to CPU, because that would hide the performance and policy properties the
 user asked for.
+
+Metal is only usable on macOS targets. Non-macOS builds can compile with the `metal`
+feature for feature-matrix coverage, but trying to instantiate a Metal device fails with
+a platform error.
 
 For one-off runs, `outrig run --device cuda`, `--device cuda:1`, `--device metal`, or
 `--device cpu` overrides the model's configured `device` without editing the config file.
@@ -149,18 +153,18 @@ support are not part of this surface yet.
 The in-process backend is gated behind a Cargo feature:
 
 ```
-cargo build --features mistralrs
-cargo build --features "mistralrs cuda"
-cargo build --features "mistralrs metal"
+cargo build --features local-llm
+cargo build --features "local-llm cuda"
+cargo build --features "local-llm metal"
 ```
 
-A build *without* `--features mistralrs` still **recognizes** `style = "mistralrs"` in
+A build *without* `--features local-llm` still **recognizes** `style = "mistralrs"` in
 config files. Parsing succeeds, cross-reference validation succeeds, `outrig` will load and
 display configs that contain `mistralrs`-style providers and models without complaint.
 The error fires only when an agent actually tries to use one of those models -- at
 agent-resolve time, when outrig walks `agent -> model -> provider` and tries to
 instantiate a client. The message names the missing feature flag so the fix ("rebuild
-with `--features mistralrs`", `--features cuda`, or `--features metal`) is one shot.
+with `--features local-llm`", `--features cuda`, or `--features metal`) is one shot.
 
 The point of this design is portability: a repo's `.agents/outrig/config.toml` can declare
 both an OpenAI-style provider and a `mistralrs`-style provider, and the same checked-in

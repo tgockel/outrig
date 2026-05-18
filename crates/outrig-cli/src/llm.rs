@@ -4,16 +4,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 use futures_util::StreamExt;
 use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use thiserror::Error;
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::Result;
@@ -30,12 +30,12 @@ pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_CAP as usize;
 pub const DEFAULT_TOOL_RESULT_CAP_BYTES: usize =
     outrig::config::DEFAULT_TOOL_RESULT_CAP_BYTES as usize;
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 pub mod mistralrs;
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 pub mod registry;
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 pub use registry::LlmRegistry;
 
 /// Default preamble used when an agent leaves the field unset. Deliberately
@@ -65,8 +65,8 @@ pub enum LlmResolveError {
 
     #[error(
         "mistralrs provider {name:?} requested but this build of outrig \
-         does not include the 'mistralrs' feature; rebuild with \
-         --features mistralrs to enable"
+         does not include the 'local-llm' feature; rebuild with \
+         --features local-llm to enable"
     )]
     MistralrsFeatureDisabled { name: String },
 
@@ -93,7 +93,7 @@ pub enum LlmResolveError {
     )]
     MistralrsDeviceOverrideUnsupported { model: String, provider: String },
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     #[error(
         "mistralrs model {model:?}: requested context-length \
          {requested} exceeds the model's maximum of {max}"
@@ -104,7 +104,7 @@ pub enum LlmResolveError {
         max: usize,
     },
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     #[error("mistralrs model {model:?}: failed to load model: {source}")]
     MistralrsLoad {
         model: String,
@@ -320,7 +320,7 @@ fn parse_mistralrs_device(
             })?,
         None => MistralrsDeviceSpec::Cpu,
     };
-    if !cfg!(feature = "mistralrs") {
+    if !cfg!(feature = "local-llm") {
         return Ok(spec);
     }
 
@@ -331,7 +331,7 @@ fn validate_mistralrs_device(
     model_name: &str,
     spec: MistralrsDeviceSpec,
 ) -> std::result::Result<MistralrsDeviceSpec, LlmResolveError> {
-    if !cfg!(feature = "mistralrs") {
+    if !cfg!(feature = "local-llm") {
         return Ok(spec);
     }
 
@@ -363,7 +363,7 @@ pub enum RigAgent {
         agent: rig::agent::Agent<rig::providers::openai::CompletionModel>,
         tool_call_cap: usize,
     },
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     Mistralrs {
         agent: rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
         tool_call_cap: usize,
@@ -383,9 +383,9 @@ pub async fn build_agent(
     resolved: &ResolvedAgent,
     tools: Vec<McpToolAdapter>,
     cache_root: &Path,
-    #[cfg(feature = "mistralrs")] registry: &LlmRegistry,
+    #[cfg(feature = "local-llm")] registry: &LlmRegistry,
 ) -> Result<RigAgent> {
-    #[cfg(not(feature = "mistralrs"))]
+    #[cfg(not(feature = "local-llm"))]
     let _ = cache_root;
     match &resolved.provider {
         ResolvedProvider::OpenAi {
@@ -406,14 +406,14 @@ pub async fn build_agent(
             })
         }
         ResolvedProvider::Mistralrs => {
-            #[cfg(not(feature = "mistralrs"))]
+            #[cfg(not(feature = "local-llm"))]
             {
                 Err(LlmResolveError::MistralrsFeatureDisabled {
                     name: resolved.provider_name.clone(),
                 }
                 .into())
             }
-            #[cfg(feature = "mistralrs")]
+            #[cfg(feature = "local-llm")]
             {
                 let weights = resolved.model_weights.as_ref().ok_or_else(|| {
                     LlmResolveError::MistralrsLoad {
@@ -470,7 +470,7 @@ impl RigAgent {
                 agent,
                 tool_call_cap,
             } => run_turn_inner(agent, prompt, history, *tool_call_cap).await,
-            #[cfg(feature = "mistralrs")]
+            #[cfg(feature = "local-llm")]
             RigAgent::Mistralrs {
                 agent,
                 tool_call_cap,
@@ -506,7 +506,7 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     }
 }
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 async fn run_turn_streaming_mistralrs(
     agent: &rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
     prompt: &str,
@@ -517,7 +517,7 @@ async fn run_turn_streaming_mistralrs(
     run_turn_streaming_inner(agent, prompt, history, tool_call_cap, &mut stdout).await
 }
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 async fn run_turn_streaming_inner<M, W>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
@@ -574,7 +574,7 @@ where
     Ok(String::new())
 }
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 fn handle_streaming_error(err: StreamingError, history: &mut Vec<Message>) -> Result<String> {
     let prompt_error = match err {
         StreamingError::Completion(err) => rig::completion::PromptError::CompletionError(err),
@@ -705,9 +705,9 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     use rig::completion::{CompletionError, CompletionRequest, CompletionResponse, Usage};
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
 
     #[test]
@@ -744,13 +744,13 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     #[derive(Clone)]
     struct ScriptedStreamingModel {
         chunks: Arc<Vec<RawStreamingChoice<()>>>,
     }
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     impl ScriptedStreamingModel {
         fn new(chunks: Vec<RawStreamingChoice<()>>) -> Self {
             Self {
@@ -759,7 +759,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     impl CompletionModel for ScriptedStreamingModel {
         type Response = ();
         type StreamingResponse = ();
@@ -798,7 +798,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     #[tokio::test]
     async fn streaming_turn_writes_chunks_once_and_retains_history() {
         let model = ScriptedStreamingModel::new(vec![

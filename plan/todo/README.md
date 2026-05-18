@@ -8,7 +8,5 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-split library tidy-up
 
-- **[0067](0067-rename-mistralrs-feature-to-local-llm.md)** Rename `mistralrs` Cargo feature
-  to `local-llm`.
 - **[0068](0068-readme-crate-name-signposting.md)** README and quickstart crate-name
   signposting.

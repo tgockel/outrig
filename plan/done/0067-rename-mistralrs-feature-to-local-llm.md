@@ -58,6 +58,15 @@ documentation that mentions `--features mistralrs`.
 - `python3 scripts/audit-doc-style.py doc/reference/config.md
   doc/usage/run.md doc/usage/config.md` passes.
 
+## Decisions
+
+- Keep `mistralrs` in provider-style names, module/test filenames, and
+  dependency names. This task only renames the public Cargo feature.
+- Keep `metal` buildable on non-macOS targets for the feature matrix,
+  but gate actual Metal device construction to macOS. The upstream
+  Metal dependency features are Apple-only, so macOS local-llm builds
+  carry those backend features through target-specific dependencies.
+
 ## Dependencies
 
 - None. Independent of the visibility/relocation sweep ahead of it;

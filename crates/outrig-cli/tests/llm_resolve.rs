@@ -2,12 +2,12 @@
 //! every failure mode listed in `plan/done/0012-llm-resolver.md`'s test
 //! plan plus the two happy-path resolutions.
 
-#[cfg(not(feature = "mistralrs"))]
+#[cfg(not(feature = "local-llm"))]
 use std::path::Path;
 
 use outrig::config::{Config, MistralrsDeviceSpec};
 use outrig_cli::error::CliError;
-#[cfg(not(feature = "mistralrs"))]
+#[cfg(not(feature = "local-llm"))]
 use outrig_cli::llm::build_agent;
 use outrig_cli::llm::{
     DEFAULT_TOOL_RESULT_CAP_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider,
@@ -298,7 +298,7 @@ preamble = "hi"
     );
 }
 
-#[cfg(all(feature = "mistralrs", not(feature = "cuda")))]
+#[cfg(all(feature = "local-llm", not(feature = "cuda")))]
 #[test]
 fn mistralrs_cuda_device_feature_off_explains_clearly() {
     let cfg = local_mistralrs_cfg(Some("cuda:2"));
@@ -322,7 +322,7 @@ fn mistralrs_cuda_device_feature_off_explains_clearly() {
     );
 }
 
-#[cfg(all(feature = "mistralrs", not(feature = "metal")))]
+#[cfg(all(feature = "local-llm", not(feature = "metal")))]
 #[test]
 fn mistralrs_metal_device_feature_off_explains_clearly() {
     let cfg = local_mistralrs_cfg(Some("metal"));
@@ -435,10 +435,10 @@ preamble = "hi"
 
 /// Feature-off build: building an agent for a `mistralrs` provider fails
 /// with a message that names both the provider and the missing feature
-/// flag, so the fix ("rebuild with --features mistralrs") is one shot.
+/// flag, so the fix ("rebuild with --features local-llm") is one shot.
 /// Pinned verbatim because `doc/concepts/llm-providers.md` promises this
 /// wording.
-#[cfg(not(feature = "mistralrs"))]
+#[cfg(not(feature = "local-llm"))]
 #[tokio::test]
 async fn mistralrs_provider_feature_off_explains_clearly() {
     let var = "OUTRIG_TEST_LLM_RESOLVE_MISTRALRS";
@@ -473,8 +473,8 @@ preamble = "hi"
     assert_eq!(
         err.to_string(),
         "mistralrs provider \"local\" requested but this build of outrig \
-         does not include the 'mistralrs' feature; rebuild with \
-         --features mistralrs to enable",
+         does not include the 'local-llm' feature; rebuild with \
+         --features local-llm to enable",
     );
 }
 

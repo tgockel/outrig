@@ -206,7 +206,7 @@ async fn run_inner(
         all_tools.extend(adapters);
     }
 
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     let registry = llm::LlmRegistry::new();
 
     let span = ProgressSpan::start("building agent");
@@ -214,7 +214,7 @@ async fn run_inner(
         &resolved,
         all_tools.clone(),
         cache_root,
-        #[cfg(feature = "mistralrs")]
+        #[cfg(feature = "local-llm")]
         &registry,
     )
     .await?;

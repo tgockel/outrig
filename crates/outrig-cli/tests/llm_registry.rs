@@ -1,4 +1,4 @@
-#![cfg(feature = "mistralrs")]
+#![cfg(feature = "local-llm")]
 //! Sharing semantics of [`outrig_cli::llm::LlmRegistry`].
 //!
 //! Real `MistralrsModel`s wrap a heavy `MistralRs` engine, so these tests

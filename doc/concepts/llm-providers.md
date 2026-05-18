@@ -201,7 +201,7 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 The provider takes no `base-url` and no `api-key`. Each mistralrs model must set
 exactly one of `model-id` / `model-path`. One provider can back many models.
 
-The backend is gated behind `cargo build --features mistralrs`. A build *without* the
+The backend is gated behind `cargo build --features local-llm`. A build *without* the
 feature still parses and validates `style = "mistralrs"` blocks cleanly; the error fires
 only when an agent tries to actually use one of those models, with a message that names
 the missing feature flag. This keeps configs portable across builds.

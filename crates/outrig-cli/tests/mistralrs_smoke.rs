@@ -1,9 +1,9 @@
-#![cfg(feature = "mistralrs")]
+#![cfg(feature = "local-llm")]
 //! End-to-end smoke for the in-process mistralrs shim. Each test is gated
 //! behind an environment variable that points at a real GGUF model, since
 //! loading any model takes seconds and ~hundreds of MB to gigabytes of disk.
 //! Without those env vars the tests print a `skip:` notice and exit 0 so
-//! `cargo test --features mistralrs` stays green in CI.
+//! `cargo test --features local-llm` stays green in CI.
 
 use std::path::Path;
 use std::time::Duration;

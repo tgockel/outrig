@@ -6,7 +6,7 @@
 //! `/api/models/{id}/tree/{revision}` directly via `reqwest` (rather
 //! than `hf-hub::Api::info()`, which only exposes filenames).
 //!
-//! The `mistralrs` feature pulls in `reqwest` for the real implementation.
+//! The `local-llm` feature pulls in `reqwest` for the real implementation.
 //! Builds without the feature still get the trait plus an `Unavailable`
 //! impl that always errors -- so the init flow can prompt for `model-file`
 //! as free-form text without compiling against `reqwest`.
@@ -28,10 +28,10 @@ pub trait HfTreeFetcher {
     async fn list_files(&mut self, model_id: &str, revision: Option<&str>) -> Result<Vec<HfFile>>;
 }
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 pub struct ApiHfTreeFetcher;
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 #[derive(serde::Deserialize)]
 struct TreeEntry {
     #[serde(rename = "type")]
@@ -41,7 +41,7 @@ struct TreeEntry {
     size: Option<u64>,
 }
 
-#[cfg(feature = "mistralrs")]
+#[cfg(feature = "local-llm")]
 impl HfTreeFetcher for ApiHfTreeFetcher {
     async fn list_files(&mut self, model_id: &str, revision: Option<&str>) -> Result<Vec<HfFile>> {
         let revision = revision.unwrap_or("main");
@@ -77,7 +77,7 @@ impl HfTreeFetcher for ApiHfTreeFetcher {
     }
 }
 
-/// Always-fails fetcher used when the `mistralrs` feature is off (or by
+/// Always-fails fetcher used when the `local-llm` feature is off (or by
 /// callers that explicitly want to bypass the network). Returns a
 /// configuration error the prompt flow recognizes as "fall back to the
 /// free-form text prompt".
@@ -99,18 +99,18 @@ impl HfTreeFetcher for UnavailableHfTreeFetcher {
 /// Pick a fetcher appropriate for the current build. Mirrors the
 /// `init::prompt::auto` factory.
 pub fn auto() -> AutoHfTreeFetcher {
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     {
         AutoHfTreeFetcher::Api(ApiHfTreeFetcher)
     }
-    #[cfg(not(feature = "mistralrs"))]
+    #[cfg(not(feature = "local-llm"))]
     {
         AutoHfTreeFetcher::Unavailable(UnavailableHfTreeFetcher)
     }
 }
 
 pub enum AutoHfTreeFetcher {
-    #[cfg(feature = "mistralrs")]
+    #[cfg(feature = "local-llm")]
     Api(ApiHfTreeFetcher),
     Unavailable(UnavailableHfTreeFetcher),
 }
@@ -118,7 +118,7 @@ pub enum AutoHfTreeFetcher {
 impl HfTreeFetcher for AutoHfTreeFetcher {
     async fn list_files(&mut self, model_id: &str, revision: Option<&str>) -> Result<Vec<HfFile>> {
         match self {
-            #[cfg(feature = "mistralrs")]
+            #[cfg(feature = "local-llm")]
             Self::Api(f) => f.list_files(model_id, revision).await,
             Self::Unavailable(f) => f.list_files(model_id, revision).await,
         }

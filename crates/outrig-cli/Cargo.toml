@@ -12,9 +12,11 @@ repository.workspace    = true
 [features]
 default   = []
 e2e       = []
-mistralrs = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap", "dep:reqwest"]
+local-llm = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap", "dep:reqwest"]
 cuda      = ["candle-core?/cuda", "mistralrs-core?/cuda"]
-metal     = ["candle-core?/metal", "mistralrs-core?/metal"]
+# Metal's upstream dependency features are Apple-only. The public feature
+# gates outrig's runtime path; macOS local-llm builds carry the backend deps.
+metal     = []
 
 [[bin]]
 name = "outrig"
@@ -56,3 +58,7 @@ walkdir            = { workspace = true, default-features = true }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core    = { version = "=0.10.2", default-features = false, optional = true, features = ["metal"] }
+mistralrs-core = { version = "=0.8.1", default-features = false, optional = true, features = ["metal"] }

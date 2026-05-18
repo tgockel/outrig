@@ -182,10 +182,10 @@ fields (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `d
 live on `[models.<name>]` -- see the
 [mistralrs models](#mistralrs-models) subsection.
 
-#### Always parses, even without `--features mistralrs`
+#### Always parses, even without `--features local-llm`
 
 outrig **always** recognizes `style = "mistralrs"` for parsing and cross-reference
-validation, regardless of whether the binary was built with `--features mistralrs`. The
+validation, regardless of whether the binary was built with `--features local-llm`. The
 build-time feature gates only the *use* of the provider: trying to resolve an agent that
 points at a `mistralrs` provider on a non-feature build fails at run time, with a message
 that names the missing flag.
@@ -281,13 +281,17 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 is an error.
 
 `device = "cuda"` and `device = "cuda:N"` require a binary built with
-`--features "mistralrs cuda"`; `device = "metal"` requires
-`--features "mistralrs metal"`. The feature check happens when an agent resolves the
-model. Enabling `cuda` or `metal` without `mistralrs` emits a build warning and has no
+`--features "local-llm cuda"`; `device = "metal"` requires
+`--features "local-llm metal"`. The feature check happens when an agent resolves the
+model. Enabling `cuda` or `metal` without `local-llm` emits a build warning and has no
 effect. outrig does not fall back to CPU if the requested backend is unavailable. With
 CUDA, `cuda:N` selects the base device for mistralrs's automatic mapper; it is not an
 exclusive single-device sharding directive. `outrig run --device <device>` overrides this
 field for one run without editing config.
+
+Metal is only usable on macOS targets. Non-macOS builds can compile with the `metal`
+feature for feature-matrix coverage, but trying to instantiate a Metal device fails with
+a platform error.
 
 ## `[agents.<name>]`
 
@@ -536,7 +540,7 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
 [providers.local]
-# requires `cargo build --features mistralrs` to actually use, but always parses.
+# requires `cargo build --features local-llm` to actually use, but always parses.
 style = "mistralrs"
 
 [models.fast]
@@ -611,8 +615,8 @@ build-args = { NODE_VERSION = "20" }
 - Every `agents.<name>.container` (if set) must name an existing `[containers.<name>]`.
 - Every `providers.<name>.style` must be one of `{"openai", "mistralrs"}`. Other styles are
   reserved for future Rig adapters and listed as TODO in the providers concept page. The
-  build-time feature gate (`--features mistralrs`) is **not** checked at validate time --
-  see "Always parses, even without `--features mistralrs`" above.
+  build-time feature gate (`--features local-llm`) is **not** checked at validate time --
+  see "Always parses, even without `--features local-llm`" above.
 - Every `providers.<name>.api-key` (on `style = "openai"`) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - Every `[models.<name>]` whose provider has `style = "openai"` must set

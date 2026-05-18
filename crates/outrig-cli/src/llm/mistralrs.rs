@@ -235,7 +235,7 @@ fn candle_device(model_name: &str, spec: MistralrsDeviceSpec) -> Result<candle_c
             }
         }
         MistralrsDeviceSpec::Metal => {
-            #[cfg(feature = "metal")]
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 candle_core::Device::new_metal(0).map_err(|source| {
                     LlmResolveError::MistralrsLoad {
@@ -244,6 +244,14 @@ fn candle_device(model_name: &str, spec: MistralrsDeviceSpec) -> Result<candle_c
                     }
                     .into()
                 })
+            }
+            #[cfg(all(feature = "metal", not(target_os = "macos")))]
+            {
+                Err(LlmResolveError::MistralrsLoad {
+                    model: model_name.to_string(),
+                    source: anyhow::anyhow!("metal backend requires a macOS target"),
+                }
+                .into())
             }
             #[cfg(not(feature = "metal"))]
             {
