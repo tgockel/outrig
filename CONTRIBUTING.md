@@ -7,8 +7,8 @@ before opening a PR:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 ## End-to-end tests
@@ -17,7 +17,7 @@ Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. Th
 run in CI. Run the full suite with:
 
 ```sh
-cargo test --features e2e
+cargo test --workspace --features outrig/e2e --features outrig-cli/e2e
 ```
 
 Prerequisites: rootless `podman` + `buildah` on `PATH`. The two run-time tests have

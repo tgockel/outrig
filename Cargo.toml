@@ -1,49 +1,35 @@
-[package]
-name = "outrig"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
-description = "Run LLM agents with podman-isolated MCP servers"
+[workspace]
+resolver = "2"
+members  = ["crates/outrig", "crates/outrig-cli"]
+
+[workspace.package]
+version       = "0.1.0"
+edition       = "2024"
+license       = "Apache-2.0"
+homepage      = "https://tgockel.github.io/outrig/"
 documentation = "https://tgockel.github.io/outrig/"
-homepage = "https://tgockel.github.io/outrig/"
-repository = "https://github.com/tgockel/outrig"
+repository    = "https://github.com/tgockel/outrig"
 
-[features]
-default   = ["internal"]
-internal  = []
-e2e       = []
-mistralrs = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap", "dep:reqwest"]
-cuda      = ["candle-core?/cuda", "mistralrs-core?/cuda"]
-metal     = ["candle-core?/metal", "mistralrs-core?/metal"]
-
-[[bin]]
-name              = "outrig"
-required-features = ["internal"]
-
-[[test]]
-name              = "library_surface"
-required-features = ["e2e"]
-
-[dependencies]
+[workspace.dependencies]
 anyhow             = "1.0"
 async-stream       = "0.3"
 axum               = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 blake3             = "1.5"
-candle-core        = { version = "=0.10.2", optional = true, default-features = false }
+candle-core        = { version = "=0.10.2", default-features = false }
 clap               = { version = "4.5", features = ["derive"] }
 dialoguer          = { version = "0.12", features = ["fuzzy-select"] }
 directories        = "5.0"
 futures-util       = "0.3"
 heck               = "0.5"
-hf-hub             = { version = "=0.4.3", optional = true, default-features = false }
+hf-hub             = { version = "=0.4.3", default-features = false }
 ignore             = "0.4"
-indexmap           = { version = "2.14", optional = true }
+indexmap           = "2.14"
 jiff               = "0.2"
-mistralrs-core     = { version = "=0.8.1", optional = true, default-features = false }
+mistralrs-core     = { version = "=0.8.1", default-features = false }
 nix                = { version = "0.29", features = ["user"] }
 rand               = "0.8"
 regex              = "1.10"
-reqwest            = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rig-core           = { version = "0.36", default-features = false, features = ["reqwest", "rustls"] }
 schemars           = "0.8"
 serde              = { version = "1.0", features = ["derive"] }
@@ -57,8 +43,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-util         = "0.7"
 walkdir            = "2.5"
 
-[dependencies.rmcp]
-version = "1.6"
+[workspace.dependencies.rmcp]
+version          = "1.6"
 default-features = false
 features = [
     "base64",
@@ -70,7 +56,7 @@ features = [
     "transport-streamable-http-server",
 ]
 
-[dependencies.tokio]
+[workspace.dependencies.tokio]
 version = "1.40"
 features = [
     "rt-multi-thread",
@@ -84,6 +70,3 @@ features = [
     "time",
     "sync",
 ]
-
-[dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

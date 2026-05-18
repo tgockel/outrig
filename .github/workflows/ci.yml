@@ -24,7 +24,7 @@ jobs:
       matrix:
         include:
           - { name: default,   cargo_args: "" }
-          - { name: mistralrs, cargo_args: "--features mistralrs" }
+          - { name: mistralrs, cargo_args: "--features outrig-cli/mistralrs" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

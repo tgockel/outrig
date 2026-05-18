@@ -23,10 +23,14 @@ and won't paper over a broken setup.
 
 ## Install outrig
 
-> **TODO: Incomplete** -- `cargo install outrig` is not yet on crates.io.
+> **TODO: Incomplete** -- `cargo install outrig-cli` is not yet on crates.io.
+
+The `outrig` workspace publishes two crates: `outrig` (the library, for
+embedding into other agent frameworks) and `outrig-cli` (the command-line
+tool that produces the `outrig` binary).
 
 ```sh
-$ cargo install outrig
+$ cargo install outrig-cli
 $ outrig --version
 outrig 0.1.0
 ```

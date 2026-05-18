@@ -1,0 +1,865 @@
+//! Config schema, parsing, merge, and validation.
+
+pub mod api_key;
+mod env_ref;
+pub mod env_value;
+pub mod merge;
+pub mod validate;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
+
+pub use api_key::ApiKeyRef;
+pub use env_value::EnvValue;
+pub use merge::merge;
+pub use validate::ConfigValidationError;
+
+use crate::error::{OutrigError, Result};
+
+/// True when the parse error is an "unknown field" complaint and its span
+/// lands on a `[<dotted.path>]` header whose path has an unquoted `.`. That's
+/// the shape that makes TOML treat a name like `opus-4.7` as nested keys
+/// (`opus-4` table with field `7`) and is the cue to suggest quoting.
+/// Restricting to unknown-field errors avoids hinting on legitimate dotted
+/// headers like `[providers.openai]` whose values fail validation.
+fn error_lands_on_unquoted_dotted_header(err: &toml::de::Error, input: &str) -> bool {
+    if !err.message().contains("unknown field") {
+        return false;
+    }
+    let Some(span) = err.span() else {
+        return false;
+    };
+    let line_start = input[..span.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = input[span.start..]
+        .find('\n')
+        .map_or(input.len(), |i| span.start + i);
+    let line = input[line_start..line_end].trim();
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    let mut in_quote = false;
+    for c in rest[..end].chars() {
+        match c {
+            '"' => in_quote = !in_quote,
+            '.' if !in_quote => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+pub const DEFAULT_TOOL_CALL_CAP: u32 = 50;
+pub const MAX_TOOL_CALL_CAP: u32 = 2000;
+pub const DEFAULT_TOOL_RESULT_CAP_BYTES: u32 = 256 * 1024;
+pub const MIN_TOOL_RESULT_CAP_BYTES: u32 = 1024;
+pub const MAX_TOOL_RESULT_CAP_BYTES: u32 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_cache_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
+    pub network: NetworkConfig,
+
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, LlmProvider>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, Model>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, Agent>,
+
+    #[serde(default)]
+    pub workspace: Workspace,
+
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub containers: BTreeMap<String, ContainerConfig>,
+}
+
+impl Config {
+    pub fn load_from_str(s: &str) -> Result<Self> {
+        let mut cfg: Self = match toml::from_str(s) {
+            Ok(c) => c,
+            Err(e) if error_lands_on_unquoted_dotted_header(&e, s) => {
+                return Err(OutrigError::ConfigDottedKey { source: e });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        cfg.network.declared = declares_top_level_network(s)?;
+        Ok(cfg)
+    }
+
+    /// Read repo + (optional) global config files, merge with repo precedence,
+    /// and validate the merged result against `repo_root`. The repo config
+    /// file is read from `<repo_root>/.agents/outrig/config.toml`.
+    pub fn load(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+        let repo_path = crate::repo::repo_config_path(repo_root);
+        let repo_text = fs::read_to_string(&repo_path)?;
+        let repo_cfg = Self::load_from_str(&repo_text)?;
+        reject_repo_network_policy(&repo_text)?;
+
+        let global_cfg = match global_path {
+            Some(g) => match fs::read_to_string(g) {
+                Ok(text) => Self::load_from_str(&text)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+                Err(e) => return Err(e.into()),
+            },
+            None => Self::default(),
+        };
+
+        let merged = merge(global_cfg, repo_cfg);
+        merged.validate(Some(repo_root))?;
+        Ok(merged)
+    }
+
+    /// Validate every cross-reference rule documented in `doc/reference/config.md`.
+    /// `repo_root: Some(_)` enables `dockerfile`/`context` on-disk existence checks;
+    /// `None` keeps the check pure-structural for unit tests.
+    pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
+        validate::validate(self, repo_root)?;
+        Ok(())
+    }
+}
+
+fn declares_top_level_network(text: &str) -> Result<bool> {
+    let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
+        crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
+    })?;
+    Ok(value.as_table().contains_key("network"))
+}
+
+fn reject_repo_network_policy(text: &str) -> Result<()> {
+    let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
+        crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
+    })?;
+    let Some(network) = value.get("network").and_then(toml_edit::Item::as_table) else {
+        return Ok(());
+    };
+    for key in ["default", "allow", "deny"] {
+        if network.contains_key(key) {
+            return Err(OutrigError::Configuration(format!(
+                "repo config may set [network].mode only; [network].{key} belongs in global config"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "style",
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum LlmProvider {
+    // The kebab-case rule auto-converts `OpenAi` to `open-ai`; the doc'd
+    // tag is `openai`, so override per-variant.
+    #[serde(rename = "openai")]
+    OpenAi {
+        base_url: String,
+        api_key: ApiKeyRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_timeout_secs: Option<u64>,
+    },
+    Mistralrs,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Model {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<PathBuf>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_vec_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_file: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MistralrsDeviceSpec {
+    #[default]
+    Cpu,
+    Cuda(usize),
+    Metal,
+}
+
+impl MistralrsDeviceSpec {
+    pub const EXPECTED: &'static str = "expected one of: cpu, cuda, cuda:N, metal";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MistralrsDeviceParseError;
+
+impl std::fmt::Display for MistralrsDeviceParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MistralrsDeviceSpec::EXPECTED)
+    }
+}
+
+impl std::error::Error for MistralrsDeviceParseError {}
+
+impl std::str::FromStr for MistralrsDeviceSpec {
+    type Err = MistralrsDeviceParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda(0)),
+            "metal" => Ok(Self::Metal),
+            _ => {
+                let Some(ordinal) = s.strip_prefix("cuda:") else {
+                    return Err(MistralrsDeviceParseError);
+                };
+                if ordinal.is_empty() || !ordinal.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(MistralrsDeviceParseError);
+                }
+                ordinal
+                    .parse::<usize>()
+                    .map(Self::Cuda)
+                    .map_err(|_| MistralrsDeviceParseError)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for MistralrsDeviceSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::Cuda(0) => f.write_str("cuda"),
+            Self::Cuda(ordinal) => write!(f, "cuda:{ordinal}"),
+            Self::Metal => f.write_str("metal"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Agent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_cap: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Workspace {
+    pub host_path: PathBuf,
+    pub container_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountConfig>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            host_path: PathBuf::from("."),
+            container_path: PathBuf::from("/workspace"),
+            mounts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MountConfig {
+    pub host_path: PathBuf,
+    pub container_path: PathBuf,
+    #[serde(default)]
+    pub access: MountAccess,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountAccess {
+    #[default]
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkMode {
+    #[default]
+    Default,
+    Audit,
+    Filter,
+}
+
+impl std::str::FromStr for NetworkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(Self::Default),
+            "audit" => Ok(Self::Audit),
+            "filter" => Ok(Self::Filter),
+            _ => Err("expected one of: default, audit, filter".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str("default"),
+            Self::Audit => f.write_str("audit"),
+            Self::Filter => f.write_str("filter"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkAction {
+    Allow,
+    #[default]
+    Deny,
+}
+
+impl NetworkAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    fn is_deny(action: &Self) -> bool {
+        *action == Self::Deny
+    }
+}
+
+impl std::fmt::Display for NetworkAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NetworkEntry {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+impl NetworkEntry {
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: None,
+        }
+    }
+
+    pub fn with_port(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port: Some(port),
+        }
+    }
+
+    pub(crate) fn validate(&self, path: &str) -> std::result::Result<(), String> {
+        if self.port == Some(0) {
+            return Err(format!("{path}.port must be between 1 and 65535"));
+        }
+        parse_network_host_pattern(&self.host)
+            .map(|_| ())
+            .map_err(|e| format!("{path}.host {e}"))
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+        struct Table {
+            host: String,
+            #[serde(default)]
+            port: Option<u16>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            String(String),
+            Table(Table),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::String(s) => parse_network_entry_string(&s).map_err(serde::de::Error::custom),
+            Repr::Table(t) => Ok(Self {
+                host: t.host,
+                port: t.port,
+            }),
+        }
+    }
+}
+
+fn parse_network_entry_string(s: &str) -> std::result::Result<NetworkEntry, String> {
+    if s.is_empty() {
+        return Err("network entry must not be empty".to_string());
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return Err("bracketed IPv6 network entry is missing `]`".to_string());
+        };
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            let Some(raw) = suffix.strip_prefix(':') else {
+                return Err("bracketed network entry may only be followed by `:<port>`".to_string());
+            };
+            Some(parse_network_port(raw)?)
+        };
+        return Ok(NetworkEntry {
+            host: host.to_string(),
+            port,
+        });
+    }
+
+    if s.matches(':').count() == 1 {
+        let (host, raw_port) = s
+            .rsplit_once(':')
+            .expect("single colon implies split_once succeeds");
+        if raw_port.is_empty() {
+            return Err("network entry port must not be empty".to_string());
+        }
+        if raw_port.chars().all(|c| c.is_ascii_digit()) {
+            return Ok(NetworkEntry {
+                host: host.to_string(),
+                port: Some(parse_network_port(raw_port)?),
+            });
+        }
+        return Err("network entry port must be an integer".to_string());
+    }
+
+    Ok(NetworkEntry {
+        host: s.to_string(),
+        port: None,
+    })
+}
+
+fn parse_network_port(raw: &str) -> std::result::Result<u16, String> {
+    if raw.is_empty() {
+        return Err("network entry port must not be empty".to_string());
+    }
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| "network entry port must be between 1 and 65535".to_string())?;
+    if port == 0 {
+        return Err("network entry port must be between 1 and 65535".to_string());
+    }
+    Ok(port)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NetworkPolicy {
+    #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
+    pub default: NetworkAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<NetworkEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<NetworkEntry>,
+}
+
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self {
+            default: NetworkAction::Deny,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+}
+
+impl NetworkPolicy {
+    pub fn builder() -> NetworkPolicyBuilder {
+        NetworkPolicyBuilder::default()
+    }
+
+    pub(crate) fn allow_all() -> Self {
+        Self {
+            default: NetworkAction::Allow,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+
+    pub(crate) fn has_entries(&self) -> bool {
+        !self.allow.is_empty() || !self.deny.is_empty()
+    }
+
+    pub(crate) fn validate(&self, require_entries: bool) -> std::result::Result<(), String> {
+        if require_entries && !self.has_entries() {
+            return Err(
+                "network filter mode requires at least one allow or deny entry".to_string(),
+            );
+        }
+        for (idx, entry) in self.allow.iter().enumerate() {
+            entry.validate(&format!("network.allow[{idx}]"))?;
+        }
+        for (idx, entry) in self.deny.iter().enumerate() {
+            entry.validate(&format!("network.deny[{idx}]"))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPolicyBuilder {
+    policy: NetworkPolicy,
+}
+
+impl NetworkPolicyBuilder {
+    pub fn default_action(mut self, action: NetworkAction) -> Self {
+        self.policy.default = action;
+        self
+    }
+
+    pub fn allow_host(mut self, host: impl Into<String>) -> Self {
+        self.policy.allow.push(NetworkEntry::new(host));
+        self
+    }
+
+    pub fn allow_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.policy.allow.push(NetworkEntry::with_port(host, port));
+        self
+    }
+
+    pub fn deny_host(mut self, host: impl Into<String>) -> Self {
+        self.policy.deny.push(NetworkEntry::new(host));
+        self
+    }
+
+    pub fn deny_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.policy.deny.push(NetworkEntry::with_port(host, port));
+        self
+    }
+
+    pub fn build(self) -> Result<NetworkPolicy> {
+        self.policy
+            .validate(true)
+            .map_err(OutrigError::Configuration)?;
+        Ok(self.policy)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NetworkConfig {
+    pub mode: NetworkMode,
+    #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
+    pub default: NetworkAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<NetworkEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<NetworkEntry>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    declared: bool,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            mode: NetworkMode::Default,
+            default: NetworkAction::Deny,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            declared: false,
+        }
+    }
+}
+
+impl PartialEq for NetworkConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.default == other.default
+            && self.allow == other.allow
+            && self.deny == other.deny
+    }
+}
+
+impl Eq for NetworkConfig {}
+
+impl NetworkConfig {
+    pub(crate) fn is_declared(&self) -> bool {
+        self.declared
+    }
+
+    pub(crate) fn set_declared(&mut self, declared: bool) {
+        self.declared = declared;
+    }
+
+    pub fn policy(&self) -> NetworkPolicy {
+        NetworkPolicy {
+            default: self.default,
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+        }
+    }
+
+    pub fn has_policy_entries(&self) -> bool {
+        !self.allow.is_empty() || !self.deny.is_empty()
+    }
+}
+
+impl NetworkConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkHostPattern {
+    Ip(IpAddr),
+    Cidr { base: IpAddr, prefix: u8 },
+    HostGlob(String),
+}
+
+pub(crate) fn parse_network_host_pattern(
+    host: &str,
+) -> std::result::Result<NetworkHostPattern, String> {
+    if host.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err("must not contain whitespace".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(NetworkHostPattern::Ip(ip));
+    }
+    if let Some((raw_ip, raw_prefix)) = host.split_once('/') {
+        let ip = raw_ip
+            .parse::<IpAddr>()
+            .map_err(|_| "has an invalid CIDR address".to_string())?;
+        let prefix = raw_prefix
+            .parse::<u8>()
+            .map_err(|_| "has an invalid CIDR prefix".to_string())?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(format!(
+                "has CIDR prefix {prefix}, maximum for this address is {max}"
+            ));
+        }
+        return Ok(NetworkHostPattern::Cidr { base: ip, prefix });
+    }
+    if host.contains('/') || host.contains(':') {
+        return Err("must be a hostname glob, IP address, or CIDR".to_string());
+    }
+    if host.starts_with('.') || host.ends_with('.') || host.contains("..") {
+        return Err("has an invalid hostname glob".to_string());
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '*')
+    {
+        return Err("has an invalid hostname glob".to_string());
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err("has an invalid hostname glob".to_string());
+        }
+        if label != "*" && !label.contains('*') && (label.starts_with('-') || label.ends_with('-'))
+        {
+            return Err("has an invalid hostname glob".to_string());
+        }
+    }
+    Ok(NetworkHostPattern::HostGlob(host.to_ascii_lowercase()))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ContainerSecurity {
+    pub capability_profile: CapabilityProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_drop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cap_add: Vec<String>,
+}
+
+impl ContainerSecurity {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityProfile {
+    #[default]
+    Default,
+    NoNetRaw,
+    DropAll,
+}
+
+pub(crate) fn capability_name_without_prefix(name: &str) -> &str {
+    name.strip_prefix("CAP_").unwrap_or(name)
+}
+
+pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
+    let name = capability_name_without_prefix(name);
+    if name.is_empty() {
+        return None;
+    }
+    if name
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ContainerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub build_args: BTreeMap<String, EnvValue>,
+    #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
+    pub security: ContainerSecurity,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerSpec>,
+}
+
+/// Discriminated view of the container source -- build-from-Dockerfile or
+/// use-existing-image. Returned by [`ContainerConfig::source`].
+pub enum ContainerSourceRef<'a> {
+    Build {
+        dockerfile: &'a Path,
+        context: &'a Path,
+        build_args: &'a BTreeMap<String, EnvValue>,
+    },
+    Image {
+        image_name: &'a str,
+    },
+}
+
+impl ContainerConfig {
+    /// Return the discriminated source variant. Panics if validation has not
+    /// run (i.e. both or neither shape is set). Every real call path goes
+    /// through `Config::load` which validates first.
+    pub fn source(&self) -> ContainerSourceRef<'_> {
+        match (&self.image_name, &self.dockerfile, &self.context) {
+            (Some(name), None, None) => ContainerSourceRef::Image { image_name: name },
+            (None, Some(df), Some(ctx)) => ContainerSourceRef::Build {
+                dockerfile: df,
+                context: ctx,
+                build_args: &self.build_args,
+            },
+            _ => panic!(
+                "ContainerConfig::source() called on an unvalidated config; \
+                 call Config::validate() first"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum McpServerSpec {
+    Short(Vec<String>),
+    Full {
+        command: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, EnvValue>,
+    },
+}
+
+impl McpServerSpec {
+    /// Returns the argv and the (still-unresolved) env map. Resolution of any
+    /// `EnvValue::EnvRef` entries happens at the call site that's about to
+    /// spawn the MCP server, so a missing host env var is reported as an
+    /// MCP-startup failure rather than a config-load failure.
+    pub fn normalize(&self) -> (Vec<String>, BTreeMap<String, EnvValue>) {
+        match self {
+            Self::Short(command) => (command.clone(), BTreeMap::new()),
+            Self::Full { command, env } => (command.clone(), env.clone()),
+        }
+    }
+}
+
+/// Accepts `model-file = "x.gguf"` *or* `model-file = ["a.gguf", "b.gguf"]`
+/// during deserialization, normalizing to `Vec<String>`. The single-string
+/// form keeps configs from before this field went multi (split-quantization
+/// shards) parsing without a hand edit; the array form is what the init
+/// flow writes today.
+fn deserialize_string_or_vec_string<'de, D>(
+    d: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        Single(String),
+        Multi(Vec<String>),
+    }
+
+    Option::<StringOrVec>::deserialize(d).map(|opt| {
+        opt.map(|v| match v {
+            StringOrVec::Single(s) => vec![s],
+            StringOrVec::Multi(ss) => ss,
+        })
+    })
+}
