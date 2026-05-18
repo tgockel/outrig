@@ -80,7 +80,7 @@ by hand, not an exhaustive Dockerfile generator.
   go      Go 1.22.
   none    Just the base image -- nothing extra installed.
 
-  See: doc/usage/container.md#known-toolchains
+  See: https://tgockel.github.io/outrig/usage/container.html#known-toolchains
 
 ? Language toolchains [default: ]:
 ```

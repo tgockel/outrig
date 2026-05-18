@@ -57,6 +57,15 @@ fn extras_field() -> Field {
     }
 }
 
+fn anchored_doc_field() -> Field {
+    Field {
+        name: "Anchored docs",
+        description: "Exercises mdBook anchor conversion.",
+        options: &[],
+        doc_link: "doc/usage/container.md#known-toolchains",
+    }
+}
+
 #[tokio::test]
 async fn string_returns_default_on_empty() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
@@ -110,13 +119,42 @@ async fn string_help_then_value() {
         "expected description in help output: {stderr:?}"
     );
     assert!(
-        stderr.contains("See: doc/concepts/workspace.md"),
+        stderr.contains("See: https://tgockel.github.io/outrig/concepts/workspace.html"),
         "expected doc_link in help output: {stderr:?}"
     );
     let prompt_count = stderr.matches("? Workspace host-path").count();
     assert_eq!(
         prompt_count, 2,
         "expected two prompt renders (initial + after help), got: {stderr:?}"
+    );
+}
+
+#[tokio::test]
+async fn string_help_preserves_doc_anchor_in_public_url() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    let (stderr_w, mut stderr_r) = duplex(BUF);
+    stdin_w.write_all(b"?\nvalue\n").await.unwrap();
+    drop(stdin_w);
+
+    let mut prompt = TerminalPrompt::new(BufReader::new(stdin_r), stderr_w);
+    let field = anchored_doc_field();
+
+    let got = timeout(TEST_TIMEOUT, prompt.ask_string(&field, ""))
+        .await
+        .expect("must not hang")
+        .expect("ask_string must succeed");
+    drop(prompt);
+
+    assert_eq!(got, "value");
+
+    let mut stderr_buf = Vec::new();
+    stderr_r.read_to_end(&mut stderr_buf).await.unwrap();
+    let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
+    assert!(
+        stderr.contains(
+            "See: https://tgockel.github.io/outrig/usage/container.html#known-toolchains"
+        ),
+        "expected anchored public doc_link in help output: {stderr:?}"
     );
 }
 

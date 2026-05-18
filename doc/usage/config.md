@@ -69,7 +69,7 @@ prompt is then re-displayed so you can answer:
              Together, vLLM, Ollama, and any compatible endpoint.
   anthropic  (TODO: not yet wired in v0) Native Anthropic API.
 
-  See: doc/concepts/llm-providers.md
+  See: https://tgockel.github.io/outrig/concepts/llm-providers.html
 
 ? Pick a provider style [default: openai]:
 ```

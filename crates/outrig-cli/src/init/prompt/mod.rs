@@ -18,6 +18,8 @@ use tokio::io::{
 use self::dialoguer::DialoguerPrompt;
 use crate::error::{OutrigError, Result};
 
+const PUBLIC_DOC_BASE_URL: &str = "https://tgockel.github.io/outrig/";
+
 /// Static metadata for one interactive question.
 ///
 /// Constants live next to the call sites (e.g. `init/container.rs`) and are
@@ -30,6 +32,7 @@ pub struct Field {
     /// Discrete choices as `(value, blurb)` pairs. Empty for free-text fields.
     pub options: &'static [(&'static str, &'static str)],
     /// Path under the repo root, e.g. `"doc/concepts/llm-providers.md"`.
+    /// Help output renders this as a public documentation URL.
     pub doc_link: &'static str,
 }
 
@@ -232,7 +235,7 @@ where
 }
 
 /// Render the `?`-help block: indented description (skipped if empty),
-/// then each option's `value  blurb` row, then a `See: <doc_link>` footer.
+/// then each option's `value  blurb` row, then a public `See: <url>` footer.
 /// Shared between `TerminalPrompt::write_help` and the dialoguer impl.
 pub(super) fn format_field_help(field: &Field) -> String {
     let mut buf = String::new();
@@ -251,9 +254,31 @@ pub(super) fn format_field_help(field: &Field) -> String {
     }
     buf.push('\n');
     buf.push_str("  See: ");
-    buf.push_str(field.doc_link);
+    buf.push_str(&public_doc_link(field.doc_link));
     buf.push_str("\n\n");
     buf
+}
+
+fn public_doc_link(doc_link: &str) -> String {
+    let Some(rest) = doc_link.strip_prefix("doc/") else {
+        return doc_link.to_string();
+    };
+    let (path, anchor) = rest.split_once('#').unwrap_or((rest, ""));
+    let (path, suffix) = path
+        .strip_suffix(".md")
+        .map_or((path, ""), |path| (path, ".html"));
+
+    let mut out = String::with_capacity(
+        PUBLIC_DOC_BASE_URL.len() + path.len() + suffix.len() + anchor.len() + 1,
+    );
+    out.push_str(PUBLIC_DOC_BASE_URL);
+    out.push_str(path);
+    out.push_str(suffix);
+    if !anchor.is_empty() {
+        out.push('#');
+        out.push_str(anchor);
+    }
+    out
 }
 
 pub(super) fn parse_bool(s: &str) -> Option<bool> {

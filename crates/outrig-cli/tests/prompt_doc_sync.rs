@@ -1,5 +1,6 @@
 //! Asserts that every `Field::doc_link` in the codebase points to a real
-//! file under `doc/`. This catches drift between prompt help and the docs.
+//! file under `doc/`. This catches drift between prompt help and the docs,
+//! while still allowing optional mdBook anchors in the rendered URL.
 //!
 //! Field discovery is a manual `&[&Field]` slice. Each task that adds a
 //! `Field` constant (0023 / 0024 / 0026) appends it to `ALL_FIELDS` below.
@@ -35,7 +36,11 @@ fn every_doc_link_resolves() {
         .and_then(Path::parent)
         .expect("workspace root");
     for field in all_fields() {
-        let path = workspace_root.join(field.doc_link);
+        let local_path = field
+            .doc_link
+            .split_once('#')
+            .map_or(field.doc_link, |(path, _)| path);
+        let path = workspace_root.join(local_path);
         assert!(
             path.is_file(),
             "Field {:?} has doc_link `{}` which does not resolve to a file (looked at {})",
