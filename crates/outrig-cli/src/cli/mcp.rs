@@ -292,7 +292,7 @@ async fn serve_inner(
     print_banner(StartupBanner {
         container_name: container_cfg_name,
         image_tag,
-        container_pod_name: &container.name,
+        container_pod_name: container.name(),
         per_server_counts: &per_server_counts,
         public_names: &public_names,
         session_id,
@@ -323,7 +323,7 @@ async fn serve_stdio_transport(
     let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
     let mut monitor = Box::pin(async {
         if attached {
-            wait_for_attached_container_stop(container.name.clone()).await
+            wait_for_attached_container_stop(container.name().to_string()).await
         } else {
             std::future::pending::<Result<()>>().await
         }
@@ -481,7 +481,7 @@ where
     let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
     let mut monitor = Box::pin(async {
         if attached {
-            wait_for_attached_container_stop(container.name.clone()).await
+            wait_for_attached_container_stop(container.name().to_string()).await
         } else {
             std::future::pending::<Result<()>>().await
         }

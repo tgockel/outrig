@@ -6,9 +6,9 @@
 //! that would otherwise collide after character replacement get distinct
 //! suffixes.
 //!
-//! Both `outrig run` (via [`crate::rig_tool::McpToolAdapter`]) and the
-//! `mcp_proxy` server share this so they advertise identical public names for
-//! the same upstream tool.
+//! Both `outrig run` (through the companion `outrig-cli` crate) and the
+//! [`mcp_proxy`](crate::mcp_proxy) server share this so they advertise
+//! identical public names for the same upstream tool.
 
 /// Maximum length OpenAI accepts for a tool name. Other providers are more
 /// liberal but this is the safe lower bound.

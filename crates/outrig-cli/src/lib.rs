@@ -12,3 +12,4 @@ pub mod llm;
 pub mod mcp_self;
 pub mod repl;
 pub mod rig_tool;
+pub mod session;

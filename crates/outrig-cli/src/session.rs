@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
-use crate::error::{OutrigError, Result};
+use outrig::config::Config;
+use outrig::error::{OutrigError, Result};
 
 const SESSION_JSON: &str = "session.json";
 
@@ -304,7 +304,7 @@ pub fn resolve_session_root_for_cli(
     if let Some(p) = flag {
         return Ok(p.to_path_buf());
     }
-    let repo_cfg_path = match crate::repo::resolve_repo_config(repo_cfg_override, cwd) {
+    let repo_cfg_path = match outrig::repo::resolve_repo_config(repo_cfg_override, cwd) {
         Ok(p) => Some(p),
         Err(OutrigError::NoRepoConfig) => None,
         Err(e) => return Err(e),
@@ -317,7 +317,7 @@ pub fn resolve_session_root_for_cli(
     if let Some(root) = read_session_root(global_cfg_path)? {
         return Ok(root);
     }
-    Ok(crate::repo::default_session_root())
+    Ok(outrig::repo::default_session_root())
 }
 
 fn read_session_root(path: &Path) -> Result<Option<PathBuf>> {

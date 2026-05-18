@@ -101,8 +101,8 @@ pub fn model_cache_root(from_config: Option<&Path>) -> PathBuf {
     std::env::temp_dir().join("outrig-models")
 }
 
-/// XDG-default session root. The cascade lives in
-/// [`crate::session::resolve_session_root`] -- this is just the bottom rung.
+/// XDG-default session root. CLI session-root precedence lives in
+/// `outrig-cli`; this is just the bottom rung shared by callers.
 pub fn default_session_root() -> PathBuf {
     if let Some(dirs) = ProjectDirs::from("", "", "outrig") {
         return dirs.data_dir().join("sessions");

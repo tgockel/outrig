@@ -77,11 +77,11 @@ async fn bootstrap_then_id_matches_host() {
 
     let host_ws = tempfile::tempdir().expect("tempdir");
     let mut container = start_alpine(host_ws.path()).await;
-    install_shadow(&container.name).await;
+    install_shadow(container.name()).await;
 
     container.bootstrap_user().await.expect("bootstrap_user");
-    assert!(container.user_name.is_some());
-    assert!(container.group_name.is_some());
+    assert!(container.user_name().is_some());
+    assert!(container.group_name().is_some());
 
     let mut child = container
         .exec_stdio(&["id".to_string()], &BTreeMap::new())
@@ -89,8 +89,8 @@ async fn bootstrap_then_id_matches_host() {
         .expect("exec_stdio id");
     let out = read_stdout(&mut child).await;
 
-    let expect_uid = format!("uid={}", container.uid);
-    let expect_gid = format!("gid={}", container.gid);
+    let expect_uid = format!("uid={}", container.uid());
+    let expect_gid = format!("gid={}", container.gid());
     assert!(
         out.contains(&expect_uid),
         "expected `{expect_uid}` in `id` output, got: {out}"
@@ -110,7 +110,7 @@ async fn workspace_writes_have_host_ownership() {
 
     let host_ws = tempfile::tempdir().expect("tempdir");
     let mut container = start_alpine(host_ws.path()).await;
-    install_shadow(&container.name).await;
+    install_shadow(container.name()).await;
     container.bootstrap_user().await.expect("bootstrap_user");
 
     let mut child = container
@@ -131,12 +131,12 @@ async fn workspace_writes_have_host_ownership() {
     let meta = fs::metadata(&host_file).expect("stat host file");
     assert_eq!(
         meta.uid(),
-        container.uid,
+        container.uid(),
         "file should be owned by host UID"
     );
     assert_eq!(
         meta.gid(),
-        container.gid,
+        container.gid(),
         "file should be owned by host GID"
     );
     assert_eq!(
@@ -177,22 +177,22 @@ async fn bootstrap_reuses_existing_entry() {
 
     let host_ws = tempfile::tempdir().expect("tempdir");
     let mut container = start_alpine(host_ws.path()).await;
-    install_shadow(&container.name).await;
+    install_shadow(container.name()).await;
 
     // Bootstrap should reuse whatever entry is already at the host UID/GID,
     // whether that's an auto-injection from `--userns=keep-id` or one we
     // manually plant here. Probe first; plant only if absent.
-    let expected_grp = match first_name_in_db(&container.name, "group", container.gid).await {
+    let expected_grp = match first_name_in_db(container.name(), "group", container.gid()).await {
         Some(existing) => existing,
         None => {
             let planted = "preexisting_grp";
             process::run_capture(
                 Cmd::new("podman")
                     .args(["exec", "--user=0:0"])
-                    .arg(&container.name)
+                    .arg(container.name())
                     .arg("groupadd")
                     .arg("--gid")
-                    .arg(container.gid.to_string())
+                    .arg(container.gid().to_string())
                     .arg(planted),
             )
             .await
@@ -200,19 +200,19 @@ async fn bootstrap_reuses_existing_entry() {
             planted.to_string()
         }
     };
-    let expected_usr = match first_name_in_db(&container.name, "passwd", container.uid).await {
+    let expected_usr = match first_name_in_db(container.name(), "passwd", container.uid()).await {
         Some(existing) => existing,
         None => {
             let planted = "preexisting_usr";
             process::run_capture(
                 Cmd::new("podman")
                     .args(["exec", "--user=0:0"])
-                    .arg(&container.name)
+                    .arg(container.name())
                     .arg("useradd")
                     .arg("-u")
-                    .arg(container.uid.to_string())
+                    .arg(container.uid().to_string())
                     .arg("-g")
-                    .arg(container.gid.to_string())
+                    .arg(container.gid().to_string())
                     .arg(planted),
             )
             .await
@@ -223,12 +223,12 @@ async fn bootstrap_reuses_existing_entry() {
 
     container.bootstrap_user().await.expect("bootstrap_user");
     assert_eq!(
-        container.group_name.as_deref(),
+        container.group_name(),
         Some(expected_grp.as_str()),
         "bootstrap should reuse the pre-existing group at the host GID"
     );
     assert_eq!(
-        container.user_name.as_deref(),
+        container.user_name(),
         Some(expected_usr.as_str()),
         "bootstrap should reuse the pre-existing user at the host UID"
     );

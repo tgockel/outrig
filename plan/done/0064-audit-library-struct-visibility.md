@@ -54,3 +54,22 @@ homes now that the binary/library boundary is real.
 
 - None in `plan/todo/`. Implicitly requires the workspace split
   (`361c6dbb`, already merged).
+
+## Decisions
+
+1. **`outrig` is the runtime-core crate.** External Rust users should get
+   supported container/image/MCP/proxy/network primitives plus the
+   `Outrig` facade. CLI-only policy and UX code belongs in `outrig-cli`,
+   not behind a friend-style `internal` feature.
+2. **`ContainerHandle` is stale wording.** The current runtime type is
+   `container::Container`; this task tightens that type rather than adding
+   a compatibility alias.
+3. **Session records are CLI-owned.** `Session`, `SessionId`, and
+   `SessionStore` moved into `outrig-cli`; runtime container names now use
+   a private library helper instead of depending on CLI session ids.
+4. **Generic subprocess helpers are not public API.** The `process`
+   module keeps `Transcript` public for runtime/CLI logging, but `Cmd` and
+   generic capture/spawn helpers are crate-private implementation details.
+5. **Top-level clap dispatch is CLI-library code.** `main.rs` is a thin
+   entry point; parser and dispatch types live under `outrig-cli`'s
+   `cli` module.

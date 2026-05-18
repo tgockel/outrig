@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-split library tidy-up
 
-- **[0064](0064-audit-library-struct-visibility.md)** Post-split library tidy-up: visibility,
-  names, placement.
 - **[0065](0065-tighten-library-module-visibility.md)** Tighten library module visibility
   after split.
 - **[0066](0066-move-hf-fully-to-cli.md)** Move `hf` module fully into `outrig-cli`.

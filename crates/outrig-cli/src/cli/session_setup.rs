@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cli::env_arg::CliEnvEntries;
 use crate::error::{OutrigError, Result};
 use crate::llm;
+use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{Config, ContainerConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
 use outrig::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -43,7 +44,6 @@ use outrig::mcp::McpClient;
 use outrig::network::NetworkInterceptor;
 use outrig::process::Transcript;
 use outrig::repo;
-use outrig::session::{self, Session, SessionId, SessionStore};
 
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -398,7 +398,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         let span = ProgressSpan::start(format!("starting container {container_name}"));
         match Container::start_named(&image_tag, launch, container_name, transcript).await {
             Ok(container) => {
-                span.done(format!("container ready: {}", container.name));
+                span.done(format!("container ready: {}", container.name()));
                 container
             }
             Err(e) => {

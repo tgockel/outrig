@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -47,7 +47,6 @@ pub struct McpToolResult {
 #[derive(Debug)]
 pub struct McpClient {
     name: String,
-    stderr_path: PathBuf,
     service: RunningService<RoleClient, ()>,
     child: Child,
 }
@@ -126,7 +125,6 @@ impl McpClient {
 
         Ok(Self {
             name: name.to_string(),
-            stderr_path,
             service,
             child,
         })
@@ -135,11 +133,6 @@ impl McpClient {
     /// The local name this client was constructed with (e.g. `"fs"`).
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Path to the file capturing this server's stderr.
-    pub fn stderr_path(&self) -> &Path {
-        &self.stderr_path
     }
 
     /// Issue an MCP `tools/list` (paginating internally) and project the
@@ -356,7 +349,7 @@ fn render_command(argv: &[String]) -> String {
         .join(" ")
 }
 
-pub fn kind_of(v: &Value) -> &'static str {
+pub(crate) fn kind_of(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
         Value::Bool(_) => "bool",

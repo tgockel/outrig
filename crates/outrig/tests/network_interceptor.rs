@@ -100,7 +100,7 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
         .await
         .expect("start network interceptor");
 
-    process::run_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+    process::run_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
         "curl",
         "-fsS",
         "https://example.com",
@@ -198,7 +198,7 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     .await
     .expect("start network interceptor");
 
-    let output = process::try_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+    let output = process::try_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
         "curl",
         "-fsS",
         "--connect-timeout",

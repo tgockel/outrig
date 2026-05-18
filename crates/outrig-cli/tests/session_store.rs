@@ -4,7 +4,7 @@
 use std::time::{Duration, SystemTime};
 
 use outrig::error::OutrigError;
-use outrig::session::{SessionId, SessionStore};
+use outrig_cli::session::{SessionId, SessionStore};
 
 mod common;
 use common::sample_session;

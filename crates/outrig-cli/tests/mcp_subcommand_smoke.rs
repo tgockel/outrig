@@ -15,7 +15,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo test --features e2e mcp_subcommand_smoke -- --nocapture
+//! cargo test -p outrig-cli --features e2e mcp_subcommand_smoke -- --nocapture
 //! ```
 
 #![cfg(feature = "e2e")]
@@ -30,7 +30,7 @@ use outrig::config::{ContainerConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig::mcp::McpClient;
-use outrig::session::{Session, SessionId, SessionStore};
+use outrig_cli::session::{Session, SessionId, SessionStore};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;
 use serde_json::Value;
@@ -43,7 +43,10 @@ use common::stream_lines;
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn fixture_mcp_fs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("outrig-cli is under crates/")
+        .join("outrig/tests/fixtures/mcp-fs")
 }
 
 fn fs_spec() -> McpServerSpec {
@@ -114,7 +117,7 @@ fn create_host_session(
         id: sid.clone(),
         started_at: SystemTime::now(),
         ended_at: None,
-        container_name: container.name.clone(),
+        container_name: container.name().to_string(),
         image_tag: image.to_string(),
         container_config_name: "smoke".to_string(),
         agent_name: Some("smoke".to_string()),
@@ -738,7 +741,7 @@ async fn mcp_attach_by_session_id_reuses_container_and_writes_own_logs() {
 
     host_client.shutdown().await.expect("shutdown host mcp");
     assert!(
-        Container::is_running(&container.name)
+        Container::is_running(container.name())
             .await
             .expect("podman inspect"),
         "attacher shutdown must leave host container running"
@@ -767,7 +770,7 @@ async fn mcp_attach_by_podman_name_requires_container_config_and_borrows_lifecyc
         sessions.path().display().to_string(),
         "mcp".to_string(),
         "--attach".to_string(),
-        container.name.clone(),
+        container.name().to_string(),
         "--container".to_string(),
         "smoke".to_string(),
     ];
@@ -779,7 +782,7 @@ async fn mcp_attach_by_podman_name_requires_container_config_and_borrows_lifecyc
         run.stderr
     );
     assert!(
-        Container::is_running(&container.name)
+        Container::is_running(container.name())
             .await
             .expect("podman inspect"),
         "direct attacher must not stop the borrowed container"

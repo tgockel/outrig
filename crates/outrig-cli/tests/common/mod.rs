@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
 
 use outrig::error::OutrigError;
-use outrig::session::{Session, SessionId};
 use outrig_cli::error::Result;
 use outrig_cli::hf::{HfFile, HfTreeFetcher};
 use outrig_cli::init::prompt::TerminalPrompt;
+use outrig_cli::session::{Session, SessionId};
 
 /// Install a best-effort tracing subscriber for integration tests that
 /// surface process output under `--nocapture`.

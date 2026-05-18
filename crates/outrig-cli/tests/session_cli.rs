@@ -9,8 +9,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use outrig::session::{SessionId, SessionStore};
 use outrig_cli::cli::{discard, logs, ls};
+use outrig_cli::session::{SessionId, SessionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 mod common;

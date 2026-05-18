@@ -13,7 +13,7 @@ use clap::Parser;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::Result;
-use outrig::session::{self, Session, SessionStore};
+use crate::session::{self, Session, SessionStore};
 
 #[derive(Debug, Parser)]
 pub struct LsArgs {}

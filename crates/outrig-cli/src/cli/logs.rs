@@ -17,7 +17,7 @@ use clap::{ArgGroup, Parser};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{OutrigError, Result};
-use outrig::session::{self, SessionStore};
+use crate::session::{self, SessionStore};
 
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
 /// MCP server stderr captures land at `<session>/logs/<server>.stderr` (see

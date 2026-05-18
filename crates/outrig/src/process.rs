@@ -1,7 +1,9 @@
-//! Generic subprocess wrappers used by image/container modules. Provides
-//! consistent stderr capture, structured failure errors, and tracing-friendly
-//! streamed output. Knows nothing about buildah or podman -- callers pass the
-//! program name in.
+//! Process transcript support.
+//!
+//! The public piece is [`Transcript`], which mirrors command lines and output
+//! into a log file for runtime startup paths. The generic command/capture
+//! helpers in this module are crate-private implementation details used by
+//! the container and image runtimes.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -21,25 +23,25 @@ const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
 const STREAM_READ_CHUNK: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
-pub struct Cmd {
-    pub program: &'static str,
-    pub args: Vec<OsString>,
+pub(crate) struct Cmd {
+    pub(crate) program: &'static str,
+    pub(crate) args: Vec<OsString>,
 }
 
 impl Cmd {
-    pub fn new(program: &'static str) -> Self {
+    pub(crate) fn new(program: &'static str) -> Self {
         Self {
             program,
             args: Vec::new(),
         }
     }
 
-    pub fn arg<S: AsRef<OsStr>>(mut self, arg: S) -> Self {
+    pub(crate) fn arg<S: AsRef<OsStr>>(mut self, arg: S) -> Self {
         self.args.push(arg.as_ref().to_os_string());
         self
     }
 
-    pub fn args<I, S>(mut self, args: I) -> Self
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -52,7 +54,7 @@ impl Cmd {
     /// Build a fresh `tokio::process::Command` from this argv. No stdio
     /// configuration is applied -- the caller layers `.stdin()` / `.stdout()`
     /// / `.stderr()` to taste before spawning.
-    pub fn to_tokio_command(&self) -> Command {
+    pub(crate) fn to_tokio_command(&self) -> Command {
         let mut c = Command::new(self.program);
         c.args(&self.args);
         c
@@ -61,7 +63,7 @@ impl Cmd {
     /// Render the argv as a shell-like command line for diagnostics. This is
     /// display-only; callers must still spawn via `Command` so no quoting
     /// participates in execution.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         std::iter::once(OsStr::new(self.program))
             .chain(self.args.iter().map(OsString::as_os_str))
             .map(render_arg)
@@ -121,14 +123,14 @@ impl Transcript {
 /// caller (e.g. `git rev-parse --git-dir` for "is this a git repo?",
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
-pub async fn try_capture(cmd: Cmd) -> Result<Output> {
+pub(crate) async fn try_capture(cmd: Cmd) -> Result<Output> {
     Ok(cmd.to_tokio_command().output().await?)
 }
 
 /// Spawn the command, capture stdout and stderr, and optionally tee a
 /// transcript of the command line plus both output streams. Non-zero exit is
 /// returned in the `Output`, matching [`try_capture`].
-pub async fn try_capture_logged(
+pub(crate) async fn try_capture_logged(
     cmd: Cmd,
     prefix: &'static str,
     transcript: Option<&Transcript>,
@@ -171,7 +173,7 @@ pub async fn try_capture_logged(
 /// success. On non-zero (or signal) exit, return [`OutrigError::Process`] with
 /// the program, argv, exit code, and the last `STDERR_TAIL_LIMIT` bytes of
 /// stderr (lossy UTF-8, prefixed with a truncation marker if elision occurred).
-pub async fn run_capture(cmd: Cmd) -> Result<Output> {
+pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
     let mut child = cmd
         .to_tokio_command()
         .stdin(Stdio::null())
@@ -212,7 +214,7 @@ pub async fn run_capture(cmd: Cmd) -> Result<Output> {
 
 /// Logged sibling of [`run_capture`]. On success, returns captured output;
 /// on non-zero, returns the same structured process error with a stderr tail.
-pub async fn run_capture_logged(
+pub(crate) async fn run_capture_logged(
     cmd: Cmd,
     prefix: &'static str,
     transcript: Option<&Transcript>,
@@ -244,7 +246,7 @@ pub(crate) fn process_error_from_output(cmd: Cmd, output: Output) -> OutrigError
 /// inherits the parent's; stdin is null. Returns the [`ExitStatus`] -- a
 /// non-zero exit is **not** an error, since callers may want to inspect
 /// status before deciding what it means.
-pub async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> {
+pub(crate) async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> {
     let mut child = cmd
         .to_tokio_command()
         .stdin(Stdio::null())
@@ -272,7 +274,7 @@ pub async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> 
 /// Spawn the command with all three of stdin/stdout/stderr piped, returning
 /// the [`Child`]. The caller owns the child and is responsible for waiting on
 /// it. Used by `podman exec -i` callers that want full bidirectional control.
-pub async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
+pub(crate) async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
     let child = cmd
         .to_tokio_command()
         .stdin(Stdio::piped())
@@ -416,3 +418,7 @@ fn is_shell_safe_byte(b: u8) -> bool {
             b'/' | b'.' | b'-' | b'_' | b':' | b'=' | b',' | b'+' | b'@' | b'%'
         )
 }
+
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod process_tests;

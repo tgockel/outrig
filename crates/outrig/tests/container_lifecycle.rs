@@ -93,7 +93,7 @@ async fn start_then_stop_leaves_no_container() {
     )
     .await
     .expect("start");
-    let name = container.name.clone();
+    let name = container.name().to_string();
 
     assert!(
         podman_ps_lists(&name, false).await,
@@ -153,7 +153,7 @@ async fn extra_mounts_enforce_access_modes() {
     let read = process::run_capture(
         Cmd::new("podman")
             .arg("exec")
-            .arg(&container.name)
+            .arg(container.name())
             .args(["cat", "/resources/ro/MARKER.txt"]),
     )
     .await
@@ -161,7 +161,7 @@ async fn extra_mounts_enforce_access_modes() {
     assert_eq!(String::from_utf8_lossy(&read.stdout), "read-only marker\n");
 
     let ro_write =
-        process::try_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+        process::try_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
             "sh",
             "-c",
             "echo nope > /resources/ro/out.txt",
@@ -177,7 +177,7 @@ async fn extra_mounts_enforce_access_modes() {
         "read-only write must not create a host file"
     );
 
-    process::run_capture(Cmd::new("podman").arg("exec").arg(&container.name).args([
+    process::run_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
         "sh",
         "-c",
         "echo yes > /resources/rw/out.txt",
@@ -213,7 +213,7 @@ async fn capability_flags_are_recorded_in_podman_create_command() {
     .await
     .expect("start");
 
-    let inspect = podman_inspect_json(&container.name).await;
+    let inspect = podman_inspect_json(container.name()).await;
     let create_command = inspect_string_array(&inspect, &[&["Config", "CreateCommand"]])
         .expect("podman inspect should expose Config.CreateCommand");
 
@@ -247,7 +247,7 @@ async fn drop_without_stop_cleans_up() {
         )
         .await
         .expect("start");
-        name = container.name.clone();
+        name = container.name().to_string();
         assert!(
             podman_ps_lists(&name, false).await,
             "container should be running"
@@ -288,7 +288,7 @@ async fn attached_handle_does_not_stop_or_cleanup_container() {
     )
     .await
     .expect("start");
-    let name = container.name.clone();
+    let name = container.name().to_string();
 
     {
         let _attached = Container::attach(

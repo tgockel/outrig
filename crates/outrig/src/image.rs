@@ -1,6 +1,6 @@
 //! Image build via buildah with content-addressed cache.
 //!
-//! [`CacheKey::compute`] produces a deterministic 16-hex-char key over
+//! The cache-key helper produces a deterministic 16-hex-char key over
 //! `(Dockerfile bytes, resolved build-args, context content)`. [`ensure_image`]
 //! probes `outrig-cache:<key>` first; on miss it shells out to
 //! `buildah build`. Buildah's own layer cache still helps speed up the build
@@ -41,14 +41,14 @@ pub struct ImageBuildOutcome {
     pub cache_hit: bool,
 }
 
-pub struct CacheKey;
+pub(crate) struct CacheKey;
 
 impl CacheKey {
     /// Hash `(Dockerfile bytes, sorted build-args, context content)` into a
     /// 16-hex-char blake3 prefix. The build-args must already be resolved to
     /// concrete values. Caller passes absolute paths; `ensure_image` resolves
     /// relative-to-repo-root before calling.
-    pub async fn compute(
+    pub(crate) async fn compute(
         dockerfile: &Path,
         build_args: &BTreeMap<String, String>,
         context: &Path,
@@ -78,7 +78,7 @@ impl CacheKey {
 /// Resolve `build-args` for a container-config. Literal values pass through;
 /// `${VAR}` references are read from the host environment and framed with the
 /// container name plus the build-arg key on failure.
-pub fn resolve_build_args(
+pub(crate) fn resolve_build_args(
     container: &str,
     cfg: &ContainerConfig,
 ) -> Result<BTreeMap<String, String>> {
@@ -146,7 +146,7 @@ pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
 
 /// Logged sibling of [`probe_cached`]. Used by session startup so verbose
 /// mode records the cache probe alongside build/start lifecycle commands.
-pub async fn probe_cached_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
+async fn probe_cached_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
     let probe = process::try_capture_logged(
         Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag.0),
         "buildah",
@@ -165,7 +165,7 @@ pub async fn probe_pulled(tag: &ImageTag) -> Result<bool> {
 }
 
 /// Logged sibling of [`probe_pulled`].
-pub async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
+async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
     let probe = process::try_capture_logged(
         Cmd::new("podman").args(["image", "exists"]).arg(&tag.0),
         "podman",
@@ -193,7 +193,7 @@ pub async fn pull_image(tag: &ImageTag) -> Result<()> {
 }
 
 /// Logged sibling of [`pull_image`] for session startup.
-pub async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<()> {
+async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<()> {
     process::run_capture_logged(
         Cmd::new("podman").arg("pull").arg(&tag.0),
         "podman",
@@ -249,34 +249,6 @@ async fn build_image_with_build_args(
         });
     }
     Ok(())
-}
-
-/// Build variant for session startup. With `transcript = Some`, the buildah
-/// command line and output are mirrored to stderr and `container.log`; with
-/// `None`, output is captured silently and appears only in the process error
-/// tail if buildah fails.
-pub async fn build_image_logged(
-    cfg: &ContainerConfig,
-    repo_root: &Path,
-    tag: &ImageTag,
-    no_cache: bool,
-    transcript: Option<&Transcript>,
-) -> Result<()> {
-    build_image_logged_for(UNNAMED_CONTAINER, cfg, repo_root, tag, no_cache, transcript).await
-}
-
-/// Named-container variant of [`build_image_logged`] with build-arg resolution
-/// errors framed against the selected container-config.
-pub async fn build_image_logged_for(
-    container: &str,
-    cfg: &ContainerConfig,
-    repo_root: &Path,
-    tag: &ImageTag,
-    no_cache: bool,
-    transcript: Option<&Transcript>,
-) -> Result<()> {
-    let build_args = resolve_build_args(container, cfg)?;
-    build_image_logged_with_build_args(cfg, repo_root, tag, no_cache, transcript, &build_args).await
 }
 
 async fn build_image_logged_with_build_args(
@@ -615,3 +587,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "image_cache_tests.rs"]
+mod image_cache_tests;
+
+#[cfg(test)]
+#[path = "build_args_env_value_tests.rs"]
+mod build_args_env_value_tests;

@@ -11,8 +11,8 @@ use clap::{ArgGroup, Parser};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{OutrigError, Result};
-use outrig::process::{self, Cmd};
-use outrig::session::{self, Session, SessionStore};
+use crate::session::{self, Session, SessionStore};
+use outrig::container::Container;
 
 #[derive(Debug, Parser)]
 #[command(group(
@@ -144,11 +144,5 @@ fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
 }
 
 async fn podman_is_running(name: String) -> Result<bool> {
-    let out = process::try_capture(
-        Cmd::new("podman")
-            .args(["ps", "-q", "--filter"])
-            .arg(format!("name=^{name}$")),
-    )
-    .await?;
-    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    Ok(Container::is_running(&name).await?)
 }

@@ -43,7 +43,7 @@ pub enum EmbeddedContainerConfigError {
 }
 
 pub async fn read_embedded_container(container: &Container) -> Result<EmbeddedContainerConfig> {
-    let cmd = podman_exec_root(&container.name)
+    let cmd = podman_exec_root(container.name())
         .arg("cat")
         .arg(EMBEDDED_CONTAINER_CONFIG_PATH);
     let output =
@@ -56,7 +56,7 @@ pub async fn read_embedded_container(container: &Container) -> Result<EmbeddedCo
         return Err(process::process_error_from_output(cmd, output));
     }
 
-    parse_embedded_container(&container.name, output.stdout)
+    parse_embedded_container(container.name(), output.stdout)
 }
 
 pub fn parse_embedded_container(

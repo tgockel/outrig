@@ -27,7 +27,6 @@ use crate::config::{CapabilityProfile, MountAccess, capability_name_without_pref
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd, Transcript};
-use crate::session::SessionId;
 
 /// Maximum `_`-suffix retries before bootstrap gives up.
 const BOOTSTRAP_RETRIES: usize = 10;
@@ -36,18 +35,18 @@ static TRACKED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 #[derive(Debug)]
 pub struct Container {
-    pub name: String,
-    pub image_tag: ImageTag,
-    pub host_workspace: PathBuf,
-    pub container_workspace: PathBuf,
-    pub uid: u32,
-    pub gid: u32,
+    name: String,
+    image_tag: ImageTag,
+    host_workspace: PathBuf,
+    container_workspace: PathBuf,
+    uid: u32,
+    gid: u32,
     /// In-container user name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
-    pub user_name: Option<String>,
+    user_name: Option<String>,
     /// In-container group name resolved by [`Container::bootstrap_user`].
     /// `None` until bootstrap has run.
-    pub group_name: Option<String>,
+    group_name: Option<String>,
     transcript: Option<Transcript>,
     ownership: ContainerOwnership,
     disposed: bool,
@@ -115,7 +114,7 @@ impl Container {
     /// read-write and used as the working directory; extra mounts never
     /// affect `-w`.
     pub async fn start(image: &ImageTag, launch: ContainerLaunchSpec) -> Result<Self> {
-        let name = format!("outrig-{}", SessionId::new());
+        let name = format!("outrig-{}", runtime_id());
         Self::start_named(image, launch, name, None).await
     }
 
@@ -220,6 +219,38 @@ impl Container {
             return Ok(false);
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn image_tag(&self) -> &ImageTag {
+        &self.image_tag
+    }
+
+    pub fn host_workspace(&self) -> &Path {
+        &self.host_workspace
+    }
+
+    pub fn container_workspace(&self) -> &Path {
+        &self.container_workspace
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    pub fn user_name(&self) -> Option<&str> {
+        self.user_name.as_deref()
+    }
+
+    pub fn group_name(&self) -> Option<&str> {
+        self.group_name.as_deref()
     }
 
     /// Materialize an in-container user+group matching the host UID/GID,
@@ -354,7 +385,7 @@ impl Container {
     /// Panics if [`Container::bootstrap_user`] has not yet been called --
     /// the user/group don't exist inside the container, so a `--user`-scoped
     /// exec would fail at the podman layer with a less useful message.
-    pub fn build_exec_argv(&self, cmd: &[String], env: &BTreeMap<String, String>) -> Cmd {
+    pub(crate) fn build_exec_argv(&self, cmd: &[String], env: &BTreeMap<String, String>) -> Cmd {
         let user_name = self
             .user_name
             .as_deref()
@@ -583,6 +614,18 @@ fn untrack(name: &str) {
     if let Ok(mut g) = TRACKED.lock() {
         g.remove(name);
     }
+}
+
+fn runtime_id() -> String {
+    use jiff::Zoned;
+    use rand::RngCore;
+
+    let ts = Zoned::now()
+        .with_time_zone(jiff::tz::TimeZone::UTC)
+        .strftime("%Y%m%dT%H%M%S");
+    let mut buf = [0_u8; 2];
+    rand::thread_rng().fill_bytes(&mut buf);
+    format!("{ts}-{:02x}{:02x}", buf[0], buf[1])
 }
 
 fn parse_container_inspect(name: &str, stdout: &[u8]) -> Result<ContainerInspect> {

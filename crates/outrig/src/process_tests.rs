@@ -1,4 +1,4 @@
-//! Integration tests for `outrig::process`: covers all three call patterns
+//! Unit tests for `process`: covers all three call patterns
 //! (`run_capture`, `run_streamed`, `spawn_stdio`), the structured `Process`
 //! error variant, and the honest stderr-tail truncation behavior.
 
@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::fmt::MakeWriter;
 
-use outrig::error::OutrigError;
-use outrig::process::{self, Cmd, Transcript};
+use crate::error::OutrigError;
+
+use super::{Cmd, Transcript};
 
 #[test]
 fn cmd_render_quotes_args_for_display() {
@@ -25,7 +26,7 @@ fn cmd_render_quotes_args_for_display() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn run_capture_echo_succeeds() {
-    let out = process::run_capture(Cmd::new("/bin/echo").arg("hi"))
+    let out = super::run_capture(Cmd::new("/bin/echo").arg("hi"))
         .await
         .expect("/bin/echo hi must succeed");
     assert!(out.status.success());
@@ -34,7 +35,7 @@ async fn run_capture_echo_succeeds() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn run_capture_false_fails_with_exit_1() {
-    let err = process::run_capture(Cmd::new("/bin/false").arg("ignored-arg"))
+    let err = super::run_capture(Cmd::new("/bin/false").arg("ignored-arg"))
         .await
         .expect_err("/bin/false must fail");
     let OutrigError::Process {
@@ -67,7 +68,7 @@ async fn run_capture_false_fails_with_exit_1() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn try_capture_returns_output_on_nonzero_exit() {
-    let out = process::try_capture(Cmd::new("/bin/false"))
+    let out = super::try_capture(Cmd::new("/bin/false"))
         .await
         .expect("try_capture must not error on non-zero exit");
     assert!(!out.status.success());
@@ -82,7 +83,7 @@ async fn logged_capture_tees_command_and_output_to_transcript() {
         .await
         .expect("create transcript");
 
-    let output = process::run_capture_logged(
+    let output = super::run_capture_logged(
         Cmd::new("/bin/sh").args(["-c", "echo out; echo err 1>&2"]),
         "test",
         Some(&transcript),
@@ -109,7 +110,7 @@ async fn run_capture_truncates_long_stderr_with_marker() {
          printf 'line-5000\\n' 1>&2; \
          exit 1",
     ]);
-    let err = process::run_capture(cmd)
+    let err = super::run_capture(cmd)
         .await
         .expect_err("non-zero exit must fail");
     let OutrigError::Process { stderr_tail, .. } = &err else {
@@ -139,7 +140,7 @@ async fn run_capture_keeps_large_stderr_tail_bounded() {
          printf 'the-end\\n' 1>&2; \
          exit 1",
     ]);
-    let err = process::run_capture(cmd)
+    let err = super::run_capture(cmd)
         .await
         .expect_err("non-zero exit must fail");
     let OutrigError::Process { stderr_tail, .. } = &err else {
@@ -170,7 +171,7 @@ async fn run_capture_does_not_mark_exact_limit_stderr_truncated() {
         "-c",
         "dd if=/dev/zero bs=1024 count=1024 1>&2 2>/dev/null; exit 1",
     ]);
-    let err = process::run_capture(cmd)
+    let err = super::run_capture(cmd)
         .await
         .expect_err("non-zero exit must fail");
     let OutrigError::Process { stderr_tail, .. } = &err else {
@@ -201,7 +202,7 @@ fn run_streamed_forwards_stderr_to_tracing() {
         .build()
         .expect("build current_thread runtime");
     let status = rt.block_on(async {
-        process::run_streamed(
+        super::run_streamed(
             Cmd::new("/bin/sh").args(["-c", "echo hello-from-stderr 1>&2"]),
             "test",
         )
@@ -220,7 +221,7 @@ fn run_streamed_forwards_stderr_to_tracing() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_stdio_stdin_stdout_usable() {
-    let mut child = process::spawn_stdio(Cmd::new("/bin/cat"))
+    let mut child = super::spawn_stdio(Cmd::new("/bin/cat"))
         .await
         .expect("spawn /bin/cat must succeed");
     let mut stdin = child.stdin.take().expect("stdin was piped");

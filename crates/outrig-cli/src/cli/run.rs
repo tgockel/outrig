@@ -224,7 +224,7 @@ async fn run_inner(
         &resolved,
         container_cfg_name,
         image_tag,
-        &container.name,
+        container.name(),
         &per_server_counts,
         &all_tools,
         session_id,

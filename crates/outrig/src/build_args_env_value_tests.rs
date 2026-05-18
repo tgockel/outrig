@@ -1,11 +1,12 @@
-//! Integration tests for `build-args` values parsed as `EnvValue` and
+//! Unit tests for `build-args` values parsed as `EnvValue` and
 //! resolved into concrete strings for image builds.
 
-use outrig::config::{Config, EnvValue};
-use outrig::error::OutrigError;
-use outrig::image;
+use crate::config::{Config, ContainerConfig, EnvValue};
+use crate::error::OutrigError;
 
-fn container_config(toml_src: &str) -> outrig::config::ContainerConfig {
+use super::resolve_build_args;
+
+fn container_config(toml_src: &str) -> ContainerConfig {
     let cfg = Config::load_from_str(toml_src).expect("config parses");
     cfg.containers["coding"].clone()
 }
@@ -59,7 +60,7 @@ context    = "ctx"
 build-args = {{ NODE_VERSION = "20", GH_TOKEN = "${{{var}}}" }}
 "#,
         ));
-        let resolved = image::resolve_build_args("coding", &container).expect("resolves");
+        let resolved = resolve_build_args("coding", &container).expect("resolves");
 
         unsafe {
             std::env::remove_var(var);
@@ -86,7 +87,7 @@ build-args = {{ GH_TOKEN = "${{{var}}}" }}
 "#,
         ));
 
-        let err = image::resolve_build_args("coding", &container).expect_err("must error");
+        let err = resolve_build_args("coding", &container).expect_err("must error");
         let msg = err.to_string();
         assert!(
             msg.contains("coding"),

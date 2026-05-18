@@ -19,7 +19,6 @@ pub mod network;
 mod outrig_;
 pub mod process;
 pub mod repo;
-pub mod session;
 pub mod tool_name;
 
 pub use config::{

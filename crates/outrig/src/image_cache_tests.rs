@@ -1,4 +1,4 @@
-//! Pure-key tests for `outrig::image::CacheKey::compute`. These don't need
+//! Pure-key tests for `image::CacheKey::compute`. These don't need
 //! buildah or podman -- the cache-key machinery is hashing and subprocess work
 //! against `git` and `tar`.
 
@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use outrig::image::CacheKey;
+use super::CacheKey;
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
