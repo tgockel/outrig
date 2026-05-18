@@ -2,7 +2,7 @@
 //!
 //! This is the library crate. The companion `outrig-cli` crate produces
 //! the `outrig` command-line tool and pulls in the LLM-side dependencies
-//! (`rig-core`, `mistralrs-core`, `hf-hub`, etc.). Library consumers stay
+//! for provider integrations and local model backends. Library consumers stay
 //! free of that dep graph.
 //!
 //! The curated entry point is [`Outrig::launch`].

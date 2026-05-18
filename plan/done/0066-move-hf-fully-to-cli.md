@@ -36,3 +36,12 @@ doubles live entirely under `crates/outrig-cli/`.
 
 - Soft on 0065 (run after the module-level surface settles so this
   relocation doesn't churn module visibility).
+
+## Decisions
+
+- The module relocation itself was already completed by the preceding
+  library surface tightening: `outrig` no longer has `src/hf.rs` or
+  `pub mod hf`, while `outrig-cli` owns the trait, real fetcher, and
+  test fakes. This task only had to remove the remaining library-doc
+  mention of the CLI-side dependency name and verify the public docs
+  are `hf`-clean.
