@@ -157,7 +157,7 @@ async fn serve(
         store,
         attached,
         network,
-        cfg: _,
+        cfg,
         session: _,
         session_dir: _,
     } = setup;
@@ -185,6 +185,7 @@ async fn serve(
         &cli_env,
         attached,
         listen,
+        &cfg,
     )
     .await;
 
@@ -260,8 +261,11 @@ async fn serve_inner(
     cli_env: &CliEnvEntries,
     attached: bool,
     listen: Option<&ListenAddr>,
+    cfg: &crate::config::Config,
 ) -> Result<i32> {
-    let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
+    let session_env = session_setup::mitm_session_env(cfg);
+    let connected =
+        session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env, &session_env).await?;
     if connected.is_empty() {
         return Err(OutrigError::Configuration(
             "outrig mcp with no merged MCP entries has nothing to proxy".to_string(),

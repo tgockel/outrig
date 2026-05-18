@@ -132,6 +132,58 @@ override this setting for one fresh session. `--network audit` and `--network fi
 rejected with `outrig mcp --attach` because borrowed containers are not retrofitted with a new
 interceptor.
 
+### `[network.mitm]`
+
+HTTPS MITM is an opt-in extension that composes with `mode = "audit"` or `mode = "filter"`.
+When enabled, the interceptor generates a per-session CA, installs its public certificate into
+the session container's trust store, terminates incoming TLS on the configured ports, and
+re-encrypts upstream. Audit records gain `method`, `url`, and `status`. See
+[Concepts -> Network MITM](../concepts/network-mitm.md) for the full security model.
+
+```toml
+[network.mitm]
+enable         = true     # default false; master switch for HTTPS MITM
+ports          = [443]    # default [443]; ports treated as HTTPS-bearing
+capture-bodies = false    # default false; opt-in body capture
+max-body-bytes = 65536    # default 65536; per-body cap when capture is on
+```
+
+| Key              | Type     | Required | Default | Description                              |
+|------------------|----------|----------|---------|------------------------------------------|
+| `enable`         | bool     | no       | `false` | Toggle MITM on/off.                      |
+| `ports`          | int list | no       | `[443]` | Ports treated as HTTPS-bearing.          |
+| `capture-bodies` | bool     | no       | `false` | Include base64 bodies in audit records.  |
+| `max-body-bytes` | integer  | no       | `65536` | Per-body cap (bytes) when capture is on. |
+
+Repo configs may set `[network.mitm].enable` (so a repo can opt out of MITM even when the
+global config opts in), but cannot set `ports`, `capture-bodies`, or `max-body-bytes`. Those
+are global-only, like the other policy keys.
+
+When MITM is enabled, `allow` and `deny` entries may carry an optional `path` glob (inline-table
+form only). URL rules ride the same lists as host/port rules; entries without `path` keep the
+host-only behavior from `mode = "filter"`. Entries with `path` are skipped at TCP-open time and
+only fire after MITM has parsed the request line:
+
+```toml
+[network]
+mode    = "filter"
+default = "deny"
+allow   = [
+    "github.com:443",
+    { host = "api.github.com", port = 443, path = "/repos/*" },
+]
+deny    = [
+    "*:22",
+    { host = "api.github.com", port = 443, path = "/admin/*" },
+]
+
+[network.mitm]
+enable = true
+```
+
+The path glob uses the same `*` semantics as host globs and is case-sensitive. A `path` entry
+without `[network.mitm].enable = true` is rejected at config validation.
+
 ## `[providers.<name>]`
 
 A provider tells outrig how to reach a model -- either a remote HTTPS endpoint that speaks

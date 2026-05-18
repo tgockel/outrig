@@ -147,8 +147,9 @@ mode = "audit"
 Audit mode writes one Zeek `conn.log`-style JSON object per connection to
 `<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only: every connection is still
 allowed, but records include the best known host, destination IP and port, transport, service,
-byte counts, and duration. HTTPS remains opaque except for TLS SNI. URL, method, status, and
-body inspection are deferred.
+byte counts, and duration. By default HTTPS remains opaque except for TLS SNI; enable the
+[MITM mode](network-mitm.md) to terminate TLS, record method/URL/status, and apply URL-aware
+policy.
 
 Filter mode uses the same interceptor and audit log, then applies global host/port policy
 before opening upstream TCP connections:

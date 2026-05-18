@@ -107,7 +107,9 @@ impl Config {
             }
             Err(e) => return Err(e.into()),
         };
-        cfg.network.declared = declares_top_level_network(s)?;
+        let (declared, mitm_declared) = declares_network_tables(s)?;
+        cfg.network.declared = declared;
+        cfg.network.mitm_declared = mitm_declared;
         Ok(cfg)
     }
 
@@ -143,11 +145,19 @@ impl Config {
     }
 }
 
-fn declares_top_level_network(text: &str) -> Result<bool> {
+fn declares_network_tables(text: &str) -> Result<(bool, bool)> {
     let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
         crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
     })?;
-    Ok(value.as_table().contains_key("network"))
+    let top = value.as_table();
+    let declared = top.contains_key("network");
+    let mitm_declared = top
+        .get("network")
+        .and_then(toml_edit::Item::as_table)
+        .and_then(|t| t.get("mitm"))
+        .and_then(toml_edit::Item::as_table)
+        .is_some_and(|t| t.contains_key("enable"));
+    Ok((declared, mitm_declared))
 }
 
 fn reject_repo_network_policy(text: &str) -> Result<()> {
@@ -162,6 +172,16 @@ fn reject_repo_network_policy(text: &str) -> Result<()> {
             return Err(OutrigError::Configuration(format!(
                 "repo config may set [network].mode only; [network].{key} belongs in global config"
             )));
+        }
+    }
+    if let Some(mitm) = network.get("mitm").and_then(toml_edit::Item::as_table) {
+        for key in ["ports", "capture-bodies", "max-body-bytes"] {
+            if mitm.contains_key(key) {
+                return Err(OutrigError::Configuration(format!(
+                    "repo config may set [network.mitm].enable only; \
+                     [network.mitm].{key} belongs in global config"
+                )));
+            }
         }
     }
     Ok(())
@@ -389,6 +409,11 @@ pub struct NetworkEntry {
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// URL-path glob for MITM rules. Only consulted after TLS termination
+    /// when MITM is enabled. Inline-table form only; the string sugar
+    /// (`"host:port"`) does not embed a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl NetworkEntry {
@@ -396,6 +421,7 @@ impl NetworkEntry {
         Self {
             host: host.into(),
             port: None,
+            path: None,
         }
     }
 
@@ -403,6 +429,15 @@ impl NetworkEntry {
         Self {
             host: host.into(),
             port: Some(port),
+            path: None,
+        }
+    }
+
+    pub fn with_url(host: impl Into<String>, port: u16, path: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: Some(port),
+            path: Some(path.into()),
         }
     }
 
@@ -412,8 +447,25 @@ impl NetworkEntry {
         }
         parse_network_host_pattern(&self.host)
             .map(|_| ())
-            .map_err(|e| format!("{path}.host {e}"))
+            .map_err(|e| format!("{path}.host {e}"))?;
+        if let Some(url_path) = &self.path {
+            validate_network_path(url_path).map_err(|e| format!("{path}.path {e}"))?;
+        }
+        Ok(())
     }
+}
+
+pub(crate) fn validate_network_path(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if !value.starts_with('/') {
+        return Err("must start with `/`".to_string());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("must not contain whitespace".to_string());
+    }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for NetworkEntry {
@@ -427,6 +479,8 @@ impl<'de> Deserialize<'de> for NetworkEntry {
             host: String,
             #[serde(default)]
             port: Option<u16>,
+            #[serde(default)]
+            path: Option<String>,
         }
 
         #[derive(Deserialize)]
@@ -441,6 +495,7 @@ impl<'de> Deserialize<'de> for NetworkEntry {
             Repr::Table(t) => Ok(Self {
                 host: t.host,
                 port: t.port,
+                path: t.path,
             }),
         }
     }
@@ -467,6 +522,7 @@ fn parse_network_entry_string(s: &str) -> std::result::Result<NetworkEntry, Stri
         return Ok(NetworkEntry {
             host: host.to_string(),
             port,
+            path: None,
         });
     }
 
@@ -481,6 +537,7 @@ fn parse_network_entry_string(s: &str) -> std::result::Result<NetworkEntry, Stri
             return Ok(NetworkEntry {
                 host: host.to_string(),
                 port: Some(parse_network_port(raw_port)?),
+                path: None,
             });
         }
         return Err("network entry port must be an integer".to_string());
@@ -489,6 +546,7 @@ fn parse_network_entry_string(s: &str) -> std::result::Result<NetworkEntry, Stri
     Ok(NetworkEntry {
         host: s.to_string(),
         port: None,
+        path: None,
     })
 }
 
@@ -580,6 +638,20 @@ impl NetworkPolicyBuilder {
         self
     }
 
+    /// Add a URL-aware allow rule. Only matches once MITM has terminated TLS
+    /// and parsed the request line.
+    pub fn allow_url(
+        mut self,
+        host: impl Into<String>,
+        port: u16,
+        path: impl Into<String>,
+    ) -> Self {
+        self.policy
+            .allow
+            .push(NetworkEntry::with_url(host, port, path));
+        self
+    }
+
     pub fn deny_host(mut self, host: impl Into<String>) -> Self {
         self.policy.deny.push(NetworkEntry::new(host));
         self
@@ -587,6 +659,15 @@ impl NetworkPolicyBuilder {
 
     pub fn deny_host_port(mut self, host: impl Into<String>, port: u16) -> Self {
         self.policy.deny.push(NetworkEntry::with_port(host, port));
+        self
+    }
+
+    /// Add a URL-aware deny rule. Only matches once MITM has terminated TLS
+    /// and parsed the request line.
+    pub fn deny_url(mut self, host: impl Into<String>, port: u16, path: impl Into<String>) -> Self {
+        self.policy
+            .deny
+            .push(NetworkEntry::with_url(host, port, path));
         self
     }
 
@@ -608,9 +689,14 @@ pub struct NetworkConfig {
     pub allow: Vec<NetworkEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<NetworkEntry>,
+    #[serde(default, skip_serializing_if = "MitmConfig::is_default")]
+    pub mitm: MitmConfig,
     #[serde(skip)]
     #[schemars(skip)]
     declared: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    mitm_declared: bool,
 }
 
 impl Default for NetworkConfig {
@@ -620,7 +706,9 @@ impl Default for NetworkConfig {
             default: NetworkAction::Deny,
             allow: Vec::new(),
             deny: Vec::new(),
+            mitm: MitmConfig::default(),
             declared: false,
+            mitm_declared: false,
         }
     }
 }
@@ -631,6 +719,7 @@ impl PartialEq for NetworkConfig {
             && self.default == other.default
             && self.allow == other.allow
             && self.deny == other.deny
+            && self.mitm == other.mitm
     }
 }
 
@@ -645,6 +734,14 @@ impl NetworkConfig {
         self.declared = declared;
     }
 
+    pub(crate) fn is_mitm_declared(&self) -> bool {
+        self.mitm_declared
+    }
+
+    pub(crate) fn set_mitm_declared(&mut self, declared: bool) {
+        self.mitm_declared = declared;
+    }
+
     pub fn policy(&self) -> NetworkPolicy {
         NetworkPolicy {
             default: self.default,
@@ -655,6 +752,88 @@ impl NetworkConfig {
 
     pub(crate) fn has_policy_entries(&self) -> bool {
         !self.allow.is_empty() || !self.deny.is_empty()
+    }
+}
+
+/// MITM (man-in-the-middle) HTTPS interception settings. Off by default;
+/// when on, the interceptor terminates TLS using a per-session CA so it can
+/// apply URL-aware policy and record HTTP method/url/status (and, opt-in,
+/// request/response bodies). The CA is global-only configuration; a repo
+/// config may flip `enable` (typically to opt out) but cannot widen the
+/// capture footprint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MitmConfig {
+    /// Master switch for MITM. When false, no CA is generated and HTTPS
+    /// connections pass through opaquely (the 0060 behavior).
+    pub enable: bool,
+    /// TCP ports treated as HTTPS-bearing. Empty serializes to the default
+    /// `[443]` at use time. Always serialized when non-default to make the
+    /// config self-documenting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
+    /// When true, request and response bodies are captured into the audit
+    /// log (base64-encoded, capped by `max_body_bytes`).
+    pub capture_bodies: bool,
+    /// Per-body size cap when `capture_bodies` is on. Zero serializes to the
+    /// default at use time (`DEFAULT_MITM_MAX_BODY_BYTES`).
+    pub max_body_bytes: usize,
+}
+
+pub const DEFAULT_MITM_PORTS: &[u16] = &[443];
+pub const DEFAULT_MITM_MAX_BODY_BYTES: usize = 64 * 1024;
+pub const MIN_MITM_MAX_BODY_BYTES: usize = 1024;
+pub const MAX_MITM_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+// Default values are the natural defaults of each type: `false` for bool,
+// empty vec, zero for the body cap (sentinel meaning "use the
+// `DEFAULT_MITM_MAX_BODY_BYTES` constant"). The explicit impl wasn't
+// adding documentation that derive can't.
+
+impl MitmConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Effective list of HTTPS-bearing ports, substituting the default when
+    /// no explicit list is configured.
+    pub fn effective_ports(&self) -> Vec<u16> {
+        if self.ports.is_empty() {
+            DEFAULT_MITM_PORTS.to_vec()
+        } else {
+            self.ports.clone()
+        }
+    }
+
+    /// Effective body cap, substituting the default when zero.
+    pub fn effective_max_body_bytes(&self) -> usize {
+        if self.max_body_bytes == 0 {
+            DEFAULT_MITM_MAX_BODY_BYTES
+        } else {
+            self.max_body_bytes
+        }
+    }
+
+    pub(crate) fn validate(&self) -> std::result::Result<(), String> {
+        if !self.enable {
+            return Ok(());
+        }
+        for (idx, port) in self.ports.iter().enumerate() {
+            if *port == 0 {
+                return Err(format!(
+                    "network.mitm.ports[{idx}] must be between 1 and 65535"
+                ));
+            }
+        }
+        if self.max_body_bytes != 0
+            && !(MIN_MITM_MAX_BODY_BYTES..=MAX_MITM_MAX_BODY_BYTES).contains(&self.max_body_bytes)
+        {
+            return Err(format!(
+                "network.mitm.max-body-bytes must be 0 or between {MIN_MITM_MAX_BODY_BYTES} \
+                 and {MAX_MITM_MAX_BODY_BYTES}"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -864,4 +1043,116 @@ where
             StringOrVec::Multi(ss) => ss,
         })
     })
+}
+
+#[cfg(test)]
+mod mitm_tests {
+    use super::*;
+
+    #[test]
+    fn network_entry_inline_table_accepts_path() {
+        let entry: NetworkEntry =
+            toml::from_str("host = \"api.example.com\"\nport = 443\npath = \"/repos/*\"\n")
+                .expect("entry");
+        assert_eq!(entry.host, "api.example.com");
+        assert_eq!(entry.port, Some(443));
+        assert_eq!(entry.path.as_deref(), Some("/repos/*"));
+        entry.validate("test").expect("valid entry");
+    }
+
+    #[test]
+    fn network_entry_string_sugar_has_no_path() {
+        let entry: NetworkEntry = toml::from_str("v = \"github.com:443\"\n")
+            .map(|wrapper: toml::Table| wrapper["v"].clone().try_into::<NetworkEntry>().unwrap())
+            .expect("string entry");
+        assert_eq!(entry.path, None);
+    }
+
+    #[test]
+    fn network_entry_validates_path_starts_with_slash() {
+        let entry = NetworkEntry {
+            host: "example.com".to_string(),
+            port: Some(443),
+            path: Some("repos/*".to_string()),
+        };
+        let err = entry.validate("network.allow[0]").expect_err("invalid");
+        assert!(err.contains("must start with `/`"), "got: {err}");
+    }
+
+    #[test]
+    fn mitm_config_defaults_are_disabled() {
+        let m = MitmConfig::default();
+        assert!(!m.enable);
+        assert!(m.is_default());
+        assert!(m.validate().is_ok());
+        assert_eq!(m.effective_ports(), vec![443]);
+        assert_eq!(m.effective_max_body_bytes(), DEFAULT_MITM_MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn mitm_config_validates_body_cap_range() {
+        let mut m = MitmConfig {
+            enable: true,
+            max_body_bytes: 64,
+            ..MitmConfig::default()
+        };
+        let err = m.validate().expect_err("below min should fail");
+        assert!(err.contains("max-body-bytes"));
+
+        m.max_body_bytes = MAX_MITM_MAX_BODY_BYTES + 1;
+        let err = m.validate().expect_err("above max should fail");
+        assert!(err.contains("max-body-bytes"));
+
+        m.max_body_bytes = 0;
+        m.validate().expect("zero is sentinel for default");
+    }
+
+    #[test]
+    fn mitm_config_rejects_zero_port() {
+        let m = MitmConfig {
+            enable: true,
+            ports: vec![443, 0],
+            ..MitmConfig::default()
+        };
+        let err = m.validate().expect_err("port 0 should fail");
+        assert!(err.contains("ports[1]"));
+    }
+
+    #[test]
+    fn repo_config_can_set_mitm_enable_but_nothing_else() {
+        reject_repo_network_policy("[network.mitm]\nenable = true\n").expect("enable allowed");
+
+        let err = reject_repo_network_policy("[network.mitm]\nports = [443]\n")
+            .expect_err("ports rejected");
+        assert!(err.to_string().contains("[network.mitm].ports"));
+
+        let err = reject_repo_network_policy("[network.mitm]\ncapture-bodies = true\n")
+            .expect_err("capture-bodies rejected");
+        assert!(err.to_string().contains("capture-bodies"));
+
+        let err = reject_repo_network_policy("[network.mitm]\nmax-body-bytes = 4096\n")
+            .expect_err("max-body-bytes rejected");
+        assert!(err.to_string().contains("max-body-bytes"));
+    }
+
+    #[test]
+    fn declares_network_tables_detects_mitm_enable() {
+        let (declared, mitm_declared) =
+            declares_network_tables("[network]\nmode = \"audit\"\n").expect("toml ok");
+        assert!(declared);
+        assert!(!mitm_declared);
+
+        let (declared, mitm_declared) =
+            declares_network_tables("[network]\nmode = \"audit\"\n[network.mitm]\nenable = true\n")
+                .expect("toml ok");
+        assert!(declared);
+        assert!(mitm_declared);
+
+        let (declared, mitm_declared) =
+            declares_network_tables("[network.mitm]\n").expect("toml ok");
+        // The `[network.mitm]` table exists but doesn't set `enable`, so a
+        // repo declaring just an empty table doesn't trigger repo-precedence.
+        assert!(declared);
+        assert!(!mitm_declared);
+    }
 }

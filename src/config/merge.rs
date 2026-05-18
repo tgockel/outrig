@@ -16,6 +16,10 @@ use super::Config;
 /// - `[network].mode` follows repo precedence when the repo file declares the
 ///   table. Policy keys (`default`, `allow`, `deny`) are global-only and are
 ///   always taken from the global config.
+/// - `[network.mitm].enable` follows repo precedence when the repo file
+///   declares it, so a repo can opt out of MITM (or in, if the global hasn't).
+///   Other `[network.mitm]` keys (`ports`, `capture-bodies`, `max-body-bytes`)
+///   are global-only and always taken from the global config.
 /// - `[workspace]` primary fields are repo-owned. Since `Workspace` has serde
 ///   defaults, an absent block in the repo file deserializes to those defaults
 ///   -- so taking repo `host-path`/`container-path` unconditionally matches
@@ -46,6 +50,12 @@ pub fn merge(global: Config, repo: Config) -> Config {
         network.set_declared(true);
     } else {
         network.set_declared(false);
+    }
+    if repo.network.is_mitm_declared() {
+        network.mitm.enable = repo.network.mitm.enable;
+        network.set_mitm_declared(true);
+    } else {
+        network.set_mitm_declared(false);
     }
 
     Config {

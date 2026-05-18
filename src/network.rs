@@ -7,6 +7,11 @@
 //! from the host namespace, so OutRig's own traffic is not routed back
 //! through the interceptor.
 
+pub mod mitm;
+pub(crate) mod mitm_io;
+pub mod tls;
+pub mod trust;
+
 use std::collections::BTreeMap;
 use std::fs::File as StdFile;
 use std::io::{self, Write as _};
@@ -28,10 +33,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    NetworkAction, NetworkEntry, NetworkHostPattern, NetworkPolicy, parse_network_host_pattern,
+    MitmConfig, NetworkAction, NetworkEntry, NetworkHostPattern, NetworkPolicy,
+    parse_network_host_pattern,
 };
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
+use crate::network::mitm::{
+    MitmAuditEvent, MitmAuditHook, MitmConnection, MitmContext, MitmPolicyDecision, MitmPolicyHook,
+};
 use crate::process::{self, Cmd, Transcript};
 
 const NETWORK_LOG: &str = "network.jsonl";
@@ -70,6 +79,10 @@ struct CompiledNetworkPolicy {
 struct CompiledNetworkEntry {
     pattern: NetworkHostPattern,
     port: Option<u16>,
+    /// URL-path glob, present only when the source `NetworkEntry` set
+    /// `path = "..."`. Entries with `path` are skipped by
+    /// `decide_pre_mitm` and only matched by `decide_post_mitm`.
+    path: Option<String>,
 }
 
 impl CompiledNetworkPolicy {
@@ -82,8 +95,15 @@ impl CompiledNetworkPolicy {
         })
     }
 
-    fn decide(&self, dst: SocketAddr, sniff: &Sniff) -> PolicyDecision {
+    /// Decision used at TCP-open time, before any TLS termination. Entries
+    /// with a `path` set are skipped here -- they can't match a TCP socket
+    /// yet, and letting host+port matching close the connection before TLS
+    /// would defeat URL-aware filtering.
+    fn decide_pre_mitm(&self, dst: SocketAddr, sniff: &Sniff) -> PolicyDecision {
         for (idx, entry) in self.deny.iter().enumerate() {
+            if entry.path.is_some() {
+                continue;
+            }
             if entry.matches(dst, sniff) {
                 return PolicyDecision {
                     action: NetworkAction::Deny,
@@ -92,7 +112,44 @@ impl CompiledNetworkPolicy {
             }
         }
         for (idx, entry) in self.allow.iter().enumerate() {
+            if entry.path.is_some() {
+                continue;
+            }
             if entry.matches(dst, sniff) {
+                return PolicyDecision {
+                    action: NetworkAction::Allow,
+                    rule: format!("allow[{idx}]"),
+                };
+            }
+        }
+        PolicyDecision {
+            action: self.default,
+            rule: "default".to_string(),
+        }
+    }
+
+    /// Decision used after MITM has terminated TLS and parsed the request
+    /// line. Every entry participates; entries with `path` glob-match
+    /// against `url_path`. Deny-wins and `default` fallback unchanged.
+    ///
+    /// `_method` is reserved for future method-aware rules.
+    fn decide_post_mitm(
+        &self,
+        dst: SocketAddr,
+        sniff: &Sniff,
+        _method: &str,
+        url_path: &str,
+    ) -> PolicyDecision {
+        for (idx, entry) in self.deny.iter().enumerate() {
+            if entry.matches_with_path(dst, sniff, url_path) {
+                return PolicyDecision {
+                    action: NetworkAction::Deny,
+                    rule: format!("deny[{idx}]"),
+                };
+            }
+        }
+        for (idx, entry) in self.allow.iter().enumerate() {
+            if entry.matches_with_path(dst, sniff, url_path) {
                 return PolicyDecision {
                     action: NetworkAction::Allow,
                     rule: format!("allow[{idx}]"),
@@ -128,6 +185,20 @@ impl CompiledNetworkEntry {
             }
         }
     }
+
+    /// Like `matches`, plus a path glob check when this entry has one.
+    /// Used post-MITM with the parsed request URL path. Entries without a
+    /// `path` match on host/port alone (so a host-only allow keeps
+    /// covering MITM traffic).
+    fn matches_with_path(&self, dst: SocketAddr, sniff: &Sniff, url_path: &str) -> bool {
+        if !self.matches(dst, sniff) {
+            return false;
+        }
+        match self.path.as_deref() {
+            Some(pattern) => glob_matches(pattern, url_path),
+            None => true,
+        }
+    }
 }
 
 fn compile_network_entries(entries: Vec<NetworkEntry>) -> Result<Vec<CompiledNetworkEntry>> {
@@ -138,6 +209,7 @@ fn compile_network_entries(entries: Vec<NetworkEntry>) -> Result<Vec<CompiledNet
                 pattern: parse_network_host_pattern(&entry.host)
                     .map_err(OutrigError::Configuration)?,
                 port: entry.port,
+                path: entry.path,
             })
         })
         .collect()
@@ -201,12 +273,20 @@ pub struct NetworkInterceptor {
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     cleanup: Cleanup,
+    mitm: MitmContext,
     disposed: bool,
 }
 
 impl NetworkInterceptor {
     pub async fn start(container: &Container, log_dir: &Path, session_id: &str) -> Result<Self> {
-        Self::start_with_policy(container, log_dir, session_id, NetworkPolicy::allow_all()).await
+        Self::start_with_options(
+            container,
+            log_dir,
+            session_id,
+            NetworkPolicy::allow_all(),
+            &MitmConfig::default(),
+        )
+        .await
     }
 
     pub async fn start_with_policy(
@@ -214,6 +294,28 @@ impl NetworkInterceptor {
         log_dir: &Path,
         session_id: &str,
         policy: NetworkPolicy,
+    ) -> Result<Self> {
+        Self::start_with_options(
+            container,
+            log_dir,
+            session_id,
+            policy,
+            &MitmConfig::default(),
+        )
+        .await
+    }
+
+    /// Start the interceptor with both an egress policy and the MITM
+    /// configuration. When `mitm.enable` is true, the CA is generated under
+    /// `log_dir/../tls/` (i.e. alongside `logs/`), installed in the
+    /// container trust store, and used to terminate TLS on HTTPS-bearing
+    /// ports listed in `mitm.ports`.
+    pub async fn start_with_options(
+        container: &Container,
+        log_dir: &Path,
+        session_id: &str,
+        policy: NetworkPolicy,
+        mitm: &MitmConfig,
     ) -> Result<Self> {
         require_tool("nft")?;
         require_tool("nsenter")?;
@@ -239,6 +341,20 @@ impl NetworkInterceptor {
             transcript: container.transcript(),
         };
 
+        // MITM materializes one CA per session under <session_dir>/tls/
+        // alongside <log_dir>. `log_dir` points at `<session_dir>/logs/`,
+        // so parent() lands on the session directory.
+        let mitm_ctx = if mitm.enable {
+            let session_dir = log_dir.parent().unwrap_or(log_dir);
+            let ctx = MitmContext::enabled(mitm, session_dir, session_id)?;
+            if let Some(pem) = ctx.ca_pem() {
+                crate::network::trust::install_ca_in_container(container, &pem).await?;
+            }
+            ctx
+        } else {
+            MitmContext::disabled()
+        };
+
         install_audit_resolv_conf(container).await?;
         apply_nft_rules(&cleanup, tcp_port, dns_port).await?;
 
@@ -248,6 +364,7 @@ impl NetworkInterceptor {
                 audit.clone(),
                 dns_cache.clone(),
                 policy.clone(),
+                mitm_ctx.clone(),
                 cancel.clone(),
             )),
             tokio::spawn(dns_loop(sockets.dns, dns_cache, cancel.clone())),
@@ -257,6 +374,7 @@ impl NetworkInterceptor {
             cancel,
             tasks,
             cleanup,
+            mitm: mitm_ctx,
             disposed: false,
         })
     }
@@ -270,6 +388,7 @@ impl NetworkInterceptor {
         if let Err(e) = self.cleanup.delete_table().await {
             tracing::warn!(target: "outrig::network", "network cleanup failed: {e}");
         }
+        self.mitm.cleanup();
         self.disposed = true;
     }
 }
@@ -382,6 +501,14 @@ struct AuditRecord {
     missed_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_name: Option<String>,
+    // MITM-only fields. All optional: connections that did not go through
+    // MITM serialize with the exact 0060 shape (none of these appear).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
     #[serde(rename = "outrig.session_id")]
     outrig_session_id: String,
     #[serde(rename = "outrig.container")]
@@ -392,6 +519,21 @@ struct AuditRecord {
     outrig_action: &'static str,
     #[serde(rename = "outrig.rule")]
     outrig_rule: String,
+    #[serde(
+        rename = "outrig.request_body_b64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    outrig_request_body_b64: Option<String>,
+    #[serde(
+        rename = "outrig.response_body_b64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    outrig_response_body_b64: Option<String>,
+    #[serde(
+        rename = "outrig.body_truncated",
+        skip_serializing_if = "Option::is_none"
+    )]
+    outrig_body_truncated: Option<&'static str>,
 }
 
 impl AuditRecord {
@@ -414,11 +556,56 @@ impl AuditRecord {
             local_resp: false,
             missed_bytes: 0,
             server_name: event.sniff.sni,
+            method: None,
+            url: None,
+            status: None,
             outrig_session_id: session_id.to_string(),
             outrig_container: container.to_string(),
             outrig_host: host,
             outrig_action: event.decision.action.as_str(),
             outrig_rule: event.decision.rule,
+            outrig_request_body_b64: None,
+            outrig_response_body_b64: None,
+            outrig_body_truncated: None,
+        }
+    }
+
+    /// Build one per-request MITM audit record from a `MitmAuditEvent`.
+    /// Shares the Zeek `uid` of the parent TCP connection so consumers can
+    /// group request records with their underlying flow.
+    fn from_mitm(
+        session_id: &str,
+        container: &str,
+        event: crate::network::mitm::MitmAuditEvent,
+    ) -> Self {
+        Self {
+            ts: zeek_timestamp(event.opened),
+            uid: event.uid,
+            id_orig_h: event.orig.ip().to_string(),
+            id_orig_p: event.orig.port(),
+            id_resp_h: event.dst.ip().to_string(),
+            id_resp_p: event.dst.port(),
+            proto: "tcp",
+            service: "ssl-mitm",
+            duration: event.duration.as_secs_f64(),
+            orig_bytes: 0,
+            resp_bytes: 0,
+            conn_state: "SF",
+            local_orig: true,
+            local_resp: false,
+            missed_bytes: 0,
+            server_name: event.server_name,
+            method: Some(event.method),
+            url: Some(event.url),
+            status: event.status,
+            outrig_session_id: session_id.to_string(),
+            outrig_container: container.to_string(),
+            outrig_host: event.host,
+            outrig_action: event.action.as_str(),
+            outrig_rule: event.rule,
+            outrig_request_body_b64: event.request_body_b64,
+            outrig_response_body_b64: event.response_body_b64,
+            outrig_body_truncated: event.body_truncated,
         }
     }
 }
@@ -483,6 +670,7 @@ async fn tcp_accept_loop(
     audit: AuditSink,
     dns_cache: DnsCache,
     policy: Arc<CompiledNetworkPolicy>,
+    mitm: MitmContext,
     cancel: CancellationToken,
 ) {
     loop {
@@ -497,6 +685,7 @@ async fn tcp_accept_loop(
                             audit.clone(),
                             dns_cache.clone(),
                             policy.clone(),
+                            mitm.clone(),
                         ));
                     }
                     Err(e) => {
@@ -515,6 +704,7 @@ async fn handle_tcp(
     audit: AuditSink,
     dns_cache: DnsCache,
     policy: Arc<CompiledNetworkPolicy>,
+    mitm: MitmContext,
 ) {
     let opened = SystemTime::now();
     let started = Instant::now();
@@ -547,7 +737,7 @@ async fn handle_tcp(
         }
     }
 
-    let decision = policy.decide(dst, &sniff);
+    let decision = policy.decide_pre_mitm(dst, &sniff);
     if decision.action == NetworkAction::Deny {
         write_audit(
             &audit,
@@ -564,6 +754,54 @@ async fn handle_tcp(
         )
         .await;
         let _ = client.shutdown().await;
+        return;
+    }
+
+    // MITM branch: take over the TLS connection ourselves so we can apply
+    // URL-aware policy and record method/url/status. Only fires when MITM
+    // is enabled, the destination port matches the configured HTTPS port
+    // list, and the client is actually speaking TLS with an SNI (no SNI
+    // means we can't honestly mint a leaf cert -- pass through opaque).
+    if mitm.is_enabled()
+        && mitm.is_https_port(dst.port())
+        && sniff.service == "ssl"
+        && let Some(sni) = sniff.sni.clone()
+    {
+        let uid = zeek_uid();
+        let policy_for_hook = policy.clone();
+        let sniff_for_hook = sniff.clone();
+        let policy_hook: MitmPolicyHook = Arc::new(move |_method, _url, url_path| {
+            let decision =
+                policy_for_hook.decide_post_mitm(dst, &sniff_for_hook, _method, url_path);
+            MitmPolicyDecision {
+                action: decision.action,
+                rule: decision.rule,
+            }
+        });
+        let audit_for_hook = audit.clone();
+        let audit_hook: MitmAuditHook = Arc::new(move |event: MitmAuditEvent| {
+            let sink = audit_for_hook.clone();
+            Box::pin(async move {
+                let record = AuditRecord::from_mitm(&sink.session_id, &sink.container, event);
+                if let Err(e) = sink.write(&record).await {
+                    tracing::warn!(target: "outrig::network", "mitm audit write failed: {e}");
+                }
+            })
+        });
+
+        let replay = crate::network::mitm_io::ReplayingStream::new(client, initial_client_bytes);
+        let conn = MitmConnection {
+            mitm: mitm.clone(),
+            orig,
+            dst,
+            sni,
+            uid,
+            policy: policy_hook,
+            audit: audit_hook,
+        };
+        if let Err(e) = crate::network::mitm::handle_tls_mitm(replay, conn).await {
+            tracing::warn!(target: "outrig::network", "mitm proxy failed: {e}");
+        }
         return;
     }
 
@@ -1452,7 +1690,7 @@ mod tests {
                 .expect("policy"),
         )
         .expect("compile policy");
-        let decision = policy.decide(
+        let decision = policy.decide_pre_mitm(
             "93.184.216.34:443".parse().expect("dst"),
             &Sniff {
                 service: "ssl",
@@ -1478,7 +1716,7 @@ mod tests {
         )
         .expect("compile policy");
 
-        let npm = policy.decide(
+        let npm = policy.decide_pre_mitm(
             "104.16.0.1:443".parse().expect("dst"),
             &Sniff {
                 service: "ssl",
@@ -1486,7 +1724,7 @@ mod tests {
                 sni: Some("registry.npmjs.org".to_string()),
             },
         );
-        let cidr = policy.decide(
+        let cidr = policy.decide_pre_mitm(
             "10.2.3.4:22".parse().expect("dst"),
             &Sniff {
                 service: "-",
@@ -1494,7 +1732,7 @@ mod tests {
                 sni: None,
             },
         );
-        let ipv6 = policy.decide(
+        let ipv6 = policy.decide_pre_mitm(
             "[2001:db8::1]:443".parse().expect("dst"),
             &Sniff {
                 service: "ssl",
@@ -1502,7 +1740,7 @@ mod tests {
                 sni: None,
             },
         );
-        let ipv6_wrong_port = policy.decide(
+        let ipv6_wrong_port = policy.decide_pre_mitm(
             "[2001:db8::1]:80".parse().expect("dst"),
             &Sniff {
                 service: "http",
@@ -1534,5 +1772,158 @@ mod tests {
             dns_answer_ips(&response),
             vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
         );
+    }
+
+    fn build_mitm_policy(
+        allow: Vec<NetworkEntry>,
+        deny: Vec<NetworkEntry>,
+    ) -> CompiledNetworkPolicy {
+        CompiledNetworkPolicy::new(NetworkPolicy {
+            default: NetworkAction::Deny,
+            allow,
+            deny,
+        })
+        .expect("compile policy")
+    }
+
+    #[test]
+    fn pre_mitm_skips_path_bearing_entries() {
+        // A path-only deny must NOT close the TCP socket before MITM gets a
+        // chance to parse the URL. The host+port still needs an explicit
+        // allow to reach the MITM layer.
+        let policy = build_mitm_policy(
+            vec![NetworkEntry::with_port("api.github.com", 443)],
+            vec![NetworkEntry::with_url("api.github.com", 443, "/admin/*")],
+        );
+        let decision = policy.decide_pre_mitm(
+            "140.82.121.5:443".parse().expect("dst"),
+            &Sniff {
+                service: "ssl",
+                host: Some("api.github.com".to_string()),
+                sni: Some("api.github.com".to_string()),
+            },
+        );
+        assert_eq!(decision.action, NetworkAction::Allow);
+        assert_eq!(decision.rule, "allow[0]");
+    }
+
+    #[test]
+    fn post_mitm_matches_path_glob() {
+        let policy = build_mitm_policy(
+            vec![NetworkEntry::with_url("api.github.com", 443, "/repos/*")],
+            vec![NetworkEntry::with_url("api.github.com", 443, "/admin/*")],
+        );
+        let dst = "140.82.121.5:443".parse().expect("dst");
+        let sniff = Sniff {
+            service: "ssl-mitm",
+            host: Some("api.github.com".to_string()),
+            sni: Some("api.github.com".to_string()),
+        };
+
+        let allow = policy.decide_post_mitm(dst, &sniff, "get", "/repos/foo/bar");
+        assert_eq!(allow.action, NetworkAction::Allow);
+        assert_eq!(allow.rule, "allow[0]");
+
+        let deny = policy.decide_post_mitm(dst, &sniff, "get", "/admin/users");
+        assert_eq!(deny.action, NetworkAction::Deny);
+        assert_eq!(deny.rule, "deny[0]");
+
+        let fallthrough = policy.decide_post_mitm(dst, &sniff, "get", "/other");
+        assert_eq!(fallthrough.action, NetworkAction::Deny);
+        assert_eq!(fallthrough.rule, "default");
+    }
+
+    #[test]
+    fn post_mitm_root_path_matches_star() {
+        let policy = build_mitm_policy(
+            vec![NetworkEntry::with_url("api.github.com", 443, "/*")],
+            vec![],
+        );
+        let decision = policy.decide_post_mitm(
+            "140.82.121.5:443".parse().expect("dst"),
+            &Sniff {
+                service: "ssl-mitm",
+                host: Some("api.github.com".to_string()),
+                sni: Some("api.github.com".to_string()),
+            },
+            "get",
+            "/",
+        );
+        assert_eq!(decision.action, NetworkAction::Allow);
+    }
+
+    #[test]
+    fn audit_record_from_mitm_includes_url_method_status() {
+        use crate::network::mitm::MitmAuditEvent;
+        let event = MitmAuditEvent {
+            opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            duration: Duration::from_millis(82),
+            orig: "10.0.2.100:50123".parse().expect("orig"),
+            dst: "140.82.121.5:443".parse().expect("dst"),
+            server_name: Some("api.github.com".to_string()),
+            host: "api.github.com".to_string(),
+            action: NetworkAction::Allow,
+            rule: "allow[1]".to_string(),
+            method: "GET".to_string(),
+            url: "https://api.github.com/repos/foo/bar".to_string(),
+            status: Some(200),
+            request_body_b64: None,
+            response_body_b64: None,
+            body_truncated: None,
+            uid: "Cabcdef1234567890".to_string(),
+        };
+        let record = AuditRecord::from_mitm("20260513T000000-abcd", "outrig-test", event);
+        let json = serde_json::to_value(record).expect("record json");
+
+        assert_eq!(json["service"], "ssl-mitm");
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["url"], "https://api.github.com/repos/foo/bar");
+        assert_eq!(json["status"], 200);
+        assert_eq!(json["server_name"], "api.github.com");
+        assert_eq!(json["outrig.action"], "allow");
+        assert_eq!(json["outrig.rule"], "allow[1]");
+        assert_eq!(json["uid"], "Cabcdef1234567890");
+        assert!(json.get("outrig.request_body_b64").is_none());
+        assert!(json.get("outrig.response_body_b64").is_none());
+        assert!(json.get("outrig.body_truncated").is_none());
+    }
+
+    #[test]
+    fn audit_record_non_mitm_omits_method_url_status() {
+        // Regression guard: 0060 audit records must stay byte-identical to
+        // the pre-MITM shape, so adding MITM fields cannot leak `method` /
+        // `url` / `status` (or the body fields) into non-MITM records.
+        let record = AuditRecord::new(
+            "20260513T000000-abcd",
+            "outrig-test",
+            AuditEvent {
+                opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                duration: Duration::from_millis(125),
+                orig: "10.0.2.100:50123".parse().expect("orig"),
+                dst: "93.184.216.34:443".parse().expect("dst"),
+                sniff: Sniff {
+                    service: "ssl",
+                    host: Some("example.com".to_string()),
+                    sni: Some("example.com".to_string()),
+                },
+                bytes_tx: 1,
+                bytes_rx: 2,
+                decision: PolicyDecision::allow_default(),
+            },
+        );
+        let json = serde_json::to_value(record).expect("record json");
+        for absent in [
+            "method",
+            "url",
+            "status",
+            "outrig.request_body_b64",
+            "outrig.response_body_b64",
+            "outrig.body_truncated",
+        ] {
+            assert!(
+                json.get(absent).is_none(),
+                "non-MITM record must not carry {absent}"
+            );
+        }
     }
 }

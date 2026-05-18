@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::env_arg::CliEnvEntries;
-use crate::config::{Config, ContainerConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
+use crate::config::{
+    Config, ContainerConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode, NetworkPolicy,
+};
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     embedded,
@@ -412,32 +414,24 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 
     let network = match network_mode {
         NetworkMode::Default => None,
-        NetworkMode::Audit => {
-            let span = ProgressSpan::start("starting network audit interceptor");
-            match NetworkInterceptor::start(&container, &log_dir, sid.as_str()).await {
-                Ok(interceptor) => {
-                    span.done("network audit interceptor ready");
-                    Some(interceptor)
-                }
-                Err(e) => {
-                    let _ = container.stop(STOP_GRACE).await;
-                    let _ = store.finalize(&sid, SystemTime::now(), 1);
-                    return Err(e);
-                }
-            }
-        }
-        NetworkMode::Filter => {
-            let span = ProgressSpan::start("starting network filter interceptor");
-            match NetworkInterceptor::start_with_policy(
+        mode => {
+            let (label, policy) = match mode {
+                NetworkMode::Audit => ("network audit", NetworkPolicy::allow_all()),
+                NetworkMode::Filter => ("network filter", cfg.network.policy()),
+                NetworkMode::Default => unreachable!(),
+            };
+            let span = ProgressSpan::start(format!("starting {label} interceptor"));
+            match NetworkInterceptor::start_with_options(
                 &container,
                 &log_dir,
                 sid.as_str(),
-                cfg.network.policy(),
+                policy,
+                &cfg.network.mitm,
             )
             .await
             {
                 Ok(interceptor) => {
-                    span.done("network filter interceptor ready");
+                    span.done(format!("{label} interceptor ready"));
                     Some(interceptor)
                 }
                 Err(e) => {
@@ -515,18 +509,28 @@ pub async fn merged_mcp(
 
 /// Spawn one [`McpClient`] per backing MCP declared in `mcp`, in key-sorted
 /// (`BTreeMap`) iteration order. `cli_env` provides any `--env` overlay
-/// entries to merge per server. Adapter construction is the caller's job
-/// because only the REPL path consumes adapters.
+/// entries to merge per server; `session_env` adds session-wide entries
+/// (currently the MITM trust-store env vars) shared by every server.
+/// Adapter construction is the caller's job because only the REPL path
+/// consumes adapters.
 pub async fn connect_mcp_clients(
     container: &Container,
     mcp: &BTreeMap<String, McpServerSpec>,
     log_dir: &Path,
     cli_env: &CliEnvEntries,
+    session_env: &BTreeMap<String, crate::config::EnvValue>,
 ) -> Result<Vec<Arc<McpClient>>> {
     let mut arcs = Vec::with_capacity(mcp.len());
     for (mcp_name, spec) in mcp {
         let span = ProgressSpan::start(format!("MCP {mcp_name}: initializing"));
-        let extra_env = cli_env.for_server(mcp_name);
+        let mut extra_env = cli_env.for_server(mcp_name);
+        // Per-server CLI overlay wins over the session-wide MITM env --
+        // explicit user intent shouldn't be overridden by infrastructure.
+        for (key, value) in session_env {
+            extra_env
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
         let client =
             McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir, &extra_env)
                 .await?;
@@ -534,6 +538,17 @@ pub async fn connect_mcp_clients(
         arcs.push(Arc::new(client));
     }
     Ok(arcs)
+}
+
+/// Env vars MCP servers need when MITM is enabled. Empty when off.
+pub fn mitm_session_env(cfg: &Config) -> BTreeMap<String, crate::config::EnvValue> {
+    if !cfg.network.mitm.enable {
+        return BTreeMap::new();
+    }
+    crate::network::trust::exec_env_overrides()
+        .into_iter()
+        .map(|(k, v)| (k, crate::config::EnvValue::Literal(v)))
+        .collect()
 }
 
 /// Cleanup tail. Order: MCP shutdowns (so their `podman exec` pipes drain

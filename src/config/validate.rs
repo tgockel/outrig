@@ -327,7 +327,37 @@ fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {
     cfg.network
         .policy()
         .validate(cfg.network.mode == NetworkMode::Filter)
-        .map_err(|message| ConfigValidationError::NetworkPolicyInvalid { message })
+        .map_err(|message| ConfigValidationError::NetworkPolicyInvalid { message })?;
+
+    cfg.network
+        .mitm
+        .validate()
+        .map_err(|message| ConfigValidationError::NetworkPolicyInvalid { message })?;
+
+    if !cfg.network.mitm.enable {
+        for (idx, entry) in cfg.network.allow.iter().enumerate() {
+            if entry.path.is_some() {
+                return Err(ConfigValidationError::NetworkPolicyInvalid {
+                    message: format!(
+                        "network.allow[{idx}] sets `path` but [network.mitm].enable is false; \
+                         URL-aware rules require MITM"
+                    ),
+                });
+            }
+        }
+        for (idx, entry) in cfg.network.deny.iter().enumerate() {
+            if entry.path.is_some() {
+                return Err(ConfigValidationError::NetworkPolicyInvalid {
+                    message: format!(
+                        "network.deny[{idx}] sets `path` but [network.mitm].enable is false; \
+                         URL-aware rules require MITM"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_container_security(

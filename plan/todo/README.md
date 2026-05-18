@@ -6,6 +6,3 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase J -- post-v0 features and fixes
-
-- **[0064](0064-network-interceptor-mitm.md)** Network interceptor MITM.

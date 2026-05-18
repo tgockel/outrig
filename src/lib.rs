@@ -22,8 +22,8 @@ pub mod mcp_proxy;
 mod outrig_;
 
 pub use config::{
-    CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
-    NetworkPolicyBuilder,
+    CapabilityProfile, MitmConfig, MountAccess, NetworkAction, NetworkEntry, NetworkMode,
+    NetworkPolicy, NetworkPolicyBuilder,
 };
 pub use mcp::{McpTool, McpToolResult};
 pub use outrig_::{

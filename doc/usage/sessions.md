@@ -146,6 +146,13 @@ the sniffed application (`http`, `ssl`, `ssh`, or `-`), `duration` is seconds, a
 metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`, and
 `outrig.host`.
 
+When MITM is enabled, each HTTPS request produces an additional record with
+`service = "ssl-mitm"` carrying `method`, `url`, and `status` (and, with `capture-bodies` on,
+`outrig.request_body_b64`, `outrig.response_body_b64`, and `outrig.body_truncated`). The `uid`
+on the MITM record matches the TCP-level record for the same connection, so grouping with
+`jq 'group_by(.uid)'` recovers the request flow. See
+[Concepts -> Network MITM](../concepts/network-mitm.md).
+
 ## `outrig discard`
 
 Delete a session's entire on-disk record (including logs):

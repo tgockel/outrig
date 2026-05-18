@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::config::{
     CapabilityProfile, ContainerConfig, ContainerSecurity, ContainerSourceRef, EnvValue,
-    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, Workspace,
+    McpServerSpec, MitmConfig, MountAccess, NetworkMode, NetworkPolicy, Workspace,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -74,6 +74,10 @@ pub struct CapabilitySpec {
 pub struct NetworkSpec {
     pub mode: NetworkMode,
     pub policy: Option<NetworkPolicy>,
+    /// HTTPS MITM settings. Off by default; when enabled, the interceptor
+    /// terminates TLS using a per-session CA and records URL / method /
+    /// status (and optional bodies) on each request.
+    pub mitm: MitmConfig,
 }
 
 impl From<&ContainerSecurity> for SecuritySpec {
@@ -255,6 +259,14 @@ impl LaunchSpec {
     pub fn with_network_filter(mut self, policy: NetworkPolicy) -> Self {
         self.network.mode = NetworkMode::Filter;
         self.network.policy = Some(policy);
+        self
+    }
+
+    /// Enable HTTPS MITM with the given settings. Compose with
+    /// `with_network_mode` or `with_network_filter` to select the egress
+    /// policy applied alongside.
+    pub fn with_mitm(mut self, mitm: MitmConfig) -> Self {
+        self.network.mitm = mitm;
         self
     }
 }
