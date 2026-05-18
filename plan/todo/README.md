@@ -6,6 +6,14 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Phase J -- post-v0 features and fixes
+## Phase J -- post-split library tidy-up
 
-- **[0064](0064-network-interceptor-mitm.md)** Network interceptor MITM.
+- **[0064](0064-audit-library-struct-visibility.md)** Post-split library tidy-up: visibility,
+  names, placement.
+- **[0065](0065-tighten-library-module-visibility.md)** Tighten library module visibility
+  after split.
+- **[0066](0066-move-hf-fully-to-cli.md)** Move `hf` module fully into `outrig-cli`.
+- **[0067](0067-rename-mistralrs-feature-to-local-llm.md)** Rename `mistralrs` Cargo feature
+  to `local-llm`.
+- **[0068](0068-readme-crate-name-signposting.md)** README and quickstart crate-name
+  signposting.
