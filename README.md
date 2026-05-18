@@ -5,6 +5,10 @@
 `outrig` runs an LLM agent on the host and connects it to MCP servers inside a podman-managed
 container, so tools like filesystem and shell access stay inside the sandbox you've set up.
 
+Crate names matter: depend on `outrig` when embedding the library, and install
+`outrig-cli` when you want the command-line tool that provides the `outrig` binary. Both
+crates publish from this repository.
+
 You define the sandbox in your repository: a `Dockerfile` for the container, an
 `.agents/outrig/config.toml` describing which MCP servers run inside it and which LLM the agent
 talks to. Then you run `outrig run` from your shell, and outrig drops you into a stdin/stdout REPL
@@ -12,6 +16,19 @@ where you talk to the agent.
 
 The agent layer is the [Rig](https://github.com/0xPlaygrounds/rig) crate -- outrig's job is to run
 Rig in the host process and give it a container-isolated MCP tool set.
+
+## Install
+
+> **Release action:** reserve or publish both `outrig` and `outrig-cli` on crates.io before
+> removing this note from the first public install instructions.
+
+Install the CLI package to get the `outrig` command:
+
+```sh
+$ cargo install outrig-cli
+```
+
+For library use, depend on the `outrig` crate from your Rust package.
 
 ## At a glance
 

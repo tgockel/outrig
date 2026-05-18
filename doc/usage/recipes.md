@@ -75,7 +75,7 @@ Catch a broken Dockerfile or dependency bump before anyone tries to use the agen
 
 ```sh
 # .github/workflows/outrig-images.yml (sketch)
-- run: cargo install outrig
+- run: cargo install outrig-cli
 - run: outrig build --all
 ```
 

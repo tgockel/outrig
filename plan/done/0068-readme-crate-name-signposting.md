@@ -35,3 +35,9 @@ which crate to install (or depend on) for which use case.
 - Soft on 0066 (so the README describes the final post-tidy-up shape
   of both crates) and on 0067 (so `--features local-llm` is the
   spelling that ships in the install snippet).
+
+## Decisions
+
+- crates.io returned 404 for both `outrig` and `outrig-cli` on
+  2026-05-18, so the README records a release action instead of
+  claiming either name is already reserved or published.

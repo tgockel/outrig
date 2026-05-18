@@ -5,8 +5,3 @@ on smaller-numbered predecessors. Run `/next-task` to advance one task end-to-en
 branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls.
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
-
-## Phase J -- post-split library tidy-up
-
-- **[0068](0068-readme-crate-name-signposting.md)** README and quickstart crate-name
-  signposting.

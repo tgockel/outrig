@@ -4,6 +4,10 @@ This walks you from a fresh repo to your first running agent in five minutes, mo
 `outrig init` (which orchestrates `outrig config init` and `outrig container add` under the
 hood).
 
+Crate names matter: depend on `outrig` when embedding the library, and install
+`outrig-cli` when you want the command-line tool that provides the `outrig` binary. Both
+crates publish from this repository.
+
 ## Prerequisites
 
 - Rust toolchain (you'll need it to install outrig itself).
@@ -25,9 +29,7 @@ and won't paper over a broken setup.
 
 > **TODO: Incomplete** -- `cargo install outrig-cli` is not yet on crates.io.
 
-The `outrig` workspace publishes two crates: `outrig` (the library, for
-embedding into other agent frameworks) and `outrig-cli` (the command-line
-tool that produces the `outrig` binary).
+Install the CLI package to get the `outrig` command:
 
 ```sh
 $ cargo install outrig-cli
