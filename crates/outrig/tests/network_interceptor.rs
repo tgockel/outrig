@@ -14,6 +14,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -22,7 +23,6 @@ use outrig::config::{ContainerConfig, NetworkAction, NetworkPolicy};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig::network::NetworkInterceptor;
-use outrig::process::{self, Cmd};
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -75,6 +75,21 @@ async fn read_audit_records(log_dir: &Path) -> Vec<Value> {
     }
 }
 
+fn run_capture(cmd: &mut Command) -> Output {
+    let output = cmd.output().expect("spawn command");
+    assert!(
+        output.status.success(),
+        "command exited non-zero: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn try_capture(cmd: &mut Command) -> Output {
+    cmd.output().expect("spawn command")
+}
+
 #[tokio::test]
 async fn curl_https_example_dot_com_writes_allow_audit_record() {
     let _guard = E2E_LOCK.lock().await;
@@ -100,13 +115,12 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
         .await
         .expect("start network interceptor");
 
-    process::run_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
-        "curl",
-        "-fsS",
-        "https://example.com",
-    ]))
-    .await
-    .expect("curl example.com through interceptor");
+    run_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["curl", "-fsS", "https://example.com"]),
+    );
 
     let records = read_audit_records(&log_dir).await;
     let record = records
@@ -198,15 +212,18 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     .await
     .expect("start network interceptor");
 
-    let output = process::try_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
-        "curl",
-        "-fsS",
-        "--connect-timeout",
-        "5",
-        "https://example.com",
-    ]))
-    .await
-    .expect("curl through interceptor");
+    let output = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args([
+                "curl",
+                "-fsS",
+                "--connect-timeout",
+                "5",
+                "https://example.com",
+            ]),
+    );
     assert!(
         !output.status.success(),
         "curl should fail when example.com is denied"

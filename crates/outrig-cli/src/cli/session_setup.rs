@@ -33,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cli::env_arg::CliEnvEntries;
 use crate::error::{OutrigError, Result};
 use crate::llm;
+use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{Config, ContainerConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
 use outrig::container::{
@@ -40,10 +41,8 @@ use outrig::container::{
     embedded,
 };
 use outrig::image::{self, ImageTag};
-use outrig::mcp::McpClient;
 use outrig::network::NetworkInterceptor;
-use outrig::process::Transcript;
-use outrig::repo;
+use outrig::{McpClient, Transcript};
 
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -147,13 +146,13 @@ struct AttachResolution {
 /// Run the shared bootstrap. Returns once the container is up, the runtime
 /// user is bootstrapped, and the session directory + log dir exist.
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
-    let repo_root = repo::repo_root_from_config_path(args.repo_cfg_path);
+    let repo_root = repo_root_from_config_path(args.repo_cfg_path);
     let span = ProgressSpan::start("loading config");
     let cfg = Config::load(&repo_root, Some(args.global_cfg_path))?;
     span.done("config loaded");
 
     let session_root =
-        session::resolve_session_root(args.session_root_flag, &cfg, &repo::default_session_root());
+        session::resolve_session_root(args.session_root_flag, &cfg, &default_session_root());
     let store = SessionStore::new(session_root);
     let attach = match args.attach_target {
         Some(target) if args.require_agent => {

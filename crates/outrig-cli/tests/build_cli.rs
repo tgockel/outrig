@@ -11,11 +11,11 @@
 #![cfg(feature = "e2e")]
 
 use std::path::Path;
+use std::process::{Command, Output};
 use std::time::Instant;
 
 use outrig::config::Config;
 use outrig::image;
-use outrig::process::{self, Cmd};
 use outrig_cli::cli::build::{self, BuildArgs};
 
 const ALPINE_DOCKERFILE: &str = "FROM docker.io/library/alpine:latest\n";
@@ -48,10 +48,12 @@ fn write_repo(repo: &Path, container_blocks: &[(&str, &str)], default_container:
 }
 
 async fn buildah_image_id(tag: &str) -> String {
-    let out = process::try_capture(Cmd::new("buildah").args(["images", "--quiet"]).arg(tag))
-        .await
-        .expect("buildah images");
+    let out = try_capture(Command::new("buildah").args(["images", "--quiet"]).arg(tag));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn try_capture(cmd: &mut Command) -> Output {
+    cmd.output().expect("spawn command")
 }
 
 async fn tag_for(repo: &Path, container: &str) -> String {

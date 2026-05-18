@@ -16,6 +16,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -24,44 +25,53 @@ use outrig::container::{
     self, Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
 };
 use outrig::image::ImageTag;
-use outrig::process::{self, Cmd};
 use outrig::{CapabilityProfile, MountAccess};
 
 const ALPINE: &str = "docker.io/library/alpine:latest";
 
 async fn pull_alpine() {
-    process::run_capture(Cmd::new("podman").arg("pull").arg(ALPINE))
-        .await
-        .expect("podman pull alpine");
+    run_capture(Command::new("podman").arg("pull").arg(ALPINE));
 }
 
 async fn podman_ps_lists(name: &str, include_stopped: bool) -> bool {
-    let mut cmd = Cmd::new("podman").arg("ps");
+    let mut cmd = Command::new("podman");
+    cmd.arg("ps");
     if include_stopped {
-        cmd = cmd.arg("-a");
+        cmd.arg("-a");
     }
-    let out = process::run_capture(
+    let out = run_capture(
         cmd.arg("--filter")
             .arg(format!("name={name}"))
             .args(["--format", "{{.Names}}"]),
-    )
-    .await
-    .expect("podman ps");
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|l| l.trim() == name)
 }
 
 async fn podman_inspect_json(name: &str) -> Value {
-    let out = process::run_capture(Cmd::new("podman").arg("inspect").arg(name))
-        .await
-        .expect("podman inspect");
+    let out = run_capture(Command::new("podman").arg("inspect").arg(name));
     let value: Value = serde_json::from_slice(&out.stdout).expect("podman inspect JSON");
     value
         .as_array()
         .and_then(|items| items.first())
         .cloned()
         .expect("podman inspect should return a non-empty array")
+}
+
+fn run_capture(cmd: &mut Command) -> Output {
+    let output = cmd.output().expect("spawn command");
+    assert!(
+        output.status.success(),
+        "command exited non-zero: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn try_capture(cmd: &mut Command) -> Output {
+    cmd.output().expect("spawn command")
 }
 
 fn inspect_string_array(value: &Value, paths: &[&[&str]]) -> Option<Vec<String>> {
@@ -150,24 +160,20 @@ async fn extra_mounts_enforce_access_modes() {
     .await
     .expect("start");
 
-    let read = process::run_capture(
-        Cmd::new("podman")
+    let read = run_capture(
+        Command::new("podman")
             .arg("exec")
             .arg(container.name())
             .args(["cat", "/resources/ro/MARKER.txt"]),
-    )
-    .await
-    .expect("cat read-only marker");
+    );
     assert_eq!(String::from_utf8_lossy(&read.stdout), "read-only marker\n");
 
-    let ro_write =
-        process::try_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
-            "sh",
-            "-c",
-            "echo nope > /resources/ro/out.txt",
-        ]))
-        .await
-        .expect("attempt write to read-only mount");
+    let ro_write = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["sh", "-c", "echo nope > /resources/ro/out.txt"]),
+    );
     assert!(
         !ro_write.status.success(),
         "read-only mount write should fail"
@@ -177,13 +183,12 @@ async fn extra_mounts_enforce_access_modes() {
         "read-only write must not create a host file"
     );
 
-    process::run_capture(Cmd::new("podman").arg("exec").arg(container.name()).args([
-        "sh",
-        "-c",
-        "echo yes > /resources/rw/out.txt",
-    ]))
-    .await
-    .expect("write to read-write mount");
+    run_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["sh", "-c", "echo yes > /resources/rw/out.txt"]),
+    );
     assert_eq!(
         std::fs::read_to_string(rw_dir.path().join("out.txt")).expect("read rw output"),
         "yes\n"

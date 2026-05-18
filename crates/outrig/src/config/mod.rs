@@ -1,10 +1,10 @@
 //! Config schema, parsing, merge, and validation.
 
-pub mod api_key;
+mod api_key;
 mod env_ref;
-pub mod env_value;
-pub mod merge;
-pub mod validate;
+mod env_value;
+mod merge;
+mod validate;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub use api_key::ApiKeyRef;
-pub use env_value::EnvValue;
+pub use api_key::{ApiKeyError, ApiKeyRef};
+pub use env_value::{EnvValue, EnvValueError};
 pub use merge::merge;
 pub use validate::ConfigValidationError;
+pub(crate) use validate::{is_valid_mcp_server_name, mcp_command_is_empty};
 
 use crate::error::{OutrigError, Result};
 

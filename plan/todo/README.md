@@ -8,8 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Phase J -- post-split library tidy-up
 
-- **[0065](0065-tighten-library-module-visibility.md)** Tighten library module visibility
-  after split.
 - **[0066](0066-move-hf-fully-to-cli.md)** Move `hf` module fully into `outrig-cli`.
 - **[0067](0067-rename-mistralrs-feature-to-local-llm.md)** Rename `mistralrs` Cargo feature
   to `local-llm`.

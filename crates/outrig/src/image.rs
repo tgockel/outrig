@@ -203,22 +203,8 @@ async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> R
     Ok(())
 }
 
-/// Run `buildah build` for `cfg`, tagging the result `tag`. Stderr is
-/// streamed to `tracing::info!` with the `[buildah]` prefix. Pass
-/// `no_cache = true` to add `--no-cache` so buildah ignores its layer
-/// cache (independent of our project-level tag cache, which the caller
-/// controls by deciding whether to call this function at all).
-pub async fn build_image(
-    cfg: &ContainerConfig,
-    repo_root: &Path,
-    tag: &ImageTag,
-    no_cache: bool,
-) -> Result<()> {
-    build_image_for(UNNAMED_CONTAINER, cfg, repo_root, tag, no_cache).await
-}
-
-/// Named-container variant of [`build_image`] with build-arg resolution errors
-/// framed against the selected container-config.
+/// Run `buildah build` for `cfg`, tagging the result `tag`, with build-arg
+/// resolution errors framed against the selected container-config.
 pub async fn build_image_for(
     container: &str,
     cfg: &ContainerConfig,
@@ -279,9 +265,9 @@ pub async fn ensure_image(
     ensure_image_for(UNNAMED_CONTAINER, cfg, repo_root, no_cache).await
 }
 
-/// Named-container variant of [`ensure_image`] with build-arg resolution
-/// errors framed against the selected container-config.
-pub async fn ensure_image_for(
+/// Implementation of [`ensure_image`] with build-arg resolution errors framed
+/// against the selected container-config.
+async fn ensure_image_for(
     container: &str,
     cfg: &ContainerConfig,
     repo_root: &Path,
@@ -324,21 +310,10 @@ pub async fn ensure_image_for(
     }
 }
 
-/// Ensure an already-computed tag exists. This lets session startup write a
-/// complete `session.json` and open `logs/container.log` before the buildah
-/// probe/build begins, without hashing the Dockerfile/context twice.
-pub async fn ensure_tagged_image(
-    cfg: &ContainerConfig,
-    repo_root: &Path,
-    tag: &ImageTag,
-    no_cache: bool,
-    transcript: Option<&Transcript>,
-) -> Result<ImageBuildOutcome> {
-    ensure_tagged_image_for(UNNAMED_CONTAINER, cfg, repo_root, tag, no_cache, transcript).await
-}
-
-/// Named-container variant of [`ensure_tagged_image`] with build-arg
-/// resolution errors framed against the selected container-config.
+/// Ensure an already-computed tag exists, with build-arg resolution errors
+/// framed against the selected container-config. This lets session startup
+/// write a complete `session.json` and open `logs/container.log` before the
+/// buildah probe/build begins, without hashing the Dockerfile/context twice.
 pub async fn ensure_tagged_image_for(
     container: &str,
     cfg: &ContainerConfig,

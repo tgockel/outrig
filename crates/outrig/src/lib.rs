@@ -13,23 +13,25 @@ pub mod config;
 pub mod container;
 pub mod error;
 pub mod image;
-pub mod mcp;
+mod mcp;
 pub mod mcp_proxy;
 pub mod network;
 mod outrig_;
-pub mod process;
-pub mod repo;
-pub mod tool_name;
+mod process;
+mod repo;
+mod tool_name;
 
 pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
     NetworkPolicyBuilder,
 };
-pub use mcp::{McpTool, McpToolResult};
+pub use mcp::{McpClient, McpTool, McpToolResult};
 pub use outrig_::{
     CapabilitySpec, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec, ToolHandle,
     WorkspaceSpec,
 };
+pub use process::Transcript;
+pub use tool_name::sanitize as sanitize_tool_name;
 
 /// Load the project config rooted at `dir`. Walks up from `dir` looking
 /// for `.agents/outrig/config.toml`, then merges in the optional `global`

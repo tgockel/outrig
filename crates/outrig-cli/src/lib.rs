@@ -10,6 +10,7 @@ pub mod hf;
 pub mod init;
 pub mod llm;
 pub mod mcp_self;
+pub(crate) mod paths;
 pub mod repl;
 pub mod rig_tool;
 pub mod session;

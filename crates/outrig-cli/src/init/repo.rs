@@ -18,8 +18,8 @@ use crate::container_setup::add as container_add;
 use crate::error::{OutrigError, Result};
 use crate::hf::HfTreeFetcher;
 use crate::init::prompt::{Field, PromptSource};
+use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
 use outrig::config::{Agent, Config, LlmProvider, Model, Workspace};
-use outrig::repo;
 
 /// Idempotent. Returns `Some(container_name)` when this call wrote the
 /// repo config (the user named a container during the bootstrap), or
@@ -32,7 +32,7 @@ pub async fn ensure(
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
 ) -> Result<Option<String>> {
-    let cfg_path = repo::repo_config_path(repo_root);
+    let cfg_path = repo_config_path(repo_root);
     if cfg_path.exists() {
         eprintln!(
             "[outrig] using existing repo config at {}",
@@ -49,7 +49,7 @@ pub async fn ensure(
 }
 
 /// Resolve the repo root for `outrig container add`. Walks up via
-/// [`repo::find_repo_root_from`]; on [`OutrigError::NoRepoConfig`] prompts
+/// [`find_repo_root_from`]; on [`OutrigError::NoRepoConfig`] prompts
 /// the user, and on yes bootstraps the repo config against `cwd` and
 /// returns `cwd`. On no, re-raises `NoRepoConfig` so the exit code and
 /// error string match the previous behavior for scripts that test the
@@ -63,7 +63,7 @@ pub async fn resolve_or_bootstrap(
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
 ) -> Result<(PathBuf, Option<String>)> {
-    match repo::find_repo_root_from(cwd) {
+    match find_repo_root_from(cwd) {
         Ok(root) => Ok((root, None)),
         Err(OutrigError::NoRepoConfig) => {
             eprintln!(
@@ -83,7 +83,7 @@ pub async fn resolve_or_bootstrap(
 
 /// Walks the three repo-config sections (container / model / agent),
 /// builds a [`Config`], serializes to TOML, and writes atomically via
-/// [`repo::write_atomic`]. Section headers signal each transition so
+/// [`write_atomic`]. Section headers signal each transition so
 /// the prompts don't bleed together.
 async fn write_repo_config(
     repo_root: &Path,
@@ -138,8 +138,8 @@ async fn write_repo_config(
         model_choices,
         preamble,
     )?;
-    let cfg_path = repo::repo_config_path(repo_root);
-    repo::write_atomic(&cfg_path, &toml_text)?;
+    let cfg_path = repo_config_path(repo_root);
+    write_atomic(&cfg_path, &toml_text)?;
     eprintln!();
     eprintln!("[outrig] wrote {}", cfg_path.display());
     Ok(container_name)

@@ -11,8 +11,7 @@ use std::string::FromUtf8Error;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::McpServerSpec;
-use crate::config::validate::{is_valid_mcp_server_name, mcp_command_is_empty};
+use crate::config::{McpServerSpec, is_valid_mcp_server_name, mcp_command_is_empty};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 use crate::process;

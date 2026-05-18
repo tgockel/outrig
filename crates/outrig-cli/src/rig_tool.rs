@@ -4,7 +4,7 @@
 //! so the agent loop can hand it directly to a Rig `Agent`. The original
 //! tool name (used on the MCP wire) lives next to the sanitized
 //! `<server>__<tool>` name (the form the LLM sees, produced by
-//! [`outrig::tool_name::sanitize`]), so a single adapter knows both ends of
+//! [`outrig::sanitize_tool_name`]), so a single adapter knows both ends of
 //! the dispatch.
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::Value;
 
 use crate::error::Result;
-use outrig::mcp::{McpClient, McpToolResult};
+use outrig::{McpClient, McpToolResult};
 
 /// A Rig dynamic-tool view of one MCP-discovered tool.
 ///
@@ -46,7 +46,7 @@ impl McpToolAdapter {
         Ok(tools
             .into_iter()
             .map(|t| McpToolAdapter {
-                openai_name: outrig::tool_name::sanitize(&server_name, &t.name),
+                openai_name: outrig::sanitize_tool_name(&server_name, &t.name),
                 mcp_tool_name: t.name,
                 description: t.description.unwrap_or_default(),
                 input_schema: t.input_schema,

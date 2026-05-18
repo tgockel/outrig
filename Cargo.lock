@@ -3790,7 +3790,6 @@ dependencies = [
  "async-stream",
  "axum",
  "blake3",
- "directories",
  "futures-util",
  "heck",
  "ignore",

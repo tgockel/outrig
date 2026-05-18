@@ -1,4 +1,4 @@
-//! End-to-end smoke for `outrig::mcp`. Gated behind `--features e2e`
+//! End-to-end smoke for `McpClient`. Gated behind `--features e2e`
 //! because it shells out to a real `buildah` (to build the fixture image),
 //! a real `podman` (to start the container), and a real
 //! `@modelcontextprotocol/server-filesystem` MCP server inside the
@@ -22,11 +22,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use outrig::McpClient;
 use outrig::config::{ContainerConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::error::OutrigError;
 use outrig::image::{self, ImageTag};
-use outrig::mcp::McpClient;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")

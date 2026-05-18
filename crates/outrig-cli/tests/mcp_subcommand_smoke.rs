@@ -26,10 +26,10 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use outrig::McpClient;
 use outrig::config::{ContainerConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
-use outrig::mcp::McpClient;
 use outrig_cli::session::{Session, SessionId, SessionStore};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::serve_client;

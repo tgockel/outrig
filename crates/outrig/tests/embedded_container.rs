@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use outrig::McpClient;
 use outrig::config::{ContainerConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec, embedded};
 use outrig::error::OutrigError;
 use outrig::image::{self, ImageTag};
-use outrig::mcp::McpClient;
 use rmcp::service::serve_client;
 use tokio::process::Command;
 use tokio::time::timeout;

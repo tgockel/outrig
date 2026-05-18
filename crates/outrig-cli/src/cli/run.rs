@@ -23,16 +23,16 @@ use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
 use crate::error::{OutrigError, Result};
 use crate::llm;
+use crate::paths::model_cache_root;
 use crate::repl::Repl;
 use crate::rig_tool::McpToolAdapter;
+use outrig::McpClient;
 use outrig::config::{
     Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
     MistralrsDeviceSpec, NetworkMode,
 };
 use outrig::container::Container;
 use outrig::image::ImageTag;
-use outrig::mcp::McpClient;
-use outrig::repo;
 
 #[derive(Debug, Parser)]
 pub struct RunArgs {
@@ -117,7 +117,7 @@ pub async fn execute(
         session: _,
         session_dir: _,
     } = setup;
-    let cache_root = repo::model_cache_root(cfg.model_cache_root.as_deref());
+    let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
 
     // Validate per-server env entries against the resolved MCP map.
     let mcp = session_setup::merged_mcp(&container, &container_cfg).await?;

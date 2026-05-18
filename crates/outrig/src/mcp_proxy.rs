@@ -3,7 +3,7 @@
 //! [`ProxyServer`] implements [`rmcp::ServerHandler`] over `Vec<C>` where
 //! each `C` is a [`BackingClient`] -- in production, `Arc<McpClient>`. The
 //! union of every backing server's tools is exposed as a single namespaced
-//! surface (`<server>__<tool>`, through `tool_name::sanitize`) so an
+//! surface (`<server>__<tool>`, through [`crate::sanitize_tool_name`]) so an
 //! external MCP client sees one server with many tools instead of *N* servers
 //! with overlapping names.
 //!
@@ -238,7 +238,7 @@ impl<C: BackingClient> ProxyServer<C> {
     }
 
     /// Build a `tools/list` response: every backing server's tools, in
-    /// registration order, namespaced through `tool_name::sanitize`. Exposed
+    /// registration order, namespaced through [`crate::sanitize_tool_name`]. Exposed
     /// (rather than living inline in [`ServerHandler::list_tools`]) so the
     /// dispatch can be exercised in `tests/mcp_proxy_dispatch.rs` without
     /// fabricating an rmcp [`RequestContext`].

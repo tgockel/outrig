@@ -17,7 +17,9 @@ use crate::container_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::error::{OutrigError, Result};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
-use outrig::repo;
+use crate::paths::{
+    container_dir, container_dir_rel, global_config_path, repo_config_path, write_atomic,
+};
 
 /// CLI entry point. Resolves the repo root from `cwd` (walking up, with a
 /// fallback prompt to bootstrap a fresh `.agents/outrig/config.toml` if
@@ -32,7 +34,7 @@ pub async fn run(
     name: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let global_path = repo::global_config_path(global_override);
+    let global_path = global_config_path(global_override);
     let mut prompt = prompt::auto();
     let mut hf = crate::hf::auto();
     let (repo_root, bootstrapped_name) =
@@ -54,7 +56,7 @@ pub async fn run_with(
     force: bool,
     prompt: &mut impl PromptSource,
 ) -> Result<()> {
-    let cfg_path = repo::repo_config_path(repo_root);
+    let cfg_path = repo_config_path(repo_root);
 
     let name = match name_arg {
         Some(n) => n,
@@ -64,7 +66,7 @@ pub async fn run_with(
         }
     };
 
-    let dockerfile_path = repo::container_dir(repo_root, &name).join("Dockerfile");
+    let dockerfile_path = container_dir(repo_root, &name).join("Dockerfile");
     let mut doc = load_doc(&cfg_path)?;
 
     if !force {
@@ -99,14 +101,14 @@ pub async fn run_with(
     let mcps: Vec<McpServer> = mcp_indices.iter().map(|&i| McpServer::ALL[i]).collect();
 
     let dockerfile = render::render(base, &toolchains, &mcps);
-    repo::write_atomic(&dockerfile_path, &dockerfile)?;
+    write_atomic(&dockerfile_path, &dockerfile)?;
     eprintln!(
         "[outrig] wrote {}",
         display_rel(&dockerfile_path, repo_root)
     );
 
     insert_container_block(&mut doc, &name, &mcps);
-    repo::write_atomic(&cfg_path, &doc.to_string())?;
+    write_atomic(&cfg_path, &doc.to_string())?;
     eprintln!(
         "[outrig] added [containers.{name}] block to {}",
         display_rel(&cfg_path, repo_root)
@@ -230,7 +232,7 @@ fn container_block_exists(doc: &DocumentMut, name: &str) -> bool {
 }
 
 fn insert_container_block(doc: &mut DocumentMut, name: &str, mcps: &[McpServer]) {
-    let rel = repo::container_dir_rel(name);
+    let rel = container_dir_rel(name);
     let dockerfile = rel.join("Dockerfile").to_string_lossy().into_owned();
     let context = rel.to_string_lossy().into_owned();
 

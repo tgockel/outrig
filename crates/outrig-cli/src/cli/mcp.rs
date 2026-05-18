@@ -38,10 +38,10 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
 use crate::error::{OutrigError, Result};
+use outrig::McpClient;
 use outrig::config::{ContainerConfig, McpServerSpec, NetworkMode};
 use outrig::container::Container;
 use outrig::image::ImageTag;
-use outrig::mcp::McpClient;
 use outrig::mcp_proxy::ProxyServer;
 
 const ATTACH_MONITOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);

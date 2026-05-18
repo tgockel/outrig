@@ -20,30 +20,26 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::ImageTag;
-use outrig::process::{self, Cmd};
 use tokio::io::AsyncReadExt;
 
 const ALPINE: &str = "docker.io/library/alpine:latest";
 
 async fn pull_alpine() {
-    process::run_capture(Cmd::new("podman").arg("pull").arg(ALPINE))
-        .await
-        .expect("podman pull alpine");
+    run_capture(Command::new("podman").arg("pull").arg(ALPINE));
 }
 
 async fn install_shadow(name: &str) {
-    process::run_capture(
-        Cmd::new("podman")
+    run_capture(
+        Command::new("podman")
             .args(["exec", "--user=0:0"])
             .arg(name)
             .args(["apk", "add", "--no-cache", "shadow"]),
-    )
-    .await
-    .expect("apk add shadow");
+    );
 }
 
 async fn start_alpine(host_ws: &Path) -> Container {
@@ -68,6 +64,21 @@ async fn read_stdout(child: &mut tokio::process::Child) -> String {
     let status = child.wait().await.expect("wait child");
     assert!(status.success(), "child exited non-zero: {status:?}");
     out
+}
+
+fn run_capture(cmd: &mut Command) -> Output {
+    let output = cmd.output().expect("spawn command");
+    assert!(
+        output.status.success(),
+        "command exited non-zero: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn try_capture(cmd: &mut Command) -> Output {
+    cmd.output().expect("spawn command")
 }
 
 #[tokio::test]
@@ -153,16 +164,14 @@ async fn workspace_writes_have_host_ownership() {
 /// container already has an entry at the host UID/GID (e.g. `--userns=keep-id`
 /// auto-injects one in modern podman) or whether the test needs to plant one.
 async fn first_name_in_db(name: &str, db: &str, id: u32) -> Option<String> {
-    let probe = process::try_capture(
-        Cmd::new("podman")
+    let probe = try_capture(
+        Command::new("podman")
             .args(["exec", "--user=0:0"])
             .arg(name)
             .arg("getent")
             .arg(db)
             .arg(id.to_string()),
-    )
-    .await
-    .ok()?;
+    );
     if !probe.status.success() {
         return None;
     }
@@ -186,17 +195,15 @@ async fn bootstrap_reuses_existing_entry() {
         Some(existing) => existing,
         None => {
             let planted = "preexisting_grp";
-            process::run_capture(
-                Cmd::new("podman")
+            run_capture(
+                Command::new("podman")
                     .args(["exec", "--user=0:0"])
                     .arg(container.name())
                     .arg("groupadd")
                     .arg("--gid")
                     .arg(container.gid().to_string())
                     .arg(planted),
-            )
-            .await
-            .expect("plant group");
+            );
             planted.to_string()
         }
     };
@@ -204,8 +211,8 @@ async fn bootstrap_reuses_existing_entry() {
         Some(existing) => existing,
         None => {
             let planted = "preexisting_usr";
-            process::run_capture(
-                Cmd::new("podman")
+            run_capture(
+                Command::new("podman")
                     .args(["exec", "--user=0:0"])
                     .arg(container.name())
                     .arg("useradd")
@@ -214,9 +221,7 @@ async fn bootstrap_reuses_existing_entry() {
                     .arg("-g")
                     .arg(container.gid().to_string())
                     .arg(planted),
-            )
-            .await
-            .expect("plant user");
+            );
             planted.to_string()
         }
     };

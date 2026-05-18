@@ -38,3 +38,19 @@ that nothing outside the library needs.
 
 - Soft on 0064 (per-item surface should be settled before drawing the
   module boundary).
+
+## Decisions
+
+1. **Private modules can still have curated root exports.** `mcp`,
+   `process`, `repo`, and `tool_name` are implementation modules, but
+   `McpClient`, `Transcript`, and `sanitize_tool_name` remain public
+   through crate-root re-exports where low-level callers still need them.
+   Repo/config path policy belongs to `outrig-cli`.
+2. **`config` remains the schema namespace.** The top-level `config`
+   module stays public because it is the typed TOML schema. Its child
+   modules are private; public items such as `ApiKeyRef`, `EnvValue`,
+   `merge`, and `ConfigValidationError` are reachable from
+   `outrig::config::*`.
+3. **Test subprocess helpers are local test concerns.** Integration tests
+   that need direct podman/buildah probes now use local command helpers
+   rather than depending on the library's private process wrapper.

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use outrig::error::OutrigError;
-use outrig::mcp::{McpTool, McpToolResult};
 use outrig::mcp_proxy::{BackingClient, ProxyServer};
+use outrig::{McpTool, McpToolResult};
 use rmcp::model::{CallToolRequestParams, RawContent};
 use serde_json::{Value, json};
 
@@ -271,7 +271,7 @@ async fn duplicate_client_name_is_rejected() {
 #[tokio::test]
 async fn public_name_collision_is_rejected() {
     // Two distinct (server, tool) pairs that sanitize to the same public
-    // name. `tool_name::sanitize` replaces non-charset chars with `_`, so
+    // name. `sanitize_tool_name` replaces non-charset chars with `_`, so
     // ("fs/", "bar") and ("fs", "_bar") both collapse to `fs___bar`.
     let a = Arc::new(FakeClient::new("fs/").with_tool("bar"));
     let b = Arc::new(FakeClient::new("fs").with_tool("_bar"));

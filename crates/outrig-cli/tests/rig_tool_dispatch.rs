@@ -22,10 +22,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use outrig::McpClient;
 use outrig::config::{ContainerConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
-use outrig::mcp::McpClient;
 use outrig_cli::rig_tool::McpToolAdapter;
 use rig::tool::ToolDyn;
 

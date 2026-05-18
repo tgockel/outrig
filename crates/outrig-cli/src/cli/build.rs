@@ -15,9 +15,9 @@ use std::time::Instant;
 use clap::{ArgGroup, Parser};
 
 use crate::error::{OutrigError, Result};
+use crate::paths::repo_root_from_config_path;
 use outrig::config::{Config, ContainerConfig, ContainerSourceRef};
 use outrig::image::{self, ImageTag};
-use outrig::repo;
 
 #[derive(Debug, Parser)]
 #[command(group(ArgGroup::new("target").args(["container", "all"])))]
@@ -41,7 +41,7 @@ pub async fn execute(
     global_cfg_path: &Path,
     args: &BuildArgs,
 ) -> Result<i32> {
-    let repo_root = repo::repo_root_from_config_path(repo_cfg_path);
+    let repo_root = repo_root_from_config_path(repo_cfg_path);
     let cfg = Config::load(&repo_root, Some(global_cfg_path))?;
 
     let targets: Vec<&str> = if args.all {
