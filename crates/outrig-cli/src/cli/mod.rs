@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod build;
+pub mod clean;
 pub mod design_prompt;
 pub mod discard;
 pub mod env_arg;

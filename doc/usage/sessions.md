@@ -175,7 +175,37 @@ directory) but only of the session record itself -- your repository is untouched
 that's still running can't be discarded; outrig refuses with an error pointing at the running
 container.
 
-> **TODO: Incomplete** -- bulk discard (`outrig discard --older-than 7d`) is deferred.
+## `outrig clean`
+
+Delete old stopped session records in bulk. Bare `outrig clean` uses a 30-day retention
+window, previews the sessions it will remove, then asks once before deleting:
+
+```sh
+$ outrig clean
+[outrig] will remove 2 sessions older than 30d:
+  20260401T134412-3f2a  ended 2026-04-01 13:46:30  /tmp/old-a
+  20260402T091203-44d2  ended 2026-04-02 09:18:54  /tmp/old-b
+Clean 2 sessions? [y/N]:
+```
+
+Use `--older-than` to pick a different cutoff. Durations are positive integers with `s`, `m`,
+`h`, or `d` units:
+
+```sh
+$ outrig clean --older-than 7d
+$ outrig clean --older-than 12h
+```
+
+Use `--yes` (`-y`) to skip the prompt:
+
+```sh
+$ outrig clean --older-than 30d --yes
+```
+
+`outrig clean` uses the same deletion semantics as `outrig discard`: auto-allocated sessions
+remove the session directory, while sessions created with `--session-dir` remove both the
+symlink target and the symlink under the session root. Running sessions are skipped so cleanup
+doesn't race a live `outrig run` or `outrig mcp` writer.
 
 ## What sessions don't track
 
@@ -203,5 +233,6 @@ you're running two agents on overlapping work.
 - [outrig run](run.md) -- what produces a session in the first place.
 - [outrig mcp](mcp.md) -- stdio MCP server sessions with no agent.
 - [Concepts -> Workspace](../concepts/workspace.md) -- why there's no per-session changeset.
-- [Reference -> CLI](../reference/cli.md) -- every flag for `ls`, `logs`, and `discard`.
+- [Reference -> CLI](../reference/cli.md) -- every flag for `ls`, `logs`, `discard`, and
+  `clean`.
 - [Reference -> Config](../reference/config.md) -- the `session-root` config key.

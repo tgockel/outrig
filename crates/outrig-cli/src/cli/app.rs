@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::build::{self, BuildArgs};
+use crate::cli::clean::{self, CleanArgs};
 use crate::cli::design_prompt::{self, DesignArgs};
 use crate::cli::discard::{self, DiscardArgs};
 use crate::cli::logs::{self, LogsArgs};
@@ -69,6 +70,8 @@ enum Cmd {
     Logs(LogsArgs),
     /// Delete a session's on-disk record.
     Discard(DiscardArgs),
+    /// Delete old stopped session records.
+    Clean(CleanArgs),
 }
 
 #[derive(Debug, Args)]
@@ -209,6 +212,12 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 &global,
                 &cwd,
             ))
+        }
+        Cmd::Clean(args) => {
+            let (cwd, global, runtime) = session_cmd_ctx(cli)?;
+            let session_root = cli.session_root.as_deref();
+            let repo_cfg = cli.config.as_deref();
+            runtime.block_on(clean::execute(args, session_root, repo_cfg, &global, &cwd))
         }
     }
 }

@@ -132,8 +132,8 @@ outrig run [--agent <name>]
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
 under `<path>`, and additionally creates a symlink `<session-root>/<sid> -> <path>` so
-`outrig ls`/`logs`/`discard` still find it. When omitted, outrig auto-generates a session id
-and writes to `<session-root>/<sid>/` directly.
+`outrig ls`/`logs`/`discard`/`clean` still find it. When omitted, outrig auto-generates a
+session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
@@ -305,6 +305,26 @@ outrig discard [<session>] [--yes]
 `outrig run --session-dir <path>` (i.e. lives at a user-chosen path with a symlink in the root),
 discard removes the real directory **and** the symlink. Refuses if the session's container is
 still running. Discards the session directory only -- your repository is untouched.
+
+### `outrig clean`
+
+Delete old stopped session records in bulk.
+
+```
+outrig clean [--older-than <duration>]
+             [--yes]
+             [--session-root <path>]
+```
+
+| Argument / flag            | Default | Description                          |
+|----------------------------|---------|--------------------------------------|
+| `--older-than <duration>`  | `30d`   | Remove sessions older than cutoff.   |
+| `--yes`, `-y`              | off     | Skip the interactive confirmation.   |
+
+Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
+The command previews matching sessions and asks once before deleting unless `--yes` is set.
+Running sessions are skipped. Sessions created with `--session-dir` remove both the symlink
+target and the symlink under the session root.
 
 ## Exit codes
 

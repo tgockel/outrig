@@ -7,10 +7,11 @@
 //! closure.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use outrig_cli::cli::{discard, logs, ls};
-use outrig_cli::session::{SessionId, SessionStore};
+use clap::Parser;
+use outrig_cli::cli::{clean, discard, logs, ls};
+use outrig_cli::session::{Session, SessionId, SessionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 mod common;
@@ -542,6 +543,295 @@ async fn discard_accepts_yes_at_prompt() {
         .expect("discard");
     drop(ew);
     assert!(!dir.exists());
+}
+
+// -------- clean --------
+
+const DAY_SECS: u64 = 24 * 60 * 60;
+
+fn days(count: u64) -> Duration {
+    Duration::from_secs(count * DAY_SECS)
+}
+
+fn clean_args(older_than: Duration, yes: bool) -> clean::CleanArgs {
+    clean::CleanArgs { older_than, yes }
+}
+
+fn clean_now() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+}
+
+fn session_with_age(
+    id: &SessionId,
+    now: SystemTime,
+    started_age: Duration,
+    ended_age: Option<Duration>,
+) -> Session {
+    let mut session = sample_session(id);
+    session.started_at = now - started_age;
+    session.ended_at = ended_age.map(|age| now - age);
+    session.exit_code = session.ended_at.map(|_| 0);
+    session
+}
+
+#[test]
+fn clean_default_older_than_is_30_days() {
+    let args = clean::CleanArgs::try_parse_from(["clean"]).expect("parse clean args");
+    assert_eq!(args.older_than, clean::DEFAULT_OLDER_THAN);
+    assert!(!args.yes);
+}
+
+#[test]
+fn clean_duration_parser_accepts_units_and_rejects_invalid() {
+    assert_eq!(clean::parse_duration("7d").expect("days"), days(7));
+    assert_eq!(
+        clean::parse_duration("12h").expect("hours"),
+        Duration::from_secs(12 * 60 * 60)
+    );
+    assert_eq!(
+        clean::parse_duration("45m").expect("minutes"),
+        Duration::from_secs(45 * 60)
+    );
+    assert_eq!(
+        clean::parse_duration("10s").expect("seconds"),
+        Duration::from_secs(10)
+    );
+
+    assert!(clean::parse_duration("0d").is_err());
+    assert!(clean::parse_duration("30x").is_err());
+    assert!(clean::parse_duration("days").is_err());
+}
+
+#[tokio::test]
+async fn clean_default_30d_removes_only_old_finished_sessions() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let old_sid = SessionId("20260501T134412-3f2a".into());
+    let old_dir = store
+        .create(
+            &old_sid,
+            None,
+            &mut session_with_age(&old_sid, now, days(40), Some(days(31))),
+        )
+        .expect("old create");
+    let recent_sid = SessionId("20260502T134412-4a4a".into());
+    let recent_dir = store
+        .create(
+            &recent_sid,
+            None,
+            &mut session_with_age(&recent_sid, now, days(29), Some(days(29))),
+        )
+        .expect("recent create");
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
+        .await
+        .expect("clean");
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    assert!(!old_dir.exists(), "old session should be removed");
+    assert!(recent_dir.exists(), "recent session should remain");
+    let err = drain(stderr_r).await;
+    assert!(err.contains("older than 30d"), "stderr:\n{err}");
+    assert!(err.contains("cleaned 1 session"), "stderr:\n{err}");
+}
+
+#[tokio::test]
+async fn clean_custom_older_than_uses_requested_cutoff() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let old_sid = SessionId("20260501T134412-3f2a".into());
+    let old_dir = store
+        .create(
+            &old_sid,
+            None,
+            &mut session_with_age(
+                &old_sid,
+                now,
+                Duration::from_secs(8_000),
+                Some(Duration::from_secs(7_200)),
+            ),
+        )
+        .expect("old create");
+    let recent_sid = SessionId("20260502T134412-4a4a".into());
+    let recent_dir = store
+        .create(
+            &recent_sid,
+            None,
+            &mut session_with_age(
+                &recent_sid,
+                now,
+                Duration::from_secs(1_000),
+                Some(Duration::from_secs(1_000)),
+            ),
+        )
+        .expect("recent create");
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(Duration::from_secs(60 * 60), true);
+    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
+        .await
+        .expect("clean");
+    drop(ew);
+
+    assert!(!old_dir.exists(), "old session should be removed");
+    assert!(recent_dir.exists(), "recent session should remain");
+    let err = drain(stderr_r).await;
+    assert!(err.contains("older than 1h"), "stderr:\n{err}");
+}
+
+#[tokio::test]
+async fn clean_without_yes_aborts_on_n() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(
+            &sid,
+            None,
+            &mut session_with_age(&sid, now, days(40), Some(days(31))),
+        )
+        .expect("create");
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(&b"n\n"[..]);
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, false);
+    let rc = clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
+        .await
+        .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0);
+    assert!(dir.exists(), "dir must remain after abort");
+    let err = drain(stderr_r).await;
+    assert!(err.contains("will remove 1 session"), "stderr:\n{err}");
+    assert!(err.contains("aborted"), "stderr:\n{err}");
+}
+
+#[tokio::test]
+async fn clean_accepts_yes_at_prompt() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(
+            &sid,
+            None,
+            &mut session_with_age(&sid, now, days(40), Some(days(31))),
+        )
+        .expect("create");
+
+    let (mut ew, _stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(&b"yes\n"[..]);
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, false);
+    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
+        .await
+        .expect("clean");
+    drop(ew);
+
+    assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn clean_skips_running_sessions() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
+        .expect("create");
+    let running = format!("outrig-{}", sid.as_str());
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(&mut ew, stdin, &store, &args, now, move |name| {
+        let is_running = name == running.as_str();
+        async move { Ok(is_running) }
+    })
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert!(dir.exists(), "running session should remain");
+    let err = drain(stderr_r).await;
+    assert!(err.contains("skipped running sessions"), "stderr:\n{err}");
+    assert!(
+        err.contains("no stopped sessions older than 30d"),
+        "stderr:\n{err}"
+    );
+}
+
+#[tokio::test]
+async fn clean_removes_stale_unfinalized_non_running_sessions() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let dir = store
+        .create(&sid, None, &mut session_with_age(&sid, now, days(40), None))
+        .expect("create");
+
+    let (mut ew, _stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
+        .await
+        .expect("clean");
+    drop(ew);
+
+    assert!(!dir.exists(), "stale non-running session should be removed");
+}
+
+#[tokio::test]
+async fn clean_removes_symlinked_session_target_and_link() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let target = store
+        .create(
+            &sid,
+            Some(explicit.path()),
+            &mut session_with_age(&sid, now, days(40), Some(days(31))),
+        )
+        .expect("create");
+    let link = root.path().join(sid.as_str());
+    assert!(target.exists());
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("link")
+            .file_type()
+            .is_symlink()
+    );
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
+        .await
+        .expect("clean");
+    drop(ew);
+
+    assert!(!target.exists(), "target should be removed");
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "symlink should be removed"
+    );
+    let err = drain(stderr_r).await;
+    assert!(err.contains("(symlink)"), "stderr:\n{err}");
 }
 
 // -------- wiring sanity --------

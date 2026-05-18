@@ -14,7 +14,8 @@ like in practice, what comes back when something goes wrong.
 - **[outrig run](run.md)** -- start an interactive agent session. The main subcommand.
 - **[outrig mcp](mcp.md)** -- expose a container-config's MCP tools to an external client.
 - **[outrig build](build.md)** -- pre-warm the image cache so the next `outrig run` is instant.
-- **[Sessions](sessions.md)** -- `outrig ls`, `outrig logs`, `outrig discard`.
+- **[Sessions](sessions.md)** -- `outrig ls`, `outrig logs`, `outrig discard`,
+  `outrig clean`.
 - **[Recipes](recipes.md)** -- common patterns (multiple container-configs, capturing
   transcripts, scripted single-prompt runs).
 
