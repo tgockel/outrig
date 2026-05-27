@@ -30,9 +30,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: mozilla-actions/sccache-action@v0.0.3
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+          cache-on-failure: true
       - run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
       - run: cargo test ${{ matrix.cargo_args }}
 
