@@ -998,6 +998,13 @@ mod config_load {
         fs::write(agents.join("config.toml"), body).unwrap();
     }
 
+    fn expect_load_validation_err(err: OutrigError) -> ConfigValidationError {
+        match err {
+            OutrigError::ConfigValidation(e) => e,
+            other => panic!("expected ConfigValidation, got: {other:?}"),
+        }
+    }
+
     /// End-to-end load of `tests/fixtures/config-full.toml` (acceptance criterion).
     /// Writes the fixture to a tempdir, plus the dockerfile/context paths it
     /// references, then drives the full disk pipeline through `Config::load`.
@@ -1032,6 +1039,77 @@ mod config_load {
         write_repo_cfg(tmp.path(), "");
         let absent = tmp.path().join("does-not-exist.toml");
         Config::load(tmp.path(), Some(&absent)).expect("absent global is treated as empty");
+    }
+
+    #[test]
+    fn run_model_override_can_supply_selected_agents_missing_model() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-agent = "coding"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+preamble = "hi"
+"#,
+        );
+
+        let strict_err = Config::load(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(strict_err),
+                ConfigValidationError::AgentMissingModel { ref agent } if agent == "coding"
+            ),
+            "strict load should still reject a model-less agent with no default-model",
+        );
+
+        let cfg = Config::load_for_run(tmp.path(), None, None, Some("fast"))
+            .expect("run --model supplies the selected agent model");
+        assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
+    }
+
+    #[test]
+    fn run_model_override_does_not_supply_other_agents_missing_model() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-agent = "coding"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+preamble = "hi"
+
+[agents.review]
+preamble = "review"
+"#,
+        );
+
+        let err = Config::load_for_run(tmp.path(), None, None, Some("fast")).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::AgentMissingModel { ref agent } if agent == "review"
+            ),
+            "model override must only relax the selected agent",
+        );
     }
 
     #[test]

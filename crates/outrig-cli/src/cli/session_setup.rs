@@ -105,6 +105,9 @@ pub struct SessionSetupArgs<'a> {
     /// Raw `--agent` flag. Read only when `require_agent = true`; ignored
     /// otherwise (and `outrig mcp` always passes `None`).
     pub agent_flag: Option<&'a str>,
+    /// Raw `--model` flag. Read only when `require_agent = true`; ignored
+    /// otherwise (and `outrig mcp` always passes `None`).
+    pub model_override: Option<&'a str>,
     /// `true` for `outrig run`: [`setup`] resolves an agent from
     /// `agent_flag.or(cfg.default_agent)` (errors if neither) and lets
     /// `agent.container` participate in the container fallback.
@@ -148,7 +151,16 @@ struct AttachResolution {
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let repo_root = repo_root_from_config_path(args.repo_cfg_path);
     let span = ProgressSpan::start("loading config");
-    let cfg = Config::load(&repo_root, Some(args.global_cfg_path))?;
+    let cfg = if args.require_agent {
+        Config::load_for_run(
+            &repo_root,
+            Some(args.global_cfg_path),
+            args.agent_flag,
+            args.model_override,
+        )?
+    } else {
+        Config::load(&repo_root, Some(args.global_cfg_path))?
+    };
     span.done("config loaded");
 
     let session_root =
@@ -196,8 +208,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             .ok_or_else(|| {
                 OutrigError::Configuration("no --agent and no default-agent configured".to_string())
             })?;
-        let resolved =
-            llm::resolve_agent_with_device_override(&cfg, agent_name, args.device_override)?;
+        let resolved = llm::resolve_agent_with_overrides(
+            &cfg,
+            agent_name,
+            args.model_override,
+            args.device_override,
+        )?;
         (
             Some(resolved.agent_name.clone()),
             resolved.container.clone(),

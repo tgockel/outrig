@@ -324,8 +324,9 @@ preamble = "You are a meticulous code reviewer..."
 - `tool-result-cap` (integer, optional, default: top-level value or `262144`): bytes per result.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
-set. When `outrig run --agent <a>` runs, the chosen container is `--container` if given,
-otherwise `agents.<a>.container` if set, otherwise `default-container`.
+set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
+`outrig run --agent <a>` runs, the chosen container is `--container` if given, otherwise
+`agents.<a>.container` if set, otherwise `default-container`.
 `tool-call-cap` is per turn, not per session; follow-up prompts start a fresh count.
 `tool-result-cap` is per result and applies equally to successful MCP results and MCP error
 messages.

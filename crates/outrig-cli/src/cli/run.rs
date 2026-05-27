@@ -40,6 +40,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub agent: Option<String>,
 
+    /// Pick a `[models.<name>]` block for this run. Overrides the agent's
+    /// `model` and the top-level `default-model`.
+    #[arg(long, value_name = "NAME")]
+    pub model: Option<String>,
+
     /// Pick a `[containers.<name>]` block. Overrides the agent's `container`
     /// and the top-level `default-container`.
     #[arg(long, value_name = "NAME")]
@@ -90,6 +95,7 @@ pub async fn execute(
         container_flag: args.container.as_deref(),
         attach_target: None,
         agent_flag: args.agent.as_deref(),
+        model_override: args.model.as_deref(),
         require_agent: true,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
@@ -144,6 +150,7 @@ pub async fn execute(
         &mut mcp_arcs,
         args.max_tool_calls,
         args.max_tool_result_bytes,
+        args.model.as_deref(),
         args.device,
         &mcp,
         &cli_env,
@@ -176,6 +183,7 @@ async fn run_inner(
     mcp_arcs: &mut Vec<Arc<McpClient>>,
     max_tool_calls: Option<u32>,
     max_tool_result_bytes: Option<u32>,
+    model_override: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
     mcp: &std::collections::BTreeMap<String, outrig::config::McpServerSpec>,
     cli_env: &CliEnvEntries,
@@ -183,7 +191,8 @@ async fn run_inner(
     // `setup` already validated presence and used the resolved `.container`
     // for the container fallback. We re-resolve here for `build_agent` +
     // banner; cheap (config table lookups, no I/O).
-    let mut resolved = llm::resolve_agent_with_device_override(cfg, agent_name, device_override)?;
+    let mut resolved =
+        llm::resolve_agent_with_overrides(cfg, agent_name, model_override, device_override)?;
     apply_tool_call_cap_override(&mut resolved, max_tool_calls);
     apply_tool_result_cap_override(&mut resolved, max_tool_result_bytes);
 
@@ -450,6 +459,12 @@ mod tests {
             msg.contains(MistralrsDeviceSpec::EXPECTED),
             "unexpected clap error: {msg}",
         );
+    }
+
+    #[test]
+    fn model_arg_accepts_name() {
+        let args = RunArgs::try_parse_from(["run", "--model", "smart"]).expect("arg parses");
+        assert_eq!(args.model.as_deref(), Some("smart"));
     }
 
     #[test]

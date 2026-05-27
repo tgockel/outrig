@@ -114,6 +114,27 @@ impl Config {
     /// and validate the merged result against `repo_root`. The repo config
     /// file is read from `<repo_root>/.agents/outrig/config.toml`.
     pub fn load(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
+        merged.validate(Some(repo_root))?;
+        Ok(merged)
+    }
+
+    /// Load config for `outrig run`, allowing `--model` to supply the selected
+    /// agent's model even when no top-level `default-model` is configured.
+    pub fn load_for_run(
+        repo_root: &Path,
+        global_path: Option<&Path>,
+        agent_flag: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Self> {
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
+        let agent_model_override =
+            model_override.and(agent_flag.or(merged.default_agent.as_deref()));
+        merged.validate_for_run(Some(repo_root), agent_model_override)?;
+        Ok(merged)
+    }
+
+    fn load_unvalidated(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
         let repo_path = crate::repo::repo_config_path(repo_root);
         let repo_text = fs::read_to_string(&repo_path)?;
         let repo_cfg = Self::load_from_str(&repo_text)?;
@@ -128,9 +149,7 @@ impl Config {
             None => Self::default(),
         };
 
-        let merged = merge(global_cfg, repo_cfg);
-        merged.validate(Some(repo_root))?;
-        Ok(merged)
+        Ok(merge(global_cfg, repo_cfg))
     }
 
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
@@ -138,6 +157,21 @@ impl Config {
     /// `None` keeps the check pure-structural for unit tests.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
+        Ok(())
+    }
+
+    fn validate_for_run(
+        &self,
+        repo_root: Option<&Path>,
+        agent_model_override: Option<&str>,
+    ) -> Result<()> {
+        validate::validate_with_options(
+            self,
+            repo_root,
+            validate::ValidationOptions {
+                agent_model_override,
+            },
+        )?;
         Ok(())
     }
 }

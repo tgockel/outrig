@@ -11,7 +11,7 @@ use outrig_cli::error::CliError;
 use outrig_cli::llm::build_agent;
 use outrig_cli::llm::{
     DEFAULT_TOOL_RESULT_CAP_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider,
-    resolve_agent, resolve_agent_with_device_override,
+    resolve_agent, resolve_agent_with_device_override, resolve_agent_with_overrides,
 };
 
 fn parse(s: &str) -> Config {
@@ -145,6 +145,90 @@ preamble = "be meticulous"
 }
 
 #[test]
+fn model_override_replaces_agent_model() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_MODEL_OVERRIDE_AGENT";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.review]
+model    = "fast"
+preamble = "be meticulous"
+"#,
+    ));
+
+    let r = resolve_agent_with_overrides(&cfg, "review", Some("smart"), None).expect("resolves");
+    assert_eq!(r.model_name, "smart");
+    assert_eq!(r.model_identifier, "gpt-4o");
+    assert_eq!(r.preamble, "be meticulous");
+
+    unset_env(var);
+}
+
+#[test]
+fn model_override_replaces_default_model() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_MODEL_OVERRIDE_DEFAULT";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.coding]
+preamble = "code"
+"#,
+    ));
+
+    let r = resolve_agent_with_overrides(&cfg, "coding", Some("smart"), None).expect("resolves");
+    assert_eq!(r.model_name, "smart");
+    assert_eq!(r.model_identifier, "gpt-4o");
+
+    unset_env(var);
+}
+
+#[test]
+fn model_override_supplies_model_without_default() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_MODEL_OVERRIDE_NO_DEFAULT";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        "",
+        r#"
+[agents.coding]
+preamble = "code"
+"#,
+    ));
+
+    let r = resolve_agent_with_overrides(&cfg, "coding", Some("fast"), None).expect("resolves");
+    assert_eq!(r.model_name, "fast");
+    assert_eq!(r.model_identifier, "gpt-4o-mini");
+
+    unset_env(var);
+}
+
+#[test]
+fn unknown_model_override_errors() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_MODEL_OVERRIDE_UNKNOWN";
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.coding]
+preamble = "code"
+"#,
+    ));
+
+    let err = resolve_agent_with_overrides(&cfg, "coding", Some("ghost"), None).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CliError::LlmResolve(LlmResolveError::UnknownModel { name }) if name == "ghost"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
 fn tool_call_cap_resolves_from_top_level_then_agent() {
     let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_CAP";
     set_env(var, "k");
@@ -261,6 +345,31 @@ fn mistralrs_device_override_replaces_model_device() {
     let cfg = local_mistralrs_cfg(Some("cuda"));
     let r = resolve_agent_with_device_override(&cfg, "smoke", Some(MistralrsDeviceSpec::Cpu))
         .expect("resolves");
+    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
+}
+
+#[test]
+fn device_override_applies_to_model_override() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_DEVICE_WITH_MODEL_OVERRIDE";
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.coding]
+model    = "fast"
+preamble = "hi"
+"#,
+    ));
+
+    let r = resolve_agent_with_overrides(
+        &cfg,
+        "coding",
+        Some("claude"),
+        Some(MistralrsDeviceSpec::Cpu),
+    )
+    .expect("resolves");
+    assert_eq!(r.model_name, "claude");
     let weights = r.model_weights.as_ref().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }

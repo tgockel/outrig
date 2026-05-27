@@ -175,12 +175,21 @@ pub struct ResolvedAgent {
 /// `cfg.validate()` was called -- so errors carry the resolution context
 /// (which agent, which model) regardless.
 pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
-    resolve_agent_with_device_override(cfg, agent_name, None)
+    resolve_agent_with_overrides(cfg, agent_name, None, None)
 }
 
 pub fn resolve_agent_with_device_override(
     cfg: &Config,
     agent_name: &str,
+    device_override: Option<MistralrsDeviceSpec>,
+) -> Result<ResolvedAgent> {
+    resolve_agent_with_overrides(cfg, agent_name, None, device_override)
+}
+
+pub fn resolve_agent_with_overrides(
+    cfg: &Config,
+    agent_name: &str,
+    model_override: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
 ) -> Result<ResolvedAgent> {
     let agent = cfg.agents.get(agent_name).ok_or_else(|| {
@@ -199,9 +208,8 @@ pub fn resolve_agent_with_device_override(
         }
     })?;
 
-    let model_name = agent
-        .model
-        .as_deref()
+    let model_name = model_override
+        .or(agent.model.as_deref())
         .or(cfg.default_model.as_deref())
         .ok_or_else(|| LlmResolveError::AgentMissingModel {
             agent: agent_name.to_string(),

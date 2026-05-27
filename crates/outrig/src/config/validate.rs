@@ -206,9 +206,22 @@ pub enum ConfigValidationError {
     OpenAiModelHasMistralrsField { model: String, field: &'static str },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ValidationOptions<'a> {
+    pub agent_model_override: Option<&'a str>,
+}
+
 pub(super) fn validate(
     cfg: &Config,
     repo_root: Option<&Path>,
+) -> Result<(), ConfigValidationError> {
+    validate_with_options(cfg, repo_root, ValidationOptions::default())
+}
+
+pub(super) fn validate_with_options(
+    cfg: &Config,
+    repo_root: Option<&Path>,
+    options: ValidationOptions<'_>,
 ) -> Result<(), ConfigValidationError> {
     validate_workspace_mounts(cfg, repo_root)?;
 
@@ -241,7 +254,9 @@ pub(super) fn validate(
             None => {
                 // default-model existence already checked above; here we just
                 // need it to be set at all.
-                if cfg.default_model.is_none() {
+                let has_run_model_override =
+                    options.agent_model_override == Some(agent_name.as_str());
+                if cfg.default_model.is_none() && !has_run_model_override {
                     return Err(ConfigValidationError::AgentMissingModel {
                         agent: agent_name.clone(),
                     });

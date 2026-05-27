@@ -14,6 +14,7 @@ outrig run [--agent <name>]
            [--device <cpu|cuda|cuda:N|metal>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
+           [--model <name>]
            [--network <default|audit|filter>]
            [--session-dir <path>]
            [--session-root <path>]
@@ -31,6 +32,8 @@ outrig run [--agent <name>]
   per-turn tool-call cap for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
   override the per-tool-result byte cap for this run.
+- `--model <name>` (default: agent's `model`, else `default-model`): select an existing
+  `[models.<name>]` entry for this run.
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this run.
@@ -83,8 +86,9 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 7. **Connect MCP servers.** For each entry in `[containers.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`.
-8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), look up
-   `[agents.<a>].model` -- if unset, fall back to top-level `default-model`. Then
+8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), pick the
+   model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
+   must name an existing `[models.<name>]` entry; it is not a raw provider model identifier. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call cap from
    `tool-call-cap` and the per-result byte cap from `tool-result-cap`. For in-process
    mistralrs models, `--device` overrides the model's configured `device` for this run. For

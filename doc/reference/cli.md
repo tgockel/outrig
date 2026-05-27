@@ -104,6 +104,7 @@ outrig run [--agent <name>]
            [--global-config <path>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
+           [--model <name>]
            [--network <default|audit|filter>]
            [--session-dir <path>]
            [--session-root <path>]
@@ -124,6 +125,8 @@ outrig run [--agent <name>]
   cap.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
   per-tool-result byte cap.
+- `--model <name>` (default: agent's `model`, else `default-model`): configured
+  `[models.<name>]` entry to use for this run. This is not a raw provider model identifier.
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.
