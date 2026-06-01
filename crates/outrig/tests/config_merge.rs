@@ -627,25 +627,25 @@ cap-add  = ["CAP_MKNOD"]
     }
 
     #[test]
-    fn top_level_tool_call_cap_zero_errors() {
+    fn top_level_tool_call_max_zero_errors() {
         let cfg = parse(
             r#"
-tool-call-cap = 0
+tool-call-max = 0
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::ToolCallCapOutOfRange { path, value, max } => {
-                assert_eq!(path, "top-level tool-call-cap");
+            ConfigValidationError::ToolCallMaxOutOfRange { path, value, max } => {
+                assert_eq!(path, "top-level tool-call-max");
                 assert_eq!(value, 0);
                 assert_eq!(max, 2000);
             }
-            other => panic!("expected ToolCallCapOutOfRange, got: {other:?}"),
+            other => panic!("expected ToolCallMaxOutOfRange, got: {other:?}"),
         }
     }
 
     #[test]
-    fn agent_tool_call_cap_too_large_errors() {
+    fn agent_tool_call_max_too_large_errors() {
         let cfg = parse(
             r#"
 default-model = "fast"
@@ -660,40 +660,40 @@ provider   = "openai"
 identifier = "gpt-4o-mini"
 
 [agents.coding]
-tool-call-cap = 5000
+tool-call-max = 5000
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::ToolCallCapOutOfRange { path, value, max } => {
-                assert_eq!(path, "agents.coding.tool-call-cap");
+            ConfigValidationError::ToolCallMaxOutOfRange { path, value, max } => {
+                assert_eq!(path, "agents.coding.tool-call-max");
                 assert_eq!(value, 5000);
                 assert_eq!(max, 2000);
             }
-            other => panic!("expected ToolCallCapOutOfRange, got: {other:?}"),
+            other => panic!("expected ToolCallMaxOutOfRange, got: {other:?}"),
         }
     }
 
     #[test]
-    fn top_level_tool_result_cap_too_small_errors() {
+    fn top_level_tool_result_max_too_small_errors() {
         let cfg = parse(
             r#"
-tool-result-cap = 0
+tool-result-max = 0
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::ToolResultCapTooSmall { path, value, min } => {
-                assert_eq!(path, "top-level tool-result-cap");
+            ConfigValidationError::ToolResultMaxTooSmall { path, value, min } => {
+                assert_eq!(path, "top-level tool-result-max");
                 assert_eq!(value, 0);
                 assert_eq!(min, 1024);
             }
-            other => panic!("expected ToolResultCapTooSmall, got: {other:?}"),
+            other => panic!("expected ToolResultMaxTooSmall, got: {other:?}"),
         }
     }
 
     #[test]
-    fn agent_tool_result_cap_too_large_errors() {
+    fn agent_tool_result_max_too_large_errors() {
         let cfg = parse(
             r#"
 default-model = "fast"
@@ -708,17 +708,17 @@ provider   = "openai"
 identifier = "gpt-4o-mini"
 
 [agents.coding]
-tool-result-cap = 100000000
+tool-result-max = 100000000
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::ToolResultCapTooLarge { path, value, max } => {
-                assert_eq!(path, "agents.coding.tool-result-cap");
+            ConfigValidationError::ToolResultMaxTooLarge { path, value, max } => {
+                assert_eq!(path, "agents.coding.tool-result-max");
                 assert_eq!(value, 100000000);
                 assert_eq!(max, 16 * 1024 * 1024);
             }
-            other => panic!("expected ToolResultCapTooLarge, got: {other:?}"),
+            other => panic!("expected ToolResultMaxTooLarge, got: {other:?}"),
         }
     }
 }
@@ -849,59 +849,59 @@ session-root = "/var/lib/outrig/sessions"
     }
 
     #[test]
-    fn tool_call_cap_repo_overrides_global() {
+    fn tool_call_max_repo_overrides_global() {
         let global = parse(
             r#"
-tool-call-cap = 100
+tool-call-max = 100
 "#,
         );
         let repo = parse(
             r#"
-tool-call-cap = 300
+tool-call-max = 300
 "#,
         );
         let merged = merge(global, repo);
-        assert_eq!(merged.tool_call_cap, Some(300));
+        assert_eq!(merged.tool_call_max, Some(300));
     }
 
     #[test]
-    fn tool_call_cap_global_used_when_repo_unset() {
+    fn tool_call_max_global_used_when_repo_unset() {
         let global = parse(
             r#"
-tool-call-cap = 100
+tool-call-max = 100
 "#,
         );
         let repo = parse("");
         let merged = merge(global, repo);
-        assert_eq!(merged.tool_call_cap, Some(100));
+        assert_eq!(merged.tool_call_max, Some(100));
     }
 
     #[test]
-    fn tool_result_cap_repo_overrides_global() {
+    fn tool_result_max_repo_overrides_global() {
         let global = parse(
             r#"
-tool-result-cap = 262144
+tool-result-max = 262144
 "#,
         );
         let repo = parse(
             r#"
-tool-result-cap = 524288
+tool-result-max = 524288
 "#,
         );
         let merged = merge(global, repo);
-        assert_eq!(merged.tool_result_cap, Some(524288));
+        assert_eq!(merged.tool_result_max, Some(524288));
     }
 
     #[test]
-    fn tool_result_cap_global_used_when_repo_unset() {
+    fn tool_result_max_global_used_when_repo_unset() {
         let global = parse(
             r#"
-tool-result-cap = 262144
+tool-result-max = 262144
 "#,
         );
         let repo = parse("");
         let merged = merge(global, repo);
-        assert_eq!(merged.tool_result_cap, Some(262144));
+        assert_eq!(merged.tool_result_max, Some(262144));
     }
 
     #[test]

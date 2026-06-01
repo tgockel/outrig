@@ -10,7 +10,7 @@ use outrig_cli::error::CliError;
 #[cfg(not(feature = "local-llm"))]
 use outrig_cli::llm::build_agent;
 use outrig_cli::llm::{
-    DEFAULT_TOOL_RESULT_CAP_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider,
+    DEFAULT_TOOL_RESULT_MAX_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider,
     resolve_agent, resolve_agent_with_device_override, resolve_agent_with_overrides,
 };
 
@@ -117,8 +117,8 @@ max-tokens  = 4096
     assert_eq!(r.preamble, "you are a careful coder");
     assert_eq!(r.temperature, Some(0.2));
     assert_eq!(r.max_tokens, Some(4096));
-    assert_eq!(r.tool_call_cap, MAX_TOOL_CALLS);
-    assert_eq!(r.tool_result_cap_bytes, DEFAULT_TOOL_RESULT_CAP_BYTES);
+    assert_eq!(r.tool_call_max, MAX_TOOL_CALLS);
+    assert_eq!(r.tool_result_max_bytes, DEFAULT_TOOL_RESULT_MAX_BYTES);
 
     unset_env(var);
 }
@@ -229,14 +229,14 @@ preamble = "code"
 }
 
 #[test]
-fn tool_call_cap_resolves_from_top_level_then_agent() {
-    let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_CAP";
+fn tool_call_max_resolves_from_top_level_then_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_MAX";
     set_env(var, "k");
     let cfg = parse(&cfg_with_key_var(
         var,
         r#"
 default-model = "fast"
-tool-call-cap = 100
+tool-call-max = 100
 "#,
         r#"
 [agents.coding]
@@ -244,28 +244,28 @@ preamble = "code"
 
 [agents.review]
 preamble = "review"
-tool-call-cap = 300
+tool-call-max = 300
 "#,
     ));
 
     let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
-    assert_eq!(coding.tool_call_cap, 100);
+    assert_eq!(coding.tool_call_max, 100);
 
     let review = resolve_agent(&cfg, "review").expect("review resolves");
-    assert_eq!(review.tool_call_cap, 300);
+    assert_eq!(review.tool_call_max, 300);
 
     unset_env(var);
 }
 
 #[test]
-fn tool_result_cap_resolves_from_top_level_then_agent() {
-    let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_RESULT_CAP";
+fn tool_result_max_resolves_from_top_level_then_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_TOOL_RESULT_MAX";
     set_env(var, "k");
     let cfg = parse(&cfg_with_key_var(
         var,
         r#"
 default-model = "fast"
-tool-result-cap = 524288
+tool-result-max = 524288
 "#,
         r#"
 [agents.coding]
@@ -273,15 +273,15 @@ preamble = "code"
 
 [agents.review]
 preamble = "review"
-tool-result-cap = 1048576
+tool-result-max = 1048576
 "#,
     ));
 
     let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
-    assert_eq!(coding.tool_result_cap_bytes, 524288);
+    assert_eq!(coding.tool_result_max_bytes, 524288);
 
     let review = resolve_agent(&cfg, "review").expect("review resolves");
-    assert_eq!(review.tool_result_cap_bytes, 1048576);
+    assert_eq!(review.tool_result_max_bytes, 1048576);
 
     unset_env(var);
 }

@@ -13,8 +13,8 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ImageConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
-    MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, MistralrsDeviceSpec, Model, NetworkMode,
+    Config, ImageConfig, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model, NetworkMode,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
     normalize_capability_name,
 };
 
@@ -135,13 +135,13 @@ pub enum ConfigValidationError {
     CapabilityDropAddConflict { image: String, capability: String },
 
     #[error("{path} must be between 1 and {max}; got {value}")]
-    ToolCallCapOutOfRange { path: String, value: u32, max: u32 },
+    ToolCallMaxOutOfRange { path: String, value: u32, max: u32 },
 
     #[error("{path} must be at least {min} bytes; got {value}")]
-    ToolResultCapTooSmall { path: String, value: u32, min: u32 },
+    ToolResultMaxTooSmall { path: String, value: u32, min: u32 },
 
     #[error("{path} must be at most {max} bytes; got {value}")]
-    ToolResultCapTooLarge { path: String, value: u32, max: u32 },
+    ToolResultMaxTooLarge { path: String, value: u32, max: u32 },
 
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
@@ -297,20 +297,20 @@ pub(super) fn validate_with_options(
         return Err(ConfigValidationError::ModelCacheRootNotAbsolute { path: path.clone() });
     }
 
-    if let Some(value) = cfg.tool_call_cap {
-        validate_tool_call_cap("top-level tool-call-cap", value)?;
+    if let Some(value) = cfg.tool_call_max {
+        validate_tool_call_max("top-level tool-call-max", value)?;
     }
-    if let Some(value) = cfg.tool_result_cap {
-        validate_tool_result_cap("top-level tool-result-cap", value)?;
+    if let Some(value) = cfg.tool_result_max {
+        validate_tool_result_max("top-level tool-result-max", value)?;
     }
     validate_network_policy(cfg)?;
 
     for (agent_name, agent) in &cfg.agents {
-        if let Some(value) = agent.tool_call_cap {
-            validate_tool_call_cap(&format!("agents.{agent_name}.tool-call-cap"), value)?;
+        if let Some(value) = agent.tool_call_max {
+            validate_tool_call_max(&format!("agents.{agent_name}.tool-call-max"), value)?;
         }
-        if let Some(value) = agent.tool_result_cap {
-            validate_tool_result_cap(&format!("agents.{agent_name}.tool-result-cap"), value)?;
+        if let Some(value) = agent.tool_result_max {
+            validate_tool_result_max(&format!("agents.{agent_name}.tool-result-max"), value)?;
         }
     }
 
@@ -443,30 +443,30 @@ pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
     }
 }
 
-fn validate_tool_call_cap(path: &str, value: u32) -> Result<(), ConfigValidationError> {
-    if !(1..=MAX_TOOL_CALL_CAP).contains(&value) {
-        return Err(ConfigValidationError::ToolCallCapOutOfRange {
+fn validate_tool_call_max(path: &str, value: u32) -> Result<(), ConfigValidationError> {
+    if !(1..=TOOL_CALL_MAX_LIMIT).contains(&value) {
+        return Err(ConfigValidationError::ToolCallMaxOutOfRange {
             path: path.to_string(),
             value,
-            max: MAX_TOOL_CALL_CAP,
+            max: TOOL_CALL_MAX_LIMIT,
         });
     }
     Ok(())
 }
 
-fn validate_tool_result_cap(path: &str, value: u32) -> Result<(), ConfigValidationError> {
-    if value < MIN_TOOL_RESULT_CAP_BYTES {
-        return Err(ConfigValidationError::ToolResultCapTooSmall {
+fn validate_tool_result_max(path: &str, value: u32) -> Result<(), ConfigValidationError> {
+    if value < TOOL_RESULT_MAX_FLOOR_BYTES {
+        return Err(ConfigValidationError::ToolResultMaxTooSmall {
             path: path.to_string(),
             value,
-            min: MIN_TOOL_RESULT_CAP_BYTES,
+            min: TOOL_RESULT_MAX_FLOOR_BYTES,
         });
     }
-    if value > MAX_TOOL_RESULT_CAP_BYTES {
-        return Err(ConfigValidationError::ToolResultCapTooLarge {
+    if value > TOOL_RESULT_MAX_CEILING_BYTES {
+        return Err(ConfigValidationError::ToolResultMaxTooLarge {
             path: path.to_string(),
             value,
-            max: MAX_TOOL_RESULT_CAP_BYTES,
+            max: TOOL_RESULT_MAX_CEILING_BYTES,
         });
     }
     Ok(())

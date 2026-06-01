@@ -28,10 +28,10 @@ outrig run [--agent <name>]
   non-standard locations.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   override the in-process mistralrs model device for this run.
-- `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): override the
-  per-turn tool-call cap for this run.
-- `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
-  override the per-tool-result byte cap for this run.
+- `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): override the
+  per-turn tool-call max for this run.
+- `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
+  override the per-tool-result byte max for this run.
 - `--model <name>` (default: agent's `model`, else `default-model`): select an existing
   `[models.<name>]` entry for this run.
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
@@ -89,8 +89,8 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), pick the
    model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
    must name an existing `[models.<name>]` entry; it is not a raw provider model identifier. Then
-   `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call cap from
-   `tool-call-cap` and the per-result byte cap from `tool-result-cap`. For in-process
+   `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call max from
+   `tool-call-max` and the per-result byte max from `tool-result-max`. For in-process
    mistralrs models, `--device` overrides the model's configured `device` for this run. For
    OpenAI-style models, `--device` is rejected. Then read the API key from the env var named in
    the provider's `api-key`. Build the Rig provider client.
@@ -128,8 +128,8 @@ A typical startup looks like:
 [outrig] building agent
 [outrig] agent ready (0ms)
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
-[outrig] tool-call cap:     50
-[outrig] tool-result cap:   262144 bytes
+[outrig] tool-call max:     50
+[outrig] tool-result max:   262144 bytes
 [outrig] image-config:  coding
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3
 [outrig] container started: outrig-20260502T103412-3f2a
@@ -172,30 +172,30 @@ Behind the scenes the agent may make many tool calls per turn -- Rig drives the
 model-tool-model loop until the model emits a normal text reply with no tool calls. Tool-call
 traces appear on stderr; assistant text is printed on stdout.
 
-Each turn has a tool-call cap. The compiled-in default is `50`; a top-level
-`tool-call-cap` in config changes the default, `[agents.<name>].tool-call-cap` overrides it for
-one agent, and `outrig run --max-tool-calls <n>` overrides both for the current run. The cap is
+Each turn has a tool-call max. The compiled-in default is `50`; a top-level
+`tool-call-max` in config changes the default, `[agents.<name>].tool-call-max` overrides it for
+one agent, and `outrig run --max-tool-calls <n>` overrides both for the current run. The max is
 per turn, so a follow-up prompt starts a fresh count.
 
-Each individual tool result also has a byte cap before it is appended to the LLM-visible
+Each individual tool result also has a byte max before it is appended to the LLM-visible
 conversation history. The compiled-in default is `262144` bytes (256 KiB); a top-level
-`tool-result-cap` in config changes the default, `[agents.<name>].tool-result-cap` overrides it
+`tool-result-max` in config changes the default, `[agents.<name>].tool-result-max` overrides it
 for one agent, and `outrig run --max-tool-result-bytes <n>` overrides both for the current run.
-If a tool returns more than the cap, outrig keeps the head of the result and appends a marker
-that includes the original size, the cap, and a hint to narrow the next query.
+If a tool returns more than the max, outrig keeps the head of the result and appends a marker
+that includes the original size, the max, and a hint to narrow the next query.
 
-When the tool-call cap fires, outrig ends the current turn and keeps protocol-valid partial
+When the tool-call max fires, outrig ends the current turn and keeps protocol-valid partial
 conversation history. If the model had already asked for the next tool call, outrig records a
-tool result saying that call was not executed because the cap was reached:
+tool result saying that call was not executed because the max was reached:
 
 ```
-[outrig] tool-call iteration cap (50) reached; ending turn
+[outrig] tool-call iteration max (50) reached; ending turn
 [outrig] partial history retained -- send another prompt (e.g. "continue")
         to keep going, or "/reset" to drop it.
 ```
 
 Type `continue`, or any more specific instruction, to let the next turn pick up from the retained
-tool calls with a fresh cap. If the skipped tool call is still needed, the model can ask for it
+tool calls with a fresh max. If the skipped tool call is still needed, the model can ask for it
 again. Use `/reset` first when you want to drop that history.
 
 The REPL is line-buffered. Multi-line input is not supported in v0.

@@ -350,8 +350,8 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
     assert!(
         captured
             .stderr
-            .contains("[outrig] tool-call iteration cap (1) reached; ending turn"),
-        "stderr lacked cap message: {}",
+            .contains("[outrig] tool-call iteration max (1) reached; ending turn"),
+        "stderr lacked max message: {}",
         captured.stderr
     );
     assert!(
@@ -364,8 +364,8 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
     assert!(
         captured
             .stdout
-            .contains("(turn ended; tool-call cap reached)"),
-        "stdout lacked canned cap reply: {}",
+            .contains("(turn ended; tool-call max reached)"),
+        "stdout lacked canned max reply: {}",
         captured.stdout
     );
     assert!(
@@ -407,8 +407,8 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
         synthetic_tool_result
             .get("content")
             .and_then(Value::as_str)
-            .is_some_and(|content| content.contains("per-turn tool-call cap (1)")),
-        "synthetic tool result lacked cap marker: {third_messages_json}",
+            .is_some_and(|content| content.contains("per-turn tool-call max (1)")),
+        "synthetic tool result lacked max marker: {third_messages_json}",
     );
 
     let continue_index = third_messages

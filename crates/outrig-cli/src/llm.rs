@@ -18,17 +18,17 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::Result;
 use crate::rig_tool::McpToolAdapter;
-use outrig::config::{Config, DEFAULT_TOOL_CALL_CAP, LlmProvider, MistralrsDeviceSpec};
+use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
 
-/// Hard cap on tool calls per turn. The hook below trips this; rig's own
+/// Hard max on tool calls per turn. The hook below trips this; rig's own
 /// `max_turns` is set to the same value as a defense in depth, so whichever
 /// fires first surfaces a controllable message.
-pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_CAP as usize;
+pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_MAX as usize;
 
 /// Default byte ceiling applied to each individual MCP tool result before it
 /// is handed to Rig and appended to model-visible chat history.
-pub const DEFAULT_TOOL_RESULT_CAP_BYTES: usize =
-    outrig::config::DEFAULT_TOOL_RESULT_CAP_BYTES as usize;
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize =
+    outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES as usize;
 
 #[cfg(feature = "local-llm")]
 pub mod mistralrs;
@@ -162,8 +162,8 @@ pub struct ResolvedAgent {
     pub preamble: String,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
-    pub tool_call_cap: usize,
-    pub tool_result_cap_bytes: usize,
+    pub tool_call_max: usize,
+    pub tool_result_max_bytes: usize,
     pub image: Option<String>,
 }
 
@@ -302,14 +302,14 @@ pub fn resolve_agent_with_overrides(
             .unwrap_or_else(|| DEFAULT_PREAMBLE.to_string()),
         temperature: agent.temperature,
         max_tokens: agent.max_tokens,
-        tool_call_cap: agent
-            .tool_call_cap
-            .or(cfg.tool_call_cap)
-            .unwrap_or(DEFAULT_TOOL_CALL_CAP) as usize,
-        tool_result_cap_bytes: agent
-            .tool_result_cap
-            .or(cfg.tool_result_cap)
-            .unwrap_or(outrig::config::DEFAULT_TOOL_RESULT_CAP_BYTES)
+        tool_call_max: agent
+            .tool_call_max
+            .or(cfg.tool_call_max)
+            .unwrap_or(DEFAULT_TOOL_CALL_MAX) as usize,
+        tool_result_max_bytes: agent
+            .tool_result_max
+            .or(cfg.tool_result_max)
+            .unwrap_or(outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES)
             as usize,
         image: agent.image.clone(),
     })
@@ -369,12 +369,12 @@ fn validate_mistralrs_device(
 pub enum RigAgent {
     OpenAi {
         agent: rig::agent::Agent<rig::providers::openai::CompletionModel>,
-        tool_call_cap: usize,
+        tool_call_max: usize,
     },
     #[cfg(feature = "local-llm")]
     Mistralrs {
         agent: rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
-        tool_call_cap: usize,
+        tool_call_max: usize,
     },
 }
 
@@ -410,7 +410,7 @@ pub async fn build_agent(
             let model = client.completion_model(&resolved.model_identifier);
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(model, resolved, tools),
-                tool_call_cap: resolved.tool_call_cap,
+                tool_call_max: resolved.tool_call_max,
             })
         }
         ResolvedProvider::Mistralrs => {
@@ -455,7 +455,7 @@ pub async fn build_agent(
                     .await?;
                 Ok(RigAgent::Mistralrs {
                     agent: finish_agent((*model).clone(), resolved, tools),
-                    tool_call_cap: resolved.tool_call_cap,
+                    tool_call_max: resolved.tool_call_max,
                 })
             }
         }
@@ -469,20 +469,20 @@ impl RigAgent {
     ///
     /// The per-turn [`OutrigPromptHook`] prints `[outrig] tool call: ...` to
     /// stderr for every tool invocation and terminates the loop after
-    /// the resolved tool-call cap. If the hook terminates the loop, Rig
+    /// the resolved tool-call max. If the hook terminates the loop, Rig
     /// returns the partial chat history it had accumulated; outrig splices in
     /// that new suffix so the user can send a follow-up prompt to continue.
     pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
         match self {
             RigAgent::OpenAi {
                 agent,
-                tool_call_cap,
-            } => run_turn_inner(agent, prompt, history, *tool_call_cap).await,
+                tool_call_max,
+            } => run_turn_inner(agent, prompt, history, *tool_call_max).await,
             #[cfg(feature = "local-llm")]
             RigAgent::Mistralrs {
                 agent,
-                tool_call_cap,
-            } => run_turn_streaming_mistralrs(agent, prompt, history, *tool_call_cap).await,
+                tool_call_max,
+            } => run_turn_streaming_mistralrs(agent, prompt, history, *tool_call_max).await,
         }
     }
 }
@@ -491,13 +491,13 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
     history: &mut Vec<Message>,
-    tool_call_cap: usize,
+    tool_call_max: usize,
 ) -> Result<String> {
-    let hook = OutrigPromptHook::new(tool_call_cap);
+    let hook = OutrigPromptHook::new(tool_call_max);
     let result = agent
         .prompt(prompt.to_string())
         .with_history(history.clone())
-        .max_turns(tool_call_cap)
+        .max_turns(tool_call_max)
         .with_hook(hook)
         .extended_details()
         .await;
@@ -519,10 +519,10 @@ async fn run_turn_streaming_mistralrs(
     agent: &rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
     prompt: &str,
     history: &mut Vec<Message>,
-    tool_call_cap: usize,
+    tool_call_max: usize,
 ) -> Result<String> {
     let mut stdout = tokio::io::stdout();
-    run_turn_streaming_inner(agent, prompt, history, tool_call_cap, &mut stdout).await
+    run_turn_streaming_inner(agent, prompt, history, tool_call_max, &mut stdout).await
 }
 
 #[cfg(feature = "local-llm")]
@@ -530,18 +530,18 @@ async fn run_turn_streaming_inner<M, W>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
     history: &mut Vec<Message>,
-    tool_call_cap: usize,
+    tool_call_max: usize,
     stdout: &mut W,
 ) -> Result<String>
 where
     M: CompletionModel + 'static,
     W: AsyncWrite + Unpin,
 {
-    let hook = OutrigPromptHook::new(tool_call_cap);
+    let hook = OutrigPromptHook::new(tool_call_max);
     let mut stream = agent
         .stream_prompt(prompt.to_string())
         .with_history(history.clone())
-        .multi_turn(tool_call_cap)
+        .multi_turn(tool_call_max)
         .with_hook(hook)
         .await;
 
@@ -607,20 +607,20 @@ fn handle_prompt_error(
                  (e.g. \"continue\") to keep going, or \"/reset\" to drop it."
             );
             extend_history_with_new_suffix(history, chat_history);
-            Ok("(turn ended; tool-call cap reached)".to_string())
+            Ok("(turn ended; tool-call max reached)".to_string())
         }
         rig::completion::PromptError::MaxTurnsError {
             max_turns,
             chat_history,
             ..
         } => {
-            eprintln!("[outrig] tool-call iteration cap ({max_turns}) reached; ending turn");
+            eprintln!("[outrig] tool-call iteration max ({max_turns}) reached; ending turn");
             eprintln!(
                 "[outrig] partial history retained -- send another prompt \
                  (e.g. \"continue\") to keep going, or \"/reset\" to drop it."
             );
             extend_history_with_new_suffix(history, *chat_history);
-            Ok("(turn ended; tool-call cap reached)".to_string())
+            Ok("(turn ended; tool-call max reached)".to_string())
         }
         other => Err(other.into()),
     }
@@ -636,21 +636,21 @@ fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Mess
 }
 
 /// Per-request hook that traces every tool call to stderr and stops the agent
-/// loop after `cap` calls. Cloned by rig per request; shared atomics keep a
-/// single turn's calls counting against the same cap.
+/// loop after `max` calls. Cloned by rig per request; shared atomics keep a
+/// single turn's calls counting against the same max.
 #[derive(Clone)]
 pub struct OutrigPromptHook {
     counter: Arc<AtomicUsize>,
     cap_reached: Arc<AtomicBool>,
-    cap: usize,
+    max: usize,
 }
 
 impl OutrigPromptHook {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(max: usize) -> Self {
         Self {
             counter: Arc::new(AtomicUsize::new(0)),
             cap_reached: Arc::new(AtomicBool::new(false)),
-            cap,
+            max,
         }
     }
 }
@@ -659,8 +659,8 @@ impl<M: CompletionModel> PromptHook<M> for OutrigPromptHook {
     async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
         if self.cap_reached.load(Ordering::SeqCst) {
             return HookAction::terminate(format!(
-                "tool-call iteration cap ({}) reached; ending turn",
-                self.cap
+                "tool-call iteration max ({}) reached; ending turn",
+                self.max
             ));
         }
         HookAction::cont()
@@ -674,13 +674,13 @@ impl<M: CompletionModel> PromptHook<M> for OutrigPromptHook {
         args: &str,
     ) -> ToolCallHookAction {
         let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        if n > self.cap {
+        if n > self.max {
             self.cap_reached.store(true, Ordering::SeqCst);
             return ToolCallHookAction::skip(format!(
-                "[outrig] tool call not executed: per-turn tool-call cap ({}) \
+                "[outrig] tool call not executed: per-turn tool-call max ({}) \
                  was reached before this call could run. The user may continue \
-                 with a fresh cap; repeat the tool call if still needed.",
-                self.cap
+                 with a fresh max; repeat the tool call if still needed.",
+                self.max
             ));
         }
         eprintln!("[outrig] tool call: {tool_name}({args})");

@@ -86,8 +86,8 @@ An agent ties a model to a system preamble and (optionally) a default image.
 image       = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
-tool-call-cap = 300
-tool-result-cap = 1048576
+tool-call-max = 300
+tool-result-max = 1048576
 
 [agents.review]
 model    = "smart"      # explicit override of default-model
@@ -104,11 +104,11 @@ under -- the place to encode role, scope, voice.
 with different sampling for different tasks (e.g. low temperature for code, higher for
 brainstorming).
 
-`tool-call-cap` also lives on the agent when a role needs longer tool loops. If unset, the agent
-uses the top-level `tool-call-cap`, then the compiled-in default of `50`. The cap is per user
+`tool-call-max` also lives on the agent when a role needs longer tool loops. If unset, the agent
+uses the top-level `tool-call-max`, then the compiled-in default of `50`. The max is per user
 turn, so typing a follow-up prompt starts a fresh count while keeping conversation history.
-`tool-result-cap` works the same way for oversized MCP output: an agent can inherit the
-top-level cap or set its own byte cap when a role regularly reads larger files or logs.
+`tool-result-max` works the same way for oversized MCP output: an agent can inherit the
+top-level max or set its own byte max when a role regularly reads larger files or logs.
 
 ### `default-model` at the top level
 

@@ -222,8 +222,8 @@ Diagnostics arrive on stderr:
 
 ```
 [outrig] agent:             coder (model: fast / provider: openai / gpt-4o-mini)
-[outrig] tool-call cap:     50
-[outrig] tool-result cap:   262144 bytes
+[outrig] tool-call max:     50
+[outrig] tool-result max:   262144 bytes
 [outrig] image-config:  hello-outrig-standard
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260502T103412-3f2a

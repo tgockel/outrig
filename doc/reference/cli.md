@@ -121,10 +121,10 @@ outrig run [--agent <name>]
   on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`): override
   the in-process mistralrs model device for this run. Rejected for OpenAI-style models.
-- `--max-tool-calls <n>` (default: resolved `tool-call-cap`, else `50`): per-turn tool-call
-  cap.
-- `--max-tool-result-bytes <n>` (default: resolved `tool-result-cap`, else `262144`):
-  per-tool-result byte cap.
+- `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): per-turn tool-call
+  max.
+- `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
+  per-tool-result byte max.
 - `--model <name>` (default: agent's `model`, else `default-model`): configured
   `[models.<name>]` entry to use for this run. This is not a raw provider model identifier.
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):

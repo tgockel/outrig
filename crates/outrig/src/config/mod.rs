@@ -57,11 +57,11 @@ fn error_lands_on_unquoted_dotted_header(err: &toml::de::Error, input: &str) -> 
     false
 }
 
-pub const DEFAULT_TOOL_CALL_CAP: u32 = 50;
-pub const MAX_TOOL_CALL_CAP: u32 = 2000;
-pub const DEFAULT_TOOL_RESULT_CAP_BYTES: u32 = 256 * 1024;
-pub const MIN_TOOL_RESULT_CAP_BYTES: u32 = 1024;
-pub const MAX_TOOL_RESULT_CAP_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_TOOL_CALL_MAX: u32 = 50;
+pub const TOOL_CALL_MAX_LIMIT: u32 = 2000;
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: u32 = 256 * 1024;
+pub const TOOL_RESULT_MAX_FLOOR_BYTES: u32 = 1024;
+pub const TOOL_RESULT_MAX_CEILING_BYTES: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -77,9 +77,9 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_cache_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_cap: Option<u32>,
+    pub tool_call_max: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_result_cap: Option<u32>,
+    pub tool_result_max: Option<u32>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
 
@@ -316,9 +316,9 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_cap: Option<u32>,
+    pub tool_call_max: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_result_cap: Option<u32>,
+    pub tool_result_max: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

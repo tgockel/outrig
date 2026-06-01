@@ -28,8 +28,8 @@ use crate::repl::Repl;
 use crate::rig_tool::McpToolAdapter;
 use outrig::McpClient;
 use outrig::config::{
-    Config, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES, MIN_TOOL_RESULT_CAP_BYTES,
-    MistralrsDeviceSpec, NetworkMode,
+    Config, MistralrsDeviceSpec, NetworkMode, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
+    TOOL_RESULT_MAX_FLOOR_BYTES,
 };
 use outrig::container::Container;
 use outrig::image::ImageTag;
@@ -55,12 +55,12 @@ pub struct RunArgs {
     #[arg(long = "session-dir", value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
 
-    /// Override the per-turn tool-call cap for this run.
-    #[arg(long = "max-tool-calls", value_name = "N", value_parser = parse_tool_call_cap)]
+    /// Override the per-turn tool-call max for this run.
+    #[arg(long = "max-tool-calls", value_name = "N", value_parser = parse_tool_call_max)]
     pub max_tool_calls: Option<u32>,
 
-    /// Override the per-result truncation cap for this run.
-    #[arg(long = "max-tool-result-bytes", value_name = "N", value_parser = parse_tool_result_cap)]
+    /// Override the per-result truncation max for this run.
+    #[arg(long = "max-tool-result-bytes", value_name = "N", value_parser = parse_tool_result_max)]
     pub max_tool_result_bytes: Option<u32>,
 
     /// Add or override env vars for MCP servers. Repeatable.
@@ -193,8 +193,8 @@ async fn run_inner(
     // banner; cheap (config table lookups, no I/O).
     let mut resolved =
         llm::resolve_agent_with_overrides(cfg, agent_name, model_override, device_override)?;
-    apply_tool_call_cap_override(&mut resolved, max_tool_calls);
-    apply_tool_result_cap_override(&mut resolved, max_tool_result_bytes);
+    apply_tool_call_max_override(&mut resolved, max_tool_calls);
+    apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
     let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
     mcp_arcs.extend(connected);
@@ -204,7 +204,7 @@ async fn run_inner(
     for arc in mcp_arcs.iter() {
         let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
         let adapters =
-            McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_cap_bytes).await?;
+            McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_max_bytes).await?;
         let tool_count = adapters.len();
         let tool_word = plural(tool_count, "tool", "tools");
         span.done(format!(
@@ -310,13 +310,13 @@ fn print_banner(
     );
     let _ = writeln!(
         buf,
-        "[outrig] tool-call cap:     {}",
-        resolved.tool_call_cap
+        "[outrig] tool-call max:     {}",
+        resolved.tool_call_max
     );
     let _ = writeln!(
         buf,
-        "[outrig] tool-result cap:   {} bytes",
-        resolved.tool_result_cap_bytes
+        "[outrig] tool-result max:   {} bytes",
+        resolved.tool_result_max_bytes
     );
     if let Some(weights) = &resolved.model_weights {
         let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
@@ -362,44 +362,44 @@ fn truncate_description(desc: &str, max: usize) -> String {
     }
 }
 
-fn apply_tool_call_cap_override(resolved: &mut llm::ResolvedAgent, max_tool_calls: Option<u32>) {
+fn apply_tool_call_max_override(resolved: &mut llm::ResolvedAgent, max_tool_calls: Option<u32>) {
     if let Some(max_tool_calls) = max_tool_calls {
-        resolved.tool_call_cap = max_tool_calls as usize;
+        resolved.tool_call_max = max_tool_calls as usize;
     }
 }
 
-fn apply_tool_result_cap_override(
+fn apply_tool_result_max_override(
     resolved: &mut llm::ResolvedAgent,
     max_tool_result_bytes: Option<u32>,
 ) {
     if let Some(max_tool_result_bytes) = max_tool_result_bytes {
-        resolved.tool_result_cap_bytes = max_tool_result_bytes as usize;
+        resolved.tool_result_max_bytes = max_tool_result_bytes as usize;
     }
 }
 
-fn parse_tool_call_cap(s: &str) -> std::result::Result<u32, String> {
+fn parse_tool_call_max(s: &str) -> std::result::Result<u32, String> {
     let value = s
         .parse::<u32>()
-        .map_err(|_| format!("must be an integer between 1 and {MAX_TOOL_CALL_CAP}"))?;
-    if !(1..=MAX_TOOL_CALL_CAP).contains(&value) {
+        .map_err(|_| format!("must be an integer between 1 and {TOOL_CALL_MAX_LIMIT}"))?;
+    if !(1..=TOOL_CALL_MAX_LIMIT).contains(&value) {
         return Err(format!(
-            "must be between 1 and {MAX_TOOL_CALL_CAP}; got {value}"
+            "must be between 1 and {TOOL_CALL_MAX_LIMIT}; got {value}"
         ));
     }
     Ok(value)
 }
 
-fn parse_tool_result_cap(s: &str) -> std::result::Result<u32, String> {
+fn parse_tool_result_max(s: &str) -> std::result::Result<u32, String> {
     let value = s.parse::<u32>().map_err(|_| {
         format!(
-            "must be an integer between {MIN_TOOL_RESULT_CAP_BYTES} and \
-             {MAX_TOOL_RESULT_CAP_BYTES}"
+            "must be an integer between {TOOL_RESULT_MAX_FLOOR_BYTES} and \
+             {TOOL_RESULT_MAX_CEILING_BYTES}"
         )
     })?;
-    if !(MIN_TOOL_RESULT_CAP_BYTES..=MAX_TOOL_RESULT_CAP_BYTES).contains(&value) {
+    if !(TOOL_RESULT_MAX_FLOOR_BYTES..=TOOL_RESULT_MAX_CEILING_BYTES).contains(&value) {
         return Err(format!(
-            "must be between {MIN_TOOL_RESULT_CAP_BYTES} and \
-             {MAX_TOOL_RESULT_CAP_BYTES}; got {value}"
+            "must be between {TOOL_RESULT_MAX_FLOOR_BYTES} and \
+             {TOOL_RESULT_MAX_CEILING_BYTES}; got {value}"
         ));
     }
     Ok(value)
@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_override_replaces_resolved_tool_call_cap() {
+    fn cli_override_replaces_resolved_tool_call_max() {
         let mut resolved = llm::ResolvedAgent {
             agent_name: "coding".to_string(),
             model_name: "fast".to_string(),
@@ -479,18 +479,18 @@ mod tests {
             preamble: "test".to_string(),
             temperature: None,
             max_tokens: None,
-            tool_call_cap: 100,
-            tool_result_cap_bytes: llm::DEFAULT_TOOL_RESULT_CAP_BYTES,
+            tool_call_max: 100,
+            tool_result_max_bytes: llm::DEFAULT_TOOL_RESULT_MAX_BYTES,
             image: None,
         };
 
-        apply_tool_call_cap_override(&mut resolved, Some(50));
+        apply_tool_call_max_override(&mut resolved, Some(50));
 
-        assert_eq!(resolved.tool_call_cap, 50);
+        assert_eq!(resolved.tool_call_max, 50);
     }
 
     #[test]
-    fn cli_override_replaces_resolved_tool_result_cap() {
+    fn cli_override_replaces_resolved_tool_result_max() {
         let mut resolved = llm::ResolvedAgent {
             agent_name: "coding".to_string(),
             model_name: "fast".to_string(),
@@ -501,14 +501,14 @@ mod tests {
             preamble: "test".to_string(),
             temperature: None,
             max_tokens: None,
-            tool_call_cap: 100,
-            tool_result_cap_bytes: 262_144,
+            tool_call_max: 100,
+            tool_result_max_bytes: 262_144,
             image: None,
         };
 
-        apply_tool_result_cap_override(&mut resolved, Some(65_536));
+        apply_tool_result_max_override(&mut resolved, Some(65_536));
 
-        assert_eq!(resolved.tool_result_cap_bytes, 65_536);
+        assert_eq!(resolved.tool_result_max_bytes, 65_536);
     }
 
     #[test]

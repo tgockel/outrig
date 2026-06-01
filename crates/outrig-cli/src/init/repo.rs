@@ -365,16 +365,16 @@ fn render(
             preamble: Some(preamble),
             temperature: None,
             max_tokens: None,
-            tool_call_cap: None,
-            tool_result_cap: None,
+            tool_call_max: None,
+            tool_result_max: None,
         },
     );
     let cfg = Config {
         default_image: Some(image_name),
         default_agent: Some(agent_name),
         default_model: model_choices.default_model,
-        tool_call_cap: None,
-        tool_result_cap: None,
+        tool_call_max: None,
+        tool_result_max: None,
         workspace: Workspace {
             host_path: PathBuf::from(host_path),
             container_path: PathBuf::from(container_path),

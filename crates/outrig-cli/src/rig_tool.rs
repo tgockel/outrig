@@ -64,29 +64,29 @@ impl McpToolAdapter {
 #[error("{0}")]
 struct McpAdapterError(String);
 
-pub fn truncate_for_llm(result: &str, cap: usize) -> String {
-    if result.is_empty() || result.len() <= cap {
+pub fn truncate_for_llm(result: &str, max: usize) -> String {
+    if result.is_empty() || result.len() <= max {
         return result.to_string();
     }
-    if cap == 0 {
+    if max == 0 {
         return String::new();
     }
 
     let original_len = result.len();
-    let mut cut = cap.saturating_sub(truncation_marker(original_len, cap, 0).len());
+    let mut cut = max.saturating_sub(truncation_marker(original_len, max, 0).len());
     loop {
         cut = floor_char_boundary(result, cut.min(result.len()));
-        let marker = truncation_marker(original_len, cap, cut);
-        if marker.len() >= cap {
-            return truncate_marker(&marker, cap);
+        let marker = truncation_marker(original_len, max, cut);
+        if marker.len() >= max {
+            return truncate_marker(&marker, max);
         }
 
-        let content_budget = cap - marker.len();
+        let content_budget = max - marker.len();
         if cut <= content_budget {
             let mut truncated = String::with_capacity(cut + marker.len());
             truncated.push_str(&result[..cut]);
             truncated.push_str(&marker);
-            debug_assert!(truncated.len() <= cap);
+            debug_assert!(truncated.len() <= max);
             return truncated;
         }
 
@@ -94,8 +94,8 @@ pub fn truncate_for_llm(result: &str, cap: usize) -> String {
     }
 }
 
-fn adapt_tool_result(result: McpToolResult, cap: usize) -> std::result::Result<String, ToolError> {
-    let content_text = truncate_for_llm(&result.content_text, cap);
+fn adapt_tool_result(result: McpToolResult, max: usize) -> std::result::Result<String, ToolError> {
+    let content_text = truncate_for_llm(&result.content_text, max);
     if result.is_error {
         Err(ToolError::ToolCallError(Box::new(McpAdapterError(
             content_text,
@@ -105,28 +105,28 @@ fn adapt_tool_result(result: McpToolResult, cap: usize) -> std::result::Result<S
     }
 }
 
-fn truncation_marker(original_len: usize, cap: usize, kept: usize) -> String {
+fn truncation_marker(original_len: usize, max: usize, kept: usize) -> String {
     let dropped = original_len.saturating_sub(kept);
     format!(
         concat!(
             "\n\n[outrig: tool result truncated]\n",
             "  original size: {original_len} bytes\n",
-            "  cap:           {cap} bytes\n",
+            "  max:           {max} bytes\n",
             "  kept:          first {kept} bytes; trailing {dropped} bytes dropped.\n\n",
-            "  This tool result was larger than the configured cap. Your next call\n",
+            "  This tool result was larger than the configured max. Your next call\n",
             "  should narrow the query: use head/tail/grep/--max-count, scope a\n",
             "  directory or line range, or call a more specific tool. Re-running\n",
             "  the same call will produce the same truncation.",
         ),
         original_len = original_len,
-        cap = cap,
+        max = max,
         kept = kept,
         dropped = dropped,
     )
 }
 
-fn truncate_marker(marker: &str, cap: usize) -> String {
-    let cut = floor_char_boundary(marker, cap.min(marker.len()));
+fn truncate_marker(marker: &str, max: usize) -> String {
+    let cut = floor_char_boundary(marker, max.min(marker.len()));
     marker[..cut].to_string()
 }
 
@@ -175,33 +175,33 @@ impl ToolDyn for McpToolAdapter {
 mod tests {
     use super::*;
 
-    const CAP: usize = 1024;
+    const MAX: usize = 1024;
 
     #[test]
     fn truncate_for_llm_leaves_empty_and_under_cap_results_unchanged() {
-        assert_eq!(truncate_for_llm("", CAP), "");
-        assert_eq!(truncate_for_llm("short", CAP), "short");
+        assert_eq!(truncate_for_llm("", MAX), "");
+        assert_eq!(truncate_for_llm("short", MAX), "short");
     }
 
     #[test]
     fn truncate_for_llm_leaves_exact_cap_result_unchanged() {
-        let input = "a".repeat(CAP);
+        let input = "a".repeat(MAX);
 
-        let output = truncate_for_llm(&input, CAP);
+        let output = truncate_for_llm(&input, MAX);
 
         assert_eq!(output, input);
     }
 
     #[test]
     fn truncate_for_llm_caps_one_byte_over_with_marker() {
-        let input = "a".repeat(CAP + 1);
+        let input = "a".repeat(MAX + 1);
 
-        let output = truncate_for_llm(&input, CAP);
+        let output = truncate_for_llm(&input, MAX);
 
-        assert!(output.len() <= CAP, "output len: {}", output.len());
+        assert!(output.len() <= MAX, "output len: {}", output.len());
         assert!(output.contains("[outrig: tool result truncated]"));
         assert!(output.contains("original size: 1025 bytes"));
-        assert!(output.contains("cap:           1024 bytes"));
+        assert!(output.contains("max:           1024 bytes"));
         assert!(output.ends_with("produce the same truncation."));
     }
 
@@ -213,7 +213,7 @@ mod tests {
 
         assert!(output.len() <= 4096, "output len: {}", output.len());
         assert!(output.contains("original size: 5242880 bytes"));
-        assert!(output.contains("cap:           4096 bytes"));
+        assert!(output.contains("max:           4096 bytes"));
         assert!(output.contains("should narrow the query"));
     }
 
@@ -221,9 +221,9 @@ mod tests {
     fn truncate_for_llm_keeps_valid_utf8_at_boundary() {
         let input = format!("{}{}", "a".repeat(900), "🙂".repeat(200));
 
-        let output = truncate_for_llm(&input, CAP);
+        let output = truncate_for_llm(&input, MAX);
 
-        assert!(output.len() <= CAP, "output len: {}", output.len());
+        assert!(output.len() <= MAX, "output len: {}", output.len());
         assert!(output.is_char_boundary(output.len()));
         assert!(output.contains("[outrig: tool result truncated]"));
     }
@@ -231,30 +231,30 @@ mod tests {
     #[test]
     fn adapt_tool_result_truncates_success_content() {
         let result = McpToolResult {
-            content_text: "a".repeat(CAP + 1),
+            content_text: "a".repeat(MAX + 1),
             is_error: false,
         };
 
-        let output = adapt_tool_result(result, CAP).expect("success result");
+        let output = adapt_tool_result(result, MAX).expect("success result");
 
-        assert!(output.len() <= CAP, "output len: {}", output.len());
+        assert!(output.len() <= MAX, "output len: {}", output.len());
         assert!(output.contains("[outrig: tool result truncated]"));
     }
 
     #[test]
     fn adapt_tool_result_truncates_error_content() {
         let result = McpToolResult {
-            content_text: "e".repeat(CAP + 1),
+            content_text: "e".repeat(MAX + 1),
             is_error: true,
         };
 
-        let err = adapt_tool_result(result, CAP).expect_err("error result");
+        let err = adapt_tool_result(result, MAX).expect_err("error result");
         let ToolError::ToolCallError(source) = err else {
             panic!("expected tool-call error");
         };
         let msg = source.to_string();
 
-        assert!(msg.len() <= CAP, "error len: {}", msg.len());
+        assert!(msg.len() <= MAX, "error len: {}", msg.len());
         assert!(msg.contains("[outrig: tool result truncated]"));
     }
 }

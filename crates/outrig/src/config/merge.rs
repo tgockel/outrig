@@ -11,7 +11,7 @@ use super::Config;
 ///   are preserved as-is.
 /// - For top-level scalars (`default-image`, `default-agent`,
 ///   `default-model`, `session-root`, `model-cache-root`,
-///   `tool-call-cap`, `tool-result-cap`): repo's value wins if set,
+///   `tool-call-max`, `tool-result-max`): repo's value wins if set,
 ///   else global's.
 /// - `[network].mode` follows repo precedence when the repo file declares the
 ///   table. Policy keys (`default`, `allow`, `deny`) are global-only and are
@@ -54,8 +54,8 @@ pub fn merge(global: Config, repo: Config) -> Config {
         default_model: repo.default_model.or(global.default_model),
         session_root: repo.session_root.or(global.session_root),
         model_cache_root: repo.model_cache_root.or(global.model_cache_root),
-        tool_call_cap: repo.tool_call_cap.or(global.tool_call_cap),
-        tool_result_cap: repo.tool_result_cap.or(global.tool_result_cap),
+        tool_call_max: repo.tool_call_max.or(global.tool_call_max),
+        tool_result_max: repo.tool_result_max.or(global.tool_result_max),
         network,
         providers,
         models,

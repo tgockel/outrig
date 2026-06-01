@@ -26,8 +26,8 @@ default-agent     = "coding"
 default-model     = "fast"
 session-root      = "/var/lib/outrig/sessions"        # optional; defaults to XDG data dir
 model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XDG cache dir
-tool-call-cap     = 100                               # optional; defaults to 50
-tool-result-cap   = 262144                            # optional; defaults to 256 KiB
+tool-call-max     = 100                               # optional; defaults to 50
+tool-result-max   = 262144                            # optional; defaults to 256 KiB
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -43,16 +43,16 @@ deny  = ["*:22"]                                      # optional; global only
 | `default-model`    | string  | if agent omits `model` | global | Fallback model name.      |
 | `session-root`     | path    | no                     | global | Sessions root dir.        |
 | `model-cache-root` | path    | no                     | global | GGUF download cache dir.  |
-| `tool-call-cap`    | integer | no                     | global | Per-turn tool-call cap.   |
-| `tool-result-cap`  | integer | no                     | global | Per-tool-result byte cap. |
+| `tool-call-max`    | integer | no                     | global | Per-turn tool-call max.   |
+| `tool-result-max`  | integer | no                     | global | Per-tool-result byte max. |
 | `network.mode`     | string  | no                     | either | Network mode.             |
 | `network.default`  | string  | no                     | global | Filter fallback action.   |
 | `network.allow`    | array   | no                     | global | Filter allow entries.     |
 | `network.deny`     | array   | no                     | global | Filter deny entries.      |
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
-project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-cap`
-belong in the global config since they're user/machine-level. `tool-result-cap` usually belongs
+project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-max`
+belong in the global config since they're user/machine-level. `tool-result-max` usually belongs
 there too, although repo or agent config can tighten it for a noisy project. `[network].mode`
 can live in either file; when both set it, the repo value wins for that repo. Network policy
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
@@ -69,18 +69,18 @@ points at one specific session directory. See [Sessions](../usage/sessions.md).
 with `model-id` -- that's where the auto-downloaded GGUFs land. See
 [Concepts -> In-process LLMs](../concepts/in-process-llm.md).
 
-`tool-call-cap` is the default maximum number of tool calls in one user turn. The compiled-in
+`tool-call-max` is the default maximum number of tool calls in one user turn. The compiled-in
 default is `50`; config may set any value from `1` through `2000`.
-`[agents.<name>].tool-call-cap` overrides the top-level value for one agent, and
+`[agents.<name>].tool-call-max` overrides the top-level value for one agent, and
 `outrig run --max-tool-calls <n>` overrides both for one invocation.
 
-`tool-result-cap` is the default maximum byte size for one MCP tool result before it is added to
+`tool-result-max` is the default maximum byte size for one MCP tool result before it is added to
 the LLM-visible conversation history. The compiled-in default is `262144` bytes (256 KiB);
 config may set any value from `1024` through `16777216` bytes.
-`[agents.<name>].tool-result-cap` overrides the top-level value for one agent, and
+`[agents.<name>].tool-result-max` overrides the top-level value for one agent, and
 `outrig run --max-tool-result-bytes <n>` overrides both for one invocation. Results larger than
-the cap are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
-marker that reports the original size and cap.
+the max are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
+marker that reports the original size and max.
 
 ## `[network]`
 
@@ -305,8 +305,8 @@ image = "coding"
 preamble  = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 max-tokens  = 4096
-tool-call-cap = 300
-tool-result-cap = 1048576
+tool-call-max = 300
+tool-result-max = 1048576
 
 [agents.review]
 model    = "smart"        # explicit override of default-model
@@ -319,16 +319,16 @@ preamble = "You are a meticulous code reviewer..."
 - `image` (string, optional, default: `default-image`): default image-config
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
-- `max-tokens` (integer, optional, default: provider default): output token cap per turn.
-- `tool-call-cap` (integer, optional, default: top-level value or `50`): tool calls per turn.
-- `tool-result-cap` (integer, optional, default: top-level value or `262144`): bytes per result.
+- `max-tokens` (integer, optional, default: provider default): output token max per turn.
+- `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per turn.
+- `tool-result-max` (integer, optional, default: top-level value or `262144`): bytes per result.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
 `outrig run --agent <a>` runs, the chosen image-config is `--image` if given, otherwise
 `agents.<a>.image` if set, otherwise `default-image`.
-`tool-call-cap` is per turn, not per session; follow-up prompts start a fresh count.
-`tool-result-cap` is per result and applies equally to successful MCP results and MCP error
+`tool-call-max` is per turn, not per session; follow-up prompts start a fresh count.
+`tool-result-max` is per result and applies equally to successful MCP results and MCP error
 messages.
 
 ## `[workspace]`
@@ -526,8 +526,8 @@ global-only; repo config cannot set `network.default`, `network.allow`, or `netw
 default-model    = "fast"
 session-root     = "/var/lib/outrig/sessions"   # optional; default = XDG data dir
 model-cache-root = "/var/cache/outrig/models"   # optional; default = XDG cache dir
-tool-call-cap    = 100                           # optional; default = 50
-tool-result-cap  = 262144                        # optional; default = 256 KiB
+tool-call-max    = 100                           # optional; default = 50
+tool-result-max  = 262144                        # optional; default = 256 KiB
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -583,8 +583,8 @@ access         = "read-write"
 image       = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
-tool-call-cap = 300
-tool-result-cap = 1048576
+tool-call-max = 300
+tool-result-max = 1048576
 
 [agents.review]
 model    = "smart"        # explicit override
@@ -634,8 +634,8 @@ build-args = { NODE_VERSION = "20" }
   allowed on mistralrs models. `device`, if set, must be one of `cpu`, `cuda`,
   `cuda:N`, or `metal`.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
-- `tool-call-cap`, if set at the top level or on an agent, must be between `1` and `2000`.
-- `tool-result-cap`, if set at the top level or on an agent, must be between `1024` and
+- `tool-call-max`, if set at the top level or on an agent, must be between `1` and `2000`.
+- `tool-result-max`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.
 - `[network].mode`, if set, must be `default` or `audit`.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
