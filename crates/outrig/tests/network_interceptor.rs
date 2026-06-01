@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use outrig::config::{ContainerConfig, NetworkAction, NetworkPolicy};
+use outrig::config::{ImageConfig, NetworkAction, NetworkPolicy};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig::network::NetworkInterceptor;
@@ -38,7 +38,7 @@ RUN apk add --no-cache ca-certificates curl shadow
 }
 
 async fn ensure_curl_image(context: &Path) -> ImageTag {
-    let cfg = ContainerConfig {
+    let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),

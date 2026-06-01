@@ -67,7 +67,7 @@ pub const MAX_TOOL_RESULT_CAP_BYTES: u32 = 16 * 1024 * 1024;
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_container: Option<String>,
+    pub default_image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,7 +94,7 @@ pub struct Config {
     pub workspace: Workspace,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub containers: BTreeMap<String, ContainerConfig>,
+    pub images: BTreeMap<String, ImageConfig>,
 }
 
 impl Config {
@@ -308,7 +308,7 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container: Option<String>,
+    pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preamble: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -757,7 +757,7 @@ pub(crate) fn parse_network_host_pattern(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ContainerSecurity {
+pub struct ImageSecurity {
     pub capability_profile: CapabilityProfile,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_drop: Vec<String>,
@@ -765,7 +765,7 @@ pub struct ContainerSecurity {
     pub cap_add: Vec<String>,
 }
 
-impl ContainerSecurity {
+impl ImageSecurity {
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
@@ -801,7 +801,7 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ContainerConfig {
+pub struct ImageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -810,15 +810,15 @@ pub struct ContainerConfig {
     pub context: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, EnvValue>,
-    #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
-    pub security: ContainerSecurity,
+    #[serde(default, skip_serializing_if = "ImageSecurity::is_default")]
+    pub security: ImageSecurity,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
 
 /// Discriminated view of the container source -- build-from-Dockerfile or
-/// use-existing-image. Returned by [`ContainerConfig::source`].
-pub enum ContainerSourceRef<'a> {
+/// use-existing-image. Returned by [`ImageConfig::source`].
+pub enum ImageSourceRef<'a> {
     Build {
         dockerfile: &'a Path,
         context: &'a Path,
@@ -829,20 +829,20 @@ pub enum ContainerSourceRef<'a> {
     },
 }
 
-impl ContainerConfig {
+impl ImageConfig {
     /// Return the discriminated source variant. Panics if validation has not
     /// run (i.e. both or neither shape is set). Every real call path goes
     /// through `Config::load` which validates first.
-    pub fn source(&self) -> ContainerSourceRef<'_> {
+    pub fn source(&self) -> ImageSourceRef<'_> {
         match (&self.image_name, &self.dockerfile, &self.context) {
-            (Some(name), None, None) => ContainerSourceRef::Image { image_name: name },
-            (None, Some(df), Some(ctx)) => ContainerSourceRef::Build {
+            (Some(name), None, None) => ImageSourceRef::Image { image_name: name },
+            (None, Some(df), Some(ctx)) => ImageSourceRef::Build {
                 dockerfile: df,
                 context: ctx,
                 build_args: &self.build_args,
             },
             _ => panic!(
-                "ContainerConfig::source() called on an unvalidated config; \
+                "ImageConfig::source() called on an unvalidated config; \
                  call Config::validate() first"
             ),
         }

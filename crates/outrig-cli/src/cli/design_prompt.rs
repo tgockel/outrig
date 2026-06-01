@@ -17,7 +17,7 @@ pub struct DesignArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum DesignCommand {
-    /// Print a self-contained prompt for AI-assisted container-config design.
+    /// Print a self-contained prompt for AI-assisted image-config design.
     Prompt(PromptArgs),
 }
 
@@ -64,14 +64,14 @@ pub(crate) fn render_prompt() -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "You are designing a container-config for OutRig version {}.",
+        "You are designing an image-config for OutRig version {}.",
         env!("CARGO_PKG_VERSION")
     );
     out.push_str(
         "\n\
          OutRig runs LLM agents with MCP servers inside podman containers. \
          Produce a Dockerfile and a matching `.agents/outrig/config.toml` \
-         `[containers.<name>]` block. Respect these rules:\n\
+         `[images.<name>]` block. Respect these rules:\n\
          \n\
          - Keep the container alive with `CMD [\"sleep\", \"infinity\"]`.\n\
          - Do not add a Dockerfile `USER`; OutRig maps the host UID/GID at runtime.\n\
@@ -155,11 +155,11 @@ CMD ["sleep", "infinity"]
 ```
 
 ```toml
-[containers.rust-dev]
-dockerfile = ".agents/outrig/containers/rust-dev/Dockerfile"
-context = ".agents/outrig/containers/rust-dev"
+[images.rust-dev]
+dockerfile = ".agents/outrig/images/rust-dev/Dockerfile"
+context = ".agents/outrig/images/rust-dev"
 
-  [containers.rust-dev.mcp]
+  [images.rust-dev.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
@@ -181,11 +181,11 @@ CMD ["sleep", "infinity"]
 ```
 
 ```toml
-[containers.node-dev]
-dockerfile = ".agents/outrig/containers/node-dev/Dockerfile"
-context = ".agents/outrig/containers/node-dev"
+[images.node-dev]
+dockerfile = ".agents/outrig/images/node-dev/Dockerfile"
+context = ".agents/outrig/images/node-dev"
 
-  [containers.node-dev.mcp]
+  [images.node-dev.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
 "#;
@@ -208,11 +208,11 @@ CMD ["sleep", "infinity"]
 ```
 
 ```toml
-[containers.tools]
-dockerfile = ".agents/outrig/containers/tools/Dockerfile"
-context = ".agents/outrig/containers/tools"
+[images.tools]
+dockerfile = ".agents/outrig/images/tools/Dockerfile"
+context = ".agents/outrig/images/tools"
 
-  [containers.tools.mcp]
+  [images.tools.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
   git = { command = ["mcp-server-git", "--repository", "/workspace"] }
   build = { command = ["project-build-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }

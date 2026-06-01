@@ -1,23 +1,23 @@
-# `outrig container`
+# `outrig image`
 
-`outrig container` groups commands that manage container-configs (the named Dockerfile +
-MCP-server bundles that host the agent's tools). In v0 only `outrig container add` is implemented;
-the rest of the group (`container ls`, `container rm`) is reserved for later.
+`outrig image` groups commands that manage image-configs (the named Dockerfile +
+MCP-server bundles that host the agent's tools). In v0 only `outrig image add` is implemented;
+the rest of the group (`image ls`, `image rm`) is reserved for later.
 
-## `outrig container add`
+## `outrig image add`
 
-`outrig container add` scaffolds a new container-config. It writes a Dockerfile under
-`.agents/outrig/containers/<name>/Dockerfile` and appends matching `[containers.<name>]` and
-`[containers.<name>.mcp]` blocks to your repo's `config.toml`.
+`outrig image add` scaffolds a new image-config. It writes a Dockerfile under
+`.agents/outrig/images/<name>/Dockerfile` and appends matching `[images.<name>]` and
+`[images.<name>.mcp]` blocks to your repo's `config.toml`.
 
-Run it any time you want to add a container-config -- e.g., a `planning` config alongside
+Run it any time you want to add an image-config -- e.g., a `planning` config alongside
 the `<repo>-standard` one [`outrig init`](init.md) creates by default. `init` calls
-`container add` in a loop for the first (and any further) containers you create during
+`image add` in a loop for the first (and any further) image-configs you create during
 initial setup.
 
 ### Bootstrapping a fresh repo
 
-If you run `outrig container add` in a directory without an `.agents/outrig/config.toml`
+If you run `outrig image add` in a directory without an `.agents/outrig/config.toml`
 (neither here nor in any parent), outrig prompts before scaffolding:
 
 ```
@@ -26,39 +26,39 @@ If you run `outrig container add` in a directory without an `.agents/outrig/conf
 ```
 
 Answering `y` walks the same repo-config prompts that [`outrig init`](init.md) uses
-(workspace, default agent, preamble), then continues with the `container add` flow.
+(workspace, default agent, preamble), then continues with the `image add` flow.
 Answering `n` exits with the same error a strict `find` would have produced -- run
 `outrig init` later when you're ready.
 
 ### Synopsis
 
 ```
-outrig container add [<name>] [--force]
+outrig image add [<name>] [--force]
 ```
 
 | Argument / flag | Default  | Description                                                 |
 |-----------------|----------|-------------------------------------------------------------|
-| `<name>`        | prompted | Container-config name (becomes `[containers.<name>]`).      |
+| `<name>`        | prompted | Image-config name (becomes `[images.<name>]`).              |
 | `--force`       | off      | Overwrite existing Dockerfile/config entries for this name. |
 
 ### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
 Enter at any prompt for an explanation of what's being asked plus the available options.
-The default container-config name is `<repo-folder>-standard` (kebab-cased), so the example
+The default image-config name is `<repo-folder>-standard` (kebab-cased), so the example
 below assumes a `hello-outrig` repo.
 
 ```sh
 $ cd hello-outrig
-$ outrig container add
-? Container-config name [default: hello-outrig-standard]:
+$ outrig image add
+? Image-config name [default: hello-outrig-standard]:
 ? Base image [default: debian:bookworm-slim]:
 ? Language toolchains [default: ]: rust, node
 ? MCP servers [default: fs]:
 
-[outrig] wrote .agents/outrig/containers/hello-outrig-standard/Dockerfile
-[outrig] added [containers.hello-outrig-standard] block to .agents/outrig/config.toml
-[outrig] added [containers.hello-outrig-standard.mcp] entries: fs
+[outrig] wrote .agents/outrig/images/hello-outrig-standard/Dockerfile
+[outrig] added [images.hello-outrig-standard] block to .agents/outrig/config.toml
+[outrig] added [images.hello-outrig-standard.mcp] entries: fs
 
 Next: try `outrig build` to verify the image builds, then `outrig run`.
 ```
@@ -80,7 +80,7 @@ by hand, not an exhaustive Dockerfile generator.
   go      Go 1.22.
   none    Just the base image -- nothing extra installed.
 
-  See: https://tgockel.github.io/outrig/usage/container.html#known-toolchains
+  See: https://tgockel.github.io/outrig/usage/image.html#known-toolchains
 
 ? Language toolchains [default: ]:
 ```
@@ -107,25 +107,25 @@ You can pick more than one. The Dockerfile is a starting point -- edit it freely
   `{ command = ["mcp-server-git", "--repository", "/workspace"] }`.
 
 `fs` is the default. Add `git` for repo-aware tools, or wire up additional servers by
-editing the `[containers.<name>.mcp]` block directly -- see
+editing the `[images.<name>.mcp]` block directly -- see
 [Concepts -> MCP Servers](../concepts/mcp-servers.md).
-A shell MCP server is the usual next tool for coding containers; choose a package, install it in
-the Dockerfile, and declare its command in `[containers.<name>.mcp]`.
+A shell MCP server is the usual next tool for coding image-configs; choose a package, install it
+in the Dockerfile, and declare its command in `[images.<name>.mcp]`.
 
 > **TODO: Incomplete** -- the list of "known MCP servers" will grow as the ecosystem does.
 > Anything not listed here you install in the Dockerfile by hand.
 
 ### When templates do not fit
 
-The prompt flow is intentionally small. If you need a container with a database, internal SDK,
+The prompt flow is intentionally small. If you need an image with a database, internal SDK,
 unlisted MCP server, or other custom package set, use
 [`outrig mcp self`](ai-assisted-design.md). It gives an MCP-capable AI tool the OutRig docs,
 config schema, suggested tools, and advisory validators so it can propose a Dockerfile and
-matching `[containers.<name>]` block without being limited to the built-in template menu.
+matching `[images.<name>]` block without being limited to the built-in template menu.
 
 ### What gets written
 
-`.agents/outrig/containers/hello-outrig-standard/Dockerfile` (excerpt):
+`.agents/outrig/images/hello-outrig-standard/Dockerfile` (excerpt):
 
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
@@ -160,11 +160,11 @@ matching your host UID/GID at run time (see
 Appended to `.agents/outrig/config.toml`:
 
 ```toml
-[containers.hello-outrig-standard]
-dockerfile = ".agents/outrig/containers/hello-outrig-standard/Dockerfile"
-context    = ".agents/outrig/containers/hello-outrig-standard"
+[images.hello-outrig-standard]
+dockerfile = ".agents/outrig/images/hello-outrig-standard/Dockerfile"
+context    = ".agents/outrig/images/hello-outrig-standard"
 
-  [containers.hello-outrig-standard.mcp]
+  [images.hello-outrig-standard.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
 
@@ -174,21 +174,21 @@ Without `--force`, outrig refuses if either the Dockerfile path or the config bl
 exists for that name:
 
 ```
-$ outrig container add hello-outrig-standard
-error: .agents/outrig/containers/hello-outrig-standard/Dockerfile
+$ outrig image add hello-outrig-standard
+error: .agents/outrig/images/hello-outrig-standard/Dockerfile
        already exists; pass --force to overwrite.
 ```
 
-With `--force`, the Dockerfile is replaced and the `[containers.<name>]` block is rewritten in
+With `--force`, the Dockerfile is replaced and the `[images.<name>]` block is rewritten in
 place (preserving surrounding TOML).
 
 ## See also
 
-- [outrig init](init.md) -- runs `container add` in a loop as the last step of initial setup.
+- [outrig init](init.md) -- runs `image add` in a loop as the last step of initial setup.
 - [Concepts -> Containers](../concepts/containers.md) -- Dockerfile conventions and named
-  container-configs.
-- [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- the MCP servers `container add`
+  image-configs.
+- [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- the MCP servers `image add`
   scaffolds.
-- [AI-assisted design](ai-assisted-design.md) -- design a custom container-config with
+- [AI-assisted design](ai-assisted-design.md) -- design a custom image-config with
   `outrig mcp self`.
-- [Reference -> Config](../reference/config.md) -- the `[containers.<name>]` schema.
+- [Reference -> Config](../reference/config.md) -- the `[images.<name>]` schema.

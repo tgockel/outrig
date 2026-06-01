@@ -80,7 +80,7 @@ pub struct Session {
     pub ended_at: Option<SystemTime>,
     pub container_name: String,
     pub image_tag: String,
-    pub container_config_name: String,
+    pub image_config_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub working_dir: PathBuf,

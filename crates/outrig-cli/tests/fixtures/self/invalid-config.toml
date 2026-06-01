@@ -1,6 +1,6 @@
-[containers.c]
+[images.c]
 dockerfile = "Dockerfile"
 context = "."
 
-[containers.c.mcp]
+[images.c.mcp]
 "bad.name" = ["mcp"]

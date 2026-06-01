@@ -1,6 +1,6 @@
 # `outrig build`
 
-`outrig build` builds (or cache-hits) the image for one or more container-configs, without
+`outrig build` builds (or cache-hits) the image for one or more image-configs, without
 starting an agent session. It's useful for:
 
 - Verifying your `Dockerfile` builds cleanly before you start an agent.
@@ -10,15 +10,15 @@ starting an agent session. It's useful for:
 ## Synopsis
 
 ```
-outrig build [--container <name>]
+outrig build [--image <name>]
              [--config <path>]
              [--no-cache]
              [--all]
 ```
 
-- `--container <name>` (default: `default-container`): build a specific named
-  container-config.
-- `--all` (default: off): build every container-config defined in the config file.
+- `--image <name>` (default: `default-image`): build a specific named
+  image-config.
+- `--all` (default: off): build every image-config defined in the config file.
 - `--config <path>` (default: walks up from cwd): use a non-default config path.
 - `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
   to `buildah`.
@@ -26,7 +26,7 @@ outrig build [--container <name>]
 ## What it does
 
 1. Loads `.agents/outrig/config.toml`.
-2. For each selected container-config:
+2. For each selected image-config:
    - Computes the cache key (blake3 over Dockerfile content + resolved build-args +
      context content hash).
    - If a tag matching that key exists and `--no-cache` is not set, prints
@@ -45,9 +45,9 @@ Build the default:
 
 ```sh
 $ outrig build
-[outrig] container-config: coding
-[outrig] dockerfile:       .agents/outrig/containers/coding/Dockerfile
-[outrig] context:          .agents/outrig/containers/coding
+[outrig] image-config: coding
+[outrig] dockerfile:       .agents/outrig/images/coding/Dockerfile
+[outrig] context:          .agents/outrig/images/coding
 [outrig] cache key:        outrig-cache:8c2a4f7e91d6b5a3
 [buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
 ...
@@ -61,21 +61,21 @@ $ outrig build
 [outrig] image ready (cache hit: outrig-cache:8c2a4f7e91d6b5a3)
 ```
 
-Build a specific container-config:
+Build a specific image-config:
 
 ```sh
-$ outrig build --container planning
-[outrig] container-config: planning
+$ outrig build --image planning
+[outrig] image-config: planning
 ...
 [outrig] image ready
 ```
 
-Build every container-config in one go:
+Build every image-config in one go:
 
 ```sh
 $ outrig build --all
-[outrig] container-config: coding   -> outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] container-config: planning -> outrig-cache:b91e3a6d217f4c08 (built in 27s)
+[outrig] image-config: coding   -> outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
+[outrig] image-config: planning -> outrig-cache:b91e3a6d217f4c08 (built in 27s)
 [outrig] all images ready
 ```
 

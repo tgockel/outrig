@@ -3,7 +3,7 @@
 //!
 //! `api-key` syntax is enforced at parse time by `super::api_key`; this module
 //! only checks cross-references, MCP server-name shape, and disk-existence of
-//! container `dockerfile` / `context` paths.
+//! image `dockerfile` / `context` paths.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -13,15 +13,15 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ContainerConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
+    Config, ImageConfig, LlmProvider, MAX_TOOL_CALL_CAP, MAX_TOOL_RESULT_CAP_BYTES,
     MIN_TOOL_RESULT_CAP_BYTES, McpServerSpec, MistralrsDeviceSpec, Model, NetworkMode,
     normalize_capability_name,
 };
 
 #[derive(Debug, Error)]
 pub enum ConfigValidationError {
-    #[error("default-container {name:?} does not match any [containers.<name>]")]
-    UnknownDefaultContainer { name: String },
+    #[error("default-image {name:?} does not match any [images.<name>]")]
+    UnknownDefaultImage { name: String },
 
     #[error("default-agent {name:?} does not match any [agents.<name>]")]
     UnknownDefaultAgent { name: String },
@@ -36,10 +36,10 @@ pub enum ConfigValidationError {
     AgentMissingModel { agent: String },
 
     #[error(
-        "agent {agent:?} has container={container:?} which does not match any \
-         [containers.<name>]"
+        "agent {agent:?} has image={image:?} which does not match any \
+         [images.<name>]"
     )]
-    UnknownAgentContainer { agent: String, container: String },
+    UnknownAgentImage { agent: String, image: String },
 
     #[error(
         "model {model:?} has provider={provider:?} which does not match any \
@@ -48,44 +48,44 @@ pub enum ConfigValidationError {
     UnknownModelProvider { model: String, provider: String },
 
     #[error(
-        "container {container:?} has invalid mcp server name {server:?} \
+        "image {image:?} has invalid mcp server name {server:?} \
          (must match ^[a-zA-Z][a-zA-Z0-9_-]*$)"
     )]
-    InvalidMcpServerName { container: String, server: String },
+    InvalidMcpServerName { image: String, server: String },
 
-    #[error("container {container:?} mcp server {server:?} has empty command")]
-    EmptyMcpCommand { container: String, server: String },
+    #[error("image {image:?} mcp server {server:?} has empty command")]
+    EmptyMcpCommand { image: String, server: String },
 
-    #[error("container {container:?}: neither `image-name` nor `dockerfile`+`context` is set")]
-    ContainerSourceMissing { container: String },
+    #[error("image {image:?}: neither `image-name` nor `dockerfile`+`context` is set")]
+    ImageSourceMissing { image: String },
 
     #[error(
-        "container {container:?}: conflicting fields {fields:?} -- set either `image-name` \
+        "image {image:?}: conflicting fields {fields:?} -- set either `image-name` \
          or `dockerfile`+`context`, not both"
     )]
-    ContainerSourceConflict {
-        container: String,
+    ImageSourceConflict {
+        image: String,
         fields: Vec<&'static str>,
     },
 
-    #[error("container {container:?}: `image-name` must not be empty")]
-    ContainerImageNameEmpty { container: String },
+    #[error("image {image:?}: `image-name` must not be empty")]
+    ImageNameEmpty { image: String },
 
-    #[error("container {container:?}: `{missing}` is required when `{present}` is set")]
-    ContainerHalfBuilt {
-        container: String,
+    #[error("image {image:?}: `{missing}` is required when `{present}` is set")]
+    ImageHalfBuilt {
+        image: String,
         present: &'static str,
         missing: &'static str,
     },
 
-    #[error("container {container:?}: `build-args` cannot be used with `image-name`")]
-    ContainerImageNameWithBuildArgs { container: String },
+    #[error("image {image:?}: `build-args` cannot be used with `image-name`")]
+    ImageNameWithBuildArgs { image: String },
 
-    #[error("container {container:?} dockerfile path {path:?} does not exist")]
-    DockerfileMissing { container: String, path: PathBuf },
+    #[error("image {image:?} dockerfile path {path:?} does not exist")]
+    DockerfileMissing { image: String, path: PathBuf },
 
-    #[error("container {container:?} context path {path:?} does not exist")]
-    ContextMissing { container: String, path: PathBuf },
+    #[error("image {image:?} context path {path:?} does not exist")]
+    ContextMissing { image: String, path: PathBuf },
 
     #[error("session-root {path:?} must be an absolute path")]
     SessionRootNotAbsolute { path: PathBuf },
@@ -108,39 +108,31 @@ pub enum ConfigValidationError {
     #[error("workspace mount container-path {path:?} is declared more than once")]
     WorkspaceMountContainerDuplicate { path: PathBuf },
 
-    #[error("container {container:?}: `{field}` capability name must not be empty")]
-    CapabilityNameEmpty {
-        container: String,
-        field: &'static str,
-    },
+    #[error("image {image:?}: `{field}` capability name must not be empty")]
+    CapabilityNameEmpty { image: String, field: &'static str },
 
     #[error(
-        "container {container:?}: `{field}` capability {capability:?} must match \
+        "image {image:?}: `{field}` capability {capability:?} must match \
          ^[A-Z0-9_]+$ after optional CAP_ stripping"
     )]
     CapabilityNameInvalid {
-        container: String,
+        image: String,
         field: &'static str,
         capability: String,
     },
 
-    #[error(
-        "container {container:?}: `{field}` capability {capability:?} is declared more than once"
-    )]
+    #[error("image {image:?}: `{field}` capability {capability:?} is declared more than once")]
     CapabilityNameDuplicate {
-        container: String,
+        image: String,
         field: &'static str,
         capability: String,
     },
 
     #[error(
-        "container {container:?}: capability {capability:?} is listed in both `cap-drop` \
+        "image {image:?}: capability {capability:?} is listed in both `cap-drop` \
          and `cap-add`"
     )]
-    CapabilityDropAddConflict {
-        container: String,
-        capability: String,
-    },
+    CapabilityDropAddConflict { image: String, capability: String },
 
     #[error("{path} must be between 1 and {max}; got {value}")]
     ToolCallCapOutOfRange { path: String, value: u32, max: u32 },
@@ -225,10 +217,10 @@ pub(super) fn validate_with_options(
 ) -> Result<(), ConfigValidationError> {
     validate_workspace_mounts(cfg, repo_root)?;
 
-    if let Some(name) = &cfg.default_container
-        && !cfg.containers.contains_key(name)
+    if let Some(name) = &cfg.default_image
+        && !cfg.images.contains_key(name)
     {
-        return Err(ConfigValidationError::UnknownDefaultContainer { name: name.clone() });
+        return Err(ConfigValidationError::UnknownDefaultImage { name: name.clone() });
     }
     if let Some(name) = &cfg.default_agent
         && !cfg.agents.contains_key(name)
@@ -263,30 +255,30 @@ pub(super) fn validate_with_options(
                 }
             }
         }
-        if let Some(c) = &agent.container
-            && !cfg.containers.contains_key(c)
+        if let Some(c) = &agent.image
+            && !cfg.images.contains_key(c)
         {
-            return Err(ConfigValidationError::UnknownAgentContainer {
+            return Err(ConfigValidationError::UnknownAgentImage {
                 agent: agent_name.clone(),
-                container: c.clone(),
+                image: c.clone(),
             });
         }
     }
 
-    for (container_name, container) in &cfg.containers {
-        validate_container_source(container_name, container, repo_root)?;
-        validate_container_security(container_name, container)?;
+    for (image_name, image) in &cfg.images {
+        validate_image_source(image_name, image, repo_root)?;
+        validate_image_security(image_name, image)?;
 
-        for (server_name, spec) in &container.mcp {
+        for (server_name, spec) in &image.mcp {
             if !is_valid_mcp_server_name(server_name) {
                 return Err(ConfigValidationError::InvalidMcpServerName {
-                    container: container_name.clone(),
+                    image: image_name.clone(),
                     server: server_name.clone(),
                 });
             }
             if mcp_command_is_empty(spec) {
                 return Err(ConfigValidationError::EmptyMcpCommand {
-                    container: container_name.clone(),
+                    image: image_name.clone(),
                     server: server_name.clone(),
                 });
             }
@@ -345,16 +337,16 @@ fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {
         .map_err(|message| ConfigValidationError::NetworkPolicyInvalid { message })
 }
 
-fn validate_container_security(
-    container_name: &str,
-    container: &ContainerConfig,
+fn validate_image_security(
+    image_name: &str,
+    image: &ImageConfig,
 ) -> Result<(), ConfigValidationError> {
-    let drops = validate_capability_list(container_name, "cap-drop", &container.security.cap_drop)?;
-    let adds = validate_capability_list(container_name, "cap-add", &container.security.cap_add)?;
+    let drops = validate_capability_list(image_name, "cap-drop", &image.security.cap_drop)?;
+    let adds = validate_capability_list(image_name, "cap-add", &image.security.cap_add)?;
 
     if let Some(capability) = drops.intersection(&adds).next() {
         return Err(ConfigValidationError::CapabilityDropAddConflict {
-            container: container_name.to_string(),
+            image: image_name.to_string(),
             capability: capability.clone(),
         });
     }
@@ -363,7 +355,7 @@ fn validate_container_security(
 }
 
 fn validate_capability_list(
-    container_name: &str,
+    image_name: &str,
     field: &'static str,
     capabilities: &[String],
 ) -> Result<BTreeSet<String>, ConfigValidationError> {
@@ -373,12 +365,12 @@ fn validate_capability_list(
         let Some(normalized) = normalize_capability_name(capability) else {
             if super::capability_name_without_prefix(capability).is_empty() {
                 return Err(ConfigValidationError::CapabilityNameEmpty {
-                    container: container_name.to_string(),
+                    image: image_name.to_string(),
                     field,
                 });
             }
             return Err(ConfigValidationError::CapabilityNameInvalid {
-                container: container_name.to_string(),
+                image: image_name.to_string(),
                 field,
                 capability: capability.clone(),
             });
@@ -386,7 +378,7 @@ fn validate_capability_list(
 
         if !seen.insert(normalized.clone()) {
             return Err(ConfigValidationError::CapabilityNameDuplicate {
-                container: container_name.to_string(),
+                image: image_name.to_string(),
                 field,
                 capability: normalized,
             });
@@ -592,16 +584,16 @@ fn mcp_server_name_re() -> &'static Regex {
     })
 }
 
-/// Validate the XOR constraint on container source fields: exactly one of
+/// Validate the XOR constraint on image source fields: exactly one of
 /// `image-name` or `dockerfile`+`context` must be set.
-fn validate_container_source(
-    container_name: &str,
-    container: &ContainerConfig,
+fn validate_image_source(
+    image_name: &str,
+    image: &ImageConfig,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
-    let has_image_name = container.image_name.is_some();
-    let has_dockerfile = container.dockerfile.is_some();
-    let has_context = container.context.is_some();
+    let has_image_name = image.image_name.is_some();
+    let has_dockerfile = image.dockerfile.is_some();
+    let has_context = image.context.is_some();
 
     if has_image_name {
         // image-name path: reject any build-path fields.
@@ -613,40 +605,40 @@ fn validate_container_source(
             conflicts.push("context");
         }
         if conflicts.len() > 1 {
-            return Err(ConfigValidationError::ContainerSourceConflict {
-                container: container_name.to_string(),
+            return Err(ConfigValidationError::ImageSourceConflict {
+                image: image_name.to_string(),
                 fields: conflicts,
             });
         }
-        if !container.build_args.is_empty() {
-            return Err(ConfigValidationError::ContainerImageNameWithBuildArgs {
-                container: container_name.to_string(),
+        if !image.build_args.is_empty() {
+            return Err(ConfigValidationError::ImageNameWithBuildArgs {
+                image: image_name.to_string(),
             });
         }
-        let name = container.image_name.as_deref().unwrap();
+        let name = image.image_name.as_deref().unwrap();
         if name.is_empty() {
-            return Err(ConfigValidationError::ContainerImageNameEmpty {
-                container: container_name.to_string(),
+            return Err(ConfigValidationError::ImageNameEmpty {
+                image: image_name.to_string(),
             });
         }
     } else {
         // Build path: require both dockerfile and context.
         match (has_dockerfile, has_context) {
             (false, false) => {
-                return Err(ConfigValidationError::ContainerSourceMissing {
-                    container: container_name.to_string(),
+                return Err(ConfigValidationError::ImageSourceMissing {
+                    image: image_name.to_string(),
                 });
             }
             (true, false) => {
-                return Err(ConfigValidationError::ContainerHalfBuilt {
-                    container: container_name.to_string(),
+                return Err(ConfigValidationError::ImageHalfBuilt {
+                    image: image_name.to_string(),
                     present: "dockerfile",
                     missing: "context",
                 });
             }
             (false, true) => {
-                return Err(ConfigValidationError::ContainerHalfBuilt {
-                    container: container_name.to_string(),
+                return Err(ConfigValidationError::ImageHalfBuilt {
+                    image: image_name.to_string(),
                     present: "context",
                     missing: "dockerfile",
                 });
@@ -656,19 +648,19 @@ fn validate_container_source(
 
         // On-disk existence checks for the build path.
         if let Some(root) = repo_root {
-            let dockerfile = container.dockerfile.as_ref().unwrap();
+            let dockerfile = image.dockerfile.as_ref().unwrap();
             let df_path = root.join(dockerfile);
             if !df_path.exists() {
                 return Err(ConfigValidationError::DockerfileMissing {
-                    container: container_name.to_string(),
+                    image: image_name.to_string(),
                     path: dockerfile.clone(),
                 });
             }
-            let context = container.context.as_ref().unwrap();
+            let context = image.context.as_ref().unwrap();
             let ctx_path = root.join(context);
             if !ctx_path.exists() {
                 return Err(ConfigValidationError::ContextMissing {
-                    container: container_name.to_string(),
+                    image: image_name.to_string(),
                     path: context.clone(),
                 });
             }

@@ -6,11 +6,11 @@ without copy-pasting:
 
 - **Provider** -- where to talk to (`base-url`, `api-key`, wire format).
 - **Model** -- a named identifier living on one provider (e.g. `gpt-4o-mini` on `openai`).
-- **Agent** -- a runnable unit: model + system preamble (+ optional default container).
+- **Agent** -- a runnable unit: model + system preamble (+ optional default image).
 
 Most users keep providers and models in the **global** config (`~/.outrig/config.toml`) since
 those depend on the user's accounts and preferences. Agents typically live in the **repo** config
-because their preambles and container choices are project-specific.
+because their preambles and image choices are project-specific.
 
 ```mermaid
 flowchart LR
@@ -23,14 +23,14 @@ flowchart LR
     subgraph repo[".agents/outrig/config.toml"]
         a1["[agents.coding]<br/>preamble"]
         a2["[agents.review]<br/>preamble"]
-        cont["[containers.coding]"]
+        cont["[images.coding]"]
     end
     user --> prov
     m1 --> prov
     m2 --> prov
     a1 --> m1
     a2 --> m2
-    a1 -. "container" .-> cont
+    a1 -. "image" .-> cont
 ```
 
 ## `[providers.<name>]`
@@ -78,12 +78,12 @@ identifier; every agent using that name picks up the change.
 
 ## `[agents.<name>]`
 
-An agent ties a model to a system preamble and (optionally) a default container.
+An agent ties a model to a system preamble and (optionally) a default image.
 
 ```toml
 [agents.coding]
 # model omitted -> falls back to top-level default-model
-container   = "coding"
+image       = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 tool-call-cap = 300
@@ -96,8 +96,8 @@ preamble = "You are a meticulous code reviewer. Be specific about line numbers."
 
 `model` is optional. If set, it must reference one of the names you defined under
 `[models.<name>]`; if omitted, the agent inherits the top-level `default-model` (typically
-declared in `~/.outrig/config.toml`). `container` is optional too: if set, `outrig run --agent
-<name>` defaults to that container-config. `preamble` is the system prompt the agent operates
+declared in `~/.outrig/config.toml`). `image` is optional too: if set, `outrig run --agent
+<name>` defaults to that image-config. `preamble` is the system prompt the agent operates
 under -- the place to encode role, scope, voice.
 
 `temperature` and `max-tokens` live on the agent because the same underlying model is often used
@@ -255,10 +255,10 @@ api-key  = "${OPENAI_API_KEY}"
 | `[models.<name>]`     | typical home (reused names)      | allowed for repo-specific models    |
 | `[agents.<name>]`     | rare                             | typical home                        |
 | `[workspace]`         | --                               | repo only                           |
-| `[containers.<name>]` | --                               | repo only                           |
+| `[images.<name>]` | --                               | repo only                           |
 | `default-model`       | typical home                     | optional override                   |
 | `default-agent`       | rare                             | required for `outrig run`           |
-| `default-container`   | rare                             | required for `outrig run`           |
+| `default-image`   | rare                             | required for `outrig run`           |
 
 If a name is defined in both, the repo wins -- override by redefining.
 

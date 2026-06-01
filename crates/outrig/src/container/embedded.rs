@@ -22,12 +22,12 @@ pub const EMBEDDED_CONTAINER_CONFIG_PATH: &str = "/etc/outrig/container.toml";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
-pub struct EmbeddedContainerConfig {
+pub struct EmbeddedImageConfig {
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
 
 #[derive(Debug, Error)]
-pub enum EmbeddedContainerConfigError {
+pub enum EmbeddedImageConfigError {
     #[error("content is not valid UTF-8: {0}")]
     NonUtf8(#[from] FromUtf8Error),
 
@@ -41,7 +41,7 @@ pub enum EmbeddedContainerConfigError {
     EmptyMcpCommand { server: String },
 }
 
-pub async fn read_embedded_container(container: &Container) -> Result<EmbeddedContainerConfig> {
+pub async fn read_embedded_container(container: &Container) -> Result<EmbeddedImageConfig> {
     let cmd = podman_exec_root(container.name())
         .arg("cat")
         .arg(EMBEDDED_CONTAINER_CONFIG_PATH);
@@ -50,7 +50,7 @@ pub async fn read_embedded_container(container: &Container) -> Result<EmbeddedCo
 
     if !output.status.success() {
         if is_missing_embedded_config(&output.stderr) {
-            return Ok(EmbeddedContainerConfig::default());
+            return Ok(EmbeddedImageConfig::default());
         }
         return Err(process::process_error_from_output(cmd, output));
     }
@@ -58,13 +58,10 @@ pub async fn read_embedded_container(container: &Container) -> Result<EmbeddedCo
     parse_embedded_container(container.name(), output.stdout)
 }
 
-pub fn parse_embedded_container(
-    container: &str,
-    bytes: Vec<u8>,
-) -> Result<EmbeddedContainerConfig> {
+pub fn parse_embedded_container(container: &str, bytes: Vec<u8>) -> Result<EmbeddedImageConfig> {
     let text = String::from_utf8(bytes)
         .map_err(|source| embedded_parse_error(container, source.into()))?;
-    let cfg = toml::from_str::<EmbeddedContainerConfig>(&text)
+    let cfg = toml::from_str::<EmbeddedImageConfig>(&text)
         .map_err(|source| embedded_parse_error(container, source.into()))?;
     validate_embedded_container(container, &cfg)?;
     Ok(cfg)
@@ -88,12 +85,12 @@ pub fn merge_mcp(
     image
 }
 
-fn validate_embedded_container(container: &str, cfg: &EmbeddedContainerConfig) -> Result<()> {
+fn validate_embedded_container(container: &str, cfg: &EmbeddedImageConfig) -> Result<()> {
     for (server, spec) in &cfg.mcp {
         if !is_valid_mcp_server_name(server) {
             return Err(embedded_parse_error(
                 container,
-                EmbeddedContainerConfigError::InvalidMcpServerName {
+                EmbeddedImageConfigError::InvalidMcpServerName {
                     server: server.clone(),
                 },
             ));
@@ -101,7 +98,7 @@ fn validate_embedded_container(container: &str, cfg: &EmbeddedContainerConfig) -
         if mcp_command_is_empty(spec) {
             return Err(embedded_parse_error(
                 container,
-                EmbeddedContainerConfigError::EmptyMcpCommand {
+                EmbeddedImageConfigError::EmptyMcpCommand {
                     server: server.clone(),
                 },
             ));
@@ -110,7 +107,7 @@ fn validate_embedded_container(container: &str, cfg: &EmbeddedContainerConfig) -
     Ok(())
 }
 
-fn embedded_parse_error(container: &str, source: EmbeddedContainerConfigError) -> OutrigError {
+fn embedded_parse_error(container: &str, source: EmbeddedImageConfigError) -> OutrigError {
     OutrigError::EmbeddedContainerParse {
         container: container.to_string(),
         source: Box::new(source),

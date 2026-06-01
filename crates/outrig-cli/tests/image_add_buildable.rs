@@ -1,4 +1,4 @@
-//! End-to-end test that `outrig container add` produces a Dockerfile that
+//! End-to-end test that `outrig image add` produces a Dockerfile that
 //! actually builds. Gated behind `--features e2e` because it shells out to
 //! a real `buildah` and pulls a real base image.
 //!
@@ -21,7 +21,7 @@ use tokio::time::timeout;
 
 use outrig::config::Config;
 use outrig::image;
-use outrig_cli::container_setup::add::run_with;
+use outrig_cli::image_setup::add::run_with;
 
 use common::scripted_prompt;
 
@@ -53,12 +53,9 @@ async fn generated_alpine_image_builds() {
 
     let cfg_text = std::fs::read_to_string(tmp.path().join(".agents/outrig/config.toml")).unwrap();
     let cfg = Config::load_from_str(&cfg_text).expect("config must parse");
-    let container = cfg
-        .containers
-        .get("coding")
-        .expect("coding container present");
+    let image = cfg.images.get("coding").expect("coding image present");
 
-    let outcome = image::ensure_image(container, tmp.path(), false)
+    let outcome = image::ensure_image(image, tmp.path(), false)
         .await
         .expect("ensure_image must succeed against generated config");
     assert!(!outcome.tag.0.is_empty(), "image tag must not be empty");

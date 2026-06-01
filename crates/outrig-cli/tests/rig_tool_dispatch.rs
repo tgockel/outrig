@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use outrig::McpClient;
-use outrig::config::{ContainerConfig, McpServerSpec};
+use outrig::config::{ImageConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig_cli::rig_tool::McpToolAdapter;
@@ -42,7 +42,7 @@ fn init_tracing() {
 }
 
 async fn ensure_fixture_image() -> ImageTag {
-    let cfg = ContainerConfig {
+    let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),

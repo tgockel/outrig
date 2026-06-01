@@ -1,7 +1,7 @@
 # Mirror of doc/reference/config.md "Full examples", flattened into one file
 # so the schema fixture exercises every legal section in a single round-trip.
 
-default-container = "coding"
+default-image = "coding"
 default-agent     = "coding"
 default-model     = "fast"
 session-root      = "/var/lib/outrig/sessions"
@@ -47,7 +47,7 @@ model-path     = ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
 context-length = 4096
 
 [agents.coding]
-container   = "coding"
+image   = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 max-tokens  = 4096
@@ -71,17 +71,17 @@ host-path      = ".agents/outrig/resources/cache"
 container-path = "/resources/cache"
 access         = "read-write"
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
 build-args = { NODE_VERSION = "20" }
 
-  [containers.coding.security]
+  [images.coding.security]
   capability-profile = "no-net-raw"
   cap-drop = ["MKNOD", "SETFCAP"]
   cap-add  = ["NET_BIND_SERVICE"]
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   shell = ["bash", "-lc", "exec shell-mcp-command"]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }

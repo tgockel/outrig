@@ -28,20 +28,20 @@ fn install_tracing() {
         .try_init();
 }
 
-fn write_repo(repo: &Path, container_blocks: &[(&str, &str)], default_container: Option<&str>) {
+fn write_repo(repo: &Path, container_blocks: &[(&str, &str)], default_image: Option<&str>) {
     let agents = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents).unwrap();
 
     let mut cfg = String::new();
-    if let Some(name) = default_container {
-        cfg.push_str(&format!("default-container = \"{name}\"\n\n"));
+    if let Some(name) = default_image {
+        cfg.push_str(&format!("default-image = \"{name}\"\n\n"));
     }
     for (name, dockerfile_body) in container_blocks {
         let dir = repo.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("Dockerfile"), dockerfile_body).unwrap();
         cfg.push_str(&format!(
-            "[containers.{name}]\ndockerfile = \"{name}/Dockerfile\"\ncontext = \"{name}\"\n\n"
+            "[images.{name}]\ndockerfile = \"{name}/Dockerfile\"\ncontext = \"{name}\"\n\n"
         ));
     }
     std::fs::write(agents.join("config.toml"), cfg).unwrap();
@@ -59,12 +59,12 @@ fn try_capture(cmd: &mut Command) -> Output {
 async fn tag_for(repo: &Path, container: &str) -> String {
     let cfg_text = std::fs::read_to_string(repo.join(".agents/outrig/config.toml")).unwrap();
     let cfg = Config::load_from_str(&cfg_text).expect("config parses");
-    let cc = cfg.containers.get(container).expect("container exists");
+    let cc = cfg.images.get(container).expect("container exists");
     image::compute_tag(cc, repo).await.unwrap().0
 }
 
 #[tokio::test]
-async fn build_default_container_then_cache_hits() {
+async fn build_default_image_then_cache_hits() {
     install_tracing();
 
     let tmp = tempfile::tempdir().unwrap();

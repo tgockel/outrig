@@ -52,7 +52,7 @@ async fn ls_lists_newest_first() {
     assert!(out.contains("ID"));
     assert!(out.contains("STARTED"));
     assert!(out.contains("DURATION"));
-    assert!(out.contains("CONTAINER"));
+    assert!(out.contains("IMAGE"));
     assert!(out.contains("EXIT"));
 }
 

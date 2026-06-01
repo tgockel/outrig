@@ -1,26 +1,26 @@
-default-container = "outrig-standard"
-default-agent     = "coding"
+default-image = "outrig-standard"
+default-agent = "coding"
 
 [workspace]
 host-path      = "."
 container-path = "/workspace"
 
 [agents.coding]
-container = "outrig-standard"
-preamble  = "You are a careful coding assistant. The repo is mounted at /workspace."
+image    = "outrig-standard"
+preamble = "You are a careful coding assistant. The repo is mounted at /workspace."
 
-[containers.outrig-standard]
-dockerfile = ".agents/outrig/containers/outrig-standard/Dockerfile"
-context    = ".agents/outrig/containers/outrig-standard"
+[images.outrig-standard]
+dockerfile = ".agents/outrig/images/outrig-standard/Dockerfile"
+context    = ".agents/outrig/images/outrig-standard"
 
-  [containers.outrig-standard.mcp]
+  [images.outrig-standard.mcp]
   fs  = { command = ["mcp-server-filesystem", "/workspace"] }
   git = { command = ["mcp-server-git", "--repository", "/workspace"] }
 
-  [containers.outrig-standard.mcp.shell]
+  [images.outrig-standard.mcp.shell]
   command = ["mcp-shell-server"]
 
-    [containers.outrig-standard.mcp.shell.env]
+    [images.outrig-standard.mcp.shell.env]
     ALLOW_COMMANDS = "cargo,mdbook,mdbook-mermaid,lychee,python3,git,rg,grep,sed,awk,find,ls,cat,pwd,wc,head,tail"
     CARGO_HOME     = "/workspace/.cargo"
     RUSTUP_HOME    = "/usr/local/rustup"

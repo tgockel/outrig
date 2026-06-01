@@ -4,9 +4,9 @@ use crate::cli::mcp::McpArgs;
 use crate::error::{OutrigError, Result};
 
 pub async fn execute(args: &McpArgs) -> Result<i32> {
-    if args.container.is_some() {
+    if args.image.is_some() {
         return Err(OutrigError::Configuration(
-            "`outrig mcp self` does not select a container; remove --container".to_string(),
+            "`outrig mcp self` does not select an image; remove --image".to_string(),
         )
         .into());
     }

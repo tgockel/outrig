@@ -1,12 +1,12 @@
-//! `outrig build`: pre-warm one (or every) container-config image.
+//! `outrig build`: pre-warm one (or every) image-config image.
 //!
 //! [`execute`] follows the order documented in `doc/usage/build.md`:
 //! load + merge + validate config, decide the target list, then for each
 //! target compute the cache tag, probe the image store, and either print
 //! a one-line "cache hit" summary or stream a `buildah build` between the
 //! verbose header and a final `image ready` line. `--all` prints a
-//! per-container summary line instead of the verbose form so the output
-//! stays scannable across many container-configs.
+//! per-image summary line instead of the verbose form so the output
+//! stays scannable across many image-configs.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -16,17 +16,17 @@ use clap::{ArgGroup, Parser};
 
 use crate::error::{OutrigError, Result};
 use crate::paths::repo_root_from_config_path;
-use outrig::config::{Config, ContainerConfig, ContainerSourceRef};
+use outrig::config::{Config, ImageConfig, ImageSourceRef};
 use outrig::image::{self, ImageTag};
 
 #[derive(Debug, Parser)]
-#[command(group(ArgGroup::new("target").args(["container", "all"])))]
+#[command(group(ArgGroup::new("target").args(["image", "all"])))]
 pub struct BuildArgs {
-    /// Pick a `[containers.<name>]` block. Defaults to `default-container` from config.
+    /// Pick a `[images.<name>]` block. Defaults to `default-image` from config.
     #[arg(long, value_name = "NAME")]
-    pub container: Option<String>,
+    pub image: Option<String>,
 
-    /// Build every container-config defined in the config file.
+    /// Build every image-config defined in the config file.
     #[arg(long)]
     pub all: bool,
 
@@ -45,21 +45,21 @@ pub async fn execute(
     let cfg = Config::load(&repo_root, Some(global_cfg_path))?;
 
     let targets: Vec<&str> = if args.all {
-        if cfg.containers.is_empty() {
+        if cfg.images.is_empty() {
             return Err(OutrigError::Configuration(
-                "--all requires at least one [containers.<name>] block".to_string(),
+                "--all requires at least one [images.<name>] block".to_string(),
             )
             .into());
         }
-        cfg.containers.keys().map(String::as_str).collect()
+        cfg.images.keys().map(String::as_str).collect()
     } else {
         let name = args
-            .container
+            .image
             .as_deref()
-            .or(cfg.default_container.as_deref())
+            .or(cfg.default_image.as_deref())
             .ok_or_else(|| {
                 OutrigError::Configuration(
-                    "no --container, --all, or default-container configured".to_string(),
+                    "no --image, --all, or default-image configured".to_string(),
                 )
             })?;
         vec![name]
@@ -69,9 +69,9 @@ pub async fn execute(
         build_all(&cfg, &repo_root, &targets, args.no_cache).await
     } else {
         let name = targets[0];
-        let cc = cfg.containers.get(name).ok_or_else(|| {
+        let cc = cfg.images.get(name).ok_or_else(|| {
             OutrigError::Configuration(format!(
-                "container-config {name:?} does not match any [containers.<name>]"
+                "image-config {name:?} does not match any [images.<name>]"
             ))
         })?;
         build_single(name, cc, &repo_root, args.no_cache).await
@@ -80,12 +80,12 @@ pub async fn execute(
 
 async fn build_single(
     name: &str,
-    cc: &ContainerConfig,
+    cc: &ImageConfig,
     repo_root: &Path,
     no_cache: bool,
 ) -> Result<i32> {
     match cc.source() {
-        ContainerSourceRef::Image { image_name } => {
+        ImageSourceRef::Image { image_name } => {
             let tag = image::ImageTag(image_name.to_string());
             let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
             if already_pulled {
@@ -97,7 +97,7 @@ async fn build_single(
             eprintln!("[outrig] image ready");
             Ok(0)
         }
-        ContainerSourceRef::Build { .. } => {
+        ImageSourceRef::Build { .. } => {
             let tag = image::compute_tag_for(name, cc, repo_root).await?;
             let cache_hit = !no_cache && image::probe_cached(&tag).await?;
             if cache_hit {
@@ -120,13 +120,13 @@ async fn build_all(
 ) -> Result<i32> {
     let pad = targets.iter().map(|n| n.len()).max().unwrap_or(0);
     for name in targets {
-        let cc = cfg.containers.get(*name).ok_or_else(|| {
+        let cc = cfg.images.get(*name).ok_or_else(|| {
             OutrigError::Configuration(format!(
-                "container-config {name:?} does not match any [containers.<name>]"
+                "image-config {name:?} does not match any [images.<name>]"
             ))
         })?;
         match cc.source() {
-            ContainerSourceRef::Image { image_name } => {
+            ImageSourceRef::Image { image_name } => {
                 let tag = image::ImageTag(image_name.to_string());
                 let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
                 let suffix = if already_pulled {
@@ -136,9 +136,9 @@ async fn build_all(
                     image::pull_image(&tag).await?;
                     format!("(pulled in {}s)", started.elapsed().as_secs())
                 };
-                eprintln!("[outrig] container-config: {name:<pad$} -> {tag} {suffix}");
+                eprintln!("[outrig] image-config: {name:<pad$} -> {tag} {suffix}");
             }
-            ContainerSourceRef::Build { .. } => {
+            ImageSourceRef::Build { .. } => {
                 let tag = image::compute_tag_for(name, cc, repo_root).await?;
                 let cache_hit = !no_cache && image::probe_cached(&tag).await?;
                 let suffix = if cache_hit {
@@ -148,7 +148,7 @@ async fn build_all(
                     image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
                     format!("(built in {}s)", started.elapsed().as_secs())
                 };
-                eprintln!("[outrig] container-config: {name:<pad$} -> {tag} {suffix}");
+                eprintln!("[outrig] image-config: {name:<pad$} -> {tag} {suffix}");
             }
         }
     }
@@ -156,9 +156,9 @@ async fn build_all(
     Ok(0)
 }
 
-fn print_build_header(name: &str, cc: &ContainerConfig, tag: &ImageTag) {
+fn print_build_header(name: &str, cc: &ImageConfig, tag: &ImageTag) {
     let mut buf = String::new();
-    let _ = writeln!(buf, "[outrig] container-config: {name}");
+    let _ = writeln!(buf, "[outrig] image-config: {name}");
     let _ = writeln!(
         buf,
         "[outrig] dockerfile:       {}",
@@ -175,7 +175,7 @@ fn print_build_header(name: &str, cc: &ContainerConfig, tag: &ImageTag) {
 
 fn print_image_header(name: &str, tag: &ImageTag) {
     let mut buf = String::new();
-    let _ = writeln!(buf, "[outrig] container-config: {name}");
+    let _ = writeln!(buf, "[outrig] image-config: {name}");
     let _ = writeln!(buf, "[outrig] image:            {tag}");
     eprint!("{buf}");
 }

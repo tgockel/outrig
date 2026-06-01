@@ -1,7 +1,7 @@
 # AI-assisted design
 
 When the built-in templates do not fit, attach `outrig mcp self` to an MCP-capable AI tool and
-ask it to design a container-config. The server exposes OutRig's docs, config schema, curated
+ask it to design an image-config. The server exposes OutRig's docs, config schema, curated
 suggestions, and advisory validators over stdio. It cannot write files, run builds, or mutate your
 repo; the AI can use those read-only tools before writing through its own client, or it can return
 the exact file contents for you to install.
@@ -76,15 +76,15 @@ The valid `<tool>` names are `claude-code`, `claude-desktop`, `codex`, and `curs
 
 The server exposes these tools:
 
-| Tool                          | What it returns                                                |
-|-------------------------------|----------------------------------------------------------------|
-| `list_docs`                   | Embedded doc pages with titles and summaries.                  |
-| `get_doc`                     | Markdown for one embedded page.                                |
-| `get_config_schema`           | JSON Schema for container config and MCP server entries.       |
-| `list_base_images`            | Base-image suggestions, explicitly non-exhaustive.             |
-| `list_mcp_server_suggestions` | MCP server suggestions and shell guidance.                     |
-| `validate_dockerfile`         | Advisory warnings about OutRig Dockerfile conventions.         |
-| `validate_config`             | TOML parse and config validation results for container blocks. |
+| Tool                          | What it returns                                            |
+|-------------------------------|------------------------------------------------------------|
+| `list_docs`                   | Embedded doc pages with titles and summaries.              |
+| `get_doc`                     | Markdown for one embedded page.                            |
+| `get_config_schema`           | JSON Schema for image config and MCP server entries.       |
+| `list_base_images`            | Base-image suggestions, explicitly non-exhaustive.         |
+| `list_mcp_server_suggestions` | MCP server suggestions and shell guidance.                 |
+| `validate_dockerfile`         | Advisory warnings about OutRig Dockerfile conventions.     |
+| `validate_config`             | TOML parse and config validation results for image blocks. |
 
 The suggestion tools are not a registry. The AI can pick any base image, package set, or MCP
 server command that fits the job. In particular, OutRig supports shell MCP servers even when the
@@ -97,10 +97,10 @@ images.
 Ask for the files you want and tell the AI to validate both artifacts before it reports done:
 
 ```text
-Design an OutRig container-config for a Rust and Postgres development environment.
+Design an OutRig image-config for a Rust and Postgres development environment.
 Use the filesystem MCP server at /workspace and add a custom MCP server that runs pg-dump-mcp.
 Read the OutRig docs and schema first, then validate the proposed Dockerfile and TOML.
-If your client can edit this repo, write the Dockerfile and [containers.<name>] block directly.
+If your client can edit this repo, write the Dockerfile and [images.<name>] block directly.
 Otherwise return the exact file paths and file contents.
 ```
 
@@ -126,7 +126,7 @@ outrig design prompt | xclip -selection clipboard
 ```
 
 Paste that prompt into ChatGPT, Claude.ai, or any chat UI, followed by what you want the
-container-config to do. The output is intentionally self-contained: OutRig's version, embedded
+image-config to do. The output is intentionally self-contained: OutRig's version, embedded
 docs, conventions, and worked examples are all in the prompt.
 
 To inspect or edit the prompt before sending it:

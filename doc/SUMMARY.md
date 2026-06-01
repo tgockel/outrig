@@ -18,7 +18,7 @@
 - [Overview](usage/README.md)
   - [outrig init](usage/init.md)
   - [outrig config](usage/config.md)
-  - [outrig container](usage/container.md)
+  - [outrig image](usage/image.md)
   - [AI-assisted design](usage/ai-assisted-design.md)
   - [outrig run](usage/run.md)
   - [outrig mcp](usage/mcp.md)

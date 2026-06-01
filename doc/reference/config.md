@@ -7,7 +7,7 @@ outrig reads two TOML files:
   `[providers.<name>]` and (typically) `[models.<name>]` since those reference API keys and
   model identifiers that belong to the user, not to any one repo.
 - **Repo config** at `.agents/outrig/config.toml` -- repository-level, committed to source
-  control. Holds `[workspace]`, `[containers.<name>]`, `[agents.<name>]`, and any repo-specific
+  control. Holds `[workspace]`, `[images.<name>]`, `[agents.<name>]`, and any repo-specific
   providers or models.
 
 Both files use the same schema. Names declared in either are visible everywhere; if a name
@@ -19,7 +19,7 @@ their as-written form. Unknown keys are an error -- outrig validates with `deny_
 
 ```toml
 # repo config (.agents/outrig/config.toml):
-default-container = "coding"
+default-image = "coding"
 default-agent     = "coding"
 
 # global config (~/.outrig/config.toml):
@@ -36,21 +36,21 @@ allow = ["github.com:443", "*.npmjs.org"]             # optional; global only
 deny  = ["*:22"]                                      # optional; global only
 ```
 
-| Key                 | Type    | Required               | Where  | Description                    |
-|---------------------|---------|------------------------|--------|--------------------------------|
-| `default-container` | string  | for `outrig run`       | repo   | Default `--container`.         |
-| `default-agent`     | string  | for `outrig run`       | repo   | Default `--agent`.             |
-| `default-model`     | string  | if agent omits `model` | global | Fallback model name.           |
-| `session-root`      | path    | no                     | global | Sessions root dir.             |
-| `model-cache-root`  | path    | no                     | global | GGUF download cache dir.       |
-| `tool-call-cap`     | integer | no                     | global | Per-turn tool-call cap.        |
-| `tool-result-cap`   | integer | no                     | global | Per-tool-result byte cap.      |
-| `network.mode`      | string  | no                     | either | Network mode.                  |
-| `network.default`   | string  | no                     | global | Filter fallback action.        |
-| `network.allow`     | array   | no                     | global | Filter allow entries.          |
-| `network.deny`      | array   | no                     | global | Filter deny entries.           |
+| Key                | Type    | Required               | Where  | Description               |
+|--------------------|---------|------------------------|--------|---------------------------|
+| `default-image`    | string  | for `outrig run`       | repo   | Default `--image`.        |
+| `default-agent`    | string  | for `outrig run`       | repo   | Default `--agent`.        |
+| `default-model`    | string  | if agent omits `model` | global | Fallback model name.      |
+| `session-root`     | path    | no                     | global | Sessions root dir.        |
+| `model-cache-root` | path    | no                     | global | GGUF download cache dir.  |
+| `tool-call-cap`    | integer | no                     | global | Per-turn tool-call cap.   |
+| `tool-result-cap`  | integer | no                     | global | Per-tool-result byte cap. |
+| `network.mode`     | string  | no                     | either | Network mode.             |
+| `network.default`  | string  | no                     | global | Filter fallback action.   |
+| `network.allow`    | array   | no                     | global | Filter allow entries.     |
+| `network.deny`     | array   | no                     | global | Filter deny entries.      |
 
-`default-container` and `default-agent` belong in the repo config -- containers and agents are
+`default-image` and `default-agent` belong in the repo config -- image-configs and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-cap`
 belong in the global config since they're user/machine-level. `tool-result-cap` usually belongs
 there too, although repo or agent config can tighten it for a noisy project. `[network].mode`
@@ -295,13 +295,13 @@ a platform error.
 
 ## `[agents.<name>]`
 
-An agent is the runnable unit: a model plus a system prompt, optionally bound to a container so
-`outrig run --agent <name>` knows which sandbox to use.
+An agent is the runnable unit: a model plus a system prompt, optionally bound to an image-config
+so `outrig run --agent <name>` knows which sandbox to use.
 
 ```toml
 [agents.coding]
 # model omitted -> falls back to top-level default-model
-container = "coding"
+image = "coding"
 preamble  = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 max-tokens  = 4096
@@ -316,7 +316,7 @@ preamble = "You are a meticulous code reviewer..."
 - `model` (string, optional, default: `default-model`): name of an entry in
   `[models.<name>]`.
 - `preamble` (string, optional, default: minimal default): system prompt for this agent.
-- `container` (string, optional, default: `default-container`): default container-config
+- `image` (string, optional, default: `default-image`): default image-config
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
 - `max-tokens` (integer, optional, default: provider default): output token cap per turn.
@@ -325,8 +325,8 @@ preamble = "You are a meticulous code reviewer..."
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
-`outrig run --agent <a>` runs, the chosen container is `--container` if given, otherwise
-`agents.<a>.container` if set, otherwise `default-container`.
+`outrig run --agent <a>` runs, the chosen image-config is `--image` if given, otherwise
+`agents.<a>.image` if set, otherwise `default-image`.
 `tool-call-cap` is per turn, not per session; follow-up prompts start a fresh count.
 `tool-result-cap` is per result and applies equally to successful MCP results and MCP error
 messages.
@@ -364,17 +364,17 @@ written inside the container appear with your host UID/GID. Extra mounts default
 set `access = "read-write"` only for directories the agent should be able to modify. See
 [Concepts -> Workspace](../concepts/workspace.md).
 
-## `[containers.<name>]`
+## `[images.<name>]`
 
-You declare one or more container-configs. The selected one becomes the agent's environment.
+You declare one or more image-configs. The selected one becomes the agent's environment.
 Each block takes exactly one of two shapes:
 
 ### Build-from-Dockerfile (existing form)
 
 ```toml
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
 build-args = { NODE_VERSION = "20" }
 ```
 
@@ -388,7 +388,7 @@ build-args = { NODE_VERSION = "20" }
 ### Use-existing-image (new form)
 
 ```toml
-[containers.scratch]
+[images.scratch]
 image-name = "docker.io/library/ubuntu:24.04"
 ```
 
@@ -400,8 +400,8 @@ image-name = "docker.io/library/ubuntu:24.04"
 
 Notes:
 
-- `outrig container add` writes its output under `.agents/outrig/containers/<name>/`. You can
-  put Dockerfiles anywhere you want by editing these paths; the `.agents/outrig/containers/`
+- `outrig image add` writes its output under `.agents/outrig/images/<name>/`. You can
+  put Dockerfiles anywhere you want by editing these paths; the `.agents/outrig/images/`
   default just keeps outrig-specific files together.
 - Inner keys of `build-args` are user-defined Dockerfile `ARG` names; they're left as written
   since they map to env-var-style identifiers.
@@ -409,12 +409,12 @@ Notes:
   run time, not baked into the image. See
   [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping).
 
-### `[containers.<name>.security]`
+### `[images.<name>.security]`
 
 Optional runtime security controls for the selected container:
 
 ```toml
-[containers.coding.security]
+[images.coding.security]
 capability-profile = "no-net-raw"
 cap-drop = ["MKNOD", "SETFCAP"]
 cap-add  = ["NET_BIND_SERVICE"]
@@ -435,13 +435,13 @@ podman form without the `CAP_` prefix. The existing `--security-opt=no-new-privi
 setting is always applied. This section does not configure seccomp, AppArmor, SELinux,
 read-only roots, mount policy, or network egress filtering.
 
-### `[containers.<name>.mcp]`
+### `[images.<name>.mcp]`
 
 Map of MCP server entries, **keyed on server name**. Each entry is one of two shapes via a
 serde-untagged dispatch:
 
 ```toml
-[containers.coding.mcp]
+[images.coding.mcp]
 # Short form -- array of strings, becomes { command = [...] }
 shell = ["bash", "-lc", "exec shell-mcp-command"]
 
@@ -461,7 +461,7 @@ Notes:
 
 - The first element of `command` must be on `$PATH` inside the container, or absolute.
 - The map key (e.g. `fs`, `shell`, `build`) is the server name. It must match
-  `^[a-zA-Z][a-zA-Z0-9_-]*$` and be unique within a container-config.
+  `^[a-zA-Z][a-zA-Z0-9_-]*$` and be unique within an image-config.
 - The server name appears in `outrig logs <session> <server>` and as the prefix on every tool
   the server advertises (`<server>__<tool>`).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
@@ -562,7 +562,7 @@ device     = "cpu"
 ### Repo `.agents/outrig/config.toml`
 
 ```toml
-default-container = "coding"
+default-image = "coding"
 default-agent     = "coding"
 
 [workspace]
@@ -580,7 +580,7 @@ access         = "read-write"
 
 [agents.coding]
 # model omitted -> uses global default-model = "fast"
-container   = "coding"
+image       = "coding"
 preamble    = "You are a careful coding assistant. Repo is at /workspace."
 temperature = 0.2
 tool-call-cap = 300
@@ -590,17 +590,17 @@ tool-result-cap = 1048576
 model    = "smart"        # explicit override
 preamble = "You are a meticulous code reviewer."
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
 build-args = { NODE_VERSION = "20" }
 
-  [containers.coding.security]
+  [images.coding.security]
   capability-profile = "no-net-raw"
   cap-drop = ["MKNOD", "SETFCAP"]
   cap-add  = ["NET_BIND_SERVICE"]
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
@@ -608,12 +608,12 @@ build-args = { NODE_VERSION = "20" }
 
 ## Validation rules
 
-- `default-container` must name an existing `[containers.<name>]` block.
+- `default-image` must name an existing `[images.<name>]` block.
 - `default-agent` must name an existing `[agents.<name>]` block.
 - Every `agents.<name>.model` (if set) must name an existing `[models.<name>]`. If `model` is
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.
-- Every `agents.<name>.container` (if set) must name an existing `[containers.<name>]`.
+- Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
 - Every `providers.<name>.style` must be one of `{"openai", "mistralrs"}`. Other styles are
   reserved for future Rig adapters and listed as TODO in the providers concept page. The
   build-time feature gate (`--features local-llm`) is **not** checked at validate time --
@@ -638,15 +638,15 @@ build-args = { NODE_VERSION = "20" }
 - `tool-result-cap`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.
 - `[network].mode`, if set, must be `default` or `audit`.
-- Every server name in `[containers.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
-  unique within its container-config.
+- Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
+  unique within its image-config.
 - Every `command` array must be non-empty.
 - `dockerfile` and `context` must exist on disk relative to the repo root (build path only).
-- Each `[containers.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
+- Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
 - `image-name` must not be empty.
-- Every `[containers.<name>.security].capability-profile`, if set, must be one of
+- Every `[images.<name>.security].capability-profile`, if set, must be one of
   `default`, `no-net-raw`, or `drop-all`.
 - Every capability name in `cap-drop` or `cap-add` must be non-empty and match
   `^[A-Z0-9_]+$` after optional `CAP_` stripping.

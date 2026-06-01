@@ -44,7 +44,7 @@ container, MCP, or agent behavior. Normal startup progress is printed to stderr 
 
 Idempotent end-to-end setup orchestrator. Runs `outrig config init` if the global config is
 missing, writes `.agents/outrig/config.toml` if it doesn't exist, then offers to call
-`outrig container add` in a loop.
+`outrig image add` in a loop.
 
 ```
 outrig init [--force]
@@ -52,7 +52,7 @@ outrig init [--force]
 
 | Flag      | Default | Description                                                                |
 |-----------|---------|----------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing files. Propagates to `config init` and `container add`. |
+| `--force` | off     | Overwrite existing files. Propagates to `config init` and `image add`.     |
 
 See [Usage -> outrig init](../usage/init.md).
 
@@ -72,24 +72,24 @@ outrig config init [--force]
 
 See [Usage -> outrig config](../usage/config.md).
 
-### `outrig container add`
+### `outrig image add`
 
-Interactively scaffold a container-config: writes a Dockerfile under
-`.agents/outrig/containers/<name>/Dockerfile` and adds the matching `[containers.<name>]` and
-`[containers.<name>.mcp]` blocks to the repo config. The first subcommand of the `outrig
-container` group; future subcommands (`container ls`, `container rm`) are deferred.
+Interactively scaffold an image-config: writes a Dockerfile under
+`.agents/outrig/images/<name>/Dockerfile` and adds the matching `[images.<name>]` and
+`[images.<name>.mcp]` blocks to the repo config. The first subcommand of the `outrig
+image` group; future subcommands (`image ls`, `image rm`) are deferred.
 
 ```
-outrig container add [<name>]
-                     [--force]
+outrig image add [<name>]
+                 [--force]
 ```
 
 | Argument / flag | Default  | Description                             |
 |-----------------|----------|-----------------------------------------|
-| `<name>`        | prompted | Container-config name.                  |
+| `<name>`        | prompted | Image-config name.                      |
 | `--force`       | off      | Overwrite existing files for this name. |
 
-See [Usage -> outrig container](../usage/container.md).
+See [Usage -> outrig image](../usage/image.md).
 
 ### `outrig run`
 
@@ -97,7 +97,7 @@ Start an interactive agent session.
 
 ```
 outrig run [--agent <name>]
-           [--container <name>]
+           [--image <name>]
            [--config <path>]
            [--device <cpu|cuda|cuda:N|metal>]
            [--env <KEY=VALUE>]
@@ -112,7 +112,7 @@ outrig run [--agent <name>]
 ```
 
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
-- `--container <name>` (default: from agent or `default-container`): container-config to
+- `--image <name>` (default: from agent or `default-image`): image-config to
   launch.
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for MCP servers. `KEY=VALUE`
   applies to every server; `SERVER:KEY=VALUE` targets a single server by name. Values support
@@ -146,10 +146,10 @@ See [Usage -> outrig run](../usage/run.md) for REPL details.
 
 ### `outrig mcp`
 
-Serve the selected container-config's backing MCP servers as one MCP server over stdio.
+Serve the selected image-config's backing MCP servers as one MCP server over stdio.
 
 ```
-outrig mcp [--container <name>]
+outrig mcp [--image <name>]
            [--attach <session-id-or-container-name>]
            [--listen <addr>]
            [--env <KEY=VALUE>]
@@ -160,7 +160,7 @@ outrig mcp [--container <name>]
            [--session-root <path>]
            [--verbose]
 
-outrig mcp show-merged [--container <name>]
+outrig mcp show-merged [--image <name>]
                        [--attach <session-id-or-container-name>]
                        [--session-dir <path>]
                        [--config <path>]
@@ -173,7 +173,7 @@ outrig mcp self
 
 | Flag                   | Default                      | Description                           |
 |------------------------|------------------------------|---------------------------------------|
-| `--container <name>`   | `default-container`          | Container-config to launch.           |
+| `--image <name>`       | `default-image`              | Image-config to launch.               |
 | `--attach <id-or-name>`| off                          | Reuse an existing container.          |
 | `--listen <addr>`      | off                          | Serve Streamable HTTP at `/mcp`.      |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
@@ -182,20 +182,20 @@ outrig mcp self
 | `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
 
 There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does not let
-`agent.container` participate in container selection, and does not read provider API keys.
-Container selection is `--container`, then top-level `default-container`, then an error.
+`agent.image` participate in image-config selection, and does not read provider API keys.
+Image-config selection is `--image`, then top-level `default-image`, then an error.
 
 With `--attach`, the value is resolved first as an exact session id under the resolved
 session root. A session match supplies the podman container name and default
-container-config. If there is no session match, the value is treated as a podman
-container name and `--container <name>` is required.
+image-config. If there is no session match, the value is treated as a podman
+container name and `--image <name>` is required.
 
 Startup builds or cache-hits the image and starts the container unless `--attach` is set.
 Attach mode validates the existing container with `podman inspect` and borrows it without
 stopping or removing it during teardown. Both modes initialize every entry in the merged
 MCP table, list their tools, print a banner to stderr, and then speak MCP JSON-RPC on
 stdout/stdin. The merged table is image `/etc/outrig/container.toml` plus
-`[containers.<name>.mcp]` overrides. All non-protocol output stays off stdout.
+`[images.<name>.mcp]` overrides. All non-protocol output stays off stdout.
 
 When `--listen <addr>` is set, `outrig mcp` serves Streamable HTTP instead of stdio.
 TCP addresses are socket addresses such as `127.0.0.1:7331` or `0.0.0.0:7331`;
@@ -208,13 +208,13 @@ same shared outrig proxy and backing MCP processes.
 `--network audit` and `--network filter` are supported only for fresh-container `outrig mcp`
 sessions. Attach mode cannot retrofit a borrowed container with a new interceptor.
 
-`outrig mcp show-merged` uses the same container selection and setup path, but exits after
+`outrig mcp show-merged` uses the same image-config selection and setup path, but exits after
 printing the effective `[mcp]` table to stdout. It is for debugging embedded image config and
 repo-local overrides, not for serving MCP JSON-RPC.
 
 `outrig mcp self` serves host-side self-description tools over stdio. It does not start a
 container or require a repo config. Use it from an external MCP-capable AI tool when the built-in
-container templates do not fit.
+image templates do not fit.
 
 | Trigger or failure                               | Exit |
 |--------------------------------------------------|------|
@@ -236,19 +236,19 @@ See [Usage -> outrig mcp](../usage/mcp.md) for client configuration and stdio de
 
 ### `outrig build`
 
-Build (or cache-hit) one or more container-config images, without starting an agent.
+Build (or cache-hit) one or more image-config images, without starting an agent.
 
 ```
-outrig build [--container <name>]
+outrig build [--image <name>]
              [--all]
              [--no-cache]
              [--config <path>]
 ```
 
-- `--container <name>` (default: `default-container`): build a specific named
-  container-config.
-- `--all` (default: off): build every container-config. Mutually exclusive with
-  `--container`.
+- `--image <name>` (default: `default-image`): build a specific named
+  image-config.
+- `--all` (default: off): build every image-config. Mutually exclusive with
+  `--image`.
 - `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
   to buildah.
 
@@ -281,7 +281,7 @@ outrig logs [<session>] [<server>]
 | Argument / flag        | Default                   | Description                                 |
 |------------------------|---------------------------|---------------------------------------------|
 | `<session>`            | omit with `--session-dir` | Session id; resolved under session root.    |
-| `<server>`             | list available logs       | Server name from `[containers.<name>.mcp]`. |
+| `<server>`             | list available logs       | Server name from `[images.<name>.mcp]`. |
 | `--follow`, `-f`       | off                       | Tail the log; continue reading new lines.   |
 | `--session-dir <path>` | --                        | Read directly from this session dir.        |
 

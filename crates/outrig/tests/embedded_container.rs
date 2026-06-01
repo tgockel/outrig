@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use outrig::McpClient;
-use outrig::config::{ContainerConfig, McpServerSpec};
+use outrig::config::{ImageConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec, embedded};
 use outrig::error::OutrigError;
 use outrig::image::{self, ImageTag};
@@ -60,7 +60,7 @@ async fn ensure_image_with_container_toml(container_toml: Option<&str>) -> Image
         std::fs::write(ctx.path().join("container.toml"), text).expect("write container.toml");
     }
 
-    let cfg = ContainerConfig {
+    let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
@@ -75,7 +75,7 @@ async fn ensure_image_with_container_toml(container_toml: Option<&str>) -> Image
 }
 
 async fn ensure_missing_file_image() -> ImageTag {
-    let cfg = ContainerConfig {
+    let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
@@ -306,13 +306,13 @@ async fn mcp_show_merged_prints_effective_toml() {
 
     let config_toml = format!(
         r#"
-default-container = "smoke"
+default-image = "smoke"
 
-[containers.smoke]
+[images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
 
-  [containers.smoke.mcp]
+  [images.smoke.mcp]
   fs = ["mcp-server-filesystem", "/workspace"]
 "#,
         dockerfile = image_ctx.path().join("Dockerfile").display(),
@@ -329,7 +329,7 @@ context = "{context}"
                 sessions.path().to_str().expect("sessions path utf-8"),
                 "mcp",
                 "show-merged",
-                "--container",
+                "--image",
                 "smoke",
             ])
             .current_dir(repo_dir.path())
@@ -394,7 +394,7 @@ async fn run_mode_uses_embedded_image_entries() {
     let config_toml = format!(
         r#"
 default-agent = "smoke"
-default-container = "smoke"
+default-image = "smoke"
 
 [providers.openai]
 style = "openai"
@@ -409,7 +409,7 @@ identifier = "gpt-4o-mini"
 model = "fast"
 preamble = "test"
 
-[containers.smoke]
+[images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
 "#,
@@ -479,9 +479,9 @@ async fn mcp_server_mode_uses_embedded_image_entries() {
 
     let config_toml = format!(
         r#"
-default-container = "smoke"
+default-image = "smoke"
 
-[containers.smoke]
+[images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
 "#,

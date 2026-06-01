@@ -1,14 +1,14 @@
 //! Unit tests for `build-args` values parsed as `EnvValue` and
 //! resolved into concrete strings for image builds.
 
-use crate::config::{Config, ContainerConfig, EnvValue};
+use crate::config::{Config, EnvValue, ImageConfig};
 use crate::error::OutrigError;
 
 use super::resolve_build_args;
 
-fn container_config(toml_src: &str) -> ContainerConfig {
+fn image_config(toml_src: &str) -> ImageConfig {
     let cfg = Config::load_from_str(toml_src).expect("config parses");
-    cfg.containers["coding"].clone()
+    cfg.images["coding"].clone()
 }
 
 mod parse {
@@ -16,9 +16,9 @@ mod parse {
 
     #[test]
     fn build_args_classify_literals_and_refs() {
-        let container = container_config(
+        let image = image_config(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 build-args = { NODE_VERSION = "20", GH_TOKEN = "${GITHUB_TOKEN}", STILL_LIT = "${lower_case}" }
@@ -26,15 +26,15 @@ build-args = { NODE_VERSION = "20", GH_TOKEN = "${GITHUB_TOKEN}", STILL_LIT = "$
         );
 
         assert_eq!(
-            container.build_args["NODE_VERSION"],
+            image.build_args["NODE_VERSION"],
             EnvValue::Literal("20".to_string()),
         );
         assert_eq!(
-            container.build_args["GH_TOKEN"],
+            image.build_args["GH_TOKEN"],
             EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
         );
         assert_eq!(
-            container.build_args["STILL_LIT"],
+            image.build_args["STILL_LIT"],
             EnvValue::Literal("${lower_case}".to_string()),
         );
     }
@@ -52,15 +52,15 @@ mod resolve {
             std::env::set_var(var, "secret-token");
         }
 
-        let container = container_config(&format!(
+        let image = image_config(&format!(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 build-args = {{ NODE_VERSION = "20", GH_TOKEN = "${{{var}}}" }}
 "#,
         ));
-        let resolved = resolve_build_args("coding", &container).expect("resolves");
+        let resolved = resolve_build_args("coding", &image).expect("resolves");
 
         unsafe {
             std::env::remove_var(var);
@@ -78,20 +78,20 @@ build-args = {{ NODE_VERSION = "20", GH_TOKEN = "${{{var}}}" }}
             std::env::remove_var(var);
         }
 
-        let container = container_config(&format!(
+        let image = image_config(&format!(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 build-args = {{ GH_TOKEN = "${{{var}}}" }}
 "#,
         ));
 
-        let err = resolve_build_args("coding", &container).expect_err("must error");
+        let err = resolve_build_args("coding", &image).expect_err("must error");
         let msg = err.to_string();
         assert!(
             msg.contains("coding"),
-            "error should name the container-config, got: {msg}",
+            "error should name the image-config, got: {msg}",
         );
         assert!(
             msg.contains("GH_TOKEN"),
@@ -102,10 +102,10 @@ build-args = {{ GH_TOKEN = "${{{var}}}" }}
             "error should name the missing env var, got: {msg}",
         );
 
-        let OutrigError::BuildArgResolveFailed { container, key, .. } = err else {
+        let OutrigError::BuildArgResolveFailed { image, key, .. } = err else {
             panic!("expected BuildArgResolveFailed");
         };
-        assert_eq!(container, "coding");
+        assert_eq!(image, "coding");
         assert_eq!(key, "GH_TOKEN");
     }
 }

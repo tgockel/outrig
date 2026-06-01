@@ -6,13 +6,13 @@ repo, and outrig builds it with `buildah` and runs it with `podman`.
 
 ## Default location
 
-[`outrig container add`](../usage/container.md#outrig-container-add) writes container files
-under `.agents/outrig/containers/<name>/`:
+[`outrig image add`](../usage/image.md#outrig-image-add) writes image files
+under `.agents/outrig/images/<name>/`:
 
 ```
 .agents/outrig/
 ├── config.toml
-└── containers/
+└── images/
     └── coding/
         ├── Dockerfile
         └── (any other files referenced by the Dockerfile)
@@ -21,7 +21,7 @@ under `.agents/outrig/containers/<name>/`:
 Putting them under `.agents/outrig/` keeps outrig-specific build context separate from your
 project's own Dockerfiles (which often live at the repo root or under `containers/`,
 `docker/`, etc. for unrelated purposes). You can override the default by editing
-`[containers.<name>].dockerfile` and `.context` to point anywhere relative to the repo root.
+`[images.<name>].dockerfile` and `.context` to point anywhere relative to the repo root.
 
 ## Dockerfile conventions
 
@@ -54,7 +54,7 @@ in-container user matching your host UID/GID.
 ### Install MCP servers
 
 The image needs to contain the binaries and dependencies for every MCP server you reference in
-the matching `[containers.<name>.mcp]` config. There's no other place to put them -- outrig
+the matching `[images.<name>.mcp]` config. There's no other place to put them -- outrig
 doesn't fetch tools at run time.
 
 ```Dockerfile
@@ -64,20 +64,20 @@ RUN npm install -g @modelcontextprotocol/server-filesystem
 If multiple MCP servers need different language toolchains (one needs Node, one needs Python),
 install both in the same image. The agent's whole MCP set runs in one container per session.
 
-## The `[containers.<name>]` config block
+## The `[images.<name>]` config block
 
-A typical config has at least one `[containers.<name>]` block plus a top-level
-`default-container`:
+A typical config has at least one `[images.<name>]` block plus a top-level
+`default-image`:
 
 ```toml
-default-container = "coding"
+default-image = "coding"
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"   # relative to repo root
-context    = ".agents/outrig/containers/coding"              # relative to repo root
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"   # relative to repo root
+context    = ".agents/outrig/images/coding"              # relative to repo root
 build-args = { NODE_VERSION = "20" }                          # extra Dockerfile ARGs
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
@@ -86,7 +86,7 @@ build-args = { NODE_VERSION = "20" }                          # extra Dockerfile
 `.agents/outrig/`). `build-args` are extra Dockerfile `ARG`s -- whatever your Dockerfile needs
 parameterized at build time.
 
-The `[containers.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
+The `[images.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
 
 ### Capability profiles
 
@@ -95,7 +95,7 @@ toolchains and MCP servers working while still applying `--security-opt=no-new-p
 When a container can run with less privilege, add a security block:
 
 ```toml
-[containers.coding.security]
+[images.coding.security]
 capability-profile = "no-net-raw"
 ```
 
@@ -109,7 +109,7 @@ The supported profiles are:
 You can combine a profile with explicit overrides:
 
 ```toml
-[containers.web.security]
+[images.web.security]
 capability-profile = "drop-all"
 cap-add = ["NET_BIND_SERVICE"]
 ```
@@ -123,10 +123,10 @@ If you already have an image (from a registry, CI pipeline, or local build), set
 `image-name` instead of `dockerfile` + `context`:
 
 ```toml
-[containers.scratch]
+[images.scratch]
 image-name = "docker.io/library/ubuntu:24.04"
 
-  [containers.scratch.mcp]
+  [images.scratch.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
 
@@ -137,11 +137,11 @@ Exactly one of these two shapes must be set on each block:
 
 Setting both, neither, or `image-name` alongside `build-args` is a config-validation error.
 
-`outrig build --container scratch` pulls the image if not already local:
+`outrig build --image scratch` pulls the image if not already local:
 
 ```sh
-$ outrig build --container scratch
-[outrig] container-config: scratch
+$ outrig build --image scratch
+[outrig] image-config: scratch
 [outrig] image:            docker.io/library/ubuntu:24.04
 [outrig] image ready
 ```
@@ -149,48 +149,48 @@ $ outrig build --container scratch
 On subsequent runs when the image is already present:
 
 ```sh
-$ outrig build --container scratch
+$ outrig build --image scratch
 [outrig] image ready (already pulled: docker.io/library/ubuntu:24.04)
 ```
 
-`outrig run --container scratch` starts the container directly -- no buildah invocation.
+`outrig run --image scratch` starts the container directly -- no buildah invocation.
 
-## Named container-configs
+## Named image-configs
 
-You can declare multiple container-configs for the same repo and switch between them with
-`--container`:
+You can declare multiple image-configs for the same repo and switch between them with
+`--image`:
 
 ```toml
-default-container = "coding"
+default-image = "coding"
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 
-[containers.planning]
-dockerfile = ".agents/outrig/containers/planning/Dockerfile"
-context    = ".agents/outrig/containers/planning"
+[images.planning]
+dockerfile = ".agents/outrig/images/planning/Dockerfile"
+context    = ".agents/outrig/images/planning"
 
-  [containers.planning.mcp]
+  [images.planning.mcp]
   fs       = { command = ["mcp-server-filesystem", "/workspace"] }
   research = { command = ["mcp-research-tools"] }
 ```
 
 ```sh
-$ outrig run                              # uses default-container = "coding"
-$ outrig run --container planning  # different Dockerfile, different MCPs
+$ outrig run                       # uses default-image = "coding"
+$ outrig run --image planning      # different Dockerfile, different MCPs
 ```
 
 This is useful when you want lighter-weight environments for different kinds of work -- e.g. a
-`planning` container that has no compiler, no shell, and only research-oriented MCPs; a `coding`
-container with the full toolchain. Agents can also pin their own default container via
-`agents.<name>.container`; see [Providers, Models, and Agents](llm-providers.md).
+`planning` image that has no compiler, no shell, and only research-oriented MCPs; a `coding`
+image with the full toolchain. Agents can also pin their own default image via
+`agents.<name>.image`; see [Providers, Models, and Agents](llm-providers.md).
 
-Every container-config is built and cached independently. Switching between them is fast after
+Every image-config is built and cached independently. Switching between them is fast after
 the first build.
 
 ## Image caching
@@ -211,8 +211,8 @@ image is already present locally.
 
 outrig adds `--userns=keep-id`, `--security-opt=no-new-privileges`, the primary workspace
 bind-mount, any configured extra workspace mounts, and the runtime user-mapping bootstrap
-(see [Workspace](workspace.md)). Capability flags are emitted only when the selected container
-config opts into a capability profile or explicit `cap-drop` / `cap-add` entries.
+(see [Workspace](workspace.md)). Capability flags are emitted only when the selected
+image-config opts into a capability profile or explicit `cap-drop` / `cap-add` entries.
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode
@@ -221,8 +221,8 @@ is a separate session-level interceptor; see
 
 ## See also
 
-- [outrig container add](../usage/container.md#outrig-container-add) -- the easiest way to
-  scaffold a new container-config.
+- [outrig image add](../usage/image.md#outrig-image-add) -- the easiest way to
+  scaffold a new image-config.
 - [MCP Servers](mcp-servers.md) -- declaring and invoking the tools that run inside the
   container.
 - [MCP Trust Model](mcp-trust-model.md) -- why MCP tools can be configured liberally inside the
@@ -230,4 +230,4 @@ is a separate session-level interceptor; see
 - [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` when the
   templates do not fit.
 - [Workspace](workspace.md) -- what the container sees of your repo.
-- [Reference -> Config](../reference/config.md) -- every supported `[containers.<name>]` key.
+- [Reference -> Config](../reference/config.md) -- every supported `[images.<name>]` key.

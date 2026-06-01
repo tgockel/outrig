@@ -4,10 +4,10 @@
 //! 1. **Global config** -- defer to [`config::init::run_with`] when
 //!    `~/.outrig/config.toml` is absent; log + skip when present.
 //! 2. **Repo config** -- [`repo::ensure`] writes `.agents/outrig/config.toml`
-//!    against `cwd` if missing. Also reused by `outrig container add` as a
+//!    against `cwd` if missing. Also reused by `outrig image add` as a
 //!    fallback when run in an uninitialized repo.
-//! 3. **Container loop** -- offer to scaffold container-configs by
-//!    delegating to [`container::add::run_with`] in a loop.
+//! 3. **Image loop** -- offer to scaffold image-configs by
+//!    delegating to [`image::add::run_with`] in a loop.
 //!
 //! One [`PromptSource`] is threaded through all three phases so scripted
 //! tests can drive the entire flow with a single byte stream.
@@ -18,9 +18,9 @@ pub mod repo;
 use std::path::Path;
 
 use crate::config_init;
-use crate::container_setup;
 use crate::error::Result;
 use crate::hf::{self, HfTreeFetcher};
+use crate::image_setup;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::global_config_path;
 
@@ -58,25 +58,25 @@ pub async fn run_with(
         eprintln!("[outrig] wrote {}", global_path.display());
     }
 
-    // Phase 2: repo config. Returns the bootstrapped container name (if
-    // we wrote the config) so phase 3's first container-add can skip its
+    // Phase 2: repo config. Returns the bootstrapped image name (if
+    // we wrote the config) so phase 3's first image-add can skip its
     // name prompt.
     let mut bootstrapped_name = repo::ensure(cwd, &global_path, prompt, hf).await?;
 
-    // Phase 3: container loop. The gate prompt is skipped on the first
-    // iteration when phase 2 just bootstrapped a container -- the user
-    // already chose to add one by walking through the container section,
+    // Phase 3: image loop. The gate prompt is skipped on the first
+    // iteration when phase 2 just bootstrapped an image -- the user
+    // already chose to add one by walking through the image section,
     // so asking again would be redundant. When phase 2 short-circuited
     // on an existing config, the gate fires (re-runs may not want to
-    // add a container).
+    // add an image).
     let mut first = true;
     loop {
         let should_run = if first && bootstrapped_name.is_some() {
             true
         } else if first {
-            prompt.ask_bool(&ADD_FIRST_CONTAINER_FIELD, true).await?
+            prompt.ask_bool(&ADD_FIRST_IMAGE_FIELD, true).await?
         } else {
-            prompt.ask_bool(&ADD_ANOTHER_CONTAINER_FIELD, false).await?
+            prompt.ask_bool(&ADD_ANOTHER_IMAGE_FIELD, false).await?
         };
         if !should_run {
             break;
@@ -86,28 +86,28 @@ pub async fn run_with(
         } else {
             None
         };
-        container_setup::add::run_with(cwd, name, force, prompt).await?;
+        image_setup::add::run_with(cwd, name, force, prompt).await?;
         first = false;
     }
 
     Ok(())
 }
 
-const ADD_FIRST_CONTAINER_FIELD: Field = Field {
-    name: "Add a container-config now?",
-    description: "Yes: walk through `outrig container add` to scaffold a \
-                  Dockerfile and [containers.<name>] block.",
+const ADD_FIRST_IMAGE_FIELD: Field = Field {
+    name: "Add an image-config now?",
+    description: "Yes: walk through `outrig image add` to scaffold a \
+                  Dockerfile and [images.<name>] block.",
     options: &[],
     doc_link: "doc/usage/init.md",
 };
 
-const ADD_ANOTHER_CONTAINER_FIELD: Field = Field {
-    name: "Add another container-config?",
-    description: "Yes: scaffold one more container-config via \
-                  `outrig container add`. No: finish init.",
+const ADD_ANOTHER_IMAGE_FIELD: Field = Field {
+    name: "Add another image-config?",
+    description: "Yes: scaffold one more image-config via \
+                  `outrig image add`. No: finish init.",
     options: &[],
     doc_link: "doc/usage/init.md",
 };
 
 /// Slice of every `Field` declared in this module, for `prompt_doc_sync.rs`.
-pub const DOC_SYNC_FIELDS: &[&Field] = &[&ADD_FIRST_CONTAINER_FIELD, &ADD_ANOTHER_CONTAINER_FIELD];
+pub const DOC_SYNC_FIELDS: &[&Field] = &[&ADD_FIRST_IMAGE_FIELD, &ADD_ANOTHER_IMAGE_FIELD];

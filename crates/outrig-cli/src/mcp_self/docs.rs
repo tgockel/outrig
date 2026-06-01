@@ -50,8 +50,8 @@ pub const DOCS: &[Doc] = &[
         markdown: include_str!("../../../../doc/usage/ai-assisted-design.md"),
     },
     Doc {
-        page: "usage/container",
-        markdown: include_str!("../../../../doc/usage/container.md"),
+        page: "usage/image",
+        markdown: include_str!("../../../../doc/usage/image.md"),
     },
 ];
 

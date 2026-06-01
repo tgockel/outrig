@@ -14,7 +14,7 @@ use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
 use crate::error::Result;
 use crate::paths::{global_config_path, resolve_repo_config};
-use crate::{config_init, container_setup, init};
+use crate::{config_init, image_setup, init};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -52,18 +52,18 @@ enum Cmd {
     Mcp(McpArgs),
     /// Generate prompts and setup snippets for AI-assisted design.
     Design(DesignArgs),
-    /// Build (or cache-hit) one or more container-config images.
+    /// Build (or cache-hit) one or more image-config images.
     Build(BuildArgs),
     /// Read or write outrig's configuration files.
     Config(ConfigArgs),
     /// Interactively set up global + repo config.
     Init {
-        /// Overwrite existing files. Propagates to `config init` and `container add`.
+        /// Overwrite existing files. Propagates to `config init` and `image add`.
         #[arg(long)]
         force: bool,
     },
-    /// Manage container-configs.
-    Container(ContainerArgs),
+    /// Manage image-configs.
+    Image(ImageArgs),
     /// List sessions newest-first under the session root.
     Ls(LsArgs),
     /// Print or follow a session's MCP-server stderr.
@@ -91,16 +91,16 @@ enum ConfigCmd {
 }
 
 #[derive(Debug, Args)]
-struct ContainerArgs {
+struct ImageArgs {
     #[command(subcommand)]
-    cmd: ContainerCmd,
+    cmd: ImageCmd,
 }
 
 #[derive(Debug, Subcommand)]
-enum ContainerCmd {
-    /// Scaffold a new container-config (Dockerfile + `[containers.<name>]`).
+enum ImageCmd {
+    /// Scaffold a new image-config (Dockerfile + `[images.<name>]`).
     Add {
-        /// Container-config name. Prompted if omitted.
+        /// Image-config name. Prompted if omitted.
         name: Option<String>,
         /// Overwrite an existing Dockerfile / config block of this name.
         #[arg(long)]
@@ -174,13 +174,13 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             runtime.block_on(init::run(*force, cli.global_config.as_deref()))?;
             Ok(0)
         }
-        Cmd::Container(args) => match &args.cmd {
-            ContainerCmd::Add { name, force } => {
+        Cmd::Image(args) => match &args.cmd {
+            ImageCmd::Add { name, force } => {
                 let cwd = std::env::current_dir()?;
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(container_setup::add::run(
+                runtime.block_on(image_setup::add::run(
                     &cwd,
                     cli.global_config.as_deref(),
                     name.clone(),

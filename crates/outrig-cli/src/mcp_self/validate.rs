@@ -228,11 +228,11 @@ CMD ["sleep", "infinity"]
     fn config_validator_reports_invalid_mcp_name() {
         let out = validate_config(
             r#"
-[containers.c]
+[images.c]
 dockerfile = "Dockerfile"
 context = "."
 
-[containers.c.mcp]
+[images.c.mcp]
 "bad.name" = ["mcp"]
 "#,
         );

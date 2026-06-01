@@ -47,4 +47,4 @@ of building a narrow MCP config that prevents useful work.
 - [Containers](containers.md) -- Dockerfile conventions and runtime user mapping.
 - [MCP Servers](mcp-servers.md) -- declaring the tools that run inside the container.
 - [AI-assisted design](../usage/ai-assisted-design.md) -- using `outrig mcp self` to design
-  container-configs with an external AI tool.
+  image-configs with an external AI tool.

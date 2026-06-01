@@ -6,10 +6,10 @@ use super::Config;
 
 /// Merge `global` and `repo`, with `repo` winning on every collision.
 ///
-/// - For each map (`providers`, `models`, `agents`, `containers`): repo entries
+/// - For each map (`providers`, `models`, `agents`, `images`): repo entries
 ///   replace global entries with the same key. Entries unique to either side
 ///   are preserved as-is.
-/// - For top-level scalars (`default-container`, `default-agent`,
+/// - For top-level scalars (`default-image`, `default-agent`,
 ///   `default-model`, `session-root`, `model-cache-root`,
 ///   `tool-call-cap`, `tool-result-cap`): repo's value wins if set,
 ///   else global's.
@@ -32,8 +32,8 @@ pub fn merge(global: Config, repo: Config) -> Config {
     let mut agents = global.agents;
     agents.extend(repo.agents);
 
-    let mut containers = global.containers;
-    containers.extend(repo.containers);
+    let mut images = global.images;
+    images.extend(repo.images);
 
     let mut workspace = repo.workspace;
     let mut mounts = global.workspace.mounts;
@@ -49,7 +49,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
     }
 
     Config {
-        default_container: repo.default_container.or(global.default_container),
+        default_image: repo.default_image.or(global.default_image),
         default_agent: repo.default_agent.or(global.default_agent),
         default_model: repo.default_model.or(global.default_model),
         session_root: repo.session_root.or(global.session_root),
@@ -61,6 +61,6 @@ pub fn merge(global: Config, repo: Config) -> Config {
         models,
         agents,
         workspace,
-        containers,
+        images,
     }
 }

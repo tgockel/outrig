@@ -1,7 +1,7 @@
 # Quickstart
 
 This walks you from a fresh repo to your first running agent in five minutes, mostly via
-`outrig init` (which orchestrates `outrig config init` and `outrig container add` under the
+`outrig init` (which orchestrates `outrig config init` and `outrig image add` under the
 hood).
 
 Crate names matter: depend on `outrig` when embedding the library, and install
@@ -49,14 +49,14 @@ $ outrig init
 
 `init` walks you through the global config first (providers and models -- skipped if it
 already exists), then the repo config (workspace, default agent), then offers to call
-`container add` for the first container-config. Every prompt shows its default in
+`image add` for the first image-config. Every prompt shows its default in
 `[default: ...]`; press Enter to accept. Type `?` and Enter at any prompt for an explanation
 and the available options.
 
-If the built-in container prompts do not cover the environment you need, still start with
+If the built-in image prompts do not cover the environment you need, still start with
 `outrig init` for the provider, workspace, and agent scaffolding. Then use
 [AI-assisted design](usage/ai-assisted-design.md) to have an AI tool generate or refine the
-Dockerfile and `[containers.<name>]` block. The MCP path gives the AI validators;
+Dockerfile and `[images.<name>]` block. The MCP path gives the AI validators;
 `outrig design prompt` is the no-MCP fallback.
 
 ```
@@ -83,8 +83,8 @@ Configuring your first agent
 ? Agent name [default: coder]:
 ? Preamble (one line) [default: You are a careful coding assistant.]:
 
-Configuring your first container
-? Container name [default: hello-outrig-standard]:
+Configuring your first image
+? Image-config name [default: hello-outrig-standard]:
 ? Workspace host-path [default: .]:
 ? Workspace container-path [default: /workspace]:
 
@@ -93,8 +93,8 @@ Configuring your first container
 ? Base image [default: debian:bookworm-slim]:
 ? Language toolchains [default: ]: node
 ? MCP servers [default: fs]:
-[outrig] wrote .agents/outrig/containers/hello-outrig-standard/Dockerfile
-[outrig] added [containers.hello-outrig-standard] to .agents/outrig/config.toml
+[outrig] wrote .agents/outrig/images/hello-outrig-standard/Dockerfile
+[outrig] added [images.hello-outrig-standard] to .agents/outrig/config.toml
 ```
 
 (In the transcript above we accepted most defaults by pressing Enter; only `node` was typed
@@ -109,7 +109,7 @@ hello-outrig/
 └── .agents/
     └── outrig/
         ├── config.toml
-        └── containers/
+        └── images/
             └── hello-outrig-standard/
                 └── Dockerfile
 ```
@@ -147,7 +147,7 @@ identifier = "gpt-4o-mini"
 `.agents/outrig/config.toml`:
 
 ```toml
-default-container = "hello-outrig-standard"
+default-image = "hello-outrig-standard"
 default-agent     = "coder"
 
 [workspace]
@@ -158,16 +158,16 @@ container-path = "/workspace"
 # model omitted -> falls back to default-model = "fast"
 preamble = "You are a careful coding assistant."
 
-[containers.hello-outrig-standard]
-dockerfile = ".agents/outrig/containers/hello-outrig-standard/Dockerfile"
-context    = ".agents/outrig/containers/hello-outrig-standard"
+[images.hello-outrig-standard]
+dockerfile = ".agents/outrig/images/hello-outrig-standard/Dockerfile"
+context    = ".agents/outrig/images/hello-outrig-standard"
 
-  [containers.hello-outrig-standard.mcp]
+  [images.hello-outrig-standard.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
 
-`.agents/outrig/containers/hello-outrig-standard/Dockerfile` (excerpt):
+`.agents/outrig/images/hello-outrig-standard/Dockerfile` (excerpt):
 
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
@@ -183,7 +183,7 @@ WORKDIR /workspace
 CMD ["sleep", "infinity"]
 ```
 
-The Dockerfile is yours to edit -- `container add` produces a known-good starting point, not a
+The Dockerfile is yours to edit -- `image add` produces a known-good starting point, not a
 finished spec. Note there's no `USER` directive and no `useradd`: outrig sets up a user matching
 your host UID/GID at run time, so the same image works for any host user without rebuilding.
 See [Concepts -> Workspace](concepts/workspace.md#uidgid-runtime-user-mapping).
@@ -195,9 +195,9 @@ to verify and keeps the first run snappy:
 
 ```sh
 $ outrig build
-[outrig] container-config: hello-outrig-standard
-[outrig] dockerfile:       .agents/outrig/containers/hello-outrig-standard/Dockerfile
-[outrig] context:          .agents/outrig/containers/hello-outrig-standard
+[outrig] image-config: hello-outrig-standard
+[outrig] dockerfile:       .agents/outrig/images/hello-outrig-standard/Dockerfile
+[outrig] context:          .agents/outrig/images/hello-outrig-standard
 [outrig] cache key:        outrig-cache:8c2a4f7e91d6b5a3
 [buildah] STEP 1/N: FROM docker.io/library/debian:bookworm-slim
 ...
@@ -224,7 +224,7 @@ Diagnostics arrive on stderr:
 [outrig] agent:             coder (model: fast / provider: openai / gpt-4o-mini)
 [outrig] tool-call cap:     50
 [outrig] tool-result cap:   262144 bytes
-[outrig] container-config:  hello-outrig-standard
+[outrig] image-config:  hello-outrig-standard
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260502T103412-3f2a
 [outrig] mcp fs:    initialized (3 tools)
@@ -315,8 +315,8 @@ work back from you.
   LLM config and how to add more models or agents.
 - [Concepts -> Containers](concepts/containers.md) -- the Dockerfile conventions in detail.
 - [Concepts -> MCP Servers](concepts/mcp-servers.md) -- how to add more tools.
-- [Usage -> AI-assisted design](usage/ai-assisted-design.md) -- AI-guided container-config
+- [Usage -> AI-assisted design](usage/ai-assisted-design.md) -- AI-guided image-config
   design after `outrig init`.
 - [Usage -> outrig run](usage/run.md) -- REPL behavior, slash commands, multiple
-  container-configs.
+  image-configs.
 - [Reference -> Config](reference/config.md) -- every key in `config.toml`.

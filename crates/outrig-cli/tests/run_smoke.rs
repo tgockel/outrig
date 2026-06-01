@@ -39,7 +39,7 @@ fn write_smoke_config(repo: &Path, mock_addr: &str) {
     let config_toml = format!(
         r#"
 default-agent = "smoke"
-default-container = "smoke"
+default-image = "smoke"
 
 [providers.openai]
 style = "openai"
@@ -55,11 +55,11 @@ identifier = "gpt-4o-mini"
 model = "fast"
 preamble = "test"
 
-[containers.smoke]
+[images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
 
-  [containers.smoke.mcp]
+  [images.smoke.mcp]
   fs = ["mcp-server-filesystem", "/workspace"]
 "#,
         addr = mock_addr,

@@ -23,7 +23,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use outrig::config::ContainerConfig;
+use outrig::config::ImageConfig;
 use outrig::image;
 
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn build_then_cache_hit_under_100ms() {
     )
     .expect("write Dockerfile");
 
-    let cfg = ContainerConfig {
+    let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),

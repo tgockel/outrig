@@ -4,9 +4,9 @@
 
 pub mod cli;
 pub mod config_init;
-pub mod container_setup;
 pub mod error;
 pub mod hf;
+pub mod image_setup;
 pub mod init;
 pub mod llm;
 pub mod mcp_self;

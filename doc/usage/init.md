@@ -5,11 +5,11 @@ focused commands plus one inline repo-config phase:
 
 1. If `~/.outrig/config.toml` is missing, run [`outrig config init`](config.md#outrig-config-init).
 2. Create `.agents/outrig/` and `.agents/outrig/config.toml` if absent.
-3. Offer to call [`outrig container add`](container.md#outrig-container-add) in a loop.
+3. Offer to call [`outrig image add`](image.md#outrig-image-add) in a loop.
 
 Each phase is idempotent. Re-running `outrig init` on a fully-set-up repo does nothing for
-the first two phases; the container loop is always offered (you may want to add another
-container-config later).
+the first two phases; the image-config loop is always offered (you may want to add another
+image-config later).
 
 ## Synopsis
 
@@ -19,7 +19,7 @@ outrig init [--force]
 
 | Flag      | Default | Description                                                                |
 |-----------|---------|----------------------------------------------------------------------------|
-| `--force` | off     | Overwrite existing files. Propagates to `config init` and `container add`. |
+| `--force` | off     | Overwrite existing files. Propagates to `config init` and `image add`.     |
 
 ## Run it
 
@@ -74,8 +74,8 @@ Configuring your first agent
 ? Agent name [default: coder]:
 ? Preamble (one line, edit later) [default: You are a careful coding assistant.]:
 
-Configuring your first container
-? Container name [default: hello-outrig-standard]:
+Configuring your first image
+? Image-config name [default: hello-outrig-standard]:
 ? Workspace host-path [default: .]:
 ? Workspace container-path [default: /workspace]:
 
@@ -83,7 +83,7 @@ Configuring your first container
 ```
 
 The default agent name is `coder` (a role-based constant). The default
-container-config name is `<repo-folder>-standard` (kebab-cased), so the container carries
+image-config name is `<repo-folder>-standard` (kebab-cased), so the image-config carries
 the repo's identity while the agent carries its role.
 
 The model section reads your global `~/.outrig/config.toml` and lists the available models.
@@ -105,14 +105,14 @@ If no `default-model` is set anywhere -- globally or at the repo level -- the ag
 prompt forces an explicit `model` selection. That guarantees the resulting config
 validates and `outrig run` will work.
 
-Finally the container loop:
+Finally the image-config loop:
 
 ```
-? Add a container-config now? [Y/n]:
+? Add an image-config now? [Y/n]:
 
-  ... (calls `outrig container add` -- see that page for the full prompt sequence)
+  ... (calls `outrig image add` -- see that page for the full prompt sequence)
 
-? Add another container-config? [y/N]:
+? Add another image-config? [y/N]:
 ```
 
 Press Ctrl-C at any prompt to stop; partial files are not written until all answers are
@@ -120,10 +120,10 @@ gathered.
 
 ## What gets written
 
-A minimal `.agents/outrig/config.toml` (containers will be filled in by `container add`):
+A minimal `.agents/outrig/config.toml` (image-configs will be filled in by `image add`):
 
 ```toml
-default-container = "hello-outrig-standard"
+default-image = "hello-outrig-standard"
 default-agent     = "coder"
 
 [workspace]
@@ -136,9 +136,9 @@ preamble = "You are a careful coding assistant."
 ```
 
 The global `~/.outrig/config.toml` is written by
-[`outrig config init`](config.md#outrig-config-init); the per-container Dockerfile and
-`[containers.<name>]` block come from
-[`outrig container add`](container.md#outrig-container-add).
+[`outrig config init`](config.md#outrig-config-init); the per-image Dockerfile and
+`[images.<name>]` block come from
+[`outrig image add`](image.md#outrig-image-add).
 
 ## Re-running
 
@@ -146,11 +146,11 @@ Without `--force`, `outrig init` skips work that's already done:
 
 - Global config present -> skip the `config init` phase.
 - Repo `config.toml` present -> skip the repo-config phase.
-- Container loop -> always offered, since adding more containers later is the expected
+- Image-config loop -> always offered, since adding more image-configs later is the expected
   workflow.
 
 With `--force`, every nested write rewrites in place. You probably want the more targeted
-commands instead -- `outrig config init --force` or `outrig container add <name> --force`.
+commands instead -- `outrig config init --force` or `outrig image add <name> --force`.
 
 > **TODO: Incomplete** -- non-interactive mode (`outrig init --provider openai --model fast
 > ...`) is deferred.
@@ -159,7 +159,7 @@ commands instead -- `outrig config init --force` or `outrig container add <name>
 
 - [outrig config init](config.md#outrig-config-init) -- the global-config phase, runnable on
   its own.
-- [outrig container add](container.md#outrig-container-add) -- scaffolds a container-config;
+- [outrig image add](image.md#outrig-image-add) -- scaffolds an image-config;
   `init` calls it in a loop.
 - [Concepts -> LLM Providers](../concepts/llm-providers.md) -- what providers, models, and
   agents are and how they compose.

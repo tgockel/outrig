@@ -71,13 +71,13 @@ async fn fresh_state_writes_global_repo_and_container() {
 
     // Container name default = `<repo-folder-kebab>-standard` (== "repo-standard").
     // Agent name default = "coder" (constant, role-based).
-    let dockerfile = cwd.join(".agents/outrig/containers/repo-standard/Dockerfile");
+    let dockerfile = cwd.join(".agents/outrig/images/repo-standard/Dockerfile");
     assert!(dockerfile.is_file(), "container Dockerfile not written");
 
     // Merged validation (with repo_root) succeeds: containers reference
     // existing dockerfile/context paths, default-* keys resolve, etc.
     let merged = Config::load(&cwd, Some(&global)).expect("merged config must load");
-    assert_eq!(merged.default_container.as_deref(), Some("repo-standard"));
+    assert_eq!(merged.default_image.as_deref(), Some("repo-standard"));
     assert_eq!(merged.default_agent.as_deref(), Some("coder"));
     assert_eq!(merged.default_model.as_deref(), Some("fast"));
 
@@ -85,10 +85,7 @@ async fn fresh_state_writes_global_repo_and_container() {
     let repo_text = std::fs::read_to_string(&repo_cfg_path).unwrap();
     assert!(repo_text.contains("[agents.coder]"), "{repo_text}");
     assert!(repo_text.contains("[workspace]"), "{repo_text}");
-    assert!(
-        repo_text.contains("[containers.repo-standard]"),
-        "{repo_text}"
-    );
+    assert!(repo_text.contains("[images.repo-standard]"), "{repo_text}");
 }
 
 #[tokio::test]
@@ -112,7 +109,7 @@ async fn idempotent_rerun_leaves_files_untouched() {
     let global_before = std::fs::read_to_string(&global).unwrap();
     let repo_cfg_path = cwd.join(".agents/outrig/config.toml");
     let repo_before = std::fs::read_to_string(&repo_cfg_path).unwrap();
-    let dockerfile_path = cwd.join(".agents/outrig/containers/repo-standard/Dockerfile");
+    let dockerfile_path = cwd.join(".agents/outrig/images/repo-standard/Dockerfile");
     let dockerfile_before = std::fs::read_to_string(&dockerfile_path).unwrap();
 
     // Re-run: only the container-loop prompt fires (answer "no") -- both
@@ -191,7 +188,7 @@ async fn skips_global_phase_when_global_exists() {
     );
     assert!(cwd.join(".agents/outrig/config.toml").is_file());
     assert!(
-        cwd.join(".agents/outrig/containers/repo-standard/Dockerfile")
+        cwd.join(".agents/outrig/images/repo-standard/Dockerfile")
             .is_file()
     );
 

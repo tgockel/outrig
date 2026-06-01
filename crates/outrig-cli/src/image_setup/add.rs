@@ -1,8 +1,8 @@
-//! `outrig container add` -- interactive scaffolding of a new container-config.
+//! `outrig image add` -- interactive scaffolding of a new image-config.
 //!
 //! Walks the user through name, base image, toolchains, and MCP servers, then
-//! writes `.agents/outrig/containers/<name>/Dockerfile` and appends matching
-//! `[containers.<name>]` and `[containers.<name>.mcp]` blocks to the repo
+//! writes `.agents/outrig/images/<name>/Dockerfile` and appends matching
+//! `[images.<name>]` and `[images.<name>.mcp]` blocks to the repo
 //! `config.toml`. The TOML mutation goes through `toml_edit` so any
 //! surrounding comments and formatting survive.
 //!
@@ -13,17 +13,15 @@ use std::path::Path;
 
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
-use crate::container_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::error::{OutrigError, Result};
+use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
-use crate::paths::{
-    container_dir, container_dir_rel, global_config_path, repo_config_path, write_atomic,
-};
+use crate::paths::{global_config_path, image_dir, image_dir_rel, repo_config_path, write_atomic};
 
 /// CLI entry point. Resolves the repo root from `cwd` (walking up, with a
 /// fallback prompt to bootstrap a fresh `.agents/outrig/config.toml` if
-/// none is found) before running the interactive container-add flow. One
+/// none is found) before running the interactive image-add flow. One
 /// `PromptSource` is threaded through both halves so the user sees a
 /// single conversation. `global_override` plumbs `--global-config` into
 /// the bootstrap path so the model-section can list models from the
@@ -47,7 +45,7 @@ pub async fn run(
 
 /// Drives the interactive flow against an arbitrary `PromptSource`.
 ///
-/// Idempotency probe (Dockerfile path + existing `[containers.<name>]`
+/// Idempotency probe (Dockerfile path + existing `[images.<name>]`
 /// block) runs *before* any prompts so an accidental re-run doesn't burn
 /// through the user's input before bailing.
 pub async fn run_with(
@@ -61,12 +59,12 @@ pub async fn run_with(
     let name = match name_arg {
         Some(n) => n,
         None => {
-            let default = init_repo::default_container_name(repo_root);
+            let default = init_repo::default_image_name(repo_root);
             prompt.ask_string(&NAME_FIELD, &default).await?
         }
     };
 
-    let dockerfile_path = container_dir(repo_root, &name).join("Dockerfile");
+    let dockerfile_path = image_dir(repo_root, &name).join("Dockerfile");
     let mut doc = load_doc(&cfg_path)?;
 
     if !force {
@@ -77,9 +75,9 @@ pub async fn run_with(
             ))
             .into());
         }
-        if container_block_exists(&doc, &name) {
+        if image_block_exists(&doc, &name) {
             return Err(OutrigError::Configuration(format!(
-                "[containers.{name}] already exists in {}; pass --force to overwrite.",
+                "[images.{name}] already exists in {}; pass --force to overwrite.",
                 cfg_path.display()
             ))
             .into());
@@ -107,18 +105,18 @@ pub async fn run_with(
         display_rel(&dockerfile_path, repo_root)
     );
 
-    insert_container_block(&mut doc, &name, &mcps);
+    insert_image_block(&mut doc, &name, &mcps);
     write_atomic(&cfg_path, &doc.to_string())?;
     eprintln!(
-        "[outrig] added [containers.{name}] block to {}",
+        "[outrig] added [images.{name}] block to {}",
         display_rel(&cfg_path, repo_root)
     );
     if mcps.is_empty() {
-        eprintln!("[outrig] [containers.{name}.mcp] is empty");
+        eprintln!("[outrig] [images.{name}.mcp] is empty");
     } else {
         let names: Vec<&str> = mcps.iter().map(|m| m.as_str()).collect();
         eprintln!(
-            "[outrig] added [containers.{name}.mcp] entries: {}",
+            "[outrig] added [images.{name}.mcp] entries: {}",
             names.join(", ")
         );
     }
@@ -129,10 +127,10 @@ pub async fn run_with(
 // ---- prompt fields --------------------------------------------------------
 
 pub(crate) const NAME_FIELD: Field = Field {
-    name: "Container name",
-    description: "Used as the [containers.<name>] key. Must match `^[a-zA-Z][a-zA-Z0-9_-]*$`.",
+    name: "Image name",
+    description: "Used as the [images.<name>] key. Must match `^[a-zA-Z][a-zA-Z0-9_-]*$`.",
     options: &[],
-    doc_link: "doc/usage/container.md",
+    doc_link: "doc/usage/image.md",
 };
 
 const BASES: &[(&str, &str)] = &[
@@ -162,7 +160,7 @@ const BASE_FIELD: Field = Field {
     name: "Base image",
     description: "The Dockerfile's `FROM` line. Pick one of the curated starting points.",
     options: BASES,
-    doc_link: "doc/usage/container.md",
+    doc_link: "doc/usage/image.md",
 };
 
 const TOOLCHAINS: &[(&str, &str)] = &[
@@ -182,7 +180,7 @@ const TOOLCHAIN_FIELD: Field = Field {
                   The Dockerfile template adds the corresponding install steps; \
                   you can edit the file afterwards.",
     options: TOOLCHAINS,
-    doc_link: "doc/usage/container.md",
+    doc_link: "doc/usage/image.md",
 };
 
 const MCPS: &[(&str, &str)] = &[
@@ -194,7 +192,7 @@ const MCP_FIELD: Field = Field {
     name: "MCP servers",
     description: "Pick zero or more MCP servers to install in the image. The \
                   Dockerfile installs each server's package and the matching \
-                  [containers.<name>.mcp] entry is appended to config.toml.",
+                  [images.<name>.mcp] entry is appended to config.toml.",
     options: MCPS,
     doc_link: "doc/concepts/mcp-servers.md",
 };
@@ -225,14 +223,14 @@ fn load_doc(cfg_path: &Path) -> Result<DocumentMut> {
     })
 }
 
-fn container_block_exists(doc: &DocumentMut, name: &str) -> bool {
-    doc.get("containers")
+fn image_block_exists(doc: &DocumentMut, name: &str) -> bool {
+    doc.get("images")
         .and_then(|c| c.as_table_like())
         .is_some_and(|t| t.contains_key(name))
 }
 
-fn insert_container_block(doc: &mut DocumentMut, name: &str, mcps: &[McpServer]) {
-    let rel = container_dir_rel(name);
+fn insert_image_block(doc: &mut DocumentMut, name: &str, mcps: &[McpServer]) {
+    let rel = image_dir_rel(name);
     let dockerfile = rel.join("Dockerfile").to_string_lossy().into_owned();
     let context = rel.to_string_lossy().into_owned();
 
@@ -246,16 +244,16 @@ fn insert_container_block(doc: &mut DocumentMut, name: &str, mcps: &[McpServer])
     }
     entry.insert("mcp", Item::Table(mcp));
 
-    let containers = doc
-        .entry("containers")
+    let images = doc
+        .entry("images")
         .or_insert_with(|| {
             let mut t = Table::new();
             t.set_implicit(true);
             Item::Table(t)
         })
         .as_table_mut()
-        .expect("containers must be a table");
-    containers.insert(name, Item::Table(entry));
+        .expect("images must be a table");
+    images.insert(name, Item::Table(entry));
 }
 
 fn mcp_value(server: McpServer) -> Item {

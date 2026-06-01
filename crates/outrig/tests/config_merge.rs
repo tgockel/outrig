@@ -113,15 +113,15 @@ allow = [{ host = "example.com", port = 0 }]
     }
 
     #[test]
-    fn dangling_default_container_errors() {
+    fn dangling_default_image_errors() {
         let cfg = parse(
             r#"
-default-container = "missing"
+default-image = "missing"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::UnknownDefaultContainer { ref name } if name == "missing"),
+            matches!(err, ConfigValidationError::UnknownDefaultImage { ref name } if name == "missing"),
             "got: {err:?}",
         );
     }
@@ -216,16 +216,16 @@ provider   = "openai"
 identifier = "gpt-4o-mini"
 
 [agents.coding]
-container = "ghost"
+image = "ghost"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::UnknownAgentContainer { agent, container } => {
+            ConfigValidationError::UnknownAgentImage { agent, image } => {
                 assert_eq!(agent, "coding");
-                assert_eq!(container, "ghost");
+                assert_eq!(image, "ghost");
             }
-            other => panic!("expected UnknownAgentContainer, got: {other:?}"),
+            other => panic!("expected UnknownAgentImage, got: {other:?}"),
         }
     }
 
@@ -273,18 +273,18 @@ preamble = "hi"
     fn mcp_server_name_invalid_errors() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   "bad name" = ["bin"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::InvalidMcpServerName { container, server } => {
-                assert_eq!(container, "coding");
+            ConfigValidationError::InvalidMcpServerName { image, server } => {
+                assert_eq!(image, "coding");
                 assert_eq!(server, "bad name");
             }
             other => panic!("expected InvalidMcpServerName, got: {other:?}"),
@@ -295,11 +295,11 @@ context    = "ctx"
     fn mcp_server_name_leading_dash_errors() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   "-leading" = ["bin"]
 "#,
         );
@@ -314,23 +314,23 @@ context    = "ctx"
     fn mcp_command_empty_errors() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   srv = []
 "#,
         );
         // Sanity: shape is Short with empty command.
         assert!(matches!(
-            cfg.containers["coding"].mcp["srv"],
+            cfg.images["coding"].mcp["srv"],
             McpServerSpec::Short(ref v) if v.is_empty(),
         ));
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::EmptyMcpCommand { container, server } => {
-                assert_eq!(container, "coding");
+            ConfigValidationError::EmptyMcpCommand { image, server } => {
+                assert_eq!(image, "coding");
                 assert_eq!(server, "srv");
             }
             other => panic!("expected EmptyMcpCommand, got: {other:?}"),
@@ -358,15 +358,15 @@ session-root = "relative/path"
         let tmp = tempdir().unwrap();
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "Dockerfile"
 context    = "."
 "#,
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::DockerfileMissing { container, path } => {
-                assert_eq!(container, "coding");
+            ConfigValidationError::DockerfileMissing { image, path } => {
+                assert_eq!(image, "coding");
                 assert_eq!(path, std::path::PathBuf::from("Dockerfile"));
             }
             other => panic!("expected DockerfileMissing, got: {other:?}"),
@@ -380,15 +380,15 @@ context    = "."
         fs::write(tmp.path().join("Dockerfile"), "FROM scratch\n").unwrap();
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "Dockerfile"
 context    = "missing-ctx"
 "#,
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::ContextMissing { container, path } => {
-                assert_eq!(container, "coding");
+            ConfigValidationError::ContextMissing { image, path } => {
+                assert_eq!(image, "coding");
                 assert_eq!(path, std::path::PathBuf::from("missing-ctx"));
             }
             other => panic!("expected ContextMissing, got: {other:?}"),
@@ -401,7 +401,7 @@ context    = "missing-ctx"
         // `repo_root = None`, the on-disk existence check is skipped.
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "does/not/exist/Dockerfile"
 context    = "does/not/exist"
 "#,
@@ -531,22 +531,22 @@ container-path = "/workspace"
     fn malformed_capability_name_errors() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.coding.security]
+[images.coding.security]
 cap-drop = ["net_raw"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
             ConfigValidationError::CapabilityNameInvalid {
-                container,
+                image,
                 field,
                 capability,
             } => {
-                assert_eq!(container, "coding");
+                assert_eq!(image, "coding");
                 assert_eq!(field, "cap-drop");
                 assert_eq!(capability, "net_raw");
             }
@@ -558,18 +558,18 @@ cap-drop = ["net_raw"]
     fn empty_capability_name_errors() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.coding.security]
+[images.coding.security]
 cap-add = ["CAP_"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::CapabilityNameEmpty { container, field } => {
-                assert_eq!(container, "coding");
+            ConfigValidationError::CapabilityNameEmpty { image, field } => {
+                assert_eq!(image, "coding");
                 assert_eq!(field, "cap-add");
             }
             other => panic!("expected CapabilityNameEmpty, got: {other:?}"),
@@ -580,22 +580,22 @@ cap-add = ["CAP_"]
     fn duplicate_capability_names_error_after_prefix_stripping() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.coding.security]
+[images.coding.security]
 cap-drop = ["NET_RAW", "CAP_NET_RAW"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
             ConfigValidationError::CapabilityNameDuplicate {
-                container,
+                image,
                 field,
                 capability,
             } => {
-                assert_eq!(container, "coding");
+                assert_eq!(image, "coding");
                 assert_eq!(field, "cap-drop");
                 assert_eq!(capability, "NET_RAW");
             }
@@ -607,22 +607,19 @@ cap-drop = ["NET_RAW", "CAP_NET_RAW"]
     fn explicit_capability_drop_add_overlap_errors() {
         let cfg = parse(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.coding.security]
+[images.coding.security]
 cap-drop = ["MKNOD"]
 cap-add  = ["CAP_MKNOD"]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::CapabilityDropAddConflict {
-                container,
-                capability,
-            } => {
-                assert_eq!(container, "coding");
+            ConfigValidationError::CapabilityDropAddConflict { image, capability } => {
+                assert_eq!(image, "coding");
                 assert_eq!(capability, "MKNOD");
             }
             other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
@@ -1013,8 +1010,8 @@ mod config_load {
         let tmp = tempdir().unwrap();
         write_repo_cfg(tmp.path(), FIXTURE_FULL);
 
-        // The fixture's container references real paths under the repo root.
-        let ctx = tmp.path().join(".agents/outrig/containers/coding");
+        // The fixture's image references real paths under the repo root.
+        let ctx = tmp.path().join(".agents/outrig/images/coding");
         fs::create_dir_all(&ctx).unwrap();
         fs::write(ctx.join("Dockerfile"), "FROM scratch\n").unwrap();
 
@@ -1028,7 +1025,7 @@ mod config_load {
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/cache")).unwrap();
 
         let cfg = Config::load(tmp.path(), None).expect("fixture loads end-to-end");
-        assert_eq!(cfg.default_container.as_deref(), Some("coding"));
+        assert_eq!(cfg.default_image.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
         assert_eq!(cfg.default_model.as_deref(), Some("fast"));
     }
@@ -1262,22 +1259,21 @@ allow = ["github.com:443"]
     fn image_name_only_validates_clean() {
         let cfg = parse(
             r#"
-[containers.scratch]
+[images.scratch]
 image-name = "docker.io/library/ubuntu:24.04"
 "#,
         );
-        cfg.validate(None)
-            .expect("image-name-only container validates");
+        cfg.validate(None).expect("image-name-only image validates");
     }
 
     #[test]
     fn image_name_with_mcp_validates_clean() {
         let cfg = parse(
             r#"
-[containers.scratch]
+[images.scratch]
 image-name = "docker.io/library/ubuntu:24.04"
 
-  [containers.scratch.mcp]
+  [images.scratch.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 "#,
         );
@@ -1288,13 +1284,13 @@ image-name = "docker.io/library/ubuntu:24.04"
     fn container_source_missing_errors() {
         let cfg = parse(
             r#"
-[containers.empty]
+[images.empty]
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::ContainerSourceMissing { .. }),
-            "expected ContainerSourceMissing, got: {err:?}"
+            matches!(err, ConfigValidationError::ImageSourceMissing { .. }),
+            "expected ImageSourceMissing, got: {err:?}"
         );
     }
 
@@ -1302,7 +1298,7 @@ image-name = "docker.io/library/ubuntu:24.04"
     fn image_name_with_dockerfile_errors() {
         let cfg = parse(
             r#"
-[containers.bad]
+[images.bad]
 image-name = "alpine:3.20"
 dockerfile = "Dockerfile"
 context    = "."
@@ -1310,8 +1306,8 @@ context    = "."
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::ContainerSourceConflict { .. }),
-            "expected ContainerSourceConflict, got: {err:?}"
+            matches!(err, ConfigValidationError::ImageSourceConflict { .. }),
+            "expected ImageSourceConflict, got: {err:?}"
         );
     }
 
@@ -1319,18 +1315,15 @@ context    = "."
     fn image_name_with_build_args_errors() {
         let cfg = parse(
             r#"
-[containers.bad]
+[images.bad]
 image-name = "alpine:3.20"
 build-args = { FOO = "bar" }
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(
-                err,
-                ConfigValidationError::ContainerImageNameWithBuildArgs { .. }
-            ),
-            "expected ContainerImageNameWithBuildArgs, got: {err:?}"
+            matches!(err, ConfigValidationError::ImageNameWithBuildArgs { .. }),
+            "expected ImageNameWithBuildArgs, got: {err:?}"
         );
     }
 
@@ -1338,14 +1331,14 @@ build-args = { FOO = "bar" }
     fn empty_image_name_errors() {
         let cfg = parse(
             r#"
-[containers.bad]
+[images.bad]
 image-name = ""
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::ContainerImageNameEmpty { .. }),
-            "expected ContainerImageNameEmpty, got: {err:?}"
+            matches!(err, ConfigValidationError::ImageNameEmpty { .. }),
+            "expected ImageNameEmpty, got: {err:?}"
         );
     }
 
@@ -1353,14 +1346,14 @@ image-name = ""
     fn dockerfile_without_context_errors() {
         let cfg = parse(
             r#"
-[containers.bad]
+[images.bad]
 dockerfile = "Dockerfile"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::ContainerHalfBuilt { .. }),
-            "expected ContainerHalfBuilt, got: {err:?}"
+            matches!(err, ConfigValidationError::ImageHalfBuilt { .. }),
+            "expected ImageHalfBuilt, got: {err:?}"
         );
     }
 
@@ -1368,14 +1361,14 @@ dockerfile = "Dockerfile"
     fn context_without_dockerfile_errors() {
         let cfg = parse(
             r#"
-[containers.bad]
+[images.bad]
 context = "."
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::ContainerHalfBuilt { .. }),
-            "expected ContainerHalfBuilt, got: {err:?}"
+            matches!(err, ConfigValidationError::ImageHalfBuilt { .. }),
+            "expected ImageHalfBuilt, got: {err:?}"
         );
     }
 }

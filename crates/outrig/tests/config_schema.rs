@@ -65,9 +65,9 @@ identifier = "claude-opus-4-7"
     #[test]
     fn dotted_container_name_also_gets_quoting_hint() {
         // Same heuristic must fire for sections other than `[models]` --
-        // here, a container whose name was meant to be `my.thing`.
+        // here, an image whose name was meant to be `my.thing`.
         let bad = r#"
-[containers.my.thing]
+[images.my.thing]
 dockerfile = "D"
 context    = "ctx"
 "#;
@@ -81,27 +81,27 @@ context    = "ctx"
     #[test]
     fn mcp_short_and_full_normalize_equal() {
         let short_toml = r#"
-[containers.c]
+[images.c]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.c.mcp]
+[images.c.mcp]
 srv = ["bin", "arg1"]
 "#;
         let full_toml = r#"
-[containers.c]
+[images.c]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.c.mcp]
+[images.c.mcp]
 srv = { command = ["bin", "arg1"] }
 "#;
 
         let short = Config::load_from_str(short_toml).expect("short form parses");
         let full = Config::load_from_str(full_toml).expect("full form parses");
 
-        let short_spec = short.containers["c"].mcp["srv"].clone();
-        let full_spec = full.containers["c"].mcp["srv"].clone();
+        let short_spec = short.images["c"].mcp["srv"].clone();
+        let full_spec = full.images["c"].mcp["srv"].clone();
 
         assert!(
             matches!(short_spec, McpServerSpec::Short(_)),
@@ -114,7 +114,7 @@ srv = { command = ["bin", "arg1"] }
 
         assert_eq!(short_spec.normalize(), full_spec.normalize());
         assert_eq!(
-            short.containers["c"].mcp["srv"].normalize(),
+            short.images["c"].mcp["srv"].normalize(),
             (vec!["bin".to_string(), "arg1".to_string()], BTreeMap::new()),
         );
     }
@@ -123,7 +123,7 @@ srv = { command = ["bin", "arg1"] }
     fn fixture_spot_checks_match_documented_keys() {
         let cfg = Config::load_from_str(FIXTURE).expect("fixture parses");
 
-        assert_eq!(cfg.default_container.as_deref(), Some("coding"));
+        assert_eq!(cfg.default_image.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
         assert_eq!(cfg.default_model.as_deref(), Some("fast"));
         assert_eq!(
@@ -190,7 +190,7 @@ srv = { command = ["bin", "arg1"] }
 
         let coding = &cfg.agents["coding"];
         assert_eq!(coding.model, None);
-        assert_eq!(coding.container.as_deref(), Some("coding"));
+        assert_eq!(coding.image.as_deref(), Some("coding"));
         assert_eq!(coding.temperature, Some(0.2));
         assert_eq!(coding.max_tokens, Some(4096));
         assert_eq!(coding.tool_call_cap, Some(300));
@@ -219,14 +219,14 @@ srv = { command = ["bin", "arg1"] }
         );
         assert_eq!(cfg.workspace.mounts[1].access, MountAccess::ReadWrite);
 
-        let coding_ctr = &cfg.containers["coding"];
+        let coding_ctr = &cfg.images["coding"];
         assert_eq!(
             coding_ctr.dockerfile,
-            Some(PathBuf::from(".agents/outrig/containers/coding/Dockerfile")),
+            Some(PathBuf::from(".agents/outrig/images/coding/Dockerfile")),
         );
         assert_eq!(
             coding_ctr.context,
-            Some(PathBuf::from(".agents/outrig/containers/coding")),
+            Some(PathBuf::from(".agents/outrig/images/coding")),
         );
         // Inner map keys (build-args ARG names, mcp env-var names) keep user
         // casing -- they're not subject to the outer `rename_all = kebab-case`.
@@ -265,13 +265,13 @@ srv = { command = ["bin", "arg1"] }
     fn container_security_absent_yields_documented_defaults() {
         let cfg = Config::load_from_str(
             r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 "#,
         )
         .expect("config parses");
-        let security = &cfg.containers["coding"].security;
+        let security = &cfg.images["coding"].security;
         assert_eq!(security.capability_profile, CapabilityProfile::Default);
         assert!(security.cap_drop.is_empty());
         assert!(security.cap_add.is_empty());
@@ -280,11 +280,11 @@ context    = "ctx"
     #[test]
     fn capability_profile_values_are_validated_by_schema() {
         let bad = r#"
-[containers.coding]
+[images.coding]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.coding.security]
+[images.coding.security]
 capability-profile = "wide-open"
 "#;
         let err = Config::load_from_str(bad).unwrap_err();

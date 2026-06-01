@@ -1,4 +1,4 @@
-//! Pure Dockerfile assembly for `outrig container add`.
+//! Pure Dockerfile assembly for `outrig image add`.
 //!
 //! `render(base, toolchains, mcps)` stitches a header (per base-family) plus
 //! per-(toolchain, family) fragments plus an MCP-server install block plus a
@@ -16,7 +16,7 @@ pub enum Family {
     Alpine,
 }
 
-/// One of the curated base images offered by `container add`. Each carries
+/// One of the curated base images offered by `image add`. Each carries
 /// the family discriminant and the full image string used in `FROM
 /// docker.io/library/<image>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +104,7 @@ impl Toolchain {
     }
 }
 
-/// Curated MCP server package recipes rendered by `container add`.
+/// Curated MCP server package recipes rendered by `image add`.
 /// Config can still declare any MCP command, including shell servers; this
 /// enum only covers recipes OutRig can install without more user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,7 +132,7 @@ impl McpServer {
     }
 
     /// argv of the runtime `command` for this server's
-    /// `[containers.<name>.mcp.<server>]` entry. The first element is the
+    /// `[images.<name>.mcp.<server>]` entry. The first element is the
     /// binary name, the rest are arguments.
     pub fn command_args(self) -> &'static [&'static str] {
         match self {

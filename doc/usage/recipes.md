@@ -24,39 +24,39 @@ strictly on stderr, redirecting stdout gives you only model output.
 This is the pattern for embedding outrig in larger shell pipelines (CI checks, batch generation,
 summarization jobs).
 
-## Recipe: separate container-configs for different tasks
+## Recipe: separate image-configs for different tasks
 
 A `coding` config has the full toolchain. A `planning` config has only research-style MCPs and
-runs against a cheaper model. Use distinct agents (each pointing at its own container) and pick
-with `--agent`:
+runs against a cheaper model. Use distinct agents (each pointing at its own image-config) and
+pick with `--agent`:
 
 ```toml
-default-container = "coding"
+default-image = "coding"
 default-agent     = "coding"
 
 [agents.coding]
 model     = "fast"
-container = "coding"
+image     = "coding"
 preamble  = "You are a careful coding assistant."
 
 [agents.planning]
 model     = "fast"
-container = "planning"
+image     = "planning"
 preamble  = "You are a research planner. Read, summarise, do not execute."
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
 
-  [containers.coding.mcp]
+  [images.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 
-[containers.planning]
-dockerfile = ".agents/outrig/containers/planning/Dockerfile"
-context    = ".agents/outrig/containers/planning"
+[images.planning]
+dockerfile = ".agents/outrig/images/planning/Dockerfile"
+context    = ".agents/outrig/images/planning"
 
-  [containers.planning.mcp]
+  [images.planning.mcp]
   fs       = { command = ["mcp-server-filesystem", "/workspace"] }
   research = { command = ["mcp-research"] }
 ```
@@ -66,7 +66,7 @@ $ outrig run                  # default-agent = "coding"
 $ outrig run --agent planning # different agent, different image, different MCPs
 ```
 
-Because each container-config caches independently, switching is fast after the first build of
+Because each image-config caches independently, switching is fast after the first build of
 each.
 
 ## Recipe: pre-warming images in CI
@@ -79,7 +79,7 @@ Catch a broken Dockerfile or dependency bump before anyone tries to use the agen
 - run: outrig build --all
 ```
 
-`outrig build --all` rebuilds every container-config, returns non-zero on the first failure, and
+`outrig build --all` rebuilds every image-config, returns non-zero on the first failure, and
 prints the failing buildah step.
 
 ## Recipe: capturing what the agent did

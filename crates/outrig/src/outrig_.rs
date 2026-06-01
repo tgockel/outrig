@@ -11,8 +11,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::{
-    CapabilityProfile, ContainerConfig, ContainerSecurity, ContainerSourceRef, EnvValue,
-    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, Workspace,
+    CapabilityProfile, EnvValue, ImageConfig, ImageSecurity, ImageSourceRef, McpServerSpec,
+    MountAccess, NetworkMode, NetworkPolicy, Workspace,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -76,8 +76,8 @@ pub struct NetworkSpec {
     pub policy: Option<NetworkPolicy>,
 }
 
-impl From<&ContainerSecurity> for SecuritySpec {
-    fn from(security: &ContainerSecurity) -> Self {
+impl From<&ImageSecurity> for SecuritySpec {
+    fn from(security: &ImageSecurity) -> Self {
         Self {
             capabilities: CapabilitySpec {
                 profile: security.capability_profile,
@@ -161,12 +161,12 @@ impl LaunchSpec {
         }
     }
 
-    /// Build a `LaunchSpec` from a parsed `[containers.<name>]` block plus
+    /// Build a `LaunchSpec` from a parsed `[images.<name>]` block plus
     /// the project's `[workspace]`. Resolves repo-relative paths against
     /// `repo_root` so the resulting spec carries absolute paths and is
     /// independent of the caller's current directory.
-    pub fn from_container_config(
-        cfg: &ContainerConfig,
+    pub fn from_image_config(
+        cfg: &ImageConfig,
         workspace: &Workspace,
         repo_root: &Path,
         log_dir: PathBuf,
@@ -186,7 +186,7 @@ impl LaunchSpec {
             })
             .collect();
         match cfg.source() {
-            ContainerSourceRef::Build {
+            ImageSourceRef::Build {
                 dockerfile,
                 context,
                 build_args,
@@ -203,7 +203,7 @@ impl LaunchSpec {
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
-            ContainerSourceRef::Image { image_name } => Self {
+            ImageSourceRef::Image { image_name } => Self {
                 source: LaunchSource::Image {
                     tag: image_name.to_string(),
                 },
@@ -302,14 +302,14 @@ impl Outrig {
                 build_args,
             } => {
                 // Reuse `ensure_image` by wrapping the raw inputs in a
-                // `ContainerConfig`. Passing an empty `repo_root` makes
+                // `ImageConfig`. Passing an empty `repo_root` makes
                 // its `repo_root.join(absolute)` calls no-ops.
-                let cfg = ContainerConfig {
+                let cfg = ImageConfig {
                     image_name: None,
                     dockerfile: Some(dockerfile.clone()),
                     context: Some(context.clone()),
                     build_args: build_args.clone(),
-                    security: ContainerSecurity::default(),
+                    security: ImageSecurity::default(),
                     mcp: BTreeMap::new(),
                 };
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag

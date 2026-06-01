@@ -45,10 +45,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub model: Option<String>,
 
-    /// Pick a `[containers.<name>]` block. Overrides the agent's `container`
-    /// and the top-level `default-container`.
+    /// Pick a `[images.<name>]` block. Overrides the agent's `image`
+    /// and the top-level `default-image`.
     #[arg(long, value_name = "NAME")]
-    pub container: Option<String>,
+    pub image: Option<String>,
 
     /// Write the session into an explicit, already-existing directory. The
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
@@ -92,7 +92,7 @@ pub async fn execute(
         repo_cfg_path,
         global_cfg_path,
         session_root_flag,
-        container_flag: args.container.as_deref(),
+        image_flag: args.image.as_deref(),
         attach_target: None,
         agent_flag: args.agent.as_deref(),
         model_override: args.model.as_deref(),
@@ -111,8 +111,8 @@ pub async fn execute(
         .expect("outrig run always resolves an agent in setup");
     let SessionSetup {
         cfg,
-        container_cfg_name,
-        container_cfg,
+        image_cfg_name,
+        image_cfg,
         image_tag,
         container,
         sid,
@@ -126,12 +126,12 @@ pub async fn execute(
     let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
 
     // Validate per-server env entries against the resolved MCP map.
-    let mcp = session_setup::merged_mcp(&container, &container_cfg).await?;
+    let mcp = session_setup::merged_mcp(&container, &image_cfg).await?;
     for name in cli_env.per_server_names() {
         if !mcp.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
-                "--env {name}:...: container '{}' has no MCP server '{name}'",
-                container_cfg_name
+                "--env {name}:...: image '{}' has no MCP server '{name}'",
+                image_cfg_name
             ))
             .into());
         }
@@ -141,7 +141,7 @@ pub async fn execute(
     let outcome: Result<i32> = run_inner(
         &cfg,
         &agent_name,
-        &container_cfg_name,
+        &image_cfg_name,
         &image_tag,
         &container,
         &log_dir,
@@ -174,7 +174,7 @@ fn parse_mistralrs_device(s: &str) -> std::result::Result<MistralrsDeviceSpec, S
 async fn run_inner(
     cfg: &Config,
     agent_name: &str,
-    container_cfg_name: &str,
+    image_cfg_name: &str,
     image_tag: &ImageTag,
     container: &Container,
     log_dir: &Path,
@@ -188,8 +188,8 @@ async fn run_inner(
     mcp: &std::collections::BTreeMap<String, outrig::config::McpServerSpec>,
     cli_env: &CliEnvEntries,
 ) -> Result<i32> {
-    // `setup` already validated presence and used the resolved `.container`
-    // for the container fallback. We re-resolve here for `build_agent` +
+    // `setup` already validated presence and used the resolved `.image`
+    // for the image fallback. We re-resolve here for `build_agent` +
     // banner; cheap (config table lookups, no I/O).
     let mut resolved =
         llm::resolve_agent_with_overrides(cfg, agent_name, model_override, device_override)?;
@@ -231,7 +231,7 @@ async fn run_inner(
 
     print_banner(
         &resolved,
-        container_cfg_name,
+        image_cfg_name,
         image_tag,
         container.name(),
         &per_server_counts,
@@ -321,7 +321,7 @@ fn print_banner(
     if let Some(weights) = &resolved.model_weights {
         let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
     }
-    let _ = writeln!(buf, "[outrig] container-config:  {container_name}");
+    let _ = writeln!(buf, "[outrig] image-config:  {container_name}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
     for (name, count) in per_server_counts {
@@ -481,7 +481,7 @@ mod tests {
             max_tokens: None,
             tool_call_cap: 100,
             tool_result_cap_bytes: llm::DEFAULT_TOOL_RESULT_CAP_BYTES,
-            container: None,
+            image: None,
         };
 
         apply_tool_call_cap_override(&mut resolved, Some(50));
@@ -503,7 +503,7 @@ mod tests {
             max_tokens: None,
             tool_call_cap: 100,
             tool_result_cap_bytes: 262_144,
-            container: None,
+            image: None,
         };
 
         apply_tool_result_cap_override(&mut resolved, Some(65_536));

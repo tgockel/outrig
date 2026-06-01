@@ -2,14 +2,14 @@
 
 `outrig run` is the main subcommand. It walks up from the current directory to find
 `.agents/outrig/config.toml`, builds (or cache-hits) the container image, starts the container,
-attaches every MCP server defined for the selected container-config, and drops you into a
+attaches every MCP server defined for the selected image-config, and drops you into a
 stdin/stdout REPL with the agent.
 
 ## Synopsis
 
 ```
 outrig run [--agent <name>]
-           [--container <name>]
+           [--image <name>]
            [--config <path>]
            [--device <cpu|cuda|cuda:N|metal>]
            [--max-tool-calls <n>]
@@ -22,8 +22,8 @@ outrig run [--agent <name>]
 ```
 
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
-- `--container <name>` (default: agent's `container`, else `default-container`): pick a
-  container.
+- `--image <name>` (default: agent's `image`, else `default-image`): pick an
+  image-config.
 - `--config <path>` (default: walks up from cwd): use from outside the repo or
   non-standard locations.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
@@ -68,8 +68,8 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 
 1. **Locate config.** Walks up from the current directory until `.agents/outrig/config.toml` is
    found, or fails.
-2. **Resolve container-config.** Uses `--container` if given, otherwise
-   `default-container`. The selected block must exist.
+2. **Resolve image-config.** Uses `--image` if given, otherwise
+   `default-image`. The selected block must exist.
 3. **Build (or cache-hit) the image.** Runs `buildah build`. If the cache hash matches an
    existing tag, no rebuild.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
@@ -83,7 +83,7 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
    matching `[network].mode` config installs the per-session interceptor and opens
    `<session_dir>/logs/network.jsonl`. Filter mode also enforces global `[network]` policy.
    The default mode skips this step entirely.
-7. **Connect MCP servers.** For each entry in `[containers.<name>.mcp]`,
+7. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`.
 8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), pick the
@@ -109,8 +109,8 @@ A typical startup looks like:
 ```
 [outrig] loading config
 [outrig] config loaded (1ms)
-[outrig] resolving agent and container
-[outrig] agent/container resolved: agent coding, container coding (0ms)
+[outrig] resolving agent and image-config
+[outrig] agent/image-config resolved: agent coding, image-config coding (0ms)
 [outrig] computing image tag
 [outrig] image tag computed: outrig-cache:8c2a4f7e91d6b5a3 (32ms)
 [outrig] ensuring image outrig-cache:8c2a4f7e91d6b5a3
@@ -130,7 +130,7 @@ A typical startup looks like:
 [outrig] agent:             coding (model: fast / provider: openai / gpt-4o-mini)
 [outrig] tool-call cap:     50
 [outrig] tool-result cap:   262144 bytes
-[outrig] container-config:  coding
+[outrig] image-config:  coding
 [outrig] image:             outrig-cache:8c2a4f7e91d6b5a3
 [outrig] container started: outrig-20260502T103412-3f2a
 [outrig] mcp fs:    initialized (3 tools)
@@ -255,16 +255,16 @@ You're not inside an outrig-configured repo. Either `cd` into one or pass `--con
 
 ```
 $ outrig run
-[outrig] container-config: coding
-error: container-config "coding" is missing required key: dockerfile
+[outrig] image-config: coding
+error: image-config "coding" is missing required key: dockerfile
 ```
 
-The selected `[containers.<name>]` block is incomplete. See
+The selected `[images.<name>]` block is incomplete. See
 [Reference -> Config](../reference/config.md).
 
 ```
 $ outrig run
-[outrig] container-config: coding
+[outrig] image-config: coding
 [outrig] image:            outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260501T134412-3f2a
 [outrig] mcp fs: error: failed to spawn `mcp-server-filesystem` in container
@@ -275,7 +275,7 @@ The MCP server binary isn't in the image. Install it in the Dockerfile.
 
 ```
 $ outrig run
-[outrig] container-config: coding
+[outrig] image-config: coding
 [outrig] image:            outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260501T134412-3f2a
 [outrig] mcp fs: initialized

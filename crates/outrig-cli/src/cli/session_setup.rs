@@ -35,7 +35,7 @@ use crate::error::{OutrigError, Result};
 use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
-use outrig::config::{Config, ContainerConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
+use outrig::config::{Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
 use outrig::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     embedded,
@@ -98,7 +98,7 @@ pub struct SessionSetupArgs<'a> {
     pub repo_cfg_path: &'a Path,
     pub global_cfg_path: &'a Path,
     pub session_root_flag: Option<&'a Path>,
-    pub container_flag: Option<&'a str>,
+    pub image_flag: Option<&'a str>,
     /// Existing session id or podman container name to attach to instead of
     /// starting a fresh container. Used by `outrig mcp --attach`.
     pub attach_target: Option<&'a str>,
@@ -110,11 +110,11 @@ pub struct SessionSetupArgs<'a> {
     pub model_override: Option<&'a str>,
     /// `true` for `outrig run`: [`setup`] resolves an agent from
     /// `agent_flag.or(cfg.default_agent)` (errors if neither) and lets
-    /// `agent.container` participate in the container fallback.
+    /// `agent.image` participate in the container fallback.
     /// `false` for `outrig mcp`: no agent at all -- `llm::resolve_agent` is
     /// not called, `cfg.default_agent` is not consulted, the resulting
     /// [`Session::agent_name`] is `None`, and the container cascade is
-    /// `container_flag -> default_container` only.
+    /// `image_flag -> default_image` only.
     pub require_agent: bool,
     pub explicit_session_dir: Option<&'a Path>,
     pub network_mode_override: Option<NetworkMode>,
@@ -127,8 +127,8 @@ pub struct SessionSetupArgs<'a> {
 /// started + bootstrapped; the session row is already on disk.
 pub struct SessionSetup {
     pub cfg: Config,
-    pub container_cfg_name: String,
-    pub container_cfg: ContainerConfig,
+    pub image_cfg_name: String,
+    pub image_cfg: ImageConfig,
     pub image_tag: ImageTag,
     pub container: Container,
     pub sid: SessionId,
@@ -143,7 +143,7 @@ pub struct SessionSetup {
 #[derive(Debug)]
 struct AttachResolution {
     container_name: String,
-    container_cfg_name: String,
+    image_cfg_name: String,
 }
 
 /// Run the shared bootstrap. Returns once the container is up, the runtime
@@ -173,7 +173,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             ))
             .into());
         }
-        Some(target) => Some(resolve_attach_target(target, args.container_flag, &store)?),
+        Some(target) => Some(resolve_attach_target(target, args.image_flag, &store)?),
         None => None,
     };
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode);
@@ -199,7 +199,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     // false` -- it has no agent concept, so `agent_flag` and
     // `cfg.default_agent` are not consulted at all.
     let span = ProgressSpan::start("resolving agent and container");
-    let (session_agent_name, agent_container) = if attach.is_some() {
+    let (session_agent_name, agent_image) = if attach.is_some() {
         (None, None)
     } else if args.require_agent {
         let agent_name = args
@@ -214,50 +214,47 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             args.model_override,
             args.device_override,
         )?;
-        (
-            Some(resolved.agent_name.clone()),
-            resolved.container.clone(),
-        )
+        (Some(resolved.agent_name.clone()), resolved.image.clone())
     } else {
         (None, None)
     };
 
-    let container_cfg_name = match &attach {
-        Some(attach) => attach.container_cfg_name.clone(),
+    let image_cfg_name = match &attach {
+        Some(attach) => attach.image_cfg_name.clone(),
         None => args
-            .container_flag
-            .or(agent_container.as_deref())
-            .or(cfg.default_container.as_deref())
+            .image_flag
+            .or(agent_image.as_deref())
+            .or(cfg.default_image.as_deref())
             .ok_or_else(|| {
                 let msg = if args.require_agent {
-                    "no --container, agent.container, or default-container configured"
+                    "no --image, agent.image, or default-image configured"
                 } else {
-                    "no --container or default-container configured"
+                    "no --image or default-image configured"
                 };
                 OutrigError::Configuration(msg.to_string())
             })?
             .to_string(),
     };
-    let container_cfg = cfg
-        .containers
-        .get(&container_cfg_name)
+    let image_cfg = cfg
+        .images
+        .get(&image_cfg_name)
         .ok_or_else(|| {
             OutrigError::Configuration(format!(
-                "container-config {container_cfg_name:?} does not match any [containers.<name>]"
+                "image-config {image_cfg_name:?} does not match any [images.<name>]"
             ))
         })?
         .clone();
     if let Some(attach) = &attach {
         span.done(format!(
-            "attach target resolved: container {}, container-config {}",
-            attach.container_name, container_cfg_name
+            "attach target resolved: container {}, image-config {}",
+            attach.container_name, image_cfg_name
         ));
     } else if let Some(agent) = &session_agent_name {
         span.done(format!(
-            "agent/container resolved: agent {agent}, container {container_cfg_name}"
+            "agent/container resolved: agent {agent}, container {image_cfg_name}"
         ));
     } else {
-        span.done(format!("container resolved: {container_cfg_name}"));
+        span.done(format!("container resolved: {image_cfg_name}"));
     }
 
     let image_tag = if let Some(attach) = &attach {
@@ -280,8 +277,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         inspect.image_tag
     } else {
         let span = ProgressSpan::start("computing image tag");
-        let image_tag =
-            image::compute_tag_for(&container_cfg_name, &container_cfg, &repo_root).await?;
+        let image_tag = image::compute_tag_for(&image_cfg_name, &image_cfg, &repo_root).await?;
         span.done(format!("image tag computed: {image_tag}"));
         image_tag
     };
@@ -304,9 +300,9 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             })
             .collect(),
         capabilities: ContainerCapabilities {
-            profile: container_cfg.security.capability_profile,
-            cap_drop: container_cfg.security.cap_drop.clone(),
-            cap_add: container_cfg.security.cap_add.clone(),
+            profile: image_cfg.security.capability_profile,
+            cap_drop: image_cfg.security.cap_drop.clone(),
+            cap_add: image_cfg.security.cap_add.clone(),
         },
     };
 
@@ -331,7 +327,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         ended_at: None,
         container_name: container_name.clone(),
         image_tag: image_tag.to_string(),
-        container_config_name: container_cfg_name.clone(),
+        image_config_name: image_cfg_name.clone(),
         agent_name: session_agent_name,
         working_dir: repo_root.clone(),
         session_dir: PathBuf::new(), // set by `create` below
@@ -385,8 +381,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     } else {
         let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
         let image_outcome = match image::ensure_tagged_image_for(
-            &container_cfg_name,
-            &container_cfg,
+            &image_cfg_name,
+            &image_cfg,
             &repo_root,
             &image_tag,
             false,
@@ -472,8 +468,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 
     Ok(SessionSetup {
         cfg,
-        container_cfg_name,
-        container_cfg,
+        image_cfg_name,
+        image_cfg,
         image_tag,
         container,
         sid,
@@ -488,7 +484,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 
 fn resolve_attach_target(
     raw: &str,
-    container_flag: Option<&str>,
+    image_flag: Option<&str>,
     store: &SessionStore,
 ) -> Result<AttachResolution> {
     let sid = SessionId::from(raw.to_string());
@@ -498,21 +494,19 @@ fn resolve_attach_target(
             let (_, session) = store.get_by_id(&sid)?;
             Ok(AttachResolution {
                 container_name: session.container_name,
-                container_cfg_name: container_flag
-                    .unwrap_or(&session.container_config_name)
-                    .to_string(),
+                image_cfg_name: image_flag.unwrap_or(&session.image_config_name).to_string(),
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let container_cfg_name = container_flag.ok_or_else(|| {
+            let image_cfg_name = image_flag.ok_or_else(|| {
                 OutrigError::Configuration(format!(
-                    "--attach {raw:?} did not match a session; pass --container <name> \
+                    "--attach {raw:?} did not match a session; pass --image <name> \
                      to treat it as a podman container name"
                 ))
             })?;
             Ok(AttachResolution {
                 container_name: raw.to_string(),
-                container_cfg_name: container_cfg_name.to_string(),
+                image_cfg_name: image_cfg_name.to_string(),
             })
         }
         Err(e) => Err(e.into()),
@@ -522,10 +516,10 @@ fn resolve_attach_target(
 /// Read image-embedded MCP config and overlay explicit `config.toml` entries.
 pub async fn merged_mcp(
     container: &Container,
-    container_cfg: &ContainerConfig,
+    image_cfg: &ImageConfig,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
     let span = ProgressSpan::start("reading and merging MCP configuration");
-    let mcp = embedded::merged_mcp(container, &container_cfg.mcp).await?;
+    let mcp = embedded::merged_mcp(container, &image_cfg.mcp).await?;
     let server_word = plural(mcp.len(), "server", "servers");
     span.done(format!(
         "MCP configuration ready: {} {server_word}",

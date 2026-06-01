@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::container_setup::render::{BaseImage, Family, McpServer};
+use crate::image_setup::render::{BaseImage, Family, McpServer};
 
 pub const SUGGESTIONS_NOTE: &str = concat!(
     "suggestions only -- incomplete starting points; ",
@@ -58,7 +58,7 @@ pub fn list_mcp_server_suggestions() -> SuggestionList<McpServerSuggestion> {
             command: Some(server.command_args()),
             install: Some(server.install_cmd()),
             curated_recipe: true,
-            guidance: "This is a maintained package recipe used by `outrig container add`; edit \
+            guidance: "This is a maintained package recipe used by `outrig image add`; edit \
                        it freely when the container needs different paths or package versions.",
             host_env: &[],
         })
@@ -71,7 +71,7 @@ pub fn list_mcp_server_suggestions() -> SuggestionList<McpServerSuggestion> {
         curated_recipe: false,
         guidance: "OutRig supports arbitrary MCP server commands. Coding containers usually need \
                    shell execution; choose and install a real shell MCP package, then declare its \
-                   command in `[containers.<name>.mcp]`.",
+                   command in `[images.<name>.mcp]`.",
         host_env: &[],
     });
     SuggestionList {

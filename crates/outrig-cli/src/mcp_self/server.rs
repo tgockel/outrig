@@ -81,7 +81,7 @@ impl SelfServer {
             tool::<EmptyArgs>(
                 LIST_BASE_IMAGES,
                 "List Base Image Suggestions",
-                "List base-image suggestions used by outrig container add.",
+                "List base-image suggestions used by outrig image add.",
             ),
             tool::<EmptyArgs>(
                 LIST_MCP_SERVER_SUGGESTIONS,
@@ -96,7 +96,7 @@ impl SelfServer {
             tool::<ValidateConfigArgs>(
                 VALIDATE_CONFIG,
                 "Validate Config",
-                "Parse and validate a TOML fragment containing [containers.<name>] entries.",
+                "Parse and validate a TOML fragment containing [images.<name>] entries.",
             ),
         ]
     }

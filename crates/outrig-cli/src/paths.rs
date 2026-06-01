@@ -9,7 +9,7 @@ use tempfile::NamedTempFile;
 use outrig::error::{OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
-const CONTAINERS_REL: &str = ".agents/outrig/containers";
+const IMAGES_REL: &str = ".agents/outrig/images";
 const GLOBAL_CONFIG_FILE: &str = "config.toml";
 const GLOBAL_HOME_DIR: &str = ".outrig";
 const GLOBAL_XDG_DIR: &str = "outrig";
@@ -31,12 +31,12 @@ pub(crate) fn repo_config_path(root: &Path) -> PathBuf {
     root.join(REPO_CONFIG_REL)
 }
 
-pub(crate) fn container_dir(root: &Path, name: &str) -> PathBuf {
-    root.join(CONTAINERS_REL).join(name)
+pub(crate) fn image_dir(root: &Path, name: &str) -> PathBuf {
+    root.join(IMAGES_REL).join(name)
 }
 
-pub(crate) fn container_dir_rel(name: &str) -> PathBuf {
-    Path::new(CONTAINERS_REL).join(name)
+pub(crate) fn image_dir_rel(name: &str) -> PathBuf {
+    Path::new(IMAGES_REL).join(name)
 }
 
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {

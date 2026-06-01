@@ -54,7 +54,7 @@ where
 }
 
 /// Hand-rolled column padding (per task notes: don't pull in a table crate).
-/// Columns: `ID`, `STARTED`, `DURATION`, `CONTAINER`, `EXIT`. The `EXIT`
+/// Columns: `ID`, `STARTED`, `DURATION`, `IMAGE`, `EXIT`. The `EXIT`
 /// column trails with `-> <target>` for symlinked entries.
 fn render_table(sessions: &[Session], now: SystemTime) -> String {
     let rows: Vec<Row> = sessions.iter().map(|s| Row::from_session(s, now)).collect();
@@ -62,20 +62,20 @@ fn render_table(sessions: &[Session], now: SystemTime) -> String {
     let id_w = max_width("ID", rows.iter().map(|r| r.id.as_str()));
     let started_w = max_width("STARTED", rows.iter().map(|r| r.started.as_str()));
     let duration_w = max_width("DURATION", rows.iter().map(|r| r.duration.as_str()));
-    let container_w = max_width("CONTAINER", rows.iter().map(|r| r.container.as_str()));
+    let image_w = max_width("IMAGE", rows.iter().map(|r| r.image.as_str()));
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<id_w$}  {:<started_w$}  {:<duration_w$}  {:<container_w$}  EXIT",
+        "{:<id_w$}  {:<started_w$}  {:<duration_w$}  {:<image_w$}  EXIT",
         "ID",
         "STARTED",
         "DURATION",
-        "CONTAINER",
+        "IMAGE",
         id_w = id_w,
         started_w = started_w,
         duration_w = duration_w,
-        container_w = container_w,
+        image_w = image_w,
     );
     for r in &rows {
         let exit_cell = match &r.link_target {
@@ -84,16 +84,16 @@ fn render_table(sessions: &[Session], now: SystemTime) -> String {
         };
         let _ = writeln!(
             out,
-            "{:<id_w$}  {:<started_w$}  {:<duration_w$}  {:<container_w$}  {}",
+            "{:<id_w$}  {:<started_w$}  {:<duration_w$}  {:<image_w$}  {}",
             r.id,
             r.started,
             r.duration,
-            r.container,
+            r.image,
             exit_cell,
             id_w = id_w,
             started_w = started_w,
             duration_w = duration_w,
-            container_w = container_w,
+            image_w = image_w,
         );
     }
     out
@@ -103,7 +103,7 @@ struct Row {
     id: String,
     started: String,
     duration: String,
-    container: String,
+    image: String,
     exit: String,
     link_target: Option<String>,
 }
@@ -116,7 +116,7 @@ impl Row {
             .duration_since(s.started_at)
             .map(session::format_duration)
             .unwrap_or_else(|_| "?".to_string());
-        let container = s.container_config_name.clone();
+        let image = s.image_config_name.clone();
         let exit = match s.exit_code {
             Some(c) => c.to_string(),
             None => "-".to_string(),
@@ -126,7 +126,7 @@ impl Row {
             id: s.id.as_str().to_string(),
             started,
             duration,
-            container,
+            image,
             exit,
             link_target,
         }

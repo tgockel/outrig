@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use outrig::McpClient;
-use outrig::config::{ContainerConfig, McpServerSpec};
+use outrig::config::{ImageConfig, McpServerSpec};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig_cli::session::{Session, SessionId, SessionStore};
@@ -57,7 +57,7 @@ fn fs_spec() -> McpServerSpec {
 }
 
 async fn ensure_fixture_image() -> ImageTag {
-    let cfg = ContainerConfig {
+    let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
         context: Some(".".into()),
@@ -79,13 +79,13 @@ fn write_mcp_config(repo: &Path) {
     let context = fixture_mcp_fs_dir();
     let config_toml = format!(
         r#"
-default-container = "smoke"
+default-image = "smoke"
 
-[containers.smoke]
+[images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
 
-  [containers.smoke.mcp]
+  [images.smoke.mcp]
   fs = ["mcp-server-filesystem", "/workspace"]
 "#,
         dockerfile = dockerfile.display(),
@@ -119,7 +119,7 @@ fn create_host_session(
         ended_at: None,
         container_name: container.name().to_string(),
         image_tag: image.to_string(),
-        container_config_name: "smoke".to_string(),
+        image_config_name: "smoke".to_string(),
         agent_name: Some("smoke".to_string()),
         working_dir: repo.to_path_buf(),
         session_dir: PathBuf::new(),
@@ -771,7 +771,7 @@ async fn mcp_attach_by_podman_name_requires_container_config_and_borrows_lifecyc
         "mcp".to_string(),
         "--attach".to_string(),
         container.name().to_string(),
-        "--container".to_string(),
+        "--image".to_string(),
         "smoke".to_string(),
     ];
     let run = run_mcp_client(&args, repo_dir.path()).await;

@@ -164,7 +164,7 @@ pub struct ResolvedAgent {
     pub max_tokens: Option<u32>,
     pub tool_call_cap: usize,
     pub tool_result_cap_bytes: usize,
-    pub container: Option<String>,
+    pub image: Option<String>,
 }
 
 /// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
@@ -311,7 +311,7 @@ pub fn resolve_agent_with_overrides(
             .or(cfg.tool_result_cap)
             .unwrap_or(outrig::config::DEFAULT_TOOL_RESULT_CAP_BYTES)
             as usize,
-        container: agent.container.clone(),
+        image: agent.image.clone(),
     })
 }
 

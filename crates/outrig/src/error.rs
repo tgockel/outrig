@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::config::{ApiKeyError, ConfigValidationError, EnvValueError};
-use crate::container::embedded::EmbeddedContainerConfigError;
+use crate::container::embedded::EmbeddedImageConfigError;
 
 #[derive(Debug, Error)]
 pub enum OutrigError {
@@ -65,9 +65,9 @@ pub enum OutrigError {
         source: EnvValueError,
     },
 
-    #[error("container {container:?} build-arg {key:?}: {source}")]
+    #[error("image {image:?} build-arg {key:?}: {source}")]
     BuildArgResolveFailed {
-        container: String,
+        image: String,
         key: String,
         #[source]
         source: EnvValueError,
@@ -77,7 +77,7 @@ pub enum OutrigError {
     EmbeddedContainerParse {
         container: String,
         #[source]
-        source: Box<EmbeddedContainerConfigError>,
+        source: Box<EmbeddedImageConfigError>,
     },
 
     #[error("{0}")]

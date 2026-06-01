@@ -39,7 +39,7 @@ use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
 use crate::error::{OutrigError, Result};
 use outrig::McpClient;
-use outrig::config::{ContainerConfig, McpServerSpec, NetworkMode};
+use outrig::config::{ImageConfig, McpServerSpec, NetworkMode};
 use outrig::container::Container;
 use outrig::image::ImageTag;
 use outrig::mcp_proxy::ProxyServer;
@@ -58,11 +58,11 @@ pub struct McpArgs {
     #[command(subcommand)]
     pub cmd: Option<McpCommand>,
 
-    /// Pick a `[containers.<name>]` block. Falls back to top-level
-    /// `default-container` only -- `outrig mcp` has no agent, so there is no
-    /// `agent.container` to consult.
+    /// Pick a `[images.<name>]` block. Falls back to top-level
+    /// `default-image` only -- `outrig mcp` has no agent, so there is no
+    /// `agent.image` to consult.
     #[arg(long, global = true, value_name = "NAME")]
-    pub container: Option<String>,
+    pub image: Option<String>,
 
     /// Write the session into an explicit, already-existing directory. The
     /// session root gets a symlink at `<root>/<sid>` pointing at this path.
@@ -125,7 +125,7 @@ pub async fn execute(
         repo_cfg_path,
         global_cfg_path,
         session_root_flag,
-        container_flag: args.container.as_deref(),
+        image_flag: args.image.as_deref(),
         attach_target: args.attach.as_deref(),
         agent_flag: None,
         model_override: None,
@@ -150,8 +150,8 @@ async fn serve(
     listen: Option<&ListenAddr>,
 ) -> Result<i32> {
     let SessionSetup {
-        container_cfg_name,
-        container_cfg,
+        image_cfg_name,
+        image_cfg,
         image_tag,
         container,
         sid,
@@ -165,12 +165,12 @@ async fn serve(
     } = setup;
 
     // Validate per-server env entries against the resolved MCP map.
-    let mcp = session_setup::merged_mcp(&container, &container_cfg).await?;
+    let mcp = session_setup::merged_mcp(&container, &image_cfg).await?;
     for name in cli_env.per_server_names() {
         if !mcp.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
-                "--env {name}:...: container '{}' has no MCP server '{name}'",
-                container_cfg_name
+                "--env {name}:...: image '{}' has no MCP server '{name}'",
+                image_cfg_name
             ))
             .into());
         }
@@ -178,7 +178,7 @@ async fn serve(
 
     let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
     let outcome: Result<i32> = serve_inner(
-        &container_cfg_name,
+        &image_cfg_name,
         &image_tag,
         &container,
         &log_dir,
@@ -218,21 +218,21 @@ fn is_attached_container_stopped(err: &crate::error::CliError) -> bool {
 
 async fn show_merged(setup: SessionSetup) -> Result<i32> {
     let SessionSetup {
-        container_cfg,
+        image_cfg,
         container,
         sid,
         store,
         attached: _,
         network,
         cfg: _,
-        container_cfg_name: _,
+        image_cfg_name: _,
         image_tag: _,
         session: _,
         session_dir: _,
         log_dir: _,
     } = setup;
 
-    let outcome = show_merged_inner(&container_cfg, &container).await;
+    let outcome = show_merged_inner(&image_cfg, &container).await;
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
     session_setup::teardown(Vec::new(), network, container, &store, &sid, final_exit).await;
     outcome
@@ -257,7 +257,7 @@ fn parse_listen_addr(s: &str) -> std::result::Result<ListenAddr, String> {
 
 #[allow(clippy::too_many_arguments)]
 async fn serve_inner(
-    container_cfg_name: &str,
+    image_cfg_name: &str,
     image_tag: &ImageTag,
     container: &Container,
     log_dir: &Path,
@@ -291,7 +291,7 @@ async fn serve_inner(
     };
 
     print_banner(StartupBanner {
-        container_name: container_cfg_name,
+        container_name: image_cfg_name,
         image_tag,
         container_pod_name: container.name(),
         per_server_counts: &per_server_counts,
@@ -647,8 +647,8 @@ async fn wait_for_attached_container_stop(container_name: String) -> Result<()> 
     .into())
 }
 
-async fn show_merged_inner(container_cfg: &ContainerConfig, container: &Container) -> Result<i32> {
-    let mcp = session_setup::merged_mcp(container, container_cfg).await?;
+async fn show_merged_inner(image_cfg: &ImageConfig, container: &Container) -> Result<i32> {
+    let mcp = session_setup::merged_mcp(container, image_cfg).await?;
     write_merged_mcp(&mcp)?;
     Ok(0)
 }
@@ -714,7 +714,7 @@ struct StartupBanner<'a> {
 
 fn print_banner(banner: StartupBanner<'_>) {
     let mut buf = String::new();
-    let _ = writeln!(buf, "[outrig] container-config:  {}", banner.container_name);
+    let _ = writeln!(buf, "[outrig] image-config:  {}", banner.container_name);
     let _ = writeln!(buf, "[outrig] image:             {}", banner.image_tag);
     let container_action = if banner.attached {
         "attached"

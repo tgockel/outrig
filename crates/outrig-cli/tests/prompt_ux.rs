@@ -62,7 +62,7 @@ fn anchored_doc_field() -> Field {
         name: "Anchored docs",
         description: "Exercises mdBook anchor conversion.",
         options: &[],
-        doc_link: "doc/usage/container.md#known-toolchains",
+        doc_link: "doc/usage/image.md#known-toolchains",
     }
 }
 
@@ -151,9 +151,7 @@ async fn string_help_preserves_doc_anchor_in_public_url() {
     stderr_r.read_to_end(&mut stderr_buf).await.unwrap();
     let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
     assert!(
-        stderr.contains(
-            "See: https://tgockel.github.io/outrig/usage/container.html#known-toolchains"
-        ),
+        stderr.contains("See: https://tgockel.github.io/outrig/usage/image.html#known-toolchains"),
         "expected anchored public doc_link in help output: {stderr:?}"
     );
 }

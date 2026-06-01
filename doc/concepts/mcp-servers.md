@@ -6,7 +6,7 @@ speaks JSON-RPC over its stdio. outrig connects to each one by `podman exec -i`'
 container, hands the resulting stdio pair to the [rmcp](https://crates.io/crates/rmcp) client, and
 treats every tool the server advertises as a Rig dynamic tool.
 
-The same `[containers.<name>.mcp]` table is consumed by both `outrig run` and
+The same `[images.<name>.mcp]` table is consumed by both `outrig run` and
 `outrig mcp`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
 republishes them as one stdio MCP server for an external client. See
 [Usage -> outrig mcp](../usage/mcp.md) for client setup and transport rules.
@@ -16,17 +16,17 @@ session's existing MCP protocol state.
 
 ## Declaring servers
 
-MCP servers are configured per-container, as a map keyed by the server's local name:
+MCP servers are configured per-image, as a map keyed by the server's local name:
 
 ```toml
-[containers.coding.mcp]
+[images.coding.mcp]
 fs    = { command = ["mcp-server-filesystem", "/workspace"] }
 shell = ["bash", "-lc", "exec shell-mcp-command"]
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
 
 `shell-mcp-command` is a placeholder for the shell MCP package you choose and install in the
-image. OutRig supports arbitrary MCP commands; `outrig container add` only renders package recipes
+image. OutRig supports arbitrary MCP commands; `outrig image add` only renders package recipes
 for the MCP servers it can install without more input.
 
 Each entry is one of:
@@ -36,7 +36,7 @@ Each entry is one of:
 - A **table** (full form): `{ command = [...], env = { KEY = "value", ... } }`. The `env` map is
   added to the `podman exec` invocation for this server.
 
-Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within a container-config.
+Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within an image-config.
 Names are how you reference servers elsewhere -- in `outrig logs <session> <server>`, in tool-call
 traces, in the prefix that gets attached to every tool the server exposes.
 
@@ -53,7 +53,7 @@ build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
 
 The `[mcp]` table uses the same short and full entry shapes as
-`[containers.<name>.mcp]`. At session startup, outrig reads the image file after
+`[images.<name>.mcp]`. At session startup, outrig reads the image file after
 the container starts, then overlays entries from `config.toml`. If both sources
 define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
@@ -62,7 +62,7 @@ in the merged set.
 Use embedded MCP config when a shared image owns the tool binaries and their
 default commands. Use `config.toml` for repo-local additions or overrides. A
 repo that wants to delegate completely to the image can omit
-`[containers.<name>.mcp]`.
+`[images.<name>.mcp]`.
 
 An `/etc/outrig/container.toml` is not required; this allows a shared container
 to be used with different configurations via `config.toml`. Malformed TOML,
@@ -72,7 +72,7 @@ mean the image metadata is broken.
 To inspect what will actually start, run:
 
 ```sh
-outrig mcp show-merged --container coding
+outrig mcp show-merged --image coding
 ```
 
 The command starts the selected container, reads the embedded file, applies
@@ -160,8 +160,8 @@ will show the underlying conflict.
 
 Two practical guidelines:
 
-- **Match servers to the container-config's purpose.** A `planning` container probably doesn't
-  need `shell`. A `coding` container almost certainly needs both `fs` and `shell`.
+- **Match servers to the image-config's purpose.** A `planning` image probably doesn't
+  need `shell`. A `coding` image almost certainly needs both `fs` and `shell`.
 - **Fewer servers is better when it's enough.** Every server is another initialize cost at
   startup, another tool list cluttering the LLM's prompt, another process to monitor. If a single
   MCP server covers your needs, use one.
@@ -172,7 +172,7 @@ Two practical guidelines:
 - [MCP Trust Model](mcp-trust-model.md) -- the container boundary that makes broad MCP tools
   practical.
 - [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` to design custom
-  MCP-enabled container-configs.
+  MCP-enabled image-configs.
 - [Sessions](../usage/sessions.md) -- `outrig logs <session> <server>` for stderr.
-- [Reference -> Config](../reference/config.md) -- full schema for the `[containers.<name>.mcp]`
+- [Reference -> Config](../reference/config.md) -- full schema for the `[images.<name>.mcp]`
   block.

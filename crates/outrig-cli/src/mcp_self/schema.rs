@@ -2,11 +2,11 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
 
-use outrig::config::{ContainerConfig, McpServerSpec};
+use outrig::config::{ImageConfig, McpServerSpec};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigSchemaResponse {
-    pub container_config: Value,
+    pub image_config_schema: Value,
     pub mcp_server_spec: Value,
     pub paths: ConfigPaths,
 }
@@ -14,7 +14,7 @@ pub struct ConfigSchemaResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigPaths {
     pub repo_config: &'static str,
-    pub container_dir: &'static str,
+    pub image_dir: &'static str,
     pub dockerfile: &'static str,
     pub context: &'static str,
     pub image_config: &'static str,
@@ -22,13 +22,13 @@ pub struct ConfigPaths {
 
 pub fn get_config_schema() -> ConfigSchemaResponse {
     ConfigSchemaResponse {
-        container_config: schema_value::<ContainerConfig>(),
+        image_config_schema: schema_value::<ImageConfig>(),
         mcp_server_spec: schema_value::<McpServerSpec>(),
         paths: ConfigPaths {
             repo_config: ".agents/outrig/config.toml",
-            container_dir: ".agents/outrig/containers/<name>/",
-            dockerfile: ".agents/outrig/containers/<name>/Dockerfile",
-            context: ".agents/outrig/containers/<name>/",
+            image_dir: ".agents/outrig/images/<name>/",
+            dockerfile: ".agents/outrig/images/<name>/Dockerfile",
+            context: ".agents/outrig/images/<name>/",
             image_config: "/etc/outrig/container.toml",
         },
     }
@@ -43,13 +43,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exports_container_and_mcp_schemas() {
+    fn exports_image_and_mcp_schemas() {
         let schema = get_config_schema();
         assert_eq!(schema.paths.repo_config, ".agents/outrig/config.toml");
         assert!(
-            schema.container_config.get("definitions").is_some(),
-            "container schema should carry definitions: {:?}",
-            schema.container_config,
+            schema.image_config_schema.get("definitions").is_some(),
+            "image schema should carry definitions: {:?}",
+            schema.image_config_schema,
         );
         assert!(
             schema.mcp_server_spec.get("schema").is_some()

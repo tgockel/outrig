@@ -2,7 +2,7 @@
 //!
 //! This server runs on the host and exposes only read/advisory tools:
 //! embedded docs, schema projection, suggested tools, and
-//! non-mutating validators for proposed container-config artifacts.
+//! non-mutating validators for proposed image-config artifacts.
 
 #![deny(clippy::print_stdout)]
 

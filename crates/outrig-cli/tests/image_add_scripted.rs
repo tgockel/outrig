@@ -1,6 +1,6 @@
-//! Integration tests for `outrig container add` driven through scripted
+//! Integration tests for `outrig image add` driven through scripted
 //! stdin (`tokio::io::duplex`) against tempdir-rooted repo configs. Asserts
-//! the resulting Dockerfile, the appended `[containers.<name>]` block,
+//! the resulting Dockerfile, the appended `[images.<name>]` block,
 //! idempotency without `--force`, and `toml_edit`-style preservation of
 //! surrounding comments.
 
@@ -13,8 +13,8 @@ use tokio::time::timeout;
 
 use outrig::config::Config;
 use outrig::error::OutrigError;
-use outrig_cli::container_setup::add::run_with;
 use outrig_cli::error::CliError;
+use outrig_cli::image_setup::add::run_with;
 use outrig_cli::init::repo::resolve_or_bootstrap;
 
 use common::scripted_prompt;
@@ -45,9 +45,7 @@ async fn defaults_write_dockerfile_and_config_block() {
     .expect("run_with must not hang")
     .expect("run_with must succeed");
 
-    let dockerfile_path = tmp
-        .path()
-        .join(".agents/outrig/containers/coding/Dockerfile");
+    let dockerfile_path = tmp.path().join(".agents/outrig/images/coding/Dockerfile");
     let dockerfile = std::fs::read_to_string(&dockerfile_path).unwrap();
     assert!(
         dockerfile.starts_with("FROM docker.io/library/debian:bookworm-slim"),
@@ -61,12 +59,12 @@ async fn defaults_write_dockerfile_and_config_block() {
     );
 
     let cfg_text = std::fs::read_to_string(tmp.path().join(".agents/outrig/config.toml")).unwrap();
-    assert!(cfg_text.contains("[containers.coding]"), "{cfg_text}");
+    assert!(cfg_text.contains("[images.coding]"), "{cfg_text}");
     assert!(
-        cfg_text.contains("dockerfile = \".agents/outrig/containers/coding/Dockerfile\""),
+        cfg_text.contains("dockerfile = \".agents/outrig/images/coding/Dockerfile\""),
         "{cfg_text}",
     );
-    assert!(cfg_text.contains("[containers.coding.mcp]"));
+    assert!(cfg_text.contains("[images.coding.mcp]"));
     assert!(
         cfg_text.contains("fs = { command = [\"mcp-server-filesystem\", \"/workspace\"] }"),
         "{cfg_text}",
@@ -81,9 +79,7 @@ async fn defaults_write_dockerfile_and_config_block() {
 async fn refuses_when_dockerfile_already_exists() {
     let tmp = tempfile::tempdir().unwrap();
     seed_repo(tmp.path(), "");
-    let dockerfile_path = tmp
-        .path()
-        .join(".agents/outrig/containers/coding/Dockerfile");
+    let dockerfile_path = tmp.path().join(".agents/outrig/images/coding/Dockerfile");
     std::fs::create_dir_all(dockerfile_path.parent().unwrap()).unwrap();
     std::fs::write(&dockerfile_path, "# stale\n").unwrap();
 
@@ -114,11 +110,11 @@ async fn refuses_when_config_block_already_exists() {
     let tmp = tempfile::tempdir().unwrap();
     seed_repo(
         tmp.path(),
-        "[containers.coding]\n\
-         dockerfile = \".agents/outrig/containers/coding/Dockerfile\"\n\
-         context    = \".agents/outrig/containers/coding\"\n\
+        "[images.coding]\n\
+         dockerfile = \".agents/outrig/images/coding/Dockerfile\"\n\
+         context    = \".agents/outrig/images/coding\"\n\
          \n\
-         [containers.coding.mcp]\n",
+         [images.coding.mcp]\n",
     );
 
     let (mut prompt, _stderr) = scripted_prompt(b"").await;
@@ -133,7 +129,7 @@ async fn refuses_when_config_block_already_exists() {
 
     let msg = format!("{err}");
     assert!(
-        msg.contains("[containers.coding]") && msg.contains("--force"),
+        msg.contains("[images.coding]") && msg.contains("--force"),
         "unexpected error: {msg}",
     );
 }
@@ -143,16 +139,14 @@ async fn force_replaces_both_atomically() {
     let tmp = tempfile::tempdir().unwrap();
     seed_repo(
         tmp.path(),
-        "[containers.coding]\n\
+        "[images.coding]\n\
          dockerfile = \"old/Dockerfile\"\n\
          context    = \"old\"\n\
          \n\
-         [containers.coding.mcp]\n\
+         [images.coding.mcp]\n\
          fs = { command = [\"old-cmd\"] }\n",
     );
-    let dockerfile_path = tmp
-        .path()
-        .join(".agents/outrig/containers/coding/Dockerfile");
+    let dockerfile_path = tmp.path().join(".agents/outrig/images/coding/Dockerfile");
     std::fs::create_dir_all(dockerfile_path.parent().unwrap()).unwrap();
     std::fs::write(&dockerfile_path, "# stale dockerfile\n").unwrap();
 
@@ -177,14 +171,14 @@ async fn force_replaces_both_atomically() {
     let cfg_text = std::fs::read_to_string(tmp.path().join(".agents/outrig/config.toml")).unwrap();
     assert!(
         !cfg_text.contains("old/Dockerfile"),
-        "old [containers.coding] not replaced:\n{cfg_text}",
+        "old [images.coding] not replaced:\n{cfg_text}",
     );
     assert!(
         !cfg_text.contains("old-cmd"),
         "old mcp entry not replaced:\n{cfg_text}",
     );
     assert!(
-        cfg_text.contains("dockerfile = \".agents/outrig/containers/coding/Dockerfile\""),
+        cfg_text.contains("dockerfile = \".agents/outrig/images/coding/Dockerfile\""),
         "{cfg_text}",
     );
 }
@@ -219,7 +213,7 @@ async fn fallback_yes_bootstraps_repo_config() {
     .expect("fallback flow must succeed");
 
     let cfg_path = cwd.join(".agents/outrig/config.toml");
-    let dockerfile = cwd.join(".agents/outrig/containers/myproj-standard/Dockerfile");
+    let dockerfile = cwd.join(".agents/outrig/images/myproj-standard/Dockerfile");
     assert!(cfg_path.is_file(), "repo config not bootstrapped");
     assert!(dockerfile.is_file(), "container Dockerfile not written");
 
@@ -229,9 +223,9 @@ async fn fallback_yes_bootstraps_repo_config() {
     let cfg = Config::load_from_str(&std::fs::read_to_string(&cfg_path).unwrap())
         .expect("repo config must parse");
 
-    assert_eq!(cfg.default_container.as_deref(), Some("myproj-standard"));
+    assert_eq!(cfg.default_image.as_deref(), Some("myproj-standard"));
     assert_eq!(cfg.default_agent.as_deref(), Some("coder"));
-    assert!(cfg.containers.contains_key("myproj-standard"));
+    assert!(cfg.images.contains_key("myproj-standard"));
     assert!(cfg.agents.contains_key("coder"));
 }
 
@@ -266,20 +260,20 @@ async fn fallback_no_returns_no_repo_config() {
 async fn force_preserves_unrelated_blocks_and_comments() {
     let tmp = tempfile::tempdir().unwrap();
     let initial = "# top-level comment\n\
-                   default-container = \"coding\"\n\
+                   default-image = \"coding\"\n\
                    \n\
-                   [containers.coding]\n\
+                   [images.coding]\n\
                    # inline comment for coding\n\
                    dockerfile = \"old/Dockerfile\"\n\
                    context    = \"old\"\n\
                    \n\
-                   [containers.coding.mcp]\n\
+                   [images.coding.mcp]\n\
                    \n\
-                   [containers.planning]\n\
-                   dockerfile = \".agents/outrig/containers/planning/Dockerfile\"\n\
-                   context    = \".agents/outrig/containers/planning\"\n\
+                   [images.planning]\n\
+                   dockerfile = \".agents/outrig/images/planning/Dockerfile\"\n\
+                   context    = \".agents/outrig/images/planning\"\n\
                    \n\
-                   [containers.planning.mcp]\n";
+                   [images.planning.mcp]\n";
     seed_repo(tmp.path(), initial);
 
     let script = b"\n\n\n";
@@ -300,16 +294,16 @@ async fn force_preserves_unrelated_blocks_and_comments() {
         "top-level comment lost:\n{cfg_text}",
     );
     assert!(
-        cfg_text.contains("default-container = \"coding\""),
-        "default-container key lost:\n{cfg_text}",
+        cfg_text.contains("default-image = \"coding\""),
+        "default-image key lost:\n{cfg_text}",
     );
     assert!(
-        cfg_text.contains("[containers.planning]"),
-        "unrelated [containers.planning] block lost:\n{cfg_text}",
+        cfg_text.contains("[images.planning]"),
+        "unrelated [images.planning] block lost:\n{cfg_text}",
     );
     // The replaced block updated to the new dockerfile path.
     assert!(
-        cfg_text.contains("dockerfile = \".agents/outrig/containers/coding/Dockerfile\""),
-        "replaced [containers.coding] missing new dockerfile path:\n{cfg_text}",
+        cfg_text.contains("dockerfile = \".agents/outrig/images/coding/Dockerfile\""),
+        "replaced [images.coding] missing new dockerfile path:\n{cfg_text}",
     );
 }

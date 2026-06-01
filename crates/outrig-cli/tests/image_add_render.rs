@@ -1,8 +1,8 @@
-//! Pure-function tests for `outrig_cli::container_setup::render::render`. Asserts
+//! Pure-function tests for `outrig_cli::image_setup::render::render`. Asserts
 //! invariants on the generated Dockerfile across every (base x toolchain x
 //! mcp) combination, plus determinism + ordering properties.
 
-use outrig_cli::container_setup::render::{self, BaseImage, McpServer, Toolchain};
+use outrig_cli::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 
 fn assert_invariants(out: &str, base: BaseImage, toolchains: &[Toolchain], mcps: &[McpServer]) {
     let label = format!("base={:?} toolchains={toolchains:?} mcps={mcps:?}", base);

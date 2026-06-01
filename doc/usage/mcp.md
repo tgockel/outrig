@@ -1,8 +1,8 @@
 # `outrig mcp`
 
-`outrig mcp` turns an outrig container-config into one MCP server for an external
+`outrig mcp` turns an outrig image-config into one MCP server for an external
 client. It starts or attaches to the selected container, launches every
-`[containers.<name>.mcp]` backing server inside it, and republishes their tools over this
+`[images.<name>.mcp]` backing server inside it, and republishes their tools over this
 process's stdio by default, or over Streamable HTTP when `--listen` is set.
 
 Use `outrig run` when you want outrig to be the LLM client: it resolves an agent,
@@ -13,7 +13,7 @@ and you want that program to drive the tools inside your outrig container.
 ## Synopsis
 
 ```
-outrig mcp [--container <name>]
+outrig mcp [--image <name>]
            [--attach <session-id-or-container-name>]
            [--listen <addr>]
            [--network <default|audit|filter>]
@@ -23,14 +23,14 @@ outrig mcp [--container <name>]
            [--session-root <path>]
            [--verbose]
 
-outrig mcp show-merged [--container <name>]
+outrig mcp show-merged [--image <name>]
                        [--attach <session-id-or-container-name>]
 
 outrig mcp self
 ```
 
-- `--container <name>` (default: `default-container`): selects a
-  `[containers.<name>]` block. Required with `--attach <podman-name>`.
+- `--image <name>` (default: `default-image`): selects a
+  `[images.<name>]` block. Required with `--attach <podman-name>`.
 - `--attach <session-id-or-container-name>` (default: off): reuse an existing
   container instead of starting one.
 - `--listen <addr>` (default: off): serve Streamable HTTP at `/mcp` instead of
@@ -48,54 +48,54 @@ outrig mcp self
 
 `outrig mcp self` is different from the session MCP server. It does not resolve a repo config,
 start a container, or create a session. It serves OutRig's own docs, schema, suggestions,
-and advisory validators so an external AI tool can design a container-config. See
+and advisory validators so an external AI tool can design an image-config. See
 [AI-assisted design](ai-assisted-design.md).
 
 There is no `--agent` flag. `outrig mcp` has no agent, so it never consults
-`default-agent`, `agent.container`, `[agents]`, `[models]`, `[providers]`, or provider
-API keys. Container selection is only:
+`default-agent`, `agent.image`, `[agents]`, `[models]`, `[providers]`, or provider
+API keys. Image-config selection is only:
 
-1. `--container <name>`
-2. top-level `default-container`
+1. `--image <name>`
+2. top-level `default-image`
 
 If neither is set, startup fails with:
 
 ```
-error: no --container or default-container configured
+error: no --image or default-image configured
 ```
 
-With `--attach`, container-config selection is different:
+With `--attach`, image-config selection is different:
 
 1. If the attach value matches an exact session id under the resolved session root,
-   outrig reuses that session row's `container_name` and `container_config_name`.
-2. If `--container <name>` is also passed, it overrides the session row's
-   `container_config_name`.
+   outrig reuses that session row's `container_name` and `image_config_name`.
+2. If `--image <name>` is also passed, it overrides the session row's
+   `image_config_name`.
 3. If the attach value is not a known session id, outrig treats it as a podman
-   container name and requires `--container <name>`.
+   container name and requires `--image <name>`.
 
 `--network audit` and `--network filter` are rejected with `--attach`; borrowed containers are
 not retrofitted with a new interceptor.
 
-The selected container must expose at least one backing MCP server after image
-`/etc/outrig/container.toml` entries and `[containers.<name>.mcp]` overrides are merged. A
-container-config with no merged entries has nothing to proxy, so `outrig mcp` exits before the
+The selected image-config must expose at least one backing MCP server after image
+`/etc/outrig/container.toml` entries and `[images.<name>.mcp]` overrides are merged. An
+image-config with no merged entries has nothing to proxy, so `outrig mcp` exits before the
 client sees an MCP `initialize` response.
 
 ## Minimal Config
 
-`outrig mcp` can run from a container-only repo config:
+`outrig mcp` can run from an image-only repo config:
 
 ```toml
-default-container = "coding"
+default-image = "coding"
 
 [workspace]
 root = "."
 
-[containers.coding]
-dockerfile = ".agents/outrig/containers/coding/Dockerfile"
-context    = ".agents/outrig/containers/coding"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
 
-[containers.coding.mcp]
+[images.coding.mcp]
 fs    = ["mcp-server-filesystem", "/workspace"]
 shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
@@ -112,7 +112,7 @@ overrides in `.agents/outrig/config.toml`. See
 To inspect the effective table without serving MCP:
 
 ```sh
-outrig mcp show-merged --container coding
+outrig mcp show-merged --image coding
 ```
 
 In fresh mode this starts the selected container, reads `/etc/outrig/container.toml`,
@@ -127,7 +127,7 @@ to share its workspace, installed tools, and environment:
 
 ```sh
 outrig mcp --attach 20260504T141907-a83f
-outrig mcp --attach outrig-20260504T141907-a83f --container coding
+outrig mcp --attach outrig-20260504T141907-a83f --image coding
 ```
 
 The first form resolves an existing outrig session id. The second form borrows a
@@ -157,7 +157,7 @@ Claude Code can add a stdio server from the command line:
 ```sh
 claude mcp add --transport stdio outrig -- outrig mcp \
   --config /path/to/repo/.agents/outrig/config.toml \
-  --container coding
+  --image coding
 ```
 
 Claude Code and Cursor both understand an `mcpServers` JSON shape. For Cursor, place
@@ -174,7 +174,7 @@ For Claude Code project scope, use `.mcp.json` in the project root.
         "mcp",
         "--config",
         "/path/to/repo/.agents/outrig/config.toml",
-        "--container",
+        "--image",
         "coding"
       ],
       "env": {}
@@ -194,7 +194,7 @@ Zed uses `context_servers` in its settings:
         "mcp",
         "--config",
         "/path/to/repo/.agents/outrig/config.toml",
-        "--container",
+        "--image",
         "coding"
       ],
       "env": {}
@@ -209,7 +209,7 @@ Use `--listen` when you want one long-lived `outrig mcp` process that multiple
 MCP clients can connect to:
 
 ```sh
-outrig mcp --listen 127.0.0.1:7331 --container coding
+outrig mcp --listen 127.0.0.1:7331 --image coding
 ```
 
 The MCP endpoint is `/mcp`, so clients should connect to:
@@ -227,7 +227,7 @@ the local machine.
 For local multi-process access without a TCP port, use a Unix socket:
 
 ```sh
-outrig mcp --listen unix:/tmp/outrig.sock --container coding
+outrig mcp --listen unix:/tmp/outrig.sock --image coding
 ```
 
 Socket filesystem permissions are the access boundary. HTTP clients still use the
@@ -238,8 +238,8 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 1. **Locate config.** Walks up from the current directory until
    `.agents/outrig/config.toml` is found, or fails. The MCP host's `cwd` therefore
    needs to be the repo, or pass `--config <path>` explicitly.
-2. **Resolve container-config.** Uses `--container` if given, otherwise top-level
-   `default-container`. There is no `agent.container` step -- this subcommand has no
+2. **Resolve image-config.** Uses `--image` if given, otherwise top-level
+   `default-image`. There is no `agent.image` step -- this subcommand has no
    agent.
 3. **Prepare the container.** Fresh mode builds or cache-hits the image and starts
    `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
@@ -249,7 +249,7 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
 5. **Merge MCP config.** Read `/etc/outrig/container.toml` from the image if present,
-   then overlay `[containers.<name>.mcp]` from config by server name.
+   then overlay `[images.<name>.mcp]` from config by server name.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command and run the MCP `initialize` handshake.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with
@@ -268,7 +268,7 @@ After the image is ready, the container is running, and all backing MCP servers 
 answered `tools/list`, `outrig mcp` prints one banner to stderr:
 
 ```
-[outrig] container-config:  coding
+[outrig] image-config:  coding
 [outrig] image:             outrig:coding-1f3a2b
 [outrig] container started: outrig-coding-2026-05-04-a83f
 [outrig] mcp fs:    initialized (3 tools)
@@ -358,7 +358,7 @@ On disk, new `outrig mcp` session JSON omits `agent_name`; older JSON with
 
 ```sh
 $ outrig ls
-ID                     STARTED              DURATION  CONTAINER  EXIT
+ID                     STARTED              DURATION  IMAGE      EXIT
 20260504T141907-a83f   2026-05-04 14:19:07  0m44s     coding     0
 
 $ outrig logs 20260504T141907-a83f fs

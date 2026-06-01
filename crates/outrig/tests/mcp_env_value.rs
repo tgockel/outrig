@@ -54,7 +54,7 @@ mod mcp_env_table {
 
     fn build_env(toml_src: &str) -> std::collections::BTreeMap<String, EnvValue> {
         let cfg = Config::load_from_str(toml_src).expect("config parses");
-        let McpServerSpec::Full { env, .. } = cfg.containers["c"].mcp["srv"].clone() else {
+        let McpServerSpec::Full { env, .. } = cfg.images["c"].mcp["srv"].clone() else {
             panic!("expected Full form, got Short");
         };
         env
@@ -64,11 +64,11 @@ mod mcp_env_table {
     fn mixed_table_classifies_each_value() {
         let env = build_env(
             r#"
-[containers.c]
+[images.c]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.c.mcp]
+[images.c.mcp]
 srv = { command = ["bin"], env = { CARGO_HOME = "/workspace/.cargo", GH_TOKEN = "${GITHUB_TOKEN}" } }
 "#,
         );
@@ -86,11 +86,11 @@ srv = { command = ["bin"], env = { CARGO_HOME = "/workspace/.cargo", GH_TOKEN = 
     #[test]
     fn round_trip_preserves_literal_and_envref() {
         let original = r#"
-[containers.c]
+[images.c]
 dockerfile = "D"
 context    = "ctx"
 
-[containers.c.mcp]
+[images.c.mcp]
 srv = { command = ["bin"], env = { CARGO_HOME = "/workspace/.cargo", GH_TOKEN = "${GITHUB_TOKEN}" } }
 "#;
 

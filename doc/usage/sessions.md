@@ -1,7 +1,7 @@
 # Sessions
 
 A session is the on-disk record of one `outrig run` or `outrig mcp` invocation: when it started
-and ended, which container-config it used, what image tag, plus per-MCP-server stderr captured to
+and ended, which image-config it used, what image tag, plus per-MCP-server stderr captured to
 disk. Sessions exist so you can go back and inspect what happened -- they are *not* a staging area
 for workspace changes (outrig writes to your repo directly; see
 [Workspace](../concepts/workspace.md)).
@@ -64,7 +64,7 @@ List sessions newest-first:
 
 ```sh
 $ outrig ls
-ID                     STARTED              DURATION  CONTAINER  EXIT
+ID                     STARTED              DURATION  IMAGE      EXIT
 20260501T141907-9b1c   2026-05-01 14:19:07  0m44s     coding     0   -> /tmp/my-debug-run
 20260501T134412-3f2a   2026-05-01 13:44:12  2m18s     coding     0
 20260430T091203-44d2   2026-04-30 09:12:03  6m02s     planning   1
@@ -78,7 +78,7 @@ sessions whose root entry is a symlink (created via `outrig run --session-dir`).
 `outrig mcp` sessions have no agent. Their in-memory session row has `agent_name = None`; new
 on-disk `session.json` files omit `agent_name`, and older records with `"agent_name": null`
 mean the same thing. `outrig ls` does not currently show an agent column, so these sessions appear
-with the same `ID / STARTED / DURATION / CONTAINER / EXIT` columns as `outrig run` sessions.
+with the same `ID / STARTED / DURATION / IMAGE / EXIT` columns as `outrig run` sessions.
 
 Override the root for a single invocation with `--session-root`:
 

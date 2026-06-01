@@ -1,10 +1,10 @@
 //! Repo-config phase of `outrig init`, plus the bootstrap fallback used
-//! by `outrig container add` when run in an uninitialized repo.
+//! by `outrig image add` when run in an uninitialized repo.
 //!
 //! Two public entry points share one private writer:
 //! - [`ensure`] is what `outrig init` calls: idempotent: write the config
 //!   if missing, log + skip if present.
-//! - [`resolve_or_bootstrap`] is what `outrig container add` calls before
+//! - [`resolve_or_bootstrap`] is what `outrig image add` calls before
 //!   dispatching: walk up to find an existing `.agents/outrig/config.toml`,
 //!   and on `NoRepoConfig` prompt the user to bootstrap one against `cwd`.
 
@@ -14,18 +14,18 @@ use std::path::{Path, PathBuf};
 use heck::ToKebabCase;
 
 use crate::config_init;
-use crate::container_setup::add as container_add;
 use crate::error::{OutrigError, Result};
 use crate::hf::HfTreeFetcher;
+use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
 use outrig::config::{Agent, Config, LlmProvider, Model, Workspace};
 
-/// Idempotent. Returns `Some(container_name)` when this call wrote the
-/// repo config (the user named a container during the bootstrap), or
+/// Idempotent. Returns `Some(image_name)` when this call wrote the
+/// repo config (the user named an image during the bootstrap), or
 /// `None` when the file already existed and was left alone. Callers
-/// thread the name into the subsequent `container::add::run_with` so the
-/// container-name prompt doesn't fire twice.
+/// thread the name into the subsequent `image_setup::add::run_with` so the
+/// image-name prompt doesn't fire twice.
 pub async fn ensure(
     repo_root: &Path,
     global_path: &Path,
@@ -48,14 +48,14 @@ pub async fn ensure(
     Ok(Some(name))
 }
 
-/// Resolve the repo root for `outrig container add`. Walks up via
+/// Resolve the repo root for `outrig image add`. Walks up via
 /// [`find_repo_root_from`]; on [`OutrigError::NoRepoConfig`] prompts
 /// the user, and on yes bootstraps the repo config against `cwd` and
 /// returns `cwd`. On no, re-raises `NoRepoConfig` so the exit code and
 /// error string match the previous behavior for scripts that test the
 /// unconfigured case.
-/// Returns the resolved repo root paired with `Some(container_name)` when
-/// this call ran the bootstrap (the user named a container) or `None`
+/// Returns the resolved repo root paired with `Some(image_name)` when
+/// this call ran the bootstrap (the user named an image) or `None`
 /// when an existing config was found by walking up.
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
@@ -81,7 +81,7 @@ pub async fn resolve_or_bootstrap(
     }
 }
 
-/// Walks the three repo-config sections (container / model / agent),
+/// Walks the three repo-config sections (image / model / agent),
 /// builds a [`Config`], serializes to TOML, and writes atomically via
 /// [`write_atomic`]. Section headers signal each transition so
 /// the prompts don't bleed together.
@@ -96,8 +96,8 @@ async fn write_repo_config(
     let global = load_global_summary(global_path)?;
     let model_choices = ask_repo_models(prompt, &global, hf).await?;
 
-    // Agent before container: the container section then flows directly
-    // into `container::add`'s base/toolchains/MCP prompts without an
+    // Agent before image: the image section then flows directly
+    // into `image_setup::add`'s base/toolchains/MCP prompts without an
     // agent-section interruption.
     eprintln!();
     eprintln!("Configuring your first agent");
@@ -113,10 +113,10 @@ async fn write_repo_config(
         .await?;
 
     eprintln!();
-    eprintln!("Configuring your first container");
-    let default_name = default_container_name(repo_root);
-    let container_name = prompt
-        .ask_string(&container_add::NAME_FIELD, &default_name)
+    eprintln!("Configuring your first image");
+    let default_name = default_image_name(repo_root);
+    let image_name = prompt
+        .ask_string(&image_add::NAME_FIELD, &default_name)
         .await?;
     let ws_default = Workspace::default();
     let host_path = prompt
@@ -132,7 +132,7 @@ async fn write_repo_config(
     let toml_text = render(
         agent_name,
         agent_model,
-        container_name.clone(),
+        image_name.clone(),
         host_path,
         container_path,
         model_choices,
@@ -142,7 +142,7 @@ async fn write_repo_config(
     write_atomic(&cfg_path, &toml_text)?;
     eprintln!();
     eprintln!("[outrig] wrote {}", cfg_path.display());
-    Ok(container_name)
+    Ok(image_name)
 }
 
 /// Snapshot of the parts of the global config we surface in the model
@@ -327,13 +327,13 @@ struct RepoModelChoices {
 /// regardless of where you run from.
 pub(crate) const DEFAULT_AGENT_NAME: &str = "coder";
 
-/// Suggest `<repo-folder-kebab>-standard` as the default container-config
-/// name, so the container (and `default-container`) carries the repo's
+/// Suggest `<repo-folder-kebab>-standard` as the default image-config
+/// name, so the image (and `default-image`) carries the repo's
 /// identity by default. Falls back to plain `"standard"` when the path
-/// has no usable last component. Shared with `container::add` so its
-/// name prompt suggests the same value as `default-container` written
+/// has no usable last component. Shared with `image_setup::add` so its
+/// name prompt suggests the same value as `default-image` written
 /// here.
-pub(crate) fn default_container_name(repo_root: &Path) -> String {
+pub(crate) fn default_image_name(repo_root: &Path) -> String {
     let folder = repo_root
         .file_name()
         .and_then(|s| s.to_str())
@@ -350,7 +350,7 @@ pub(crate) fn default_container_name(repo_root: &Path) -> String {
 fn render(
     agent_name: String,
     agent_model: Option<String>,
-    container_name: String,
+    image_name: String,
     host_path: String,
     container_path: String,
     model_choices: RepoModelChoices,
@@ -361,7 +361,7 @@ fn render(
         agent_name.clone(),
         Agent {
             model: agent_model,
-            container: None,
+            image: None,
             preamble: Some(preamble),
             temperature: None,
             max_tokens: None,
@@ -370,7 +370,7 @@ fn render(
         },
     );
     let cfg = Config {
-        default_container: Some(container_name),
+        default_image: Some(image_name),
         default_agent: Some(agent_name),
         default_model: model_choices.default_model,
         tool_call_cap: None,
@@ -395,7 +395,7 @@ const CONFIGURE_NOW_FIELD: Field = Field {
     name: "Configure outrig in this directory now?",
     description: "Yes walks the same prompts as `outrig init` (workspace, model, \
                   agent) and writes .agents/outrig/config.toml here, then \
-                  continues with `container add`. No exits without changes.",
+                  continues with `image add`. No exits without changes.",
     options: &[],
     doc_link: "doc/usage/init.md",
 };

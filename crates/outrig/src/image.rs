@@ -13,14 +13,14 @@ use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{ContainerConfig, ContainerSourceRef};
+use crate::config::{ImageConfig, ImageSourceRef};
 use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
 const TAG_PREFIX: &str = "outrig-cache";
 const KEY_HEX_LEN: usize = 16;
 const TAR_READ_CHUNK: usize = 64 * 1024;
-const UNNAMED_CONTAINER: &str = "<container>";
+const UNNAMED_IMAGE: &str = "<image>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageTag(pub String);
@@ -75,19 +75,19 @@ impl CacheKey {
     }
 }
 
-/// Resolve `build-args` for a container-config. Literal values pass through;
+/// Resolve `build-args` for an image-config. Literal values pass through;
 /// `${VAR}` references are read from the host environment and framed with the
-/// container name plus the build-arg key on failure.
+/// image name plus the build-arg key on failure.
 pub(crate) fn resolve_build_args(
-    container: &str,
-    cfg: &ContainerConfig,
+    image: &str,
+    cfg: &ImageConfig,
 ) -> Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
     for (key, value) in &cfg.build_args {
         let value = value
             .resolve()
             .map_err(|source| OutrigError::BuildArgResolveFailed {
-                container: container.to_string(),
+                image: image.to_string(),
                 key: key.clone(),
                 source,
             })?;
@@ -102,29 +102,25 @@ pub(crate) fn resolve_build_args(
 /// tracks the concrete values passed to buildah. Useful when a caller wants
 /// to print the tag *before* deciding whether to build (e.g. the
 /// `outrig build` CLI's verbose header in `doc/usage/build.md`).
-pub async fn compute_tag(cfg: &ContainerConfig, repo_root: &Path) -> Result<ImageTag> {
-    compute_tag_for(UNNAMED_CONTAINER, cfg, repo_root).await
+pub async fn compute_tag(cfg: &ImageConfig, repo_root: &Path) -> Result<ImageTag> {
+    compute_tag_for(UNNAMED_IMAGE, cfg, repo_root).await
 }
 
-/// Named-container variant of [`compute_tag`]. Use this when config-derived
+/// Named-image variant of [`compute_tag`]. Use this when config-derived
 /// build args may need `${VAR}` resolution so errors can identify the source
-/// container-config.
-pub async fn compute_tag_for(
-    container: &str,
-    cfg: &ContainerConfig,
-    repo_root: &Path,
-) -> Result<ImageTag> {
+/// image-config.
+pub async fn compute_tag_for(image: &str, cfg: &ImageConfig, repo_root: &Path) -> Result<ImageTag> {
     match cfg.source() {
-        ContainerSourceRef::Image { image_name } => Ok(ImageTag(image_name.to_string())),
-        ContainerSourceRef::Build { .. } => {
-            let build_args = resolve_build_args(container, cfg)?;
+        ImageSourceRef::Image { image_name } => Ok(ImageTag(image_name.to_string())),
+        ImageSourceRef::Build { .. } => {
+            let build_args = resolve_build_args(image, cfg)?;
             compute_tag_with_build_args(cfg, repo_root, &build_args).await
         }
     }
 }
 
 async fn compute_tag_with_build_args(
-    cfg: &ContainerConfig,
+    cfg: &ImageConfig,
     repo_root: &Path,
     build_args: &BTreeMap<String, String>,
 ) -> Result<ImageTag> {
@@ -204,20 +200,20 @@ async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> R
 }
 
 /// Run `buildah build` for `cfg`, tagging the result `tag`, with build-arg
-/// resolution errors framed against the selected container-config.
+/// resolution errors framed against the selected image-config.
 pub async fn build_image_for(
-    container: &str,
-    cfg: &ContainerConfig,
+    image: &str,
+    cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
 ) -> Result<()> {
-    let build_args = resolve_build_args(container, cfg)?;
+    let build_args = resolve_build_args(image, cfg)?;
     build_image_with_build_args(cfg, repo_root, tag, no_cache, &build_args).await
 }
 
 async fn build_image_with_build_args(
-    cfg: &ContainerConfig,
+    cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
@@ -238,7 +234,7 @@ async fn build_image_with_build_args(
 }
 
 async fn build_image_logged_with_build_args(
-    cfg: &ContainerConfig,
+    cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
@@ -258,23 +254,23 @@ async fn build_image_logged_with_build_args(
 /// `buildah build`. Stderr from buildah is streamed to `tracing::info!`
 /// with the `[buildah]` prefix.
 pub async fn ensure_image(
-    cfg: &ContainerConfig,
+    cfg: &ImageConfig,
     repo_root: &Path,
     no_cache: bool,
 ) -> Result<ImageBuildOutcome> {
-    ensure_image_for(UNNAMED_CONTAINER, cfg, repo_root, no_cache).await
+    ensure_image_for(UNNAMED_IMAGE, cfg, repo_root, no_cache).await
 }
 
 /// Implementation of [`ensure_image`] with build-arg resolution errors framed
-/// against the selected container-config.
+/// against the selected image-config.
 async fn ensure_image_for(
-    container: &str,
-    cfg: &ContainerConfig,
+    image: &str,
+    cfg: &ImageConfig,
     repo_root: &Path,
     no_cache: bool,
 ) -> Result<ImageBuildOutcome> {
     match cfg.source() {
-        ContainerSourceRef::Image { image_name } => {
+        ImageSourceRef::Image { image_name } => {
             let tag = ImageTag(image_name.to_string());
             if !no_cache && probe_pulled(&tag).await? {
                 tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
@@ -290,8 +286,8 @@ async fn ensure_image_for(
                 cache_hit: false,
             })
         }
-        ContainerSourceRef::Build { .. } => {
-            let build_args = resolve_build_args(container, cfg)?;
+        ImageSourceRef::Build { .. } => {
+            let build_args = resolve_build_args(image, cfg)?;
             let tag = compute_tag_with_build_args(cfg, repo_root, &build_args).await?;
             if !no_cache && probe_cached(&tag).await? {
                 tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
@@ -311,19 +307,19 @@ async fn ensure_image_for(
 }
 
 /// Ensure an already-computed tag exists, with build-arg resolution errors
-/// framed against the selected container-config. This lets session startup
+/// framed against the selected image-config. This lets session startup
 /// write a complete `session.json` and open `logs/container.log` before the
 /// buildah probe/build begins, without hashing the Dockerfile/context twice.
 pub async fn ensure_tagged_image_for(
-    container: &str,
-    cfg: &ContainerConfig,
+    image: &str,
+    cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
     transcript: Option<&Transcript>,
 ) -> Result<ImageBuildOutcome> {
     match cfg.source() {
-        ContainerSourceRef::Image { .. } => {
+        ImageSourceRef::Image { .. } => {
             if !no_cache && probe_pulled_logged(tag, transcript).await? {
                 tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
                 return Ok(ImageBuildOutcome {
@@ -338,8 +334,8 @@ pub async fn ensure_tagged_image_for(
                 cache_hit: false,
             })
         }
-        ContainerSourceRef::Build { .. } => {
-            let build_args = resolve_build_args(container, cfg)?;
+        ImageSourceRef::Build { .. } => {
+            let build_args = resolve_build_args(image, cfg)?;
             if !no_cache && probe_cached_logged(tag, transcript).await? {
                 tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
                 return Ok(ImageBuildOutcome {
@@ -366,7 +362,7 @@ pub async fn ensure_tagged_image_for(
 }
 
 fn build_image_cmd(
-    cfg: &ContainerConfig,
+    cfg: &ImageConfig,
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
@@ -533,7 +529,7 @@ mod tests {
 
     #[test]
     fn build_image_cmd_uses_resolved_build_args() {
-        let cfg = ContainerConfig {
+        let cfg = ImageConfig {
             image_name: None,
             dockerfile: Some(PathBuf::from("Dockerfile")),
             context: Some(PathBuf::from(".")),
