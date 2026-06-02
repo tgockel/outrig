@@ -42,10 +42,10 @@ traces, in the prefix that gets attached to every tool the server exposes.
 
 ## Embedding MCP config in the image
 
-An image can also ship its MCP declarations at `/etc/outrig/container.toml`:
+An image can also ship its MCP declarations at `/etc/outrig/image.toml`:
 
 ```toml
-# /etc/outrig/container.toml
+# /etc/outrig/image.toml
 [mcp]
 fs    = { command = ["mcp-server-filesystem", "/workspace"] }
 shell = ["bash", "-lc", "exec shell-mcp-command"]
@@ -64,7 +64,7 @@ default commands. Use `config.toml` for repo-local additions or overrides. A
 repo that wants to delegate completely to the image can omit
 `[images.<name>.mcp]`.
 
-An `/etc/outrig/container.toml` is not required; this allows a shared container
+An `/etc/outrig/image.toml` is not required; this allows a shared image
 to be used with different configurations via `config.toml`. Malformed TOML,
 invalid server names, and empty command arrays are startup errors because they
 mean the image metadata is broken.

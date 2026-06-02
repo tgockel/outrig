@@ -22,6 +22,7 @@ const LIST_BASE_IMAGES: &str = "list_base_images";
 const LIST_MCP_SERVER_SUGGESTIONS: &str = "list_mcp_server_suggestions";
 const VALIDATE_DOCKERFILE: &str = "validate_dockerfile";
 const VALIDATE_CONFIG: &str = "validate_config";
+const VALIDATE_IMAGE_TOML: &str = "validate_image_toml";
 
 #[derive(Debug, Clone, Default)]
 pub struct SelfServer;
@@ -76,7 +77,7 @@ impl SelfServer {
             tool::<EmptyArgs>(
                 GET_CONFIG_SCHEMA,
                 "Get Config Schema",
-                "Return JSON Schema for container config and MCP server entries.",
+                "Return JSON Schema for image config and MCP server entries.",
             ),
             tool::<EmptyArgs>(
                 LIST_BASE_IMAGES,
@@ -86,17 +87,22 @@ impl SelfServer {
             tool::<EmptyArgs>(
                 LIST_MCP_SERVER_SUGGESTIONS,
                 "List MCP Server Suggestions",
-                "List MCP server suggestions and shell guidance for OutRig containers.",
+                "List MCP server suggestions and shell guidance for OutRig images.",
             ),
             tool::<ValidateDockerfileArgs>(
                 VALIDATE_DOCKERFILE,
                 "Validate Dockerfile",
-                "Return advisory warnings for a proposed OutRig container Dockerfile.",
+                "Return advisory warnings for a proposed OutRig image Dockerfile.",
             ),
             tool::<ValidateConfigArgs>(
                 VALIDATE_CONFIG,
                 "Validate Config",
                 "Parse and validate a TOML fragment containing [images.<name>] entries.",
+            ),
+            tool::<ValidateConfigArgs>(
+                VALIDATE_IMAGE_TOML,
+                "Validate Image TOML",
+                "Parse and validate complete standalone image.toml content.",
             ),
         ]
     }
@@ -134,6 +140,13 @@ impl SelfServer {
                 };
                 json_result(validate::validate_config(&args.toml))
             }
+            VALIDATE_IMAGE_TOML => {
+                let args: ValidateConfigArgs = match parse_args(request.arguments) {
+                    Ok(args) => args,
+                    Err(result) => return Ok(result),
+                };
+                json_result(validate::validate_image_toml(&args.toml))
+            }
             other => Ok(CallToolResult::error(vec![Content::text(format!(
                 "unknown tool: {other}"
             ))])),
@@ -149,7 +162,7 @@ impl ServerHandler for SelfServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Read OutRig docs and schema, then validate proposed container artifacts. \
+                "Read OutRig docs and schema, then validate proposed image artifacts. \
                  This server never writes files or builds images. If your client permits normal \
                  repo edits, write the validated artifacts directly; otherwise return exact file \
                  contents and paths for the user to install. Do not stage files in /tmp and ask \
@@ -263,6 +276,7 @@ mod tests {
                 LIST_MCP_SERVER_SUGGESTIONS,
                 VALIDATE_DOCKERFILE,
                 VALIDATE_CONFIG,
+                VALIDATE_IMAGE_TOML,
             ],
         );
     }

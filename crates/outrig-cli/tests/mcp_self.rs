@@ -65,6 +65,7 @@ async fn mcp_self_serves_docs_schema_suggestions_and_validators() {
             "list_mcp_server_suggestions",
             "validate_dockerfile",
             "validate_config",
+            "validate_image_toml",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),
@@ -167,6 +168,25 @@ async fn mcp_self_serves_docs_schema_suggestions_and_validators() {
                 .expect("error message")
                 .contains("invalid mcp server name"),
             "expected invalid mcp server-name error: {config}",
+        );
+
+        let image_toml: Value = call_json(
+            &service,
+            "validate_image_toml",
+            serde_json::json!({
+                "toml": r#"
+[image]
+ref = "rust-dev"
+
+[mcp]
+fs = ["mcp-server-filesystem", "/workspace"]
+"#
+            }),
+        )
+        .await;
+        assert_eq!(
+            image_toml["valid"], true,
+            "expected valid image.toml: {image_toml}"
         );
 
         let _ = service.cancel().await;

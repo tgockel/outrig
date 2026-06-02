@@ -1,4 +1,4 @@
-//! End-to-end coverage for `/etc/outrig/container.toml` embedded MCP config.
+//! End-to-end coverage for `/etc/outrig/image.toml` embedded MCP config.
 //! Gated behind `--features e2e` because it builds fixture images and starts
 //! real podman containers.
 
@@ -42,22 +42,22 @@ fn crash_spec() -> McpServerSpec {
     ])
 }
 
-async fn ensure_image_with_container_toml(container_toml: Option<&str>) -> ImageTag {
+async fn ensure_image_with_image_toml(image_toml: Option<&str>) -> ImageTag {
     let ctx = tempfile::tempdir().expect("tempdir image context");
     let mut dockerfile = String::from(
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n",
     );
-    if container_toml.is_some() {
+    if image_toml.is_some() {
         dockerfile.push_str(
             "RUN mkdir -p /etc/outrig\n\
-             COPY container.toml /etc/outrig/container.toml\n",
+             COPY image.toml /etc/outrig/image.toml\n",
         );
     }
     std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
-    if let Some(text) = container_toml {
-        std::fs::write(ctx.path().join("container.toml"), text).expect("write container.toml");
+    if let Some(text) = image_toml {
+        std::fs::write(ctx.path().join("image.toml"), text).expect("write image.toml");
     }
 
     let cfg = ImageConfig {
@@ -135,7 +135,7 @@ async fn assert_servers_boot(
 async fn image_only_embedded_mcp_boots() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_container_toml(Some(
+    let image = ensure_image_with_image_toml(Some(
         r#"
         [mcp]
         fs = ["mcp-server-filesystem", "/workspace"]
@@ -161,7 +161,7 @@ async fn image_only_embedded_mcp_boots() {
 async fn config_entry_overrides_image_entry_whole() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_container_toml(Some(
+    let image = ensure_image_with_image_toml(Some(
         r#"
         [mcp]
         fs = ["node", "-e", "process.exit(42)"]
@@ -187,7 +187,7 @@ async fn config_entry_overrides_image_entry_whole() {
 async fn image_and_config_entries_are_additive() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_container_toml(Some(
+    let image = ensure_image_with_image_toml(Some(
         r#"
         [mcp]
         fs = ["mcp-server-filesystem", "/workspace"]
@@ -235,14 +235,14 @@ async fn missing_embedded_file_falls_back_to_config() {
 async fn malformed_embedded_toml_is_hard_error() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_container_toml(Some("[mcp]\nfs = [")).await;
+    let image = ensure_image_with_image_toml(Some("[mcp]\nfs = [")).await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
     let err = embedded::merged_mcp(&container, &BTreeMap::new())
         .await
         .expect_err("malformed embedded TOML should fail");
-    assert!(matches!(err, OutrigError::EmbeddedContainerParse { .. }));
+    assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
 
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
@@ -251,7 +251,7 @@ async fn malformed_embedded_toml_is_hard_error() {
 async fn unknown_embedded_top_level_tables_are_ignored() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_container_toml(Some(
+    let image = ensure_image_with_image_toml(Some(
         r#"
         [workspace]
         hint = "/workspace"
@@ -291,18 +291,18 @@ async fn mcp_show_merged_prints_effective_toml() {
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n\
          RUN mkdir -p /etc/outrig\n\
-         COPY container.toml /etc/outrig/container.toml\n",
+         COPY image.toml /etc/outrig/image.toml\n",
     )
     .expect("write Dockerfile");
     std::fs::write(
-        image_ctx.path().join("container.toml"),
+        image_ctx.path().join("image.toml"),
         r#"
         [mcp]
         fs = ["node", "-e", "process.exit(42)"]
         shell = ["mcp-server-filesystem", "/workspace"]
         "#,
     )
-    .expect("write container.toml");
+    .expect("write image.toml");
 
     let config_toml = format!(
         r#"
@@ -379,17 +379,17 @@ async fn run_mode_uses_embedded_image_entries() {
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n\
          RUN mkdir -p /etc/outrig\n\
-         COPY container.toml /etc/outrig/container.toml\n",
+         COPY image.toml /etc/outrig/image.toml\n",
     )
     .expect("write Dockerfile");
     std::fs::write(
-        image_ctx.path().join("container.toml"),
+        image_ctx.path().join("image.toml"),
         r#"
         [mcp]
         fs = ["mcp-server-filesystem", "/workspace"]
         "#,
     )
-    .expect("write container.toml");
+    .expect("write image.toml");
 
     let config_toml = format!(
         r#"
@@ -465,17 +465,17 @@ async fn mcp_server_mode_uses_embedded_image_entries() {
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n\
          RUN mkdir -p /etc/outrig\n\
-         COPY container.toml /etc/outrig/container.toml\n",
+         COPY image.toml /etc/outrig/image.toml\n",
     )
     .expect("write Dockerfile");
     std::fs::write(
-        image_ctx.path().join("container.toml"),
+        image_ctx.path().join("image.toml"),
         r#"
         [mcp]
         fs = ["mcp-server-filesystem", "/workspace"]
         "#,
     )
-    .expect("write container.toml");
+    .expect("write image.toml");
 
     let config_toml = format!(
         r#"

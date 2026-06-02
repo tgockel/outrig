@@ -29,7 +29,7 @@ pub fn get_config_schema() -> ConfigSchemaResponse {
             image_dir: ".agents/outrig/images/<name>/",
             dockerfile: ".agents/outrig/images/<name>/Dockerfile",
             context: ".agents/outrig/images/<name>/",
-            image_config: "/etc/outrig/container.toml",
+            image_config: "/etc/outrig/image.toml",
         },
     }
 }
@@ -46,6 +46,7 @@ mod tests {
     fn exports_image_and_mcp_schemas() {
         let schema = get_config_schema();
         assert_eq!(schema.paths.repo_config, ".agents/outrig/config.toml");
+        assert_eq!(schema.paths.image_config, "/etc/outrig/image.toml");
         assert!(
             schema.image_config_schema.get("definitions").is_some(),
             "image schema should carry definitions: {:?}",

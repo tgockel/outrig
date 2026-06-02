@@ -46,8 +46,11 @@ and standalone image projects use the same `image.toml` file shape.
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
   ```
 
-- Require `[image].ref`, `[build].dockerfile`, `[build].context`, and a valid
-  nonempty `[mcp]` table for standalone validation.
+- Require `[image].ref` and a valid nonempty `[mcp]` table for standalone
+  validation.
+- Treat `[build]` as optional. If omitted, later standalone commands use
+  defaults relative to `image.toml`: `dockerfile = "Dockerfile"` and
+  `context = "."`. If `[build]` is present, both fields are required.
 - Treat `[image].description`, `[image].version`, and `[image].tags` as optional
   metadata.
 - Add `outrig mcp self` tool `validate_image_toml` for complete standalone
@@ -64,8 +67,9 @@ and standalone image projects use the same `image.toml` file shape.
 - Images without `/etc/outrig/image.toml` still work with repo-only
   `[images.<name>.mcp]` entries.
 - Malformed embedded `image.toml` is a hard runtime error.
-- `validate_image_toml` accepts a complete valid standalone file and rejects:
-  missing `image.ref`, missing build fields, empty `[mcp]`, invalid MCP server
+- `validate_image_toml` accepts standalone files with either explicit
+  `[build]` fields or the default sibling `Dockerfile` layout, and rejects:
+  missing `image.ref`, partial build fields, empty `[mcp]`, invalid MCP server
   names, and empty MCP commands.
 - `cargo test embedded` and the MCP self validator tests pass.
 
@@ -76,3 +80,9 @@ and standalone image projects use the same `image.toml` file shape.
 - **Hard: 0053**. This task renames and extends the embedded image-config
   support introduced there.
 - **Hard: 0055**. The new validator is exposed through `outrig mcp self`.
+
+## Decisions
+
+- Standalone `[build]` is optional in `image.toml`. When omitted, disk-aware
+  standalone commands default to a sibling `Dockerfile` and `context = "."`.
+  The validator only checks TOML shape; it does not check for sibling files.

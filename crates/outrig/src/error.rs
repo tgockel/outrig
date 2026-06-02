@@ -73,8 +73,8 @@ pub enum OutrigError {
         source: EnvValueError,
     },
 
-    #[error("container {container:?} embedded config: {source}")]
-    EmbeddedContainerParse {
+    #[error("container {container:?} embedded image config: {source}")]
+    EmbeddedImageConfigParse {
         container: String,
         #[source]
         source: Box<EmbeddedImageConfigError>,

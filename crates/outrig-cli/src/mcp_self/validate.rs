@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use outrig::config::Config;
+use outrig::container::embedded::parse_standalone_image_toml;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ValidationMessage {
@@ -99,6 +100,23 @@ pub fn validate_config(toml: &str) -> ConfigValidation {
             valid: false,
             errors: vec![ValidationMessage {
                 code: "config_invalid",
+                message: err.to_string(),
+                line: None,
+            }],
+        },
+    }
+}
+
+pub fn validate_image_toml(toml: &str) -> ConfigValidation {
+    match parse_standalone_image_toml(toml) {
+        Ok(_) => ConfigValidation {
+            valid: true,
+            errors: Vec::new(),
+        },
+        Err(err) => ConfigValidation {
+            valid: false,
+            errors: vec![ValidationMessage {
+                code: "image_toml_invalid",
                 message: err.to_string(),
                 line: None,
             }],
@@ -238,5 +256,121 @@ context = "."
         );
         assert!(!out.valid);
         assert!(out.errors[0].message.contains("invalid mcp server name"));
+    }
+
+    #[test]
+    fn image_toml_validator_accepts_explicit_build() {
+        let out = validate_image_toml(
+            r#"
+[image]
+ref = "rust-dev"
+description = "Rust tools"
+version = "0.1.0"
+tags = ["rust"]
+
+[build]
+dockerfile = "Dockerfile"
+context = "."
+
+[mcp]
+fs = { command = ["mcp-server-filesystem", "/workspace"] }
+"#,
+        );
+        assert!(out.valid, "expected valid image.toml: {out:?}");
+        assert_eq!(out.errors, Vec::new());
+    }
+
+    #[test]
+    fn image_toml_validator_accepts_default_build() {
+        let out = validate_image_toml(
+            r#"
+[image]
+ref = "rust-dev"
+
+[mcp]
+fs = ["mcp-server-filesystem", "/workspace"]
+"#,
+        );
+        assert!(
+            out.valid,
+            "expected valid default build image.toml: {out:?}"
+        );
+    }
+
+    #[test]
+    fn image_toml_validator_rejects_missing_image_ref() {
+        let out = validate_image_toml(
+            r#"
+[image]
+description = "missing ref"
+
+[mcp]
+fs = ["mcp-server-filesystem", "/workspace"]
+"#,
+        );
+        assert!(!out.valid);
+        assert!(out.errors[0].message.contains("image.ref is required"));
+    }
+
+    #[test]
+    fn image_toml_validator_rejects_partial_build_fields() {
+        let out = validate_image_toml(
+            r#"
+[image]
+ref = "rust-dev"
+
+[build]
+context = "."
+
+[mcp]
+fs = ["mcp-server-filesystem", "/workspace"]
+"#,
+        );
+        assert!(!out.valid);
+        assert!(out.errors[0].message.contains("build.dockerfile"));
+    }
+
+    #[test]
+    fn image_toml_validator_rejects_empty_mcp() {
+        let out = validate_image_toml(
+            r#"
+[image]
+ref = "rust-dev"
+
+[mcp]
+"#,
+        );
+        assert!(!out.valid);
+        assert!(out.errors[0].message.contains("mcp table"));
+    }
+
+    #[test]
+    fn image_toml_validator_rejects_invalid_mcp_name() {
+        let out = validate_image_toml(
+            r#"
+[image]
+ref = "rust-dev"
+
+[mcp]
+"bad.name" = ["mcp"]
+"#,
+        );
+        assert!(!out.valid);
+        assert!(out.errors[0].message.contains("invalid mcp server name"));
+    }
+
+    #[test]
+    fn image_toml_validator_rejects_empty_mcp_command() {
+        let out = validate_image_toml(
+            r#"
+[image]
+ref = "rust-dev"
+
+[mcp]
+fs = []
+"#,
+        );
+        assert!(!out.valid);
+        assert!(out.errors[0].message.contains("empty command"));
     }
 }
