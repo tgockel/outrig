@@ -5,3 +5,10 @@ on smaller-numbered predecessors. Run `/next-task` to advance one task end-to-en
 branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls.
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
+
+| Task | Title | Dependencies |
+|---|---|---|
+| 0069 | Embedded `image.toml` for standalone images | 0051, 0053, 0055 |
+| 0070 | `outrig image init` for standalone image projects | 0069 |
+| 0071 | `outrig image build` for standalone image projects | 0069, 0070 |
+| 0072 | `outrig image inspect` and standalone design prompts | 0069, 0071 |
