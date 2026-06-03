@@ -3,7 +3,8 @@
 `outrig image` groups commands for the container images that host an agent's tools.
 `outrig image add` scaffolds a repo-local image-config (a named Dockerfile + MCP-server
 bundle); `outrig image init` scaffolds a standalone image project whose build output is a
-reusable image. The rest of the group (`image ls`, `image rm`) is reserved for later.
+reusable image, and `outrig image build` builds and validates that project. The rest of the
+group (`image ls`, `image rm`) is reserved for later.
 
 ## `outrig image add`
 
@@ -263,6 +264,75 @@ error: rust-dev/Dockerfile, rust-dev/image.toml, rust-dev/README.md
 ```
 
 `--force` regenerates the three files and leaves anything else in the directory untouched.
+
+## outrig image build
+
+`outrig image build` builds a standalone image project (the output of `outrig image init`) and
+validates that the result is a working OutRig toolset image. It is the standalone-project
+counterpart to [`outrig build`](build.md), which builds repo-local image-configs.
+
+It reads the project's `image.toml`, builds the declared `Dockerfile` with buildah, and tags the
+result with the `[image].ref` from `image.toml`. Then it always validates the built image, and --
+unless `--no-test` -- live-tests every MCP server the image declares.
+
+### Synopsis
+
+```
+outrig image build [<dir>] [--tag <ref>] [--no-test] [--no-cache]
+```
+
+| Argument / flag | Default       | Description                                           |
+|-----------------|---------------|-------------------------------------------------------|
+| `<dir>`         | current dir   | Project directory holding `image.toml`.               |
+| `--tag <ref>`   | `[image].ref` | Build tag override; does not edit `image.toml`.       |
+| `--no-test`     | off           | Skip the live MCP test; still validates `image.toml`. |
+| `--no-cache`    | off           | Force a clean build; passed through to buildah.       |
+
+### What it does
+
+```sh
+$ outrig image build rust-dev
+[outrig] building image rust-dev
+[outrig]   dockerfile: Dockerfile
+[outrig]   context:    .
+... buildah build output ...
+[outrig] image ready
+[outrig] image.toml validated (1 mcp server)
+[outrig] mcp fs: initialized (12 tools)
+[outrig] image ok
+```
+
+After the build, outrig reads `/etc/outrig/image.toml` back out of the built image (not the copy
+on disk) and parses it against the full standalone schema. By default it then starts the image,
+and for each declared MCP server initializes it and calls `tools/list`, reporting the tool count
+per server. The image is built locally; nothing is pushed.
+
+### Failure modes
+
+The command exits nonzero -- printing `error: ...` -- in these cases:
+
+- **`image.toml` missing, malformed, or missing required fields** (no `[image].ref`, an empty or
+  invalid `[mcp]` table, a partial `[build]`): caught before the build runs.
+- **The built image does not contain `/etc/outrig/image.toml`**: the Dockerfile never copied it
+  to that path. Caught after the build, even with `--no-test`.
+- **A declared MCP server cannot initialize or return `tools/list`**: caught during the live
+  test. `--no-test` skips this check (the per-server stderr is captured in the error message).
+
+### `--no-test`
+
+`--no-test` skips *only* the live MCP server test. The embedded `image.toml` is still read from
+the built image and validated, so a missing or malformed baked config still fails. Use it to
+verify a build quickly, or in environments where starting the servers is not wanted.
+
+### `--tag` and `--no-cache`
+
+`--tag <ref>` tags the build output as `<ref>` for that invocation instead of the `[image].ref`
+in `image.toml`; the file is never rewritten. Short refs are passed to buildah verbatim, so both
+`rust-dev` and `rust-dev:0.1.0` work.
+
+Unlike repo-local `outrig build`, a standalone build tags a caller-named ref rather than a
+content-addressed `outrig-cache:<key>` tag, so there is no project-level cache to skip:
+`--no-cache` only forwards `--no-cache` to buildah to force a clean build.
 
 ## See also
 

@@ -126,6 +126,39 @@ pub fn parse_standalone_image_toml(
     StandaloneImageToml::try_from(raw)
 }
 
+/// Read and fully validate `/etc/outrig/image.toml` from a built image's
+/// running container. Unlike [`read_embedded_image_config`] -- which is lenient
+/// (a missing file yields an empty config, and only the `[mcp]` table is
+/// parsed) -- this is strict: a missing file is a hard error, and the content is
+/// validated against the full standalone schema via
+/// [`parse_standalone_image_toml`]. `outrig image build` uses this to prove the
+/// build output is a usable OutRig toolset image.
+pub async fn read_standalone_image_toml(container: &Container) -> Result<StandaloneImageToml> {
+    let cmd = podman_exec_root(container.name())
+        .arg("cat")
+        .arg(EMBEDDED_IMAGE_CONFIG_PATH);
+    let output =
+        process::try_capture_logged(cmd.clone(), "podman", container.transcript().as_ref()).await?;
+
+    if !output.status.success() {
+        if is_missing_embedded_image_config(&output.stderr) {
+            return Err(OutrigError::Configuration(format!(
+                "built image is missing {EMBEDDED_IMAGE_CONFIG_PATH} \
+                 (a standalone image must bake its image.toml)"
+            )));
+        }
+        return Err(process::process_error_from_output(cmd, output));
+    }
+
+    // The parser takes `&str`; a genuinely non-UTF-8 baked file would fail the
+    // TOML parse below anyway, so a lossy decode preserves fail-closed behavior
+    // without a separate UTF-8 error path.
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_standalone_image_toml(&text).map_err(|source| {
+        OutrigError::Configuration(format!("invalid {EMBEDDED_IMAGE_CONFIG_PATH}: {source}"))
+    })
+}
+
 pub async fn merged_mcp(
     container: &Container,
     config_mcp: &BTreeMap<String, McpServerSpec>,

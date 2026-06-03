@@ -115,6 +115,23 @@ enum ImageCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Build a standalone image project and validate the built image.
+    Build {
+        /// Project directory holding `image.toml`. Defaults to the current
+        /// directory.
+        dir: Option<PathBuf>,
+        /// Tag the build output as this ref instead of `[image].ref`. Does not
+        /// rewrite `image.toml`.
+        #[arg(long, value_name = "REF")]
+        tag: Option<String>,
+        /// Skip the live MCP server test. Still validates the embedded
+        /// `image.toml`.
+        #[arg(long = "no-test")]
+        no_test: bool,
+        /// Force a clean build (passes `--no-cache` to buildah).
+        #[arg(long = "no-cache")]
+        no_cache: bool,
+    },
 }
 
 pub fn run() -> ExitCode {
@@ -200,6 +217,25 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             ImageCmd::Init { dir, force } => {
                 let cwd = std::env::current_dir()?;
                 image_setup::init::run(&cwd, dir.as_deref(), *force)?;
+                Ok(0)
+            }
+            ImageCmd::Build {
+                dir,
+                tag,
+                no_test,
+                no_cache,
+            } => {
+                let cwd = std::env::current_dir()?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(image_setup::build::run(
+                    &cwd,
+                    dir.as_deref(),
+                    tag.as_deref(),
+                    *no_test,
+                    *no_cache,
+                ))?;
                 Ok(0)
             }
         },

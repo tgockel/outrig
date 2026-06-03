@@ -109,6 +109,29 @@ outrig image init [<dir>]
 
 See [Usage -> outrig image](../usage/image.md#outrig-image-init).
 
+### `outrig image build`
+
+Build a standalone image project (the output of `outrig image init`) with buildah, tag it by
+its `image.toml` `[image].ref`, and validate the result: the built image must carry
+`/etc/outrig/image.toml`, and -- unless `--no-test` -- every declared MCP server must start
+and answer `tools/list`.
+
+```
+outrig image build [<dir>]
+                   [--tag <ref>]
+                   [--no-test]
+                   [--no-cache]
+```
+
+| Argument / flag | Default       | Description                                            |
+|-----------------|---------------|--------------------------------------------------------|
+| `<dir>`         | current dir   | Project directory holding `image.toml`.                |
+| `--tag <ref>`   | `[image].ref` | Tag the output as `<ref>`; does not rewrite image.toml. |
+| `--no-test`     | off           | Skip the live MCP test; still validates `image.toml`.  |
+| `--no-cache`    | off           | Force a clean build. Passes `--no-cache` to buildah.   |
+
+See [Usage -> outrig image](../usage/image.md#outrig-image-build).
+
 ### `outrig run`
 
 Start an interactive agent session.

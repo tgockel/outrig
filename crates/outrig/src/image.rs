@@ -361,6 +361,37 @@ pub async fn ensure_tagged_image_for(
     }
 }
 
+/// Build a standalone image project with buildah, tagging the result `tag`.
+/// `dockerfile` and `context` are resolved relative to `project_dir`. Stderr
+/// from buildah is streamed to `tracing::info!` with the `[buildah]` prefix.
+///
+/// Unlike [`ensure_image`], there is no content-addressed cache probe: a
+/// standalone build tags a caller-named ref (e.g. `rust-dev`), not
+/// `outrig-cache:<key>`. `no_cache` therefore only forwards `--no-cache` to
+/// buildah.
+pub async fn build_standalone(
+    project_dir: &Path,
+    dockerfile: &Path,
+    context: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+) -> Result<()> {
+    let dockerfile = project_dir.join(dockerfile);
+    let context = project_dir.join(context);
+    let cmd = buildah_build_cmd(&dockerfile, &context, tag, no_cache, &BTreeMap::new());
+    let argv_for_error = cmd.args.clone();
+    let status = process::run_streamed(cmd, "buildah").await?;
+    if !status.success() {
+        return Err(OutrigError::Process {
+            program: "buildah",
+            argv: argv_for_error,
+            exit_code: status.code(),
+            stderr_tail: String::new(),
+        });
+    }
+    Ok(())
+}
+
 fn build_image_cmd(
     cfg: &ImageConfig,
     repo_root: &Path,
@@ -370,20 +401,34 @@ fn build_image_cmd(
 ) -> Cmd {
     let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
     let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
+    buildah_build_cmd(&dockerfile, &context, tag, no_cache, build_args)
+}
 
+/// Assemble a `buildah build --tag <tag> --file <dockerfile> [--no-cache]
+/// [--build-arg ...] <context>` command. `dockerfile` and `context` are
+/// absolute (already joined with their base dir). Shared by repo-local
+/// image-config builds ([`build_image_cmd`]) and standalone image builds
+/// ([`build_standalone`]).
+fn buildah_build_cmd(
+    dockerfile: &Path,
+    context: &Path,
+    tag: &ImageTag,
+    no_cache: bool,
+    build_args: &BTreeMap<String, String>,
+) -> Cmd {
     let mut cmd = Cmd::new("buildah")
         .arg("build")
         .arg("--tag")
         .arg(&tag.0)
         .arg("--file")
-        .arg(&dockerfile);
+        .arg(dockerfile);
     if no_cache {
         cmd = cmd.arg("--no-cache");
     }
     for (k, v) in build_args {
         cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
     }
-    cmd.arg(&context)
+    cmd.arg(context)
 }
 
 async fn is_git_context(ctx: &Path) -> Result<bool> {
