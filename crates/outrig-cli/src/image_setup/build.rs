@@ -1,11 +1,11 @@
 //! `outrig image build` -- build a standalone image project and validate it.
 //!
-//! Reads `PROJECT_DIR/image.toml`, builds the declared image with buildah
-//! (tagged by `[image].ref`, or `--tag <ref>`), then starts a throwaway
-//! container to prove the result is a usable OutRig toolset image: it must
-//! carry `/etc/outrig/image.toml` (validated against the full standalone
-//! schema), and -- unless `--no-test` -- every declared MCP server must
-//! initialize and answer `tools/list`.
+//! Reads `PROJECT_DIR/image.toml`, serializes it into OCI labels, builds the
+//! declared image with buildah (tagged by `[image].ref`, or `--tag <ref>`, and
+//! stamped with those labels), then starts a throwaway container to prove the
+//! result is a usable OutRig toolset image: it must carry a valid
+//! `org.outrig.mcp` label, and -- unless `--no-test` -- every declared MCP
+//! server must initialize and answer `tools/list`.
 //!
 //! Unlike repo-local `outrig build`, there is no content-addressed cache: the
 //! output is a caller-named ref, so `--no-cache` only forwards to buildah.
@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use outrig::McpClient;
 use outrig::container::embedded::{
-    StandaloneImageToml, parse_standalone_image_toml, read_standalone_image_toml,
+    StandaloneImageToml, parse_standalone_image_toml, read_standalone_image_mcp,
+    standalone_config_to_labels,
 };
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
@@ -37,6 +38,7 @@ pub async fn run(
 ) -> Result<()> {
     let project_dir = dir.map_or_else(|| cwd.to_path_buf(), |d| cwd.join(d));
     let parsed = load_project_image_toml(&project_dir)?;
+    let labels = standalone_config_to_labels(&parsed)?;
     let tag = ImageTag(
         tag_override
             .map(str::to_string)
@@ -55,6 +57,7 @@ pub async fn run(
         &parsed.build.context,
         &tag,
         no_cache,
+        &labels,
     )
     .await?;
     eprintln!("[outrig] image ready");
@@ -88,8 +91,8 @@ pub async fn run(
 
 /// Read and parse the project's own `image.toml`. Failures (missing file,
 /// malformed TOML, missing required fields) are framed against the project path
-/// -- this is the user's input, distinct from the baked-in copy validated later
-/// via [`read_standalone_image_toml`].
+/// -- this is the user's input, distinct from the stamped labels validated
+/// later via [`read_standalone_image_mcp`].
 fn load_project_image_toml(project_dir: &Path) -> Result<StandaloneImageToml> {
     let path = project_dir.join("image.toml");
     let text = std::fs::read_to_string(&path).map_err(|source| {
@@ -100,13 +103,13 @@ fn load_project_image_toml(project_dir: &Path) -> Result<StandaloneImageToml> {
     Ok(parsed)
 }
 
-/// Read+validate the baked `/etc/outrig/image.toml` (always), then -- unless
+/// Read+validate the stamped `org.outrig.mcp` label (always), then -- unless
 /// `no_test` -- start each declared MCP server and report its tool count.
 async fn validate_and_test(container: &mut Container, log_dir: &Path, no_test: bool) -> Result<()> {
-    let baked = read_standalone_image_toml(container).await?;
-    let count = baked.mcp.len();
+    let mcp = read_standalone_image_mcp(container).await?;
+    let count = mcp.len();
     eprintln!(
-        "[outrig] image.toml validated ({count} mcp {})",
+        "[outrig] image config validated ({count} mcp {})",
         plural(count, "server", "servers")
     );
 
@@ -116,7 +119,7 @@ async fn validate_and_test(container: &mut Container, log_dir: &Path, no_test: b
     }
 
     container.bootstrap_user().await?;
-    for (name, spec) in &baked.mcp {
+    for (name, spec) in &mcp {
         let client =
             McpClient::connect_via_podman_exec(container, spec, name, log_dir, &BTreeMap::new())
                 .await?;

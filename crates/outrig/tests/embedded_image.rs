@@ -42,23 +42,34 @@ fn crash_spec() -> McpServerSpec {
     ])
 }
 
-async fn ensure_image_with_image_toml(image_toml: Option<&str>) -> ImageTag {
+/// Dockerfile-escape a label value (backslashes first, then double quotes) so a
+/// JSON value survives `LABEL "key"="value"` parsing.
+fn dockerfile_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn label_line(key: &str, value: &str) -> String {
+    format!("LABEL \"{key}\"=\"{}\"\n", dockerfile_escape(value))
+}
+
+fn mcp_label_json(mcp: &BTreeMap<String, McpServerSpec>) -> String {
+    serde_json::to_string(mcp).expect("serialize mcp label json")
+}
+
+/// Build an alpine + filesystem-MCP fixture image carrying `labels` (stamped via
+/// Dockerfile `LABEL`, mirroring what `outrig image build` stamps via
+/// `--label`). An empty slice builds a label-free image.
+async fn ensure_image_with_labels(labels: &[(&str, &str)]) -> ImageTag {
     let ctx = tempfile::tempdir().expect("tempdir image context");
     let mut dockerfile = String::from(
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n",
     );
-    if image_toml.is_some() {
-        dockerfile.push_str(
-            "RUN mkdir -p /etc/outrig\n\
-             COPY image.toml /etc/outrig/image.toml\n",
-        );
+    for &(key, value) in labels {
+        dockerfile.push_str(&label_line(key, value));
     }
     std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
-    if let Some(text) = image_toml {
-        std::fs::write(ctx.path().join("image.toml"), text).expect("write image.toml");
-    }
 
     let cfg = ImageConfig {
         image_name: None,
@@ -74,7 +85,16 @@ async fn ensure_image_with_image_toml(image_toml: Option<&str>) -> ImageTag {
         .tag
 }
 
-async fn ensure_missing_file_image() -> ImageTag {
+/// Convenience over [`ensure_image_with_labels`] for the common case: stamp just
+/// the `org.outrig.mcp` label from an mcp table.
+async fn ensure_image_with_mcp(mcp: &BTreeMap<String, McpServerSpec>) -> ImageTag {
+    let json = mcp_label_json(mcp);
+    ensure_image_with_labels(&[(embedded::LABEL_MCP, json.as_str())]).await
+}
+
+/// Build a label-free image (the committed mcp-fs fixture has the tool binaries
+/// but no `org.outrig.*` labels) -- runtime must fall back to repo config.
+async fn ensure_label_free_image() -> ImageTag {
     let cfg = ImageConfig {
         image_name: None,
         dockerfile: Some("Dockerfile".into()),
@@ -135,13 +155,9 @@ async fn assert_servers_boot(
 async fn image_only_embedded_mcp_boots() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_image_toml(Some(
-        r#"
-        [mcp]
-        fs = ["mcp-server-filesystem", "/workspace"]
-        "#,
-    ))
-    .await;
+    let mut mcp = BTreeMap::new();
+    mcp.insert("fs".to_string(), fs_spec());
+    let image = ensure_image_with_mcp(&mcp).await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
@@ -161,13 +177,9 @@ async fn image_only_embedded_mcp_boots() {
 async fn config_entry_overrides_image_entry_whole() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_image_toml(Some(
-        r#"
-        [mcp]
-        fs = ["node", "-e", "process.exit(42)"]
-        "#,
-    ))
-    .await;
+    let mut mcp = BTreeMap::new();
+    mcp.insert("fs".to_string(), crash_spec());
+    let image = ensure_image_with_mcp(&mcp).await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
@@ -187,14 +199,10 @@ async fn config_entry_overrides_image_entry_whole() {
 async fn image_and_config_entries_are_additive() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_image_toml(Some(
-        r#"
-        [mcp]
-        fs = ["mcp-server-filesystem", "/workspace"]
-        shell = ["mcp-server-filesystem", "/workspace"]
-        "#,
-    ))
-    .await;
+    let mut mcp = BTreeMap::new();
+    mcp.insert("fs".to_string(), fs_spec());
+    mcp.insert("shell".to_string(), fs_spec());
+    let image = ensure_image_with_mcp(&mcp).await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
@@ -213,10 +221,10 @@ async fn image_and_config_entries_are_additive() {
 }
 
 #[tokio::test]
-async fn missing_embedded_file_falls_back_to_config() {
+async fn missing_label_falls_back_to_config() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_missing_file_image().await;
+    let image = ensure_label_free_image().await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
@@ -224,7 +232,7 @@ async fn missing_embedded_file_falls_back_to_config() {
     config.insert("fs".to_string(), fs_spec());
     let merged = embedded::merged_mcp(&container, &config)
         .await
-        .expect("missing embedded file should be empty");
+        .expect("missing org.outrig.mcp label should be empty");
     assert_eq!(merged, config);
     assert_servers_boot(&container, &merged, &["fs"]).await;
 
@@ -232,41 +240,43 @@ async fn missing_embedded_file_falls_back_to_config() {
 }
 
 #[tokio::test]
-async fn malformed_embedded_toml_is_hard_error() {
+async fn malformed_mcp_label_is_hard_error() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_image_toml(Some("[mcp]\nfs = [")).await;
+    let image = ensure_image_with_labels(&[(embedded::LABEL_MCP, r#"{"fs": ["#)]).await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
     let err = embedded::merged_mcp(&container, &BTreeMap::new())
         .await
-        .expect_err("malformed embedded TOML should fail");
+        .expect_err("malformed org.outrig.mcp label should fail");
     assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
 
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
 #[tokio::test]
-async fn unknown_embedded_top_level_tables_are_ignored() {
+async fn extra_labels_do_not_disturb_mcp_read() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_image_toml(Some(
-        r#"
-        [workspace]
-        hint = "/workspace"
-
-        [mcp]
-        fs = ["mcp-server-filesystem", "/workspace"]
-        "#,
-    ))
+    let mut mcp = BTreeMap::new();
+    mcp.insert("fs".to_string(), fs_spec());
+    let json = mcp_label_json(&mcp);
+    // Metadata labels, a forward-looking schema bump, and an unrelated label
+    // must all be ignored: runtime reads only `org.outrig.mcp`.
+    let image = ensure_image_with_labels(&[
+        (embedded::LABEL_DESCRIPTION, "Fixture image"),
+        (embedded::LABEL_SCHEMA, "2"),
+        (embedded::LABEL_MCP, json.as_str()),
+        ("org.example.unknown", "ignored"),
+    ])
     .await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");
     let container = start_and_bootstrap(&image, host_ws.path()).await;
 
     let merged = embedded::merged_mcp(&container, &BTreeMap::new())
         .await
-        .expect("unknown top-level table should be ignored");
+        .expect("extra labels should be ignored");
     assert_eq!(
         merged.keys().map(String::as_str).collect::<Vec<_>>(),
         vec!["fs"]
@@ -285,24 +295,17 @@ async fn mcp_show_merged_prints_effective_toml() {
     let agents_dir = repo_dir.path().join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
-    std::fs::write(
-        image_ctx.path().join("Dockerfile"),
+    let dockerfile = format!(
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n\
-         RUN mkdir -p /etc/outrig\n\
-         COPY image.toml /etc/outrig/image.toml\n",
-    )
-    .expect("write Dockerfile");
-    std::fs::write(
-        image_ctx.path().join("image.toml"),
-        r#"
-        [mcp]
-        fs = ["node", "-e", "process.exit(42)"]
-        shell = ["mcp-server-filesystem", "/workspace"]
-        "#,
-    )
-    .expect("write image.toml");
+         {}",
+        label_line(
+            embedded::LABEL_MCP,
+            r#"{"fs":["node","-e","process.exit(42)"],"shell":["mcp-server-filesystem","/workspace"]}"#,
+        ),
+    );
+    std::fs::write(image_ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
 
     let config_toml = format!(
         r#"
@@ -373,23 +376,17 @@ async fn run_mode_uses_embedded_image_entries() {
     let agents_dir = repo_dir.path().join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
-    std::fs::write(
-        image_ctx.path().join("Dockerfile"),
+    let dockerfile = format!(
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n\
-         RUN mkdir -p /etc/outrig\n\
-         COPY image.toml /etc/outrig/image.toml\n",
-    )
-    .expect("write Dockerfile");
-    std::fs::write(
-        image_ctx.path().join("image.toml"),
-        r#"
-        [mcp]
-        fs = ["mcp-server-filesystem", "/workspace"]
-        "#,
-    )
-    .expect("write image.toml");
+         {}",
+        label_line(
+            embedded::LABEL_MCP,
+            r#"{"fs":["mcp-server-filesystem","/workspace"]}"#,
+        ),
+    );
+    std::fs::write(image_ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
 
     let config_toml = format!(
         r#"
@@ -459,23 +456,17 @@ async fn mcp_server_mode_uses_embedded_image_entries() {
     std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
 
     let image_ctx = tempfile::tempdir().expect("tempdir image context");
-    std::fs::write(
-        image_ctx.path().join("Dockerfile"),
+    let dockerfile = format!(
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache nodejs npm shadow\n\
          RUN npm install -g @modelcontextprotocol/server-filesystem\n\
-         RUN mkdir -p /etc/outrig\n\
-         COPY image.toml /etc/outrig/image.toml\n",
-    )
-    .expect("write Dockerfile");
-    std::fs::write(
-        image_ctx.path().join("image.toml"),
-        r#"
-        [mcp]
-        fs = ["mcp-server-filesystem", "/workspace"]
-        "#,
-    )
-    .expect("write image.toml");
+         {}",
+        label_line(
+            embedded::LABEL_MCP,
+            r#"{"fs":["mcp-server-filesystem","/workspace"]}"#,
+        ),
+    );
+    std::fs::write(image_ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
 
     let config_toml = format!(
         r#"

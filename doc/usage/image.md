@@ -193,8 +193,9 @@ it creates three files and nothing else:
 - `Dockerfile` -- a Debian-slim image with the filesystem MCP server, ending in the standard
   `CMD ["sleep", "infinity"]`. It copies the project's `image.toml` to `/etc/outrig/image.toml`
   so the image carries its own MCP declarations.
-- `image.toml` -- the standalone image config: `[image].ref` plus a `[mcp]` table. outrig reads
-  the embedded copy at session startup and merges it with any repo `[images.<name>.mcp]`.
+- `image.toml` -- the standalone image config: `[image].ref` plus a `[mcp]` table. `outrig image
+  build` stamps the `[mcp]` table into the image's OCI labels, which outrig reads back at session
+  startup and merges with any repo `[images.<name>.mcp]`.
 - `README.md` -- how to build the image and reference it from a repo.
 
 The command is noninteractive -- there are no prompts. The project name (used as `[image].ref`)
@@ -271,9 +272,10 @@ error: rust-dev/Dockerfile, rust-dev/image.toml, rust-dev/README.md
 validates that the result is a working OutRig toolset image. It is the standalone-project
 counterpart to [`outrig build`](build.md), which builds repo-local image-configs.
 
-It reads the project's `image.toml`, builds the declared `Dockerfile` with buildah, and tags the
-result with the `[image].ref` from `image.toml`. Then it always validates the built image, and --
-unless `--no-test` -- live-tests every MCP server the image declares.
+It reads the project's `image.toml`, serializes it into OCI labels, builds the declared
+`Dockerfile` with buildah, and tags the result with the `[image].ref` from `image.toml` --
+stamping those labels onto the image. Then it always validates the built image, and -- unless
+`--no-test` -- live-tests every MCP server the image declares.
 
 ### Synopsis
 
@@ -297,15 +299,15 @@ $ outrig image build rust-dev
 [outrig]   context:    .
 ... buildah build output ...
 [outrig] image ready
-[outrig] image.toml validated (1 mcp server)
+[outrig] image config validated (1 mcp server)
 [outrig] mcp fs: initialized (12 tools)
 [outrig] image ok
 ```
 
-After the build, outrig reads `/etc/outrig/image.toml` back out of the built image (not the copy
-on disk) and parses it against the full standalone schema. By default it then starts the image,
-and for each declared MCP server initializes it and calls `tools/list`, reporting the tool count
-per server. The image is built locally; nothing is pushed.
+After the build, outrig reads the stamped `org.outrig.mcp` label back off the built image and
+validates it (every server name well-formed, every command non-empty). By default it then starts
+the image, and for each declared MCP server initializes it and calls `tools/list`, reporting the
+tool count per server. The image is built locally; nothing is pushed.
 
 ### Failure modes
 
@@ -313,16 +315,16 @@ The command exits nonzero -- printing `error: ...` -- in these cases:
 
 - **`image.toml` missing, malformed, or missing required fields** (no `[image].ref`, an empty or
   invalid `[mcp]` table, a partial `[build]`): caught before the build runs.
-- **The built image does not contain `/etc/outrig/image.toml`**: the Dockerfile never copied it
-  to that path. Caught after the build, even with `--no-test`.
+- **The stamped `org.outrig.mcp` label is missing or malformed**: read back off the built image
+  and validated after the build, even with `--no-test`.
 - **A declared MCP server cannot initialize or return `tools/list`**: caught during the live
   test. `--no-test` skips this check (the per-server stderr is captured in the error message).
 
 ### `--no-test`
 
-`--no-test` skips *only* the live MCP server test. The embedded `image.toml` is still read from
-the built image and validated, so a missing or malformed baked config still fails. Use it to
-verify a build quickly, or in environments where starting the servers is not wanted.
+`--no-test` skips *only* the live MCP server test. The stamped `org.outrig.mcp` label is still
+read back from the built image and validated, so a missing or malformed config still fails. Use
+it to verify a build quickly, or in environments where starting the servers is not wanted.
 
 ### `--tag` and `--no-cache`
 

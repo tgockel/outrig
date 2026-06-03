@@ -72,3 +72,42 @@ runtime and at build-validation time, replacing the `podman exec cat` file read.
 
 - **Hard: 0069**. Serializes the standalone schema/validation introduced there into labels.
 - **Hard: 0071**. Extends the standalone build path and its build-validation read.
+
+## Decisions
+
+1. **Stamping is independent of the Dockerfile.** `build_standalone` stamps labels via
+   `buildah --label` from the validated on-disk `image.toml`, so the built image always
+   carries `org.outrig.mcp`. The build-validation read-back (`read_standalone_image_mcp`) is
+   therefore a stamp/round-trip post-condition (proves `--label` applied and the JSON
+   validates), not a could-fail-on-missing-COPY check. Consequently the two
+   `image_build.rs` e2e tests that asserted "missing COPY -> build fails"
+   (`build_fails_when_built_image_lacks_image_toml`, `no_test_still_validates_embedded_image_toml`)
+   were removed; on-disk malformed/missing input stays covered by build.rs `load_errors_*`
+   unit tests, and the scaffold test gained a label read-back assertion.
+
+2. **Read fns keep `&Container`; `image::read_image_labels(tag, transcript)` is the primitive.**
+   The six runtime call sites are unchanged. The primitive lives in `image.rs` (not `embedded.rs`)
+   because `Container::transcript()` and the `process::*` capture helpers are `pub(crate)`.
+
+3. **Pure label<->mcp seams for testability.** `parse_mcp_table` + `embedded_mcp_from_labels`
+   + `standalone_mcp_from_labels` take a label map, so the missing/empty/malformed/fallback
+   branches are unit-tested without podman. `/simplify` compared this against an inlined
+   alternative and ruled the factoring simpler *because* it makes those acceptance branches
+   testable (verdict ORIGINAL_SIMPLER).
+
+4. **`org.outrig.schema` is stamped, not read.** Forward-compat only in this task; no
+   schema-version branching. No inverse metadata decoder either (description/version/tags are
+   write-only here) -- add it when a remote-ref / `image inspect` task needs to read them back.
+
+5. **Doc split with 0073.** Read-mechanism statements were flipped to OCI labels now; the init
+   scaffold's Dockerfile `COPY` (still emitted this task) and its doc/README mentions are left
+   for 0073, which removes the baked file.
+
+6. **Pre-existing e2e compile rot (out of scope, filed).** The `--features e2e` suite does not
+   compile, predating this task (e2e is not in CI): `crates/outrig/tests/embedded_image.rs`'s
+   CLI-driven cases use `env!("CARGO_BIN_EXE_outrig")`, but the `outrig` binary is defined in
+   `outrig-cli`, so that var is never set for `outrig`'s tests; and
+   `crates/outrig-cli/tests/build_cli.rs` references the renamed `BuildArgs.container`. Filed to
+   `plan/next/fix-e2e-test-compile-rot.md`. The migrated label logic in both suites was
+   compile-verified (`image_build.rs` as-is; `embedded_image.rs` by temporarily neutralizing the
+   pre-existing `env!` blocker, then reverting). Runtime e2e was not executed.

@@ -52,6 +52,29 @@ fn write_project(dir: &Path, dockerfile: &str, image_toml: &str) {
     std::fs::write(dir.join("image.toml"), image_toml).expect("write image.toml");
 }
 
+/// Read the OCI labels off a built image as a JSON string (or `null` when the
+/// image carries none).
+async fn podman_image_labels(tag: &str) -> String {
+    let out = Command::new("podman")
+        .args([
+            "image",
+            "inspect",
+            tag,
+            "--format",
+            "{{json .Config.Labels}}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("spawn podman image inspect");
+    assert!(
+        out.status.success(),
+        "podman image inspect {tag} failed: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Acceptance: building the `outrig image init rust-dev` scaffold succeeds, and
 /// its declared MCP server is live-tested (initialize + tools/list).
 #[tokio::test]
@@ -70,53 +93,18 @@ async fn generated_scaffold_builds_and_mcp_boots() {
         "live fs server should be tested:\n{stderr}"
     );
     assert!(stderr.contains("[outrig] image ok"), "{stderr}");
-}
 
-/// Acceptance: the command fails if the built image does not contain
-/// `/etc/outrig/image.toml` (here the Dockerfile omits the COPY).
-#[tokio::test]
-async fn build_fails_when_built_image_lacks_image_toml() {
-    let _guard = E2E_LOCK.lock().await;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("no-copy");
-    write_project(
-        &proj,
-        "FROM docker.io/library/alpine:latest\nCMD [\"sleep\", \"infinity\"]\n",
-        "[image]\nref = \"outrig-e2e-no-copy\"\n\
-         [mcp]\nfs = [\"mcp-server-filesystem\", \"/workspace\"]\n",
-    );
-
-    let out = outrig_image_build(&[proj.to_str().unwrap()], LIGHT_TIMEOUT).await;
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The build stamps the config into OCI labels; confirm they read back off
+    // the built image (acceptance: "reads them back off the built image").
+    let labels = podman_image_labels("rust-dev").await;
     assert!(
-        !out.status.success(),
-        "expected failure, got success:\n{stderr}"
+        labels.contains("org.outrig.mcp"),
+        "built image should carry org.outrig.mcp: {labels}"
     );
-    assert!(stderr.contains("/etc/outrig/image.toml"), "{stderr}");
-    assert!(stderr.to_lowercase().contains("missing"), "{stderr}");
-}
-
-/// Acceptance: `--no-test` skips ONLY the live MCP probe -- it still validates
-/// the baked `image.toml`, so the missing-COPY image must still fail.
-#[tokio::test]
-async fn no_test_still_validates_embedded_image_toml() {
-    let _guard = E2E_LOCK.lock().await;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("no-copy-notest");
-    write_project(
-        &proj,
-        "FROM docker.io/library/alpine:latest\nCMD [\"sleep\", \"infinity\"]\n",
-        "[image]\nref = \"outrig-e2e-no-copy-notest\"\n\
-         [mcp]\nfs = [\"mcp-server-filesystem\", \"/workspace\"]\n",
-    );
-
-    let out = outrig_image_build(&[proj.to_str().unwrap(), "--no-test"], LIGHT_TIMEOUT).await;
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !out.status.success(),
-        "--no-test must still validate the baked image.toml:\n{stderr}"
+        labels.contains("\"fs\""),
+        "org.outrig.mcp should declare the fs server: {labels}"
     );
-    assert!(stderr.contains("/etc/outrig/image.toml"), "{stderr}");
 }
 
 /// Acceptance: `--no-test` succeeds without running the live probe, and a

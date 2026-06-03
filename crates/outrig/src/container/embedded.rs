@@ -1,28 +1,46 @@
 //! Image-embedded metadata.
 //!
-//! Runtime reads `/etc/outrig/image.toml` from the running container and only
-//! consumes its `[mcp]` table. Other top-level tables are intentionally ignored
-//! so images can carry forward-looking metadata without breaking older outrig
-//! binaries.
+//! A standalone image advertises its MCP/config via OCI image labels (the
+//! `LABEL_*` constants below). Runtime reads them with `podman image inspect`
+//! -- no running container, no pull -- and consumes only `org.outrig.mcp`;
+//! other labels are ignored so images can carry forward-looking metadata
+//! without breaking older outrig binaries. Authoring is unchanged: humans
+//! still write `image.toml` (TOML on disk), which `outrig image build`
+//! validates and serializes into labels.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::string::FromUtf8Error;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{McpServerSpec, is_valid_mcp_server_name, mcp_command_is_empty};
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
-use crate::process;
 
-use super::podman_exec_root;
-
+/// Where the Dockerfile still copies the authored `image.toml`. No longer read
+/// (labels are authoritative); the file and its `COPY` are removed in a
+/// follow-up task.
 pub const EMBEDDED_IMAGE_CONFIG_PATH: &str = "/etc/outrig/image.toml";
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+/// `org.opencontainers.image.description` <- `[image].description`.
+pub const LABEL_DESCRIPTION: &str = "org.opencontainers.image.description";
+/// `org.opencontainers.image.version` <- `[image].version`.
+pub const LABEL_VERSION: &str = "org.opencontainers.image.version";
+/// `org.outrig.tags` <- `[image].tags`, serialized as a JSON array.
+pub const LABEL_TAGS: &str = "org.outrig.tags";
+/// `org.outrig.mcp` <- the `[mcp]` table, serialized as a JSON object. The
+/// load-bearing label: the one runtime and build validation read back.
+pub const LABEL_MCP: &str = "org.outrig.mcp";
+/// `org.outrig.schema` <- the config schema version, stamped for forward
+/// compatibility. Not read in this version.
+pub const LABEL_SCHEMA: &str = "org.outrig.schema";
+/// Current schema version stamped into [`LABEL_SCHEMA`].
+pub const LABEL_SCHEMA_VERSION: &str = "1";
+
+/// The `[mcp]` table an image advertises via `org.outrig.mcp`, decoded for the
+/// runtime read. A missing label yields the default (empty) value.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EmbeddedImageConfig {
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
@@ -59,11 +77,8 @@ impl Default for StandaloneBuildConfig {
 
 #[derive(Debug, Error)]
 pub enum EmbeddedImageConfigError {
-    #[error("content is not valid UTF-8: {0}")]
-    NonUtf8(#[from] FromUtf8Error),
-
-    #[error("TOML parse failed: {0}")]
-    Toml(#[from] toml::de::Error),
+    #[error("org.outrig.mcp is not valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
 
     #[error("invalid mcp server name {server:?} (must match ^[a-zA-Z][a-zA-Z0-9_-]*$)")]
     InvalidMcpServerName { server: String },
@@ -93,30 +108,14 @@ pub enum StandaloneImageTomlError {
     EmptyMcpCommand { server: String },
 }
 
+/// Lenient runtime read: inspect the container's image labels and decode
+/// `org.outrig.mcp`. A label-less image (or one without that key) yields an
+/// empty config, so runtime falls back to repo `[images.<name>.mcp]`.
 pub async fn read_embedded_image_config(container: &Container) -> Result<EmbeddedImageConfig> {
-    let cmd = podman_exec_root(container.name())
-        .arg("cat")
-        .arg(EMBEDDED_IMAGE_CONFIG_PATH);
-    let output =
-        process::try_capture_logged(cmd.clone(), "podman", container.transcript().as_ref()).await?;
-
-    if !output.status.success() {
-        if is_missing_embedded_image_config(&output.stderr) {
-            return Ok(EmbeddedImageConfig::default());
-        }
-        return Err(process::process_error_from_output(cmd, output));
-    }
-
-    parse_embedded_image_config(container.name(), output.stdout)
-}
-
-pub fn parse_embedded_image_config(container: &str, bytes: Vec<u8>) -> Result<EmbeddedImageConfig> {
-    let text = String::from_utf8(bytes)
-        .map_err(|source| embedded_image_config_parse_error(container, source.into()))?;
-    let cfg = toml::from_str::<EmbeddedImageConfig>(&text)
-        .map_err(|source| embedded_image_config_parse_error(container, source.into()))?;
-    validate_embedded_image_config(container, &cfg)?;
-    Ok(cfg)
+    let labels =
+        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
+            .await?;
+    embedded_mcp_from_labels(&container.image_tag().0, &labels)
 }
 
 pub fn parse_standalone_image_toml(
@@ -126,37 +125,46 @@ pub fn parse_standalone_image_toml(
     StandaloneImageToml::try_from(raw)
 }
 
-/// Read and fully validate `/etc/outrig/image.toml` from a built image's
-/// running container. Unlike [`read_embedded_image_config`] -- which is lenient
-/// (a missing file yields an empty config, and only the `[mcp]` table is
-/// parsed) -- this is strict: a missing file is a hard error, and the content is
-/// validated against the full standalone schema via
-/// [`parse_standalone_image_toml`]. `outrig image build` uses this to prove the
-/// build output is a usable OutRig toolset image.
-pub async fn read_standalone_image_toml(container: &Container) -> Result<StandaloneImageToml> {
-    let cmd = podman_exec_root(container.name())
-        .arg("cat")
-        .arg(EMBEDDED_IMAGE_CONFIG_PATH);
-    let output =
-        process::try_capture_logged(cmd.clone(), "podman", container.transcript().as_ref()).await?;
+/// Strict build-validation read: inspect the built image's labels and decode a
+/// non-empty, valid `org.outrig.mcp`. Unlike [`read_embedded_image_config`]
+/// (lenient -- a missing label yields an empty config), a missing or empty
+/// label is a hard error here. `outrig image build` uses it to prove the
+/// stamped config round-trips off the built image.
+pub async fn read_standalone_image_mcp(
+    container: &Container,
+) -> Result<BTreeMap<String, McpServerSpec>> {
+    let labels =
+        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
+            .await?;
+    standalone_mcp_from_labels(&labels)
+}
 
-    if !output.status.success() {
-        if is_missing_embedded_image_config(&output.stderr) {
-            return Err(OutrigError::Configuration(format!(
-                "built image is missing {EMBEDDED_IMAGE_CONFIG_PATH} \
-                 (a standalone image must bake its image.toml)"
-            )));
-        }
-        return Err(process::process_error_from_output(cmd, output));
+/// Serialize a validated standalone config into the OCI label map buildah
+/// stamps at build time. `org.outrig.mcp` (the `[mcp]` table) and
+/// `org.outrig.schema` are always emitted; description, version, and tags only
+/// when the author set them.
+pub fn standalone_config_to_labels(cfg: &StandaloneImageToml) -> Result<BTreeMap<String, String>> {
+    let mut labels = BTreeMap::new();
+    labels.insert(LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VERSION.to_string());
+    labels.insert(LABEL_MCP.to_string(), to_json_label(LABEL_MCP, &cfg.mcp)?);
+    if let Some(description) = &cfg.image.description {
+        labels.insert(LABEL_DESCRIPTION.to_string(), description.clone());
     }
+    if let Some(version) = &cfg.image.version {
+        labels.insert(LABEL_VERSION.to_string(), version.clone());
+    }
+    if !cfg.image.tags.is_empty() {
+        labels.insert(
+            LABEL_TAGS.to_string(),
+            to_json_label(LABEL_TAGS, &cfg.image.tags)?,
+        );
+    }
+    Ok(labels)
+}
 
-    // The parser takes `&str`; a genuinely non-UTF-8 baked file would fail the
-    // TOML parse below anyway, so a lossy decode preserves fail-closed behavior
-    // without a separate UTF-8 error path.
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_standalone_image_toml(&text).map_err(|source| {
-        OutrigError::Configuration(format!("invalid {EMBEDDED_IMAGE_CONFIG_PATH}: {source}"))
-    })
+fn to_json_label<T: serde::Serialize>(key: &str, value: &T) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|source| OutrigError::Configuration(format!("serialize {key} label: {source}")))
 }
 
 pub async fn merged_mcp(
@@ -177,41 +185,73 @@ pub fn merge_mcp(
     image
 }
 
-fn validate_embedded_image_config(container: &str, cfg: &EmbeddedImageConfig) -> Result<()> {
-    for (server, spec) in &cfg.mcp {
+/// Parse and validate the `org.outrig.mcp` label value (a JSON object mapping
+/// server name -> spec): every name must match the server-name pattern and
+/// carry a non-empty command. Shared by the lenient runtime read and the
+/// strict build-validation read.
+fn parse_mcp_table(
+    raw: &str,
+) -> std::result::Result<BTreeMap<String, McpServerSpec>, EmbeddedImageConfigError> {
+    let mcp = serde_json::from_str::<BTreeMap<String, McpServerSpec>>(raw)?;
+    for (server, spec) in &mcp {
         if !is_valid_mcp_server_name(server) {
-            return Err(embedded_image_config_parse_error(
-                container,
-                EmbeddedImageConfigError::InvalidMcpServerName {
-                    server: server.clone(),
-                },
-            ));
+            return Err(EmbeddedImageConfigError::InvalidMcpServerName {
+                server: server.clone(),
+            });
         }
         if mcp_command_is_empty(spec) {
-            return Err(embedded_image_config_parse_error(
-                container,
-                EmbeddedImageConfigError::EmptyMcpCommand {
-                    server: server.clone(),
-                },
-            ));
+            return Err(EmbeddedImageConfigError::EmptyMcpCommand {
+                server: server.clone(),
+            });
         }
     }
-    Ok(())
+    Ok(mcp)
 }
 
-fn embedded_image_config_parse_error(
-    container: &str,
-    source: EmbeddedImageConfigError,
-) -> OutrigError {
-    OutrigError::EmbeddedImageConfigParse {
-        container: container.to_string(),
-        source: Box::new(source),
+/// Lenient decode for the runtime read: a missing `org.outrig.mcp` label is an
+/// empty config (fall back to repo config); a present-but-malformed label is a
+/// hard error. `image` names the offending image in the error.
+fn embedded_mcp_from_labels(
+    image: &str,
+    labels: &BTreeMap<String, String>,
+) -> Result<EmbeddedImageConfig> {
+    match labels.get(LABEL_MCP) {
+        None => Ok(EmbeddedImageConfig::default()),
+        Some(raw) => {
+            let mcp = parse_mcp_table(raw)
+                .map_err(|source| embedded_image_config_parse_error(image, source))?;
+            Ok(EmbeddedImageConfig { mcp })
+        }
     }
 }
 
-fn is_missing_embedded_image_config(stderr: &[u8]) -> bool {
-    let stderr = String::from_utf8_lossy(stderr);
-    stderr.contains(EMBEDDED_IMAGE_CONFIG_PATH) && stderr.contains("No such file")
+/// Strict decode for build validation: the built image must carry a non-empty,
+/// valid `org.outrig.mcp` label.
+fn standalone_mcp_from_labels(
+    labels: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, McpServerSpec>> {
+    let raw = labels.get(LABEL_MCP).ok_or_else(|| {
+        OutrigError::Configuration(format!(
+            "built image is missing the {LABEL_MCP} label \
+             (a standalone image must stamp its config)"
+        ))
+    })?;
+    let mcp = parse_mcp_table(raw).map_err(|source| {
+        OutrigError::Configuration(format!("invalid {LABEL_MCP} label: {source}"))
+    })?;
+    if mcp.is_empty() {
+        return Err(OutrigError::Configuration(format!(
+            "{LABEL_MCP} label must contain at least one server"
+        )));
+    }
+    Ok(mcp)
+}
+
+fn embedded_image_config_parse_error(image: &str, source: EmbeddedImageConfigError) -> OutrigError {
+    OutrigError::EmbeddedImageConfigParse {
+        image: image.to_string(),
+        source: Box::new(source),
+    }
 }
 
 impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
@@ -303,76 +343,201 @@ mod tests {
         McpServerSpec::Short(cmd.iter().map(|s| s.to_string()).collect())
     }
 
-    #[test]
-    fn parse_reads_mcp_and_ignores_unknown_top_level_tables() {
-        let cfg = parse_embedded_image_config(
-            "ctr",
-            br#"
-            [image]
-            ref = "rust-dev"
+    fn full(cmd: &[&str], env: &[(&str, EnvValue)]) -> McpServerSpec {
+        McpServerSpec::Full {
+            command: cmd.iter().map(|s| s.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        }
+    }
 
-            [build]
-            dockerfile = "Dockerfile"
-            context = "."
-
-            [workspace]
-            hint = "/workspace"
-
-            [mcp]
-            fs = ["mcp-server-filesystem", "/workspace"]
-            build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
-            "#
-            .to_vec(),
-        )
-        .expect("embedded config parses");
-
-        let (cmd, env) = cfg.mcp["fs"].normalize();
-        assert_eq!(
-            cmd,
-            vec![
-                "mcp-server-filesystem".to_string(),
-                "/workspace".to_string()
-            ]
-        );
-        assert!(env.is_empty());
-        let (cmd, env) = cfg.mcp["build"].normalize();
-        assert_eq!(cmd, vec!["cargo-mcp".to_string()]);
-        assert_eq!(
-            env["CARGO_HOME"],
-            EnvValue::Literal("/workspace/.cargo".to_string())
-        );
+    fn standalone(
+        mcp: BTreeMap<String, McpServerSpec>,
+        description: Option<&str>,
+        version: Option<&str>,
+        tags: &[&str],
+    ) -> StandaloneImageToml {
+        StandaloneImageToml {
+            image: StandaloneImageMetadata {
+                image_ref: "img".to_string(),
+                description: description.map(str::to_string),
+                version: version.map(str::to_string),
+                tags: tags.iter().map(|s| s.to_string()).collect(),
+            },
+            build: StandaloneBuildConfig::default(),
+            mcp,
+        }
     }
 
     #[test]
-    fn invalid_server_name_is_embedded_parse_error() {
-        let err = parse_embedded_image_config(
-            "ctr",
-            br#"
-            [mcp]
-            "bad.name" = ["bin"]
-            "#
-            .to_vec(),
-        )
-        .unwrap_err();
+    fn labels_round_trip_short_and_full_specs() {
+        let mut mcp = BTreeMap::new();
+        mcp.insert(
+            "fs".to_string(),
+            short(&["mcp-server-filesystem", "/workspace"]),
+        );
+        mcp.insert(
+            "build".to_string(),
+            full(
+                &["cargo-mcp"],
+                &[(
+                    "CARGO_HOME",
+                    EnvValue::Literal("/workspace/.cargo".to_string()),
+                )],
+            ),
+        );
+        let cfg = standalone(mcp.clone(), None, None, &[]);
 
+        let labels = standalone_config_to_labels(&cfg).expect("serialize labels");
+        let parsed = parse_mcp_table(&labels[LABEL_MCP]).expect("parse mcp label");
+
+        assert_eq!(parsed, mcp);
+        assert!(matches!(parsed["fs"], McpServerSpec::Short(_)));
+        assert!(matches!(parsed["build"], McpServerSpec::Full { .. }));
+    }
+
+    #[test]
+    fn full_spec_with_empty_env_round_trips_as_full() {
+        // Guards the untagged ordering (Short before Full) plus the always-
+        // serialized `env`: an empty-env Full must not collapse to Short on the
+        // way back through the label.
+        let mut mcp = BTreeMap::new();
+        mcp.insert("build".to_string(), full(&["cargo-mcp"], &[]));
+        let cfg = standalone(mcp, None, None, &[]);
+
+        let labels = standalone_config_to_labels(&cfg).expect("serialize labels");
+        let parsed = parse_mcp_table(&labels[LABEL_MCP]).expect("parse mcp label");
+
+        assert!(matches!(parsed["build"], McpServerSpec::Full { .. }));
+    }
+
+    #[test]
+    fn env_ref_round_trips_through_label() {
+        let mut mcp = BTreeMap::new();
+        mcp.insert(
+            "db".to_string(),
+            full(
+                &["db-mcp"],
+                &[("TOKEN", EnvValue::EnvRef("DB_TOKEN".to_string()))],
+            ),
+        );
+        let cfg = standalone(mcp, None, None, &[]);
+
+        let labels = standalone_config_to_labels(&cfg).expect("serialize labels");
+        let parsed = parse_mcp_table(&labels[LABEL_MCP]).expect("parse mcp label");
+
+        let (_, env) = parsed["db"].normalize();
+        assert_eq!(env["TOKEN"], EnvValue::EnvRef("DB_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn metadata_labels_present_when_set() {
+        let mut mcp = BTreeMap::new();
+        mcp.insert(
+            "fs".to_string(),
+            short(&["mcp-server-filesystem", "/workspace"]),
+        );
+        let cfg = standalone(mcp, Some("Rust tooling"), Some("0.1.0"), &["rust", "build"]);
+
+        let labels = standalone_config_to_labels(&cfg).expect("serialize labels");
+
+        assert_eq!(labels[LABEL_SCHEMA], "1");
+        assert_eq!(labels[LABEL_DESCRIPTION], "Rust tooling");
+        assert_eq!(labels[LABEL_VERSION], "0.1.0");
+        assert_eq!(labels[LABEL_TAGS], r#"["rust","build"]"#);
+    }
+
+    #[test]
+    fn metadata_labels_absent_when_unset() {
+        let mut mcp = BTreeMap::new();
+        mcp.insert(
+            "fs".to_string(),
+            short(&["mcp-server-filesystem", "/workspace"]),
+        );
+        let cfg = standalone(mcp, None, None, &[]);
+
+        let labels = standalone_config_to_labels(&cfg).expect("serialize labels");
+
+        assert!(!labels.contains_key(LABEL_DESCRIPTION));
+        assert!(!labels.contains_key(LABEL_VERSION));
+        assert!(!labels.contains_key(LABEL_TAGS));
+        assert!(labels.contains_key(LABEL_MCP));
+        assert!(labels.contains_key(LABEL_SCHEMA));
+    }
+
+    #[test]
+    fn parse_mcp_table_rejects_bad_json() {
+        let err = parse_mcp_table(r#"{"fs": ["#).unwrap_err();
+        assert!(matches!(err, EmbeddedImageConfigError::Json(_)));
+    }
+
+    #[test]
+    fn parse_mcp_table_rejects_invalid_server_name() {
+        let err = parse_mcp_table(r#"{"bad.name": ["bin"]}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedImageConfigError::InvalidMcpServerName { server } if server == "bad.name"
+        ));
+    }
+
+    #[test]
+    fn parse_mcp_table_rejects_empty_command() {
+        let err = parse_mcp_table(r#"{"fs": []}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedImageConfigError::EmptyMcpCommand { server } if server == "fs"
+        ));
+    }
+
+    #[test]
+    fn embedded_mcp_missing_label_is_empty() {
+        let cfg =
+            embedded_mcp_from_labels("img", &BTreeMap::new()).expect("missing label is lenient");
+        assert!(cfg.mcp.is_empty());
+    }
+
+    #[test]
+    fn embedded_mcp_malformed_label_is_hard_error() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LABEL_MCP.to_string(),
+            r#"{"bad.name": ["bin"]}"#.to_string(),
+        );
+        let err = embedded_mcp_from_labels("img", &labels).unwrap_err();
         assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
         assert!(err.to_string().contains("bad.name"));
     }
 
     #[test]
-    fn empty_command_is_embedded_parse_error() {
-        let err = parse_embedded_image_config(
-            "ctr",
-            br#"
-            [mcp]
-            fs = []
-            "#
-            .to_vec(),
-        )
-        .unwrap_err();
+    fn standalone_mcp_missing_label_is_hard_error() {
+        let err = standalone_mcp_from_labels(&BTreeMap::new()).unwrap_err();
+        assert!(matches!(err, OutrigError::Configuration(_)));
+        assert!(err.to_string().contains(LABEL_MCP));
+    }
 
-        assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
-        assert!(err.to_string().contains("empty command"));
+    #[test]
+    fn standalone_mcp_empty_table_is_hard_error() {
+        let mut labels = BTreeMap::new();
+        labels.insert(LABEL_MCP.to_string(), "{}".to_string());
+        let err = standalone_mcp_from_labels(&labels).unwrap_err();
+        assert!(matches!(err, OutrigError::Configuration(_)));
+        assert!(err.to_string().contains("at least one server"));
+    }
+
+    #[test]
+    fn standalone_mcp_valid_label_parses() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LABEL_MCP.to_string(),
+            r#"{"fs":["mcp-server-filesystem","/workspace"]}"#.to_string(),
+        );
+        let mcp = standalone_mcp_from_labels(&labels).expect("valid label parses");
+        assert_eq!(
+            mcp.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["fs"]
+        );
     }
 
     #[test]
@@ -389,19 +554,6 @@ mod tests {
         assert_eq!(merged["fs"], short(&["config-fs"]));
         assert_eq!(merged["shell"], short(&["image-shell"]));
         assert_eq!(merged["build"], short(&["config-build"]));
-    }
-
-    #[test]
-    fn missing_file_detection_matches_gnu_and_busybox_cat() {
-        assert!(is_missing_embedded_image_config(
-            b"cat: /etc/outrig/image.toml: No such file or directory\n"
-        ));
-        assert!(is_missing_embedded_image_config(
-            b"cat: can't open '/etc/outrig/image.toml': No such file or directory\n"
-        ));
-        assert!(!is_missing_embedded_image_config(
-            b"Error: no container with name or ID \"outrig-missing\" found\n"
-        ));
     }
 
     #[test]

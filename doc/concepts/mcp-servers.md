@@ -42,10 +42,12 @@ traces, in the prefix that gets attached to every tool the server exposes.
 
 ## Embedding MCP config in the image
 
-An image can also ship its MCP declarations at `/etc/outrig/image.toml`:
+An image can also carry its MCP declarations in its `org.outrig.mcp` OCI label. You author them
+as a `[mcp]` table in the project's `image.toml`, which `outrig image build` serializes into the
+label:
 
 ```toml
-# /etc/outrig/image.toml
+# image.toml
 [mcp]
 fs    = { command = ["mcp-server-filesystem", "/workspace"] }
 shell = ["bash", "-lc", "exec shell-mcp-command"]
@@ -53,8 +55,8 @@ build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 ```
 
 The `[mcp]` table uses the same short and full entry shapes as
-`[images.<name>.mcp]`. At session startup, outrig reads the image file after
-the container starts, then overlays entries from `config.toml`. If both sources
+`[images.<name>.mcp]`. At session startup, outrig reads the `org.outrig.mcp`
+label off the image, then overlays entries from `config.toml`. If both sources
 define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
 in the merged set.
@@ -64,8 +66,8 @@ default commands. Use `config.toml` for repo-local additions or overrides. A
 repo that wants to delegate completely to the image can omit
 `[images.<name>.mcp]`.
 
-An `/etc/outrig/image.toml` is not required; this allows a shared image
-to be used with different configurations via `config.toml`. Malformed TOML,
+The `org.outrig.mcp` label is not required; this allows a shared image
+to be used with different configurations via `config.toml`. Malformed JSON,
 invalid server names, and empty command arrays are startup errors because they
 mean the image metadata is broken.
 
@@ -75,9 +77,9 @@ To inspect what will actually start, run:
 outrig mcp show-merged --image coding
 ```
 
-The command starts the selected container, reads the embedded file, applies
-`config.toml` overrides, prints the effective `[mcp]` table to stdout, and
-then stops the container.
+The command starts the selected container, reads the `org.outrig.mcp` label,
+applies `config.toml` overrides, prints the effective `[mcp]` table to stdout,
+and then stops the container.
 
 ## Lifecycle
 

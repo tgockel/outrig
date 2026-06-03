@@ -77,7 +77,7 @@ With `--attach`, image-config selection is different:
 not retrofitted with a new interceptor.
 
 The selected image-config must expose at least one backing MCP server after image
-`/etc/outrig/image.toml` entries and `[images.<name>.mcp]` overrides are merged. An
+`org.outrig.mcp` label entries and `[images.<name>.mcp]` overrides are merged. An
 image-config with no merged entries has nothing to proxy, so `outrig mcp` exits before the
 client sees an MCP `initialize` response.
 
@@ -104,7 +104,7 @@ The MCP server binaries still have to exist inside the image. Install them in th
 container Dockerfile just as you would for `outrig run`. In the example above,
 `shell-mcp-command` stands for whichever shell MCP server package you choose to install.
 
-An image can also carry the same `[mcp]` table at `/etc/outrig/image.toml`.
+An image can also carry the same `[mcp]` table in its `org.outrig.mcp` OCI label.
 Use that when a shared image owns the default tool set, then keep only repo-specific
 overrides in `.agents/outrig/config.toml`. See
 [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
@@ -115,7 +115,7 @@ To inspect the effective table without serving MCP:
 outrig mcp show-merged --image coding
 ```
 
-In fresh mode this starts the selected container, reads `/etc/outrig/image.toml`,
+In fresh mode this starts the selected container, reads the image's `org.outrig.mcp` label,
 applies `config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops
 the container. With `--attach`, it borrows the existing container for the same read and
 leaves it running.
@@ -248,7 +248,7 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 4. **Start network interception, if enabled.** Fresh sessions can write
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
-5. **Merge MCP config.** Read `/etc/outrig/image.toml` from the image if present,
+5. **Merge MCP config.** Read the image's `org.outrig.mcp` label if present,
    then overlay `[images.<name>.mcp]` from config by server name.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command and run the MCP `initialize` handshake.

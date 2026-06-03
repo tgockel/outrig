@@ -112,9 +112,9 @@ See [Usage -> outrig image](../usage/image.md#outrig-image-init).
 ### `outrig image build`
 
 Build a standalone image project (the output of `outrig image init`) with buildah, tag it by
-its `image.toml` `[image].ref`, and validate the result: the built image must carry
-`/etc/outrig/image.toml`, and -- unless `--no-test` -- every declared MCP server must start
-and answer `tools/list`.
+its `image.toml` `[image].ref`, stamp its config into OCI labels, and validate the result: the
+built image must carry a valid `org.outrig.mcp` label, and -- unless `--no-test` -- every
+declared MCP server must start and answer `tools/list`.
 
 ```
 outrig image build [<dir>]
@@ -235,7 +235,7 @@ Startup builds or cache-hits the image and starts the container unless `--attach
 Attach mode validates the existing container with `podman inspect` and borrows it without
 stopping or removing it during teardown. Both modes initialize every entry in the merged
 MCP table, list their tools, print a banner to stderr, and then speak MCP JSON-RPC on
-stdout/stdin. The merged table is image `/etc/outrig/image.toml` plus
+stdout/stdin. The merged table is the image's `org.outrig.mcp` label plus
 `[images.<name>.mcp]` overrides. All non-protocol output stays off stdout.
 
 When `--listen <addr>` is set, `outrig mcp` serves Streamable HTTP instead of stdio.

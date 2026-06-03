@@ -361,9 +361,11 @@ pub async fn ensure_tagged_image_for(
     }
 }
 
-/// Build a standalone image project with buildah, tagging the result `tag`.
-/// `dockerfile` and `context` are resolved relative to `project_dir`. Stderr
-/// from buildah is streamed to `tracing::info!` with the `[buildah]` prefix.
+/// Build a standalone image project with buildah, tagging the result `tag` and
+/// stamping `labels` (the project's config, serialized to OCI labels) into the
+/// image metadata. `dockerfile` and `context` are resolved relative to
+/// `project_dir`. Stderr from buildah is streamed to `tracing::info!` with the
+/// `[buildah]` prefix.
 ///
 /// Unlike [`ensure_image`], there is no content-addressed cache probe: a
 /// standalone build tags a caller-named ref (e.g. `rust-dev`), not
@@ -375,10 +377,18 @@ pub async fn build_standalone(
     context: &Path,
     tag: &ImageTag,
     no_cache: bool,
+    labels: &BTreeMap<String, String>,
 ) -> Result<()> {
     let dockerfile = project_dir.join(dockerfile);
     let context = project_dir.join(context);
-    let cmd = buildah_build_cmd(&dockerfile, &context, tag, no_cache, &BTreeMap::new());
+    let cmd = buildah_build_cmd(
+        &dockerfile,
+        &context,
+        tag,
+        no_cache,
+        &BTreeMap::new(),
+        labels,
+    );
     let argv_for_error = cmd.args.clone();
     let status = process::run_streamed(cmd, "buildah").await?;
     if !status.success() {
@@ -392,6 +402,37 @@ pub async fn build_standalone(
     Ok(())
 }
 
+/// Read the OCI labels off a local image `tag` via `podman image inspect`. This
+/// reads image metadata only -- no container runs, and for a local image
+/// nothing is pulled. Returns the label map; an image with no labels (podman
+/// prints `null`) yields an empty map. A missing tag fails the inspect and
+/// surfaces as a process error.
+///
+/// `transcript`, when present, tees the podman command line and output into the
+/// session transcript, matching every other in-session podman call.
+pub async fn read_image_labels(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<BTreeMap<String, String>> {
+    let cmd = Cmd::new("podman")
+        .arg("image")
+        .arg("inspect")
+        .arg(&tag.0)
+        .arg("--format")
+        .arg("{{json .Config.Labels}}");
+    let output = process::run_capture_logged(cmd, "podman", transcript).await?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(trimmed).map_err(|source| {
+        OutrigError::Configuration(format!(
+            "podman image inspect {tag}: invalid labels JSON: {source}"
+        ))
+    })
+}
+
 fn build_image_cmd(
     cfg: &ImageConfig,
     repo_root: &Path,
@@ -401,20 +442,34 @@ fn build_image_cmd(
 ) -> Cmd {
     let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
     let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
-    buildah_build_cmd(&dockerfile, &context, tag, no_cache, build_args)
+    buildah_build_cmd(
+        &dockerfile,
+        &context,
+        tag,
+        no_cache,
+        build_args,
+        &BTreeMap::new(),
+    )
 }
 
 /// Assemble a `buildah build --tag <tag> --file <dockerfile> [--no-cache]
-/// [--build-arg ...] <context>` command. `dockerfile` and `context` are
-/// absolute (already joined with their base dir). Shared by repo-local
-/// image-config builds ([`build_image_cmd`]) and standalone image builds
-/// ([`build_standalone`]).
+/// [--build-arg ...] [--label ...] <context>` command. `dockerfile` and
+/// `context` are absolute (already joined with their base dir). Shared by
+/// repo-local image-config builds ([`build_image_cmd`]) and standalone image
+/// builds ([`build_standalone`]).
+///
+/// Labels stamp a standalone image's config (e.g. `org.outrig.mcp`) into OCI
+/// metadata; repo-local builds pass an empty map. `Cmd` builds argv directly
+/// (no shell), so a JSON label value -- braces, quotes, spaces -- reaches
+/// buildah as one literal argument, and buildah splits `key=value` on the
+/// first `=` (JSON has none at the top level).
 fn buildah_build_cmd(
     dockerfile: &Path,
     context: &Path,
     tag: &ImageTag,
     no_cache: bool,
     build_args: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
 ) -> Cmd {
     let mut cmd = Cmd::new("buildah")
         .arg("build")
@@ -427,6 +482,9 @@ fn buildah_build_cmd(
     }
     for (k, v) in build_args {
         cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
+    }
+    for (k, v) in labels {
+        cmd = cmd.arg("--label").arg(format!("{k}={v}"));
     }
     cmd.arg(context)
 }
