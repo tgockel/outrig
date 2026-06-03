@@ -106,6 +106,15 @@ enum ImageCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a standalone image project (Dockerfile + image.toml + README).
+    Init {
+        /// Project directory. Defaults to the current directory; its name
+        /// becomes the image ref.
+        dir: Option<PathBuf>,
+        /// Overwrite the generated files if they already exist.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub fn run() -> ExitCode {
@@ -186,6 +195,11 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     name.clone(),
                     *force,
                 ))?;
+                Ok(0)
+            }
+            ImageCmd::Init { dir, force } => {
+                let cwd = std::env::current_dir()?;
+                image_setup::init::run(&cwd, dir.as_deref(), *force)?;
                 Ok(0)
             }
         },

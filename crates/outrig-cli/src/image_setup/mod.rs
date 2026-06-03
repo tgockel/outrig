@@ -3,6 +3,7 @@
 //! a curated set of base-image templates.
 
 pub mod add;
+pub mod init;
 pub mod render;
 
 pub use add::DOC_SYNC_FIELDS;

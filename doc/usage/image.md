@@ -1,8 +1,9 @@
 # `outrig image`
 
-`outrig image` groups commands that manage image-configs (the named Dockerfile +
-MCP-server bundles that host the agent's tools). In v0 only `outrig image add` is implemented;
-the rest of the group (`image ls`, `image rm`) is reserved for later.
+`outrig image` groups commands for the container images that host an agent's tools.
+`outrig image add` scaffolds a repo-local image-config (a named Dockerfile + MCP-server
+bundle); `outrig image init` scaffolds a standalone image project whose build output is a
+reusable image. The rest of the group (`image ls`, `image rm`) is reserved for later.
 
 ## `outrig image add`
 
@@ -181,6 +182,87 @@ error: .agents/outrig/images/hello-outrig-standard/Dockerfile
 
 With `--force`, the Dockerfile is replaced and the `[images.<name>]` block is rewritten in
 place (preserving surrounding TOML).
+
+## outrig image init
+
+`outrig image init` scaffolds a *standalone* image project: a self-contained directory whose
+build output is a reusable container image. Unlike `image add`, it writes no repo config --
+it creates three files and nothing else:
+
+- `Dockerfile` -- a Debian-slim image with the filesystem MCP server, ending in the standard
+  `CMD ["sleep", "infinity"]`. It copies the project's `image.toml` to `/etc/outrig/image.toml`
+  so the image carries its own MCP declarations.
+- `image.toml` -- the standalone image config: `[image].ref` plus a `[mcp]` table. outrig reads
+  the embedded copy at session startup and merges it with any repo `[images.<name>.mcp]`.
+- `README.md` -- how to build the image and reference it from a repo.
+
+The command is noninteractive -- there are no prompts. The project name (used as `[image].ref`)
+defaults to the target directory's name.
+
+### Synopsis
+
+```
+outrig image init [<dir>] [--force]
+```
+
+| Argument / flag | Default     | Description                                          |
+|-----------------|-------------|------------------------------------------------------|
+| `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
+| `--force`       | off         | Overwrite the generated files if they already exist. |
+
+The directory name must match `^[a-zA-Z][a-zA-Z0-9_-]*$` (e.g. `rust-dev`). A target that
+resolves to no usable name is rejected; `.` and the no-argument form use the current
+directory's name.
+
+### What gets written
+
+```sh
+$ outrig image init rust-dev
+[outrig] wrote rust-dev/Dockerfile
+[outrig] wrote rust-dev/image.toml
+[outrig] wrote rust-dev/README.md
+[outrig] next: build this image with `outrig image build`
+```
+
+`rust-dev/image.toml`:
+
+```toml
+[image]
+ref = "rust-dev"
+
+[mcp]
+fs = { command = ["mcp-server-filesystem", "/workspace"] }
+```
+
+`[build]` is omitted, so the build defaults to the sibling `Dockerfile` with context `.`.
+
+### Consuming the image from a repo
+
+Once built, reference the image from a repo's `config.toml` with `image-name`. Because the
+MCP servers are embedded in the image, the consuming block needs no `[images.<name>.mcp]`:
+
+```toml
+[images.rust-dev]
+image-name = "rust-dev"
+```
+
+That embedded-vs-repo split is the key difference from `image add`, whose repo-local blocks
+carry their own `[images.<name>.mcp]` entries. See
+[Concepts -> Containers](../concepts/containers.md#using-a-pre-built-image) for the
+`image-name` shape.
+
+### Re-running
+
+Without `--force`, `init` refuses if any of the three files already exists, naming the
+conflicts:
+
+```
+$ outrig image init rust-dev
+error: rust-dev/Dockerfile, rust-dev/image.toml, rust-dev/README.md
+       already present; pass --force to overwrite.
+```
+
+`--force` regenerates the three files and leaves anything else in the directory untouched.
 
 ## See also
 

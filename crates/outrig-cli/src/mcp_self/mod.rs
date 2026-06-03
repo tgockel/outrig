@@ -10,6 +10,6 @@ pub(crate) mod docs;
 mod schema;
 mod server;
 mod suggestions;
-mod validate;
+pub(crate) mod validate;
 
 pub use server::serve_stdio;

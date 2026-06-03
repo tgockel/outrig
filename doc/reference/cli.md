@@ -76,8 +76,8 @@ See [Usage -> outrig config](../usage/config.md).
 
 Interactively scaffold an image-config: writes a Dockerfile under
 `.agents/outrig/images/<name>/Dockerfile` and adds the matching `[images.<name>]` and
-`[images.<name>.mcp]` blocks to the repo config. The first subcommand of the `outrig
-image` group; future subcommands (`image ls`, `image rm`) are deferred.
+`[images.<name>.mcp]` blocks to the repo config. Use `outrig image init` instead for a
+standalone image project; `image ls` / `image rm` are deferred.
 
 ```
 outrig image add [<name>]
@@ -90,6 +90,24 @@ outrig image add [<name>]
 | `--force`       | off      | Overwrite existing files for this name. |
 
 See [Usage -> outrig image](../usage/image.md).
+
+### `outrig image init`
+
+Noninteractively scaffold a standalone image project: writes a `Dockerfile`, an
+embedded-config `image.toml`, and a `README.md` into a target directory. The directory name
+becomes the image ref; other repos consume the built image via `image-name`.
+
+```
+outrig image init [<dir>]
+                  [--force]
+```
+
+| Argument / flag | Default     | Description                                          |
+|-----------------|-------------|------------------------------------------------------|
+| `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
+| `--force`       | off         | Overwrite the generated files if they already exist. |
+
+See [Usage -> outrig image](../usage/image.md#outrig-image-init).
 
 ### `outrig run`
 
