@@ -1110,6 +1110,101 @@ preamble = "review"
     }
 
     #[test]
+    fn build_load_allows_agent_without_model_or_default() {
+        let tmp = tempdir().unwrap();
+        let image_dir = tmp.path().join("coding");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-image = "coding"
+
+[images.coding]
+dockerfile = "coding/Dockerfile"
+context    = "coding"
+
+[agents.coding]
+preamble = "hi"
+"#,
+        );
+
+        let strict_err = Config::load(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(strict_err),
+                ConfigValidationError::AgentMissingModel { ref agent } if agent == "coding"
+            ),
+            "strict load should still reject a model-less agent with no default-model",
+        );
+
+        let cfg = Config::load_for_build(tmp.path(), None)
+            .expect("build load does not require an agent model or default-model");
+        assert_eq!(cfg.default_image.as_deref(), Some("coding"));
+        assert!(cfg.images.contains_key("coding"));
+    }
+
+    #[test]
+    fn build_load_allows_dangling_default_model() {
+        let tmp = tempdir().unwrap();
+        let image_dir = tmp.path().join("coding");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-image = "coding"
+default-model = "phantom"
+
+[images.coding]
+dockerfile = "coding/Dockerfile"
+context    = "coding"
+"#,
+        );
+
+        let strict_err = Config::load(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(strict_err),
+                ConfigValidationError::UnknownDefaultModel { ref name } if name == "phantom"
+            ),
+            "strict load should still reject a dangling default-model",
+        );
+
+        let cfg = Config::load_for_build(tmp.path(), None)
+            .expect("build load does not require default-model to resolve");
+        assert_eq!(cfg.default_model.as_deref(), Some("phantom"));
+        assert!(cfg.images.contains_key("coding"));
+    }
+
+    #[test]
+    fn build_load_still_validates_image_paths() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-image = "coding"
+
+[images.coding]
+dockerfile = "missing/Dockerfile"
+context    = "."
+
+[agents.coding]
+preamble = "hi"
+"#,
+        );
+
+        let err = Config::load_for_build(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::DockerfileMissing { ref image, .. } if image == "coding"
+            ),
+            "build load must still validate image paths",
+        );
+    }
+
+    #[test]
     fn global_provides_default_model_for_repo_agent() {
         // Validates the merge+validate round-trip: global supplies the
         // default-model that the repo's agent (no explicit `model`) resolves

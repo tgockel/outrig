@@ -608,6 +608,9 @@ build-args = { NODE_VERSION = "20" }
 
 ## Validation rules
 
+`outrig run` and `outrig mcp` use the full validation path. `outrig build` validates every
+image-config in the merged config but does not require agent/model/provider wiring to resolve.
+
 - `default-image` must name an existing `[images.<name>]` block.
 - `default-agent` must name an existing `[agents.<name>]` block.
 - Every `agents.<name>.model` (if set) must name an existing `[models.<name>]`. If `model` is

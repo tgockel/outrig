@@ -74,7 +74,7 @@ async fn build_default_image_then_cache_hits() {
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
-        container: None,
+        image: None,
         all: false,
         no_cache: false,
     };
@@ -120,7 +120,7 @@ async fn build_all_iterates_every_container() {
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
-        container: None,
+        image: None,
         all: true,
         no_cache: false,
     };
@@ -155,7 +155,7 @@ async fn build_all_short_circuits_on_first_failure() {
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
-        container: None,
+        image: None,
         all: true,
         no_cache: false,
     };
@@ -187,7 +187,7 @@ async fn no_cache_rebuilds_after_cache_hit() {
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
-        container: None,
+        image: None,
         all: false,
         no_cache: false,
     };
@@ -199,7 +199,7 @@ async fn no_cache_rebuilds_after_cache_hit() {
     assert!(!id_before.is_empty(), "image must exist after warm-up");
 
     let no_cache_args = BuildArgs {
-        container: None,
+        image: None,
         all: false,
         no_cache: true,
     };

@@ -25,7 +25,8 @@ outrig build [--image <name>]
 
 ## What it does
 
-1. Loads `.agents/outrig/config.toml`.
+1. Loads `.agents/outrig/config.toml` and validates every image-config in the merged config.
+   Agent/model wiring is not required for image builds.
 2. For each selected image-config:
    - Computes the cache key (blake3 over Dockerfile content + resolved build-args +
      context content hash).

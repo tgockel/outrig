@@ -134,6 +134,15 @@ impl Config {
         Ok(merged)
     }
 
+    /// Load config for `outrig build`. Image building only needs the image
+    /// sections, so this preserves image and general validation while skipping
+    /// agent/model/provider cross-reference checks.
+    pub fn load_for_build(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+        let merged = Self::load_unvalidated(repo_root, global_path)?;
+        merged.validate_for_build(Some(repo_root))?;
+        Ok(merged)
+    }
+
     fn load_unvalidated(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
         let repo_path = crate::repo::repo_config_path(repo_root);
         let repo_text = fs::read_to_string(&repo_path)?;
@@ -170,6 +179,19 @@ impl Config {
             repo_root,
             validate::ValidationOptions {
                 agent_model_override,
+                validate_llm: true,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn validate_for_build(&self, repo_root: Option<&Path>) -> Result<()> {
+        validate::validate_with_options(
+            self,
+            repo_root,
+            validate::ValidationOptions {
+                agent_model_override: None,
+                validate_llm: false,
             },
         )?;
         Ok(())

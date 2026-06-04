@@ -1,7 +1,7 @@
 //! `outrig build`: pre-warm one (or every) image-config image.
 //!
 //! [`execute`] follows the order documented in `doc/usage/build.md`:
-//! load + merge + validate config, decide the target list, then for each
+//! load + merge + validate the build-relevant config, decide the target list, then for each
 //! target compute the cache tag, probe the image store, and either print
 //! a one-line "cache hit" summary or stream a `buildah build` between the
 //! verbose header and a final `image ready` line. `--all` prints a
@@ -42,7 +42,7 @@ pub async fn execute(
     args: &BuildArgs,
 ) -> Result<i32> {
     let repo_root = repo_root_from_config_path(repo_cfg_path);
-    let cfg = Config::load(&repo_root, Some(global_cfg_path))?;
+    let cfg = Config::load_for_build(&repo_root, Some(global_cfg_path))?;
 
     let targets: Vec<&str> = if args.all {
         if cfg.images.is_empty() {

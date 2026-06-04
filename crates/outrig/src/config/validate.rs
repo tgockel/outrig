@@ -198,9 +198,19 @@ pub enum ConfigValidationError {
     OpenAiModelHasMistralrsField { model: String, field: &'static str },
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct ValidationOptions<'a> {
     pub agent_model_override: Option<&'a str>,
+    pub validate_llm: bool,
+}
+
+impl Default for ValidationOptions<'_> {
+    fn default() -> Self {
+        Self {
+            agent_model_override: None,
+            validate_llm: true,
+        }
+    }
 }
 
 pub(super) fn validate(
@@ -222,46 +232,49 @@ pub(super) fn validate_with_options(
     {
         return Err(ConfigValidationError::UnknownDefaultImage { name: name.clone() });
     }
-    if let Some(name) = &cfg.default_agent
-        && !cfg.agents.contains_key(name)
-    {
-        return Err(ConfigValidationError::UnknownDefaultAgent { name: name.clone() });
-    }
-    if let Some(name) = &cfg.default_model
-        && !cfg.models.contains_key(name)
-    {
-        return Err(ConfigValidationError::UnknownDefaultModel { name: name.clone() });
-    }
 
-    for (agent_name, agent) in &cfg.agents {
-        match &agent.model {
-            Some(m) => {
-                if !cfg.models.contains_key(m) {
-                    return Err(ConfigValidationError::UnknownAgentModel {
-                        agent: agent_name.clone(),
-                        model: m.clone(),
-                    });
-                }
-            }
-            None => {
-                // default-model existence already checked above; here we just
-                // need it to be set at all.
-                let has_run_model_override =
-                    options.agent_model_override == Some(agent_name.as_str());
-                if cfg.default_model.is_none() && !has_run_model_override {
-                    return Err(ConfigValidationError::AgentMissingModel {
-                        agent: agent_name.clone(),
-                    });
-                }
-            }
-        }
-        if let Some(c) = &agent.image
-            && !cfg.images.contains_key(c)
+    if options.validate_llm {
+        if let Some(name) = &cfg.default_agent
+            && !cfg.agents.contains_key(name)
         {
-            return Err(ConfigValidationError::UnknownAgentImage {
-                agent: agent_name.clone(),
-                image: c.clone(),
-            });
+            return Err(ConfigValidationError::UnknownDefaultAgent { name: name.clone() });
+        }
+        if let Some(name) = &cfg.default_model
+            && !cfg.models.contains_key(name)
+        {
+            return Err(ConfigValidationError::UnknownDefaultModel { name: name.clone() });
+        }
+
+        for (agent_name, agent) in &cfg.agents {
+            match &agent.model {
+                Some(m) => {
+                    if !cfg.models.contains_key(m) {
+                        return Err(ConfigValidationError::UnknownAgentModel {
+                            agent: agent_name.clone(),
+                            model: m.clone(),
+                        });
+                    }
+                }
+                None => {
+                    // default-model existence already checked above; here we just
+                    // need it to be set at all.
+                    let has_run_model_override =
+                        options.agent_model_override == Some(agent_name.as_str());
+                    if cfg.default_model.is_none() && !has_run_model_override {
+                        return Err(ConfigValidationError::AgentMissingModel {
+                            agent: agent_name.clone(),
+                        });
+                    }
+                }
+            }
+            if let Some(c) = &agent.image
+                && !cfg.images.contains_key(c)
+            {
+                return Err(ConfigValidationError::UnknownAgentImage {
+                    agent: agent_name.clone(),
+                    image: c.clone(),
+                });
+            }
         }
     }
 
@@ -305,25 +318,27 @@ pub(super) fn validate_with_options(
     }
     validate_network_policy(cfg)?;
 
-    for (agent_name, agent) in &cfg.agents {
-        if let Some(value) = agent.tool_call_max {
-            validate_tool_call_max(&format!("agents.{agent_name}.tool-call-max"), value)?;
-        }
-        if let Some(value) = agent.tool_result_max {
-            validate_tool_result_max(&format!("agents.{agent_name}.tool-result-max"), value)?;
-        }
-    }
-
-    for (model_name, model) in &cfg.models {
-        let provider = cfg.providers.get(&model.provider).ok_or_else(|| {
-            ConfigValidationError::UnknownModelProvider {
-                model: model_name.clone(),
-                provider: model.provider.clone(),
+    if options.validate_llm {
+        for (agent_name, agent) in &cfg.agents {
+            if let Some(value) = agent.tool_call_max {
+                validate_tool_call_max(&format!("agents.{agent_name}.tool-call-max"), value)?;
             }
-        })?;
-        match provider {
-            LlmProvider::OpenAi { .. } => validate_openai_model(model_name, model)?,
-            LlmProvider::Mistralrs => validate_mistralrs_model(model_name, model, repo_root)?,
+            if let Some(value) = agent.tool_result_max {
+                validate_tool_result_max(&format!("agents.{agent_name}.tool-result-max"), value)?;
+            }
+        }
+
+        for (model_name, model) in &cfg.models {
+            let provider = cfg.providers.get(&model.provider).ok_or_else(|| {
+                ConfigValidationError::UnknownModelProvider {
+                    model: model_name.clone(),
+                    provider: model.provider.clone(),
+                }
+            })?;
+            match provider {
+                LlmProvider::OpenAi { .. } => validate_openai_model(model_name, model)?,
+                LlmProvider::Mistralrs => validate_mistralrs_model(model_name, model, repo_root)?,
+            }
         }
     }
 
