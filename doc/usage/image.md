@@ -332,9 +332,10 @@ it to verify a build quickly, or in environments where starting the servers is n
 in `image.toml`; the file is never rewritten. Short refs are passed to buildah verbatim, so both
 `rust-dev` and `rust-dev:0.1.0` work.
 
-Unlike repo-local `outrig build`, a standalone build tags a caller-named ref rather than a
-content-addressed `outrig-cache:<key>` tag, so there is no project-level cache to skip:
-`--no-cache` only forwards `--no-cache` to buildah to force a clean build.
+Unlike repo-local `outrig build` -- which tags `<image-config-name>:<content-hash>` and skips
+the build on a cache hit -- a standalone build tags a stable, caller-named ref with no content
+hash, so there is no project-level cache to skip: `--no-cache` only forwards `--no-cache` to
+buildah to force a clean build.
 
 ## See also
 

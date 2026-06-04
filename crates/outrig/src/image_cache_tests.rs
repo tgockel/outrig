@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use super::CacheKey;
+use super::{CacheKey, ImageConfig, UNNAMED_IMAGE, compute_tag, compute_tag_for};
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -173,6 +173,54 @@ async fn tar_path_key_is_mtime_independent() {
     assert_eq!(
         ka, kb,
         "tar-path hash must ignore filesystem mtimes (so fresh clones cache-hit)"
+    );
+}
+
+fn build_cfg(ctx: &Path) -> ImageConfig {
+    ImageConfig {
+        image_name: None,
+        dockerfile: Some(ctx.join("Dockerfile")),
+        context: Some(ctx.to_path_buf()),
+        build_args: BTreeMap::new(),
+        security: Default::default(),
+        mcp: BTreeMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn named_build_tag_uses_image_config_name_as_repo() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let cfg = build_cfg(ctx.path());
+
+    // Empty repo_root: dockerfile/context are already absolute, so join is a no-op.
+    let tag = compute_tag_for("outrig-standard", &cfg, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+
+    let (repo, hash) = tag.0.split_once(':').expect("tag has repo:hash form");
+    assert_eq!(repo, "outrig-standard");
+    assert_eq!(
+        hash.len(),
+        16,
+        "tag part is the 16-hex cache key, got {hash:?}"
+    );
+}
+
+#[tokio::test]
+async fn unnamed_build_tag_falls_back_to_outrig_cache() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let cfg = build_cfg(ctx.path());
+
+    let named = compute_tag_for(UNNAMED_IMAGE, &cfg, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+    let unnamed = compute_tag(&cfg, Path::new("")).await.expect("compute_tag");
+
+    assert_eq!(named, unnamed);
+    assert!(
+        named.0.starts_with("outrig-cache:"),
+        "nameless path keeps the outrig-cache repository, got {}",
+        named.0
     );
 }
 

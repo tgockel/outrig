@@ -13,8 +13,8 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ImageConfig, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model, NetworkMode,
-    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
+    Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
+    NetworkMode, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
     normalize_capability_name,
 };
 
@@ -55,6 +55,13 @@ pub enum ConfigValidationError {
 
     #[error("image {image:?} mcp server {server:?} has empty command")]
     EmptyMcpCommand { image: String, server: String },
+
+    #[error(
+        "image {image:?}: a build image's name becomes its container image \
+         repository, so it must match ^[a-z0-9]+([._-]+[a-z0-9]+)*$ \
+         (lowercase alphanumeric, separated by `.`, `_`, or `-`)"
+    )]
+    BuildImageNameInvalid { image: String },
 
     #[error("image {image:?}: neither `image-name` nor `dockerfile`+`context` is set")]
     ImageSourceMissing { image: String },
@@ -280,6 +287,17 @@ pub(super) fn validate_with_options(
 
     for (image_name, image) in &cfg.images {
         validate_image_source(image_name, image, repo_root)?;
+        // A build image's name becomes its container image repository, so it
+        // must be a valid repository component. Image-name configs use the
+        // `image-name` field as the tag, so their block key is just a label.
+        // `validate_image_source` ran above, so `source()` won't panic here.
+        if matches!(image.source(), ImageSourceRef::Build { .. })
+            && !is_valid_build_image_name(image_name)
+        {
+            return Err(ConfigValidationError::BuildImageNameInvalid {
+                image: image_name.clone(),
+            });
+        }
         validate_image_security(image_name, image)?;
 
         for (server_name, spec) in &image.mcp {
@@ -451,6 +469,12 @@ pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
     mcp_server_name_re().is_match(server)
 }
 
+/// A build image's config name becomes the repository of its container image
+/// tag (`<name>:<hash>`), so it must be a valid lowercase repository component.
+pub(crate) fn is_valid_build_image_name(name: &str) -> bool {
+    build_image_name_re().is_match(name)
+}
+
 pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
     match spec {
         McpServerSpec::Short(cmd) => cmd.is_empty(),
@@ -596,6 +620,13 @@ fn mcp_server_name_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"^[a-zA-Z][a-zA-Z0-9_-]*$").expect("mcp server-name regex compiles")
+    })
+}
+
+fn build_image_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[a-z0-9]+([._-]+[a-z0-9]+)*$").expect("build image-name regex compiles")
     })
 }
 

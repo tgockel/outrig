@@ -198,10 +198,10 @@ $ outrig build
 [outrig] image-config: hello-outrig-standard
 [outrig] dockerfile:       .agents/outrig/images/hello-outrig-standard/Dockerfile
 [outrig] context:          .agents/outrig/images/hello-outrig-standard
-[outrig] cache key:        outrig-cache:8c2a4f7e91d6b5a3
+[outrig] image tag:        hello-outrig-standard:8c2a4f7e91d6b5a3
 [buildah] STEP 1/N: FROM docker.io/library/debian:bookworm-slim
 ...
-[buildah] Successfully tagged outrig-cache:8c2a4f7e91d6b5a3
+[buildah] Successfully tagged hello-outrig-standard:8c2a4f7e91d6b5a3
 [outrig] image ready
 ```
 
@@ -209,7 +209,7 @@ A second `outrig build` is a cache hit:
 
 ```sh
 $ outrig build
-[outrig] image ready (cache hit: outrig-cache:8c2a4f7e91d6b5a3)
+[outrig] image ready (cache hit: hello-outrig-standard:8c2a4f7e91d6b5a3)
 ```
 
 ## Run an agent
@@ -225,7 +225,7 @@ Diagnostics arrive on stderr:
 [outrig] tool-call max:     50
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  hello-outrig-standard
-[outrig] image:             outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
+[outrig] image:             hello-outrig-standard:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260502T103412-3f2a
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)

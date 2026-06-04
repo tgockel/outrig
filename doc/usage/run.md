@@ -112,9 +112,9 @@ A typical startup looks like:
 [outrig] resolving agent and image-config
 [outrig] agent/image-config resolved: agent coding, image-config coding (0ms)
 [outrig] computing image tag
-[outrig] image tag computed: outrig-cache:8c2a4f7e91d6b5a3 (32ms)
-[outrig] ensuring image outrig-cache:8c2a4f7e91d6b5a3
-[outrig] image ready: outrig-cache:8c2a4f7e91d6b5a3 (cache hit) (18ms)
+[outrig] image tag computed: coding:8c2a4f7e91d6b5a3 (32ms)
+[outrig] ensuring image coding:8c2a4f7e91d6b5a3
+[outrig] image ready: coding:8c2a4f7e91d6b5a3 (cache hit) (18ms)
 [outrig] starting container outrig-20260502T103412-3f2a
 [outrig] container ready: outrig-20260502T103412-3f2a (620ms)
 [outrig] bootstrapping container user
@@ -131,7 +131,7 @@ A typical startup looks like:
 [outrig] tool-call max:     50
 [outrig] tool-result max:   262144 bytes
 [outrig] image-config:  coding
-[outrig] image:             outrig-cache:8c2a4f7e91d6b5a3
+[outrig] image:             coding:8c2a4f7e91d6b5a3
 [outrig] container started: outrig-20260502T103412-3f2a
 [outrig] mcp fs:    initialized (3 tools)
 [outrig] mcp shell: initialized (1 tool)
@@ -265,7 +265,7 @@ The selected `[images.<name>]` block is incomplete. See
 ```
 $ outrig run
 [outrig] image-config: coding
-[outrig] image:            outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
+[outrig] image:            coding:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260501T134412-3f2a
 [outrig] mcp fs: error: failed to spawn `mcp-server-filesystem` in container
 [outrig] caused by: exec: "mcp-server-filesystem": executable file not found in $PATH
@@ -276,7 +276,7 @@ The MCP server binary isn't in the image. Install it in the Dockerfile.
 ```
 $ outrig run
 [outrig] image-config: coding
-[outrig] image:            outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
+[outrig] image:            coding:8c2a4f7e91d6b5a3 (cache hit)
 [outrig] container started: outrig-20260501T134412-3f2a
 [outrig] mcp fs: initialized
 [outrig] mcp shell: initialized

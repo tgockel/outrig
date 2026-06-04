@@ -34,11 +34,13 @@ outrig build [--image <name>]
      `image ready (cache hit)` and skips.
    - Otherwise runs:
      ```
-     buildah build --tag outrig-cache:<hash> \
+     buildah build --tag <image-config-name>:<hash> \
                    --file <dockerfile> \
                    [user build-args] \
                    <context>
      ```
+     The repository is the `[images.<name>]` block key, so the built image is self-describing
+     in `podman images`; the `<hash>` is the content-addressed cache key.
 
 ## Examples
 
@@ -49,7 +51,7 @@ $ outrig build
 [outrig] image-config: coding
 [outrig] dockerfile:       .agents/outrig/images/coding/Dockerfile
 [outrig] context:          .agents/outrig/images/coding
-[outrig] cache key:        outrig-cache:8c2a4f7e91d6b5a3
+[outrig] image tag:        coding:8c2a4f7e91d6b5a3
 [buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
 ...
 [outrig] image ready
@@ -59,7 +61,7 @@ Cache hit on the second run:
 
 ```sh
 $ outrig build
-[outrig] image ready (cache hit: outrig-cache:8c2a4f7e91d6b5a3)
+[outrig] image ready (cache hit: coding:8c2a4f7e91d6b5a3)
 ```
 
 Build a specific image-config:
@@ -75,8 +77,8 @@ Build every image-config in one go:
 
 ```sh
 $ outrig build --all
-[outrig] image-config: coding   -> outrig-cache:8c2a4f7e91d6b5a3 (cache hit)
-[outrig] image-config: planning -> outrig-cache:b91e3a6d217f4c08 (built in 27s)
+[outrig] image-config: coding   -> coding:8c2a4f7e91d6b5a3 (cache hit)
+[outrig] image-config: planning -> planning:b91e3a6d217f4c08 (built in 27s)
 [outrig] all images ready
 ```
 

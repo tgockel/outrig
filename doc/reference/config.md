@@ -378,6 +378,11 @@ context    = ".agents/outrig/images/coding"
 build-args = { NODE_VERSION = "20" }
 ```
 
+For a build-from-Dockerfile image, the block name becomes the built image's repository (the
+image is tagged `<name>:<content-hash>`). Use a repo-specific, lowercase name (e.g.
+`outrig-standard`, not `standard`) so `podman images` makes clear which repo it came from. The
+name must be a valid container image repository component -- see the validation rules below.
+
 - `dockerfile` (path, required\*): path to the Dockerfile, relative to the repo root.
 - `context` (path, required\*): path to the build context, relative to the repo root.
 - `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
@@ -649,6 +654,10 @@ image-config in the merged config but does not require agent/model/provider wiri
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
 - `image-name` must not be empty.
+- A build-from-Dockerfile `[images.<name>]` block key must be a valid container image
+  repository component -- lowercase alphanumeric separated by `.`, `_`, or `-`
+  (`^[a-z0-9]+([._-]+[a-z0-9]+)*$`) -- because it becomes the built image's repository.
+  Image-name configs are exempt: their block key is just a label.
 - Every `[images.<name>.security].capability-profile`, if set, must be one of
   `default`, `no-net-raw`, or `drop-all`.
 - Every capability name in `cap-drop` or `cap-add` must be non-empty and match

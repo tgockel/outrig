@@ -311,6 +311,53 @@ context    = "ctx"
     }
 
     #[test]
+    fn build_image_name_invalid_errors() {
+        // A build image's name becomes its container image repository, so an
+        // uppercase / spaced name is rejected at config load.
+        let cfg = parse(
+            r#"
+[images."Bad Name"]
+dockerfile = "D"
+context    = "ctx"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::BuildImageNameInvalid { image } => {
+                assert_eq!(image, "Bad Name");
+            }
+            other => panic!("expected BuildImageNameInvalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_image_repo_specific_name_validates() {
+        let cfg = parse(
+            r#"
+[images.outrig-standard]
+dockerfile = "D"
+context    = "ctx"
+"#,
+        );
+        cfg.validate(None)
+            .expect("repo-specific lowercase build image name validates");
+    }
+
+    #[test]
+    fn image_name_config_skips_build_name_check() {
+        // Image-name (pull) configs use `image-name` as the tag, so the block
+        // key is just a label and isn't constrained to a repository grammar.
+        let cfg = parse(
+            r#"
+[images."Pull Only"]
+image-name = "docker.io/library/alpine:latest"
+"#,
+        );
+        cfg.validate(None)
+            .expect("image-name config block key is not constrained");
+    }
+
+    #[test]
     fn mcp_command_empty_errors() {
         let cfg = parse(
             r#"

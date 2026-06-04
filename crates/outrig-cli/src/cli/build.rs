@@ -169,7 +169,7 @@ fn print_build_header(name: &str, cc: &ImageConfig, tag: &ImageTag) {
         "[outrig] context:          {}",
         cc.context.as_ref().expect("build path").display()
     );
-    let _ = writeln!(buf, "[outrig] cache key:        {tag}");
+    let _ = writeln!(buf, "[outrig] image tag:        {tag}");
     eprint!("{buf}");
 }
 

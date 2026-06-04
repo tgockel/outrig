@@ -1,11 +1,12 @@
 //! Image build via buildah with content-addressed cache.
 //!
 //! The cache-key helper produces a deterministic 16-hex-char key over
-//! `(Dockerfile bytes, resolved build-args, context content)`. [`ensure_image`]
-//! probes `outrig-cache:<key>` first; on miss it shells out to
-//! `buildah build`. Buildah's own layer cache still helps speed up the build
-//! itself when we miss; the project-level tag cache exists so a *hit* skips
-//! buildah entirely.
+//! `(Dockerfile bytes, resolved build-args, context content)`. Built images are
+//! tagged `<image-config-name>:<key>` (the nameless library path falls back to
+//! `outrig-cache:<key>`). [`ensure_image`] probes that tag first; on miss it
+//! shells out to `buildah build`. Buildah's own layer cache still helps speed up
+//! the build itself when we miss; the project-level tag cache exists so a *hit*
+//! skips buildah entirely.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
@@ -17,10 +18,24 @@ use crate::config::{ImageConfig, ImageSourceRef};
 use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
+/// Repository used for build-type images that have no image-config name (the
+/// nameless library path: [`crate::Outrig::launch`] with a raw build spec).
+/// Named call paths use the image-config name as the repository instead, so a
+/// built image reads as `<image-config-name>:<hash>` in `podman images`.
 const TAG_PREFIX: &str = "outrig-cache";
 const KEY_HEX_LEN: usize = 16;
 const TAR_READ_CHUNK: usize = 64 * 1024;
 const UNNAMED_IMAGE: &str = "<image>";
+
+/// Repository name for a build-type image: the image-config name, falling back
+/// to [`TAG_PREFIX`] for the nameless library path ([`UNNAMED_IMAGE`]).
+fn tag_repo(image: &str) -> &str {
+    if image == UNNAMED_IMAGE {
+        TAG_PREFIX
+    } else {
+        image
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageTag(pub String);
@@ -96,30 +111,34 @@ pub(crate) fn resolve_build_args(
     Ok(resolved)
 }
 
-/// Compute the deterministic `outrig-cache:<key>` tag for `cfg` without
-/// touching buildah. For image-name configs, the tag is the literal
-/// `image-name` value. This resolves `build-args` first because the cache key
-/// tracks the concrete values passed to buildah. Useful when a caller wants
-/// to print the tag *before* deciding whether to build (e.g. the
-/// `outrig build` CLI's verbose header in `doc/usage/build.md`).
+/// Compute the deterministic `<repo>:<key>` tag for `cfg` without touching
+/// buildah. For image-name configs, the tag is the literal `image-name` value.
+/// This resolves `build-args` first because the cache key tracks the concrete
+/// values passed to buildah. Useful when a caller wants to print the tag
+/// *before* deciding whether to build (e.g. the `outrig build` CLI's verbose
+/// header in `doc/usage/build.md`). This nameless variant uses the
+/// `outrig-cache` repository; prefer [`compute_tag_for`] when the image-config
+/// name is known so the built image is self-describing.
 pub async fn compute_tag(cfg: &ImageConfig, repo_root: &Path) -> Result<ImageTag> {
     compute_tag_for(UNNAMED_IMAGE, cfg, repo_root).await
 }
 
-/// Named-image variant of [`compute_tag`]. Use this when config-derived
-/// build args may need `${VAR}` resolution so errors can identify the source
-/// image-config.
+/// Named-image variant of [`compute_tag`]. The image-config name becomes the
+/// repository of a build-type tag (`<name>:<key>`) so `podman images` shows
+/// where the image came from. Also used when config-derived build args may
+/// need `${VAR}` resolution so errors can identify the source image-config.
 pub async fn compute_tag_for(image: &str, cfg: &ImageConfig, repo_root: &Path) -> Result<ImageTag> {
     match cfg.source() {
         ImageSourceRef::Image { image_name } => Ok(ImageTag(image_name.to_string())),
         ImageSourceRef::Build { .. } => {
             let build_args = resolve_build_args(image, cfg)?;
-            compute_tag_with_build_args(cfg, repo_root, &build_args).await
+            compute_tag_with_build_args(tag_repo(image), cfg, repo_root, &build_args).await
         }
     }
 }
 
 async fn compute_tag_with_build_args(
+    repo: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
     build_args: &BTreeMap<String, String>,
@@ -127,7 +146,7 @@ async fn compute_tag_with_build_args(
     let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
     let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
     let key = CacheKey::compute(&dockerfile, build_args, &context).await?;
-    Ok(ImageTag(format!("{TAG_PREFIX}:{key}")))
+    Ok(ImageTag(format!("{repo}:{key}")))
 }
 
 /// Returns `true` iff `tag` already exists in buildah's local image store.
@@ -250,9 +269,9 @@ async fn build_image_logged_with_build_args(
     Ok(())
 }
 
-/// Probe `outrig-cache:<key>`; on miss (or when `no_cache` is set), run
-/// `buildah build`. Stderr from buildah is streamed to `tracing::info!`
-/// with the `[buildah]` prefix.
+/// Probe the build tag (`outrig-cache:<key>` for this nameless variant); on
+/// miss (or when `no_cache` is set), run `buildah build`. Stderr from buildah
+/// is streamed to `tracing::info!` with the `[buildah]` prefix.
 pub async fn ensure_image(
     cfg: &ImageConfig,
     repo_root: &Path,
@@ -288,7 +307,8 @@ async fn ensure_image_for(
         }
         ImageSourceRef::Build { .. } => {
             let build_args = resolve_build_args(image, cfg)?;
-            let tag = compute_tag_with_build_args(cfg, repo_root, &build_args).await?;
+            let tag =
+                compute_tag_with_build_args(tag_repo(image), cfg, repo_root, &build_args).await?;
             if !no_cache && probe_cached(&tag).await? {
                 tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
                 return Ok(ImageBuildOutcome {
@@ -368,9 +388,9 @@ pub async fn ensure_tagged_image_for(
 /// `[buildah]` prefix.
 ///
 /// Unlike [`ensure_image`], there is no content-addressed cache probe: a
-/// standalone build tags a caller-named ref (e.g. `rust-dev`), not
-/// `outrig-cache:<key>`. `no_cache` therefore only forwards `--no-cache` to
-/// buildah.
+/// standalone build tags a stable caller-named ref (e.g. `rust-dev`), not a
+/// `<name>:<key>` content-hash tag. `no_cache` therefore only forwards
+/// `--no-cache` to buildah.
 pub async fn build_standalone(
     project_dir: &Path,
     dockerfile: &Path,
