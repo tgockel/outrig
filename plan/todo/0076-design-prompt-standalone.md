@@ -1,11 +1,11 @@
-# 0075 -- `outrig design prompt --standalone`
+# 0076 -- `outrig design prompt --standalone`
 
 ## Context
 
 `outrig design prompt` prints a self-contained AI design prompt for repo-local
 `[images.<name>]` image-configs. Standalone image projects -- whose build output is a reusable,
 labeled image -- have no equivalent prompt. This task adds one, reflecting the label-based model
-settled in 0072/0073: a standalone project is authored as `image.toml` + `Dockerfile` +
+settled in 0072/0074: a standalone project is authored as `image.toml` + `Dockerfile` +
 `README.md`, and `outrig image build` stamps the config into OCI labels (no `COPY image.toml`).
 
 ## Goal
@@ -43,4 +43,4 @@ project and reflects the label-based authoring model.
 
 ## Dependencies
 
-- **Hard: 0073**. The prompt describes the final no-`COPY`, label-stamped authoring model.
+- **Hard: 0074**. The prompt describes the final no-`COPY`, label-stamped authoring model.

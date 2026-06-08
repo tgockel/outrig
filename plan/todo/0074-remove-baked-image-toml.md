@@ -1,4 +1,4 @@
-# 0073 -- Remove the baked `/etc/outrig/image.toml`
+# 0074 -- Remove the baked `/etc/outrig/image.toml`
 
 ## Context
 

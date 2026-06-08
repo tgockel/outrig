@@ -1,8 +1,8 @@
-# 0074 -- `outrig image inspect <ref>` (local, read-only)
+# 0075 -- `outrig image inspect <ref>` (local, read-only)
 
 ## Context
 
-With config now carried as OCI labels (0072/0073), users need a quick, read-only way to see
+With config now carried as OCI labels (0072/0074), users need a quick, read-only way to see
 what a local image declares -- its metadata and its declared MCP servers -- without starting a
 container or any MCP servers.
 
@@ -10,7 +10,7 @@ This is a true inspect: it reads image labels via `podman image inspect`, which 
 and never pulls. It does **not** start the declared MCP servers. Starting servers and calling
 `tools/list` is a *test*, and that concept already lives in `outrig image build` (run by
 default, skippable with `--no-test`); `inspect` does not duplicate it. (A future task may add a
-standalone test verb and/or remote inspection -- see `plan/next/`.)
+standalone test verb; remote inspection follows in 0077.)
 
 ## Goal
 

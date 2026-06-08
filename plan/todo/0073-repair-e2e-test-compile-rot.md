@@ -1,4 +1,6 @@
-# Repair pre-existing e2e test compile rot
+# 0073 -- Repair pre-existing e2e test compile rot
+
+## Context
 
 The `--features e2e` test suite does not compile (it is not run in CI, so it has
 drifted). This is independent of any single feature task; discovered while
@@ -17,7 +19,28 @@ the first crate):
   in-process `merged_mcp` cases in `crates/outrig`.
 
 - `crates/outrig-cli/tests/build_cli.rs` -- constructs `BuildArgs { container:
-  None, .. }`, but the field was renamed to `image`. Update the four call sites.
+  None, .. }`, but the field was renamed to `image`. Update the five call sites.
 
-Acceptance: `cargo test --features e2e --no-run` compiles all e2e targets; the
-suites run (podman/buildah present) green.
+## Goal
+
+Repair the pre-existing e2e compile drift so later image tasks can rely on the full
+`--features e2e` suite as an acceptance check.
+
+## Deliverables
+
+- Move the CLI-driven `embedded_image.rs` cases that need `CARGO_BIN_EXE_outrig` into
+  `crates/outrig-cli/tests/`, leaving the in-process `merged_mcp` coverage in
+  `crates/outrig`.
+- Rename the stale `BuildArgs { container: ... }` field to `image` in all five
+  `crates/outrig-cli/tests/build_cli.rs` literals.
+- Audit for any additional e2e compile drift surfaced after the first failing crate.
+
+## Acceptance
+
+- `cargo test --features e2e --no-run` compiles all e2e targets.
+- The e2e suites run green when podman/buildah are present.
+
+## Dependencies
+
+- **Hard: 0072**. The drift was found while migrating the embedded-image e2e suites in
+  the OCI-label task.
