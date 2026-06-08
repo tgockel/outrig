@@ -18,11 +18,6 @@ use crate::config::{McpServerSpec, is_valid_mcp_server_name, mcp_command_is_empt
 use crate::container::Container;
 use crate::error::{OutrigError, Result};
 
-/// Where the Dockerfile still copies the authored `image.toml`. No longer read
-/// (labels are authoritative); the file and its `COPY` are removed in a
-/// follow-up task.
-pub const EMBEDDED_IMAGE_CONFIG_PATH: &str = "/etc/outrig/image.toml";
-
 /// `org.opencontainers.image.description` <- `[image].description`.
 pub const LABEL_DESCRIPTION: &str = "org.opencontainers.image.description";
 /// `org.opencontainers.image.version` <- `[image].version`.
@@ -37,13 +32,6 @@ pub const LABEL_MCP: &str = "org.outrig.mcp";
 pub const LABEL_SCHEMA: &str = "org.outrig.schema";
 /// Current schema version stamped into [`LABEL_SCHEMA`].
 pub const LABEL_SCHEMA_VERSION: &str = "1";
-
-/// The `[mcp]` table an image advertises via `org.outrig.mcp`, decoded for the
-/// runtime read. A missing label yields the default (empty) value.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct EmbeddedImageConfig {
-    pub mcp: BTreeMap<String, McpServerSpec>,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StandaloneImageToml {
@@ -108,16 +96,6 @@ pub enum StandaloneImageTomlError {
     EmptyMcpCommand { server: String },
 }
 
-/// Lenient runtime read: inspect the container's image labels and decode
-/// `org.outrig.mcp`. A label-less image (or one without that key) yields an
-/// empty config, so runtime falls back to repo `[images.<name>.mcp]`.
-pub async fn read_embedded_image_config(container: &Container) -> Result<EmbeddedImageConfig> {
-    let labels =
-        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
-            .await?;
-    embedded_mcp_from_labels(&container.image_tag().0, &labels)
-}
-
 pub fn parse_standalone_image_toml(
     toml: &str,
 ) -> std::result::Result<StandaloneImageToml, StandaloneImageTomlError> {
@@ -126,10 +104,10 @@ pub fn parse_standalone_image_toml(
 }
 
 /// Strict build-validation read: inspect the built image's labels and decode a
-/// non-empty, valid `org.outrig.mcp`. Unlike [`read_embedded_image_config`]
-/// (lenient -- a missing label yields an empty config), a missing or empty
-/// label is a hard error here. `outrig image build` uses it to prove the
-/// stamped config round-trips off the built image.
+/// non-empty, valid `org.outrig.mcp`. Unlike the runtime merge path (lenient --
+/// a missing label yields an empty config), a missing or empty label is a hard
+/// error here. `outrig image build` uses it to prove the stamped config
+/// round-trips off the built image.
 pub async fn read_standalone_image_mcp(
     container: &Container,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
@@ -171,8 +149,11 @@ pub async fn merged_mcp(
     container: &Container,
     config_mcp: &BTreeMap<String, McpServerSpec>,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
-    let embedded = read_embedded_image_config(container).await?;
-    Ok(merge_mcp(embedded.mcp, config_mcp))
+    let labels =
+        crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
+            .await?;
+    let image_mcp = embedded_mcp_from_labels(&container.image_tag().0, &labels)?;
+    Ok(merge_mcp(image_mcp, config_mcp))
 }
 
 pub fn merge_mcp(
@@ -214,13 +195,13 @@ fn parse_mcp_table(
 fn embedded_mcp_from_labels(
     image: &str,
     labels: &BTreeMap<String, String>,
-) -> Result<EmbeddedImageConfig> {
+) -> Result<BTreeMap<String, McpServerSpec>> {
     match labels.get(LABEL_MCP) {
-        None => Ok(EmbeddedImageConfig::default()),
+        None => Ok(BTreeMap::new()),
         Some(raw) => {
             let mcp = parse_mcp_table(raw)
                 .map_err(|source| embedded_image_config_parse_error(image, source))?;
-            Ok(EmbeddedImageConfig { mcp })
+            Ok(mcp)
         }
     }
 }
@@ -493,9 +474,9 @@ mod tests {
 
     #[test]
     fn embedded_mcp_missing_label_is_empty() {
-        let cfg =
+        let mcp =
             embedded_mcp_from_labels("img", &BTreeMap::new()).expect("missing label is lenient");
-        assert!(cfg.mcp.is_empty());
+        assert!(mcp.is_empty());
     }
 
     #[test]

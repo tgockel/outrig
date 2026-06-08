@@ -45,3 +45,14 @@ readers, and the documentation that describes the file model.
 ## Dependencies
 
 - **Hard: 0072**. Labels must be authoritative before the file path is removed.
+
+## Decisions
+
+- `outrig mcp self` now keeps `paths` path-only and reports the image-side label surface in a
+  top-level `image_labels` object (`mcp`, `schema`, `description`, `version`, `tags`).
+- The runtime merge path reads `org.outrig.mcp` labels directly inside `merged_mcp`; the public
+  `read_embedded_image_config` wrapper and `EmbeddedImageConfig` return type were removed with the
+  baked-file path.
+- `outrig image init` renders the standard Dockerfile directly. The generated project
+  `image.toml` remains the authoring source, and `outrig image build` is responsible for stamping
+  it into OCI labels.

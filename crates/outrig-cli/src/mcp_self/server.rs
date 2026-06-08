@@ -77,7 +77,7 @@ impl SelfServer {
             tool::<EmptyArgs>(
                 GET_CONFIG_SCHEMA,
                 "Get Config Schema",
-                "Return JSON Schema for image config and MCP server entries.",
+                "Return JSON Schema plus path and image-label hints.",
             ),
             tool::<EmptyArgs>(
                 LIST_BASE_IMAGES,

@@ -80,7 +80,7 @@ The server exposes these tools:
 |-------------------------------|------------------------------------------------------------|
 | `list_docs`                   | Embedded doc pages with titles and summaries.              |
 | `get_doc`                     | Markdown for one embedded page.                            |
-| `get_config_schema`           | JSON Schema for image config and MCP server entries.       |
+| `get_config_schema`           | JSON Schema plus path and image-label hints.               |
 | `list_base_images`            | Base-image suggestions, explicitly non-exhaustive.         |
 | `list_mcp_server_suggestions` | MCP server suggestions and shell guidance.                 |
 | `validate_dockerfile`         | Advisory warnings about OutRig Dockerfile conventions.     |

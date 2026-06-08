@@ -7,13 +7,11 @@
 //! `image.toml`, and `README.md` -- and touches nothing else.
 //!
 //! The Dockerfile body is the same one `outrig image add` would render for a
-//! Debian-slim base with the filesystem MCP server, plus a `COPY` that bakes the
-//! project's `image.toml` into the image at `/etc/outrig/image.toml` so OutRig
-//! reads the embedded `[mcp]` table at session startup.
+//! Debian-slim base with the filesystem MCP server. The generated `image.toml`
+//! stays beside the Dockerfile as the authoring source; `outrig image build`
+//! validates it and stamps its config into OCI labels.
 
 use std::path::Path;
-
-use outrig::container::embedded::EMBEDDED_IMAGE_CONFIG_PATH;
 
 use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer};
@@ -92,23 +90,15 @@ fn is_valid_project_name(name: &str) -> bool {
 }
 
 /// Render the standalone Dockerfile: the curated Debian-slim + filesystem-MCP
-/// body from `render`, plus a `COPY` of the project's `image.toml` into the
-/// image. The COPY is spliced in just before the footer's unique
-/// `WORKDIR /workspace` token (see `render_footer_token_is_unique`).
+/// body from `render`.
 fn render_dockerfile() -> String {
-    let body = render::render(BaseImage::DebianBookwormSlim, &[], &[McpServer::Fs]);
-    body.replace(
-        "WORKDIR /workspace",
-        &format!(
-            "# OutRig image config\nCOPY image.toml {EMBEDDED_IMAGE_CONFIG_PATH}\n\nWORKDIR /workspace"
-        ),
-    )
+    render::render(BaseImage::DebianBookwormSlim, &[], &[McpServer::Fs])
 }
 
 fn render_image_toml(name: &str) -> String {
     format!(
-        "# OutRig standalone image config. Baked into the image at {EMBEDDED_IMAGE_CONFIG_PATH}\n\
-         # and read by OutRig at session startup. Required: [image].ref and a non-empty [mcp].\n\
+        "# OutRig standalone image config. `outrig image build` validates this file\n\
+         # and stamps its MCP config into OCI labels. Required: [image].ref and a non-empty [mcp].\n\
          \n\
          [image]\n\
          ref = \"{name}\"\n\
@@ -131,8 +121,8 @@ fn render_readme(name: &str) -> String {
          \n\
          ## Files\n\
          \n\
-         - `Dockerfile`: the image definition. Follows OutRig conventions -- no `USER`, ends with `CMD [\"sleep\", \"infinity\"]`, installs the host-UID bootstrap packages, and copies `image.toml` to `{EMBEDDED_IMAGE_CONFIG_PATH}`.\n\
-         - `image.toml`: image metadata plus the embedded `[mcp]` table. With no `[build]` section it builds the sibling `Dockerfile` with context `.`.\n\
+         - `Dockerfile`: the image definition. Follows OutRig conventions -- no `USER`, ends with `CMD [\"sleep\", \"infinity\"]`, and installs the host-UID bootstrap packages.\n\
+         - `image.toml`: image metadata plus the `[mcp]` table. With no `[build]` section it builds the sibling `Dockerfile` with context `.`. `outrig image build` stamps this config into OCI labels.\n\
          - `README.md`: this file.\n\
          \n\
          ## Build\n\
@@ -141,11 +131,11 @@ fn render_readme(name: &str) -> String {
          outrig image build\n\
          ```\n\
          \n\
-         Run from this directory. It builds the `Dockerfile`, tags the image as `{name}`, and verifies the embedded `image.toml` and its MCP servers.\n\
+         Run from this directory. It builds the `Dockerfile`, tags the image as `{name}`, stamps the `image.toml` config into OCI labels, and verifies the labeled MCP servers.\n\
          \n\
          ## Use it from a repo\n\
          \n\
-         Reference the built image from a repo's `.agents/outrig/config.toml` with `image-name`. The MCP servers are embedded in the image, so no `[images.{name}.mcp]` block is needed:\n\
+         Reference the built image from a repo's `.agents/outrig/config.toml` with `image-name`. The MCP servers are declared by the image labels, so no `[images.{name}.mcp]` block is needed:\n\
          \n\
          ```toml\n\
          [images.{name}]\n\
@@ -246,17 +236,7 @@ mod tests {
         assert_eq!(validate_dockerfile(&dockerfile).warnings, Vec::new());
         assert!(dockerfile.starts_with("FROM docker.io/library/debian:bookworm-slim"));
         assert!(dockerfile.contains("npm install -g @modelcontextprotocol/server-filesystem"));
-
-        let copy_at = dockerfile
-            .find("COPY image.toml /etc/outrig/image.toml")
-            .expect("COPY line present");
-        let workdir_at = dockerfile
-            .find("WORKDIR /workspace")
-            .expect("WORKDIR present");
-        assert!(
-            copy_at < workdir_at,
-            "COPY must precede WORKDIR:\n{dockerfile}"
-        );
+        assert!(!dockerfile.contains("COPY image.toml"), "{dockerfile}");
 
         assert!(
             dockerfile
@@ -268,7 +248,6 @@ mod tests {
 
     #[test]
     fn render_footer_token_is_unique() {
-        // Pins the contract the Dockerfile COPY-insert relies on.
         let body = render::render(BaseImage::DebianBookwormSlim, &[], &[McpServer::Fs]);
         assert_eq!(body.matches("WORKDIR /workspace").count(), 1, "{body}");
     }
@@ -308,6 +287,10 @@ mod tests {
         // image-name immediately follows the [images.<name>] header.
         assert!(
             readme.contains("[images.rust-dev]\nimage-name = \"rust-dev\""),
+            "{readme}"
+        );
+        assert!(
+            readme.contains("stamps this config into OCI labels"),
             "{readme}"
         );
     }

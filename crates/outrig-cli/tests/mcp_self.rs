@@ -107,6 +107,9 @@ async fn mcp_self_serves_docs_schema_suggestions_and_validators() {
 
         let schema: Value = call_json(&service, "get_config_schema", serde_json::json!({})).await;
         assert_eq!(schema["paths"]["repo_config"], ".agents/outrig/config.toml");
+        assert!(schema["paths"].get("image_config").is_none());
+        assert_eq!(schema["image_labels"]["mcp"], "org.outrig.mcp");
+        assert_eq!(schema["image_labels"]["schema"], "org.outrig.schema");
         assert!(schema["image_config_schema"].is_object());
 
         let bases: Value = call_json(&service, "list_base_images", serde_json::json!({})).await;

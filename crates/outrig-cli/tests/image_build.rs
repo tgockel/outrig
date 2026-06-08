@@ -121,14 +121,12 @@ async fn generated_scaffold_builds_and_mcp_boots() {
 async fn no_test_succeeds_and_tag_override_preserves_image_toml() {
     let _guard = E2E_LOCK.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("with-copy");
+    let proj = tmp.path().join("label-stamped");
     write_project(
         &proj,
         "FROM docker.io/library/alpine:latest\n\
-         RUN mkdir -p /etc/outrig\n\
-         COPY image.toml /etc/outrig/image.toml\n\
          CMD [\"sleep\", \"infinity\"]\n",
-        "[image]\nref = \"outrig-e2e-with-copy\"\n\
+        "[image]\nref = \"outrig-e2e-label-stamped\"\n\
          [mcp]\nfs = [\"mcp-server-filesystem\", \"/workspace\"]\n",
     );
     let before = std::fs::read(proj.join("image.toml")).expect("read image.toml");
@@ -156,8 +154,8 @@ async fn no_test_succeeds_and_tag_override_preserves_image_toml() {
 }
 
 /// Acceptance: a declared MCP server that cannot start fails the build (this is
-/// the failure `--no-test` exists to skip). The baked image.toml declares a
-/// server whose command does not exist, so the live probe cannot initialize it.
+/// the failure `--no-test` exists to skip). The stamped label declares a server
+/// whose command does not exist, so the live probe cannot initialize it.
 /// `shadow` is installed so the UID/GID bootstrap (which precedes the probe)
 /// succeeds and the failure is squarely the server, not the container.
 #[tokio::test]
@@ -169,8 +167,6 @@ async fn build_fails_when_mcp_server_cannot_start() {
         &proj,
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache shadow\n\
-         RUN mkdir -p /etc/outrig\n\
-         COPY image.toml /etc/outrig/image.toml\n\
          CMD [\"sleep\", \"infinity\"]\n",
         "[image]\nref = \"outrig-e2e-broken-mcp\"\n\
          [mcp]\nbroken = [\"outrig-no-such-mcp-binary\"]\n",

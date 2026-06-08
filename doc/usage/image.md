@@ -191,11 +191,11 @@ build output is a reusable container image. Unlike `image add`, it writes no rep
 it creates three files and nothing else:
 
 - `Dockerfile` -- a Debian-slim image with the filesystem MCP server, ending in the standard
-  `CMD ["sleep", "infinity"]`. It copies the project's `image.toml` to `/etc/outrig/image.toml`
-  so the image carries its own MCP declarations.
-- `image.toml` -- the standalone image config: `[image].ref` plus a `[mcp]` table. `outrig image
-  build` stamps the `[mcp]` table into the image's OCI labels, which outrig reads back at session
-  startup and merges with any repo `[images.<name>.mcp]`.
+  `CMD ["sleep", "infinity"]`. It installs the tool binaries; it does not copy OutRig config.
+- `image.toml` -- the standalone image authoring config: `[image].ref` plus a `[mcp]` table.
+  `outrig image build` validates this file and stamps the `[mcp]` table into the image's OCI
+  labels, which outrig reads back at session startup and merges with any repo
+  `[images.<name>.mcp]`.
 - `README.md` -- how to build the image and reference it from a repo.
 
 The command is noninteractive -- there are no prompts. The project name (used as `[image].ref`)
@@ -241,15 +241,16 @@ fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ### Consuming the image from a repo
 
 Once built, reference the image from a repo's `config.toml` with `image-name`. Because the
-MCP servers are embedded in the image, the consuming block needs no `[images.<name>.mcp]`:
+MCP server declarations are stamped into image labels, the consuming block needs no
+`[images.<name>.mcp]`:
 
 ```toml
 [images.rust-dev]
 image-name = "rust-dev"
 ```
 
-That embedded-vs-repo split is the key difference from `image add`, whose repo-local blocks
-carry their own `[images.<name>.mcp]` entries. See
+That label-vs-repo split is the key difference from `image add`, whose repo-local blocks carry
+their own `[images.<name>.mcp]` entries. See
 [Concepts -> Containers](../concepts/containers.md#using-a-pre-built-image) for the
 `image-name` shape.
 

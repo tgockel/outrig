@@ -93,9 +93,9 @@ See [Usage -> outrig image](../usage/image.md).
 
 ### `outrig image init`
 
-Noninteractively scaffold a standalone image project: writes a `Dockerfile`, an
-embedded-config `image.toml`, and a `README.md` into a target directory. The directory name
-becomes the image ref; other repos consume the built image via `image-name`.
+Noninteractively scaffold a standalone image project: writes a `Dockerfile`, an authoring
+`image.toml`, and a `README.md` into a target directory. The directory name becomes the image ref;
+other repos consume the built image via `image-name`.
 
 ```
 outrig image init [<dir>]
@@ -250,7 +250,7 @@ same shared outrig proxy and backing MCP processes.
 sessions. Attach mode cannot retrofit a borrowed container with a new interceptor.
 
 `outrig mcp show-merged` uses the same image-config selection and setup path, but exits after
-printing the effective `[mcp]` table to stdout. It is for debugging embedded image config and
+printing the effective `[mcp]` table to stdout. It is for debugging image-label declarations and
 repo-local overrides, not for serving MCP JSON-RPC.
 
 `outrig mcp self` serves host-side self-description tools over stdio. It does not start a

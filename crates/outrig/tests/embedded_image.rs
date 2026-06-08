@@ -1,4 +1,4 @@
-//! End-to-end coverage for `/etc/outrig/image.toml` embedded MCP config.
+//! End-to-end coverage for OCI-label embedded MCP config.
 //! Gated behind `--features e2e` because it builds fixture images and starts
 //! real podman containers.
 
