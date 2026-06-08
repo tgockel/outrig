@@ -8,6 +8,5 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 | Task | Title | Dependencies |
 |---|---|---|
-| 0075 | `outrig image inspect <ref>` (local, read-only) | 0072 |
 | 0076 | `outrig design prompt --standalone` | 0074 |
 | 0077 | Remote `outrig image inspect` (no-pull, via labels) | 0075 |

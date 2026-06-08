@@ -132,6 +132,21 @@ outrig image build [<dir>]
 
 See [Usage -> outrig image](../usage/image.md#outrig-image-build).
 
+### `outrig image inspect`
+
+Inspect a local image's OutRig OCI labels without pulling it, creating a container, or starting
+any MCP server.
+
+```
+outrig image inspect <ref>
+```
+
+| Argument | Description                              |
+|----------|------------------------------------------|
+| `<ref>`  | Local image ref to inspect. Never pulled. |
+
+See [Usage -> outrig image](../usage/image.md#outrig-image-inspect).
+
 ### `outrig run`
 
 Start an interactive agent session.

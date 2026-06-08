@@ -132,6 +132,12 @@ enum ImageCmd {
         #[arg(long = "no-cache")]
         no_cache: bool,
     },
+    /// Inspect a local image's OutRig labels without starting it.
+    Inspect {
+        /// Local image ref to inspect. The command never pulls.
+        #[arg(value_name = "REF")]
+        image_ref: String,
+    },
 }
 
 pub fn run() -> ExitCode {
@@ -236,6 +242,13 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     *no_test,
                     *no_cache,
                 ))?;
+                Ok(0)
+            }
+            ImageCmd::Inspect { image_ref } => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(image_setup::inspect::run(image_ref))?;
                 Ok(0)
             }
         },

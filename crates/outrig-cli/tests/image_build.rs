@@ -17,7 +17,7 @@
 
 use std::path::Path;
 use std::process::{Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -45,6 +45,17 @@ async fn outrig_image_build(extra: &[&str], budget: Duration) -> Output {
         .await
         .expect("outrig image build timed out")
         .expect("spawn outrig image build")
+}
+
+async fn outrig_image_inspect(image_ref: &str, budget: Duration) -> Output {
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut cmd = Command::new(bin);
+    cmd.args(["image", "inspect", image_ref])
+        .stdin(Stdio::null());
+    timeout(budget, cmd.output())
+        .await
+        .expect("outrig image inspect timed out")
+        .expect("spawn outrig image inspect")
 }
 
 fn write_project(dir: &Path, dockerfile: &str, image_toml: &str) {
@@ -113,6 +124,19 @@ async fn generated_scaffold_builds_and_mcp_boots() {
         json!(["mcp-server-filesystem", "/workspace"]),
         "org.outrig.mcp should declare the fs server: {labels}",
     );
+
+    let inspect = outrig_image_inspect("rust-dev", LIGHT_TIMEOUT).await;
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let stderr = String::from_utf8_lossy(&inspect.stderr);
+    assert!(
+        inspect.status.success(),
+        "inspect should succeed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("image: rust-dev"), "{stdout}");
+    assert!(
+        stdout.contains("command: [\"mcp-server-filesystem\",\"/workspace\"]"),
+        "{stdout}"
+    );
 }
 
 /// Acceptance: `--no-test` succeeds without running the live probe, and a
@@ -127,6 +151,9 @@ async fn no_test_succeeds_and_tag_override_preserves_image_toml() {
         "FROM docker.io/library/alpine:latest\n\
          CMD [\"sleep\", \"infinity\"]\n",
         "[image]\nref = \"outrig-e2e-label-stamped\"\n\
+         description = \"Label stamped test image\"\n\
+         version = \"0.2.0\"\n\
+         tags = [\"test\", \"inspect\"]\n\
          [mcp]\nfs = [\"mcp-server-filesystem\", \"/workspace\"]\n",
     );
     let before = std::fs::read(proj.join("image.toml")).expect("read image.toml");
@@ -151,6 +178,48 @@ async fn no_test_succeeds_and_tag_override_preserves_image_toml() {
 
     let after = std::fs::read(proj.join("image.toml")).expect("read image.toml");
     assert_eq!(before, after, "--tag must not rewrite image.toml");
+
+    let inspect = outrig_image_inspect("outrig-e2e-custom-ref", LIGHT_TIMEOUT).await;
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let stderr = String::from_utf8_lossy(&inspect.stderr);
+    assert!(
+        inspect.status.success(),
+        "inspect should report stamped metadata:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("image: outrig-e2e-custom-ref"), "{stdout}");
+    assert!(
+        stdout.contains("description: Label stamped test image"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("version: 0.2.0"), "{stdout}");
+    assert!(stdout.contains("tags: [\"test\",\"inspect\"]"), "{stdout}");
+}
+
+#[tokio::test]
+async fn inspect_missing_local_image_is_clear_and_does_not_pull() {
+    let _guard = E2E_LOCK.lock().await;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let image_ref = format!("outrig-e2e-missing-inspect-{suffix}");
+
+    let out = outrig_image_inspect(&image_ref, LIGHT_TIMEOUT).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "missing local image must fail:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "stdout should stay scriptable: {stdout:?}"
+    );
+    assert!(stderr.contains("local image"), "{stderr}");
+    assert!(stderr.contains("not found"), "{stderr}");
+    assert!(stderr.contains("local-only"), "{stderr}");
+    assert!(stderr.contains("does not pull"), "{stderr}");
 }
 
 /// Acceptance: a declared MCP server that cannot start fails the build (this is
@@ -170,6 +239,34 @@ async fn build_fails_when_mcp_server_cannot_start() {
          CMD [\"sleep\", \"infinity\"]\n",
         "[image]\nref = \"outrig-e2e-broken-mcp\"\n\
          [mcp]\nbroken = [\"outrig-no-such-mcp-binary\"]\n",
+    );
+
+    let inspectable = outrig_image_build(
+        &[
+            proj.to_str().unwrap(),
+            "--no-test",
+            "--tag",
+            "outrig-e2e-broken-mcp-inspect",
+        ],
+        LIGHT_TIMEOUT,
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&inspectable.stderr);
+    assert!(
+        inspectable.status.success(),
+        "--no-test should produce an inspectable broken declaration:\n{stderr}"
+    );
+
+    let inspect = outrig_image_inspect("outrig-e2e-broken-mcp-inspect", LIGHT_TIMEOUT).await;
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let stderr = String::from_utf8_lossy(&inspect.stderr);
+    assert!(
+        inspect.status.success(),
+        "inspect must not start the broken MCP server:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("command: [\"outrig-no-such-mcp-binary\"]"),
+        "{stdout}"
     );
 
     let out = outrig_image_build(&[proj.to_str().unwrap()], LIGHT_TIMEOUT).await;

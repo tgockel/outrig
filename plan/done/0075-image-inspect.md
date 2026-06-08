@@ -45,3 +45,14 @@ labels.
 ## Dependencies
 
 - **Hard: 0072**. Inspect reads the labels and uses the codec introduced there.
+
+## Decisions
+
+- Inspect stdout uses deterministic plain sections: `image:`, optional metadata lines, and an
+  indented `mcp:` section. Tags and command argv render as compact JSON arrays.
+- Full-form MCP server env declarations are printed under each server's `env:` block using the
+  serialized label value, including `${VAR}` references.
+- A present local image with no `org.outrig.mcp` label is allowed: inspect prints the image ref
+  and any metadata labels, then omits `mcp:`.
+- The CLI probes `podman image exists <ref>` before reading labels so a missing local image gets
+  a clear local-only/no-pull error instead of the generic `podman image inspect` process error.

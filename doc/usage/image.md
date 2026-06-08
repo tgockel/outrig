@@ -3,8 +3,9 @@
 `outrig image` groups commands for the container images that host an agent's tools.
 `outrig image add` scaffolds a repo-local image-config (a named Dockerfile + MCP-server
 bundle); `outrig image init` scaffolds a standalone image project whose build output is a
-reusable image, and `outrig image build` builds and validates that project. The rest of the
-group (`image ls`, `image rm`) is reserved for later.
+reusable image, `outrig image build` builds and validates that project, and
+`outrig image inspect` reads a local image's declared labels. The rest of the group
+(`image ls`, `image rm`) is reserved for later.
 
 ## `outrig image add`
 
@@ -337,6 +338,55 @@ Unlike repo-local `outrig build` -- which tags `<image-config-name>:<content-has
 the build on a cache hit -- a standalone build tags a stable, caller-named ref with no content
 hash, so there is no project-level cache to skip: `--no-cache` only forwards `--no-cache` to
 buildah to force a clean build.
+
+## outrig image inspect
+
+`outrig image inspect` prints the OutRig config labels declared by a local image. It is
+read-only: it checks the local image store, reads labels with `podman image inspect`, and never
+pulls, creates a container, or starts an MCP server. Live initialization and `tools/list` checks
+belong to [`outrig image build`](#outrig-image-build).
+
+### Synopsis
+
+```
+outrig image inspect <ref>
+```
+
+| Argument | Description                            |
+|----------|----------------------------------------|
+| `<ref>`  | Local image ref to inspect. Never pulled. |
+
+### Output
+
+The command writes only the inspect result to stdout. Diagnostics and errors go to stderr.
+
+```sh
+$ outrig image inspect rust-dev
+image: rust-dev
+description: Rust tooling
+version: 0.1.0
+tags: ["rust","build"]
+mcp:
+  fs:
+    command: ["mcp-server-filesystem","/workspace"]
+  db:
+    command: ["db-mcp"]
+    env:
+      TOKEN: "${DB_TOKEN}"
+```
+
+`description`, `version`, and `tags` appear only when the image carries those labels. If a
+local image has no `org.outrig.mcp` label, inspect still prints the image ref and any metadata
+labels it finds, then omits the `mcp:` section.
+
+### Failure modes
+
+The command exits nonzero -- printing `error: ...` -- in these cases:
+
+- **The image is not present locally**: inspect reports a local-only not-found error and does not
+  attempt a pull.
+- **A declared OutRig label is malformed**: invalid `org.outrig.tags` or `org.outrig.mcp` values
+  fail before anything is started.
 
 ## See also
 

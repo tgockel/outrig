@@ -40,6 +40,14 @@ pub struct StandaloneImageToml {
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct StandaloneImageLabels {
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
+    pub mcp: Option<BTreeMap<String, McpServerSpec>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneImageMetadata {
     pub image_ref: String,
@@ -138,6 +146,39 @@ pub fn standalone_config_to_labels(cfg: &StandaloneImageToml) -> Result<BTreeMap
         );
     }
     Ok(labels)
+}
+
+/// Decode all user-facing standalone image labels for `outrig image inspect`.
+/// Missing metadata labels are omitted, and a missing `org.outrig.mcp` is not
+/// an error: inspect can still show whatever metadata the local image carries.
+/// A present-but-malformed label is a hard error because it claims to be an
+/// OutRig declaration.
+pub fn parse_standalone_image_labels(
+    image: &str,
+    labels: &BTreeMap<String, String>,
+) -> Result<StandaloneImageLabels> {
+    let tags = match labels.get(LABEL_TAGS) {
+        Some(raw) => serde_json::from_str::<Vec<String>>(raw).map_err(|source| {
+            OutrigError::Configuration(format!(
+                "image {image:?}: invalid {LABEL_TAGS} label: {source}"
+            ))
+        })?,
+        None => Vec::new(),
+    };
+    let mcp = match labels.get(LABEL_MCP) {
+        Some(raw) => {
+            let mcp = parse_mcp_table(raw)
+                .map_err(|source| embedded_image_config_parse_error(image, source))?;
+            Some(mcp)
+        }
+        None => None,
+    };
+    Ok(StandaloneImageLabels {
+        description: labels.get(LABEL_DESCRIPTION).cloned(),
+        version: labels.get(LABEL_VERSION).cloned(),
+        tags,
+        mcp,
+    })
 }
 
 fn to_json_label<T: serde::Serialize>(key: &str, value: &T) -> Result<String> {
@@ -446,6 +487,64 @@ mod tests {
         assert!(!labels.contains_key(LABEL_TAGS));
         assert!(labels.contains_key(LABEL_MCP));
         assert!(labels.contains_key(LABEL_SCHEMA));
+    }
+
+    #[test]
+    fn standalone_image_labels_read_metadata_and_mcp() {
+        let mut mcp = BTreeMap::new();
+        mcp.insert(
+            "fs".to_string(),
+            short(&["mcp-server-filesystem", "/workspace"]),
+        );
+        let cfg = standalone(
+            mcp.clone(),
+            Some("Rust tooling"),
+            Some("0.1.0"),
+            &["rust", "build"],
+        );
+        let labels = standalone_config_to_labels(&cfg).expect("serialize labels");
+
+        let parsed = parse_standalone_image_labels("img", &labels).expect("parse labels");
+
+        assert_eq!(parsed.description.as_deref(), Some("Rust tooling"));
+        assert_eq!(parsed.version.as_deref(), Some("0.1.0"));
+        assert_eq!(parsed.tags, vec!["rust", "build"]);
+        assert_eq!(parsed.mcp, Some(mcp));
+    }
+
+    #[test]
+    fn standalone_image_labels_allow_missing_mcp() {
+        let mut labels = BTreeMap::new();
+        labels.insert(LABEL_DESCRIPTION.to_string(), "metadata only".to_string());
+        labels.insert(LABEL_TAGS.to_string(), r#"["docs"]"#.to_string());
+
+        let parsed = parse_standalone_image_labels("img", &labels).expect("parse labels");
+
+        assert_eq!(parsed.description.as_deref(), Some("metadata only"));
+        assert_eq!(parsed.tags, vec!["docs"]);
+        assert_eq!(parsed.mcp, None);
+    }
+
+    #[test]
+    fn standalone_image_labels_reject_malformed_tags() {
+        let mut labels = BTreeMap::new();
+        labels.insert(LABEL_TAGS.to_string(), "[".to_string());
+
+        let err = parse_standalone_image_labels("img", &labels).unwrap_err();
+
+        assert!(matches!(err, OutrigError::Configuration(_)));
+        assert!(err.to_string().contains(LABEL_TAGS), "{err}");
+    }
+
+    #[test]
+    fn standalone_image_labels_reject_malformed_mcp() {
+        let mut labels = BTreeMap::new();
+        labels.insert(LABEL_MCP.to_string(), r#"{"bad.name":["bin"]}"#.to_string());
+
+        let err = parse_standalone_image_labels("img", &labels).unwrap_err();
+
+        assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+        assert!(err.to_string().contains("bad.name"), "{err}");
     }
 
     #[test]

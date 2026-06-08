@@ -5,6 +5,7 @@
 pub mod add;
 pub mod build;
 pub mod init;
+pub mod inspect;
 pub mod render;
 
 pub use add::DOC_SYNC_FIELDS;
