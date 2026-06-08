@@ -108,6 +108,26 @@ Otherwise return the exact file paths and file contents.
 If an AI client is not allowed to write under `.agents/outrig`, have it return the exact file
 contents rather than staging files elsewhere and asking for a blind copy into the repo.
 
+## Standalone image projects
+
+For a reusable image that other repos consume by tag, ask for a standalone project instead of a
+repo-local `[images.<name>]` block. The output should be a directory with `Dockerfile`,
+`image.toml`, and `README.md`.
+
+```text
+Design an OutRig standalone image project for a Rust and git development toolset.
+Return complete contents for Dockerfile, image.toml, and README.md.
+Use the filesystem MCP server at /workspace and the git MCP server for /workspace.
+Read the OutRig docs and schema first, then validate the proposed Dockerfile and image.toml.
+Explain how a repo should reference the built image with image-name.
+```
+
+The standalone `image.toml` is the authoring source. It must contain `[image].ref` and a
+non-empty `[mcp]` table; optional `[image]` metadata (`description`, `version`, `tags`) and an
+optional complete `[build]` section can be added when useful. `outrig image build` validates
+that file and stamps its config into OCI labels, so the Dockerfile should install the tools and
+MCP binaries but should not copy `image.toml` into the image.
+
 ## Trust model
 
 OutRig expects MCP servers to be useful inside the container, not artificially narrow. A
@@ -134,6 +154,7 @@ To inspect or edit the prompt before sending it:
 
 ```sh
 outrig design prompt > prompt.txt
+outrig design prompt --standalone > standalone-prompt.txt
 ```
 
 Prefer the MCP path when your tool supports it. `outrig mcp self` lets the AI read docs and run

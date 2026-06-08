@@ -46,6 +46,26 @@ fn prompt_prints_self_contained_bundle() {
 }
 
 #[test]
+fn standalone_prompt_prints_project_design_bundle() {
+    let stdout = successful_stdout(&["design", "prompt", "--standalone"]);
+    assert!(!stdout.trim().is_empty(), "prompt should not be empty");
+    for marker in [
+        "# OutRig Standalone Image Project Design Prompt",
+        "`Dockerfile`, `image.toml`, and `README.md`",
+        "`image.toml` requires `[image].ref` and a non-empty `[mcp]` table",
+        "CMD [\"sleep\", \"infinity\"]",
+        "Do not add a Dockerfile `USER`",
+        "stamps the config into OCI labels",
+        "must not copy `image.toml`",
+        "### Worked example: Standalone Rust toolset image",
+        "[images.rust-toolset]",
+        "image-name = \"rust-toolset:0.1.0\"",
+    ] {
+        assert!(stdout.contains(marker), "prompt lacked {marker:?}");
+    }
+}
+
+#[test]
 fn claude_code_snippet_is_shell_command() {
     let stdout = successful_stdout(&["design", "prompt", "--print-mcp-config", "claude-code"]);
     assert_eq!(stdout, "claude mcp add outrig-self -- outrig mcp self\n");
@@ -81,6 +101,23 @@ fn codex_snippet_is_toml_mcp_servers_block() {
             .filter_map(TomlValue::as_str)
             .collect::<Vec<_>>(),
         vec!["mcp", "self"],
+    );
+}
+
+#[test]
+fn print_mcp_config_wins_over_standalone() {
+    let stdout = successful_stdout(&[
+        "design",
+        "prompt",
+        "--standalone",
+        "--print-mcp-config",
+        "codex",
+    ]);
+    let value: TomlValue = toml::from_str(&stdout).expect("valid TOML");
+    assert!(value.get("mcp_servers").is_some());
+    assert!(
+        !stdout.contains("# OutRig Standalone Image Project Design Prompt"),
+        "snippet should not include prompt text:\n{stdout}"
     );
 }
 

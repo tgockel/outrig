@@ -44,3 +44,11 @@ project and reflects the label-based authoring model.
 ## Dependencies
 
 - **Hard: 0074**. The prompt describes the final no-`COPY`, label-stamped authoring model.
+
+## Decisions
+
+- The default prompt keeps the same repo-local framing and worked examples, and continues to
+  embed `docs::DOCS`. Updates to embedded documentation, including the new standalone usage
+  section, are allowed to flow through that existing bundle.
+- `--print-mcp-config` is dispatched before `--standalone`, so combined invocations still emit
+  only the requested setup snippet.

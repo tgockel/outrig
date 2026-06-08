@@ -26,6 +26,10 @@ pub struct PromptArgs {
     /// Print a copy-pasteable MCP config snippet for the named AI tool.
     #[arg(long = "print-mcp-config", value_name = "TOOL")]
     pub print_mcp_config: Option<McpConfigTool>,
+
+    /// Print a prompt for designing a standalone image project.
+    #[arg(long)]
+    pub standalone: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -41,6 +45,7 @@ pub fn execute(args: &DesignArgs) -> Result<i32> {
     let output = match &args.cmd {
         DesignCommand::Prompt(args) => match args.print_mcp_config {
             Some(tool) => mcp_config_snippet(tool).to_string(),
+            None if args.standalone => render_standalone_prompt(),
             None => render_prompt(),
         },
     };
@@ -83,13 +88,7 @@ pub(crate) fn render_prompt() -> String {
          Read the bundled OutRig documentation and examples before designing.\n",
     );
 
-    out.push_str("\n## Bundled OutRig Docs\n\n");
-    for doc in docs::DOCS {
-        let _ = writeln!(out, "### doc/{}.md", doc.page);
-        let _ = writeln!(out);
-        out.push_str(doc.markdown.trim_end());
-        out.push_str("\n\n");
-    }
+    append_bundled_docs(&mut out);
 
     out.push_str("## Worked Examples\n\n");
     out.push_str(RUST_EXAMPLE.trim());
@@ -99,6 +98,54 @@ pub(crate) fn render_prompt() -> String {
     out.push_str(MULTI_MCP_EXAMPLE.trim());
     out.push('\n');
     out
+}
+
+pub(crate) fn render_standalone_prompt() -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# OutRig Standalone Image Project Design Prompt");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "You are designing a standalone image project for OutRig version {}.",
+        env!("CARGO_PKG_VERSION")
+    );
+    out.push_str(
+        "\n\
+         A standalone project builds one reusable, labeled container image. \
+         Produce complete file contents for `Dockerfile`, `image.toml`, and \
+         `README.md`. Respect these rules:\n\
+         \n\
+         - `image.toml` requires `[image].ref` and a non-empty `[mcp]` table.\n\
+         - `[image].description`, `[image].version`, and `[image].tags` are optional.\n\
+         - `[build]` is optional. When present, it must set both `dockerfile` and `context`.\n\
+         - Without `[build]`, `outrig image build` uses sibling `Dockerfile` and context `.`.\n\
+         - Keep the container alive with `CMD [\"sleep\", \"infinity\"]`.\n\
+         - Do not add a Dockerfile `USER`; OutRig maps the host UID/GID at runtime.\n\
+         - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
+         - `outrig image build` validates `image.toml` and stamps the config into OCI labels.\n\
+         - The Dockerfile must not copy `image.toml` or any OutRig config file into the image.\n\
+         - Return exact file paths and complete file contents.\n\
+         - Check the proposed Dockerfile and `image.toml` against the documentation below.\n\
+         \n\
+         Read the bundled OutRig documentation and example before designing.\n",
+    );
+
+    append_bundled_docs(&mut out);
+
+    out.push_str("## Worked Example\n\n");
+    out.push_str(STANDALONE_EXAMPLE.trim());
+    out.push('\n');
+    out
+}
+
+fn append_bundled_docs(out: &mut String) {
+    out.push_str("\n## Bundled OutRig Docs\n\n");
+    for doc in docs::DOCS {
+        let _ = writeln!(out, "### doc/{}.md", doc.page);
+        let _ = writeln!(out);
+        out.push_str(doc.markdown.trim_end());
+        out.push_str("\n\n");
+    }
 }
 
 fn mcp_config_snippet(tool: McpConfigTool) -> &'static str {
@@ -219,18 +266,107 @@ context = ".agents/outrig/images/tools"
 ```
 "#;
 
+const STANDALONE_EXAMPLE: &str = r#"
+### Worked example: Standalone Rust toolset image
+
+User request: reusable Rust development image with filesystem and git MCP servers.
+
+`Dockerfile`:
+
+```Dockerfile
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm python3-pip passwd \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+ | sh -s -- -y --default-toolchain stable --profile default
+ENV PATH=/root/.cargo/bin:$PATH
+RUN npm install -g @modelcontextprotocol/server-filesystem
+RUN pip install --break-system-packages mcp-server-git
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
+```
+
+`image.toml`:
+
+```toml
+[image]
+ref = "rust-toolset:0.1.0"
+description = "Reusable Rust development image for OutRig"
+version = "0.1.0"
+tags = ["rust", "git"]
+
+[mcp]
+fs = { command = ["mcp-server-filesystem", "/workspace"] }
+git = { command = ["mcp-server-git", "--repository", "/workspace"] }
+```
+
+`README.md`:
+
+````markdown
+# rust-toolset
+
+Reusable OutRig image for Rust development.
+
+## Build
+
+```sh
+outrig image build
+```
+
+The build reads `image.toml`, validates the `[mcp]` table, stamps the config into OCI labels,
+and tags the image as `rust-toolset:0.1.0`.
+
+## Use from a repo
+
+```toml
+[images.rust-toolset]
+image-name = "rust-toolset:0.1.0"
+```
+
+The MCP servers are declared by the image labels, so the repo config does not need an
+`[images.rust-toolset.mcp]` block.
+````
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn prompt_contains_version_docs_and_examples() {
+    fn repo_local_prompt_contains_version_docs_and_examples() {
         let prompt = render_prompt();
         assert!(prompt.contains(env!("CARGO_PKG_VERSION")));
+        assert!(prompt.contains("# OutRig Container-Config Design Prompt"));
+        assert!(prompt.contains("`.agents/outrig/config.toml`"));
         assert!(prompt.contains("# Containers"));
         assert!(prompt.contains("# Config Reference"));
         assert!(prompt.contains("### Worked example: Rust container"));
         assert!(prompt.contains("### Worked example: Multi-MCP container"));
+    }
+
+    #[test]
+    fn standalone_prompt_contains_schema_conventions_and_example() {
+        let prompt = render_standalone_prompt();
+        for marker in [
+            "# OutRig Standalone Image Project Design Prompt",
+            "`Dockerfile`, `image.toml`, and `README.md`",
+            "`image.toml` requires `[image].ref` and a non-empty `[mcp]` table",
+            "`[image].description`, `[image].version`, and `[image].tags` are optional",
+            "`[build]` is optional",
+            "CMD [\"sleep\", \"infinity\"]",
+            "Do not add a Dockerfile `USER`",
+            "ensure it is on `PATH`",
+            "stamps the config into OCI labels",
+            "must not copy `image.toml`",
+            "### Worked example: Standalone Rust toolset image",
+            "[images.rust-toolset]",
+            "image-name = \"rust-toolset:0.1.0\"",
+        ] {
+            assert!(prompt.contains(marker), "prompt lacked {marker:?}");
+        }
+        assert!(prompt.contains("# Containers"));
+        assert!(prompt.contains("# Config Reference"));
     }
 
     #[test]

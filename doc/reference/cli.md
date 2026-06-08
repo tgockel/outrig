@@ -72,6 +72,26 @@ outrig config init [--force]
 
 See [Usage -> outrig config](../usage/config.md).
 
+### `outrig design prompt`
+
+Print a self-contained prompt for AI-assisted image design, or print an MCP setup snippet for
+tools that can attach `outrig mcp self`.
+
+```
+outrig design prompt
+outrig design prompt --standalone
+outrig design prompt --print-mcp-config <tool>
+```
+
+| Flag                        | Default | Description                                      |
+|-----------------------------|---------|--------------------------------------------------|
+| `--standalone`              | off     | Print a prompt for a standalone image project.   |
+| `--print-mcp-config <tool>` | none    | Print a setup snippet; wins over `--standalone`. |
+
+The valid `<tool>` names are `claude-code`, `claude-desktop`, `codex`, and `cursor`.
+
+See [Usage -> AI-assisted design](../usage/ai-assisted-design.md).
+
 ### `outrig image add`
 
 Interactively scaffold an image-config: writes a Dockerfile under
