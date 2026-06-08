@@ -154,16 +154,18 @@ See [Usage -> outrig image](../usage/image.md#outrig-image-build).
 
 ### `outrig image inspect`
 
-Inspect a local image's OutRig OCI labels without pulling it, creating a container, or starting
-any MCP server.
+Inspect an image's OutRig OCI labels without pulling it, creating a container, or starting any MCP
+server. By default this reads the local image store; `--remote` reads registry metadata with
+`skopeo inspect`.
 
 ```
-outrig image inspect <ref>
+outrig image inspect [--remote] <ref>
 ```
 
-| Argument | Description                              |
-|----------|------------------------------------------|
-| `<ref>`  | Local image ref to inspect. Never pulled. |
+| Argument   | Description                                   |
+|------------|-----------------------------------------------|
+| `<ref>`    | Image ref to inspect. Never pulled.           |
+| `--remote` | Read registry metadata with `skopeo inspect`. |
 
 See [Usage -> outrig image](../usage/image.md#outrig-image-inspect).
 

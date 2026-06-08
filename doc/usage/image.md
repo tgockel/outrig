@@ -4,8 +4,9 @@
 `outrig image add` scaffolds a repo-local image-config (a named Dockerfile + MCP-server
 bundle); `outrig image init` scaffolds a standalone image project whose build output is a
 reusable image, `outrig image build` builds and validates that project, and
-`outrig image inspect` reads a local image's declared labels. The rest of the group
-(`image ls`, `image rm`) is reserved for later.
+`outrig image inspect` reads an image's declared labels locally by default, or from a
+registry with `--remote`. The rest of the group (`image ls`, `image rm`) is reserved for
+later.
 
 ## `outrig image add`
 
@@ -341,20 +342,22 @@ buildah to force a clean build.
 
 ## outrig image inspect
 
-`outrig image inspect` prints the OutRig config labels declared by a local image. It is
-read-only: it checks the local image store, reads labels with `podman image inspect`, and never
-pulls, creates a container, or starts an MCP server. Live initialization and `tools/list` checks
-belong to [`outrig image build`](#outrig-image-build).
+`outrig image inspect` prints the OutRig config labels declared by an image. It is read-only:
+local mode checks the local image store and reads labels with `podman image inspect`; remote mode
+uses `skopeo inspect` against a registry. Neither mode pulls image layers, creates a container, or
+starts an MCP server. Live initialization and `tools/list` checks belong to
+[`outrig image build`](#outrig-image-build).
 
 ### Synopsis
 
 ```
-outrig image inspect <ref>
+outrig image inspect [--remote] <ref>
 ```
 
-| Argument | Description                            |
-|----------|----------------------------------------|
-| `<ref>`  | Local image ref to inspect. Never pulled. |
+| Argument   | Description                                   |
+|------------|-----------------------------------------------|
+| `<ref>`    | Image ref to inspect. Never pulled.           |
+| `--remote` | Read registry metadata with `skopeo inspect`. |
 
 ### Output
 
@@ -375,9 +378,19 @@ mcp:
       TOKEN: "${DB_TOKEN}"
 ```
 
-`description`, `version`, and `tags` appear only when the image carries those labels. If a
-local image has no `org.outrig.mcp` label, inspect still prints the image ref and any metadata
-labels it finds, then omits the `mcp:` section.
+`description`, `version`, and `tags` appear only when the image carries those labels. If the
+image has no `org.outrig.mcp` label, inspect still prints the image ref and any metadata labels it
+finds, then omits the `mcp:` section.
+
+Use `--remote` when the ref is in a registry and you want the labels without pulling it:
+
+```sh
+outrig image inspect --remote ghcr.io/acme/rust-dev:latest
+```
+
+Remote inspection requires `skopeo` on `PATH`. Authentication uses the normal container
+credentials that `skopeo` reads, such as credentials created by `skopeo login`, `podman login`,
+`buildah login`, or `docker login`.
 
 ### Failure modes
 
@@ -385,6 +398,11 @@ The command exits nonzero -- printing `error: ...` -- in these cases:
 
 - **The image is not present locally**: inspect reports a local-only not-found error and does not
   attempt a pull.
+- **`--remote` is used but `skopeo` is not installed**: inspect reports the missing runtime
+  dependency.
+- **The registry request fails**: `skopeo` errors, including missing credentials or denied access,
+  are reported with the command and stderr tail.
+- **The remote ref uses an unsupported transport**: use a plain registry ref or `docker://<ref>`.
 - **A declared OutRig label is malformed**: invalid `org.outrig.tags` or `org.outrig.mcp` values
   fail before anything is started.
 

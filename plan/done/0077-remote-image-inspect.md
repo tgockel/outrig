@@ -33,9 +33,25 @@ Add remote, no-layer-pull inspection of standalone image labels to `outrig image
 - `outrig image inspect` can report metadata and declared MCP servers from a remote image
   ref without pulling image layers.
 - The remote path reuses the local inspect rendering and the 0072 label codec.
-- Missing labels, registry/auth failures, and unsupported refs return clear errors.
+- Remote images with no OutRig labels match local inspect by printing the image ref and any
+  metadata labels, then omitting `mcp:`. Registry/auth failures and unsupported refs return clear
+  errors.
 - Local inspect behavior from 0075 is unchanged.
 
 ## Dependencies
 
 - **Hard: 0075**. Remote inspection extends the local label inspect command and rendering.
+
+## Decisions
+
+1. Remote inspection is explicit: `outrig image inspect --remote <ref>`.
+   Local inspect keeps the 0075 local-only/no-pull behavior and does not
+   fall back to the network for missing local refs.
+2. The remote reader shells out to `skopeo inspect --no-tags docker://<ref>`.
+   This keeps registry auth and transport behavior aligned with the existing
+   container tools instead of adding a Rust registry client.
+3. Remote refs accept plain registry refs and already-prefixed `docker://`
+   refs. Other explicit transports are rejected because this command is not a
+   generic skopeo wrapper.
+4. A remote image with no `org.outrig.mcp` label matches local inspect:
+   print the image ref and any metadata labels, then omit `mcp:`.

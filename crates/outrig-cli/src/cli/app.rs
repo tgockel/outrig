@@ -132,9 +132,12 @@ enum ImageCmd {
         #[arg(long = "no-cache")]
         no_cache: bool,
     },
-    /// Inspect a local image's OutRig labels without starting it.
+    /// Inspect an image's OutRig labels without starting it.
     Inspect {
-        /// Local image ref to inspect. The command never pulls.
+        /// Inspect the registry ref with skopeo instead of the local image store.
+        #[arg(long)]
+        remote: bool,
+        /// Image ref to inspect. Local mode never pulls; remote mode reads registry metadata.
         #[arg(value_name = "REF")]
         image_ref: String,
     },
@@ -244,11 +247,11 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 ))?;
                 Ok(0)
             }
-            ImageCmd::Inspect { image_ref } => {
+            ImageCmd::Inspect { remote, image_ref } => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(image_setup::inspect::run(image_ref))?;
+                runtime.block_on(image_setup::inspect::run(image_ref, *remote))?;
                 Ok(0)
             }
         },
@@ -341,7 +344,9 @@ fn repo_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)
 
 #[cfg(test)]
 mod tests {
-    use super::log_filter_spec;
+    use clap::Parser;
+
+    use super::{Cli, Cmd, ImageCmd, log_filter_spec};
 
     #[test]
     fn outrig_log_wins_over_rust_log() {
@@ -359,5 +364,43 @@ mod tests {
     #[test]
     fn log_filter_defaults_to_info() {
         assert_eq!(log_filter_spec(None, None), "info");
+    }
+
+    #[test]
+    fn image_inspect_defaults_to_local() {
+        let cli =
+            Cli::try_parse_from(["outrig", "image", "inspect", "rust-dev"]).expect("arg parses");
+
+        let Cmd::Image(args) = cli.cmd else {
+            panic!("expected image command");
+        };
+        let ImageCmd::Inspect { remote, image_ref } = args.cmd else {
+            panic!("expected image inspect command");
+        };
+
+        assert!(!remote);
+        assert_eq!(image_ref, "rust-dev");
+    }
+
+    #[test]
+    fn image_inspect_remote_arg_parses() {
+        let cli = Cli::try_parse_from([
+            "outrig",
+            "image",
+            "inspect",
+            "--remote",
+            "quay.io/acme/rust-dev:latest",
+        ])
+        .expect("arg parses");
+
+        let Cmd::Image(args) = cli.cmd else {
+            panic!("expected image command");
+        };
+        let ImageCmd::Inspect { remote, image_ref } = args.cmd else {
+            panic!("expected image inspect command");
+        };
+
+        assert!(remote);
+        assert_eq!(image_ref, "quay.io/acme/rust-dev:latest");
     }
 }

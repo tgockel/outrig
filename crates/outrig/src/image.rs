@@ -10,8 +10,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
+use std::io::ErrorKind;
 use std::path::Path;
 
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{ImageConfig, ImageSourceRef};
@@ -26,6 +28,15 @@ const TAG_PREFIX: &str = "outrig-cache";
 const KEY_HEX_LEN: usize = 16;
 const TAR_READ_CHUNK: usize = 64 * 1024;
 const UNNAMED_IMAGE: &str = "<image>";
+const DOCKER_TRANSPORT_PREFIX: &str = "docker://";
+const UNSUPPORTED_REMOTE_TRANSPORTS: &[&str] = &[
+    "containers-storage:",
+    "dir:",
+    "docker-archive:",
+    "docker-daemon:",
+    "oci:",
+    "oci-archive:",
+];
 
 /// Repository name for a build-type image: the image-config name, falling back
 /// to [`TAG_PREFIX`] for the nameless library path ([`UNNAMED_IMAGE`]).
@@ -453,6 +464,84 @@ pub async fn read_image_labels(
     })
 }
 
+/// Read OCI labels from a registry ref via `skopeo inspect` without pulling
+/// image layers. Plain image refs are inspected as `docker://<ref>`, and an
+/// already-prefixed `docker://...` ref is accepted. Other explicit skopeo
+/// transports are rejected so `outrig image inspect --remote` stays a registry
+/// read rather than a generic skopeo wrapper.
+pub async fn read_remote_image_labels(image_ref: &str) -> Result<BTreeMap<String, String>> {
+    read_remote_image_labels_with_program("skopeo", image_ref).await
+}
+
+async fn read_remote_image_labels_with_program(
+    program: &'static str,
+    image_ref: &str,
+) -> Result<BTreeMap<String, String>> {
+    let remote_ref = docker_transport_ref(image_ref)?;
+    let output = match process::run_capture(
+        Cmd::new(program)
+            .arg("inspect")
+            .arg("--no-tags")
+            .arg(&remote_ref),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(OutrigError::Io(source)) if source.kind() == ErrorKind::NotFound => {
+            return Err(OutrigError::Configuration(
+                "`outrig image inspect --remote` requires `skopeo` on PATH".to_string(),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    labels_from_skopeo_inspect(&remote_ref, &output.stdout)
+}
+
+fn docker_transport_ref(image_ref: &str) -> Result<String> {
+    let image_ref = image_ref.trim();
+    if image_ref.is_empty() {
+        return Err(OutrigError::Configuration(
+            "remote image ref must not be empty".to_string(),
+        ));
+    }
+    if image_ref == DOCKER_TRANSPORT_PREFIX {
+        return Err(OutrigError::Configuration(
+            "remote image ref must include a repository after docker://".to_string(),
+        ));
+    }
+    if image_ref.starts_with(DOCKER_TRANSPORT_PREFIX) {
+        return Ok(image_ref.to_string());
+    }
+    if image_ref.contains("://") || has_unsupported_remote_transport(image_ref) {
+        return Err(OutrigError::Configuration(format!(
+            "unsupported remote image ref {image_ref:?}; use a registry ref or docker://<ref>"
+        )));
+    }
+    Ok(format!("{DOCKER_TRANSPORT_PREFIX}{image_ref}"))
+}
+
+fn has_unsupported_remote_transport(image_ref: &str) -> bool {
+    UNSUPPORTED_REMOTE_TRANSPORTS
+        .iter()
+        .filter_map(|transport| image_ref.strip_prefix(transport))
+        .any(|rest| rest.starts_with('/') || rest.starts_with('.') || rest.contains(':'))
+}
+
+fn labels_from_skopeo_inspect(remote_ref: &str, stdout: &[u8]) -> Result<BTreeMap<String, String>> {
+    let parsed: SkopeoInspect = serde_json::from_slice(stdout).map_err(|source| {
+        OutrigError::Configuration(format!(
+            "skopeo inspect {remote_ref}: invalid inspect JSON: {source}"
+        ))
+    })?;
+    Ok(parsed.labels.unwrap_or_default())
+}
+
+#[derive(Debug, Deserialize)]
+struct SkopeoInspect {
+    #[serde(rename = "Labels")]
+    labels: Option<BTreeMap<String, String>>,
+}
+
 fn build_image_cmd(
     cfg: &ImageConfig,
     repo_root: &Path,
@@ -645,6 +734,7 @@ async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::*;
@@ -679,6 +769,158 @@ mod tests {
             !cmd.args
                 .contains(&OsString::from("GH_TOKEN=${GITHUB_TOKEN}"))
         );
+    }
+
+    #[test]
+    fn docker_transport_ref_accepts_plain_and_docker_refs() {
+        assert_eq!(
+            docker_transport_ref("quay.io/acme/rust-dev:latest").expect("plain ref"),
+            "docker://quay.io/acme/rust-dev:latest"
+        );
+        assert_eq!(
+            docker_transport_ref("docker://quay.io/acme/rust-dev@sha256:abc").expect("docker ref"),
+            "docker://quay.io/acme/rust-dev@sha256:abc"
+        );
+        assert_eq!(
+            docker_transport_ref("localhost:5000/acme/rust-dev:latest").expect("port ref"),
+            "docker://localhost:5000/acme/rust-dev:latest"
+        );
+        assert_eq!(
+            docker_transport_ref("oci:latest").expect("short image tag"),
+            "docker://oci:latest"
+        );
+    }
+
+    #[test]
+    fn docker_transport_ref_rejects_empty_and_non_registry_refs() {
+        for image_ref in [
+            "",
+            "   ",
+            "docker://",
+            "oci:/tmp/layout:latest",
+            "dir:/tmp/image",
+            "docker-daemon:busybox:latest",
+            "http://registry.example.com/image:latest",
+        ] {
+            let err = docker_transport_ref(image_ref).expect_err("ref should be rejected");
+            assert!(matches!(err, OutrigError::Configuration(_)));
+        }
+    }
+
+    #[test]
+    fn labels_from_skopeo_inspect_reads_labels_map() {
+        let labels = labels_from_skopeo_inspect(
+            "docker://example.com/acme/rust-dev:latest",
+            br#"{
+                "Name": "example.com/acme/rust-dev",
+                "Labels": {
+                    "org.opencontainers.image.description": "Rust tooling",
+                    "org.outrig.mcp": "{\"fs\":[\"mcp-server-filesystem\",\"/workspace\"]}"
+                }
+            }"#,
+        )
+        .expect("labels parse");
+
+        assert_eq!(
+            labels["org.opencontainers.image.description"],
+            "Rust tooling"
+        );
+        assert_eq!(
+            labels["org.outrig.mcp"],
+            r#"{"fs":["mcp-server-filesystem","/workspace"]}"#
+        );
+    }
+
+    #[test]
+    fn labels_from_skopeo_inspect_allows_null_or_missing_labels() {
+        assert!(
+            labels_from_skopeo_inspect("docker://example.com/plain:latest", br#"{"Labels":null}"#)
+                .expect("null labels parse")
+                .is_empty()
+        );
+        assert!(
+            labels_from_skopeo_inspect("docker://example.com/plain:latest", br#"{"Name":"plain"}"#)
+                .expect("missing labels parse")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn labels_from_skopeo_inspect_rejects_invalid_json() {
+        let err =
+            labels_from_skopeo_inspect("docker://example.com/plain:latest", br#"{"Labels": "#)
+                .expect_err("invalid JSON must fail");
+
+        assert!(matches!(err, OutrigError::Configuration(_)));
+        assert!(
+            err.to_string().contains("invalid inspect JSON"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_remote_image_labels_invokes_skopeo_inspect_no_tags() {
+        let program = fake_skopeo(
+            "if [ \"$1\" != inspect ] || [ \"$2\" != --no-tags ] || \
+             [ \"$3\" != docker://example.com/acme/rust-dev:latest ]; then\n\
+             echo bad argv: \"$@\" >&2\n\
+             exit 42\n\
+             fi\n\
+             printf '%s' '{\"Labels\":{\"org.outrig.tags\":\"[\\\"remote\\\"]\"}}'\n",
+        );
+
+        let labels =
+            read_remote_image_labels_with_program(program, "example.com/acme/rust-dev:latest")
+                .await
+                .expect("fake skopeo succeeds");
+
+        assert_eq!(labels["org.outrig.tags"], r#"["remote"]"#);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_remote_image_labels_surfaces_registry_failures() {
+        let program = fake_skopeo("echo registry auth required >&2\nexit 7\n");
+
+        let err = read_remote_image_labels_with_program(program, "example.com/private:latest")
+            .await
+            .expect_err("fake skopeo failure must surface");
+
+        let OutrigError::Process {
+            exit_code,
+            stderr_tail,
+            ..
+        } = err
+        else {
+            panic!("expected process error");
+        };
+        assert_eq!(exit_code, Some(7));
+        assert!(stderr_tail.contains("registry auth required"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_remote_image_labels_reports_missing_skopeo() {
+        let err = read_remote_image_labels_with_program(
+            "__outrig_missing_skopeo_for_test__",
+            "example.com/acme/rust-dev:latest",
+        )
+        .await
+        .expect_err("missing binary must fail");
+
+        assert!(matches!(err, OutrigError::Configuration(_)));
+        assert!(err.to_string().contains("requires `skopeo`"), "got: {err}");
+    }
+
+    fn fake_skopeo(body: &str) -> &'static str {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("skopeo");
+        let script = format!("#!/bin/sh\n{body}");
+        std::fs::write(&path, script).expect("write fake skopeo");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod fake skopeo");
+        let path = path.to_str().expect("utf-8 fake skopeo path").to_string();
+        std::mem::forget(dir);
+        Box::leak(path.into_boxed_str())
     }
 }
 

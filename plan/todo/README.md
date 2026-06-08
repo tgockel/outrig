@@ -8,4 +8,3 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 | Task | Title | Dependencies |
 |---|---|---|
-| 0077 | Remote `outrig image inspect` (no-pull, via labels) | 0075 |
