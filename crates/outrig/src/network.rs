@@ -754,22 +754,50 @@ async fn forward_dns(query: &[u8], resolvers: &[SocketAddr]) -> io::Result<Vec<u
 }
 
 fn host_resolvers() -> Vec<SocketAddr> {
+    let primary = read_resolvers("/etc/resolv.conf");
+    let systemd_upstream = read_resolvers("/run/systemd/resolve/resolv.conf");
+    select_host_resolvers(primary, systemd_upstream)
+}
+
+fn read_resolvers(path: &str) -> Vec<SocketAddr> {
+    std::fs::read_to_string(path)
+        .map(|text| parse_resolvers(&text))
+        .unwrap_or_default()
+}
+
+fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
     let mut out = Vec::new();
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-        for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            let Some(raw) = line.strip_prefix("nameserver").map(str::trim) else {
-                continue;
-            };
-            if let Ok(ip) = raw.parse::<IpAddr>() {
-                out.push(SocketAddr::new(ip, 53));
-            }
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some(raw) = line.strip_prefix("nameserver").map(str::trim) else {
+            continue;
+        };
+        if let Ok(ip) = raw.parse::<IpAddr>() {
+            out.push(SocketAddr::new(ip, 53));
         }
     }
-    if out.is_empty() {
-        out.push(SocketAddr::from(([1, 1, 1, 1], 53)));
-    }
     out
+}
+
+fn select_host_resolvers(
+    primary: Vec<SocketAddr>,
+    systemd_upstream: Vec<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if !primary.is_empty() && primary.iter().all(|resolver| resolver.ip().is_loopback()) {
+        let upstream: Vec<_> = systemd_upstream
+            .into_iter()
+            .filter(|resolver| !resolver.ip().is_loopback())
+            .collect();
+        if !upstream.is_empty() {
+            return upstream;
+        }
+    }
+
+    if primary.is_empty() {
+        vec![SocketAddr::from(([1, 1, 1, 1], 53))]
+    } else {
+        primary
+    }
 }
 
 async fn container_pid(container: &Container) -> Result<u32> {
@@ -1353,6 +1381,49 @@ mod tests {
         assert!(rules.contains("ip6 daddr ::1 return"));
         assert!(rules.contains("meta l4proto tcp redirect to :44123"));
         assert!(rules.contains("udp dport 53 redirect to :44124"));
+    }
+
+    #[test]
+    fn resolver_parser_reads_nameserver_lines_only() {
+        let resolvers = parse_resolvers(
+            "\
+# generated file
+search example.test
+nameserver 127.0.0.53 # local stub
+nameserver 2001:4860:4860::8888
+options edns0
+",
+        );
+
+        assert_eq!(
+            resolvers,
+            vec![
+                SocketAddr::from(([127, 0, 0, 53], 53)),
+                SocketAddr::new("2001:4860:4860::8888".parse().expect("ipv6"), 53),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_resolvers_prefer_systemd_upstream_when_primary_is_stub() {
+        let primary = vec![SocketAddr::from(([127, 0, 0, 53], 53))];
+        let upstream = vec![
+            SocketAddr::from(([127, 0, 0, 54], 53)),
+            SocketAddr::from(([172, 20, 232, 252], 53)),
+        ];
+
+        assert_eq!(
+            select_host_resolvers(primary, upstream),
+            vec![SocketAddr::from(([172, 20, 232, 252], 53))]
+        );
+    }
+
+    #[test]
+    fn host_resolvers_keep_primary_when_it_has_upstream_nameserver() {
+        let primary = vec![SocketAddr::from(([10, 0, 2, 3], 53))];
+        let upstream = vec![SocketAddr::from(([172, 20, 232, 252], 53))];
+
+        assert_eq!(select_host_resolvers(primary.clone(), upstream), primary);
     }
 
     #[test]

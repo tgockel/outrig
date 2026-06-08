@@ -30,7 +30,10 @@ use outrig_cli::rig_tool::McpToolAdapter;
 use rig::tool::ToolDyn;
 
 fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("outrig-cli is under crates/")
+        .join("outrig/tests/fixtures/mcp-fs")
 }
 
 fn init_tracing() {

@@ -44,3 +44,25 @@ Repair the pre-existing e2e compile drift so later image tasks can rely on the f
 
 - **Hard: 0072**. The drift was found while migrating the embedded-image e2e suites in
   the OCI-label task.
+
+## Decisions
+
+- The `BuildArgs { container: ... }` compile drift noted in the original task had
+  already been repaired on trunk; the remaining stale e2e failure was the
+  library-crate integration test using `CARGO_BIN_EXE_outrig` for CLI-driven
+  cases.
+- The CLI-driven embedded-image cases were moved into `outrig-cli` instead of
+  switching to runtime `std::env::var("CARGO_BIN_EXE_outrig")`, because Cargo only
+  guarantees that binary path for the package that owns the binary.
+- Running the full e2e suite exposed harness rot beyond compilation: the network
+  interceptor tests depended on external DNS/HTTPS reachability and blocked the
+  current-thread Tokio runtime with synchronous podman calls. Those tests now use
+  local host-container traffic, resolve the target IP explicitly, and run on a
+  small multi-thread runtime.
+- Intercepted DNS forwarding now prefers the systemd-resolved upstream file when
+  `/etc/resolv.conf` only points at a loopback stub, so containers can still
+  resolve through the interceptor on systemd-resolved hosts.
+- The image-build e2e test now parses the `org.outrig.mcp` label JSON instead of
+  matching the old short-form substring shape.
+- The CLI `rig_tool_dispatch` and `run_smoke` e2e tests now resolve the shared
+  `mcp-fs` fixture from the library crate path, matching the other CLI e2e tests.

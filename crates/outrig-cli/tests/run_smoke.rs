@@ -27,7 +27,10 @@ use tokio::time::timeout;
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn fixture_mcp_fs_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("outrig-cli is under crates/")
+        .join("outrig/tests/fixtures/mcp-fs")
 }
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {

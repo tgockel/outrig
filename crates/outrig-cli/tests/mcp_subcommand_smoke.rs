@@ -569,7 +569,7 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(
-            tool_names.iter().any(|name| *name == "fs__list_directory"),
+            tool_names.contains(&"fs__list_directory"),
             "tools/list should include fs__list_directory: {list}"
         );
 

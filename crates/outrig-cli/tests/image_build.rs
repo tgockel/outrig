@@ -19,6 +19,7 @@ use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
+use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -75,6 +76,15 @@ async fn podman_image_labels(tag: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn mcp_label_json(labels: &str) -> Value {
+    let labels: Value = serde_json::from_str(labels).expect("podman labels JSON");
+    let mcp = labels
+        .get("org.outrig.mcp")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("built image should carry org.outrig.mcp: {labels}"));
+    serde_json::from_str(mcp).expect("org.outrig.mcp label JSON")
+}
+
 /// Acceptance: building the `outrig image init rust-dev` scaffold succeeds, and
 /// its declared MCP server is live-tested (initialize + tools/list).
 #[tokio::test]
@@ -97,13 +107,11 @@ async fn generated_scaffold_builds_and_mcp_boots() {
     // The build stamps the config into OCI labels; confirm they read back off
     // the built image (acceptance: "reads them back off the built image").
     let labels = podman_image_labels("rust-dev").await;
-    assert!(
-        labels.contains("org.outrig.mcp"),
-        "built image should carry org.outrig.mcp: {labels}"
-    );
-    assert!(
-        labels.contains("\"fs\""),
-        "org.outrig.mcp should declare the fs server: {labels}"
+    let mcp = mcp_label_json(&labels);
+    assert_eq!(
+        mcp["fs"]["command"],
+        json!(["mcp-server-filesystem", "/workspace"]),
+        "org.outrig.mcp should declare the fs server: {labels}",
     );
 }
 

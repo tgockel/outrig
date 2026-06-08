@@ -1,6 +1,6 @@
 //! End-to-end smoke for audit-mode network interception. Gated behind
-//! `--features e2e` because it needs podman/buildah, nftables namespace
-//! access, DNS, and external HTTPS connectivity.
+//! `--features e2e` because it needs podman/buildah and nftables namespace
+//! access.
 //!
 //! Run with:
 //!
@@ -13,6 +13,8 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -90,8 +92,62 @@ fn try_capture(cmd: &mut Command) -> Output {
     cmd.output().expect("spawn command")
 }
 
-#[tokio::test]
-async fn curl_https_example_dot_com_writes_allow_audit_record() {
+fn container_host_ipv4(container: &Container) -> String {
+    let output = run_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["getent", "hosts", "host.containers.internal"]),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let ip = fields.next()?;
+            ip.parse::<Ipv4Addr>().is_ok().then(|| ip.to_string())
+        })
+        .unwrap_or_else(|| panic!("host.containers.internal resolved to no IPv4 address: {stdout}"))
+}
+
+fn start_http_fixture() -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind fixture HTTP server");
+    listener
+        .set_nonblocking(true)
+        .expect("fixture listener nonblocking");
+    let addr = listener.local_addr().expect("fixture listener addr");
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Length: 2\r\n\
+                          Connection: close\r\n\
+                          \r\n\
+                          ok",
+                    );
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (addr, handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn curl_http_host_writes_allow_audit_record() {
     let _guard = E2E_LOCK.lock().await;
     common::init_tracing();
 
@@ -110,16 +166,27 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
     .await
     .expect("start container");
     container.bootstrap_user().await.expect("bootstrap user");
+    let host_ip = container_host_ipv4(&container);
+    let (server_addr, server_handle) = start_http_fixture();
 
     let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
         .await
         .expect("start network interceptor");
 
-    run_capture(
+    let output = try_capture(
         Command::new("podman")
             .arg("exec")
             .arg(container.name())
-            .args(["curl", "-fsS", "https://example.com"]),
+            .args(["curl", "-fsS", "--connect-timeout", "5", "--max-time", "10"])
+            .args(["-H", "Host: example.com"])
+            .arg(format!("http://{host_ip}:{}/", server_addr.port())),
+    );
+    let _ = server_handle.join();
+    assert!(
+        output.status.success(),
+        "curl through interceptor failed: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let records = read_audit_records(&log_dir).await;
@@ -127,9 +194,10 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
         .iter()
         .find(|record| {
             record.get("outrig.host").and_then(Value::as_str) == Some("example.com")
-                && record.get("id.resp_p").and_then(Value::as_u64) == Some(443)
+                && record.get("id.resp_p").and_then(Value::as_u64)
+                    == Some(server_addr.port() as u64)
         })
-        .unwrap_or_else(|| panic!("no example.com:443 audit record in {records:#?}"));
+        .unwrap_or_else(|| panic!("no example.com HTTP audit record in {records:#?}"));
 
     assert_eq!(
         record.get("outrig.action").and_then(Value::as_str),
@@ -140,17 +208,11 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
         Some("default")
     );
     assert_eq!(record.get("proto").and_then(Value::as_str), Some("tcp"));
-    assert_eq!(record.get("service").and_then(Value::as_str), Some("ssl"));
+    assert_eq!(record.get("service").and_then(Value::as_str), Some("http"));
     assert_eq!(
-        record.get("server_name").and_then(Value::as_str),
-        Some("example.com")
-    );
-    assert!(
-        record
-            .get("id.resp_h")
-            .and_then(Value::as_str)
-            .is_some_and(|ip| !ip.is_empty()),
-        "audit record should include destination IP: {record:#?}"
+        record.get("id.resp_h").and_then(Value::as_str),
+        Some(host_ip.as_str()),
+        "audit record should include the host destination IP",
     );
     assert!(
         record
@@ -177,7 +239,7 @@ async fn curl_https_example_dot_com_writes_allow_audit_record() {
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     let _guard = E2E_LOCK.lock().await;
     common::init_tracing();
@@ -197,6 +259,7 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     .await
     .expect("start container");
     container.bootstrap_user().await.expect("bootstrap user");
+    let host_ip = container_host_ipv4(&container);
 
     let policy = NetworkPolicy::builder()
         .default_action(NetworkAction::Allow)
@@ -221,8 +284,12 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
                 "-fsS",
                 "--connect-timeout",
                 "5",
-                "https://example.com",
-            ]),
+                "--max-time",
+                "10",
+                "--resolve",
+            ])
+            .arg(format!("example.com:443:{host_ip}"))
+            .arg("https://example.com"),
     );
     assert!(
         !output.status.success(),
@@ -245,6 +312,16 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     assert_eq!(
         record.get("outrig.rule").and_then(Value::as_str),
         Some("deny[0]")
+    );
+    assert_eq!(
+        record.get("id.resp_h").and_then(Value::as_str),
+        Some(host_ip.as_str()),
+        "audit record should include the curl --resolve destination IP",
+    );
+    assert_eq!(record.get("service").and_then(Value::as_str), Some("ssl"));
+    assert_eq!(
+        record.get("server_name").and_then(Value::as_str),
+        Some("example.com")
     );
     assert_eq!(record.get("orig_bytes").and_then(Value::as_u64), Some(0));
     assert_eq!(record.get("resp_bytes").and_then(Value::as_u64), Some(0));
