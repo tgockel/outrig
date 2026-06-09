@@ -67,7 +67,8 @@ mod tests {
         assert_eq!(schema.image_labels.mcp, "org.outrig.mcp");
         assert_eq!(schema.image_labels.schema, "org.outrig.schema");
         assert!(
-            schema.image_config_schema.get("definitions").is_some(),
+            schema.image_config_schema.get("definitions").is_some()
+                || schema.image_config_schema.get("$defs").is_some(),
             "image schema should carry definitions: {:?}",
             schema.image_config_schema,
         );

@@ -25,7 +25,7 @@ heck               = { workspace = true }
 ignore             = { workspace = true }
 jiff               = { workspace = true, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
 nix                = { workspace = true, features = ["user", "fs", "process", "signal"] }
-rand               = { workspace = true, features = ["std", "std_rng"] }
+rand               = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
 schemars           = { workspace = true, features = ["derive"] }
@@ -42,4 +42,4 @@ tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "trac
 walkdir            = { workspace = true }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls"] }

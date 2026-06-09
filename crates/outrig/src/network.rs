@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::libc;
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -443,7 +443,7 @@ fn zeek_timestamp(ts: SystemTime) -> f64 {
 
 fn zeek_uid() -> String {
     let mut buf = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     format!(
         "C{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         buf[0],

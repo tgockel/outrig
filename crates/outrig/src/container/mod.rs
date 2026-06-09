@@ -618,13 +618,13 @@ fn untrack(name: &str) {
 
 fn runtime_id() -> String {
     use jiff::Zoned;
-    use rand::RngCore;
+    use rand::Rng;
 
     let ts = Zoned::now()
         .with_time_zone(jiff::tz::TimeZone::UTC)
         .strftime("%Y%m%dT%H%M%S");
     let mut buf = [0_u8; 2];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     format!("{ts}-{:02x}{:02x}", buf[0], buf[1])
 }
 

@@ -8,9 +8,9 @@
 
 use std::env::VarError;
 
-use schemars::JsonSchema;
-use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{InstanceType, Schema, SchemaObject};
+use std::borrow::Cow;
+
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
@@ -77,19 +77,15 @@ impl<'de> Deserialize<'de> for EnvValue {
 }
 
 impl JsonSchema for EnvValue {
-    fn is_referenceable() -> bool {
-        false
+    fn inline_schema() -> bool {
+        true
     }
 
-    fn schema_name() -> String {
-        "EnvValue".to_string()
+    fn schema_name() -> Cow<'static, str> {
+        "EnvValue".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        SchemaObject {
-            instance_type: Some(InstanceType::String.into()),
-            ..Default::default()
-        }
-        .into()
+        json_schema!({ "type": "string" })
     }
 }

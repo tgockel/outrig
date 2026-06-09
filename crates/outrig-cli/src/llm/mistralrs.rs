@@ -763,9 +763,9 @@ fn translate_choice(
     if let Some(text) = &first.message.content
         && !text.is_empty()
     {
-        items.push(AssistantContent::Text(rig::completion::message::Text {
-            text: text.clone(),
-        }));
+        items.push(AssistantContent::Text(rig::completion::message::Text::new(
+            text.clone(),
+        )));
     }
 
     if let Some(calls) = &first.message.tool_calls {
@@ -775,9 +775,9 @@ fn translate_choice(
     }
 
     if items.is_empty() {
-        items.push(AssistantContent::Text(rig::completion::message::Text {
-            text: String::new(),
-        }));
+        items.push(AssistantContent::Text(rig::completion::message::Text::new(
+            String::new(),
+        )));
     }
 
     OneOrMany::many(items).map_err(|e| {
@@ -807,6 +807,8 @@ fn translate_usage(usage: &mistralrs_core::Usage) -> Usage {
         total_tokens: usage.total_tokens as u64,
         cached_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        tool_use_prompt_tokens: 0,
+        reasoning_tokens: 0,
     }
 }
 
