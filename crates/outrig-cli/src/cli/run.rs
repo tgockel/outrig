@@ -45,9 +45,10 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub model: Option<String>,
 
-    /// Pick a `[images.<name>]` block. Overrides the agent's `image`
-    /// and the top-level `default-image`.
-    #[arg(long, value_name = "NAME")]
+    /// Pick a `[images.<name>]` block. Overrides the agent's `image` and the
+    /// top-level `default-image`. An explicit value that doesn't match config
+    /// is used as a local Podman image ref, run without pulling.
+    #[arg(long, value_name = "NAME-OR-LOCAL-REF")]
     pub image: Option<String>,
 
     /// Write the session into an explicit, already-existing directory. The

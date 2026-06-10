@@ -219,31 +219,28 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         (None, None)
     };
 
-    let image_cfg_name = match &attach {
-        Some(attach) => attach.image_cfg_name.clone(),
-        None => args
-            .image_flag
-            .or(agent_image.as_deref())
-            .or(cfg.default_image.as_deref())
-            .ok_or_else(|| {
-                let msg = if args.require_agent {
-                    "no --image, agent.image, or default-image configured"
-                } else {
-                    "no --image or default-image configured"
-                };
-                OutrigError::Configuration(msg.to_string())
-            })?
-            .to_string(),
+    let (image_cfg_name, allow_raw_image) = match &attach {
+        Some(attach) => (attach.image_cfg_name.clone(), true),
+        None => match args.image_flag {
+            Some(image) => (image.to_string(), true),
+            None => {
+                let image = agent_image
+                    .as_deref()
+                    .or(cfg.default_image.as_deref())
+                    .ok_or_else(|| {
+                        let msg = if args.require_agent {
+                            "no --image, agent.image, or default-image configured"
+                        } else {
+                            "no --image or default-image configured"
+                        };
+                        OutrigError::Configuration(msg.to_string())
+                    })?;
+                (image.to_string(), false)
+            }
+        },
     };
-    let image_cfg = cfg
-        .images
-        .get(&image_cfg_name)
-        .ok_or_else(|| {
-            OutrigError::Configuration(format!(
-                "image-config {image_cfg_name:?} does not match any [images.<name>]"
-            ))
-        })?
-        .clone();
+    let (image_cfg, raw_local_image) =
+        resolve_image_config(&cfg, &image_cfg_name, allow_raw_image)?;
     if let Some(attach) = &attach {
         span.done(format!(
             "attach target resolved: container {}, image-config {}",
@@ -277,7 +274,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         inspect.image_tag
     } else {
         let span = ProgressSpan::start("computing image tag");
-        let image_tag = image::compute_tag_for(&image_cfg_name, &image_cfg, &repo_root).await?;
+        let image_tag = if raw_local_image {
+            ImageTag(image_cfg_name.clone())
+        } else {
+            image::compute_tag_for(&image_cfg_name, &image_cfg, &repo_root).await?
+        };
         span.done(format!("image tag computed: {image_tag}"));
         image_tag
     };
@@ -380,23 +381,29 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         }
     } else {
         let span = ProgressSpan::start(format!("ensuring image {image_tag}"));
-        let image_outcome = match image::ensure_tagged_image_for(
-            &image_cfg_name,
-            &image_cfg,
-            &repo_root,
-            &image_tag,
-            false,
-            transcript.as_ref(),
-        )
-        .await
-        {
+        let ensure = if raw_local_image {
+            image::ensure_local_image(&image_tag, transcript.as_ref()).await
+        } else {
+            image::ensure_tagged_image_for(
+                &image_cfg_name,
+                &image_cfg,
+                &repo_root,
+                &image_tag,
+                false,
+                transcript.as_ref(),
+            )
+            .await
+        };
+        let image_outcome = match ensure {
             Ok(outcome) => outcome,
             Err(e) => {
                 let _ = store.finalize(&sid, SystemTime::now(), 1);
                 return Err(e.into());
             }
         };
-        let cache_status = if image_outcome.cache_hit {
+        let cache_status = if raw_local_image {
+            "local image"
+        } else if image_outcome.cache_hit {
             "cache hit"
         } else {
             "built"
@@ -480,6 +487,40 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         attached: attach.is_some(),
         network,
     })
+}
+
+/// Resolve an image-config name to its [`ImageConfig`] and whether it is a
+/// *raw local image* -- a ref used verbatim that is never built or pulled.
+///
+/// A name matching a `[images.<name>]` block uses that config (not raw).
+/// Otherwise, when `allow_raw_image` is set and the name is non-empty, a
+/// minimal image-only config naming the ref itself is synthesized (raw).
+/// Otherwise it is an error.
+fn resolve_image_config(
+    cfg: &Config,
+    image_cfg_name: &str,
+    allow_raw_image: bool,
+) -> Result<(ImageConfig, bool)> {
+    if let Some(image_cfg) = cfg.images.get(image_cfg_name) {
+        return Ok((image_cfg.clone(), false));
+    }
+
+    if allow_raw_image && !image_cfg_name.trim().is_empty() {
+        let image_cfg = ImageConfig {
+            image_name: Some(image_cfg_name.to_string()),
+            dockerfile: None,
+            context: None,
+            build_args: BTreeMap::new(),
+            security: Default::default(),
+            mcp: BTreeMap::new(),
+        };
+        return Ok((image_cfg, true));
+    }
+
+    Err(OutrigError::Configuration(format!(
+        "image-config {image_cfg_name:?} does not match any [images.<name>]"
+    ))
+    .into())
 }
 
 fn resolve_attach_target(
@@ -598,6 +639,78 @@ pub async fn teardown(
         tracing::warn!(
             target: "outrig::cli::session_setup",
             "session finalize failed: {e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_image(image_ref: &str) -> ImageConfig {
+        ImageConfig {
+            image_name: Some(image_ref.to_string()),
+            dockerfile: None,
+            context: None,
+            build_args: BTreeMap::new(),
+            security: Default::default(),
+            mcp: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn image_resolution_prefers_config_entry_over_raw_fallback() {
+        let mut cfg = Config::default();
+        cfg.images.insert(
+            "outrig-standard:53e082e721df8ecc".to_string(),
+            config_image("configured"),
+        );
+
+        let (image_cfg, raw_local) =
+            resolve_image_config(&cfg, "outrig-standard:53e082e721df8ecc", true).unwrap();
+
+        assert!(!raw_local);
+        assert_eq!(image_cfg.image_name.as_deref(), Some("configured"));
+    }
+
+    #[test]
+    fn image_resolution_allows_raw_fallback_for_explicit_values() {
+        let cfg = Config::default();
+
+        let (image_cfg, raw_local) =
+            resolve_image_config(&cfg, "outrig-standard:53e082e721df8ecc", true).unwrap();
+
+        assert!(raw_local);
+        assert_eq!(
+            image_cfg.image_name.as_deref(),
+            Some("outrig-standard:53e082e721df8ecc")
+        );
+        assert!(image_cfg.mcp.is_empty());
+    }
+
+    #[test]
+    fn image_resolution_rejects_config_only_missing_values() {
+        let cfg = Config::default();
+
+        let err = resolve_image_config(&cfg, "missing", false).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("image-config \"missing\" does not match any [images.<name>]"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn image_resolution_rejects_empty_raw_value() {
+        let cfg = Config::default();
+
+        let err = resolve_image_config(&cfg, "", true).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("image-config \"\" does not match any [images.<name>]"),
+            "unexpected error: {err}"
         );
     }
 }

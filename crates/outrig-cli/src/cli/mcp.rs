@@ -60,8 +60,9 @@ pub struct McpArgs {
 
     /// Pick a `[images.<name>]` block. Falls back to top-level
     /// `default-image` only -- `outrig mcp` has no agent, so there is no
-    /// `agent.image` to consult.
-    #[arg(long, global = true, value_name = "NAME")]
+    /// `agent.image` to consult. An explicit value that doesn't match config
+    /// is used as a local Podman image ref, never pulled.
+    #[arg(long, global = true, value_name = "NAME-OR-LOCAL-REF")]
     pub image: Option<String>,
 
     /// Write the session into an explicit, already-existing directory. The

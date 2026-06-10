@@ -7,7 +7,7 @@
 mod common;
 
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use outrig::container::embedded;
 use rmcp::service::serve_client;
@@ -25,6 +25,62 @@ fn dockerfile_escape(value: &str) -> String {
 
 fn label_line(key: &str, value: &str) -> String {
     format!("LABEL \"{key}\"=\"{}\"\n", dockerfile_escape(value))
+}
+
+fn unique_image_tag(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    format!("outrig-{prefix}:{nanos}")
+}
+
+async fn build_local_image(tag: &str, image_ctx: &std::path::Path) {
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new("buildah")
+            .args(["build", "--tag"])
+            .arg(tag)
+            .arg("--file")
+            .arg(image_ctx.join("Dockerfile"))
+            .arg(image_ctx)
+            .output(),
+    )
+    .await
+    .expect("buildah build timed out")
+    .expect("spawn buildah build");
+    assert!(
+        output.status.success(),
+        "buildah build {tag} exited {:?}; stdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn write_agent_only_config(repo: &std::path::Path) {
+    let agents_dir = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
+    std::fs::write(
+        agents_dir.join("config.toml"),
+        r#"
+default-agent = "smoke"
+
+[providers.openai]
+style = "openai"
+base-url = "http://127.0.0.1:1/v1"
+api-key = "${OUTRIG_TEST_KEY}"
+
+[models.fast]
+provider = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.smoke]
+model = "fast"
+preamble = "test"
+"#,
+    )
+    .expect("write config");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -105,6 +161,164 @@ context = "{context}"
     assert!(
         !stdout.contains("process.exit(42)"),
         "stdout should not contain overridden image command: {stdout}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_show_merged_accepts_raw_local_image_ref() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    let agents_dir = repo_dir.path().join(".agents/outrig");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
+    std::fs::write(agents_dir.join("config.toml"), "").expect("write config");
+
+    let image_ref = unique_image_tag("raw-mcp");
+    let dockerfile = format!(
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache shadow\n\
+         {}",
+        label_line(embedded::LABEL_MCP, r#"{"shell":["sh","-lc","true"]}"#),
+    );
+    std::fs::write(image_ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    build_local_image(&image_ref, image_ctx.path()).await;
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "mcp",
+                "show-merged",
+                "--image",
+                &image_ref,
+            ])
+            .current_dir(repo_dir.path())
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("show-merged timed out")
+    .expect("run show-merged");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "show-merged exited {:?}; stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(stdout.contains("[mcp]"), "stdout lacked [mcp]: {stdout}");
+    assert!(
+        stdout.contains("shell"),
+        "stdout lacked raw image label entry: {stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("image ready: {image_ref} (local image)")),
+        "stderr did not report raw local image readiness: {stderr}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_accepts_raw_local_image_ref() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    write_agent_only_config(repo_dir.path());
+
+    let image_ref = unique_image_tag("raw-run");
+    std::fs::write(
+        image_ctx.path().join("Dockerfile"),
+        "FROM docker.io/library/alpine:latest\nRUN apk add --no-cache shadow\n",
+    )
+    .expect("write Dockerfile");
+    build_local_image(&image_ref, image_ctx.path()).await;
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "run",
+                "--image",
+                &image_ref,
+            ])
+            .current_dir(repo_dir.path())
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("run mode timed out")
+    .expect("run outrig run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "outrig run exited {:?}; stderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains(&format!("image ready: {image_ref} (local image)")),
+        "stderr did not report raw local image readiness: {stderr}",
+    );
+    assert!(
+        stderr.contains("[outrig] entering REPL"),
+        "run did not reach the REPL: {stderr}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_raw_image_ref_is_local_only() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    write_agent_only_config(repo_dir.path());
+
+    let image_ref = unique_image_tag("missing-raw");
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "run",
+                "--image",
+                &image_ref,
+                "-v",
+            ])
+            .current_dir(repo_dir.path())
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("run mode timed out")
+    .expect("run outrig run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "missing raw image unexpectedly succeeded; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("did not match any [images.<name>]")
+            && stderr.contains("local podman image"),
+        "stderr lacked local-only raw image error: {stderr}",
+    );
+    assert!(
+        !stderr.contains("podman pull"),
+        "raw local fallback must not pull missing images: {stderr}",
     );
 }
 

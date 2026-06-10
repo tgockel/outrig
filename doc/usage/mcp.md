@@ -13,7 +13,7 @@ and you want that program to drive the tools inside your outrig container.
 ## Synopsis
 
 ```
-outrig mcp [--image <name>]
+outrig mcp [--image <name-or-local-ref>]
            [--attach <session-id-or-container-name>]
            [--listen <addr>]
            [--network <default|audit|filter>]
@@ -23,14 +23,16 @@ outrig mcp [--image <name>]
            [--session-root <path>]
            [--verbose]
 
-outrig mcp show-merged [--image <name>]
+outrig mcp show-merged [--image <name-or-local-ref>]
                        [--attach <session-id-or-container-name>]
 
 outrig mcp self
 ```
 
-- `--image <name>` (default: `default-image`): selects a
-  `[images.<name>]` block. Required with `--attach <podman-name>`.
+- `--image <name-or-local-ref>` (default: `default-image`): selects a
+  `[images.<name>]` block. If an explicit value does not match config, it is
+  treated as a local Podman image ref and is never pulled. Required with
+  `--attach <podman-name>`.
 - `--attach <session-id-or-container-name>` (default: off): reuse an existing
   container instead of starting one.
 - `--listen <addr>` (default: off): serve Streamable HTTP at `/mcp` instead of
@@ -53,9 +55,9 @@ and advisory validators so an external AI tool can design an image-config. See
 
 There is no `--agent` flag. `outrig mcp` has no agent, so it never consults
 `default-agent`, `agent.image`, `[agents]`, `[models]`, `[providers]`, or provider
-API keys. Image-config selection is only:
+API keys. Image selection is only:
 
-1. `--image <name>`
+1. `--image <name-or-local-ref>`
 2. top-level `default-image`
 
 If neither is set, startup fails with:
@@ -64,21 +66,24 @@ If neither is set, startup fails with:
 error: no --image or default-image configured
 ```
 
+`default-image` must name a config block. The raw local-image fallback applies
+only to explicit `--image` values and to raw image refs saved in session records.
+
 With `--attach`, image-config selection is different:
 
 1. If the attach value matches an exact session id under the resolved session root,
    outrig reuses that session row's `container_name` and `image_config_name`.
-2. If `--image <name>` is also passed, it overrides the session row's
+2. If `--image <name-or-local-ref>` is also passed, it overrides the session row's
    `image_config_name`.
 3. If the attach value is not a known session id, outrig treats it as a podman
-   container name and requires `--image <name>`.
+   container name and requires `--image <name-or-local-ref>`.
 
 `--network audit` and `--network filter` are rejected with `--attach`; borrowed containers are
 not retrofitted with a new interceptor.
 
-The selected image-config must expose at least one backing MCP server after image
+The selected image must expose at least one backing MCP server after image
 `org.outrig.mcp` label entries and `[images.<name>.mcp]` overrides are merged. An
-image-config with no merged entries has nothing to proxy, so `outrig mcp` exits before the
+image with no merged entries has nothing to proxy, so `outrig mcp` exits before the
 client sees an MCP `initialize` response.
 
 ## Minimal Config
@@ -238,10 +243,11 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 1. **Locate config.** Walks up from the current directory until
    `.agents/outrig/config.toml` is found, or fails. The MCP host's `cwd` therefore
    needs to be the repo, or pass `--config <path>` explicitly.
-2. **Resolve image-config.** Uses `--image` if given, otherwise top-level
-   `default-image`. There is no `agent.image` step -- this subcommand has no
-   agent.
-3. **Prepare the container.** Fresh mode builds or cache-hits the image and starts
+2. **Resolve image.** Uses explicit `--image` first. Config entries win; an
+   unknown explicit value is treated as a local Podman image ref. Without
+   explicit `--image`, top-level `default-image` still names a config block.
+3. **Prepare the container.** Fresh mode builds, cache-hits, pulls configured
+   `image-name` refs, or probes raw local refs, then starts
    `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
    container with `podman inspect`, verifies that it is running, and does not build,
    start, stop, or remove it.
@@ -249,7 +255,8 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
 5. **Merge MCP config.** Read the image's `org.outrig.mcp` label if present,
-   then overlay `[images.<name>.mcp]` from config by server name.
+   then overlay `[images.<name>.mcp]` from config by server name. Raw image refs
+   have no repo config block, so their MCP entries come from labels only.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command and run the MCP `initialize` handshake.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with

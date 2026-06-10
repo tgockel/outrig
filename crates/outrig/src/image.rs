@@ -201,6 +201,28 @@ async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) ->
     Ok(probe.status.success())
 }
 
+/// Ensure `tag` exists in Podman's local image store without pulling it.
+///
+/// This is used for raw CLI image references: once a value failed to match an
+/// `[images.<name>]` config block, OutRig should behave like `podman run` with
+/// `--pull=never` and accept only already-local images.
+pub async fn ensure_local_image(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<ImageBuildOutcome> {
+    if probe_pulled_logged(tag, transcript).await? {
+        tracing::info!(target: "outrig::image", cache_hit = true, "ensured local image {tag}");
+        return Ok(ImageBuildOutcome {
+            tag: tag.clone(),
+            cache_hit: true,
+        });
+    }
+    Err(OutrigError::Configuration(format!(
+        "--image {:?} did not match any [images.<name>] and local podman image {:?} was not found",
+        tag.0, tag.0
+    )))
+}
+
 /// Pull an image by ref via `podman pull`. Stderr is streamed to
 /// `tracing::info!` with the `[podman]` prefix.
 pub async fn pull_image(tag: &ImageTag) -> Result<()> {

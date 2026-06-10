@@ -2,14 +2,14 @@
 
 `outrig run` is the main subcommand. It walks up from the current directory to find
 `.agents/outrig/config.toml`, builds (or cache-hits) the container image, starts the container,
-attaches every MCP server defined for the selected image-config, and drops you into a
+attaches every MCP server defined for the selected image, and drops you into a
 stdin/stdout REPL with the agent.
 
 ## Synopsis
 
 ```
 outrig run [--agent <name>]
-           [--image <name>]
+           [--image <name-or-local-ref>]
            [--config <path>]
            [--device <cpu|cuda|cuda:N|metal>]
            [--max-tool-calls <n>]
@@ -22,8 +22,9 @@ outrig run [--agent <name>]
 ```
 
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
-- `--image <name>` (default: agent's `image`, else `default-image`): pick an
-  image-config.
+- `--image <name-or-local-ref>` (default: agent's `image`, else `default-image`):
+  pick an image-config by name; if an explicit `--image` value does not match
+  config, treat it as a local Podman image ref and run it without pulling.
 - `--config <path>` (default: walks up from cwd): use from outside the repo or
   non-standard locations.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
@@ -68,10 +69,13 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 
 1. **Locate config.** Walks up from the current directory until `.agents/outrig/config.toml` is
    found, or fails.
-2. **Resolve image-config.** Uses `--image` if given, otherwise
-   `default-image`. The selected block must exist.
-3. **Build (or cache-hit) the image.** Runs `buildah build`. If the cache hash matches an
-   existing tag, no rebuild.
+2. **Resolve image.** Uses explicit `--image` first. If that value matches
+   `[images.<name>]`, OutRig uses the config block; otherwise it must already
+   exist in local Podman images. Without explicit `--image`, agent `image` and
+   `default-image` still name config blocks only.
+3. **Build/cache/probe the image.** Config build images run `buildah build` or
+   cache-hit. Config `image-name` images may be pulled. Raw `--image` refs are
+   local-only and are checked with `podman image exists`.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
    --userns=keep-id ... <image> sleep infinity`.
 5. **Bootstrap the user.** As in-container root, ensure a group with `$(id -g)` and a user with
@@ -272,6 +276,14 @@ $ outrig run
 ```
 
 The MCP server binary isn't in the image. Install it in the Dockerfile.
+
+```
+$ outrig run --image outrig-standard:53e082e721df8ecc
+error: --image "outrig-standard:53e082e721df8ecc" did not match any [images.<name>] and local podman image "outrig-standard:53e082e721df8ecc" was not found
+```
+
+An explicit `--image` ref that is not an image-config is local-only. Build, tag,
+or pull it with Podman first, then rerun the command.
 
 ```
 $ outrig run

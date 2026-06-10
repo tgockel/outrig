@@ -175,7 +175,7 @@ Start an interactive agent session.
 
 ```
 outrig run [--agent <name>]
-           [--image <name>]
+           [--image <name-or-local-ref>]
            [--config <path>]
            [--device <cpu|cuda|cuda:N|metal>]
            [--env <KEY=VALUE>]
@@ -190,8 +190,9 @@ outrig run [--agent <name>]
 ```
 
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
-- `--image <name>` (default: from agent or `default-image`): image-config to
-  launch.
+- `--image <name-or-local-ref>` (default: from agent or `default-image`):
+  image-config to launch. If an explicit value does not match config, it is
+  treated as a local Podman image ref and is not pulled.
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for MCP servers. `KEY=VALUE`
   applies to every server; `SERVER:KEY=VALUE` targets a single server by name. Values support
   the `${VAR}` host-env-reference syntax described in
@@ -224,10 +225,10 @@ See [Usage -> outrig run](../usage/run.md) for REPL details.
 
 ### `outrig mcp`
 
-Serve the selected image-config's backing MCP servers as one MCP server over stdio.
+Serve the selected image's backing MCP servers as one MCP server over stdio.
 
 ```
-outrig mcp [--image <name>]
+outrig mcp [--image <name-or-local-ref>]
            [--attach <session-id-or-container-name>]
            [--listen <addr>]
            [--env <KEY=VALUE>]
@@ -238,7 +239,7 @@ outrig mcp [--image <name>]
            [--session-root <path>]
            [--verbose]
 
-outrig mcp show-merged [--image <name>]
+outrig mcp show-merged [--image <name-or-local-ref>]
                        [--attach <session-id-or-container-name>]
                        [--session-dir <path>]
                        [--config <path>]
@@ -251,7 +252,7 @@ outrig mcp self
 
 | Flag                   | Default                      | Description                           |
 |------------------------|------------------------------|---------------------------------------|
-| `--image <name>`       | `default-image`              | Image-config to launch.               |
+| `--image <name-or-local-ref>` | `default-image`       | Image-config, or explicit local Podman image ref. |
 | `--attach <id-or-name>`| off                          | Reuse an existing container.          |
 | `--listen <addr>`      | off                          | Serve Streamable HTTP at `/mcp`.      |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
@@ -261,12 +262,14 @@ outrig mcp self
 
 There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does not let
 `agent.image` participate in image-config selection, and does not read provider API keys.
-Image-config selection is `--image`, then top-level `default-image`, then an error.
+Image selection is explicit `--image`, then top-level `default-image`, then an error.
+Config entries win; an unknown explicit `--image` is treated as a local Podman image ref.
+`default-image` remains config-only.
 
 With `--attach`, the value is resolved first as an exact session id under the resolved
 session root. A session match supplies the podman container name and default
-image-config. If there is no session match, the value is treated as a podman
-container name and `--image <name>` is required.
+image-config or raw image ref. If there is no session match, the value is treated as a podman
+container name and `--image <name-or-local-ref>` is required.
 
 Startup builds or cache-hits the image and starts the container unless `--attach` is set.
 Attach mode validates the existing container with `podman inspect` and borrows it without
