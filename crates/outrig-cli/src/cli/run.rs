@@ -21,6 +21,7 @@ use rig::completion::Message;
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
+use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
 use crate::paths::model_cache_root;
@@ -76,6 +77,11 @@ pub struct RunArgs {
     /// Override the mistralrs model device for this run.
     #[arg(long = "device", value_name = "DEVICE", value_parser = parse_mistralrs_device)]
     pub device: Option<MistralrsDeviceSpec>,
+
+    /// Mount an extra host directory into the container. Repeatable. Format
+    /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
+    #[arg(long = "volume", value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
+    pub volume: Vec<CliVolume>,
 }
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
@@ -101,6 +107,7 @@ pub async fn execute(
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
         device_override: args.device,
+        volumes: &args.volume,
         verbose,
     })
     .await?;
@@ -523,5 +530,24 @@ mod tests {
     fn env_flag_absent_yields_empty_vec() {
         let args = RunArgs::try_parse_from(["run"]).expect("arg parses");
         assert!(args.env.is_empty());
+    }
+
+    #[test]
+    fn volume_flag_collects_multiple_values() {
+        let args =
+            RunArgs::try_parse_from(["run", "--volume", "/h1:/c1", "--volume", "/h2:/c2:rw"])
+                .expect("arg parses");
+        assert_eq!(args.volume.len(), 2);
+        assert_eq!(args.volume[0].container, std::path::PathBuf::from("/c1"));
+    }
+
+    #[test]
+    fn volume_flag_rejects_bad_value() {
+        let err = RunArgs::try_parse_from(["run", "--volume", "/h:/c:bogus"])
+            .expect_err("bad access should fail");
+        assert!(
+            err.to_string().contains("ro` or `rw"),
+            "unexpected error: {err}"
+        );
     }
 }

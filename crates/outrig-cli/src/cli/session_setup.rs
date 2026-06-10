@@ -31,11 +31,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::env_arg::CliEnvEntries;
+use crate::cli::volume_arg::CliVolume;
 use crate::error::{OutrigError, Result};
 use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
-use outrig::config::{Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, NetworkMode};
+use outrig::config::{
+    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
+};
 use outrig::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     embedded,
@@ -119,6 +122,9 @@ pub struct SessionSetupArgs<'a> {
     pub explicit_session_dir: Option<&'a Path>,
     pub network_mode_override: Option<NetworkMode>,
     pub device_override: Option<MistralrsDeviceSpec>,
+    /// Extra `--volume HOST:CONTAINER[:ro|rw]` mounts appended to the
+    /// container's workspace mounts. Rejected with `--attach`.
+    pub volumes: &'a [CliVolume],
     pub verbose: u8,
 }
 
@@ -151,7 +157,7 @@ struct AttachResolution {
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let repo_root = repo_root_from_config_path(args.repo_cfg_path);
     let span = ProgressSpan::start("loading config");
-    let cfg = if args.require_agent {
+    let mut cfg = if args.require_agent {
         Config::load_for_run(
             &repo_root,
             Some(args.global_cfg_path),
@@ -162,6 +168,12 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         Config::load(&repo_root, Some(args.global_cfg_path))?
     };
     span.done("config loaded");
+    if !args.repo_cfg_path.exists() {
+        eprintln!(
+            "[outrig] no repo config found; using current directory as workspace ({})",
+            repo_root.display()
+        );
+    }
 
     let session_root =
         session::resolve_session_root(args.session_root_flag, &cfg, &default_session_root());
@@ -191,6 +203,28 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                 .to_string(),
         )
         .into());
+    }
+
+    // Extra `--volume` mounts append to the workspace mounts and are validated
+    // with the same rules as config `[workspace.mounts]`. A borrowed container
+    // (`--attach`) has fixed mounts, so reject `--volume` there.
+    if !args.volumes.is_empty() {
+        if attach.is_some() {
+            return Err(OutrigError::Configuration(
+                "--volume cannot be combined with --attach; a borrowed container's \
+                 mounts are fixed when it is created"
+                    .to_string(),
+            )
+            .into());
+        }
+        for vol in args.volumes {
+            cfg.workspace.mounts.push(MountConfig {
+                host_path: vol.host.clone(),
+                container_path: vol.container.clone(),
+                access: vol.access,
+            });
+        }
+        cfg.validate_workspace_mounts(Some(&repo_root))?;
     }
 
     // Agent presence is checked before any container work so the failure

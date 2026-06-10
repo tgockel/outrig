@@ -145,7 +145,15 @@ impl Config {
 
     fn load_unvalidated(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
         let repo_path = crate::repo::repo_config_path(repo_root);
-        let repo_text = fs::read_to_string(&repo_path)?;
+        // A missing repo config is not an error: `outrig run`/`outrig mcp` may
+        // run in a directory with no `.agents/outrig/config.toml`, falling back
+        // to the global config (and built-in defaults). Mirrors the global-file
+        // handling below.
+        let repo_text = match fs::read_to_string(&repo_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
         let repo_cfg = Self::load_from_str(&repo_text)?;
         reject_repo_network_policy(&repo_text)?;
 
@@ -166,6 +174,15 @@ impl Config {
     /// `None` keeps the check pure-structural for unit tests.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
+        Ok(())
+    }
+
+    /// Validate `[workspace.mounts]` -- including any appended at runtime, e.g.
+    /// from `--volume` -- without re-running LLM/image checks: container paths
+    /// absolute, not `/`, unique (against each other and the primary workspace
+    /// mount), and (when `repo_root` is set) host paths existing directories.
+    pub fn validate_workspace_mounts(&self, repo_root: Option<&Path>) -> Result<()> {
+        validate::validate_workspace_mounts(self, repo_root)?;
         Ok(())
     }
 

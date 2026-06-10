@@ -21,6 +21,7 @@ outrig mcp [--image <name-or-local-ref>]
            [--config <path>]
            [--global-config <path>]
            [--session-root <path>]
+           [--volume <host:container[:ro|rw]>]
            [--verbose]
 
 outrig mcp show-merged [--image <name-or-local-ref>]
@@ -42,9 +43,13 @@ outrig mcp self
   choose Podman's default networking, network audit logging, or global network filtering for
   this fresh session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
-- `--config <path>` (default: walks up from cwd): path to repo `config.toml`.
+- `--config <path>` (default: walks up from cwd; if not found, run config-less): path to repo
+  `config.toml`.
 - `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
 - `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
+- `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
+  container, on top of the default workspace mount. Read-only unless `:rw` is given; the host
+  directory must exist. Rejected with `--attach`.
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 
@@ -68,6 +73,11 @@ error: no --image or default-image configured
 
 `default-image` must name a config block. The raw local-image fallback applies
 only to explicit `--image` values and to raw image refs saved in session records.
+
+`outrig mcp` can also run in a directory with no `.agents/outrig/config.toml` (and no
+`--config`): it uses the current directory as the workspace root and merges in the global
+config. Since there is no agent, all you need is `--image <local-ref>`; the proxied MCP servers
+come from the image's `org.outrig.mcp` labels.
 
 With `--attach`, image-config selection is different:
 

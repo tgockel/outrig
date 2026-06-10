@@ -67,6 +67,23 @@ pub(crate) fn resolve_repo_config(override_path: Option<&Path>, cwd: &Path) -> R
     }
 }
 
+/// Like [`resolve_repo_config`] but never fails when no repo config is found.
+/// `outrig run`/`outrig mcp` may run in a directory with no
+/// `.agents/outrig/config.toml`. With no `--config` override and nothing found
+/// up the tree, synthesize `<cwd>/.agents/outrig/config.toml` -- a path whose
+/// file is absent. [`repo_root_from_config_path`] maps it back to `cwd`, and
+/// `Config::load` treats the missing file as an empty config merged over the
+/// global config.
+pub(crate) fn resolve_repo_config_optional(override_path: Option<&Path>, cwd: &Path) -> PathBuf {
+    match override_path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let root = find_repo_root_from(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            repo_config_path(&root)
+        }
+    }
+}
+
 pub(crate) fn model_cache_root(from_config: Option<&Path>) -> PathBuf {
     if let Some(p) = from_config {
         return p.to_path_buf();

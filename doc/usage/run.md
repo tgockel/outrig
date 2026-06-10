@@ -5,6 +5,10 @@
 attaches every MCP server defined for the selected image, and drops you into a
 stdin/stdout REPL with the agent.
 
+It can also run **config-less**: in a directory with no `.agents/outrig/config.toml`, it uses the
+current directory as the workspace and reads the agent from the global config. See
+[Config-less runs](#config-less-runs).
+
 ## Synopsis
 
 ```
@@ -18,6 +22,7 @@ outrig run [--agent <name>]
            [--network <default|audit|filter>]
            [--session-dir <path>]
            [--session-root <path>]
+           [--volume <host:container[:ro|rw]>]
            [--verbose]
 ```
 
@@ -25,8 +30,8 @@ outrig run [--agent <name>]
 - `--image <name-or-local-ref>` (default: agent's `image`, else `default-image`):
   pick an image-config by name; if an explicit `--image` value does not match
   config, treat it as a local Podman image ref and run it without pulling.
-- `--config <path>` (default: walks up from cwd): use from outside the repo or
-  non-standard locations.
+- `--config <path>` (default: walks up from cwd; if not found, run config-less -- see
+  [Config-less runs](#config-less-runs)): load config from a non-standard location.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   override the in-process mistralrs model device for this run.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): override the
@@ -42,6 +47,10 @@ outrig run [--agent <name>]
   directory; symlinked from the root.
 - `--session-root <path>` (default: `session-root` config, else XDG): root directory
   containing all sessions.
+- `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
+  container, on top of the default workspace mount. Access defaults to read-only; append `:rw`
+  for read-write. The host directory must exist; relative host paths resolve against the
+  workspace root.
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 
@@ -65,10 +74,28 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 
 `--session-dir` refuses if the path already contains a `session.json`.
 
+## Config-less runs
+
+You can run in a directory with no `.agents/outrig/config.toml` at all:
+
+```sh
+$ cd /tmp/scratch
+$ outrig run --image my-tool:latest --volume "$PWD/data:/data:rw"
+```
+
+With no repo config found and no `--config`, outrig uses the current directory as the workspace
+root (mounted at `/workspace`) and reads the agent, model, and provider from the global config
+(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). Because there is no
+`default-image`, you must pass `--image`; an unknown ref is used as a local Podman image and is
+never pulled. If the global config has no resolvable agent, startup fails with the usual
+`no --agent and no default-agent configured` error.
+
 ## What happens, in order
 
 1. **Locate config.** Walks up from the current directory until `.agents/outrig/config.toml` is
-   found, or fails.
+   found. If none is found and no `--config` is given, run config-less: the current directory
+   becomes the workspace root and config comes from the global file only (see
+   [Config-less runs](#config-less-runs)).
 2. **Resolve image.** Uses explicit `--image` first. If that value matches
    `[images.<name>]`, OutRig uses the config block; otherwise it must already
    exist in local Podman images. Without explicit `--image`, agent `image` and
@@ -77,7 +104,8 @@ $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
    cache-hit. Config `image-name` images may be pulled. Raw `--image` refs are
    local-only and are checked with `podman image exists`.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
-   --userns=keep-id ... <image> sleep infinity`.
+   --userns=keep-id ... <image> sleep infinity`. Any `[workspace.mounts]` and `--volume` entries
+   become additional `-v` binds.
 5. **Bootstrap the user.** As in-container root, ensure a group with `$(id -g)` and a user with
    `$(id -u)` exist (creating them via `groupadd`/`useradd` if not), and that
    `/home/<user>` exists and is owned by them. See

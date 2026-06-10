@@ -421,7 +421,7 @@ fn validate_capability_list(
     Ok(seen)
 }
 
-fn validate_workspace_mounts(
+pub(super) fn validate_workspace_mounts(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {

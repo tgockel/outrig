@@ -13,7 +13,7 @@ use crate::cli::mcp::{self, McpArgs};
 use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
 use crate::error::Result;
-use crate::paths::{global_config_path, resolve_repo_config};
+use crate::paths::{global_config_path, resolve_repo_config, resolve_repo_config_optional};
 use crate::{config_init, image_setup, init};
 
 #[derive(Debug, Parser)]
@@ -163,7 +163,7 @@ pub fn run() -> ExitCode {
 fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.cmd {
         Cmd::Run(args) => {
-            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
             runtime.block_on(run::execute(
                 &repo_config,
                 &global_config,
@@ -179,7 +179,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                     .build()?;
                 return runtime.block_on(mcp_self_cli::execute(args));
             }
-            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
             runtime.block_on(mcp::execute(
                 &repo_config,
                 &global_config,
@@ -190,7 +190,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Cmd::Design(args) => design_prompt::execute(args),
         Cmd::Build(args) => {
-            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli)?;
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, true)?;
             runtime.block_on(build::execute(&repo_config, &global_config, args))
         }
         Cmd::Config(args) => match &args.cmd {
@@ -329,12 +329,20 @@ fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runti
 }
 
 /// Shared preamble for `run`/`mcp`/`build`: the resolved repo config, the
-/// resolved global config, and a current-thread tokio runtime. Errors if
-/// the repo config can't be located (the user must be inside an outrig
-/// repo for these to make sense).
-fn repo_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
+/// resolved global config, and a current-thread tokio runtime. With
+/// `require_config` (build), errors if no repo config can be located;
+/// otherwise (run/mcp) a missing config falls back to the current directory
+/// as repo root, merged over the global config.
+fn repo_cmd_ctx(
+    cli: &Cli,
+    require_config: bool,
+) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
     let cwd = std::env::current_dir()?;
-    let repo_config = resolve_repo_config(cli.config.as_deref(), &cwd)?;
+    let repo_config = if require_config {
+        resolve_repo_config(cli.config.as_deref(), &cwd)?
+    } else {
+        resolve_repo_config_optional(cli.config.as_deref(), &cwd)
+    };
     let global_config = global_config_path(cli.global_config.as_deref());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

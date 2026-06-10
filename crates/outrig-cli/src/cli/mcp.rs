@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
+use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use outrig::McpClient;
 use outrig::config::{ImageConfig, McpServerSpec, NetworkMode};
@@ -88,6 +89,11 @@ pub struct McpArgs {
     /// Override network monitoring for this session.
     #[arg(long = "network", global = true, value_name = "MODE", value_parser = parse_network_mode)]
     pub network: Option<NetworkMode>,
+
+    /// Mount an extra host directory into the container. Repeatable. Format
+    /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
+    #[arg(long = "volume", global = true, value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
+    pub volume: Vec<CliVolume>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,6 +140,7 @@ pub async fn execute(
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
         device_override: None,
+        volumes: &args.volume,
         verbose,
     })
     .await?;
@@ -781,6 +788,13 @@ mod tests {
                 "127.0.0.1:7331".parse().expect("socket addr")
             ))
         );
+    }
+
+    #[test]
+    fn mcp_args_parse_volume_flag() {
+        let args = McpArgs::try_parse_from(["mcp", "--volume", "/h:/c:rw"]).expect("arg parses");
+        assert_eq!(args.volume.len(), 1);
+        assert_eq!(args.volume[0].container, std::path::PathBuf::from("/c"));
     }
 
     #[test]

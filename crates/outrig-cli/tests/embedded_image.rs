@@ -58,12 +58,7 @@ async fn build_local_image(tag: &str, image_ctx: &std::path::Path) {
     );
 }
 
-fn write_agent_only_config(repo: &std::path::Path) {
-    let agents_dir = repo.join(".agents/outrig");
-    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
-    std::fs::write(
-        agents_dir.join("config.toml"),
-        r#"
+const AGENT_CONFIG_TOML: &str = r#"
 default-agent = "smoke"
 
 [providers.openai]
@@ -78,9 +73,12 @@ identifier = "gpt-4o-mini"
 [agents.smoke]
 model = "fast"
 preamble = "test"
-"#,
-    )
-    .expect("write config");
+"#;
+
+fn write_agent_only_config(repo: &std::path::Path) {
+    let agents_dir = repo.join(".agents/outrig");
+    std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
+    std::fs::write(agents_dir.join("config.toml"), AGENT_CONFIG_TOML).expect("write config");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -319,6 +317,140 @@ async fn missing_raw_image_ref_is_local_only() {
     assert!(
         !stderr.contains("podman pull"),
         "raw local fallback must not pull missing images: {stderr}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_without_repo_config_uses_global_config() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    // A directory with no `.agents/outrig` anywhere: the agent must come from
+    // the global config, and `--volume` must thread an extra mount through.
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    let global_dir = tempfile::tempdir().expect("tempdir global config");
+    let extra_dir = tempfile::tempdir().expect("tempdir extra mount");
+
+    let global_config = global_dir.path().join("config.toml");
+    std::fs::write(&global_config, AGENT_CONFIG_TOML).expect("write global config");
+
+    let image_ref = unique_image_tag("config-less-run");
+    std::fs::write(
+        image_ctx.path().join("Dockerfile"),
+        "FROM docker.io/library/alpine:latest\nRUN apk add --no-cache shadow\n",
+    )
+    .expect("write Dockerfile");
+    build_local_image(&image_ref, image_ctx.path()).await;
+
+    let volume = format!(
+        "{}:/extra:ro",
+        extra_dir.path().to_str().expect("extra path utf-8")
+    );
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--global-config",
+                global_config.to_str().expect("global config utf-8"),
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "-v",
+                "run",
+                "--image",
+                &image_ref,
+                "--volume",
+                &volume,
+            ])
+            .current_dir(repo_dir.path())
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("run mode timed out")
+    .expect("run outrig run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "outrig run exited {:?}; stderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains("no repo config found; using current directory as workspace"),
+        "stderr lacked config-less notice: {stderr}",
+    );
+    assert!(
+        stderr.contains(&format!("image ready: {image_ref} (local image)")),
+        "stderr did not report raw local image readiness: {stderr}",
+    );
+    assert!(
+        stderr.contains("[outrig] entering REPL"),
+        "config-less run did not reach the REPL: {stderr}",
+    );
+    assert!(
+        stderr.contains(":/extra"),
+        "stderr did not show the --volume mount in the podman transcript: {stderr}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_show_merged_without_repo_config() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    // No `.agents/outrig` at all: `outrig mcp` has no agent, so `--image` alone
+    // is enough and the merged MCP table comes from the image's OCI labels.
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let image_ctx = tempfile::tempdir().expect("tempdir image context");
+
+    let image_ref = unique_image_tag("config-less-mcp");
+    let dockerfile = format!(
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache shadow\n\
+         {}",
+        label_line(embedded::LABEL_MCP, r#"{"shell":["sh","-lc","true"]}"#),
+    );
+    std::fs::write(image_ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    build_local_image(&image_ref, image_ctx.path()).await;
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "mcp",
+                "show-merged",
+                "--image",
+                &image_ref,
+            ])
+            .current_dir(repo_dir.path())
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("show-merged timed out")
+    .expect("run show-merged");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "show-merged exited {:?}; stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    assert!(stdout.contains("[mcp]"), "stdout lacked [mcp]: {stdout}");
+    assert!(
+        stdout.contains("shell"),
+        "stdout lacked the image's MCP label entry: {stdout}"
+    );
+    assert!(
+        stderr.contains("no repo config found; using current directory as workspace"),
+        "stderr lacked config-less notice: {stderr}",
     );
 }
 

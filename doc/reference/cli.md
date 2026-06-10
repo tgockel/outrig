@@ -186,6 +186,7 @@ outrig run [--agent <name>]
            [--network <default|audit|filter>]
            [--session-dir <path>]
            [--session-root <path>]
+           [--volume <host:container[:ro|rw]>]
            [--verbose]
 ```
 
@@ -210,6 +211,8 @@ outrig run [--agent <name>]
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run.
+- `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
+  container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist.
 - `-v`, `--verbose` (default: off): print container lifecycle traces.
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
@@ -220,6 +223,10 @@ session id and writes to `<session-root>/<sid>/` directly.
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
 when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C.
+
+With no repo config found and no `--config`, `run` and `mcp` use the current directory as the
+workspace root and take all config from the global file; `run` then needs its agent from the
+global config and an explicit `--image`. `build` still requires a repo config.
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.
 
@@ -237,6 +244,7 @@ outrig mcp [--image <name-or-local-ref>]
            [--config <path>]
            [--global-config <path>]
            [--session-root <path>]
+           [--volume <host:container[:ro|rw]>]
            [--verbose]
 
 outrig mcp show-merged [--image <name-or-local-ref>]
@@ -258,6 +266,7 @@ outrig mcp self
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
 | `--network <default|audit|filter>`| config, else `default` | Network monitoring mode.       |
 | `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
+| `--volume <spec>`      | --                           | Extra bind mount; not with --attach.  |
 | `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
 
 There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does not let
@@ -265,6 +274,10 @@ There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does 
 Image selection is explicit `--image`, then top-level `default-image`, then an error.
 Config entries win; an unknown explicit `--image` is treated as a local Podman image ref.
 `default-image` remains config-only.
+
+Like `outrig run`, `mcp` runs config-less when no `.agents/outrig/config.toml` is found (and no
+`--config`): the current directory becomes the workspace root and config comes from the global
+file. With no agent to resolve, `--image <local-ref>` is enough.
 
 With `--attach`, the value is resolved first as an exact session id under the resolved
 session root. A session match supplies the podman container name and default
