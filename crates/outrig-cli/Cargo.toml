@@ -4,10 +4,15 @@ description = "Command-line tool for running LLM agents with podman-isolated MCP
 build       = "build.rs"
 version.workspace       = true
 edition.workspace       = true
+rust-version.workspace  = true
 license.workspace       = true
+authors.workspace       = true
+readme.workspace        = true
 homepage.workspace      = true
 documentation.workspace = true
 repository.workspace    = true
+keywords.workspace      = true
+categories.workspace    = true
 
 [features]
 default   = []
@@ -23,7 +28,7 @@ name = "outrig"
 path = "src/main.rs"
 
 [dependencies]
-outrig = { path = "../outrig" }
+outrig = { path = "../outrig", version = "0.1.0" }
 
 anyhow             = { workspace = true, default-features = true }
 async-stream       = { workspace = true, default-features = true }
@@ -50,7 +55,7 @@ tempfile           = { workspace = true, default-features = true }
 thiserror          = { workspace = true, default-features = true }
 tokio              = { workspace = true, default-features = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "signal", "fs", "time", "sync"] }
 tokio-util         = { workspace = true, default-features = true }
-toml               = { workspace = true, default-features = true }
+toml               = { workspace = true, default-features = true, features = ["serde"] }
 toml_edit          = { workspace = true, default-features = true }
 tracing            = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter", "fmt"] }

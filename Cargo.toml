@@ -5,10 +5,15 @@ members  = ["crates/outrig", "crates/outrig-cli"]
 [workspace.package]
 version       = "0.1.0"
 edition       = "2024"
+rust-version  = "1.87"
 license       = "Apache-2.0"
+authors       = ["Travis Gockel <travis@gockelhut.com>"]
+readme        = "README.md"
 homepage      = "https://tgockel.github.io/outrig/"
 documentation = "https://tgockel.github.io/outrig/"
 repository    = "https://github.com/tgockel/outrig"
+keywords      = ["llm", "agent", "mcp", "podman", "sandbox"]
+categories    = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 anyhow             = { version = "1.0.102",            default-features = false }

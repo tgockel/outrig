@@ -19,9 +19,6 @@ Rig in the host process and give it a container-isolated MCP tool set.
 
 ## Install
 
-> **Release action:** reserve or publish both `outrig` and `outrig-cli` on crates.io before
-> removing this note from the first public install instructions.
-
 Install the CLI package to get the `outrig` command:
 
 ```sh
