@@ -1,11 +1,4 @@
-//! outrig: run LLM agents with podman-isolated MCP servers.
-//!
-//! This is the library crate. The companion `outrig-cli` crate produces
-//! the `outrig` command-line tool and pulls in the LLM-side dependencies
-//! for provider integrations and local model backends. Library consumers stay
-//! free of that dep graph.
-//!
-//! The curated entry point is [`Outrig::launch`].
+#![doc = include_str!("../README.md")]
 
 use std::path::{Path, PathBuf};
 
