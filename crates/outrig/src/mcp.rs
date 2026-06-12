@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::process::Child;
 
 use crate::config::{EnvValue, McpServerSpec};
-use crate::container::Container;
+use crate::container::{Container, embedded::McpDeclarationSource};
 use crate::error::{OutrigError, Result};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -68,6 +68,37 @@ impl McpClient {
         container: &Container,
         server_cfg: &McpServerSpec,
         name: &str,
+        log_dir: &Path,
+        extra_env: &BTreeMap<String, EnvValue>,
+    ) -> Result<Self> {
+        Self::connect_via_podman_exec_inner(container, server_cfg, name, None, log_dir, extra_env)
+            .await
+    }
+
+    pub(crate) async fn connect_via_podman_exec_with_source(
+        container: &Container,
+        server_cfg: &McpServerSpec,
+        name: &str,
+        declaration_source: McpDeclarationSource,
+        log_dir: &Path,
+        extra_env: &BTreeMap<String, EnvValue>,
+    ) -> Result<Self> {
+        Self::connect_via_podman_exec_inner(
+            container,
+            server_cfg,
+            name,
+            Some(declaration_source.description()),
+            log_dir,
+            extra_env,
+        )
+        .await
+    }
+
+    async fn connect_via_podman_exec_inner(
+        container: &Container,
+        server_cfg: &McpServerSpec,
+        name: &str,
+        declaration_source: Option<&'static str>,
         log_dir: &Path,
         extra_env: &BTreeMap<String, EnvValue>,
     ) -> Result<Self> {
@@ -117,9 +148,15 @@ impl McpClient {
         let service = match serve_client((), (stdout, stdin)).await {
             Ok(s) => s,
             Err(source) => {
-                return Err(
-                    enrich_startup_error(name, &command, &stderr_path, &mut child, source).await,
-                );
+                return Err(enrich_startup_error(
+                    name,
+                    declaration_source,
+                    &command,
+                    &stderr_path,
+                    &mut child,
+                    source,
+                )
+                .await);
             }
         };
 
@@ -262,6 +299,7 @@ impl McpClient {
 /// before we read them.
 async fn enrich_startup_error(
     name: &str,
+    declaration_source: Option<&str>,
     command: &[String],
     stderr_path: &Path,
     child: &mut Child,
@@ -286,6 +324,7 @@ async fn enrich_startup_error(
 
     OutrigError::McpStartupFailed(Box::new(crate::error::McpStartupFailure {
         name: name.to_string(),
+        declaration_source: declaration_source.map(str::to_string),
         command: render_command(command),
         exit,
         stderr_path: stderr_path.to_path_buf(),
@@ -442,12 +481,21 @@ mod tests {
             "expect initialize response".to_string(),
         );
 
-        let err = enrich_startup_error("svc", &argv, &stderr_path, &mut child, source).await;
+        let err = enrich_startup_error(
+            "svc",
+            Some("launch spec"),
+            &argv,
+            &stderr_path,
+            &mut child,
+            source,
+        )
+        .await;
 
         let OutrigError::McpStartupFailed(payload) = &err else {
             panic!("expected McpStartupFailed, got {err:?}");
         };
         assert_eq!(payload.name, "svc");
+        assert_eq!(payload.declaration_source.as_deref(), Some("launch spec"));
         assert!(payload.command.contains("sh"));
         assert_eq!(payload.exit, "code 7");
         assert!(
@@ -458,6 +506,7 @@ mod tests {
 
         let display = err.to_string();
         assert!(display.contains("svc"));
+        assert!(display.contains("from launch spec"));
         assert!(display.contains("expect initialize response"));
         assert!(display.contains("code 7"));
         assert!(display.contains("boom"));

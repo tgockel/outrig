@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use outrig::config::McpServerSpec;
 use outrig::{
-    CapabilityProfile, CapabilitySpec, LaunchSpec, MountAccess, MountSpec, NetworkAction,
-    NetworkMode, NetworkPolicy, Outrig,
+    CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountAccess, MountSpec,
+    NetworkAction, NetworkMode, NetworkPolicy, Outrig,
 };
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -43,6 +43,42 @@ fn build_fixture_image(tag: &str) {
         .status()
         .expect("spawn podman build");
     assert!(status.success(), "podman build exited non-zero: {status:?}");
+}
+
+fn dockerfile_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn label_line(key: &str, value: &str) -> String {
+    format!("LABEL \"{key}\"=\"{}\"\n", dockerfile_escape(value))
+}
+
+fn build_fixture_image_with_mcp_label(tag: &str, mcp: &BTreeMap<String, McpServerSpec>) {
+    let ctx = tempfile::tempdir().expect("tempdir image context");
+    let dockerfile = format!(
+        "FROM docker.io/library/alpine:latest\n\
+         RUN apk add --no-cache nodejs npm shadow\n\
+         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
+         {}",
+        label_line(
+            outrig::container::embedded::LABEL_MCP,
+            &serde_json::to_string(mcp).expect("serialize mcp label json"),
+        ),
+    );
+    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+
+    let status = std::process::Command::new("podman")
+        .arg("build")
+        .arg("-t")
+        .arg(tag)
+        .arg(ctx.path())
+        .status()
+        .expect("spawn podman build");
+    assert!(status.success(), "podman build exited non-zero: {status:?}");
+}
+
+fn fs_spec(path: &str) -> McpServerSpec {
+    McpServerSpec::Short(vec!["mcp-server-filesystem".to_string(), path.to_string()])
 }
 
 #[test]
@@ -191,6 +227,95 @@ async fn from_image_launches_with_extra_read_only_mount() {
     assert!(
         result.content_text.contains("REFERENCE.txt"),
         "list_directory output should mention REFERENCE.txt, got: {}",
+        result.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn from_image_can_ignore_embedded_mcp_label() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-embedded-policy-{}:latest",
+        std::process::id(),
+    );
+    let mut embedded_mcp = BTreeMap::new();
+    embedded_mcp.insert(
+        "bad".to_string(),
+        McpServerSpec::Short(vec![
+            "node".to_string(),
+            "-e".to_string(),
+            "process.exit(42)".to_string(),
+        ]),
+    );
+    build_fixture_image_with_mcp_label(&tag, &embedded_mcp);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    let mut explicit_mcp = BTreeMap::new();
+    explicit_mcp.insert("fs".to_string(), fs_spec("/workspace"));
+
+    let merge_session_dir = tempfile::tempdir().expect("tempdir merge session");
+    let merge_spec = LaunchSpec::from_image(
+        tag.clone(),
+        explicit_mcp.clone(),
+        merge_session_dir.path().join("logs"),
+    )
+    .with_workspace(outrig::WorkspaceSpec {
+        host: host_ws.path().to_path_buf(),
+        container: PathBuf::from("/workspace"),
+    });
+
+    let merge_err = match Outrig::launch(&merge_spec).await {
+        Ok(outrig) => {
+            let _ = outrig.shutdown().await;
+            panic!("default Merge policy should start embedded bad MCP and fail");
+        }
+        Err(err) => err,
+    };
+    let merge_err = merge_err.to_string();
+    assert!(
+        merge_err.contains("mcp server \"bad\" from image label org.outrig.mcp failed to start"),
+        "startup error should identify image-label source, got: {merge_err}",
+    );
+
+    let ignore_session_dir = tempfile::tempdir().expect("tempdir ignore session");
+    let ignore_spec =
+        LaunchSpec::from_image(tag, explicit_mcp, ignore_session_dir.path().join("logs"))
+            .with_workspace(outrig::WorkspaceSpec {
+                host: host_ws.path().to_path_buf(),
+                container: PathBuf::from("/workspace"),
+            })
+            .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+
+    let outrig = Outrig::launch(&ignore_spec)
+        .await
+        .expect("Ignore policy should launch explicit MCP only");
+    assert!(
+        outrig.tools().iter().all(|tool| tool.server == "fs"),
+        "only explicit fs tools should be exposed: {:?}",
+        outrig
+            .tools()
+            .iter()
+            .map(|tool| (&tool.server, &tool.name))
+            .collect::<Vec<_>>(),
+    );
+
+    let result = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool list_directory");
+    assert!(
+        result.content_text.contains("MARKER.txt"),
+        "list_directory output should mention MARKER.txt, got: {}",
         result.content_text,
     );
 

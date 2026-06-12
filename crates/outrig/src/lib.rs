@@ -20,8 +20,8 @@ pub use config::{
 };
 pub use mcp::{McpClient, McpTool, McpToolResult};
 pub use outrig_::{
-    CapabilitySpec, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec, ToolHandle,
-    WorkspaceSpec,
+    CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec,
+    ToolHandle, WorkspaceSpec,
 };
 pub use process::Transcript;
 pub use tool_name::sanitize as sanitize_tool_name;

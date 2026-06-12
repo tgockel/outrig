@@ -16,7 +16,7 @@ use crate::config::{
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
-    embedded,
+    embedded::{self, McpDeclarationSource},
 };
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
@@ -76,6 +76,18 @@ pub struct NetworkSpec {
     pub policy: Option<NetworkPolicy>,
 }
 
+/// How [`Outrig::launch`] handles MCP servers declared in an image's
+/// `org.outrig.mcp` label.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmbeddedMcpPolicy {
+    /// Merge image-embedded declarations with the launch spec's MCP map.
+    /// Launch-spec entries replace image entries with the same server name.
+    #[default]
+    Merge,
+    /// Ignore image-embedded declarations and use only the launch spec's MCP map.
+    Ignore,
+}
+
 impl From<&ImageSecurity> for SecuritySpec {
     fn from(security: &ImageSecurity) -> Self {
         Self {
@@ -107,6 +119,7 @@ pub struct LaunchSpec {
     pub mounts: Vec<MountSpec>,
     pub security: SecuritySpec,
     pub network: NetworkSpec,
+    pub embedded_mcp_policy: EmbeddedMcpPolicy,
     pub mcp: BTreeMap<String, McpServerSpec>,
     pub log_dir: PathBuf,
 }
@@ -138,6 +151,7 @@ impl LaunchSpec {
             mounts: Vec::new(),
             security: SecuritySpec::default(),
             network: NetworkSpec::default(),
+            embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
             log_dir,
         }
@@ -156,6 +170,7 @@ impl LaunchSpec {
             mounts: Vec::new(),
             security: SecuritySpec::default(),
             network: NetworkSpec::default(),
+            embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
             log_dir,
         }
@@ -200,6 +215,7 @@ impl LaunchSpec {
                 mounts,
                 security: SecuritySpec::from(&cfg.security),
                 network: NetworkSpec::default(),
+                embedded_mcp_policy: EmbeddedMcpPolicy::default(),
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -211,6 +227,7 @@ impl LaunchSpec {
                 mounts,
                 security: SecuritySpec::from(&cfg.security),
                 network: NetworkSpec::default(),
+                embedded_mcp_policy: EmbeddedMcpPolicy::default(),
                 mcp: cfg.mcp.clone(),
                 log_dir,
             },
@@ -257,6 +274,11 @@ impl LaunchSpec {
         self.network.policy = Some(policy);
         self
     }
+
+    pub fn with_embedded_mcp_policy(mut self, policy: EmbeddedMcpPolicy) -> Self {
+        self.embedded_mcp_policy = policy;
+        self
+    }
 }
 
 fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
@@ -291,8 +313,8 @@ pub struct Outrig {
 
 impl Outrig {
     /// Acquire the image, start the container, bootstrap the runtime user,
-    /// merge image-embedded MCP config with `spec.mcp`, connect every merged
-    /// MCP server, and index their tools.
+    /// resolve MCP config according to `spec.embedded_mcp_policy`, connect every
+    /// resolved MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
         let image_tag = match &spec.source {
@@ -365,15 +387,28 @@ impl Outrig {
             }
         };
 
-        let mcp = embedded::merged_mcp(&container, &spec.mcp).await?;
+        let mcp = match spec.embedded_mcp_policy {
+            EmbeddedMcpPolicy::Merge => {
+                embedded::merged_mcp_with_source(
+                    &container,
+                    &spec.mcp,
+                    McpDeclarationSource::LaunchSpec,
+                )
+                .await?
+            }
+            EmbeddedMcpPolicy::Ignore => {
+                embedded::mcp_with_source(&spec.mcp, McpDeclarationSource::LaunchSpec)
+            }
+        };
 
         let mut clients: BTreeMap<String, Arc<McpClient>> = BTreeMap::new();
         let mut tools: Vec<ToolHandle> = Vec::new();
-        for (name, server_cfg) in &mcp {
-            let client = McpClient::connect_via_podman_exec(
+        for (name, server) in &mcp {
+            let client = McpClient::connect_via_podman_exec_with_source(
                 &container,
-                server_cfg,
+                &server.spec,
                 name,
+                server.source,
                 &spec.log_dir,
                 &BTreeMap::new(),
             )
@@ -398,14 +433,14 @@ impl Outrig {
     }
 
     /// Tools advertised by every connected MCP server, in `(server, name)`
-    /// order matching the `BTreeMap` iteration of `spec.mcp` followed by
+    /// order matching the effective MCP map's `BTreeMap` iteration followed by
     /// each server's advertised order.
     pub fn tools(&self) -> &[ToolHandle] {
         &self.tools
     }
 
     /// Dispatch an MCP `tools/call` to the named server. `server` must
-    /// match a key in the `LaunchSpec::mcp` map; `tool` is the
+    /// match a key in the effective MCP map; `tool` is the
     /// un-namespaced tool name as it appeared in [`Outrig::tools`].
     pub async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<McpToolResult> {
         let client = self
@@ -448,5 +483,29 @@ impl Outrig {
             network.shutdown().await;
         }
         container.stop(SHUTDOWN_GRACE).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_dir() -> PathBuf {
+        PathBuf::from("logs")
+    }
+
+    #[test]
+    fn from_image_defaults_to_merge_embedded_mcp() {
+        let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir());
+
+        assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Merge);
+    }
+
+    #[test]
+    fn builder_can_ignore_embedded_mcp() {
+        let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir())
+            .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+
+        assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Ignore);
     }
 }

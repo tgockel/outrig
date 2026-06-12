@@ -48,6 +48,29 @@ pub struct StandaloneImageLabels {
     pub mcp: Option<BTreeMap<String, McpServerSpec>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpDeclarationSource {
+    ImageLabel,
+    LaunchSpec,
+    ConfigToml,
+}
+
+impl McpDeclarationSource {
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::ImageLabel => "image label org.outrig.mcp",
+            Self::LaunchSpec => "launch spec",
+            Self::ConfigToml => "config.toml",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct McpServerSpecWithSource {
+    pub(crate) spec: McpServerSpec,
+    pub(crate) source: McpDeclarationSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandaloneImageMetadata {
     pub image_ref: String,
@@ -213,11 +236,46 @@ pub async fn merged_mcp(
     container: &Container,
     config_mcp: &BTreeMap<String, McpServerSpec>,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
+    let sourced =
+        merged_mcp_with_source(container, config_mcp, McpDeclarationSource::ConfigToml).await?;
+    Ok(strip_mcp_sources(&sourced))
+}
+
+pub(crate) async fn merged_mcp_with_source(
+    container: &Container,
+    config_mcp: &BTreeMap<String, McpServerSpec>,
+    config_source: McpDeclarationSource,
+) -> Result<BTreeMap<String, McpServerSpecWithSource>> {
     let labels =
         crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
             .await?;
     let image_mcp = embedded_mcp_from_labels(&container.image_tag().0, &labels)?;
-    Ok(merge_mcp(image_mcp, config_mcp))
+    Ok(merge_mcp_with_source(image_mcp, config_mcp, config_source))
+}
+
+pub(crate) fn mcp_with_source(
+    mcp: &BTreeMap<String, McpServerSpec>,
+    source: McpDeclarationSource,
+) -> BTreeMap<String, McpServerSpecWithSource> {
+    mcp.iter()
+        .map(|(name, spec)| {
+            (
+                name.clone(),
+                McpServerSpecWithSource {
+                    spec: spec.clone(),
+                    source,
+                },
+            )
+        })
+        .collect()
+}
+
+fn strip_mcp_sources(
+    mcp: &BTreeMap<String, McpServerSpecWithSource>,
+) -> BTreeMap<String, McpServerSpec> {
+    mcp.iter()
+        .map(|(name, sourced)| (name.clone(), sourced.spec.clone()))
+        .collect()
 }
 
 pub fn merge_mcp(
@@ -228,6 +286,24 @@ pub fn merge_mcp(
         image.insert(name.clone(), spec.clone());
     }
     image
+}
+
+pub(crate) fn merge_mcp_with_source(
+    image: BTreeMap<String, McpServerSpec>,
+    config: &BTreeMap<String, McpServerSpec>,
+    config_source: McpDeclarationSource,
+) -> BTreeMap<String, McpServerSpecWithSource> {
+    let mut merged = mcp_with_source(&image, McpDeclarationSource::ImageLabel);
+    for (name, spec) in config {
+        merged.insert(
+            name.clone(),
+            McpServerSpecWithSource {
+                spec: spec.clone(),
+                source: config_source,
+            },
+        );
+    }
+    merged
 }
 
 /// Parse and validate the `org.outrig.mcp` label value (a JSON object mapping
@@ -689,6 +765,26 @@ mod tests {
         assert_eq!(merged["fs"], short(&["config-fs"]));
         assert_eq!(merged["shell"], short(&["image-shell"]));
         assert_eq!(merged["build"], short(&["config-build"]));
+    }
+
+    #[test]
+    fn merge_mcp_with_source_tracks_origin_and_overrides() {
+        let mut image = BTreeMap::new();
+        image.insert("fs".to_string(), short(&["image-fs"]));
+        image.insert("shell".to_string(), short(&["image-shell"]));
+
+        let mut config = BTreeMap::new();
+        config.insert("fs".to_string(), short(&["config-fs"]));
+        config.insert("build".to_string(), short(&["config-build"]));
+
+        let merged = merge_mcp_with_source(image, &config, McpDeclarationSource::LaunchSpec);
+
+        assert_eq!(merged["fs"].spec, short(&["config-fs"]));
+        assert_eq!(merged["fs"].source, McpDeclarationSource::LaunchSpec);
+        assert_eq!(merged["shell"].spec, short(&["image-shell"]));
+        assert_eq!(merged["shell"].source, McpDeclarationSource::ImageLabel);
+        assert_eq!(merged["build"].spec, short(&["config-build"]));
+        assert_eq!(merged["build"].source, McpDeclarationSource::LaunchSpec);
     }
 
     #[test]

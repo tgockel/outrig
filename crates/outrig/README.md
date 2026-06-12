@@ -48,7 +48,16 @@ outrig.shutdown().await?;
 
 `LaunchSpec` also has `LaunchSpec::build` (build an image from a `Dockerfile`) and
 `LaunchSpec::from_image_config` (drive it from a parsed config), plus builder methods for mounts,
-capability profiles, and network policy.
+capability profiles, network policy, and embedded MCP handling. By default, OutRig merges MCP
+servers from an image's `org.outrig.mcp` label with the launch spec. Library callers that want the
+launch spec's MCP map to be authoritative can opt out:
+
+```rust,no_run
+# use outrig::{EmbeddedMcpPolicy, LaunchSpec};
+# use std::collections::BTreeMap;
+let spec = LaunchSpec::from_image("my-image:latest", BTreeMap::new(), "/tmp/outrig-logs".into())
+    .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
+```
 
 ## Documentation
 
