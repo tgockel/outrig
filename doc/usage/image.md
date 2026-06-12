@@ -251,8 +251,10 @@ MCP server declarations are stamped into image labels, the consuming block needs
 image-name = "rust-dev"
 ```
 
-That label-vs-repo split is the key difference from `image add`, whose repo-local blocks carry
-their own `[images.<name>.mcp]` entries. See
+That authoring split is the key difference from `image add`: repo-local blocks keep their
+`[images.<name>.mcp]` entries in `config.toml` and stamp them into cache image labels when built;
+standalone projects carry the declarations in `image.toml` so the image can be consumed elsewhere
+without repo-local MCP config. See
 [Concepts -> Containers](../concepts/containers.md#using-a-pre-built-image) for the
 `image-name` shape.
 
@@ -381,6 +383,12 @@ mcp:
 `description`, `version`, and `tags` appear only when the image carries those labels. If the
 image has no `org.outrig.mcp` label, inspect still prints the image ref and any metadata labels it
 finds, then omits the `mcp:` section.
+
+Repo-local images built by `outrig build`, `outrig run`, or `outrig mcp` are stamped with an
+`org.outrig.mcp` label on cache misses. For those `<image-config-name>:<hash>` refs, inspect shows
+the merged MCP declarations from inherited/Dockerfile labels plus `[images.<name>.mcp]`, without
+starting a container. Standalone images may additionally show `description`, `version`, and
+`tags`.
 
 Use `--remote` when the ref is in a registry and you want the labels without pulling it:
 

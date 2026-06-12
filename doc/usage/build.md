@@ -28,17 +28,20 @@ outrig build [--image <name>]
 1. Loads `.agents/outrig/config.toml` and validates every image-config in the merged config.
    Agent/model wiring is not required for image builds.
 2. For each selected image-config:
-   - Computes the cache key (blake3 over Dockerfile content + resolved build-args +
-     context content hash).
+   - Computes the cache key (blake3 over Dockerfile content, resolved build-args,
+     the OutRig labels derived from `[images.<name>.mcp]`, and the context content hash).
    - If a tag matching that key exists and `--no-cache` is not set, prints
      `image ready (cache hit)` and skips.
-   - Otherwise runs:
+   - Otherwise runs a buildah build to a temporary tag:
      ```
-     buildah build --tag <image-config-name>:<hash> \
+     buildah build --tag <image-config-name>:outrig-tmp-... \
                    --file <dockerfile> \
                    [user build-args] \
                    <context>
      ```
+     Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
+     `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
+     merged `org.outrig.mcp` label.
      The repository is the `[images.<name>]` block key, so the built image is self-describing
      in `podman images`; the `<hash>` is the content-addressed cache key.
 

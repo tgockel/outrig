@@ -125,14 +125,37 @@ pub async fn read_standalone_image_mcp(
     standalone_mcp_from_labels(&labels)
 }
 
+/// Serialize an MCP table into the common OutRig OCI labels. Repo-local image
+/// builds use this for cache-key input before build time; standalone builds
+/// add author-facing metadata labels on top.
+pub fn mcp_config_to_labels(
+    mcp: &BTreeMap<String, McpServerSpec>,
+) -> Result<BTreeMap<String, String>> {
+    let mut labels = BTreeMap::new();
+    labels.insert(LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VERSION.to_string());
+    labels.insert(LABEL_MCP.to_string(), to_json_label(LABEL_MCP, mcp)?);
+    Ok(labels)
+}
+
+/// Merge an already-built image's inherited/Dockerfile MCP label with repo
+/// config, then serialize the effective table back into labels. This preserves
+/// the runtime merge semantics for build-from-Dockerfile images: image-owned
+/// entries survive, and repo entries replace by server name.
+pub fn merged_mcp_config_to_labels(
+    image: &str,
+    labels: &BTreeMap<String, String>,
+    config_mcp: &BTreeMap<String, McpServerSpec>,
+) -> Result<BTreeMap<String, String>> {
+    let image_mcp = embedded_mcp_from_labels(image, labels)?;
+    mcp_config_to_labels(&merge_mcp(image_mcp, config_mcp))
+}
+
 /// Serialize a validated standalone config into the OCI label map buildah
 /// stamps at build time. `org.outrig.mcp` (the `[mcp]` table) and
 /// `org.outrig.schema` are always emitted; description, version, and tags only
 /// when the author set them.
 pub fn standalone_config_to_labels(cfg: &StandaloneImageToml) -> Result<BTreeMap<String, String>> {
-    let mut labels = BTreeMap::new();
-    labels.insert(LABEL_SCHEMA.to_string(), LABEL_SCHEMA_VERSION.to_string());
-    labels.insert(LABEL_MCP.to_string(), to_json_label(LABEL_MCP, &cfg.mcp)?);
+    let mut labels = mcp_config_to_labels(&cfg.mcp)?;
     if let Some(description) = &cfg.image.description {
         labels.insert(LABEL_DESCRIPTION.to_string(), description.clone());
     }
@@ -487,6 +510,38 @@ mod tests {
         assert!(!labels.contains_key(LABEL_TAGS));
         assert!(labels.contains_key(LABEL_MCP));
         assert!(labels.contains_key(LABEL_SCHEMA));
+    }
+
+    #[test]
+    fn mcp_config_labels_serialize_empty_table_for_repo_builds() {
+        let labels = mcp_config_to_labels(&BTreeMap::new()).expect("labels");
+
+        assert_eq!(labels[LABEL_SCHEMA], LABEL_SCHEMA_VERSION);
+        assert_eq!(labels[LABEL_MCP], "{}");
+    }
+
+    #[test]
+    fn merged_mcp_config_labels_preserve_inherited_entries() {
+        let inherited = BTreeMap::from([(
+            LABEL_MCP.to_string(),
+            r#"{"fs":["mcp-server-filesystem","/workspace"],"shell":["old-shell"]}"#.to_string(),
+        )]);
+        let config = BTreeMap::from([
+            ("git".to_string(), short(&["mcp-server-git"])),
+            ("shell".to_string(), short(&["new-shell"])),
+        ]);
+
+        let labels =
+            merged_mcp_config_to_labels("img", &inherited, &config).expect("merged labels");
+        let parsed = parse_mcp_table(&labels[LABEL_MCP]).expect("parse merged mcp");
+
+        assert_eq!(
+            parsed["fs"],
+            short(&["mcp-server-filesystem", "/workspace"])
+        );
+        assert_eq!(parsed["git"], short(&["mcp-server-git"]));
+        assert_eq!(parsed["shell"], short(&["new-shell"]));
+        assert_eq!(labels[LABEL_SCHEMA], LABEL_SCHEMA_VERSION);
     }
 
     #[test]

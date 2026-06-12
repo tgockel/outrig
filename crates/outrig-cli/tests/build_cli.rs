@@ -17,6 +17,7 @@ use std::time::Instant;
 use outrig::config::Config;
 use outrig::image;
 use outrig_cli::cli::build::{self, BuildArgs};
+use serde_json::Value;
 
 const ALPINE_DOCKERFILE: &str = "FROM docker.io/library/alpine:latest\n";
 
@@ -50,6 +51,22 @@ fn write_repo(repo: &Path, container_blocks: &[(&str, &str)], default_image: Opt
 async fn buildah_image_id(tag: &str) -> String {
     let out = try_capture(Command::new("buildah").args(["images", "--quiet"]).arg(tag));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+async fn podman_image_labels(tag: &str) -> Value {
+    let out = try_capture(Command::new("podman").args([
+        "image",
+        "inspect",
+        tag,
+        "--format",
+        "{{json .Config.Labels}}",
+    ]));
+    assert!(
+        out.status.success(),
+        "podman image inspect {tag} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("labels JSON")
 }
 
 fn try_capture(cmd: &mut Command) -> Output {
@@ -99,6 +116,45 @@ async fn build_default_image_then_cache_hits() {
         started.elapsed().as_millis() < 500,
         "cache hit should be near-instant, took {:?}",
         started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn build_stamps_repo_mcp_labels() {
+    install_tracing();
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_repo(tmp.path(), &[("coding", ALPINE_DOCKERFILE)], Some("coding"));
+    let repo_cfg = tmp.path().join(".agents/outrig/config.toml");
+    let mut config = std::fs::read_to_string(&repo_cfg).unwrap();
+    config.push_str(
+        "[images.coding.mcp]\n\
+         fs = [\"mcp-server-filesystem\", \"/workspace\"]\n",
+    );
+    std::fs::write(&repo_cfg, config).unwrap();
+
+    let global_cfg = tmp.path().join("nonexistent-global.toml");
+    let args = BuildArgs {
+        image: None,
+        all: false,
+        no_cache: false,
+    };
+
+    let exit = build::execute(&repo_cfg, &global_cfg, &args)
+        .await
+        .expect("build must succeed");
+    assert_eq!(exit, 0);
+
+    let tag = tag_for(tmp.path(), "coding").await;
+    let labels = podman_image_labels(&tag).await;
+    let mcp = labels
+        .get("org.outrig.mcp")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("repo-local image should carry org.outrig.mcp: {labels}"));
+    let mcp: Value = serde_json::from_str(mcp).expect("mcp label JSON");
+    assert_eq!(
+        mcp["fs"],
+        serde_json::json!(["mcp-server-filesystem", "/workspace"])
     );
 }
 

@@ -61,6 +61,11 @@ define the same server name, the `config.toml` entry replaces the image entry in
 full; fields are not deep-merged. Servers that appear in only one source remain
 in the merged set.
 
+For build-from-Dockerfile repo images, `outrig build` also stamps the cache image with the same
+merged `org.outrig.mcp` label it would use at startup. The startup overlay still runs, but is
+idempotent for those repo-local entries. This means `outrig image inspect <name>:<hash>` can show
+the declared servers without starting a container.
+
 Use embedded MCP config when a shared image owns the tool binaries and their
 default commands. Use `config.toml` for repo-local additions or overrides. A
 repo that wants to delegate completely to the image can omit

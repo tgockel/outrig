@@ -379,7 +379,9 @@ build-args = { NODE_VERSION = "20" }
 ```
 
 For a build-from-Dockerfile image, the block name becomes the built image's repository (the
-image is tagged `<name>:<content-hash>`). Use a repo-specific, lowercase name (e.g.
+image is tagged `<name>:<content-hash>`). The content hash includes Dockerfile/context content,
+resolved build args, and the OutRig labels derived from `[images.<name>.mcp]`, so MCP config
+changes produce a new inspectable cache tag. Use a repo-specific, lowercase name (e.g.
 `outrig-standard`, not `standard`) so `podman images` makes clear which repo it came from. The
 name must be a valid container image repository component -- see the validation rules below.
 
@@ -474,6 +476,9 @@ Notes:
 - Images can provide the same table via their `org.outrig.mcp` OCI label. Repo config entries
   override image entries by server name; see
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
+- Build-from-Dockerfile repo images are stamped with the merged `org.outrig.mcp` label on cache
+  misses, so `outrig image inspect <name>:<content-hash>` can show their declared repo-local MCP
+  entries without starting a container.
 
 #### MCP `env` value syntax
 

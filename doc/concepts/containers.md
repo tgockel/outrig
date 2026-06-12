@@ -197,18 +197,24 @@ the first build.
 
 outrig tags built images as `<image-config-name>:<hash>`, where the name is the `[images.<name>]`
 block key and the hash is a content-addressed cache key combining the contents of the
-`Dockerfile`, the `build-args`, and the content of the build context (gitignore-aware when the
-context is in a git repo, otherwise a tarball hash). So `[images.outrig-standard]` builds to
-`outrig-standard:<hash>`, which podman shows as `localhost/outrig-standard`.
+`Dockerfile`, the `build-args`, the OutRig labels derived from `[images.<name>.mcp]`, and the
+content of the build context (gitignore-aware when the context is in a git repo, otherwise a
+tarball hash). So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which podman
+shows as `localhost/outrig-standard`.
+
+Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
+temporary image, reads any inherited/Dockerfile MCP label, overlays `[images.<name>.mcp]`, and
+commits the final cache tag with the merged label. This keeps `outrig image inspect
+<image-config-name>:<hash>` aligned with the declared servers that startup will use.
 
 Because the name is the image's repository, **give image-configs repo-specific, lowercase names**
 (e.g. `outrig-standard`, not `standard`) so `podman images` makes clear which repo an image came
 from. Build-image names must be valid container image repository components -- lowercase
 alphanumeric separated by `.`, `_`, or `-` -- and `outrig` rejects invalid names at config load.
 
-A change to the `Dockerfile` or any file in the context causes a rebuild on the next `outrig run`
-or `outrig build`. Otherwise the cache hit is immediate. To force a rebuild without changing
-files, run `outrig build --no-cache`.
+A change to the `Dockerfile`, any file in the context, build args, or `[images.<name>.mcp]`
+causes a rebuild on the next `outrig run` or `outrig build`. Otherwise the cache hit is
+immediate. To force a rebuild without changing files, run `outrig build --no-cache`.
 
 Image-name configs use podman's local image store directly; there is no `<name>:<hash>`
 tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the

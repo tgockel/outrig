@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use super::{CacheKey, ImageConfig, UNNAMED_IMAGE, compute_tag, compute_tag_for};
+use super::{CacheKey, ImageConfig, McpServerSpec, UNNAMED_IMAGE, compute_tag, compute_tag_for};
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -85,6 +85,27 @@ async fn build_arg_change_changes_key() {
     let ka = key(&dockerfile, &a, ctx.path()).await;
     let kb = key(&dockerfile, &b, ctx.path()).await;
     assert_eq!(ka, kb);
+}
+
+#[tokio::test]
+async fn label_change_changes_key() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let labels_a = BTreeMap::from([("org.outrig.mcp".to_string(), "{}".to_string())]);
+    let labels_b = BTreeMap::from([(
+        "org.outrig.mcp".to_string(),
+        r#"{"fs":["mcp-server-filesystem","/workspace"]}"#.to_string(),
+    )]);
+
+    let ka = CacheKey::compute_with_labels(&dockerfile, &args, ctx.path(), &labels_a)
+        .await
+        .expect("CacheKey::compute_with_labels");
+    let kb = CacheKey::compute_with_labels(&dockerfile, &args, ctx.path(), &labels_b)
+        .await
+        .expect("CacheKey::compute_with_labels");
+
+    assert_ne!(ka, kb);
 }
 
 #[tokio::test]
@@ -204,6 +225,33 @@ async fn named_build_tag_uses_image_config_name_as_repo() {
         16,
         "tag part is the 16-hex cache key, got {hash:?}"
     );
+}
+
+#[tokio::test]
+async fn named_build_tag_tracks_repo_mcp_labels() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    let mut with_fs = build_cfg(ctx.path());
+    with_fs.mcp.insert(
+        "fs".to_string(),
+        McpServerSpec::Short(vec![
+            "mcp-server-filesystem".to_string(),
+            "/workspace".to_string(),
+        ]),
+    );
+    let mut with_git = build_cfg(ctx.path());
+    with_git.mcp.insert(
+        "git".to_string(),
+        McpServerSpec::Short(vec!["mcp-server-git".to_string()]),
+    );
+
+    let fs_tag = compute_tag_for("outrig-standard", &with_fs, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+    let git_tag = compute_tag_for("outrig-standard", &with_git, Path::new(""))
+        .await
+        .expect("compute_tag_for");
+
+    assert_ne!(fs_tag, git_tag);
 }
 
 #[tokio::test]

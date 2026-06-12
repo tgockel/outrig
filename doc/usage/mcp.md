@@ -92,9 +92,10 @@ With `--attach`, image-config selection is different:
 not retrofitted with a new interceptor.
 
 The selected image must expose at least one backing MCP server after image
-`org.outrig.mcp` label entries and `[images.<name>.mcp]` overrides are merged. An
-image with no merged entries has nothing to proxy, so `outrig mcp` exits before the
-client sees an MCP `initialize` response.
+`org.outrig.mcp` label entries and `[images.<name>.mcp]` overrides are merged. Repo-local
+build cache images already stamp that merged table into their labels on cache misses, but startup
+still applies the same merge. An image with no merged entries has nothing to proxy, so `outrig mcp`
+exits before the client sees an MCP `initialize` response.
 
 ## Minimal Config
 
@@ -131,9 +132,10 @@ outrig mcp show-merged --image coding
 ```
 
 In fresh mode this starts the selected container, reads the image's `org.outrig.mcp` label,
-applies `config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops
-the container. With `--attach`, it borrows the existing container for the same read and
-leaves it running.
+applies `config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops the
+container. For repo-local build images, the cache tag was already stamped with that merged label
+when it was built. With `--attach`, it borrows the existing container for the same read and leaves
+it running.
 
 ## Attach Mode
 
@@ -265,8 +267,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
 5. **Merge MCP config.** Read the image's `org.outrig.mcp` label if present,
-   then overlay `[images.<name>.mcp]` from config by server name. Raw image refs
-   have no repo config block, so their MCP entries come from labels only.
+   then overlay `[images.<name>.mcp]` from config by server name. Repo-local build images stamp
+   this merged table into their cache tags on build misses; raw image refs have no repo config
+   block, so their MCP entries come from labels only.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
    command and run the MCP `initialize` handshake.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with

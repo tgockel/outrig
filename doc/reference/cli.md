@@ -289,7 +289,9 @@ Attach mode validates the existing container with `podman inspect` and borrows i
 stopping or removing it during teardown. Both modes initialize every entry in the merged
 MCP table, list their tools, print a banner to stderr, and then speak MCP JSON-RPC on
 stdout/stdin. The merged table is the image's `org.outrig.mcp` label plus
-`[images.<name>.mcp]` overrides. All non-protocol output stays off stdout.
+`[images.<name>.mcp]` overrides. Build-from-Dockerfile repo images stamp that merged table into
+their cache tag on build misses, so `outrig image inspect <name>:<hash>` can report the same
+declared servers without serving MCP. All non-protocol output stays off stdout.
 
 When `--listen <addr>` is set, `outrig mcp` serves Streamable HTTP instead of stdio.
 TCP addresses are socket addresses such as `127.0.0.1:7331` or `0.0.0.0:7331`;

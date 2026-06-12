@@ -1,22 +1,24 @@
 //! Image build via buildah with content-addressed cache.
 //!
 //! The cache-key helper produces a deterministic 16-hex-char key over
-//! `(Dockerfile bytes, resolved build-args, context content)`. Built images are
-//! tagged `<image-config-name>:<key>` (the nameless library path falls back to
-//! `outrig-cache:<key>`). [`ensure_image`] probes that tag first; on miss it
-//! shells out to `buildah build`. Buildah's own layer cache still helps speed up
-//! the build itself when we miss; the project-level tag cache exists so a *hit*
-//! skips buildah entirely.
+//! `(Dockerfile bytes, resolved build-args, OutRig labels, context content)`.
+//! Built images are tagged `<image-config-name>:<key>` (the nameless library
+//! path falls back to `outrig-cache:<key>`). [`ensure_image`] probes that tag
+//! first; on miss it shells out to `buildah build`. Buildah's own layer cache
+//! still helps speed up the build itself when we miss; the project-level tag
+//! cache exists so a *hit* skips buildah entirely.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::ErrorKind;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{ImageConfig, ImageSourceRef};
+use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec};
+use crate::container::embedded::{mcp_config_to_labels, merged_mcp_config_to_labels};
 use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
@@ -73,7 +75,8 @@ impl CacheKey {
     /// Hash `(Dockerfile bytes, sorted build-args, context content)` into a
     /// 16-hex-char blake3 prefix. The build-args must already be resolved to
     /// concrete values. Caller passes absolute paths; `ensure_image` resolves
-    /// relative-to-repo-root before calling.
+    /// relative-to-repo-root before calling. Repo-local builds use
+    /// [`CacheKey::compute_with_labels`] instead.
     pub(crate) async fn compute(
         dockerfile: &Path,
         build_args: &BTreeMap<String, String>,
@@ -86,6 +89,47 @@ impl CacheKey {
 
         let mut block = String::new();
         for (k, v) in build_args {
+            let _ = writeln!(block, "{k}={v}");
+        }
+        hasher.update(block.as_bytes());
+
+        if is_git_context(context).await? {
+            hash_git_context(context, &mut hasher).await?;
+        } else {
+            hash_tar_context(context, &mut hasher).await?;
+        }
+
+        let hex = hasher.finalize().to_hex();
+        Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
+    }
+
+    /// Hash the same build inputs as [`CacheKey::compute`], plus the labels
+    /// OutRig will stamp onto repo-local build images. Label changes therefore
+    /// produce new tags instead of stale `org.outrig.mcp` metadata.
+    pub(crate) async fn compute_with_labels(
+        dockerfile: &Path,
+        build_args: &BTreeMap<String, String>,
+        context: &Path,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        if labels.is_empty() {
+            return Self::compute(dockerfile, build_args, context).await;
+        }
+
+        let mut hasher = blake3::Hasher::new();
+
+        let dockerfile_bytes = tokio::fs::read(dockerfile).await?;
+        hasher.update(&dockerfile_bytes);
+
+        let mut block = String::new();
+        for (k, v) in build_args {
+            let _ = writeln!(block, "{k}={v}");
+        }
+        hasher.update(block.as_bytes());
+
+        let mut block = String::new();
+        block.push_str("\n[outrig-labels]\n");
+        for (k, v) in labels {
             let _ = writeln!(block, "{k}={v}");
         }
         hasher.update(block.as_bytes());
@@ -122,6 +166,10 @@ pub(crate) fn resolve_build_args(
     Ok(resolved)
 }
 
+fn repo_build_cache_labels(cfg: &ImageConfig) -> Result<BTreeMap<String, String>> {
+    mcp_config_to_labels(&cfg.mcp)
+}
+
 /// Compute the deterministic `<repo>:<key>` tag for `cfg` without touching
 /// buildah. For image-name configs, the tag is the literal `image-name` value.
 /// This resolves `build-args` first because the cache key tracks the concrete
@@ -156,7 +204,8 @@ async fn compute_tag_with_build_args(
 ) -> Result<ImageTag> {
     let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
     let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
-    let key = CacheKey::compute(&dockerfile, build_args, &context).await?;
+    let labels = repo_build_cache_labels(cfg)?;
+    let key = CacheKey::compute_with_labels(&dockerfile, build_args, &context, &labels).await?;
     Ok(ImageTag(format!("{repo}:{key}")))
 }
 
@@ -271,18 +320,24 @@ async fn build_image_with_build_args(
     no_cache: bool,
     build_args: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let cmd = build_image_cmd(cfg, repo_root, tag, no_cache, build_args);
-    let argv_for_error = cmd.args.clone();
-    let status = process::run_streamed(cmd, "buildah").await?;
-    if !status.success() {
-        return Err(OutrigError::Process {
-            program: "buildah",
-            argv: argv_for_error,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        });
+    let temp_tag = temporary_build_tag(tag);
+    let result = async {
+        let cmd = build_image_cmd(cfg, repo_root, &temp_tag, no_cache, build_args);
+        let argv_for_error = cmd.args.clone();
+        let status = process::run_streamed(cmd, "buildah").await?;
+        if !status.success() {
+            return Err(OutrigError::Process {
+                program: "buildah",
+                argv: argv_for_error,
+                exit_code: status.code(),
+                stderr_tail: String::new(),
+            });
+        }
+        stamp_repo_image_labels(&temp_tag, tag, &cfg.mcp, None).await
     }
-    Ok(())
+    .await;
+    cleanup_temp_image(&temp_tag, None).await;
+    result
 }
 
 async fn build_image_logged_with_build_args(
@@ -293,13 +348,19 @@ async fn build_image_logged_with_build_args(
     transcript: Option<&Transcript>,
     build_args: &BTreeMap<String, String>,
 ) -> Result<()> {
-    process::run_capture_logged(
-        build_image_cmd(cfg, repo_root, tag, no_cache, build_args),
-        "buildah",
-        transcript,
-    )
-    .await?;
-    Ok(())
+    let temp_tag = temporary_build_tag(tag);
+    let result = async {
+        process::run_capture_logged(
+            build_image_cmd(cfg, repo_root, &temp_tag, no_cache, build_args),
+            "buildah",
+            transcript,
+        )
+        .await?;
+        stamp_repo_image_labels(&temp_tag, tag, &cfg.mcp, transcript).await
+    }
+    .await;
+    cleanup_temp_image(&temp_tag, transcript).await;
+    result
 }
 
 /// Probe the build tag (`outrig-cache:<key>` for this nameless variant); on
@@ -564,6 +625,113 @@ struct SkopeoInspect {
     labels: Option<BTreeMap<String, String>>,
 }
 
+fn temporary_build_tag(final_tag: &ImageTag) -> ImageTag {
+    let (repo, key) = final_tag
+        .0
+        .rsplit_once(':')
+        .unwrap_or((TAG_PREFIX, "image"));
+    ImageTag(format!(
+        "{repo}:outrig-tmp-{}-{}-{key}",
+        std::process::id(),
+        temp_nonce()
+    ))
+}
+
+fn temporary_builder_name() -> String {
+    format!("outrig-label-{}-{}", std::process::id(), temp_nonce())
+}
+
+fn temp_nonce() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+}
+
+async fn stamp_repo_image_labels(
+    source_tag: &ImageTag,
+    final_tag: &ImageTag,
+    config_mcp: &BTreeMap<String, McpServerSpec>,
+    transcript: Option<&Transcript>,
+) -> Result<()> {
+    let inherited = read_image_labels(source_tag, transcript).await?;
+    let labels = merged_mcp_config_to_labels(&source_tag.0, &inherited, config_mcp)?;
+    commit_image_with_labels(source_tag, final_tag, &labels, transcript).await
+}
+
+async fn commit_image_with_labels(
+    source_tag: &ImageTag,
+    final_tag: &ImageTag,
+    labels: &BTreeMap<String, String>,
+    transcript: Option<&Transcript>,
+) -> Result<()> {
+    let builder = temporary_builder_name();
+    let result = async {
+        run_buildah_capture(
+            Cmd::new("buildah")
+                .arg("from")
+                .arg("--pull=never")
+                .arg("--name")
+                .arg(&builder)
+                .arg(&source_tag.0),
+            transcript,
+        )
+        .await?;
+
+        let mut config = Cmd::new("buildah").arg("config");
+        for (key, value) in labels {
+            config = config.arg("--label").arg(format!("{key}={value}"));
+        }
+        config = config.arg(&builder);
+        run_buildah_capture(config, transcript).await?;
+
+        run_buildah_capture(
+            Cmd::new("buildah")
+                .arg("commit")
+                .arg("--rm")
+                .arg("--quiet")
+                .arg(&builder)
+                .arg(&final_tag.0),
+            transcript,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        cleanup_builder(&builder, transcript).await;
+    }
+    result
+}
+
+async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Result<()> {
+    if transcript.is_some() {
+        process::run_capture_logged(cmd, "buildah", transcript).await?;
+    } else {
+        process::run_capture(cmd).await?;
+    }
+    Ok(())
+}
+
+async fn cleanup_builder(builder: &str, transcript: Option<&Transcript>) {
+    let cmd = Cmd::new("buildah").arg("rm").arg(builder);
+    if transcript.is_some() {
+        let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
+    } else {
+        let _ = process::try_capture(cmd).await;
+    }
+}
+
+async fn cleanup_temp_image(tag: &ImageTag, transcript: Option<&Transcript>) {
+    let cmd = Cmd::new("buildah").arg("rmi").arg(&tag.0);
+    if transcript.is_some() {
+        let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
+    } else {
+        let _ = process::try_capture(cmd).await;
+    }
+}
+
 fn build_image_cmd(
     cfg: &ImageConfig,
     repo_root: &Path,
@@ -585,15 +753,15 @@ fn build_image_cmd(
 
 /// Assemble a `buildah build --tag <tag> --file <dockerfile> [--no-cache]
 /// [--build-arg ...] [--label ...] <context>` command. `dockerfile` and
-/// `context` are absolute (already joined with their base dir). Shared by
-/// repo-local image-config builds ([`build_image_cmd`]) and standalone image
-/// builds ([`build_standalone`]).
+/// `context` are absolute (already joined with their base dir). Used directly
+/// by standalone image builds; repo-local builds first build a temporary image,
+/// then stamp merged OutRig labels in a final metadata-only commit.
 ///
 /// Labels stamp a standalone image's config (e.g. `org.outrig.mcp`) into OCI
-/// metadata; repo-local builds pass an empty map. `Cmd` builds argv directly
-/// (no shell), so a JSON label value -- braces, quotes, spaces -- reaches
-/// buildah as one literal argument, and buildah splits `key=value` on the
-/// first `=` (JSON has none at the top level).
+/// metadata. `Cmd` builds argv directly (no shell), so a JSON label value --
+/// braces, quotes, spaces -- reaches buildah as one literal argument, and
+/// buildah splits `key=value` on the first `=` (JSON has none at the top
+/// level).
 fn buildah_build_cmd(
     dockerfile: &Path,
     context: &Path,
