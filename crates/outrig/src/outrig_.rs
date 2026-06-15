@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::{
-    CapabilityProfile, EnvValue, ImageConfig, ImageSecurity, ImageSourceRef, McpServerSpec,
+    CapabilityProfile, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef, McpServerSpec,
     MountAccess, NetworkMode, NetworkPolicy, Workspace,
 };
 use crate::container::{
@@ -88,8 +88,8 @@ pub enum EmbeddedMcpPolicy {
     Ignore,
 }
 
-impl From<&ImageSecurity> for SecuritySpec {
-    fn from(security: &ImageSecurity) -> Self {
+impl From<&ContainerSecurity> for SecuritySpec {
+    fn from(security: &ContainerSecurity) -> Self {
         Self {
             capabilities: CapabilitySpec {
                 profile: security.capability_profile,
@@ -331,7 +331,7 @@ impl Outrig {
                     dockerfile: Some(dockerfile.clone()),
                     context: Some(context.clone()),
                     build_args: build_args.clone(),
-                    security: ImageSecurity::default(),
+                    security: ContainerSecurity::default(),
                     mcp: BTreeMap::new(),
                 };
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag

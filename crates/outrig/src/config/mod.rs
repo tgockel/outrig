@@ -796,7 +796,7 @@ pub(crate) fn parse_network_host_pattern(
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ImageSecurity {
+pub struct ContainerSecurity {
     pub capability_profile: CapabilityProfile,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_drop: Vec<String>,
@@ -804,7 +804,7 @@ pub struct ImageSecurity {
     pub cap_add: Vec<String>,
 }
 
-impl ImageSecurity {
+impl ContainerSecurity {
     fn is_default(&self) -> bool {
         self == &Self::default()
     }
@@ -849,8 +849,8 @@ pub struct ImageConfig {
     pub context: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, EnvValue>,
-    #[serde(default, skip_serializing_if = "ImageSecurity::is_default")]
-    pub security: ImageSecurity,
+    #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
+    pub security: ContainerSecurity,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
