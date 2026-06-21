@@ -57,7 +57,7 @@ $ outrig build
 [outrig] image tag:        coding:8c2a4f7e91d6b5a3
 [buildah] STEP 1/6: FROM docker.io/library/node:20-bookworm-slim
 ...
-[outrig] image ready
+[outrig] image ready: coding:8c2a4f7e91d6b5a3
 ```
 
 Cache hit on the second run:
@@ -73,7 +73,7 @@ Build a specific image-config:
 $ outrig build --image planning
 [outrig] image-config: planning
 ...
-[outrig] image ready
+[outrig] image ready: planning:b91e3a6d217f4c08
 ```
 
 Build every image-config in one go:

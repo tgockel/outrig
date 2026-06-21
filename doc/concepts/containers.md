@@ -143,7 +143,7 @@ Setting both, neither, or `image-name` alongside `build-args` is a config-valida
 $ outrig build --image scratch
 [outrig] image-config: scratch
 [outrig] image:            docker.io/library/ubuntu:24.04
-[outrig] image ready
+[outrig] image ready: docker.io/library/ubuntu:24.04
 ```
 
 On subsequent runs when the image is already present:

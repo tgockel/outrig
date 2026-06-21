@@ -94,7 +94,7 @@ async fn build_single(
             }
             print_image_header(name, &tag);
             image::pull_image(&tag).await?;
-            eprintln!("[outrig] image ready");
+            eprintln!("[outrig] image ready: {tag}");
             Ok(0)
         }
         ImageSourceRef::Build { .. } => {
@@ -106,7 +106,7 @@ async fn build_single(
             }
             print_build_header(name, cc, &tag);
             image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
-            eprintln!("[outrig] image ready");
+            eprintln!("[outrig] image ready: {tag}");
             Ok(0)
         }
     }

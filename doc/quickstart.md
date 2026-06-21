@@ -201,8 +201,7 @@ $ outrig build
 [outrig] image tag:        hello-outrig-standard:8c2a4f7e91d6b5a3
 [buildah] STEP 1/N: FROM docker.io/library/debian:bookworm-slim
 ...
-[buildah] Successfully tagged hello-outrig-standard:8c2a4f7e91d6b5a3
-[outrig] image ready
+[outrig] image ready: hello-outrig-standard:8c2a4f7e91d6b5a3
 ```
 
 A second `outrig build` is a cache hit:
