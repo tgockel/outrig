@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://tgockel.github.io/outrig/
+    about: Usage and configuration questions are usually answered in the docs.
