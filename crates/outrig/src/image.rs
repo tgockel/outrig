@@ -1059,10 +1059,9 @@ mod tests {
              printf '%s' '{\"Labels\":{\"org.outrig.tags\":\"[\\\"remote\\\"]\"}}'\n",
         );
 
-        let labels =
-            read_remote_image_labels_with_program(program, "example.com/acme/rust-dev:latest")
-                .await
-                .expect("fake skopeo succeeds");
+        let labels = read_labels_via_fake(program, "example.com/acme/rust-dev:latest")
+            .await
+            .expect("fake skopeo succeeds");
 
         assert_eq!(labels["org.outrig.tags"], r#"["remote"]"#);
     }
@@ -1071,7 +1070,7 @@ mod tests {
     async fn read_remote_image_labels_surfaces_registry_failures() {
         let program = fake_skopeo("echo registry auth required >&2\nexit 7\n");
 
-        let err = read_remote_image_labels_with_program(program, "example.com/private:latest")
+        let err = read_labels_via_fake(program, "example.com/private:latest")
             .await
             .expect_err("fake skopeo failure must surface");
 
@@ -1098,6 +1097,32 @@ mod tests {
 
         assert!(matches!(err, OutrigError::Configuration(_)));
         assert!(err.to_string().contains("requires `skopeo`"), "got: {err}");
+    }
+
+    /// Run [`read_remote_image_labels_with_program`] against a `fake_skopeo`
+    /// script, retrying on a transient `ETXTBSY` ("text file busy").
+    ///
+    /// Writing an executable and immediately exec-ing it races with other test
+    /// threads: while we hold the freshly written file's write fd, an unrelated
+    /// `Command` spawn elsewhere in the process can `fork()` and briefly inherit
+    /// that fd, so our `execve` sees the file as still open for write. The
+    /// condition clears in microseconds, so a short bounded retry is robust.
+    /// (Production never writes the program it execs, so it cannot hit this.)
+    async fn read_labels_via_fake(
+        program: &'static str,
+        image_ref: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        for _ in 0..100 {
+            match read_remote_image_labels_with_program(program, image_ref).await {
+                Err(OutrigError::Io(source)) if source.kind() == ErrorKind::ExecutableFileBusy => {
+                    // Yield so the racing thread can finish its exec and close the
+                    // inherited write fd, clearing the busy file.
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                other => return other,
+            }
+        }
+        panic!("fake skopeo stayed ETXTBSY across 100 attempts");
     }
 
     fn fake_skopeo(body: &str) -> &'static str {
