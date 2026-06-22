@@ -53,3 +53,8 @@ intra-doc links (`lychee --offline 'doc/**/*.md' README.md CONTRIBUTING.md`).
 The implementation queue lives in [`plan/todo/`](plan/todo/README.md); design docs live in
 [`doc/`](doc/README.md). The harness conventions for advancing the queue are described in
 [`.claude/CLAUDE.md`](.claude/CLAUDE.md).
+
+## Releasing
+
+Cutting a release (tagging and publishing to crates.io) is documented in
+[`RELEASING.md`](RELEASING.md).
