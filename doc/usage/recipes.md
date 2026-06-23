@@ -1,8 +1,5 @@
 # Recipes
 
-> **TODO: Incomplete** -- every command and behavior on this page describes outrig's intended
-> behavior; the implementation isn't ready yet.
-
 A handful of common patterns. None of them require anything outside the documented commands and
 config -- they're just compositions worth knowing.
 

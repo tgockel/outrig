@@ -27,8 +27,6 @@ and won't paper over a broken setup.
 
 ## Install outrig
 
-> **TODO: Incomplete** -- `cargo install outrig-cli` is not yet on crates.io.
-
 Install the CLI package to get the `outrig` command:
 
 ```sh
