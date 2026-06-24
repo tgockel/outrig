@@ -158,7 +158,12 @@ api-key  = "${OLLAMA_API_KEY}"
 | `style`                | string       | yes      | --      | Must be `"openai"` for this row. |
 | `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider. |
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.    |
-| `request-timeout-secs` | integer      | no       | `120`   | HTTP timeout for LLM calls.      |
+| `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.      |
+
+Each LLM request that fails with a transient error -- a timeout, a dropped connection, or an
+HTTP `408`/`429`/`5xx` -- is retried a few times with exponential backoff before the turn
+gives up. `request-timeout-secs` bounds each individual attempt, and defaults high enough not
+to cut off long reasoning completions.
 
 ### `style = "mistralrs"`
 

@@ -30,6 +30,15 @@ pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_MAX as usize;
 pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize =
     outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES as usize;
 
+/// Default per-request HTTP timeout for OpenAi-style providers when
+/// `request-timeout-secs` is unset (see `doc/reference/config.md`). Generous
+/// enough not to truncate long reasoning completions, and above typical proxy
+/// timeouts so a client-side timeout never races a still-in-flight server
+/// request.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+
+pub mod retry;
+
 #[cfg(feature = "local-llm")]
 pub mod mistralrs;
 #[cfg(feature = "local-llm")]
@@ -368,7 +377,7 @@ fn validate_mistralrs_device(
 /// can't carry both). Callers (the agent loop) match on the variant.
 pub enum RigAgent {
     OpenAi {
-        agent: rig::agent::Agent<rig::providers::openai::CompletionModel>,
+        agent: rig::agent::Agent<retry::RetryingModel<rig::providers::openai::CompletionModel>>,
         tool_call_max: usize,
     },
     #[cfg(feature = "local-llm")]
@@ -397,17 +406,29 @@ pub async fn build_agent(
     let _ = cache_root;
     match &resolved.provider {
         ResolvedProvider::OpenAi {
-            base_url, api_key, ..
+            base_url,
+            api_key,
+            request_timeout_secs,
         } => {
             use rig::client::CompletionClient;
             use rig::providers::openai::CompletionsClient;
 
+            let timeout = std::time::Duration::from_secs(
+                request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+            );
+            let http = reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
+
             let client = CompletionsClient::builder()
                 .api_key(api_key.clone())
                 .base_url(base_url)
+                .http_client(http)
                 .build()
                 .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
-            let model = client.completion_model(&resolved.model_identifier);
+            let model =
+                retry::RetryingModel::new(client.completion_model(&resolved.model_identifier));
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(model, resolved, tools),
                 tool_call_max: resolved.tool_call_max,
