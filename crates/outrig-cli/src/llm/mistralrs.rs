@@ -67,8 +67,8 @@ pub struct MistralrsStreamResponse {
 }
 
 impl GetTokenUsage for MistralrsStreamResponse {
-    fn token_usage(&self) -> Option<Usage> {
-        self.usage
+    fn token_usage(&self) -> Usage {
+        self.usage.unwrap_or_default()
     }
 }
 
