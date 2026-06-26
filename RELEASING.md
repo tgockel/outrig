@@ -20,9 +20,12 @@ the library is published first and the CLI second.
    `[workspace.package]` and inherited by both crates. Update the `version = "X.Y.Z"` in
    `crates/outrig-cli/Cargo.toml`'s `outrig = { ... }` dependency to match.
 
-3. **Update the CHANGELOG.** Put the released items under a dated `[X.Y.Z]` section and set
-   the date to today. Confirm the link reference at the bottom points at the tag you will
-   create.
+3. **Update the CHANGELOGs.** Each crate keeps its own changelog:
+   [`crates/outrig/CHANGELOG.md`](crates/outrig/CHANGELOG.md) and
+   [`crates/outrig-cli/CHANGELOG.md`](crates/outrig-cli/CHANGELOG.md). Move each crate's
+   released items under a dated `[X.Y.Z]` section, set the date to today, and confirm the
+   section's tag link points at that crate's tag (`outrig-vX.Y.Z` /
+   `outrig-cli-vX.Y.Z`).
 
 4. **Dry-run the library** -- catches missing files, bad README paths, and a dirty tree:
 
@@ -50,15 +53,19 @@ the library is published first and the CLI second.
    `cargo install outrig-cli` block in [`doc/quickstart.md`](doc/quickstart.md) now that the
    crate is live, and commit.
 
-7. **Tag and push:**
+7. **Tag and push.** Tag each crate independently, matching the links in the changelog
+   headers:
 
    ```sh
-   git tag -a vX.Y.Z -m "outrig X.Y.Z"
-   git push origin vX.Y.Z
+   git tag -a outrig-vX.Y.Z     -m "outrig X.Y.Z"
+   git tag -a outrig-cli-vX.Y.Z -m "outrig-cli X.Y.Z"
+   git push origin outrig-vX.Y.Z outrig-cli-vX.Y.Z
    ```
 
-8. **GitHub release.** Create a release from the tag and paste the CHANGELOG section for this
-   version. The `docs.yml` workflow already deploys the docs site on push to `trunk`.
+8. **GitHub release.** Create a release from the `outrig-cli-vX.Y.Z` tag (the user-facing
+   artifact) and paste its `crates/outrig-cli/CHANGELOG.md` section for this version,
+   noting the library's `crates/outrig/CHANGELOG.md` section as well. The `docs.yml`
+   workflow already deploys the docs site on push to `trunk`.
 
 9. **Smoke-test the published artifact:**
 
