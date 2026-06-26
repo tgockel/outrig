@@ -27,31 +27,31 @@ pub struct DocContent {
 pub const DOCS: &[Doc] = &[
     Doc {
         page: "concepts/containers",
-        markdown: include_str!("../../../../doc/concepts/containers.md"),
+        markdown: include_str!("docs/concepts/containers.md"),
     },
     Doc {
         page: "concepts/mcp-servers",
-        markdown: include_str!("../../../../doc/concepts/mcp-servers.md"),
+        markdown: include_str!("docs/concepts/mcp-servers.md"),
     },
     Doc {
         page: "concepts/mcp-trust-model",
-        markdown: include_str!("../../../../doc/concepts/mcp-trust-model.md"),
+        markdown: include_str!("docs/concepts/mcp-trust-model.md"),
     },
     Doc {
         page: "concepts/workspace",
-        markdown: include_str!("../../../../doc/concepts/workspace.md"),
+        markdown: include_str!("docs/concepts/workspace.md"),
     },
     Doc {
         page: "reference/config",
-        markdown: include_str!("../../../../doc/reference/config.md"),
+        markdown: include_str!("docs/reference/config.md"),
     },
     Doc {
         page: "usage/ai-assisted-design",
-        markdown: include_str!("../../../../doc/usage/ai-assisted-design.md"),
+        markdown: include_str!("docs/usage/ai-assisted-design.md"),
     },
     Doc {
         page: "usage/image",
-        markdown: include_str!("../../../../doc/usage/image.md"),
+        markdown: include_str!("docs/usage/image.md"),
     },
 ];
 

@@ -27,15 +27,16 @@ the library is published first and the CLI second.
    section's tag link points at that crate's tag (`outrig-vX.Y.Z` /
    `outrig-cli-vX.Y.Z`).
 
-4. **Dry-run the library** -- catches missing files, bad README paths, and a dirty tree:
+4. **Dry-run both crates** -- catches missing files, bad README paths, and a dirty tree:
 
    ```sh
    cargo publish --dry-run -p outrig
+   cargo publish --dry-run -p outrig-cli
    ```
 
-   `outrig-cli` cannot be dry-run yet: its verify build resolves the `outrig` dependency from
-   the crates.io index, which does not have the new version until step 5. It is validated by
-   its own publish below.
+   The `outrig-cli` dry-run resolves the `outrig` dependency from the workspace path (cargo
+   packages the sibling crate locally for the verify build), so it works before `outrig` is
+   on the index. The real publish in step 5 still needs `outrig` published first.
 
 5. **Publish, library first:**
 
