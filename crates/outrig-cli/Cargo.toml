@@ -62,5 +62,5 @@ tracing-subscriber = { workspace = true, default-features = true, features = ["e
 walkdir            = { workspace = true, default-features = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core    = { version = "=0.10.2", default-features = false, optional = true, features = ["metal"] }
+candle-core    = { version = "=0.11.0", default-features = false, optional = true, features = ["metal"] }
 mistralrs-core = { version = "=0.8.1", default-features = false, optional = true, features = ["metal"] }
