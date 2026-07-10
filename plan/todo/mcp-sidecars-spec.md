@@ -1,5 +1,9 @@
 # MCP sidecar containers
 
+> Shared design reference for tasks 0078-0081. Each task file carries its own Goal /
+> Deliverables / Acceptance / Dependencies and points here for the full design. Delete this
+> file when the last of the four tasks lands.
+
 ## Context
 
 Today every MCP server in a session runs inside the primary workspace container: the merged
@@ -216,7 +220,8 @@ callback wired in `run.rs`):
 
 ## Task breakdown
 
-Ordered for `/groom-plan`; each item is one numbered task on its own branch.
+Ordered for `/groom-plan`; each item is one numbered task on its own branch. Assigned
+numbers: 1 -> 0078, 2 -> 0079, 3 -> 0080, 4 -> 0081.
 
 1. **Interceptor multi-container generalization.** Attach/detach API, per-container namespace
    sockets and nft application, per-record container stamping in the audit sink, teardown of all
