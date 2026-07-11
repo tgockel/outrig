@@ -39,6 +39,34 @@ the compiled policy and the shared `AuditSink`, with a per-container attach/deta
 
 None queued. Builds on the landed interceptor work (0059/0060 lineage).
 
+## Decisions
+
+- `start` / `start_with_policy` keep their exact signatures as convenience wrappers
+  (`new` + `attach` of the primary), so both call sites (`outrig_.rs`,
+  `session_setup.rs`) and the existing e2e tests are untouched; sidecar tasks will call
+  `new`/`attach`/`detach` directly.
+- Attaching an already-attached container name and detaching an unknown name are both
+  `Configuration` errors rather than silent no-ops, so 0081's bookkeeping bugs surface
+  immediately.
+- `detach` takes the container *name*, not `&Container`, so a container that already died
+  can still be detached; the nft delete against its defunct pid fails harmlessly
+  (`try_capture_logged` tolerates non-zero exit).
+- The DNS name-to-IP cache is shared across attachments (session-level): IP-to-hostname is
+  container-independent, every attachment forwards through the same host resolvers, and
+  sharing lets filter rules and audit `outrig.host` attribution work when one container
+  connects to an IP another container resolved.
+- The nft table name stays session-derived (identical in every netns); per-container
+  uniqueness comes from netns isolation, and per-attachment `Cleanup { pid, table }` scopes
+  deletion to one container.
+- Audit stamping moved from the sink to per-attachment `AuditSink::for_container` clones
+  sharing one file lock, leaving `write_audit`, `AuditRecord`, and the JSONL schema
+  untouched.
+- The `disposed` flag is gone: `shutdown`/`detach` drain the attachment map, so `Drop`
+  (detached per-pid nft deletes) is naturally a no-op after orderly teardown.
+- Detach leaves the container's `/etc/resolv.conf` pointing at the loopback listener --
+  same as today's post-shutdown state; detach is documented as running just before the
+  container stops.
+
 ## See also
 
 - [`mcp-sidecars-spec.md`](mcp-sidecars-spec.md) -- "Network parity" section.

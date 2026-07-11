@@ -1,11 +1,13 @@
 //! Per-session network audit and filtering plumbing.
 //!
-//! Interception is intentionally opt-in. When enabled, OutRig installs a
-//! small nftables nat table in the session container's network namespace and
-//! keeps host-side listener sockets in that namespace. The accepted sockets
-//! carry the original destination metadata; upstream connections are opened
-//! from the host namespace, so OutRig's own traffic is not routed back
-//! through the interceptor.
+//! Interception is intentionally opt-in. One interceptor per session owns the
+//! compiled policy and the audit sink; each session container is covered by a
+//! per-container attachment. When a container is attached, OutRig installs a
+//! small nftables nat table in that container's network namespace and keeps
+//! host-side listener sockets in that namespace. The accepted sockets carry
+//! the original destination metadata; upstream connections are opened from
+//! the host namespace, so OutRig's own traffic is not routed back through the
+//! interceptor.
 
 use std::collections::BTreeMap;
 use std::fs::File as StdFile;
@@ -199,9 +201,21 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 #[derive(Debug)]
 pub struct NetworkInterceptor {
     cancel: CancellationToken,
+    policy: Arc<CompiledNetworkPolicy>,
+    audit: AuditSink,
+    dns_cache: DnsCache,
+    table: String,
+    attachments: BTreeMap<String, Attachment>,
+}
+
+/// Per-container interception state: the container's accept loops and the
+/// handle that deletes its nft table. Sockets live inside the container's
+/// namespaces, so every attachment owns its own listeners and loops.
+#[derive(Debug)]
+struct Attachment {
+    cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     cleanup: Cleanup,
-    disposed: bool,
 }
 
 impl NetworkInterceptor {
@@ -215,72 +229,132 @@ impl NetworkInterceptor {
         session_id: &str,
         policy: NetworkPolicy,
     ) -> Result<Self> {
+        let mut interceptor = Self::new(log_dir, session_id, policy).await?;
+        interceptor.attach(container).await?;
+        Ok(interceptor)
+    }
+
+    /// Session-level construction: validates host tooling, compiles the
+    /// policy, and opens the audit sink. Containers are covered only once
+    /// [`attach`](Self::attach)ed.
+    pub async fn new(log_dir: &Path, session_id: &str, policy: NetworkPolicy) -> Result<Self> {
         require_tool("nft")?;
         require_tool("nsenter")?;
         let policy = Arc::new(CompiledNetworkPolicy::new(policy)?);
+
+        tokio::fs::create_dir_all(log_dir).await?;
+        let audit = AuditSink::open(log_dir.join(NETWORK_LOG), session_id.to_string()).await?;
+
+        Ok(Self {
+            cancel: CancellationToken::new(),
+            policy,
+            audit,
+            dns_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            table: nft_table_name(session_id),
+            attachments: BTreeMap::new(),
+        })
+    }
+
+    /// Attaches `container`: binds listener sockets inside its user/net
+    /// namespaces, points its resolver at the DNS listener, applies the nft
+    /// redirect table in its netns (the session-derived table name cannot
+    /// collide across containers because each netns has its own table
+    /// namespace), and spawns its accept loops. Works mid-session; audit
+    /// records from this container are stamped with its name.
+    pub async fn attach(&mut self, container: &Container) -> Result<()> {
+        let name = container.name();
+        if self.attachments.contains_key(name) {
+            return Err(OutrigError::Configuration(format!(
+                "container {name:?} is already attached to the network interceptor"
+            )));
+        }
 
         let pid = container_pid(container).await?;
         let sockets = bind_interceptor_sockets(pid)?;
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
 
-        tokio::fs::create_dir_all(log_dir).await?;
-        let audit = AuditSink::open(
-            log_dir.join(NETWORK_LOG),
-            session_id.to_string(),
-            container.name().to_string(),
-        )
-        .await?;
-        let dns_cache = Arc::new(Mutex::new(BTreeMap::new()));
-        let cancel = CancellationToken::new();
         let cleanup = Cleanup {
             pid,
-            table: nft_table_name(session_id),
+            table: self.table.clone(),
             transcript: container.transcript(),
         };
 
         install_audit_resolv_conf(container).await?;
         apply_nft_rules(&cleanup, tcp_port, dns_port).await?;
 
+        let cancel = self.cancel.child_token();
         let tasks = vec![
             tokio::spawn(tcp_accept_loop(
                 sockets.tcp,
-                audit.clone(),
-                dns_cache.clone(),
-                policy.clone(),
+                self.audit.for_container(name),
+                self.dns_cache.clone(),
+                self.policy.clone(),
                 cancel.clone(),
             )),
-            tokio::spawn(dns_loop(sockets.dns, dns_cache, cancel.clone())),
+            tokio::spawn(dns_loop(
+                sockets.dns,
+                self.dns_cache.clone(),
+                cancel.clone(),
+            )),
         ];
 
-        Ok(Self {
-            cancel,
-            tasks,
-            cleanup,
-            disposed: false,
-        })
+        self.attachments.insert(
+            name.to_string(),
+            Attachment {
+                cancel,
+                tasks,
+                cleanup,
+            },
+        );
+        Ok(())
+    }
+
+    /// Detaches one container: cancels its loops and deletes its nft table
+    /// without disturbing other attachments. Takes the container name rather
+    /// than a [`Container`] so an already-dead container can still be
+    /// detached (the nft delete against its defunct pid fails harmlessly).
+    /// The container's `/etc/resolv.conf` is left pointing at the loopback
+    /// listener; detach is intended to run just before the container stops.
+    pub async fn detach(&mut self, container: &str) -> Result<()> {
+        let attachment = self.attachments.remove(container).ok_or_else(|| {
+            OutrigError::Configuration(format!(
+                "container {container:?} is not attached to the network interceptor"
+            ))
+        })?;
+        teardown_attachment(attachment).await;
+        Ok(())
     }
 
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
-        let tasks = std::mem::take(&mut self.tasks);
-        for task in tasks {
-            let _ = tokio::time::timeout(SHUTDOWN_GRACE, task).await;
-        }
-        if let Err(e) = self.cleanup.delete_table().await {
-            tracing::warn!(target: "outrig::network", "network cleanup failed: {e}");
-        }
-        self.disposed = true;
+        // Attachments live in disjoint namespaces, so their grace periods and
+        // nft deletes can overlap.
+        futures_util::future::join_all(
+            std::mem::take(&mut self.attachments)
+                .into_values()
+                .map(teardown_attachment),
+        )
+        .await;
     }
 }
 
 impl Drop for NetworkInterceptor {
     fn drop(&mut self) {
-        if self.disposed {
-            return;
-        }
         self.cancel.cancel();
-        self.cleanup.spawn_detached_delete();
+        for attachment in self.attachments.values() {
+            attachment.cleanup.spawn_detached_delete();
+        }
+    }
+}
+
+async fn teardown_attachment(attachment: Attachment) {
+    attachment.cancel.cancel();
+    for task in attachment.tasks {
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, task).await;
+    }
+    if let Err(e) = attachment.cleanup.delete_table().await {
+        tracing::warn!(target: "outrig::network", "network cleanup failed: {e}");
     }
 }
 
@@ -324,7 +398,7 @@ impl Cleanup {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct AuditSink {
     file: Arc<AsyncMutex<tokio::fs::File>>,
     session_id: String,
@@ -332,7 +406,10 @@ struct AuditSink {
 }
 
 impl AuditSink {
-    async fn open(path: PathBuf, session_id: String, container: String) -> Result<Self> {
+    /// Opens the session-level sink. Its container field is empty; each
+    /// attachment writes through a [`for_container`](Self::for_container)
+    /// handle so records carry that container's name.
+    async fn open(path: PathBuf, session_id: String) -> Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -344,8 +421,17 @@ impl AuditSink {
         Ok(Self {
             file: Arc::new(AsyncMutex::new(file)),
             session_id,
-            container,
+            container: String::new(),
         })
+    }
+
+    /// A handle writing to the same file whose records are stamped with
+    /// `container`.
+    fn for_container(&self, container: &str) -> Self {
+        Self {
+            container: container.to_string(),
+            ..self.clone()
+        }
     }
 
     async fn write(&self, record: &AuditRecord) -> Result<()> {
@@ -1605,5 +1691,44 @@ options edns0
             dns_answer_ips(&response),
             vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
         );
+    }
+
+    #[tokio::test]
+    async fn audit_sink_stamps_container_per_handle() {
+        fn event() -> AuditEvent {
+            AuditEvent {
+                opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                duration: Duration::from_millis(1),
+                orig: "10.0.2.100:50123".parse().expect("orig addr"),
+                dst: "93.184.216.34:443".parse().expect("dst addr"),
+                sniff: Sniff {
+                    service: "ssl",
+                    host: None,
+                    sni: None,
+                },
+                bytes_tx: 0,
+                bytes_rx: 0,
+                decision: PolicyDecision::allow_default(),
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NETWORK_LOG);
+        let sink = AuditSink::open(path.clone(), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        write_audit(&sink.for_container("outrig-a"), event()).await;
+        write_audit(&sink.for_container("outrig-b"), event()).await;
+
+        let text = std::fs::read_to_string(path).expect("read audit log");
+        let containers: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("record json"))
+            .collect();
+        assert_eq!(containers.len(), 2);
+        for (record, container) in containers.iter().zip(["outrig-a", "outrig-b"]) {
+            assert_eq!(record["outrig.session_id"], "sid-1");
+            assert_eq!(record["outrig.container"], container);
+        }
     }
 }
