@@ -38,6 +38,13 @@ jobs:
       - run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
       - run: cargo test ${{ matrix.cargo_args }}
 
+  doc-style:
+    name: doc-style
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/audit-doc-style.py
+
   mdbook:
     name: mdbook
     runs-on: ubuntu-latest

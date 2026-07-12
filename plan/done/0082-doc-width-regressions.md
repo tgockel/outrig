@@ -27,3 +27,14 @@ Both exceed the 100-code-point width rule.
 ## Dependencies
 
 None.
+
+## Decisions
+
+- By the time this task was picked up, both width violations had already been fixed by
+  intervening commits (most recently `8435f932`, which reworked the `cli.md` flag table
+  into its current in-width form). `python3 scripts/audit-doc-style.py` exits 0 on trunk,
+  so no doc edits were made here.
+- The CI question resolved to "the workflow doesn't gate on it": `ci.yml` never invoked
+  the audit script, despite CLAUDE.md claiming CI runs it. Fixed by adding a `doc-style`
+  job (checkout + `python3 scripts/audit-doc-style.py`). The script is stdlib-only, so
+  the job needs no pip install; its non-zero exit on violations is what gates.
