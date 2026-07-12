@@ -280,14 +280,19 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 4. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp`
    label if present, then overlay `[images.<name>.mcp]` from config by server name. Each
    declared sidecar's image is resolved, its label merged (scoped to that sidecar), and
-   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. Sidecar failures follow
-   the block's `on-failure` key.
+   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. An entrypoint-stdio
+   sidecar (inline `image`, no `command`) is instead created and initialized with its
+   ENTRYPOINT held un-executed, env baked in via `podman create --env`. Sidecar failures
+   follow the block's `on-failure` key.
 5. **Start network interception, if enabled.** The interceptor attaches to the primary
-   and every running sidecar. Fresh sessions can write
+   and every sidecar -- including created-but-not-started entrypoint sidecars, whose
+   first packet is therefore already subject to policy. Fresh sessions can write
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
-   command in the container its placement names and run the MCP `initialize` handshake.
+   command in the container its placement names -- or, for entrypoint-stdio servers,
+   `podman start --attach --interactive` the held container, whose lifetime now equals
+   the server's -- and run the MCP `initialize` handshake.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with
    each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
 8. **Serve MCP.** Without `--listen`, rmcp's stdio transport reads JSON-RPC frames

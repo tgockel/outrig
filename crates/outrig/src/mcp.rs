@@ -25,6 +25,7 @@ use tokio::process::Child;
 use crate::config::{EnvValue, McpServerSpec};
 use crate::container::{Container, embedded::McpDeclarationSource};
 use crate::error::{OutrigError, Result};
+use crate::process::{Cmd, Transcript};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -102,36 +103,81 @@ impl McpClient {
         log_dir: &Path,
         extra_env: &BTreeMap<String, EnvValue>,
     ) -> Result<Self> {
-        let (command, mut env_spec) = server_cfg.normalize();
-        // Merge CLI overlay on top of config-file env (last-wins).
-        for (key, value) in extra_env {
-            env_spec.insert(key.clone(), value.clone());
-        }
-        let mut env: BTreeMap<String, String> = BTreeMap::new();
-        for (key, value) in env_spec {
-            let resolved = value
-                .resolve()
-                .map_err(|source| OutrigError::McpEnvResolveFailed {
-                    name: name.to_string(),
-                    key: key.clone(),
-                    source,
-                })?;
-            env.insert(key, resolved);
-        }
+        let (command, env_spec) = server_cfg.normalize();
+        let env = resolve_mcp_env(name, env_spec, extra_env)?;
+        let exec_cmd = container.build_exec_argv(&command, &env);
+        Self::connect_stdio_cmd(
+            exec_cmd,
+            name,
+            declaration_source,
+            log_dir,
+            container.transcript(),
+            &command,
+        )
+        .await
+    }
 
+    /// Connect an entrypoint-stdio server: spawn
+    /// `podman start --attach --interactive <container>` as the owned child,
+    /// so the image's ENTRYPOINT becomes the server and container lifetime
+    /// equals server lifetime. The container must be created+initialized
+    /// (`Container::create_initialized`) with the server's env baked in --
+    /// `podman start` carries no `--env`.
+    ///
+    /// [`McpClient::shutdown`]'s close-stdin -> grace -> kill sequence works
+    /// unchanged: EOF on the attached stdin reaches the entrypoint, which
+    /// exits and takes the container with it (`--rm`). A server that ignores
+    /// EOF gets the *attach child* SIGKILLed, which does not stop the
+    /// container itself -- session teardown's `Container::stop` covers that.
+    pub async fn connect_via_podman_start(
+        container: &Container,
+        name: &str,
+        declaration_source: McpDeclarationSource,
+        log_dir: &Path,
+    ) -> Result<Self> {
+        let cmd = Cmd::new("podman")
+            .args(["start", "--attach", "--interactive"])
+            .arg(container.name());
+        // Derived from the one Cmd so failure diagnostics can't drift from
+        // what actually ran.
+        let argv: Vec<String> = std::iter::once(cmd.program.to_string())
+            .chain(cmd.args.iter().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        Self::connect_stdio_cmd(
+            cmd,
+            name,
+            Some(declaration_source.description()),
+            log_dir,
+            container.transcript(),
+            &argv,
+        )
+        .await
+    }
+
+    /// Transport-agnostic connection tail: spawn `cmd` with piped stdio and
+    /// stderr redirected to `<log_dir>/<name>.stderr`, then drive the MCP
+    /// `initialize` handshake. `display_command` is what a startup failure
+    /// reports as the attempted command.
+    async fn connect_stdio_cmd(
+        cmd: Cmd,
+        name: &str,
+        declaration_source: Option<&'static str>,
+        log_dir: &Path,
+        transcript: Option<Transcript>,
+        display_command: &[String],
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(log_dir).await?;
         let stderr_path = log_dir.join(format!("{name}.stderr"));
         let stderr_file = tokio::fs::File::create(&stderr_path).await?;
         let stderr_std = stderr_file.into_std().await;
 
-        let exec_cmd = container.build_exec_argv(&command, &env);
-        if let Some(transcript) = container.transcript() {
+        if let Some(transcript) = transcript {
             transcript
-                .line("podman", &format!("$ {}", exec_cmd.render()))
+                .line("podman", &format!("$ {}", cmd.render()))
                 .await?;
         }
 
-        let mut cmd = exec_cmd.to_tokio_command();
+        let mut cmd = cmd.to_tokio_command();
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr_std))
@@ -151,7 +197,7 @@ impl McpClient {
                 return Err(enrich_startup_error(
                     name,
                     declaration_source,
-                    &command,
+                    display_command,
                     &stderr_path,
                     &mut child,
                     source,
@@ -291,6 +337,35 @@ impl McpClient {
     }
 }
 
+/// Layer the CLI `--env` overlay onto the config-file env (overlay wins on
+/// key conflict) and resolve each value -- literals verbatim, `${VAR}` refs
+/// from the host environment. `name` labels resolution failures with the
+/// owning server. Shared by both stdio transports: exec-stdio resolves at
+/// connect time (`podman exec --env`), entrypoint-stdio at container-create
+/// time (`podman create --env`).
+pub fn resolve_mcp_env(
+    name: &str,
+    config_env: BTreeMap<String, EnvValue>,
+    extra_env: &BTreeMap<String, EnvValue>,
+) -> Result<BTreeMap<String, String>> {
+    let mut env_spec = config_env;
+    for (key, value) in extra_env {
+        env_spec.insert(key.clone(), value.clone());
+    }
+    let mut env = BTreeMap::new();
+    for (key, value) in env_spec {
+        let resolved = value
+            .resolve()
+            .map_err(|source| OutrigError::McpEnvResolveFailed {
+                name: name.to_string(),
+                key: key.clone(),
+                source,
+            })?;
+        env.insert(key, resolved);
+    }
+    Ok(env)
+}
+
 /// Convert rmcp's bare transport error from `serve_client` into a richer
 /// `McpStartupFailed` carrying the server name, the command we tried to run,
 /// the child's exit status (so the user sees *why* the pipe closed), and a
@@ -402,6 +477,50 @@ pub(crate) fn kind_of(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_mcp_env_overlay_wins_and_resolves_refs() {
+        // SAFETY: test-local var; std::env::set_var is unsafe in edition 2024
+        // because of thread-unsafety, acceptable in this single-purpose test.
+        unsafe { std::env::set_var("OUTRIG_TEST_MCP_ENV", "from-host") };
+        let config_env = BTreeMap::from([
+            (
+                "KEEP".to_string(),
+                EnvValue::from_raw("literal".to_string()),
+            ),
+            ("BOTH".to_string(), EnvValue::from_raw("config".to_string())),
+        ]);
+        let extra_env = BTreeMap::from([
+            (
+                "BOTH".to_string(),
+                EnvValue::from_raw("overlay".to_string()),
+            ),
+            (
+                "REF".to_string(),
+                EnvValue::from_raw("${OUTRIG_TEST_MCP_ENV}".to_string()),
+            ),
+        ]);
+
+        let env = resolve_mcp_env("svc", config_env, &extra_env).expect("resolves");
+        assert_eq!(env["KEEP"], "literal");
+        assert_eq!(env["BOTH"], "overlay");
+        assert_eq!(env["REF"], "from-host");
+    }
+
+    #[test]
+    fn resolve_mcp_env_missing_ref_names_server_and_key() {
+        let config_env = BTreeMap::from([(
+            "TOKEN".to_string(),
+            EnvValue::from_raw("${OUTRIG_TEST_MCP_ENV_MISSING}".to_string()),
+        )]);
+        let err = resolve_mcp_env("svc", config_env, &BTreeMap::new())
+            .expect_err("unset host var must fail resolution");
+        let OutrigError::McpEnvResolveFailed { name, key, .. } = &err else {
+            panic!("expected McpEnvResolveFailed, got {err:?}");
+        };
+        assert_eq!(name, "svc");
+        assert_eq!(key, "TOKEN");
+    }
 
     #[test]
     fn render_command_passes_through_simple_argv() {

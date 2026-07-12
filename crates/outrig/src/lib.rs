@@ -18,7 +18,7 @@ pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
     NetworkPolicyBuilder,
 };
-pub use mcp::{McpClient, McpTool, McpToolResult};
+pub use mcp::{McpClient, McpTool, McpToolResult, resolve_mcp_env};
 pub use outrig_::{
     CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec,
     ToolHandle, WorkspaceSpec,

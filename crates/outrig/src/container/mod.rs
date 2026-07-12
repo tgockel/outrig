@@ -50,6 +50,13 @@ pub struct Container {
     group_name: Option<String>,
     transcript: Option<Transcript>,
     ownership: ContainerOwnership,
+    /// Whether the interceptor's resolver was baked in at `podman create`
+    /// (`--dns` flags). [`NetworkInterceptor::attach`] skips its exec-based
+    /// resolv.conf install for such containers -- necessarily, since a
+    /// created-but-not-started container cannot be exec'd.
+    ///
+    /// [`NetworkInterceptor::attach`]: crate::network::NetworkInterceptor::attach
+    dns_preconfigured: bool,
     disposed: bool,
 }
 
@@ -142,9 +149,6 @@ impl Container {
         name: String,
         transcript: Option<Transcript>,
     ) -> Result<Self> {
-        let uid = nix::unistd::getuid().as_raw();
-        let gid = nix::unistd::getgid().as_raw();
-
         // Register before spawning so a SIGKILL between the spawn call and
         // its return can still be cleaned up by the panic hook.
         track(&name);
@@ -156,24 +160,74 @@ impl Container {
             return Err(e);
         }
 
-        let (host_workspace, container_workspace) = match &launch.workspace {
+        let workspace = match &launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
             None => (PathBuf::new(), PathBuf::new()),
         };
-
-        Ok(Self {
+        Ok(Self::handle(
             name,
-            image_tag: image.clone(),
-            host_workspace,
-            container_workspace,
-            uid,
-            gid,
-            user_name: None,
-            group_name: None,
+            image.clone(),
+            workspace,
             transcript,
-            ownership: ContainerOwnership::Owned,
-            disposed: false,
-        })
+            ContainerOwnership::Owned,
+            false,
+        ))
+    }
+
+    /// Create and initialize a container without executing its ENTRYPOINT:
+    /// `podman create` followed by `podman init`, which materializes the
+    /// container process and its namespaces while the entrypoint is held
+    /// un-executed until `podman start`. Used for entrypoint-stdio MCP
+    /// sidecars so the network interceptor can attach to the initialized
+    /// PID before the server can emit a packet.
+    ///
+    /// `env` becomes `--env` flags on the create (there is no later exec to
+    /// carry them). `intercept_dns` bakes the interceptor's loopback resolver
+    /// into the container via `--dns` -- the exec-based resolv.conf install
+    /// is impossible before start. A `podman init` that fails to materialize
+    /// a PID surfaces later through the interceptor's pid probe.
+    pub async fn create_initialized(
+        image: &ImageTag,
+        launch: ContainerLaunchSpec,
+        name: String,
+        transcript: Option<Transcript>,
+        env: &BTreeMap<String, String>,
+        intercept_dns: bool,
+    ) -> Result<Self> {
+        // As in start_named: register before spawning so a SIGKILL between
+        // the spawn call and its return can still be cleaned up.
+        track(&name);
+
+        let create = build_podman_create_cmd(
+            image,
+            &name,
+            &launch,
+            selinux_enforcing().await,
+            env,
+            intercept_dns,
+        );
+        let init = Cmd::new("podman").arg("init").arg(&name);
+        for cmd in [create, init] {
+            if let Err(e) = process::run_capture_logged(cmd, "podman", transcript.as_ref()).await {
+                // An init failure leaves the created container behind.
+                spawn_detached_rm(&name);
+                untrack(&name);
+                return Err(e);
+            }
+        }
+
+        let workspace = match &launch.workspace {
+            Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
+            None => (PathBuf::new(), PathBuf::new()),
+        };
+        Ok(Self::handle(
+            name,
+            image.clone(),
+            workspace,
+            transcript,
+            ContainerOwnership::Owned,
+            intercept_dns,
+        ))
     }
 
     /// Build a handle for an already-running container that outrig does not
@@ -185,24 +239,42 @@ impl Container {
         workspace: Option<(&Path, &Path)>,
         transcript: Option<Transcript>,
     ) -> Self {
-        let uid = nix::unistd::getuid().as_raw();
-        let gid = nix::unistd::getgid().as_raw();
-        let (host_workspace, container_workspace) = match workspace {
+        let workspace = match workspace {
             Some((host, container)) => (host.to_path_buf(), container.to_path_buf()),
             None => (PathBuf::new(), PathBuf::new()),
         };
+        Self::handle(
+            name.into(),
+            image_tag,
+            workspace,
+            transcript,
+            ContainerOwnership::Attached,
+            false,
+        )
+    }
 
+    /// Handle constructor shared by every path that materializes a
+    /// [`Container`], so a new field is threaded through one place.
+    fn handle(
+        name: String,
+        image_tag: ImageTag,
+        (host_workspace, container_workspace): (PathBuf, PathBuf),
+        transcript: Option<Transcript>,
+        ownership: ContainerOwnership,
+        dns_preconfigured: bool,
+    ) -> Self {
         Self {
-            name: name.into(),
+            name,
             image_tag,
             host_workspace,
             container_workspace,
-            uid,
-            gid,
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
             user_name: None,
             group_name: None,
             transcript,
-            ownership: ContainerOwnership::Attached,
+            ownership,
+            dns_preconfigured,
             disposed: false,
         }
     }
@@ -238,6 +310,12 @@ impl Container {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the interceptor's resolver was baked in at create time; see
+    /// the field doc.
+    pub(crate) fn dns_preconfigured(&self) -> bool {
+        self.dns_preconfigured
     }
 
     pub fn image_tag(&self) -> &ImageTag {
@@ -445,9 +523,12 @@ impl Container {
         }
 
         let secs = grace.as_secs().to_string();
+        // `--ignore`: an already-gone container counts as stopped -- an
+        // entrypoint-stdio sidecar exits with its server and `--rm` removes
+        // it before this orderly stop runs. Other stop failures propagate.
         process::run_capture_logged(
             Cmd::new("podman")
-                .args(["stop", "-t"])
+                .args(["stop", "--ignore", "-t"])
                 .arg(&secs)
                 .arg(&self.name),
             "podman",
@@ -535,10 +616,47 @@ fn build_podman_run_cmd(
     launch: &ContainerLaunchSpec,
     selinux: bool,
 ) -> Cmd {
-    let mut cmd = Cmd::new("podman")
+    let cmd = Cmd::new("podman")
         .args(["run", "-d", "--rm", "--name"])
         .arg(name);
+    append_launch_flags(cmd, launch, selinux)
+        .arg(image.0.as_str())
+        .args(["sleep", "infinity"])
+}
 
+/// `podman create` argv for an entrypoint-stdio container: no trailing argv
+/// (the image's ENTRYPOINT is the process), `--interactive` so stdin stays
+/// open for the later `podman start --attach --interactive`, and `--rm` so
+/// container lifetime equals server lifetime. `env` becomes `--env` flags
+/// because there is no later exec to carry it; `intercept_dns` bakes the
+/// interceptor's resolver in via `--dns` for the same reason.
+fn build_podman_create_cmd(
+    image: &ImageTag,
+    name: &str,
+    launch: &ContainerLaunchSpec,
+    selinux: bool,
+    env: &BTreeMap<String, String>,
+    intercept_dns: bool,
+) -> Cmd {
+    let mut cmd = Cmd::new("podman").args(["create", "--name"]).arg(name);
+    cmd = append_launch_flags(cmd, launch, selinux);
+
+    if intercept_dns {
+        cmd = cmd
+            .args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
+            .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION]);
+    }
+    for (k, v) in env {
+        cmd = cmd.arg("--env").arg(format!("{k}={v}"));
+    }
+
+    cmd.args(["--interactive", "--rm"]).arg(image.0.as_str())
+}
+
+/// Flags shared by `podman run` and `podman create`: labels, workspace and
+/// extra bind mounts, keep-id, workspace workdir, capability policy, and the
+/// hardening tail.
+fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool) -> Cmd {
     for (key, value) in &launch.labels {
         cmd = cmd.arg("--label").arg(format!("{key}={value}"));
     }
@@ -562,10 +680,7 @@ fn build_podman_run_cmd(
     }
 
     cmd = append_capability_flags(cmd, &launch.capabilities);
-
     cmd.args(["--security-opt=no-new-privileges", "--pull=never"])
-        .arg(image.0.as_str())
-        .args(["sleep", "infinity"])
 }
 
 fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -> Cmd {
@@ -874,6 +989,96 @@ mod tests {
                 "local:test",
                 "sleep",
                 "infinity",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_create_args_hold_entrypoint_with_env_and_dns() {
+        let launch = ContainerLaunchSpec {
+            workspace: None,
+            mounts: Vec::new(),
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::NoNetRaw,
+                cap_drop: Vec::new(),
+                cap_add: Vec::new(),
+            },
+            labels: BTreeMap::from([
+                (
+                    LABEL_SESSION.to_string(),
+                    "20260712T000000-abcd".to_string(),
+                ),
+                (LABEL_SIDECAR.to_string(), "fetch".to_string()),
+            ]),
+        };
+        let env = BTreeMap::from([
+            ("A_FIRST".to_string(), "1".to_string()),
+            ("TOKEN".to_string(), "secret value".to_string()),
+        ]);
+
+        let args = argv(build_podman_create_cmd(
+            &ImageTag("ghcr.io/example/mcp-fetch:2".to_string()),
+            "outrig-20260712T000000-abcd-fetch",
+            &launch,
+            false,
+            &env,
+            true,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--name",
+                "outrig-20260712T000000-abcd-fetch",
+                "--label",
+                "org.outrig.session=20260712T000000-abcd",
+                "--label",
+                "org.outrig.sidecar=fetch",
+                "--userns=keep-id",
+                "--cap-drop=NET_RAW",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "--dns",
+                "127.0.0.1",
+                "--dns-option",
+                "ndots:0",
+                "--env",
+                "A_FIRST=1",
+                "--env",
+                "TOKEN=secret value",
+                "--interactive",
+                "--rm",
+                "ghcr.io/example/mcp-fetch:2",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_create_args_omit_dns_and_env_when_unused() {
+        let args = argv(build_podman_create_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test-fetch",
+            &ContainerLaunchSpec::default(),
+            false,
+            &BTreeMap::new(),
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--name",
+                "outrig-test-fetch",
+                "--userns=keep-id",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "--interactive",
+                "--rm",
+                "local:test",
             ]
         );
     }

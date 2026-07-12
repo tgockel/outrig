@@ -246,13 +246,6 @@ pub enum ConfigValidationError {
         sidecar: String,
     },
 
-    #[error(
-        "image {image:?} mcp server {server:?} sets `image` without a `command` \
-         (entrypoint-stdio); that form arrives in a later release -- add a `command` \
-         to run the server via exec-stdio"
-    )]
-    McpEntrypointStdioUnsupported { image: String, server: String },
-
     #[error("image {image:?} mcp server {server:?}: `image` must not be empty")]
     McpInlineImageEmpty { image: String, server: String },
 
@@ -461,9 +454,11 @@ fn validate_security(
 }
 
 /// Placement rules for one `[images.<name>.mcp]` entry: `sidecar`/`image`
-/// mutual exclusion, named sidecars must exist and are exec-stdio-only, the
-/// entrypoint-stdio form is rejected until it ships, and an anonymous sidecar
-/// must not collide with a named one (it occupies its server's name).
+/// mutual exclusion, named sidecars must exist and are exec-stdio-only, and
+/// an anonymous sidecar must not collide with a named one (it occupies its
+/// server's name). An `image` entry without a `command` is the
+/// entrypoint-stdio form; it is structurally limited to `image` + `env`
+/// because [`McpServerSpec::Full`] has no other fields.
 fn validate_mcp_placement(
     image_name: &str,
     image: &ImageConfig,
@@ -495,12 +490,6 @@ fn validate_mcp_placement(
     if let Some(inline_image) = spec.image() {
         if inline_image.trim().is_empty() {
             return Err(ConfigValidationError::McpInlineImageEmpty {
-                image: image_name.to_string(),
-                server: server_name.to_string(),
-            });
-        }
-        if !spec.has_command() {
-            return Err(ConfigValidationError::McpEntrypointStdioUnsupported {
                 image: image_name.to_string(),
                 server: server_name.to_string(),
             });
@@ -695,8 +684,8 @@ pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
         McpServerSpec::Full {
             command: Some(cmd), ..
         } => cmd.is_empty(),
-        // The no-command entrypoint-stdio form is judged by its own
-        // validation rule, not the empty-command one.
+        // The no-command form is entrypoint-stdio when `image` is set (the
+        // image's ENTRYPOINT is the server); without `image` it is empty.
         McpServerSpec::Full {
             command: None,
             image,

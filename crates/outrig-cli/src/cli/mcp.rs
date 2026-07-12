@@ -142,6 +142,7 @@ pub async fn execute(
         // show-merged plans placement (including label merges) without
         // launching sidecar containers.
         start_sidecars: !matches!(args.cmd, Some(McpCommand::ShowMerged)),
+        cli_env: &cli_env,
         verbose,
     })
     .await?;

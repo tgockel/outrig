@@ -108,6 +108,20 @@ impl SessionMcpPlan {
             || sidecar.workspace != SidecarWorkspaceAccess::None
             || !sidecar.mounts.is_empty()
     }
+
+    /// The single entrypoint-stdio server an anonymous sidecar hosts: the
+    /// sidecar came from an inline `image` key with no `command`, so the
+    /// image's ENTRYPOINT is the server and container lifetime equals server
+    /// lifetime. `None` for named sidecars (exec-stdio hosts only) and for
+    /// anonymous exec-stdio sidecars (inline `image` + `command`). Validation
+    /// guarantees an anonymous sidecar hosts exactly its declaring server.
+    pub fn entrypoint_server_in(&self, sidecar: &SidecarPlan) -> Option<(&String, &PlacedServer)> {
+        if !sidecar.anonymous {
+            return None;
+        }
+        self.servers_in(&sidecar.name)
+            .find(|(_, placed)| placed.spec.is_entrypoint_stdio())
+    }
 }
 
 /// Build the config-declared half of the plan: named sidecar blocks,
@@ -445,7 +459,8 @@ container-path = "/cache"
 image = "img"
 
 [mcp]
-fs = { command = ["mcp-fs"], sidecar = "hosting" }
+fs    = { command = ["mcp-fs"], sidecar = "hosting" }
+fetch = { image = "ghcr.io/example/mcp-fetch:2" }
 "#,
         );
         let plan = plan_from_config(&cfg);
@@ -454,5 +469,36 @@ fs = { command = ["mcp-fs"], sidecar = "hosting" }
         assert!(plan.sidecar_needs_bootstrap(&plan.sidecars["ws"]));
         assert!(plan.sidecar_needs_bootstrap(&plan.sidecars["mounted"]));
         assert!(plan.sidecar_needs_bootstrap(&plan.sidecars["hosting"]));
+        // An entrypoint-stdio sidecar keeps the image's own USER untouched.
+        assert!(!plan.sidecar_needs_bootstrap(&plan.sidecars["fetch"]));
+    }
+
+    #[test]
+    fn entrypoint_server_found_only_in_anonymous_no_command_sidecars() {
+        let cfg = image_cfg(
+            r#"
+dockerfile = "D"
+context    = "."
+
+[sidecars.tools]
+image = "mcp-tools"
+
+[mcp]
+fs    = { command = ["mcp-fs"], sidecar = "tools" }
+grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+fetch = { image = "ghcr.io/example/mcp-fetch:2" }
+"#,
+        );
+        let plan = plan_from_config(&cfg);
+
+        let (name, placed) = plan
+            .entrypoint_server_in(&plan.sidecars["fetch"])
+            .expect("no-command inline image is entrypoint-stdio");
+        assert_eq!(name, "fetch");
+        assert_eq!(placed.spec.image(), Some("ghcr.io/example/mcp-fetch:2"));
+
+        // Anonymous with a command is exec-stdio; named sidecars never match.
+        assert!(plan.entrypoint_server_in(&plan.sidecars["grep"]).is_none());
+        assert!(plan.entrypoint_server_in(&plan.sidecars["tools"]).is_none());
     }
 }

@@ -1695,7 +1695,7 @@ context    = "ctx"
     }
 
     #[test]
-    fn entrypoint_stdio_form_parses_but_is_rejected_for_now() {
+    fn entrypoint_stdio_form_is_accepted() {
         let cfg = image_block(
             r#"
   [images.coding.mcp]
@@ -1706,15 +1706,9 @@ context    = "ctx"
         let spec = &cfg.images["coding"].mcp["fetch"];
         assert!(!spec.has_command());
         assert_eq!(spec.image(), Some("ghcr.io/example/mcp-fetch:2"));
-        // Validation-level: rejected until entrypoint-stdio ships.
-        let err = expect_validation_err(&cfg, None);
-        assert!(
-            matches!(
-                err,
-                ConfigValidationError::McpEntrypointStdioUnsupported { .. }
-            ),
-            "expected McpEntrypointStdioUnsupported, got: {err:?}"
-        );
+        // Validation-level: the image's ENTRYPOINT is the server.
+        cfg.validate(None)
+            .expect("entrypoint-stdio form validates clean");
     }
 
     #[test]

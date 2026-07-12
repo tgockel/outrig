@@ -962,7 +962,8 @@ pub enum McpServerSpec {
         sidecar: Option<String>,
         /// A dedicated anonymous sidecar for this one server. With `command`
         /// present: exec-stdio in that sidecar. Without: entrypoint-stdio
-        /// (a later release). Mutually exclusive with `sidecar`.
+        /// (the image's ENTRYPOINT is the server). Mutually exclusive with
+        /// `sidecar`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<String>,
     },
@@ -1002,6 +1003,14 @@ impl McpServerSpec {
             Self::Short(_) => true,
             Self::Full { command, .. } => command.is_some(),
         }
+    }
+
+    /// Whether this entry is the entrypoint-stdio form: an inline `image`
+    /// with no `command`, meaning the image's ENTRYPOINT is the server. The
+    /// single definition of the transport classification -- placement
+    /// planning and MCP connection both dispatch on it.
+    pub fn is_entrypoint_stdio(&self) -> bool {
+        self.image().is_some() && !self.has_command()
     }
 }
 

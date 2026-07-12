@@ -13,6 +13,16 @@
 //! - `--network audit` attaches interception to the sidecar (loopback
 //!   resolver installed), not just the primary.
 //!
+//! And task 0080's entrypoint-stdio criteria:
+//!
+//! - An off-the-shelf image whose ENTRYPOINT is the server serves tools with
+//!   env baked in at create; the `--rm` container reaps on clean EOF.
+//! - In audit mode, the entrypoint's *startup* network touch lands in
+//!   `network.jsonl` attributed to the sidecar container -- policy attached
+//!   before its first packet.
+//! - Stopping the entrypoint container mid-session degrades its tools to
+//!   errors while the session and primary-hosted tools survive.
+//!
 //! Run with:
 //!
 //! ```sh
@@ -37,11 +47,27 @@ use common::stream_lines;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn fixture_mcp_fs_dir() -> PathBuf {
+fn fixture_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("outrig-cli is under crates/")
-        .join("outrig/tests/fixtures/mcp-fs")
+        .join("outrig/tests/fixtures")
+        .join(name)
+}
+
+/// `[images.entry]` block for the entrypoint-stdio fixture, whose ENTRYPOINT
+/// touches the network and then serves mcp-server-filesystem over stdio.
+fn entry_image_block() -> String {
+    let dir = fixture_dir("mcp-entrypoint");
+    format!(
+        r#"
+  [images.entry]
+  dockerfile = "{dockerfile}"
+  context = "{context}"
+"#,
+        dockerfile = dir.join("Dockerfile").display(),
+        context = dir.display(),
+    )
 }
 
 /// Repo config: primary `fs` server plus `fs2` in a named sidecar built from
@@ -51,8 +77,8 @@ fn write_sidecar_config(repo: &Path, sidecar_blocks: &str) {
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
-    let dockerfile = fixture_mcp_fs_dir().join("Dockerfile");
-    let context = fixture_mcp_fs_dir();
+    let dockerfile = fixture_dir("mcp-fs").join("Dockerfile");
+    let context = fixture_dir("mcp-fs");
     let config_toml = format!(
         r#"
 default-image = "smoke"
@@ -590,6 +616,294 @@ async fn abort_on_failure_fails_fast_without_leftovers() {
     if let Some(primary) = primary {
         wait_until_gone(&[primary]).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entrypoint_stdio_server_serves_tools_and_reaps() {
+    common::init_tracing();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_sidecar_config(
+        repo_dir.path(),
+        &format!(
+            r#"
+  [images.smoke.mcp]
+  fs    = ["mcp-server-filesystem", "/workspace"]
+  fetch = {{ image = "entry", env = {{ MARKER = "smoke-value" }} }}
+{}"#,
+            entry_image_block()
+        ),
+    );
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &[]);
+    let child_stdin = run.stdin.take().expect("stdin piped");
+    let child_stdout = run.stdout.take().expect("stdout piped");
+
+    let work = async {
+        let service = serve_client((), (child_stdout, child_stdin))
+            .await
+            .expect("serve_client handshake");
+
+        let names = tool_names(
+            &service
+                .list_tools(Default::default())
+                .await
+                .expect("tools/list"),
+        );
+        assert!(
+            names.iter().any(|n| n == "fs__list_directory"),
+            "primary server tools missing: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "fetch__list_directory"),
+            "entrypoint server tools missing: {names:?}"
+        );
+
+        // The entrypoint server works: it serves /tmp inside its container.
+        let call_args = serde_json::json!({"path": "/tmp"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let call = service
+            .call_tool(
+                CallToolRequestParams::new("fetch__list_directory".to_string())
+                    .with_arguments(call_args),
+            )
+            .await
+            .expect("tools/call fetch__list_directory");
+        assert!(
+            call.is_error != Some(true),
+            "entrypoint-hosted tool call failed: {call:?}"
+        );
+
+        let sid = wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] session id:").await;
+        let sidecar = format!("outrig-{sid}-fetch");
+
+        // Labels + session record, exactly as exec-stdio sidecars get.
+        let labeled = podman_names(&format!("label=org.outrig.session={sid}")).await;
+        assert_eq!(
+            labeled.len(),
+            2,
+            "expected primary + entrypoint sidecar with session label, got {labeled:?}"
+        );
+        assert!(labeled.contains(&sidecar), "sidecar missing: {labeled:?}");
+        let store = SessionStore::new(sessions.path().to_path_buf());
+        let (_, session) = store
+            .get_by_id(&SessionId(sid.clone()))
+            .expect("session record");
+        assert_eq!(
+            session.sidecar_container_names,
+            vec![sidecar.clone()],
+            "session.json should list the entrypoint sidecar"
+        );
+
+        // env from the MCP entry was baked in at `podman create --env`.
+        let inspect = Command::new("podman")
+            .args(["inspect", "--format", "{{.Config.Env}}", &sidecar])
+            .output()
+            .await
+            .expect("podman inspect env");
+        let env = String::from_utf8_lossy(&inspect.stdout);
+        assert!(
+            env.contains("MARKER=smoke-value"),
+            "container env should carry the config entry env: {env}"
+        );
+
+        let _ = service.cancel().await;
+        sid
+    };
+    let sid = timeout(TEST_TIMEOUT, work)
+        .await
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+
+    let status = timeout(TEST_TIMEOUT, run.child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = run.stderr_task.await;
+    let stderr = run.stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+
+    assert!(status.success(), "clean EOF exit expected: {stderr}");
+    // Lifetime equals server lifetime: EOF closed the server, `--rm` reaped
+    // the container, and teardown tolerated it already being gone.
+    let leftovers = podman_names(&format!("label=org.outrig.session={sid}")).await;
+    assert!(
+        leftovers.is_empty(),
+        "teardown should reap primary and entrypoint sidecar: {leftovers:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entrypoint_stdio_audit_covers_first_packet() {
+    common::init_tracing();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_sidecar_config(
+        repo_dir.path(),
+        &format!(
+            r#"
+  [images.smoke.mcp]
+  fetch = {{ image = "entry" }}
+{}"#,
+            entry_image_block()
+        ),
+    );
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &["--network", "audit"]);
+    let child_stdin = run.stdin.take().expect("stdin piped");
+    let child_stdout = run.stdout.take().expect("stdout piped");
+    let service = timeout(TEST_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+        .await
+        .expect("handshake within timeout")
+        .expect("serve_client handshake");
+    wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] mcp server ready").await;
+    let sid = wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] session id:").await;
+    let sidecar = format!("outrig-{sid}-fetch");
+
+    // The loopback resolver was baked in via `--dns` at create time -- the
+    // exec-based install can't reach a container that starts as the server.
+    let resolv = Command::new("podman")
+        .args(["exec", &sidecar, "cat", "/etc/resolv.conf"])
+        .output()
+        .await
+        .expect("podman exec cat resolv.conf");
+    assert!(
+        resolv.status.success(),
+        "podman exec into entrypoint sidecar failed: {}",
+        String::from_utf8_lossy(&resolv.stderr)
+    );
+    let resolv = String::from_utf8_lossy(&resolv.stdout);
+    assert!(
+        resolv.contains("nameserver 127.0.0.1"),
+        "entrypoint sidecar resolv.conf should point at the interceptor: {resolv}"
+    );
+
+    let (session_dir, _) = SessionStore::new(sessions.path().to_path_buf())
+        .get_by_id(&SessionId(sid.clone()))
+        .expect("session record");
+
+    let _ = service.cancel().await;
+    let status = timeout(TEST_TIMEOUT, run.child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = run.stderr_task.await;
+    let stderr = run.stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(status.success(), "clean shutdown expected: {stderr}");
+
+    // The entrypoint touched example.com *before* serving MCP; an audit
+    // record attributed to the sidecar proves interception was live ahead of
+    // the entrypoint's first packet.
+    let log = std::fs::read_to_string(session_dir.join("logs/network.jsonl"))
+        .expect("network.jsonl exists");
+    assert!(
+        log.lines()
+            .any(|l| l.contains(&sidecar) && l.contains("example.com")),
+        "audit log should attribute the entrypoint's startup traffic to the \
+         sidecar container:\n{log}"
+    );
+    wait_until_gone(&[format!("outrig-{sid}"), sidecar]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entrypoint_server_exit_surfaces_as_tool_errors_session_survives() {
+    common::init_tracing();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_sidecar_config(
+        repo_dir.path(),
+        &format!(
+            r#"
+  [images.smoke.mcp]
+  fs    = ["mcp-server-filesystem", "/workspace"]
+  fetch = {{ image = "entry" }}
+{}"#,
+            entry_image_block()
+        ),
+    );
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &[]);
+    let child_stdin = run.stdin.take().expect("stdin piped");
+    let child_stdout = run.stdout.take().expect("stdout piped");
+    let service = timeout(TEST_TIMEOUT, serve_client((), (child_stdout, child_stdin)))
+        .await
+        .expect("handshake within timeout")
+        .expect("serve_client handshake");
+    wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] mcp server ready").await;
+    let sid = wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] session id:").await;
+    let sidecar = format!("outrig-{sid}-fetch");
+
+    // Kill the entrypoint server's container out from under the session.
+    let stop = Command::new("podman")
+        .args(["stop", "-t", "1", &sidecar])
+        .status()
+        .await
+        .expect("podman stop");
+    assert!(stop.success(), "podman stop failed: {stop}");
+    wait_for_stderr_value(
+        run.stderr_buf.clone(),
+        &format!("[outrig] sidecar container {sidecar} exited"),
+    )
+    .await;
+
+    // Its tools now error; the session and primary-hosted tools survive.
+    let call_args = serde_json::json!({"path": "/tmp"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let dead = timeout(
+        TEST_TIMEOUT,
+        service.call_tool(
+            CallToolRequestParams::new("fetch__list_directory".to_string())
+                .with_arguments(call_args),
+        ),
+    )
+    .await
+    .expect("dead-server call returned")
+    .expect("dead-server call is an in-band tool error, not a protocol error");
+    assert_eq!(
+        dead.is_error,
+        Some(true),
+        "call against the dead entrypoint server must surface as a tool \
+         error: {dead:?}"
+    );
+
+    let alive_args = serde_json::json!({"path": "/workspace"})
+        .as_object()
+        .unwrap()
+        .clone();
+    let alive = service
+        .call_tool(
+            CallToolRequestParams::new("fs__list_directory".to_string()).with_arguments(alive_args),
+        )
+        .await
+        .expect("primary-hosted call");
+    assert!(
+        alive.is_error != Some(true),
+        "primary-hosted tools must keep working: {alive:?}"
+    );
+
+    let _ = service.cancel().await;
+    let status = timeout(TEST_TIMEOUT, run.child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("child did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = run.stderr_task.await;
+    let stderr = run.stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(
+        status.success(),
+        "session must end cleanly despite the dead sidecar: {stderr}"
+    );
+    wait_until_gone(&[format!("outrig-{sid}")]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

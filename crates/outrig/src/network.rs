@@ -37,6 +37,14 @@ use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
 const NETWORK_LOG: &str = "network.jsonl";
+
+/// Resolver the interceptor requires inside every attached container: DNS to
+/// the loopback listener, `ndots:0` so bare names resolve without
+/// search-domain expansion. Installed by `podman exec` on running containers
+/// ([`install_audit_resolv_conf`]) and baked in via `podman create --dns` for
+/// entrypoint-stdio containers, which cannot be exec'd before start.
+pub(crate) const INTERCEPT_DNS_NAMESERVER: &str = "127.0.0.1";
+pub(crate) const INTERCEPT_DNS_OPTION: &str = "ndots:0";
 const SO_ORIGINAL_DST: libc::c_int = 80;
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -261,6 +269,13 @@ impl NetworkInterceptor {
     /// collide across containers because each netns has its own table
     /// namespace), and spawns its accept loops. Works mid-session; audit
     /// records from this container are stamped with its name.
+    ///
+    /// Also works on a container in the created+initialized state
+    /// (`Container::create_initialized`), whose entrypoint has not yet
+    /// executed -- `podman init` materializes the PID and namespaces this
+    /// needs. Attaching before `podman start` is what closes the
+    /// entrypoint-stdio race: policy is live in the netns before the
+    /// entrypoint's first packet.
     pub async fn attach(&mut self, container: &Container) -> Result<()> {
         let name = container.name();
         if self.attachments.contains_key(name) {
@@ -280,7 +295,12 @@ impl NetworkInterceptor {
             transcript: container.transcript(),
         };
 
-        install_audit_resolv_conf(container).await?;
+        // A dns-preconfigured container had the loopback resolver baked in
+        // via `podman create --dns` (`podman exec` cannot reach it before
+        // start); everything else gets the exec-based install.
+        if !container.dns_preconfigured() {
+            install_audit_resolv_conf(container).await?;
+        }
         apply_nft_rules(&cleanup, tcp_port, dns_port).await?;
 
         let cancel = self.cancel.child_token();
@@ -904,7 +924,8 @@ async fn container_pid(container: &Container) -> Result<u32> {
     })?;
     if pid == 0 {
         return Err(OutrigError::Configuration(format!(
-            "container {:?} has no running network namespace",
+            "container {:?} has no running network namespace (not running, and \
+             not materialized by `podman init`)",
             container.name()
         )));
     }
@@ -916,11 +937,11 @@ async fn install_audit_resolv_conf(container: &Container) -> Result<()> {
         Cmd::new("podman")
             .args(["exec", "--user=0:0"])
             .arg(container.name())
-            .args([
-                "sh",
-                "-c",
-                "printf 'nameserver 127.0.0.1\noptions ndots:0\n' > /etc/resolv.conf",
-            ]),
+            .args(["sh", "-c"])
+            .arg(format!(
+                "printf 'nameserver {INTERCEPT_DNS_NAMESERVER}\noptions \
+                 {INTERCEPT_DNS_OPTION}\n' > /etc/resolv.conf"
+            )),
         "podman",
         container.transcript().as_ref(),
     )

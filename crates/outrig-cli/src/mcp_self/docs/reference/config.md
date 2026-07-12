@@ -464,18 +464,27 @@ build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 # Full form with a placement key -- runs in a sidecar container
 lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
 grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+
+# entrypoint-stdio -- no command; the image's ENTRYPOINT is the server
+fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
 ```
 
 `shell-mcp-command` is a placeholder. Replace it with the shell MCP server you install in the
 image, or declare any other MCP command that should run inside the container.
 
-- `command` (array of strings, required unless using short form): argv of the MCP server.
+- `command` (array of strings, required unless using the short form or the entrypoint-stdio
+  form): argv of the MCP server.
 - `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
-  invocation.
+  invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env` (visible
+  to `podman inspect` on the host, like exec argv).
 - `sidecar` (string, optional): run this server in the named
   [`[images.<name>.sidecars.<sc>]`](#imagesnamesidecarssc) container instead of the primary.
-- `image` (string, optional): run this server in a dedicated anonymous sidecar created from
-  this image ref (resolved like the sidecar `image` key). Mutually exclusive with `sidecar`.
+- `image` (string, optional): give this server a dedicated anonymous sidecar created from this
+  image ref (resolved like the sidecar `image` key). Mutually exclusive with `sidecar`. With
+  `command`, the server is exec-stdio in that sidecar; *without* `command`, the image's
+  ENTRYPOINT is the server (entrypoint-stdio) and the entry may carry nothing but `env`. The
+  container's lifetime equals the server's: its exit surfaces as tool errors while the session
+  continues.
 
 Notes:
 

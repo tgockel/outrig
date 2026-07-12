@@ -112,6 +112,7 @@ pub async fn execute(
         device_override: args.device,
         volumes: &args.volume,
         start_sidecars: true,
+        cli_env: &cli_env,
         verbose,
     })
     .await?;

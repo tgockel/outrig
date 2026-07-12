@@ -133,6 +133,11 @@ pub struct SessionSetupArgs<'a> {
     /// `outrig mcp show-merged`, which plans placement (including sidecar
     /// label merges) without launching sidecar containers.
     pub start_sidecars: bool,
+    /// CLI `--env` overlay entries. Consulted during setup only for
+    /// entrypoint-stdio sidecars, whose env must be resolved at container
+    /// create time (`podman start` carries no `--env`); exec-stdio servers
+    /// keep resolving at connect time in [`connect_mcp_clients`].
+    pub cli_env: &'a CliEnvEntries,
     pub verbose: u8,
 }
 
@@ -536,6 +541,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         log_dir: &log_dir,
         network_mode,
         start_sidecars: args.start_sidecars,
+        cli_env: args.cli_env,
         transcript: transcript.as_ref(),
     };
     let (mcp_plan, network) = match setup_sidecars_and_network(phase, &mut containers).await {
@@ -601,6 +607,7 @@ struct SidecarPhaseArgs<'a> {
     log_dir: &'a Path,
     network_mode: NetworkMode,
     start_sidecars: bool,
+    cli_env: &'a CliEnvEntries,
     transcript: Option<&'a Transcript>,
 }
 
@@ -649,8 +656,16 @@ async fn setup_sidecars_and_network(
             continue;
         }
 
-        let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
-        match start_one_sidecar(&args, &tag, &sc, needs_bootstrap).await {
+        let started = match plan.entrypoint_server_in(&sc) {
+            Some((server_name, placed)) => {
+                create_one_entrypoint_sidecar(&args, &tag, &sc, server_name, &placed.spec).await
+            }
+            None => {
+                let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
+                start_one_sidecar(&args, &tag, &sc, needs_bootstrap).await
+            }
+        };
+        match started {
             Ok(container) => {
                 containers.sidecars.insert(name.clone(), container);
             }
@@ -689,6 +704,10 @@ async fn attach_interceptor(
         .await?
     };
     for name in containers.sidecars.keys().cloned().collect::<Vec<_>>() {
+        // Entrypoint-stdio sidecars are created+initialized but not yet
+        // started here; attaching now -- before `podman start` in
+        // connect_mcp_clients -- is what puts policy ahead of the
+        // entrypoint's first packet.
         if let Err(e) = interceptor.attach(&containers.sidecars[&name]).await {
             warn_or_bail(plan, &plan.sidecars[&name], e.into())?;
             if let Some(container) = containers.sidecars.remove(&name) {
@@ -738,6 +757,30 @@ async fn ensure_sidecar_image(
     }
 }
 
+/// The launch inputs every sidecar container shares, whichever path starts
+/// it: session + sidecar labels and the block's capability policy. Workspace
+/// and mounts stay empty; `start_one_sidecar` fills them in (the entrypoint
+/// form cannot declare either).
+fn sidecar_launch_base(args: &SidecarPhaseArgs<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
+    ContainerLaunchSpec {
+        workspace: None,
+        mounts: Vec::new(),
+        capabilities: ContainerCapabilities {
+            profile: sc.security.capability_profile,
+            cap_drop: sc.security.cap_drop.clone(),
+            cap_add: sc.security.cap_add.clone(),
+        },
+        labels: BTreeMap::from([
+            (LABEL_SESSION.to_string(), args.sid.0.clone()),
+            (LABEL_SIDECAR.to_string(), sc.name.clone()),
+        ]),
+    }
+}
+
+fn sidecar_container_name(args: &SidecarPhaseArgs<'_>, sc: &SidecarPlan) -> String {
+    format!("outrig-{}-{}", args.sid, sc.name)
+}
+
 /// Start one sidecar container (`outrig-<sid>-<sc>`, session + sidecar
 /// labels, keep-id) and bootstrap its user when identity matters.
 async fn start_one_sidecar(
@@ -751,33 +794,23 @@ async fn start_one_sidecar(
         SidecarWorkspaceAccess::Ro => Some(MountAccess::ReadOnly),
         SidecarWorkspaceAccess::Rw => Some(MountAccess::ReadWrite),
     };
-    let launch = ContainerLaunchSpec {
-        workspace: workspace_access.map(|access| ContainerWorkspace {
-            host: args.host_workspace.to_path_buf(),
-            container: args.container_workspace.to_path_buf(),
-            access,
-        }),
-        mounts: sc
-            .mounts
-            .iter()
-            .map(|mount| ContainerMount {
-                host: resolve_workspace_host(args.repo_root, &mount.host_path),
-                container: mount.container_path.clone(),
-                access: mount.access,
-            })
-            .collect(),
-        capabilities: ContainerCapabilities {
-            profile: sc.security.capability_profile,
-            cap_drop: sc.security.cap_drop.clone(),
-            cap_add: sc.security.cap_add.clone(),
-        },
-        labels: BTreeMap::from([
-            (LABEL_SESSION.to_string(), args.sid.0.clone()),
-            (LABEL_SIDECAR.to_string(), sc.name.clone()),
-        ]),
-    };
+    let mut launch = sidecar_launch_base(args, sc);
+    launch.workspace = workspace_access.map(|access| ContainerWorkspace {
+        host: args.host_workspace.to_path_buf(),
+        container: args.container_workspace.to_path_buf(),
+        access,
+    });
+    launch.mounts = sc
+        .mounts
+        .iter()
+        .map(|mount| ContainerMount {
+            host: resolve_workspace_host(args.repo_root, &mount.host_path),
+            container: mount.container_path.clone(),
+            access: mount.access,
+        })
+        .collect();
 
-    let container_name = format!("outrig-{}-{}", args.sid, sc.name);
+    let container_name = sidecar_container_name(args, sc);
     let span = ProgressSpan::start(format!("starting sidecar {}", sc.name));
     let mut container =
         Container::start_named(tag, launch, container_name, args.transcript.cloned()).await?;
@@ -786,6 +819,41 @@ async fn start_one_sidecar(
         return Err(e.into());
     }
     span.done(format!("sidecar {} ready: {}", sc.name, container.name()));
+    Ok(container)
+}
+
+/// Create + initialize one entrypoint-stdio sidecar without executing its
+/// ENTRYPOINT: the interceptor attaches to the initialized netns first, and
+/// `podman start --attach --interactive` runs the server later in
+/// [`connect_mcp_clients`]. The server's env (config + CLI `--env` overlay)
+/// is resolved here and baked in via `podman create --env`; when network
+/// interception is on, the loopback resolver rides in via `--dns` because
+/// the exec-based resolv.conf install needs a running container.
+async fn create_one_entrypoint_sidecar(
+    args: &SidecarPhaseArgs<'_>,
+    tag: &ImageTag,
+    sc: &SidecarPlan,
+    server_name: &str,
+    spec: &outrig::config::McpServerSpec,
+) -> Result<Container> {
+    let launch = sidecar_launch_base(args, sc);
+    let (_, env_spec) = spec.normalize();
+    let env =
+        outrig::resolve_mcp_env(server_name, env_spec, &args.cli_env.for_server(server_name))?;
+    let intercept_dns = args.network_mode != NetworkMode::Default;
+
+    let container_name = sidecar_container_name(args, sc);
+    let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
+    let container = Container::create_initialized(
+        tag,
+        launch,
+        container_name,
+        args.transcript.cloned(),
+        &env,
+        intercept_dns,
+    )
+    .await?;
+    span.done(format!("sidecar {} created: {}", sc.name, container.name()));
     Ok(container)
 }
 
@@ -900,16 +968,23 @@ pub async fn connect_mcp_clients(
         };
 
         let span = ProgressSpan::start(format!("MCP {mcp_name}: initializing"));
-        let extra_env = cli_env.for_server(mcp_name);
-        let result = McpClient::connect_via_podman_exec_with_source(
-            container,
-            &placed.spec,
-            mcp_name,
-            placed.source,
-            log_dir,
-            &extra_env,
-        )
-        .await;
+        let result = if placed.spec.is_entrypoint_stdio() {
+            // entrypoint-stdio: the container was created+initialized with
+            // env baked in and the interceptor already attached; `podman
+            // start --attach` here is what finally runs the entrypoint.
+            McpClient::connect_via_podman_start(container, mcp_name, placed.source, log_dir).await
+        } else {
+            let extra_env = cli_env.for_server(mcp_name);
+            McpClient::connect_via_podman_exec_with_source(
+                container,
+                &placed.spec,
+                mcp_name,
+                placed.source,
+                log_dir,
+                &extra_env,
+            )
+            .await
+        };
         match result {
             Ok(client) => {
                 span.done(format!("MCP {mcp_name}: initialized"));

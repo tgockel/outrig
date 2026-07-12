@@ -62,9 +62,11 @@ local = ["mcp-local", "--stdio"]
 fs    = { command = ["mcp-fs", "/workspace"], sidecar = "tools" }
 # exec-stdio in a dedicated anonymous sidecar built just for this server.
 grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+# entrypoint-stdio: no command; the image ENTRYPOINT is the server.
+fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
 ```
 
-The three placement shapes:
+The four placement shapes:
 
 - **Primary (default).** No placement key. The short form (bare array) always runs in the
   primary.
@@ -74,9 +76,15 @@ The three placement shapes:
   container with all defaults (no workspace, no mounts, `on-failure = "abort"`). Anything
   fancier -- workspace access, mounts, security -- requires promoting to a named block.
   `sidecar` and `image` are mutually exclusive.
+- **Entrypoint sidecar:** `image = "<ref>"` *without* a `command` runs the image's ENTRYPOINT
+  as the server over piped stdio -- the off-the-shelf MCP image pattern, zero repo-side command
+  knowledge. Only `env` may accompany it, baked in at container create. Container lifetime
+  equals server lifetime: the server exiting removes the container, surfacing exactly like a
+  mid-session sidecar death (tools error, session survives).
 
-An `image` entry *without* a `command` (the image's ENTRYPOINT as the server) is reserved for a
-later release and rejected at config load.
+Entrypoint sidecars never race session network policy: the container is created and initialized
+with its entrypoint held un-executed, audit/filter interception attaches to its network
+namespace, and only then does the entrypoint run. Its first packet is already subject to policy.
 
 Named sidecars honor their image's `org.outrig.mcp` label with the usual semantics, scoped to
 that sidecar: label-declared servers materialize as exec-stdio servers *in that sidecar*, and
