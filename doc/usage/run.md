@@ -238,12 +238,14 @@ The REPL is line-buffered. Multi-line input is not supported in v0.
 
 Anything starting with `/` is a REPL command, not a model prompt:
 
-| Command  | Effect                                                                  |
-|----------|-------------------------------------------------------------------------|
-| `/help`  | Print the slash-command list to stderr.                                 |
-| `/tools` | List every tool currently registered with the agent, with descriptions. |
-| `/reset` | Clear conversation history; container and MCP servers stay up.          |
-| `/quit`  | Exit cleanly (same as EOF/Ctrl-D).                                      |
+| Command                | Effect                                                            |
+|------------------------|-------------------------------------------------------------------|
+| `/help`                | Print the slash-command list to stderr.                           |
+| `/tools`               | List every tool registered with the agent, with descriptions.     |
+| `/reset`               | Clear conversation history; container and MCP servers stay up.    |
+| `/sidecar add <name>`  | Start a config-declared `start = "manual"` sidecar.               |
+| `/sidecar list`        | Show declared sidecars with status and hosted servers.            |
+| `/quit`                | Exit cleanly (same as EOF/Ctrl-D).                                |
 
 ```
 > /tools
@@ -256,6 +258,30 @@ Anything starting with `/` is a REPL command, not a model prompt:
 [outrig] history cleared
 >
 ```
+
+### Manual sidecars
+
+A sidecar declared with `start = "manual"` (see
+[Config -> sidecars](../reference/config.md#imagesnamesidecarssc)) is planned at session start
+-- its image label is merged and its servers are reserved names -- but its container does not
+start and its tools are absent. `/sidecar add <name>` starts it mid-session: the container
+comes up with session labels, network policy attaches (in audit and filter modes), its MCP
+servers connect, and the new tools become available to the agent **on the next turn**. Unknown
+names and already-running sidecars are errors, and there is no `/sidecar stop` in v0.
+
+```
+> /sidecar list
+[outrig] sidecars:
+  tools   not started   servers: search
+> /sidecar add tools
+[outrig] sidecar tools started: outrig-20260504T141907-a83f-tools
+[outrig] 1 MCP server connected (search); 2 tools available on the next turn
+> /sidecar add tools
+[outrig] sidecar "tools" is already running
+```
+
+A failed add -- image missing, server crashing on connect -- is reported on stderr and changes
+nothing: the container set, tool list, and conversation stay as they were.
 
 ## Interrupting and exiting
 
@@ -307,7 +333,8 @@ The MCP server binary isn't in the image. Install it in the Dockerfile.
 
 ```
 $ outrig run --image outrig-standard:53e082e721df8ecc
-error: --image "outrig-standard:53e082e721df8ecc" did not match any [images.<name>] and local podman image "outrig-standard:53e082e721df8ecc" was not found
+error: --image "outrig-standard:53e082e721df8ecc" did not match any [images.<name>]
+       and local podman image "outrig-standard:53e082e721df8ecc" was not found
 ```
 
 An explicit `--image` ref that is not an image-config is local-only. Build, tag,

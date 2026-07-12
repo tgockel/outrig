@@ -16,12 +16,12 @@ mod tool_name;
 
 pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
-    NetworkPolicyBuilder,
+    NetworkPolicyBuilder, SidecarWorkspaceAccess,
 };
 pub use mcp::{McpClient, McpTool, McpToolResult, resolve_mcp_env};
 pub use outrig_::{
     CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec,
-    ToolHandle, WorkspaceSpec,
+    SidecarServerSpec, SidecarSpec, ToolHandle, WorkspaceSpec,
 };
 pub use process::Transcript;
 pub use tool_name::sanitize as sanitize_tool_name;

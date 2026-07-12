@@ -39,7 +39,7 @@ use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
     Config, ImageConfig, MistralrsDeviceSpec, MountAccess, MountConfig, NetworkMode,
-    SidecarOnFailure, SidecarStart, SidecarWorkspaceAccess,
+    SidecarOnFailure, SidecarStart,
 };
 use outrig::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -158,6 +158,14 @@ impl SessionContainers {
             Placement::Sidecar(name) => self.sidecars.get(name),
         }
     }
+
+    /// Started sidecar container names, the shape the session store records.
+    pub fn sidecar_names(&self) -> Vec<String> {
+        self.sidecars
+            .values()
+            .map(|container| container.name().to_string())
+            .collect()
+    }
 }
 
 /// Output of [`setup`]: every long-lived value the post-setup pipeline
@@ -174,6 +182,9 @@ pub struct SessionSetup {
     pub session_dir: PathBuf,
     pub log_dir: PathBuf,
     pub store: SessionStore,
+    /// Directory the repo config was resolved against; mid-session sidecar
+    /// starts resolve mount paths against it.
+    pub repo_root: PathBuf,
     pub attached: bool,
     pub network: Option<NetworkInterceptor>,
     /// Full placement plan (config + label merges), including servers in
@@ -553,11 +564,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
 
     if !containers.sidecars.is_empty() {
-        let names: Vec<String> = containers
-            .sidecars
-            .values()
-            .map(|container| container.name().to_string())
-            .collect();
+        let names = containers.sidecar_names();
         if let Err(e) = store.set_sidecar_containers(&sid, &names) {
             abort_containers(containers, &store, &sid).await;
             return Err(e.into());
@@ -566,14 +573,17 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     }
 
     // The watcher exists to reap sidecars when the primary dies out from
-    // under outrig; a single-container session keeps today's behavior.
-    let watcher = if containers.sidecars.is_empty() {
-        None
-    } else {
+    // under outrig; a session declaring no sidecars keeps today's behavior.
+    // Declared-but-manual sidecars arm it too (possibly with an empty list)
+    // so its primary-death token is already wired into the REPL select
+    // before a `/sidecar add` starts anything.
+    let watcher = if args.start_sidecars && !mcp_plan.sidecars.is_empty() {
         Some(SessionWatcher::spawn(
             containers.primary.name().to_string(),
             session.sidecar_container_names.clone(),
         ))
+    } else {
+        None
     };
 
     Ok(SessionSetup {
@@ -587,6 +597,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         session_dir,
         log_dir,
         store,
+        repo_root,
         attached: attach.is_some(),
         network,
         mcp_plan,
@@ -609,6 +620,46 @@ struct SidecarPhaseArgs<'a> {
     start_sidecars: bool,
     cli_env: &'a CliEnvEntries,
     transcript: Option<&'a Transcript>,
+}
+
+impl<'a> SidecarPhaseArgs<'a> {
+    fn start_ctx(&self) -> SidecarStartCtx<'a> {
+        SidecarStartCtx {
+            cfg: self.cfg,
+            repo_root: self.repo_root,
+            sid: self.sid.as_str(),
+            host_workspace: self.host_workspace,
+            container_workspace: self.container_workspace,
+            transcript: self.transcript,
+        }
+    }
+}
+
+/// Inputs shared by session-start sidecar launches and mid-session
+/// (`/sidecar add`) ones -- the subset of [`SidecarPhaseArgs`] the start
+/// sequence actually reads.
+pub(crate) struct SidecarStartCtx<'a> {
+    pub cfg: &'a Config,
+    pub repo_root: &'a Path,
+    /// Container-name suffix: sidecars are named `outrig-<sid>-<sc>`.
+    pub sid: &'a str,
+    pub host_workspace: &'a Path,
+    pub container_workspace: &'a Path,
+    pub transcript: Option<&'a Transcript>,
+}
+
+/// Full start sequence for one config-declared exec-stdio sidecar: ensure
+/// its image (`--image` semantics) -> start the container (labels, keep-id)
+/// -> bootstrap the user when identity matters. Session start uses the same
+/// pieces inline (it interleaves label merges between ensure and start);
+/// `/sidecar add` calls this composition mid-session.
+pub(crate) async fn launch_declared_sidecar(
+    ctx: &SidecarStartCtx<'_>,
+    plan: &SessionMcpPlan,
+    sc: &SidecarPlan,
+) -> Result<Container> {
+    let tag = ensure_sidecar_image(ctx.cfg, ctx.repo_root, &sc.image, ctx.transcript).await?;
+    start_one_sidecar(ctx, &tag, sc, plan.sidecar_needs_bootstrap(sc)).await
 }
 
 /// Build the placement plan (config + primary and sidecar label merges),
@@ -662,7 +713,7 @@ async fn setup_sidecars_and_network(
             }
             None => {
                 let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
-                start_one_sidecar(&args, &tag, &sc, needs_bootstrap).await
+                start_one_sidecar(&args.start_ctx(), &tag, &sc, needs_bootstrap).await
             }
         };
         match started {
@@ -761,7 +812,7 @@ async fn ensure_sidecar_image(
 /// it: session + sidecar labels and the block's capability policy. Workspace
 /// and mounts stay empty; `start_one_sidecar` fills them in (the entrypoint
 /// form cannot declare either).
-fn sidecar_launch_base(args: &SidecarPhaseArgs<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
+fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
     ContainerLaunchSpec {
         workspace: None,
         mounts: Vec::new(),
@@ -771,49 +822,47 @@ fn sidecar_launch_base(args: &SidecarPhaseArgs<'_>, sc: &SidecarPlan) -> Contain
             cap_add: sc.security.cap_add.clone(),
         },
         labels: BTreeMap::from([
-            (LABEL_SESSION.to_string(), args.sid.0.clone()),
+            (LABEL_SESSION.to_string(), ctx.sid.to_string()),
             (LABEL_SIDECAR.to_string(), sc.name.clone()),
         ]),
     }
 }
 
-fn sidecar_container_name(args: &SidecarPhaseArgs<'_>, sc: &SidecarPlan) -> String {
-    format!("outrig-{}-{}", args.sid, sc.name)
+fn sidecar_container_name(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> String {
+    outrig::container::sidecar_container_name(ctx.sid, &sc.name)
 }
 
 /// Start one sidecar container (`outrig-<sid>-<sc>`, session + sidecar
 /// labels, keep-id) and bootstrap its user when identity matters.
 async fn start_one_sidecar(
-    args: &SidecarPhaseArgs<'_>,
+    ctx: &SidecarStartCtx<'_>,
     tag: &ImageTag,
     sc: &SidecarPlan,
     needs_bootstrap: bool,
 ) -> Result<Container> {
-    let workspace_access = match sc.workspace {
-        SidecarWorkspaceAccess::None => None,
-        SidecarWorkspaceAccess::Ro => Some(MountAccess::ReadOnly),
-        SidecarWorkspaceAccess::Rw => Some(MountAccess::ReadWrite),
-    };
-    let mut launch = sidecar_launch_base(args, sc);
-    launch.workspace = workspace_access.map(|access| ContainerWorkspace {
-        host: args.host_workspace.to_path_buf(),
-        container: args.container_workspace.to_path_buf(),
-        access,
-    });
+    let mut launch = sidecar_launch_base(ctx, sc);
+    launch.workspace = sc
+        .workspace
+        .mount_access()
+        .map(|access| ContainerWorkspace {
+            host: ctx.host_workspace.to_path_buf(),
+            container: ctx.container_workspace.to_path_buf(),
+            access,
+        });
     launch.mounts = sc
         .mounts
         .iter()
         .map(|mount| ContainerMount {
-            host: resolve_workspace_host(args.repo_root, &mount.host_path),
+            host: resolve_workspace_host(ctx.repo_root, &mount.host_path),
             container: mount.container_path.clone(),
             access: mount.access,
         })
         .collect();
 
-    let container_name = sidecar_container_name(args, sc);
+    let container_name = sidecar_container_name(ctx, sc);
     let span = ProgressSpan::start(format!("starting sidecar {}", sc.name));
     let mut container =
-        Container::start_named(tag, launch, container_name, args.transcript.cloned()).await?;
+        Container::start_named(tag, launch, container_name, ctx.transcript.cloned()).await?;
     if needs_bootstrap && let Err(e) = container.bootstrap_user().await {
         let _ = container.stop(STOP_GRACE).await;
         return Err(e.into());
@@ -836,13 +885,14 @@ async fn create_one_entrypoint_sidecar(
     server_name: &str,
     spec: &outrig::config::McpServerSpec,
 ) -> Result<Container> {
-    let launch = sidecar_launch_base(args, sc);
+    let ctx = args.start_ctx();
+    let launch = sidecar_launch_base(&ctx, sc);
     let (_, env_spec) = spec.normalize();
     let env =
         outrig::resolve_mcp_env(server_name, env_spec, &args.cli_env.for_server(server_name))?;
     let intercept_dns = args.network_mode != NetworkMode::Default;
 
-    let container_name = sidecar_container_name(args, sc);
+    let container_name = sidecar_container_name(&ctx, sc);
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
     let container = Container::create_initialized(
         tag,

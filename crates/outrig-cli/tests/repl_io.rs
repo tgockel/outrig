@@ -32,6 +32,10 @@ fn noop_reset() -> impl FnMut() -> std::future::Ready<String> {
     || future::ready("[outrig] (no history to reset)\n".to_string())
 }
 
+fn noop_sidecar() -> impl FnMut(Vec<String>) -> std::future::Ready<String> {
+    |_| future::ready("[outrig] (no sidecars declared)\n".to_string())
+}
+
 #[tokio::test]
 async fn processes_multiple_lines_in_order() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
@@ -52,6 +56,7 @@ async fn processes_multiple_lines_in_order() {
         on_prompt,
         noop_tools(),
         noop_reset(),
+        noop_sidecar(),
     );
 
     let mut stdout_buf = Vec::new();
@@ -99,6 +104,7 @@ async fn eof_exits_cleanly() {
         on_prompt,
         noop_tools(),
         noop_reset(),
+        noop_sidecar(),
     );
 
     timeout(TEST_TIMEOUT, run)
@@ -127,6 +133,7 @@ async fn slash_quit_exits() {
         on_prompt,
         noop_tools(),
         noop_reset(),
+        noop_sidecar(),
     );
 
     let read_out = async {
@@ -176,6 +183,7 @@ async fn empty_line_is_ignored() {
         on_prompt,
         noop_tools(),
         noop_reset(),
+        noop_sidecar(),
     );
 
     let read_out = async {
@@ -212,6 +220,7 @@ async fn empty_prompt_reply_produces_no_stdout() {
         on_prompt,
         noop_tools(),
         noop_reset(),
+        noop_sidecar(),
     );
 
     let read_out = async {
@@ -269,6 +278,7 @@ async fn sigint_mid_callback_returns_to_prompt() {
             on_prompt,
             noop_tools(),
             noop_reset(),
+            noop_sidecar(),
         )
         .await
     });
@@ -336,6 +346,7 @@ async fn slash_tools_and_reset_invoke_callbacks() {
         on_prompt,
         on_tools,
         on_reset,
+        noop_sidecar(),
     );
 
     let mut stdout_buf = Vec::new();
@@ -366,6 +377,114 @@ async fn slash_tools_and_reset_invoke_callbacks() {
     assert!(
         stderr.contains("[outrig] history cleared\n"),
         "stderr lacked /reset text (with REPL-appended newline): {stderr:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_sidecar_passes_split_args_to_callback() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w
+        .write_all(b"/sidecar add tools\n/sidecar list\n/sidecar\n")
+        .await
+        .unwrap();
+    drop(stdin_w);
+    let (stdout_w, mut stdout_r) = duplex(BUF);
+    let (stderr_w, mut stderr_r) = duplex(BUF);
+
+    let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
+
+    let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = seen.clone();
+    let on_sidecar = move |args: Vec<String>| {
+        let seen = seen_cb.clone();
+        async move {
+            seen.lock().unwrap().push(args);
+            "[outrig] sidecar handled".to_string()
+        }
+    };
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        on_prompt,
+        noop_tools(),
+        noop_reset(),
+        on_sidecar,
+    );
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    let read_out = stdout_r.read_to_end(&mut stdout_buf);
+    let read_err = stderr_r.read_to_end(&mut stderr_buf);
+
+    let (run_res, _, _) = timeout(TEST_TIMEOUT, async {
+        tokio::join!(run, read_out, read_err)
+    })
+    .await
+    .expect("test must not hang");
+    run_res.expect("run_with must succeed");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            vec!["add".to_string(), "tools".to_string()],
+            vec!["list".to_string()],
+            Vec::<String>::new(),
+        ]
+    );
+    assert!(
+        stdout_buf.is_empty(),
+        "slash output must not reach stdout, got: {:?}",
+        String::from_utf8_lossy(&stdout_buf)
+    );
+    let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
+    assert!(
+        stderr.contains("[outrig] sidecar handled\n"),
+        "stderr lacked /sidecar text: {stderr:?}"
+    );
+}
+
+#[tokio::test]
+async fn slash_help_lists_sidecar_commands() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w.write_all(b"/help\n").await.unwrap();
+    drop(stdin_w);
+    let (stdout_w, _stdout_r) = duplex(BUF);
+    let (stderr_w, mut stderr_r) = duplex(BUF);
+
+    let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        on_prompt,
+        noop_tools(),
+        noop_reset(),
+        noop_sidecar(),
+    );
+
+    let mut stderr_buf = Vec::new();
+    let read_err = stderr_r.read_to_end(&mut stderr_buf);
+
+    let (run_res, _) = timeout(TEST_TIMEOUT, async { tokio::join!(run, read_err) })
+        .await
+        .expect("test must not hang");
+    run_res.expect("run_with must succeed");
+
+    let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
+    assert!(
+        stderr.contains("/sidecar add <name>"),
+        "help lacked /sidecar add: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("/sidecar list"),
+        "help lacked /sidecar list: {stderr:?}"
     );
 }
 

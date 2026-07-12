@@ -12,6 +12,7 @@
 //! any container, so its own stops are never mistaken for external death.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -19,55 +20,76 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{CliError, Result};
 use outrig::container::force_remove_detached;
 
-/// Watches a session's containers. Spawned only for sessions that actually
-/// started sidecars -- a single-container session keeps today's behavior.
+/// Watches a session's containers. Spawned only for sessions that declare
+/// sidecars (started or `start = "manual"`) -- a single-container session
+/// keeps today's behavior. The sidecar list is shared with the primary
+/// reaper so a `/sidecar add` mid-session is covered from the moment it is
+/// [registered](SessionWatcher::register_sidecar).
 #[derive(Debug)]
 pub struct SessionWatcher {
     died: CancellationToken,
+    sidecars: Arc<Mutex<Vec<String>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl SessionWatcher {
-    /// Arm the watcher: one `podman wait` on the primary (reaps every sidecar
-    /// and cancels [`SessionWatcher::primary_died`] when it fires) plus one
-    /// per sidecar (log-only).
+    /// Arm the watcher: one `podman wait` on the primary (reaps every
+    /// registered sidecar and cancels [`SessionWatcher::primary_died`] when
+    /// it fires) plus one per sidecar (log-only).
     pub fn spawn(primary: String, sidecars: Vec<String>) -> Self {
         let died = CancellationToken::new();
-        let mut tasks = Vec::with_capacity(1 + sidecars.len());
+        let shared: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let primary_task = {
             let died = died.clone();
-            let sidecars = sidecars.clone();
+            let shared = Arc::clone(&shared);
             tokio::spawn(async move {
                 wait_for_container_exit(&primary).await;
-                for name in &sidecars {
+                // Read the list when the wait fires, not when the watcher
+                // was armed, so dynamically added sidecars are reaped too.
+                let names = shared.lock().expect("sidecar name list lock").clone();
+                for name in &names {
                     force_remove_detached(name);
                 }
                 eprintln!(
                     "[outrig] primary container {primary} exited unexpectedly; \
                      reaping {} sidecar container(s)",
-                    sidecars.len()
+                    names.len()
                 );
                 died.cancel();
             })
         };
-        tasks.push(primary_task);
 
+        let mut watcher = Self {
+            died,
+            sidecars: shared,
+            tasks: vec![primary_task],
+        };
         for name in sidecars {
-            tasks.push(tokio::spawn(async move {
-                wait_for_container_exit(&name).await;
-                eprintln!(
-                    "[outrig] sidecar container {name} exited; \
-                     its MCP tools will return errors until the session ends"
-                );
-                tracing::warn!(
-                    target: "outrig::cli::watcher",
-                    "sidecar container {name} exited mid-session"
-                );
-            }));
+            watcher.register_sidecar(name);
         }
+        watcher
+    }
 
-        Self { died, tasks }
+    /// Cover one more sidecar container: reaped when the primary dies, plus
+    /// a log-only `podman wait` announcing its own death. Called at arm time
+    /// for session-start sidecars and mid-session by `/sidecar add`.
+    pub fn register_sidecar(&mut self, name: String) {
+        self.sidecars
+            .lock()
+            .expect("sidecar name list lock")
+            .push(name.clone());
+        self.tasks.push(tokio::spawn(async move {
+            wait_for_container_exit(&name).await;
+            eprintln!(
+                "[outrig] sidecar container {name} exited; \
+                 its MCP tools will return errors until the session ends"
+            );
+            tracing::warn!(
+                target: "outrig::cli::watcher",
+                "sidecar container {name} exited mid-session"
+            );
+        }));
     }
 
     /// Token cancelled when the primary dies externally. Clone into a

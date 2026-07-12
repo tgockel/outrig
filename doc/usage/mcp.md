@@ -283,7 +283,10 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. An entrypoint-stdio
    sidecar (inline `image`, no `command`) is instead created and initialized with its
    ENTRYPOINT held un-executed, env baked in via `podman create --env`. Sidecar failures
-   follow the block's `on-failure` key.
+   follow the block's `on-failure` key. A `start = "manual"` sidecar stays planned but
+   unstarted -- its servers are skipped with a notice. `outrig mcp` has no mid-session
+   start surface; manual sidecars are started from the `outrig run` REPL
+   (`/sidecar add <name>`) or the library API.
 5. **Start network interception, if enabled.** The interceptor attaches to the primary
    and every sidecar -- including created-but-not-started entrypoint sidecars, whose
    first packet is therefore already subject to policy. Fresh sessions can write

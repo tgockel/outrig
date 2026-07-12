@@ -531,8 +531,9 @@ capability-profile = "no-net-raw"
 - `workspace` (string, optional, default: `"none"`): `"none"`, `"ro"`, or `"rw"`. Mounts the
   session workspace at the primary's container path with that access.
 - `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
-  declares a sidecar that waits for a later-release start surface (its servers are skipped
-  with a notice until then).
+  declares a sidecar that starts only when asked -- `/sidecar add <name>` in the REPL, or
+  `Outrig::add_sidecar` / `LaunchSpec::with_sidecar` from the library API. Until then its
+  servers are skipped with a notice.
 - `on-failure` (string, optional, default: `"abort"`): how a start/bootstrap/connect failure of
   this sidecar is handled at session start. `"abort"` fails the session; `"warn"` logs, skips
   the sidecar and its servers, and continues.

@@ -18,7 +18,7 @@ pub use api_key::{ApiKeyError, ApiKeyRef};
 pub use env_value::{EnvValue, EnvValueError};
 pub use merge::merge;
 pub use validate::{ConfigValidationError, MountRuleViolation};
-pub(crate) use validate::{is_valid_mcp_server_name, mcp_command_is_empty};
+pub(crate) use validate::{is_valid_mcp_server_name, is_valid_sidecar_name, mcp_command_is_empty};
 
 use crate::error::{OutrigError, Result};
 
@@ -887,6 +887,17 @@ pub enum SidecarWorkspaceAccess {
     None,
     Ro,
     Rw,
+}
+
+impl SidecarWorkspaceAccess {
+    /// The bind-mount access this level implies; `None` means no mount.
+    pub fn mount_access(self) -> Option<MountAccess> {
+        match self {
+            Self::None => None,
+            Self::Ro => Some(MountAccess::ReadOnly),
+            Self::Rw => Some(MountAccess::ReadWrite),
+        }
+    }
 }
 
 /// Whether a sidecar starts with the session or waits for an explicit

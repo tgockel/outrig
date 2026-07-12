@@ -672,6 +672,10 @@ pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
     mcp_server_name_re().is_match(server)
 }
 
+pub(crate) fn is_valid_sidecar_name(name: &str) -> bool {
+    sidecar_name_re().is_match(name)
+}
+
 /// A build image's config name becomes the repository of its container image
 /// tag (`<name>:<hash>`), so it must be a valid lowercase repository component.
 pub(crate) fn is_valid_build_image_name(name: &str) -> bool {

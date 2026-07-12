@@ -98,15 +98,16 @@ impl SessionMcpPlan {
         )
     }
 
-    /// Whether the sidecar needs the in-container user bootstrap: it hosts at
-    /// least one exec-stdio server (exec needs `--user` and `HOME`), sees the
-    /// workspace, or declares mounts. A mount-less entrypoint-stdio sidecar
-    /// keeps the image's own `USER` untouched.
+    /// Whether the sidecar needs the in-container user bootstrap; see
+    /// [`bootstrap_needed`]. A mount-less entrypoint-stdio sidecar keeps the
+    /// image's own `USER` untouched.
     pub fn sidecar_needs_bootstrap(&self, sidecar: &SidecarPlan) -> bool {
-        self.servers_in(&sidecar.name)
-            .any(|(_, placed)| placed.spec.has_command())
-            || sidecar.workspace != SidecarWorkspaceAccess::None
-            || !sidecar.mounts.is_empty()
+        bootstrap_needed(
+            self.servers_in(&sidecar.name)
+                .any(|(_, placed)| placed.spec.has_command()),
+            sidecar.workspace,
+            !sidecar.mounts.is_empty(),
+        )
     }
 
     /// The single entrypoint-stdio server an anonymous sidecar hosts: the
@@ -122,6 +123,18 @@ impl SessionMcpPlan {
         self.servers_in(&sidecar.name)
             .find(|(_, placed)| placed.spec.is_entrypoint_stdio())
     }
+}
+
+/// The single definition of "this sidecar needs the in-container user
+/// bootstrap": it hosts at least one exec-stdio server (exec needs `--user`
+/// and `HOME`), sees the workspace, or declares mounts. Shared by the
+/// config-plan path and `Outrig::add_sidecar`'s `SidecarSpec` path.
+pub fn bootstrap_needed(
+    hosts_exec_server: bool,
+    workspace: SidecarWorkspaceAccess,
+    has_mounts: bool,
+) -> bool {
+    hosts_exec_server || workspace != SidecarWorkspaceAccess::None || has_mounts
 }
 
 /// Build the config-declared half of the plan: named sidecar blocks,

@@ -81,6 +81,13 @@ pub const LABEL_SESSION: &str = "org.outrig.session";
 /// sidecar containers.
 pub const LABEL_SIDECAR: &str = "org.outrig.sidecar";
 
+/// The canonical sidecar container name, `outrig-<sid>-<sc>`. Load-bearing:
+/// the watcher reaps by it, session records store it, and `/sidecar list`
+/// looks containers up by it -- every producer must use this one scheme.
+pub fn sidecar_container_name(session_suffix: &str, sidecar: &str) -> String {
+    format!("outrig-{session_suffix}-{sidecar}")
+}
+
 /// Complete inputs for a `podman run`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerLaunchSpec {
@@ -550,7 +557,10 @@ impl Container {
         Ok(())
     }
 
-    pub(crate) fn transcript(&self) -> Option<Transcript> {
+    /// The session transcript podman commands are logged to, if any. Cloned
+    /// so mid-session container starts (e.g. `/sidecar add`) can log into
+    /// the same `container.log`.
+    pub fn transcript(&self) -> Option<Transcript> {
         self.transcript.clone()
     }
 }

@@ -174,6 +174,7 @@ async fn serve(
         image_cfg: _,
         session: _,
         session_dir: _,
+        repo_root: _,
     } = setup;
 
     // Validate per-server env entries against the full merged plan (a
@@ -230,6 +231,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         session: _,
         session_dir: _,
         log_dir: _,
+        repo_root: _,
     } = setup;
 
     let outcome = write_merged_mcp(&mcp_plan).map(|()| 0);

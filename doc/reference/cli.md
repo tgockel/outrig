@@ -260,7 +260,7 @@ outrig mcp self
 
 | Flag                   | Default                      | Description                           |
 |------------------------|------------------------------|---------------------------------------|
-| `--image <name-or-local-ref>` | `default-image`       | Image-config, or explicit local Podman image ref. |
+| `--image <name-or-ref>`| `default-image`              | Image-config or local Podman ref.     |
 | `--attach <id-or-name>`| off                          | Reuse an existing container.          |
 | `--listen <addr>`      | off                          | Serve Streamable HTTP at `/mcp`.      |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |

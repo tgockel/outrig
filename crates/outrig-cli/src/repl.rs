@@ -2,12 +2,13 @@
 //!
 //! `Repl::run` drives the I/O loop: print a banner on stderr, prompt with `> `,
 //! and feed each non-slash line to a caller-supplied async callback. Slash
-//! commands (`/help`, `/quit`, `/tools`, `/reset`) are handled here; `/tools`
-//! and `/reset` defer to caller-supplied callbacks for their text + side
-//! effects (history clearing, tool-list assembly). EOF (Ctrl-D) and `/quit`
-//! exit cleanly. SIGINT during a callback cancels the in-flight future,
-//! prints `[outrig] interrupted`, and returns to the prompt; a second
-//! consecutive SIGINT (no input typed in between) exits.
+//! commands (`/help`, `/quit`, `/tools`, `/reset`, `/sidecar`) are handled
+//! here; `/tools`, `/reset`, and `/sidecar` defer to caller-supplied
+//! callbacks for their text + side effects (history clearing, tool-list
+//! assembly, sidecar starts). EOF (Ctrl-D) and `/quit` exit cleanly. SIGINT
+//! during a callback cancels the in-flight future, prints
+//! `[outrig] interrupted`, and returns to the prompt; a second consecutive
+//! SIGINT (no input typed in between) exits.
 //!
 //! Strict stream separation: assistant text goes to stdout; everything else --
 //! banner, prompt, slash-command output, interrupt notice -- goes to stderr.
@@ -26,10 +27,12 @@ use crate::error::Result;
 
 const HELP_TEXT: &str = "\
 [outrig] slash commands:
-  /help    show this help
-  /tools   list registered tools
-  /reset   clear conversation history
-  /quit    exit the session
+  /help                 show this help
+  /tools                list registered tools
+  /reset                clear conversation history
+  /sidecar add <name>   start a config-declared manual sidecar
+  /sidecar list         show declared sidecars and their status
+  /quit                 exit the session
 ";
 
 const INTERRUPT_NOTICE: &[u8] = b"\n[outrig] interrupted\n";
@@ -45,12 +48,16 @@ impl Repl {
     /// during the callback and return an empty string to suppress trailing
     /// reprint. `on_tools` and `on_reset` produce the stderr text for `/tools`
     /// and `/reset` respectively (and `on_reset` is the side-effect site for
-    /// clearing whatever conversation state the caller owns).
-    pub async fn run<P, PFut, T, TFut, R, RFut>(
+    /// clearing whatever conversation state the caller owns). `on_sidecar`
+    /// receives `/sidecar`'s whitespace-split arguments (`["add", "tools"]`,
+    /// `["list"]`, possibly empty) and produces the stderr text; subcommand
+    /// parsing and side effects are the caller's.
+    pub async fn run<P, PFut, T, TFut, R, RFut, S, SFut>(
         banner: &str,
         on_prompt: P,
         on_tools: T,
         on_reset: R,
+        on_sidecar: S,
     ) -> Result<()>
     where
         P: FnMut(String) -> PFut,
@@ -59,6 +66,8 @@ impl Repl {
         TFut: Future<Output = String>,
         R: FnMut() -> RFut,
         RFut: Future<Output = String>,
+        S: FnMut(Vec<String>) -> SFut,
+        SFut: Future<Output = String>,
     {
         let stdin = BufReader::new(tokio::io::stdin());
         let stdout = tokio::io::stdout();
@@ -72,6 +81,7 @@ impl Repl {
             on_prompt,
             on_tools,
             on_reset,
+            on_sidecar,
         )
         .await
     }
@@ -82,7 +92,7 @@ impl Repl {
     /// interrupt closure to exercise EOF, slash commands, and SIGINT
     /// handling without touching real signals or terminals.
     #[allow(clippy::too_many_arguments)]
-    pub async fn run_with<RD, W, E, I, IFut, P, PFut, T, TFut, R, RFut>(
+    pub async fn run_with<RD, W, E, I, IFut, P, PFut, T, TFut, R, RFut, S, SFut>(
         stdin: RD,
         mut stdout: W,
         mut stderr: E,
@@ -91,6 +101,7 @@ impl Repl {
         mut on_prompt: P,
         mut on_tools: T,
         mut on_reset: R,
+        mut on_sidecar: S,
     ) -> Result<()>
     where
         RD: AsyncBufRead + Unpin,
@@ -104,6 +115,8 @@ impl Repl {
         TFut: Future<Output = String>,
         R: FnMut() -> RFut,
         RFut: Future<Output = String>,
+        S: FnMut(Vec<String>) -> SFut,
+        SFut: Future<Output = String>,
     {
         if !banner.is_empty() {
             stderr.write_all(banner.as_bytes()).await?;
@@ -159,6 +172,13 @@ impl Repl {
                     }
                     "reset" => {
                         write_stderr_line(&mut stderr, &on_reset().await).await?;
+                    }
+                    _ if cmd == "sidecar" || cmd.starts_with("sidecar ") => {
+                        let args = cmd["sidecar".len()..]
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect();
+                        write_stderr_line(&mut stderr, &on_sidecar(args).await).await?;
                     }
                     other => {
                         stderr

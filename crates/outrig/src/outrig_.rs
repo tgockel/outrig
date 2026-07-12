@@ -12,10 +12,12 @@ use serde_json::Value;
 
 use crate::config::{
     CapabilityProfile, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef, McpServerSpec,
-    MountAccess, NetworkMode, NetworkPolicy, Workspace,
+    MountAccess, NetworkMode, NetworkPolicy, SidecarWorkspaceAccess, Workspace,
+    is_valid_mcp_server_name, is_valid_sidecar_name,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+    LABEL_SESSION, LABEL_SIDECAR,
     embedded::{self, McpDeclarationSource},
 };
 use crate::error::{OutrigError, Result};
@@ -76,6 +78,88 @@ pub struct NetworkSpec {
     pub policy: Option<NetworkPolicy>,
 }
 
+/// One MCP server hosted by a [`SidecarSpec`] sidecar. Exec-stdio only:
+/// the server is spawned with `podman exec -i` inside the sidecar, so a
+/// command is always required (entrypoint-stdio has no library surface).
+#[derive(Debug, Clone)]
+pub struct SidecarServerSpec {
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, EnvValue>,
+}
+
+/// Description of one sidecar container: image (a raw podman ref, used
+/// verbatim like [`LaunchSpec::from_image`]), workspace visibility, extra
+/// mounts, security policy, and the MCP servers it hosts. Passed to
+/// [`Outrig::add_sidecar`] mid-session or declared at launch via
+/// [`LaunchSpec::with_sidecar`].
+///
+/// Config-name image resolution (the `[images.<name>]` lookup the CLI
+/// performs) is out of facade scope: callers who want a built image run
+/// `image::ensure_image` themselves and pass the resulting tag.
+#[derive(Debug, Clone)]
+pub struct SidecarSpec {
+    pub name: String,
+    pub(crate) image: String,
+    pub workspace: SidecarWorkspaceAccess,
+    pub mounts: Vec<MountSpec>,
+    pub security: SecuritySpec,
+    pub servers: BTreeMap<String, SidecarServerSpec>,
+}
+
+impl SidecarSpec {
+    /// A sidecar named `name` running `image` (a podman ref used verbatim,
+    /// no build or pull): no workspace view, no mounts, default security,
+    /// no servers.
+    pub fn from_image(name: impl Into<String>, image: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            image: image.into(),
+            workspace: SidecarWorkspaceAccess::None,
+            mounts: Vec::new(),
+            security: SecuritySpec::default(),
+            servers: BTreeMap::new(),
+        }
+    }
+
+    /// How much of the session workspace the sidecar sees (default: none).
+    pub fn with_workspace_access(mut self, access: SidecarWorkspaceAccess) -> Self {
+        self.workspace = access;
+        self
+    }
+
+    pub fn with_mount(mut self, mount: MountSpec) -> Self {
+        self.mounts.push(mount);
+        self
+    }
+
+    pub fn with_mounts(mut self, mounts: impl IntoIterator<Item = MountSpec>) -> Self {
+        self.mounts.extend(mounts);
+        self
+    }
+
+    pub fn with_security(mut self, security: SecuritySpec) -> Self {
+        self.security = security;
+        self
+    }
+
+    /// Host an exec-stdio MCP server named `name` running `command`.
+    pub fn with_server(self, name: impl Into<String>, command: Vec<String>) -> Self {
+        self.with_server_env(name, command, BTreeMap::new())
+    }
+
+    /// [`SidecarSpec::with_server`] plus per-server environment variables.
+    pub fn with_server_env(
+        mut self,
+        name: impl Into<String>,
+        command: Vec<String>,
+        env: BTreeMap<String, EnvValue>,
+    ) -> Self {
+        self.servers
+            .insert(name.into(), SidecarServerSpec { command, env });
+        self
+    }
+}
+
 /// How [`Outrig::launch`] handles MCP servers declared in an image's
 /// `org.outrig.mcp` label.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -121,6 +205,7 @@ pub struct LaunchSpec {
     pub network: NetworkSpec,
     pub embedded_mcp_policy: EmbeddedMcpPolicy,
     pub mcp: BTreeMap<String, McpServerSpec>,
+    pub sidecars: Vec<SidecarSpec>,
     pub log_dir: PathBuf,
 }
 
@@ -153,6 +238,7 @@ impl LaunchSpec {
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
+            sidecars: Vec::new(),
             log_dir,
         }
     }
@@ -172,6 +258,7 @@ impl LaunchSpec {
             network: NetworkSpec::default(),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
+            sidecars: Vec::new(),
             log_dir,
         }
     }
@@ -217,6 +304,7 @@ impl LaunchSpec {
                 network: NetworkSpec::default(),
                 embedded_mcp_policy: EmbeddedMcpPolicy::default(),
                 mcp: cfg.mcp.clone(),
+                sidecars: Vec::new(),
                 log_dir,
             },
             ImageSourceRef::Image { image_name } => Self {
@@ -229,6 +317,7 @@ impl LaunchSpec {
                 network: NetworkSpec::default(),
                 embedded_mcp_policy: EmbeddedMcpPolicy::default(),
                 mcp: cfg.mcp.clone(),
+                sidecars: Vec::new(),
                 log_dir,
             },
         }
@@ -279,6 +368,16 @@ impl LaunchSpec {
         self.embedded_mcp_policy = policy;
         self
     }
+
+    /// Declare a sidecar to start with the session. Launch-time sidecars are
+    /// abort-only: any sidecar failure fails the launch and tears down
+    /// everything already started (a library caller holds the `Result` and
+    /// can relaunch without the sidecar; the config-level `on-failure =
+    /// "warn"` convenience is a CLI concern).
+    pub fn with_sidecar(mut self, sidecar: SidecarSpec) -> Self {
+        self.sidecars.push(sidecar);
+        self
+    }
 }
 
 fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
@@ -300,15 +399,20 @@ pub struct ToolHandle {
     pub input_schema: Value,
 }
 
-/// A running container with a set of MCP servers attached. Construct via
-/// [`Outrig::launch`]; clean up via [`Outrig::shutdown`]. Dropping without
-/// `shutdown` still removes the container via a detached `podman rm -f`
-/// (plus the panic-hook sweeper if the host installed it).
+/// A running container set (one primary plus any sidecars) with MCP servers
+/// attached. Construct via [`Outrig::launch`]; grow via
+/// [`Outrig::add_sidecar`]; clean up via [`Outrig::shutdown`]. Dropping
+/// without `shutdown` still removes every container via a detached
+/// `podman rm -f` (plus the panic-hook sweeper if the host installed it).
 pub struct Outrig {
+    // Declared before `container` so field-order `Drop` reaps sidecars
+    // before the primary, mirroring orderly shutdown.
+    sidecars: BTreeMap<String, Container>,
     container: Container,
     clients: BTreeMap<String, Arc<McpClient>>,
     tools: Vec<ToolHandle>,
     network: Option<NetworkInterceptor>,
+    log_dir: PathBuf,
 }
 
 impl Outrig {
@@ -404,15 +508,17 @@ impl Outrig {
             }
         };
 
-        // The library facade is single-container until the sidecar API
-        // lands; a placement-bearing spec (e.g. copied from a repo config by
-        // `LaunchSpec::from_image_config`) would silently run in the primary
-        // otherwise.
+        // The effective MCP map runs in the primary; a placement-bearing
+        // entry (e.g. copied from a repo config by
+        // `LaunchSpec::from_image_config`) would silently run there
+        // otherwise. The library route for sidecar-hosted servers is a
+        // `SidecarSpec`, which carries its own servers.
         for (name, server) in &mcp {
             if server.spec.sidecar().is_some() || server.spec.image().is_some() {
                 return Err(OutrigError::Configuration(format!(
-                    "mcp server {name:?} declares a sidecar placement; sidecar support in \
-                     the library API arrives in a later release"
+                    "mcp server {name:?} declares a sidecar placement; the library API \
+                     hosts sidecar servers via LaunchSpec::with_sidecar / \
+                     Outrig::add_sidecar -- declare a SidecarSpec instead"
                 )));
             }
         }
@@ -429,28 +535,115 @@ impl Outrig {
                 &BTreeMap::new(),
             )
             .await?;
-            for t in client.list_tools().await? {
-                tools.push(ToolHandle {
-                    server: name.clone(),
-                    name: t.name,
-                    description: t.description.unwrap_or_default(),
-                    input_schema: t.input_schema,
-                });
-            }
+            tools.extend(tool_handles(name, client.list_tools().await?));
             clients.insert(name.clone(), Arc::new(client));
         }
 
-        Ok(Self {
+        let mut outrig = Self {
+            sidecars: BTreeMap::new(),
             container,
             clients,
             tools,
             network,
-        })
+            log_dir: spec.log_dir.clone(),
+        };
+        for sidecar in &spec.sidecars {
+            if let Err(e) = outrig.add_sidecar(sidecar.clone()).await {
+                let _ = outrig.shutdown().await;
+                return Err(e);
+            }
+        }
+        Ok(outrig)
     }
 
-    /// Tools advertised by every connected MCP server, in `(server, name)`
-    /// order matching the effective MCP map's `BTreeMap` iteration followed by
-    /// each server's advertised order.
+    /// Start a sidecar container mid-session: labels, keep-id, conditional
+    /// user bootstrap, network-interceptor attachment (when the session
+    /// launched with one), and one exec-stdio MCP connection per server in
+    /// the spec. On success the new servers' tools are appended to
+    /// [`Outrig::tools`] and returned. On failure everything started by this
+    /// call is torn down (clients, interceptor attachment, container) and the
+    /// session is left exactly as it was -- errors reach only the caller.
+    pub async fn add_sidecar(&mut self, spec: SidecarSpec) -> Result<Vec<ToolHandle>> {
+        validate_sidecar_spec(&spec, &self.clients, &self.sidecars)?;
+
+        let workspace_access = spec.workspace.mount_access();
+        if workspace_access.is_some() && self.container.host_workspace().as_os_str().is_empty() {
+            return Err(OutrigError::Configuration(format!(
+                "sidecar {:?} requests workspace access but the session has no workspace",
+                spec.name
+            )));
+        }
+        let launch = ContainerLaunchSpec {
+            workspace: workspace_access.map(|access| ContainerWorkspace {
+                host: self.container.host_workspace().to_path_buf(),
+                container: self.container.container_workspace().to_path_buf(),
+                access,
+            }),
+            mounts: spec
+                .mounts
+                .iter()
+                .map(|mount| ContainerMount {
+                    host: mount.host.clone(),
+                    container: mount.container.clone(),
+                    access: mount.access,
+                })
+                .collect(),
+            capabilities: ContainerCapabilities::from(&spec.security.capabilities),
+            labels: BTreeMap::from([
+                (
+                    LABEL_SESSION.to_string(),
+                    self.container.session_suffix().to_string(),
+                ),
+                (LABEL_SIDECAR.to_string(), spec.name.clone()),
+            ]),
+        };
+        let container_name =
+            crate::container::sidecar_container_name(self.container.session_suffix(), &spec.name);
+
+        let image = ImageTag(spec.image.clone());
+        let mut container = Container::start_named(&image, launch, container_name, None).await?;
+
+        // Bootstrap only where identity matters; every SidecarSpec server is
+        // exec-stdio, so any server implies bootstrap.
+        let needs_bootstrap = crate::container::sidecar::bootstrap_needed(
+            !spec.servers.is_empty(),
+            spec.workspace,
+            !spec.mounts.is_empty(),
+        );
+        if needs_bootstrap && let Err(e) = container.bootstrap_user().await {
+            let _ = container.stop(SHUTDOWN_GRACE).await;
+            return Err(e);
+        }
+
+        if let Some(network) = &mut self.network
+            && let Err(e) = network.attach(&container).await
+        {
+            let _ = container.stop(SHUTDOWN_GRACE).await;
+            return Err(e);
+        }
+
+        match connect_sidecar_servers(&container, &spec, &self.log_dir).await {
+            Ok((clients, tools)) => {
+                self.sidecars.insert(spec.name.clone(), container);
+                self.clients
+                    .extend(clients.into_iter().map(|(name, c)| (name, Arc::new(c))));
+                self.tools.extend(tools.iter().cloned());
+                Ok(tools)
+            }
+            Err(e) => {
+                if let Some(network) = &mut self.network {
+                    let _ = network.detach(container.name()).await;
+                }
+                let _ = container.stop(SHUTDOWN_GRACE).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Tools advertised by every connected MCP server: launch-time servers in
+    /// `(server, name)` order matching the effective MCP map's `BTreeMap`
+    /// iteration followed by each server's advertised order, then each
+    /// [`Outrig::add_sidecar`]'s tools in call order.
     pub fn tools(&self) -> &[ToolHandle] {
         &self.tools
     }
@@ -467,11 +660,14 @@ impl Outrig {
     }
 
     /// Shut down every MCP server (close-stdin -> 2 s grace -> SIGKILL),
-    /// then stop the container. Errors during MCP shutdown are logged and
-    /// swallowed so a single misbehaving server can't strand the
-    /// container; the container `stop` error, if any, propagates.
+    /// then detach the network interceptor from every container, stop the
+    /// sidecars, and finally stop the primary. Errors during MCP and sidecar
+    /// shutdown are logged and swallowed so a single misbehaving server or
+    /// sidecar can't strand the rest; the primary `stop` error, if any,
+    /// propagates.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
+            sidecars,
             container,
             clients,
             network,
@@ -498,8 +694,135 @@ impl Outrig {
         if let Some(network) = network {
             network.shutdown().await;
         }
+        for (name, sidecar) in sidecars {
+            if let Err(e) = sidecar.stop(SHUTDOWN_GRACE).await {
+                tracing::warn!(
+                    target: "outrig::outrig",
+                    "sidecar {name:?} stop failed: {e}"
+                );
+            }
+        }
         container.stop(SHUTDOWN_GRACE).await
     }
+}
+
+/// Reject a [`SidecarSpec`] that could not start or would corrupt the
+/// session's flat server namespace. Pure checks, no podman. Generic over
+/// the map values so the checks are testable with plain name maps.
+fn validate_sidecar_spec<C, S>(
+    spec: &SidecarSpec,
+    existing_clients: &BTreeMap<String, C>,
+    existing_sidecars: &BTreeMap<String, S>,
+) -> Result<()> {
+    if !is_valid_sidecar_name(&spec.name) {
+        return Err(OutrigError::Configuration(format!(
+            "invalid sidecar name {:?} (must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ -- it \
+             embeds in container names)",
+            spec.name
+        )));
+    }
+    if existing_sidecars.contains_key(&spec.name) {
+        return Err(OutrigError::Configuration(format!(
+            "sidecar {:?} is already running",
+            spec.name
+        )));
+    }
+    if spec.image.trim().is_empty() {
+        return Err(OutrigError::Configuration(format!(
+            "sidecar {:?} has an empty image ref",
+            spec.name
+        )));
+    }
+    for (name, server) in &spec.servers {
+        if !is_valid_mcp_server_name(name) {
+            return Err(OutrigError::Configuration(format!(
+                "sidecar {:?}: invalid mcp server name {name:?}",
+                spec.name
+            )));
+        }
+        if server.command.is_empty() {
+            return Err(OutrigError::Configuration(format!(
+                "sidecar {:?}: mcp server {name:?} has an empty command",
+                spec.name
+            )));
+        }
+        if existing_clients.contains_key(name) {
+            return Err(OutrigError::Configuration(format!(
+                "sidecar {:?}: mcp server name {name:?} is already connected in this \
+                 session (the per-session server namespace is flat)",
+                spec.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Connect every server in `spec` against the started sidecar and index its
+/// tools. On failure every client connected so far (including the failing
+/// one, when it got that far) is shut down before the error propagates.
+async fn connect_sidecar_servers(
+    container: &Container,
+    spec: &SidecarSpec,
+    log_dir: &Path,
+) -> Result<(BTreeMap<String, McpClient>, Vec<ToolHandle>)> {
+    let mut clients: BTreeMap<String, McpClient> = BTreeMap::new();
+    let mut tools: Vec<ToolHandle> = Vec::new();
+    for (name, server) in &spec.servers {
+        let mcp_spec = McpServerSpec::Full {
+            command: Some(server.command.clone()),
+            env: server.env.clone(),
+            sidecar: None,
+            image: None,
+        };
+        let client = match McpClient::connect_via_podman_exec_with_source(
+            container,
+            &mcp_spec,
+            name,
+            McpDeclarationSource::LaunchSpec,
+            log_dir,
+            &BTreeMap::new(),
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(e) => {
+                shutdown_partial_clients(clients).await;
+                return Err(e);
+            }
+        };
+        match client.list_tools().await {
+            Ok(listed) => {
+                tools.extend(tool_handles(name, listed));
+                clients.insert(name.clone(), client);
+            }
+            Err(e) => {
+                let _ = client.shutdown().await;
+                shutdown_partial_clients(clients).await;
+                return Err(e);
+            }
+        }
+    }
+    Ok((clients, tools))
+}
+
+/// Unwind helper for a failed [`Outrig::add_sidecar`].
+async fn shutdown_partial_clients(clients: BTreeMap<String, McpClient>) {
+    for (_, client) in clients {
+        let _ = client.shutdown().await;
+    }
+}
+
+/// Index one server's advertised tools as [`ToolHandle`]s.
+fn tool_handles(server: &str, listed: Vec<crate::mcp::McpTool>) -> Vec<ToolHandle> {
+    listed
+        .into_iter()
+        .map(|t| ToolHandle {
+            server: server.to_string(),
+            name: t.name,
+            description: t.description.unwrap_or_default(),
+            input_schema: t.input_schema,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -523,5 +846,104 @@ mod tests {
             .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
 
         assert_eq!(spec.embedded_mcp_policy, EmbeddedMcpPolicy::Ignore);
+    }
+
+    fn tools_sidecar() -> SidecarSpec {
+        SidecarSpec::from_image("tools", "ghcr.io/example/mcp-tools:1")
+            .with_server("fs", vec!["mcp-fs".to_string(), "/workspace".to_string()])
+    }
+
+    #[test]
+    fn sidecar_spec_builder_sets_fields() {
+        let spec = tools_sidecar()
+            .with_workspace_access(SidecarWorkspaceAccess::Ro)
+            .with_mount(MountSpec {
+                host: PathBuf::from("/host/cache"),
+                container: PathBuf::from("/cache"),
+                access: MountAccess::ReadWrite,
+            });
+
+        assert_eq!(spec.name, "tools");
+        assert_eq!(spec.image, "ghcr.io/example/mcp-tools:1");
+        assert_eq!(spec.workspace, SidecarWorkspaceAccess::Ro);
+        assert_eq!(spec.mounts.len(), 1);
+        assert_eq!(spec.servers["fs"].command[0], "mcp-fs");
+    }
+
+    #[test]
+    fn launch_spec_accumulates_sidecars() {
+        let spec = LaunchSpec::from_image("img:latest", BTreeMap::new(), log_dir())
+            .with_sidecar(tools_sidecar())
+            .with_sidecar(SidecarSpec::from_image("grep", "img-grep:1"));
+
+        let names: Vec<&str> = spec.sidecars.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["tools", "grep"]);
+    }
+
+    fn no_existing() -> (BTreeMap<String, ()>, BTreeMap<String, ()>) {
+        (BTreeMap::new(), BTreeMap::new())
+    }
+
+    #[test]
+    fn validate_accepts_a_plain_spec() {
+        let (clients, sidecars) = no_existing();
+        validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars).expect("spec is valid");
+    }
+
+    #[test]
+    fn validate_rejects_bad_sidecar_name() {
+        let (clients, sidecars) = no_existing();
+        let err = validate_sidecar_spec(
+            &SidecarSpec::from_image("bad name!", "img:1"),
+            &clients,
+            &sidecars,
+        )
+        .expect_err("space in name must fail");
+        assert!(err.to_string().contains("invalid sidecar name"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_image() {
+        let (clients, sidecars) = no_existing();
+        let err = validate_sidecar_spec(&SidecarSpec::from_image("t", "  "), &clients, &sidecars)
+            .expect_err("blank image must fail");
+        assert!(err.to_string().contains("empty image ref"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_server_command() {
+        let (clients, sidecars) = no_existing();
+        let spec = SidecarSpec::from_image("t", "img:1").with_server("fs", Vec::new());
+        let err =
+            validate_sidecar_spec(&spec, &clients, &sidecars).expect_err("empty command must fail");
+        assert!(err.to_string().contains("empty command"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_server_name() {
+        let (clients, sidecars) = no_existing();
+        let spec =
+            SidecarSpec::from_image("t", "img:1").with_server("1bad", vec!["mcp-fs".to_string()]);
+        let err = validate_sidecar_spec(&spec, &clients, &sidecars)
+            .expect_err("digit-leading server name must fail");
+        assert!(err.to_string().contains("invalid mcp server name"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_server_name_collision() {
+        let (mut clients, sidecars) = no_existing();
+        clients.insert("fs".to_string(), ());
+        let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars)
+            .expect_err("flat namespace collision must fail");
+        assert!(err.to_string().contains("already connected"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_running_sidecar_name() {
+        let (clients, mut sidecars) = no_existing();
+        sidecars.insert("tools".to_string(), ());
+        let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars)
+            .expect_err("duplicate sidecar name must fail");
+        assert!(err.to_string().contains("already running"), "{err}");
     }
 }

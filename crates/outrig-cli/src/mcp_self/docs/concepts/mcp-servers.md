@@ -185,6 +185,30 @@ shuts down only the MCP children it started and leaves the borrowed container ru
 If the owner stops the container while the attacher is live, the attacher exits instead
 of trying to relaunch it.
 
+## Dynamic addition
+
+Sidecars can also join a session after it starts. The primitive is the library API:
+`Outrig::add_sidecar(SidecarSpec)` accepts an arbitrary spec -- a raw podman image ref, a
+workspace view, mounts, a security block, and exec-stdio servers -- starts the container with
+session labels and keep-id, attaches the session's network interceptor, connects the servers,
+and extends `Outrig::tools`. `LaunchSpec::with_sidecar(SidecarSpec)` declares the same thing at
+launch time.
+
+The REPL surface is narrower by design: `/sidecar add <name>` starts a sidecar the image config
+declared with `start = "manual"`, and nothing else -- unknown names and already-running sidecars
+are errors, and there is no `/sidecar stop`. New tools become available to the agent on the next
+turn. `/sidecar list` shows every declared sidecar with its status (`running`, `not started`,
+`exited`) and the servers it hosts.
+
+Dynamic-add failures are reported only to the caller -- the REPL prints the error, the library
+returns `Err` -- and the session stays healthy: anything the failed add started (container,
+interceptor attachment, connected servers) is torn down, and the existing tool set is untouched.
+This is deliberately different from the session-start `on-failure` policy, which decides whether
+a *launch-time* sidecar failure aborts the session.
+
+There is intentionally no agent-invocable tool for adding sidecars: the agent must not grow its
+own environment. Only the human at the REPL or the embedding program can.
+
 ## Tool name prefixing
 
 Two different MCP servers can have a tool with the same name (e.g. both `fs` and `archive` might

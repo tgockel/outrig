@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use outrig::config::McpServerSpec;
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountAccess, MountSpec,
-    NetworkAction, NetworkMode, NetworkPolicy, Outrig,
+    NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarWorkspaceAccess,
 };
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -79,6 +79,30 @@ fn build_fixture_image_with_mcp_label(tag: &str, mcp: &BTreeMap<String, McpServe
 
 fn fs_spec(path: &str) -> McpServerSpec {
     McpServerSpec::Short(vec!["mcp-server-filesystem".to_string(), path.to_string()])
+}
+
+fn fs_command(path: &str) -> Vec<String> {
+    vec!["mcp-server-filesystem".to_string(), path.to_string()]
+}
+
+/// Container names carrying the given `org.outrig.sidecar` label, running
+/// or exited.
+fn sidecar_containers_labeled(sidecar: &str) -> Vec<String> {
+    let output = std::process::Command::new("podman")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=org.outrig.sidecar={sidecar}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .expect("podman ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]
@@ -174,6 +198,298 @@ async fn launch_lists_tools_calls_one_and_shuts_down() {
     );
 
     outrig.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn add_sidecar_extends_tools_and_serves_calls() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-add-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    let mut mcp = BTreeMap::new();
+    mcp.insert("fs".to_string(), fs_spec("/workspace"));
+    let spec = LaunchSpec::from_image(tag.clone(), mcp, session_dir.path().join("logs"))
+        .with_workspace(outrig::WorkspaceSpec {
+            host: host_ws.path().to_path_buf(),
+            container: PathBuf::from("/workspace"),
+        });
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let before = outrig.tools().len();
+
+    let added = outrig
+        .add_sidecar(
+            SidecarSpec::from_image("tools", tag.as_str())
+                .with_workspace_access(SidecarWorkspaceAccess::Ro)
+                .with_server("sidefs", fs_command("/workspace")),
+        )
+        .await
+        .expect("add_sidecar");
+
+    assert!(
+        !added.is_empty(),
+        "sidecar filesystem MCP should advertise tools"
+    );
+    assert!(
+        added.iter().all(|t| t.server == "sidefs"),
+        "returned handles should belong to the sidecar's server: {added:?}"
+    );
+    assert_eq!(
+        outrig.tools().len(),
+        before + added.len(),
+        "tools() should grow by exactly the returned handles"
+    );
+
+    // The sidecar sees the workspace read-only and serves calls.
+    let result = outrig
+        .call_tool(
+            "sidefs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool via sidecar server");
+    assert!(
+        result.content_text.contains("MARKER.txt"),
+        "sidecar list_directory should see the workspace, got: {}",
+        result.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("tools"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+#[tokio::test]
+async fn launch_with_sidecar_starts_it() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-launch-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    let spec = LaunchSpec::from_image(
+        tag.clone(),
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_workspace(outrig::WorkspaceSpec {
+        host: host_ws.path().to_path_buf(),
+        container: PathBuf::from("/workspace"),
+    })
+    .with_sidecar(
+        SidecarSpec::from_image("tools", tag.as_str())
+            .with_workspace_access(SidecarWorkspaceAccess::Ro)
+            .with_server("sidefs", fs_command("/workspace")),
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    assert!(
+        outrig.tools().iter().any(|t| t.server == "sidefs"),
+        "launch-time sidecar servers should be in tools(): {:?}",
+        outrig
+            .tools()
+            .iter()
+            .map(|t| (&t.server, &t.name))
+            .collect::<Vec<_>>(),
+    );
+
+    let result = outrig
+        .call_tool(
+            "sidefs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool via launch-time sidecar");
+    assert!(
+        result.content_text.contains("MARKER.txt"),
+        "sidecar list_directory should see the workspace, got: {}",
+        result.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn failed_add_sidecar_leaves_session_usable() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-failed-add-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    let mut mcp = BTreeMap::new();
+    mcp.insert("fs".to_string(), fs_spec("/workspace"));
+    let spec = LaunchSpec::from_image(tag.clone(), mcp, session_dir.path().join("logs"))
+        .with_workspace(outrig::WorkspaceSpec {
+            host: host_ws.path().to_path_buf(),
+            container: PathBuf::from("/workspace"),
+        });
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let before: Vec<(String, String)> = outrig
+        .tools()
+        .iter()
+        .map(|t| (t.server.clone(), t.name.clone()))
+        .collect();
+
+    // A container that cannot start: nonexistent image ref.
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("badimg", "localhost/outrig-does-not-exist:nope")
+                .with_server("s1", fs_command("/tmp")),
+        )
+        .await
+        .expect_err("nonexistent image must fail the add");
+
+    // A server that cannot connect: its command exits immediately.
+    outrig
+        .add_sidecar(SidecarSpec::from_image("badsrv", tag.as_str()).with_server(
+            "s2",
+            vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+        ))
+        .await
+        .expect_err("immediately-exiting server must fail the add");
+
+    // The session is fully usable: tool set unchanged, calls still served.
+    let after: Vec<(String, String)> = outrig
+        .tools()
+        .iter()
+        .map(|t| (t.server.clone(), t.name.clone()))
+        .collect();
+    assert_eq!(before, after, "failed adds must not change tools()");
+    let result = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("primary server still serves calls");
+    assert!(result.content_text.contains("MARKER.txt"));
+
+    // Failed adds leave no containers behind.
+    for name in ["badimg", "badsrv"] {
+        assert_eq!(
+            sidecar_containers_labeled(name),
+            Vec::<String>::new(),
+            "failed add of {name:?} should leave no container"
+        );
+    }
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn added_sidecar_egress_obeys_network_policy() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-sidecar-network-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let log_dir = session_dir.path().join("logs");
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("github.com", 443)
+        .build()
+        .expect("policy builds");
+    let spec = LaunchSpec::from_image(tag.clone(), BTreeMap::new(), log_dir.clone())
+        .with_workspace(outrig::WorkspaceSpec {
+            host: host_ws.path().to_path_buf(),
+            container: PathBuf::from("/workspace"),
+        })
+        .with_network_filter(policy);
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("tools", tag.as_str())
+                .with_server("sidefs", fs_command("/tmp")),
+        )
+        .await
+        .expect("add_sidecar under filter mode");
+
+    let names = sidecar_containers_labeled("tools");
+    assert_eq!(names.len(), 1, "expected one sidecar container: {names:?}");
+    let sidecar = &names[0];
+
+    // Interception attached: the sidecar resolves through the interceptor.
+    let resolv = std::process::Command::new("podman")
+        .args(["exec", sidecar, "cat", "/etc/resolv.conf"])
+        .output()
+        .expect("podman exec cat resolv.conf");
+    assert!(
+        String::from_utf8_lossy(&resolv.stdout).contains("nameserver 127.0.0.1"),
+        "added sidecar resolv.conf should point at the interceptor: {}",
+        String::from_utf8_lossy(&resolv.stdout),
+    );
+
+    // Drive denied egress from inside the added sidecar. A literal IP
+    // avoids DNS; the deny-all policy intercepts the connect inside the
+    // sidecar's netns (no packet leaves the host), fails the wget, and
+    // writes an audit record attributed to the sidecar.
+    let wget = std::process::Command::new("podman")
+        .args([
+            "exec",
+            sidecar,
+            "wget",
+            "-T",
+            "5",
+            "-qO-",
+            "http://192.0.2.1/",
+        ])
+        .output()
+        .expect("podman exec wget");
+    assert!(
+        !wget.status.success(),
+        "deny-all policy should fail the wget, stderr: {}",
+        String::from_utf8_lossy(&wget.stderr),
+    );
+
+    let sidecar = sidecar.clone();
+    outrig.shutdown().await.expect("shutdown");
+
+    let log = std::fs::read_to_string(log_dir.join("network.jsonl")).expect("network.jsonl exists");
+    assert!(
+        log.lines()
+            .any(|l| l.contains(&sidecar) && l.contains("192.0.2.1")),
+        "network log should attribute the added sidecar's denied egress to \
+         its container:\n{log}"
+    );
 }
 
 #[tokio::test]
