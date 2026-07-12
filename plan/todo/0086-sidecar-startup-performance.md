@@ -1,6 +1,10 @@
-# Sidecar startup and clean-sweep performance follow-ups
+# 0086 -- Sidecar startup and clean-sweep performance follow-ups
 
-Deferred efficiency items from task 0079's review pass; none block correctness.
+## Goal
+
+Land the deferred efficiency items from task 0079's review pass; none block correctness.
+
+## Deliverables
 
 - **Concurrent sidecar bring-up.** `setup_sidecars_and_network` runs image-ensure ->
   label read -> `podman run` -> bootstrap fully serially per sidecar. Sidecars are
@@ -19,3 +23,17 @@ Deferred efficiency items from task 0079's review pass; none block correctness.
   every labeled container's state in one `podman ps -a` call; answer record-backed
   running-state from that listing and keep per-name probes only for pre-label sessions.
   Batch the stray `podman rm -f` calls into one invocation while there.
+
+## Acceptance
+
+- Observable behavior is unchanged: same tools, same deterministic label-collision
+  errors, same session teardown semantics.
+- Sidecar bring-up overlaps across sidecars rather than running serially.
+- One watcher process per session instead of 1 + N `podman wait` children.
+- `outrig clean` answers record-backed running-state from the single `podman ps -a`
+  listing and batches its `podman rm -f` calls.
+
+## Dependencies
+
+None (follows up on completed task 0079; sequenced after 0085 since both touch
+`setup_sidecars_and_network`).

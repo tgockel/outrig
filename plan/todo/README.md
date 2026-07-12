@@ -6,8 +6,10 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-| Task | Title                                      | Dependencies |
-|------|--------------------------------------------|--------------|
-
-The queue is empty. Run `/groom-plan` to pull entries from `plan/next/` into the
-numbered queue.
+| Task | Title                                              | Dependencies |
+|------|----------------------------------------------------|--------------|
+| 0082 | Fix pre-existing doc-style audit violations        | --           |
+| 0083 | Fix stale `malformed_mcp_label_is_hard_error` test | --           |
+| 0084 | REPL slash-command dispatcher                      | --           |
+| 0085 | from_image_config sidecar translation              | --           |
+| 0086 | Sidecar startup and clean-sweep performance        | --           |

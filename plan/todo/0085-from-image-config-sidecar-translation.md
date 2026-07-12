@@ -1,4 +1,6 @@
-# from_image_config sidecar translation
+# 0085 -- from_image_config sidecar translation
+
+## Goal
 
 `LaunchSpec::from_image_config` copies `[images.<name>.mcp]` wholesale, so placement-bearing
 entries (`sidecar = "<sc>"`, inline `image = "..."`) survive into the spec and
@@ -9,7 +11,9 @@ Make the translation faithful instead: `from_image_config` (or a sibling constru
 the whole `Config`) turns `[sidecars.*]` blocks and placement-bearing MCP entries into
 `SidecarSpec`s on the returned `LaunchSpec`.
 
-Scope notes:
+## Deliverables
+
+A faithful translation, with these scope notes:
 
 - Named-sidecar image refs resolve like `--image` (sibling `[images.<name>]` block first,
   else raw ref), which needs the whole `Config` plus `ensure_image` -- today's
@@ -20,3 +24,14 @@ Scope notes:
   grow one or keep rejecting those specifically.
 - `start = "manual"` maps to *not* adding the sidecar at launch; decide whether the library
   should expose the declared-but-unstarted set so callers can add them later by name.
+
+## Acceptance
+
+- Placement-bearing `[mcp]` entries and `[sidecars.*]` blocks in an image config translate
+  into `SidecarSpec`s on the returned `LaunchSpec` instead of being rejected at launch.
+- `start = "manual"` sidecars are not started at launch.
+- Entrypoint-stdio placements either translate or fail with a specific, documented error.
+
+## Dependencies
+
+None (follows up on completed task 0081).
