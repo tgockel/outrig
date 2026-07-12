@@ -1,10 +1,16 @@
 # MCP Servers
 
 [MCP](https://modelcontextprotocol.io/) -- Model Context Protocol -- is the wire format outrig
-uses to talk to tools. Each MCP server is a child process that runs inside your container and
-speaks JSON-RPC over its stdio. outrig connects to each one by `podman exec -i`'ing into the
+uses to talk to tools. Each MCP server is a child process that runs inside a session container
+and speaks JSON-RPC over its stdio. outrig connects to each one by `podman exec -i`'ing into the
 container, hands the resulting stdio pair to the [rmcp](https://crates.io/crates/rmcp) client, and
 treats every tool the server advertises as a Rig dynamic tool.
+
+By default a server runs in the session's primary workspace container. An entry can instead opt
+into a **sidecar** -- an extra container owned by the session -- so the server's runtime
+dependencies stay out of the workspace image and the server sees only what its container is
+granted. See [Sidecar placement](#sidecar-placement) below and
+[Containers](containers.md#sidecar-containers) for the container-side details.
 
 The same `[images.<name>.mcp]` table is consumed by both `outrig run` and
 `outrig mcp`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
@@ -39,6 +45,52 @@ Each entry is one of:
 Server names must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and must be unique within an image-config.
 Names are how you reference servers elsewhere -- in `outrig logs <session> <server>`, in tool-call
 traces, in the prefix that gets attached to every tool the server exposes.
+
+## Sidecar placement
+
+A full-form entry can name the container it runs in:
+
+```toml
+[images.dev.sidecars.tools]
+image     = "mcp-tools"        # sibling [images.mcp-tools] block first, else raw podman ref
+workspace = "ro"               # "none" (default) | "ro" | "rw"
+
+[images.dev.mcp]
+# Runs in the primary container, exactly as before.
+local = ["mcp-local", "--stdio"]
+# exec-stdio in the named sidecar "tools".
+fs    = { command = ["mcp-fs", "/workspace"], sidecar = "tools" }
+# exec-stdio in a dedicated anonymous sidecar built just for this server.
+grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+```
+
+The three placement shapes:
+
+- **Primary (default).** No placement key. The short form (bare array) always runs in the
+  primary.
+- **Named sidecar:** `sidecar = "<sc>"` names a block under `[images.<name>.sidecars]`; the
+  server is `podman exec`'d in that container. Named sidecars require a `command`.
+- **Anonymous sidecar:** `image = "<ref>"` plus `command` gives this one server a dedicated
+  container with all defaults (no workspace, no mounts, `on-failure = "abort"`). Anything
+  fancier -- workspace access, mounts, security -- requires promoting to a named block.
+  `sidecar` and `image` are mutually exclusive.
+
+An `image` entry *without* a `command` (the image's ENTRYPOINT as the server) is reserved for a
+later release and rejected at config load.
+
+Named sidecars honor their image's `org.outrig.mcp` label with the usual semantics, scoped to
+that sidecar: label-declared servers materialize as exec-stdio servers *in that sidecar*, and
+repo config overrides by server name (the whole entry, placement included). Labels are inert on
+anonymous sidecars -- exactly the one declaring server runs there.
+
+The server-name namespace stays flat per session, across the primary and every sidecar. If two
+sidecar images both advertise the same name and neither is overridden, session start fails with
+an error naming both hosts; add an override by name in `[images.<name>.mcp]` to pick one.
+
+A sidecar that fails to start, bootstrap, or connect any of its servers is handled per its
+`on-failure` key: `abort` (the default) fails the session start; `warn` logs to stderr, skips
+the sidecar and every server it hosts, and continues with a reduced tool set. Primary-container
+and primary-hosted-server failures always fail fast.
 
 ## Embedding MCP config in the image
 
@@ -82,16 +134,28 @@ To inspect what will actually start, run:
 outrig mcp show-merged --image coding
 ```
 
-The command starts the selected container, reads the `org.outrig.mcp` label,
-applies `config.toml` overrides, prints the effective `[mcp]` table to stdout,
-and then stops the container.
+The command starts the selected container, reads the `org.outrig.mcp` label off the primary
+image and every named sidecar image, applies `config.toml` overrides, prints the effective
+`[mcp]` table to stdout (without launching sidecar containers), and then stops the container.
+Each server carries a comment naming its placement and where it was declared:
+
+```toml
+[mcp]
+# fs: primary (image label org.outrig.mcp)
+fs = ["mcp-server-filesystem", "/workspace"]
+# search: sidecar "tools" (config.toml)
+search = { command = ["mcp-search"], sidecar = "tools" }
+```
 
 ## Lifecycle
 
-When `outrig run` starts, the sequence per MCP server is:
+When `outrig run` starts, the primary container comes up first, then every `start = "auto"`
+sidecar, then network interception attaches to each container, and only then do MCP servers
+connect -- primary-hosted and sidecar-hosted alike, in name order. The sequence per MCP server
+is:
 
 1. `podman exec -i <container> <command>` -- outrig spawns the server as a child process inside
-   the running container, with stdin/stdout piped back to outrig.
+   its placement's running container, with stdin/stdout piped back to outrig.
 2. **Initialize handshake** -- outrig sends the MCP `initialize` request and reads the server's
    capabilities.
 3. **Discover tools** -- outrig calls `tools/list` and receives the list of advertised tools, each
@@ -104,9 +168,9 @@ All servers come up before the REPL accepts any input. If any server fails to in
 sandboxes.
 
 When the REPL terminates (Ctrl-D, Ctrl-C, or LLM error), outrig closes each server's stdin in
-turn, waits up to 5 seconds for the process to exit, then `podman stop`'s the container. Servers
-don't see SIGTERM directly; they see EOF on stdin, which the MCP spec defines as the normal
-shutdown signal.
+turn, waits up to 5 seconds for the process to exit, then stops the containers -- sidecars
+first, primary last. Servers don't see SIGTERM directly; they see EOF on stdin, which the MCP
+spec defines as the normal shutdown signal.
 
 In attach mode, `outrig mcp --attach` borrows a container that something else owns. It
 shuts down only the MCP children it started and leaves the borrowed container running.
@@ -151,6 +215,11 @@ You can list every tool currently registered with the agent from inside the REPL
 A crashed MCP server is surfaced as a tool-call error to the LLM, which usually causes the model
 to stop calling that tool and tell you about the failure. outrig does not auto-restart MCP servers
 in v0 -- the server is gone for the rest of the session.
+
+A sidecar container that dies mid-session behaves the same way, uniformly and regardless of its
+`on-failure` setting: outrig logs the death to stderr, every tool the sidecar hosted returns
+errors, and nothing restarts. If the *primary* container dies out from under outrig (a manual
+`podman kill`, the OOM killer), outrig reaps every sidecar and ends the session with an error.
 
 > **TODO: Incomplete** -- auto-restart and per-server health-checking are deferred.
 

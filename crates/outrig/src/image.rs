@@ -18,7 +18,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec};
-use crate::container::embedded::{mcp_config_to_labels, merged_mcp_config_to_labels};
+use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_to_labels};
 use crate::error::{OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
@@ -167,7 +167,9 @@ pub(crate) fn resolve_build_args(
 }
 
 fn repo_build_cache_labels(cfg: &ImageConfig) -> Result<BTreeMap<String, String>> {
-    mcp_config_to_labels(&cfg.mcp)
+    // Sidecar-placed entries run in other containers; they neither belong in
+    // this image's label nor affect its cache key.
+    mcp_config_to_labels(&embedded::primary_scoped_mcp(&cfg.mcp))
 }
 
 /// Compute the deterministic `<repo>:<key>` tag for `cfg` without touching
@@ -942,6 +944,7 @@ mod tests {
             )]),
             security: Default::default(),
             mcp: BTreeMap::new(),
+            sidecars: BTreeMap::new(),
         };
         let resolved = BTreeMap::from([("GH_TOKEN".to_string(), "secret-token".to_string())]);
 

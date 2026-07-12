@@ -628,9 +628,18 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
-    let rc = clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
-        .await
-        .expect("clean");
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
+    .await
+    .expect("clean");
     drop(ew);
     assert_eq!(rc, 0);
 
@@ -677,9 +686,18 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(Duration::from_secs(60 * 60), true);
-    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
-        .await
-        .expect("clean");
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
+    .await
+    .expect("clean");
     drop(ew);
 
     assert!(!old_dir.exists(), "old session should be removed");
@@ -705,9 +723,18 @@ async fn clean_without_yes_aborts_on_n() {
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(&b"n\n"[..]);
     let args = clean_args(clean::DEFAULT_OLDER_THAN, false);
-    let rc = clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
-        .await
-        .expect("clean");
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
+    .await
+    .expect("clean");
     drop(ew);
 
     assert_eq!(rc, 0);
@@ -734,9 +761,18 @@ async fn clean_accepts_yes_at_prompt() {
     let (mut ew, _stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(&b"yes\n"[..]);
     let args = clean_args(clean::DEFAULT_OLDER_THAN, false);
-    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
-        .await
-        .expect("clean");
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
+    .await
+    .expect("clean");
     drop(ew);
 
     assert!(!dir.exists());
@@ -756,10 +792,19 @@ async fn clean_skips_running_sessions() {
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
-    clean::execute_with(&mut ew, stdin, &store, &args, now, move |name| {
-        let is_running = name == running.as_str();
-        async move { Ok(is_running) }
-    })
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        move |name| {
+            let is_running = name == running.as_str();
+            async move { Ok(is_running) }
+        },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
     .await
     .expect("clean");
     drop(ew);
@@ -768,7 +813,7 @@ async fn clean_skips_running_sessions() {
     let err = drain(stderr_r).await;
     assert!(err.contains("skipped running sessions"), "stderr:\n{err}");
     assert!(
-        err.contains("no stopped sessions older than 30d"),
+        err.contains("no stopped sessions or stray containers older than 30d"),
         "stderr:\n{err}"
     );
 }
@@ -786,9 +831,18 @@ async fn clean_removes_stale_unfinalized_non_running_sessions() {
     let (mut ew, _stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
-    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
-        .await
-        .expect("clean");
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
+    .await
+    .expect("clean");
     drop(ew);
 
     assert!(!dir.exists(), "stale non-running session should be removed");
@@ -820,9 +874,18 @@ async fn clean_removes_symlinked_session_target_and_link() {
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
-    clean::execute_with(&mut ew, stdin, &store, &args, now, |_| async { Ok(false) })
-        .await
-        .expect("clean");
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        Vec::new(),
+        |_| async { Ok(()) },
+    )
+    .await
+    .expect("clean");
     drop(ew);
 
     assert!(!target.exists(), "target should be removed");
@@ -864,4 +927,229 @@ async fn session_root_flag_overrides_default() {
     let out = drain(stdout_r).await;
     assert!(out.contains(sid_a.as_str()), "expected A: {out}");
     assert!(!out.contains(sid_b.as_str()), "should not see B: {out}");
+}
+
+// -------- clean: labeled stray containers --------
+
+fn labeled(
+    name: &str,
+    session_label: &str,
+    sidecar: Option<&str>,
+    running: bool,
+    age: Duration,
+    now: SystemTime,
+) -> clean::LabeledContainer {
+    clean::LabeledContainer {
+        name: name.to_string(),
+        session_label: session_label.to_string(),
+        sidecar_label: sidecar.map(str::to_string),
+        running,
+        created: now - age,
+    }
+}
+
+#[tokio::test]
+async fn clean_removes_old_stopped_stray_containers() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let strays = vec![
+        // Record-less, stopped, old: removed.
+        labeled("outrig-lost-1", "lost-1", None, false, days(40), now),
+        // Record-less sidecar, stopped, old: removed.
+        labeled(
+            "outrig-lost-1-tools",
+            "lost-1",
+            Some("tools"),
+            false,
+            days(40),
+            now,
+        ),
+        // Record-less but too young: kept.
+        labeled("outrig-young", "young", None, false, days(1), now),
+    ];
+
+    let removed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let removed_ref = removed.clone();
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        strays,
+        move |name| {
+            let removed = removed_ref.clone();
+            async move {
+                removed.lock().unwrap().push(name);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    let removed = removed.lock().unwrap().clone();
+    assert_eq!(
+        removed,
+        vec![
+            "outrig-lost-1".to_string(),
+            "outrig-lost-1-tools".to_string()
+        ],
+        "only the old stopped strays should be removed"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("2 stray containers"),
+        "preview/summary should count strays: {err}"
+    );
+    assert!(
+        err.contains("sidecar tools"),
+        "sidecar strays should show their role: {err}"
+    );
+    assert!(
+        err.contains("cleaned 2 stray containers"),
+        "summary should mention strays: {err}"
+    );
+}
+
+#[tokio::test]
+async fn clean_never_removes_running_or_record_backed_containers() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    // A live record-backed session whose container is running.
+    let live_sid = SessionId("20260501T134412-3f2a".into());
+    store
+        .create(
+            &live_sid,
+            None,
+            &mut session_with_age(&live_sid, now, days(40), None),
+        )
+        .expect("live create");
+
+    let strays = vec![
+        // Backed by the (surviving, running) record: untouched by the sweep.
+        labeled(
+            "outrig-20260501T134412-3f2a",
+            live_sid.as_str(),
+            None,
+            true,
+            days(40),
+            now,
+        ),
+        // Record-less but RUNNING: never removed, reported.
+        labeled("outrig-orphan", "orphan-sid", None, true, days(40), now),
+    ];
+
+    let removed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let removed_ref = removed.clone();
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(true) },
+        strays,
+        move |name| {
+            let removed = removed_ref.clone();
+            async move {
+                removed.lock().unwrap().push(name);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert!(
+        removed.lock().unwrap().is_empty(),
+        "no container should be removed"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("skipped running labeled containers"),
+        "running strays should be reported: {err}"
+    );
+    assert!(err.contains("outrig-orphan"), "stderr:\n{err}");
+    assert!(
+        !err.contains("outrig-20260501T134412-3f2a  session"),
+        "record-backed containers do not belong in the stray report: {err}"
+    );
+}
+
+#[tokio::test]
+async fn clean_sweeps_strays_of_records_removed_in_same_run() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    // Old finished session whose record gets removed this run; its leftover
+    // container (a failed `--rm`) should be swept in the same pass.
+    let old_sid = SessionId("20260501T134412-3f2a".into());
+    store
+        .create(
+            &old_sid,
+            None,
+            &mut session_with_age(&old_sid, now, days(40), Some(days(31))),
+        )
+        .expect("old create");
+
+    let strays = vec![labeled(
+        "outrig-20260501T134412-3f2a",
+        old_sid.as_str(),
+        None,
+        false,
+        days(40),
+        now,
+    )];
+
+    let removed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let removed_ref = removed.clone();
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        |_| async { Ok(false) },
+        strays,
+        move |name| {
+            let removed = removed_ref.clone();
+            async move {
+                removed.lock().unwrap().push(name);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(
+        removed.lock().unwrap().clone(),
+        vec!["outrig-20260501T134412-3f2a".to_string()],
+        "the leftover container of a removed record should be swept"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("cleaned 1 session and 1 stray container"),
+        "summary should mention both: {err}"
+    );
 }

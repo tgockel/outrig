@@ -14,7 +14,6 @@
 
 #![deny(clippy::print_stdout)]
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::future::IntoFuture;
 use std::io::Write as _;
@@ -22,7 +21,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,17 +29,17 @@ use rmcp::transport::streamable_http_server::{
     SessionManager, StreamableHttpServerConfig, StreamableHttpService,
     session::local::LocalSessionManager,
 };
-use serde::Serialize;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::env_arg::CliEnvEntries;
-use crate::cli::session_setup::{self, SessionSetup, SessionSetupArgs};
+use crate::cli::session_setup::{self, SessionContainers, SessionSetup, SessionSetupArgs};
 use crate::cli::volume_arg::{CliVolume, parse_volume};
+use crate::cli::watcher;
 use crate::error::{OutrigError, Result};
 use outrig::McpClient;
-use outrig::config::{ImageConfig, McpServerSpec, NetworkMode};
-use outrig::container::Container;
+use outrig::config::{McpServerSpec, NetworkMode};
+use outrig::container::sidecar::{PlacedServer, Placement, SessionMcpPlan};
 use outrig::image::ImageTag;
 use outrig::mcp_proxy::ProxyServer;
 
@@ -141,6 +139,9 @@ pub async fn execute(
         network_mode_override: args.network,
         device_override: None,
         volumes: &args.volume,
+        // show-merged plans placement (including label merges) without
+        // launching sidecar containers.
+        start_sidecars: !matches!(args.cmd, Some(McpCommand::ShowMerged)),
         verbose,
     })
     .await?;
@@ -159,23 +160,25 @@ async fn serve(
 ) -> Result<i32> {
     let SessionSetup {
         image_cfg_name,
-        image_cfg,
         image_tag,
-        container,
+        mut containers,
         sid,
         log_dir,
         store,
         attached,
         network,
+        mcp_plan,
+        watcher,
         cfg: _,
+        image_cfg: _,
         session: _,
         session_dir: _,
     } = setup;
 
-    // Validate per-server env entries against the resolved MCP map.
-    let mcp = session_setup::merged_mcp(&container, &image_cfg).await?;
+    // Validate per-server env entries against the full merged plan (a
+    // skipped sidecar's servers are still declared names).
     for name in cli_env.per_server_names() {
-        if !mcp.contains_key(name) {
+        if !mcp_plan.servers.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
                 "--env {name}:...: image '{}' has no MCP server '{name}'",
                 image_cfg_name
@@ -184,55 +187,43 @@ async fn serve(
         }
     }
 
+    let primary_died = watcher.as_ref().map(|w| w.primary_died());
     let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
     let outcome: Result<i32> = serve_inner(
         &image_cfg_name,
         &image_tag,
-        &container,
+        &mut containers,
         &log_dir,
         sid.as_str(),
         &mut mcp_arcs,
-        &mcp,
+        &mcp_plan,
         &cli_env,
         attached,
+        primary_died,
         listen,
     )
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(mcp_arcs, network, container, &store, &sid, final_exit).await;
-    if attached
-        && outcome
-            .as_ref()
-            .err()
-            .is_some_and(is_attached_container_stopped)
-    {
-        eprintln!(
-            "error: {}",
-            outcome.as_ref().expect_err("checked err above")
-        );
-        std::process::exit(final_exit.clamp(0, 255));
-    }
-    outcome
-}
-
-fn is_attached_container_stopped(err: &crate::error::CliError) -> bool {
-    matches!(
-        err,
-        crate::error::CliError::Outrig(OutrigError::Configuration(msg))
-            if msg.contains("attached container") && msg.contains("stopped"),
+    session_setup::teardown(
+        mcp_arcs, watcher, network, containers, &store, &sid, final_exit,
     )
+    .await;
+    watcher::exit_if_monitor_stopped(&outcome, final_exit);
+    outcome
 }
 
 async fn show_merged(setup: SessionSetup) -> Result<i32> {
     let SessionSetup {
-        image_cfg,
-        container,
+        containers,
         sid,
         store,
         attached: _,
         network,
+        mcp_plan,
+        watcher,
         cfg: _,
+        image_cfg: _,
         image_cfg_name: _,
         image_tag: _,
         session: _,
@@ -240,9 +231,18 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         log_dir: _,
     } = setup;
 
-    let outcome = show_merged_inner(&image_cfg, &container).await;
+    let outcome = write_merged_mcp(&mcp_plan).map(|()| 0);
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(Vec::new(), network, container, &store, &sid, final_exit).await;
+    session_setup::teardown(
+        Vec::new(),
+        watcher,
+        network,
+        containers,
+        &store,
+        &sid,
+        final_exit,
+    )
+    .await;
     outcome
 }
 
@@ -267,16 +267,18 @@ fn parse_listen_addr(s: &str) -> std::result::Result<ListenAddr, String> {
 async fn serve_inner(
     image_cfg_name: &str,
     image_tag: &ImageTag,
-    container: &Container,
+    containers: &mut SessionContainers,
     log_dir: &Path,
     session_id: &str,
     mcp_arcs: &mut Vec<Arc<McpClient>>,
-    mcp: &BTreeMap<String, McpServerSpec>,
+    mcp_plan: &SessionMcpPlan,
     cli_env: &CliEnvEntries,
     attached: bool,
+    primary_died: Option<CancellationToken>,
     listen: Option<&ListenAddr>,
 ) -> Result<i32> {
-    let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
+    let connected =
+        session_setup::connect_mcp_clients(containers, mcp_plan, log_dir, cli_env).await?;
     if connected.is_empty() {
         return Err(OutrigError::Configuration(
             "outrig mcp with no merged MCP entries has nothing to proxy".to_string(),
@@ -301,7 +303,7 @@ async fn serve_inner(
     print_banner(StartupBanner {
         container_name: image_cfg_name,
         image_tag,
-        container_pod_name: container.name(),
+        container_pod_name: containers.primary.name(),
         per_server_counts: &per_server_counts,
         public_names: &public_names,
         session_id,
@@ -309,17 +311,51 @@ async fn serve_inner(
         transport,
     });
 
+    let monitor = if attached {
+        SessionMonitor::AttachedContainer(containers.primary.name().to_string())
+    } else if let Some(died) = primary_died {
+        SessionMonitor::Watcher {
+            primary: containers.primary.name().to_string(),
+            died,
+        }
+    } else {
+        SessionMonitor::None
+    };
+
     match listen {
-        None => serve_stdio_transport(proxy, container, attached).await,
-        Some(addr) => serve_http_transport(proxy, addr, container, attached, mcp_arcs).await,
+        None => serve_stdio_transport(proxy, monitor).await,
+        Some(addr) => serve_http_transport(proxy, addr, monitor, mcp_arcs).await,
     }
 }
 
-async fn serve_stdio_transport(
-    proxy: ProxyServer,
-    container: &Container,
-    attached: bool,
-) -> Result<i32> {
+/// What ends a serving session early, beyond signals and client EOF: the
+/// borrowed container stopping (attach mode) or the watcher reporting the
+/// primary died externally (sidecar sessions). Mutually exclusive by
+/// construction -- attach mode cannot own sidecars.
+#[derive(Debug, Clone)]
+enum SessionMonitor {
+    None,
+    AttachedContainer(String),
+    Watcher {
+        primary: String,
+        died: CancellationToken,
+    },
+}
+
+/// Resolve when the monitored condition fires (never for
+/// [`SessionMonitor::None`]). Always an `Err` describing what happened.
+async fn monitor_session(monitor: SessionMonitor) -> Result<()> {
+    match monitor {
+        SessionMonitor::None => std::future::pending().await,
+        SessionMonitor::AttachedContainer(name) => wait_for_attached_container_stop(name).await,
+        SessionMonitor::Watcher { primary, died } => {
+            died.cancelled().await;
+            Err(watcher::primary_death_error(&primary))
+        }
+    }
+}
+
+async fn serve_stdio_transport(proxy: ProxyServer, monitor: SessionMonitor) -> Result<i32> {
     // `serve_server_with_ct` lets us hold the cancellation token outside the
     // service, which is otherwise consumed by `waiting()`. Cancel-on-signal
     // -> dispatcher quiesces -> `waiting()` returns -> teardown runs.
@@ -330,13 +366,7 @@ async fn serve_stdio_transport(
 
     let mut waiter = tokio::spawn(service.waiting());
     let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
-    let mut monitor = Box::pin(async {
-        if attached {
-            wait_for_attached_container_stop(container.name().to_string()).await
-        } else {
-            std::future::pending::<Result<()>>().await
-        }
-    });
+    let mut monitor = Box::pin(monitor_session(monitor));
 
     tokio::select! {
         biased;
@@ -360,13 +390,13 @@ async fn serve_stdio_transport(
                     waiter.abort();
                     tracing::warn!(
                         target: "outrig::cli::mcp",
-                        "rmcp service did not stop after attached container disappeared"
+                        "rmcp service did not stop after the monitored container disappeared"
                     );
                 }
             }
             return match result {
                 Ok(()) => Err(OutrigError::Configuration(
-                    "attached container monitor ended unexpectedly".to_string(),
+                    "session container monitor ended unexpectedly".to_string(),
                 ).into()),
                 Err(e) => Err(e),
             };
@@ -382,8 +412,7 @@ async fn serve_stdio_transport(
 async fn serve_http_transport(
     proxy: ProxyServer,
     listen: &ListenAddr,
-    container: &Container,
-    attached: bool,
+    monitor: SessionMonitor,
     backing_clients: &[Arc<McpClient>],
 ) -> Result<i32> {
     let ct = CancellationToken::new();
@@ -403,11 +432,9 @@ async fn serve_http_transport(
             );
             let shutdown = http_shutdown(ct.clone());
             let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
-            wait_for_http_shutdown(server, ct, container, attached).await
+            wait_for_http_shutdown(server, ct, monitor).await
         }
-        ListenAddr::Unix(path) => {
-            serve_unix_http_transport(router, path, ct, container, attached).await
-        }
+        ListenAddr::Unix(path) => serve_unix_http_transport(router, path, ct, monitor).await,
     };
     close_http_sessions(&session_manager).await;
     wait_for_http_session_refs(backing_clients).await;
@@ -419,8 +446,7 @@ async fn serve_unix_http_transport(
     router: axum::Router,
     path: &Path,
     ct: CancellationToken,
-    container: &Container,
-    attached: bool,
+    monitor: SessionMonitor,
 ) -> Result<i32> {
     prepare_unix_socket(path)?;
     let listener = tokio::net::UnixListener::bind(path)?;
@@ -430,7 +456,7 @@ async fn serve_unix_http_transport(
     eprintln!("[outrig] listen: unix:{}", path.display());
     let shutdown = http_shutdown(ct.clone());
     let server = axum::serve(listener, router).with_graceful_shutdown(shutdown);
-    wait_for_http_shutdown(server, ct, container, attached).await
+    wait_for_http_shutdown(server, ct, monitor).await
 }
 
 #[cfg(not(unix))]
@@ -438,8 +464,7 @@ async fn serve_unix_http_transport(
     _router: axum::Router,
     _path: &Path,
     _ct: CancellationToken,
-    _container: &Container,
-    _attached: bool,
+    _monitor: SessionMonitor,
 ) -> Result<i32> {
     Err(
         OutrigError::Configuration("unix listen addresses require a Unix platform".to_string())
@@ -479,8 +504,7 @@ async fn http_shutdown(ct: CancellationToken) {
 async fn wait_for_http_shutdown<F>(
     server: F,
     ct: CancellationToken,
-    container: &Container,
-    attached: bool,
+    monitor: SessionMonitor,
 ) -> Result<i32>
 where
     F: IntoFuture<Output = std::io::Result<()>>,
@@ -488,13 +512,7 @@ where
     eprintln!("[outrig] mcp server ready");
     let mut server = Box::pin(server.into_future());
     let mut sigterm = signal(SignalKind::terminate()).map_err(OutrigError::Io)?;
-    let mut monitor = Box::pin(async {
-        if attached {
-            wait_for_attached_container_stop(container.name().to_string()).await
-        } else {
-            std::future::pending::<Result<()>>().await
-        }
-    });
+    let mut monitor = Box::pin(monitor_session(monitor));
 
     tokio::select! {
         biased;
@@ -517,13 +535,13 @@ where
                 Err(_) => {
                     tracing::warn!(
                         target: "outrig::cli::mcp",
-                        "HTTP MCP service did not stop after attached container disappeared"
+                        "HTTP MCP service did not stop after the monitored container disappeared"
                     );
                 }
             }
             return match result {
                 Ok(()) => Err(OutrigError::Configuration(
-                    "attached container monitor ended unexpectedly".to_string(),
+                    "session container monitor ended unexpectedly".to_string(),
                 ).into()),
                 Err(e) => Err(e),
             };
@@ -634,51 +652,91 @@ impl Drop for UnixSocketCleanup {
 }
 
 async fn wait_for_attached_container_stop(container_name: String) -> Result<()> {
-    let mut child = tokio::process::Command::new("podman")
-        .arg("wait")
-        .arg(&container_name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let status = child.wait().await?;
-    if !status.success() {
-        tracing::warn!(
-            target: "outrig::cli::mcp",
-            "podman wait for attached container {container_name:?} exited with {status}"
-        );
-    }
-    Err(OutrigError::Configuration(format!(
+    watcher::wait_for_container_exit(&container_name).await;
+    Err(crate::error::CliError::SessionMonitorStopped(format!(
         "attached container {container_name:?} stopped while `outrig mcp` was attached"
-    ))
-    .into())
+    )))
 }
 
-async fn show_merged_inner(image_cfg: &ImageConfig, container: &Container) -> Result<i32> {
-    let mcp = session_setup::merged_mcp(container, image_cfg).await?;
-    write_merged_mcp(&mcp)?;
-    Ok(0)
-}
-
-fn write_merged_mcp(mcp: &BTreeMap<String, McpServerSpec>) -> Result<()> {
-    #[derive(Serialize)]
-    struct MergedMcpView<'a> {
-        mcp: &'a BTreeMap<String, McpServerSpec>,
-    }
-
-    let rendered = if mcp.is_empty() {
-        "[mcp]\n".to_string()
-    } else {
-        toml::to_string_pretty(&MergedMcpView { mcp }).map_err(|source| {
-            OutrigError::Configuration(format!("serialize merged MCP TOML: {source}"))
-        })?
-    };
-
+fn write_merged_mcp(plan: &SessionMcpPlan) -> Result<()> {
+    let rendered = render_merged_mcp(plan);
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(rendered.as_bytes())?;
     stdout.flush()?;
     Ok(())
+}
+
+/// Render the merged plan as a `[mcp]` TOML document -- copy-pasteable as
+/// config -- with a comment per server naming its placement and provenance.
+fn render_merged_mcp(plan: &SessionMcpPlan) -> String {
+    let mut out = String::from("[mcp]\n");
+    for (name, placed) in &plan.servers {
+        let _ = writeln!(
+            out,
+            "# {name}: {} ({})",
+            describe_placement(plan, placed),
+            placed.source.description()
+        );
+        let key = toml_edit::Key::new(name);
+        let _ = writeln!(out, "{key} = {}", spec_to_toml_value(&placed.spec));
+    }
+    out
+}
+
+/// Placement text for one server: `primary`, `sidecar "<sc>"` (with a
+/// `manual, not started` qualifier when applicable), or
+/// `anonymous sidecar (image <ref>)`.
+fn describe_placement(plan: &SessionMcpPlan, placed: &PlacedServer) -> String {
+    if let Placement::Sidecar(sc) = &placed.placement {
+        match plan.sidecars.get(sc) {
+            Some(sidecar) if sidecar.anonymous => {
+                return format!("anonymous sidecar (image {})", sidecar.image);
+            }
+            Some(sidecar) if sidecar.start == outrig::config::SidecarStart::Manual => {
+                return format!("{} (manual, not started)", placed.placement.description());
+            }
+            _ => {}
+        }
+    }
+    placed.placement.description()
+}
+
+/// One spec as a TOML *value* (array or inline table), so every server stays
+/// a single `name = ...` line under `[mcp]`. `toml::to_string` would emit
+/// `[mcp.<name>]` sections instead, which comments cannot interleave with.
+fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
+    fn string_array<'a>(items: impl IntoIterator<Item = &'a String>) -> toml_edit::Value {
+        toml_edit::Value::Array(items.into_iter().map(String::as_str).collect())
+    }
+
+    match spec {
+        McpServerSpec::Short(command) => string_array(command),
+        McpServerSpec::Full {
+            command,
+            env,
+            sidecar,
+            image,
+        } => {
+            let mut table = toml_edit::InlineTable::new();
+            if let Some(command) = command {
+                table.insert("command", string_array(command));
+            }
+            if !env.is_empty() {
+                let mut env_table = toml_edit::InlineTable::new();
+                for (key, value) in env {
+                    env_table.insert(key, value.to_raw().into());
+                }
+                table.insert("env", toml_edit::Value::InlineTable(env_table));
+            }
+            if let Some(sidecar) = sidecar {
+                table.insert("sidecar", sidecar.as_str().into());
+            }
+            if let Some(image) = image {
+                table.insert("image", image.as_str().into());
+            }
+            toml_edit::Value::InlineTable(table)
+        }
+    }
 }
 
 fn log_waiter_result(
@@ -795,6 +853,83 @@ mod tests {
         let args = McpArgs::try_parse_from(["mcp", "--volume", "/h:/c:rw"]).expect("arg parses");
         assert_eq!(args.volume.len(), 1);
         assert_eq!(args.volume[0].container, std::path::PathBuf::from("/c"));
+    }
+
+    /// A plan built exactly the way production builds it: parse the
+    /// `[images.<x>]` block body and run `plan_from_config`.
+    fn plan_from_toml(image_block_body: &str) -> SessionMcpPlan {
+        let image_cfg: outrig::config::ImageConfig = toml::from_str(&format!(
+            "dockerfile = \"D\"\ncontext = \".\"\n{image_block_body}"
+        ))
+        .expect("image config parses");
+        outrig::container::sidecar::plan_from_config(&image_cfg)
+    }
+
+    #[test]
+    fn render_merged_mcp_shows_placement_comments_and_inline_specs() {
+        let plan = plan_from_toml(
+            r#"
+[sidecars.tools]
+image = "mcp-tools"
+
+[mcp]
+fs     = ["mcp-fs", "/w"]
+search = { command = ["mcp-search"], sidecar = "tools" }
+"#,
+        );
+
+        let rendered = render_merged_mcp(&plan);
+        let expected = concat!(
+            "[mcp]\n",
+            "# fs: primary (config.toml)\n",
+            "fs = [\"mcp-fs\", \"/w\"]\n",
+            "# search: sidecar \"tools\" (config.toml)\n",
+            "search = { command = [\"mcp-search\"], sidecar = \"tools\" }\n",
+        );
+        assert_eq!(rendered, expected);
+        // The document (comments stripped by the parser) is valid config TOML.
+        toml::from_str::<toml::Value>(&rendered).expect("rendered output parses as TOML");
+    }
+
+    #[test]
+    fn render_merged_mcp_marks_manual_and_anonymous_sidecars() {
+        let plan = plan_from_toml(
+            r#"
+[sidecars.lint]
+image = "mcp-lint-img"
+start = "manual"
+
+[mcp]
+lint = { command = ["mcp-lint"], env = { TOKEN = "${LINT_TOKEN}" }, sidecar = "lint" }
+"#,
+        );
+        let rendered = render_merged_mcp(&plan);
+        assert!(
+            rendered.contains("# lint: sidecar \"lint\" (manual, not started) (config.toml)"),
+            "manual sidecars should be marked: {rendered}"
+        );
+        assert!(
+            rendered.contains("env = { TOKEN = \"${LINT_TOKEN}\" }"),
+            "env refs should render in ${{VAR}} form: {rendered}"
+        );
+
+        // Anonymous placement comes from an inline `image` key.
+        let plan = plan_from_toml(
+            r#"
+[mcp]
+grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+"#,
+        );
+        let rendered = render_merged_mcp(&plan);
+        assert!(
+            rendered.contains("# grep: anonymous sidecar (image ghcr.io/example/mcp-grep:1)"),
+            "anonymous sidecars should name their image: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_merged_mcp_empty_plan_is_bare_header() {
+        assert_eq!(render_merged_mcp(&SessionMcpPlan::default()), "[mcp]\n");
     }
 
     #[test]

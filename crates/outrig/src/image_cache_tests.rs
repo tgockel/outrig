@@ -205,6 +205,7 @@ fn build_cfg(ctx: &Path) -> ImageConfig {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
     }
 }
 

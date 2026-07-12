@@ -19,6 +19,21 @@ For a coding container, `/workspace` is usually the right default because it mat
 repo. For a purpose-built operations container, a broader root can be useful if the image includes
 reference files, generated config, local SDKs, or test fixtures outside the workspace.
 
+## Least-privilege placement with sidecars
+
+The container boundary does not have to be *one* container. Placing an MCP server in a
+[sidecar](mcp-servers.md#sidecar-placement) narrows what that server can see to what its
+container is granted: no workspace unless `workspace = "ro"`/`"rw"` is set, no extra paths
+unless mounted, its own image's toolchain rather than the workspace's. An off-the-shelf MCP
+image can run tools for the agent without ever seeing the repo.
+
+Two properties keep the boundary deliberate. First, placement is repo-config-only: an image's
+`org.outrig.mcp` label can declare servers for the image that carries it, but cannot direct a
+server into some other container. Second, the agent cannot grow its own environment -- there is
+no agent-invocable tool that starts sidecars; new containers come from the config or the
+operator. Session network policy covers every container, so a sidecar is not a way around
+audit or filter mode.
+
 ## Shell tools
 
 Shell MCP servers do not need command allowlists inside a normal OutRig container. Arbitrary code

@@ -333,6 +333,7 @@ impl Outrig {
                     build_args: build_args.clone(),
                     security: ContainerSecurity::default(),
                     mcp: BTreeMap::new(),
+                    sidecars: BTreeMap::new(),
                 };
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
             }
@@ -343,6 +344,7 @@ impl Outrig {
             workspace: spec.workspace.as_ref().map(|workspace| ContainerWorkspace {
                 host: workspace.host.clone(),
                 container: workspace.container.clone(),
+                access: MountAccess::ReadWrite,
             }),
             mounts: spec
                 .mounts
@@ -354,6 +356,7 @@ impl Outrig {
                 })
                 .collect(),
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
+            labels: BTreeMap::new(),
         };
         let mut container = Container::start(&image_tag, launch).await?;
         container.bootstrap_user().await?;
@@ -400,6 +403,19 @@ impl Outrig {
                 embedded::mcp_with_source(&spec.mcp, McpDeclarationSource::LaunchSpec)
             }
         };
+
+        // The library facade is single-container until the sidecar API
+        // lands; a placement-bearing spec (e.g. copied from a repo config by
+        // `LaunchSpec::from_image_config`) would silently run in the primary
+        // otherwise.
+        for (name, server) in &mcp {
+            if server.spec.sidecar().is_some() || server.spec.image().is_some() {
+                return Err(OutrigError::Configuration(format!(
+                    "mcp server {name:?} declares a sidecar placement; sidecar support in \
+                     the library API arrives in a later release"
+                )));
+            }
+        }
 
         let mut clients: BTreeMap<String, Arc<McpClient>> = BTreeMap::new();
         let mut tools: Vec<ToolHandle> = Vec::new();

@@ -8,7 +8,7 @@
 //! - [`setup`] -- everything from config-load through "container started +
 //!   bootstrapped + session row + log dir created", returning a populated
 //!   [`SessionSetup`]. Stops *before* MCP children connect.
-//! - [`merged_mcp`] + [`connect_mcp_clients`] -- reads any image-embedded MCP
+//! - [`connect_mcp_clients`] -- reads any image-embedded MCP
 //!   config, applies repo-config overrides, and spawns one [`McpClient`] per
 //!   merged backing MCP in `BTreeMap` (key-sorted, deterministic) iteration
 //!   order. Adapter construction stays in the caller because only the REPL
@@ -32,16 +32,19 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::volume_arg::CliVolume;
+use crate::cli::watcher::SessionWatcher;
 use crate::error::{OutrigError, Result};
 use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
-    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
+    Config, ImageConfig, MistralrsDeviceSpec, MountAccess, MountConfig, NetworkMode,
+    SidecarOnFailure, SidecarStart, SidecarWorkspaceAccess,
 };
 use outrig::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
-    embedded,
+    LABEL_SESSION, LABEL_SIDECAR, embedded,
+    sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
 };
 use outrig::image::{self, ImageTag};
 use outrig::network::NetworkInterceptor;
@@ -125,18 +128,42 @@ pub struct SessionSetupArgs<'a> {
     /// Extra `--volume HOST:CONTAINER[:ro|rw]` mounts appended to the
     /// container's workspace mounts. Rejected with `--attach`.
     pub volumes: &'a [CliVolume],
+    /// Start `start = "auto"` sidecars declared by the image config. `true`
+    /// for `outrig run` and `outrig mcp` serving; `false` for
+    /// `outrig mcp show-merged`, which plans placement (including sidecar
+    /// label merges) without launching sidecar containers.
+    pub start_sidecars: bool,
     pub verbose: u8,
 }
 
+/// Every container the session owns, sidecars keyed by config name.
+/// `sidecars` is declared before `primary` so field-order `Drop` reaps
+/// sidecars first, mirroring orderly teardown.
+pub struct SessionContainers {
+    pub sidecars: BTreeMap<String, Container>,
+    pub primary: Container,
+}
+
+impl SessionContainers {
+    /// The container hosting `placement`, or `None` for a sidecar that was
+    /// skipped (warn'd, manual, or reaped).
+    pub fn container_for(&self, placement: &Placement) -> Option<&Container> {
+        match placement {
+            Placement::Primary => Some(&self.primary),
+            Placement::Sidecar(name) => self.sidecars.get(name),
+        }
+    }
+}
+
 /// Output of [`setup`]: every long-lived value the post-setup pipeline
-/// needs (REPL build, MCP children, teardown). The container is already
+/// needs (REPL build, MCP children, teardown). The containers are already
 /// started + bootstrapped; the session row is already on disk.
 pub struct SessionSetup {
     pub cfg: Config,
     pub image_cfg_name: String,
     pub image_cfg: ImageConfig,
     pub image_tag: ImageTag,
-    pub container: Container,
+    pub containers: SessionContainers,
     pub sid: SessionId,
     pub session: Session,
     pub session_dir: PathBuf,
@@ -144,6 +171,13 @@ pub struct SessionSetup {
     pub store: SessionStore,
     pub attached: bool,
     pub network: Option<NetworkInterceptor>,
+    /// Full placement plan (config + label merges), including servers in
+    /// skipped sidecars. `show-merged` renders from this;
+    /// [`connect_mcp_clients`] connects the subset whose container runs.
+    pub mcp_plan: SessionMcpPlan,
+    /// Present only when sidecars started; orderly teardown disarms it
+    /// before stopping containers.
+    pub watcher: Option<SessionWatcher>,
 }
 
 #[derive(Debug)]
@@ -275,6 +309,19 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
     let (image_cfg, raw_local_image) =
         resolve_image_config(&cfg, &image_cfg_name, allow_raw_image)?;
+    let declares_sidecars = !image_cfg.sidecars.is_empty()
+        || image_cfg
+            .mcp
+            .values()
+            .any(|spec| spec.sidecar().is_some() || spec.image().is_some());
+    if attach.is_some() && declares_sidecars {
+        return Err(OutrigError::Configuration(
+            "sidecars cannot be used with `outrig mcp --attach`; an attached session \
+             borrows its container and cannot own sidecar containers"
+                .to_string(),
+        )
+        .into());
+    }
     if let Some(attach) = &attach {
         span.done(format!(
             "attach target resolved: container {}, image-config {}",
@@ -317,12 +364,14 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         image_tag
     };
 
+    let sid = SessionId::new();
     let host_workspace = resolve_workspace_host(&repo_root, &cfg.workspace.host_path);
     let container_workspace = cfg.workspace.container_path.clone();
     let launch = ContainerLaunchSpec {
         workspace: Some(ContainerWorkspace {
             host: host_workspace.clone(),
             container: container_workspace.clone(),
+            access: MountAccess::ReadWrite,
         }),
         mounts: cfg
             .workspace
@@ -339,6 +388,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             cap_drop: image_cfg.security.cap_drop.clone(),
             cap_add: image_cfg.security.cap_add.clone(),
         },
+        labels: BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]),
     };
 
     if let Some(p) = args.explicit_session_dir
@@ -351,7 +401,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         .into());
     }
 
-    let sid = SessionId::new();
     let container_name = attach
         .as_ref()
         .map(|attach| attach.container_name.clone())
@@ -361,6 +410,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         started_at: SystemTime::now(),
         ended_at: None,
         container_name: container_name.clone(),
+        sidecar_container_names: Vec::new(),
         image_tag: image_tag.to_string(),
         image_config_name: image_cfg_name.clone(),
         agent_name: session_agent_name,
@@ -397,7 +447,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                     attach.container_name.clone(),
                     image_tag.clone(),
                     Some((&host_workspace, &container_workspace)),
-                    transcript,
+                    transcript.clone(),
                 )
             }
             Ok(false) => {
@@ -448,7 +498,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         ));
 
         let span = ProgressSpan::start(format!("starting container {container_name}"));
-        match Container::start_named(&image_tag, launch, container_name, transcript).await {
+        match Container::start_named(&image_tag, launch, container_name, transcript.clone()).await {
             Ok(container) => {
                 span.done(format!("container ready: {}", container.name()));
                 container
@@ -468,43 +518,56 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     }
     span.done("container user ready");
 
-    let network = match network_mode {
-        NetworkMode::Default => None,
-        NetworkMode::Audit => {
-            let span = ProgressSpan::start("starting network audit interceptor");
-            match NetworkInterceptor::start(&container, &log_dir, sid.as_str()).await {
-                Ok(interceptor) => {
-                    span.done("network audit interceptor ready");
-                    Some(interceptor)
-                }
-                Err(e) => {
-                    let _ = container.stop(STOP_GRACE).await;
-                    let _ = store.finalize(&sid, SystemTime::now(), 1);
-                    return Err(e.into());
-                }
-            }
+    let mut containers = SessionContainers {
+        sidecars: BTreeMap::new(),
+        primary: container,
+    };
+
+    // Placement plan, sidecar starts, and network interception. Any error
+    // propagated out of the phase aborts the whole container set.
+    let phase = SidecarPhaseArgs {
+        cfg: &cfg,
+        repo_root: &repo_root,
+        image_cfg: &image_cfg,
+        image_tag: &image_tag,
+        sid: &sid,
+        host_workspace: &host_workspace,
+        container_workspace: &container_workspace,
+        log_dir: &log_dir,
+        network_mode,
+        start_sidecars: args.start_sidecars,
+        transcript: transcript.as_ref(),
+    };
+    let (mcp_plan, network) = match setup_sidecars_and_network(phase, &mut containers).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            abort_containers(containers, &store, &sid).await;
+            return Err(e);
         }
-        NetworkMode::Filter => {
-            let span = ProgressSpan::start("starting network filter interceptor");
-            match NetworkInterceptor::start_with_policy(
-                &container,
-                &log_dir,
-                sid.as_str(),
-                cfg.network.policy(),
-            )
-            .await
-            {
-                Ok(interceptor) => {
-                    span.done("network filter interceptor ready");
-                    Some(interceptor)
-                }
-                Err(e) => {
-                    let _ = container.stop(STOP_GRACE).await;
-                    let _ = store.finalize(&sid, SystemTime::now(), 1);
-                    return Err(e.into());
-                }
-            }
+    };
+
+    if !containers.sidecars.is_empty() {
+        let names: Vec<String> = containers
+            .sidecars
+            .values()
+            .map(|container| container.name().to_string())
+            .collect();
+        if let Err(e) = store.set_sidecar_containers(&sid, &names) {
+            abort_containers(containers, &store, &sid).await;
+            return Err(e.into());
         }
+        session.sidecar_container_names = names;
+    }
+
+    // The watcher exists to reap sidecars when the primary dies out from
+    // under outrig; a single-container session keeps today's behavior.
+    let watcher = if containers.sidecars.is_empty() {
+        None
+    } else {
+        Some(SessionWatcher::spawn(
+            containers.primary.name().to_string(),
+            session.sidecar_container_names.clone(),
+        ))
     };
 
     Ok(SessionSetup {
@@ -512,7 +575,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         image_cfg_name,
         image_cfg,
         image_tag,
-        container,
+        containers,
         sid,
         session,
         session_dir,
@@ -520,7 +583,221 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         store,
         attached: attach.is_some(),
         network,
+        mcp_plan,
+        watcher,
     })
+}
+
+/// Borrowed inputs threaded from [`setup`] into
+/// [`setup_sidecars_and_network`]; grouped so the phase reads as one call.
+struct SidecarPhaseArgs<'a> {
+    cfg: &'a Config,
+    repo_root: &'a Path,
+    image_cfg: &'a ImageConfig,
+    image_tag: &'a ImageTag,
+    sid: &'a SessionId,
+    host_workspace: &'a Path,
+    container_workspace: &'a Path,
+    log_dir: &'a Path,
+    network_mode: NetworkMode,
+    start_sidecars: bool,
+    transcript: Option<&'a Transcript>,
+}
+
+/// Build the placement plan (config + primary and sidecar label merges),
+/// start `start = "auto"` sidecars, and attach the network interceptor to
+/// every running container.
+///
+/// Failure routing: image-ensure / start / bootstrap / interceptor-attach
+/// failures on a sidecar follow its `on-failure` (`warn` logs, drops the
+/// sidecar, and continues; `abort` propagates). Label-merge collisions and
+/// malformed labels are startup errors regardless of `on-failure`, as are
+/// all primary-container failures.
+async fn setup_sidecars_and_network(
+    args: SidecarPhaseArgs<'_>,
+    containers: &mut SessionContainers,
+) -> Result<(SessionMcpPlan, Option<NetworkInterceptor>)> {
+    let mut plan = sidecar::plan_from_config(args.image_cfg);
+    let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
+    sidecar::merge_primary_labels(&mut plan, image_mcp);
+
+    let sidecar_names: Vec<String> = plan.sidecars.keys().cloned().collect();
+    for name in &sidecar_names {
+        let sc = plan.sidecars[name].clone();
+
+        let tag = match ensure_sidecar_image(args.cfg, args.repo_root, &sc.image, args.transcript)
+            .await
+        {
+            Ok(tag) => tag,
+            Err(e) => {
+                warn_or_bail(&plan, &sc, e)?;
+                continue;
+            }
+        };
+
+        if !sc.anonymous {
+            let label_mcp = embedded::read_embedded_mcp(&tag, args.transcript).await?;
+            sidecar::merge_sidecar_labels(&mut plan, name, label_mcp)?;
+        }
+
+        if !args.start_sidecars || sc.start != SidecarStart::Auto {
+            if args.start_sidecars && plan.servers_in(name).next().is_some() {
+                eprintln!(
+                    "[outrig] sidecar {name} is start = \"manual\"; skipping its MCP servers"
+                );
+            }
+            continue;
+        }
+
+        let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
+        match start_one_sidecar(&args, &tag, &sc, needs_bootstrap).await {
+            Ok(container) => {
+                containers.sidecars.insert(name.clone(), container);
+            }
+            Err(e) => warn_or_bail(&plan, &sc, e)?,
+        }
+    }
+
+    let network = match args.network_mode {
+        NetworkMode::Default => None,
+        NetworkMode::Audit => Some(attach_interceptor("audit", &plan, containers, &args).await?),
+        NetworkMode::Filter => Some(attach_interceptor("filter", &plan, containers, &args).await?),
+    };
+
+    Ok((plan, network))
+}
+
+/// Start the network interceptor on the primary and attach every running
+/// sidecar. A sidecar attach failure follows its `on-failure`; `warn` stops
+/// and drops that sidecar.
+async fn attach_interceptor(
+    mode_word: &str,
+    plan: &SessionMcpPlan,
+    containers: &mut SessionContainers,
+    args: &SidecarPhaseArgs<'_>,
+) -> Result<NetworkInterceptor> {
+    let span = ProgressSpan::start(format!("starting network {mode_word} interceptor"));
+    let mut interceptor = if mode_word == "audit" {
+        NetworkInterceptor::start(&containers.primary, args.log_dir, args.sid.as_str()).await?
+    } else {
+        NetworkInterceptor::start_with_policy(
+            &containers.primary,
+            args.log_dir,
+            args.sid.as_str(),
+            args.cfg.network.policy(),
+        )
+        .await?
+    };
+    for name in containers.sidecars.keys().cloned().collect::<Vec<_>>() {
+        if let Err(e) = interceptor.attach(&containers.sidecars[&name]).await {
+            warn_or_bail(plan, &plan.sidecars[&name], e.into())?;
+            if let Some(container) = containers.sidecars.remove(&name) {
+                let _ = container.stop(STOP_GRACE).await;
+            }
+        }
+    }
+    span.done(format!("network {mode_word} interceptor ready"));
+    Ok(interceptor)
+}
+
+/// `warn` on-failure: log the failure and let the caller drop the sidecar.
+/// `abort`: propagate.
+fn warn_or_bail(plan: &SessionMcpPlan, sc: &SidecarPlan, e: crate::error::CliError) -> Result<()> {
+    if sc.on_failure != SidecarOnFailure::Warn {
+        return Err(e);
+    }
+    let server_count = plan.servers_in(&sc.name).count();
+    let server_word = plural(server_count, "server", "servers");
+    eprintln!(
+        "[outrig] warning: sidecar {}: {e}; skipping the sidecar and its \
+         {server_count} MCP {server_word}",
+        sc.name
+    );
+    Ok(())
+}
+
+/// Resolve and ensure a sidecar's image with `--image`-identical semantics:
+/// an `[images.<name>]` config name builds through the content-hash cache; an
+/// unmatched name is a raw podman ref that must be present locally.
+async fn ensure_sidecar_image(
+    cfg: &Config,
+    repo_root: &Path,
+    image_name: &str,
+    transcript: Option<&Transcript>,
+) -> Result<ImageTag> {
+    let (image_cfg, raw_local) = resolve_image_config(cfg, image_name, true)?;
+    if raw_local {
+        let tag = ImageTag(image_name.to_string());
+        image::ensure_local_image(&tag, transcript).await?;
+        Ok(tag)
+    } else {
+        let tag = image::compute_tag_for(image_name, &image_cfg, repo_root).await?;
+        image::ensure_tagged_image_for(image_name, &image_cfg, repo_root, &tag, false, transcript)
+            .await?;
+        Ok(tag)
+    }
+}
+
+/// Start one sidecar container (`outrig-<sid>-<sc>`, session + sidecar
+/// labels, keep-id) and bootstrap its user when identity matters.
+async fn start_one_sidecar(
+    args: &SidecarPhaseArgs<'_>,
+    tag: &ImageTag,
+    sc: &SidecarPlan,
+    needs_bootstrap: bool,
+) -> Result<Container> {
+    let workspace_access = match sc.workspace {
+        SidecarWorkspaceAccess::None => None,
+        SidecarWorkspaceAccess::Ro => Some(MountAccess::ReadOnly),
+        SidecarWorkspaceAccess::Rw => Some(MountAccess::ReadWrite),
+    };
+    let launch = ContainerLaunchSpec {
+        workspace: workspace_access.map(|access| ContainerWorkspace {
+            host: args.host_workspace.to_path_buf(),
+            container: args.container_workspace.to_path_buf(),
+            access,
+        }),
+        mounts: sc
+            .mounts
+            .iter()
+            .map(|mount| ContainerMount {
+                host: resolve_workspace_host(args.repo_root, &mount.host_path),
+                container: mount.container_path.clone(),
+                access: mount.access,
+            })
+            .collect(),
+        capabilities: ContainerCapabilities {
+            profile: sc.security.capability_profile,
+            cap_drop: sc.security.cap_drop.clone(),
+            cap_add: sc.security.cap_add.clone(),
+        },
+        labels: BTreeMap::from([
+            (LABEL_SESSION.to_string(), args.sid.0.clone()),
+            (LABEL_SIDECAR.to_string(), sc.name.clone()),
+        ]),
+    };
+
+    let container_name = format!("outrig-{}-{}", args.sid, sc.name);
+    let span = ProgressSpan::start(format!("starting sidecar {}", sc.name));
+    let mut container =
+        Container::start_named(tag, launch, container_name, args.transcript.cloned()).await?;
+    if needs_bootstrap && let Err(e) = container.bootstrap_user().await {
+        let _ = container.stop(STOP_GRACE).await;
+        return Err(e.into());
+    }
+    span.done(format!("sidecar {} ready: {}", sc.name, container.name()));
+    Ok(container)
+}
+
+/// Stop every session container (sidecars before the primary) and finalize
+/// the session row with a failure exit. Setup's bail-out path.
+async fn abort_containers(containers: SessionContainers, store: &SessionStore, sid: &SessionId) {
+    let SessionContainers { sidecars, primary } = containers;
+    for (_, container) in sidecars {
+        let _ = container.stop(STOP_GRACE).await;
+    }
+    let _ = primary.stop(STOP_GRACE).await;
+    let _ = store.finalize(sid, SystemTime::now(), 1);
 }
 
 /// Resolve an image-config name to its [`ImageConfig`] and whether it is a
@@ -547,6 +824,7 @@ fn resolve_image_config(
             build_args: BTreeMap::new(),
             security: Default::default(),
             mcp: BTreeMap::new(),
+            sidecars: BTreeMap::new(),
         };
         return Ok((image_cfg, true));
     }
@@ -588,60 +866,110 @@ fn resolve_attach_target(
     }
 }
 
-/// Read image-embedded MCP config and overlay explicit `config.toml` entries.
-pub async fn merged_mcp(
-    container: &Container,
-    image_cfg: &ImageConfig,
-) -> Result<BTreeMap<String, McpServerSpec>> {
-    let span = ProgressSpan::start("reading and merging MCP configuration");
-    let mcp = embedded::merged_mcp(container, &image_cfg.mcp).await?;
-    let server_word = plural(mcp.len(), "server", "servers");
-    span.done(format!(
-        "MCP configuration ready: {} {server_word}",
-        mcp.len()
-    ));
-    Ok(mcp)
-}
-
-/// Spawn one [`McpClient`] per backing MCP declared in `mcp`, in key-sorted
-/// (`BTreeMap`) iteration order. `cli_env` provides any `--env` overlay
-/// entries to merge per server. Adapter construction is the caller's job
-/// because only the REPL path consumes adapters.
+/// Spawn one [`McpClient`] per plan server whose container is running, in
+/// key-sorted (`BTreeMap`) iteration order, each against the container its
+/// placement names. Servers in sidecars that never started (manual, warn'd,
+/// or reaped) are skipped. `cli_env` provides any `--env` overlay entries to
+/// merge per server. Adapter construction is the caller's job because only
+/// the REPL path consumes adapters.
+///
+/// A connect failure on a primary-placed server -- or any server in an
+/// `on-failure = "abort"` sidecar -- propagates. In a `warn` sidecar it
+/// drops the whole sidecar: already-connected clients from that sidecar are
+/// shut down, its container is stopped and removed from `containers`, and
+/// its remaining servers are skipped.
 pub async fn connect_mcp_clients(
-    container: &Container,
-    mcp: &BTreeMap<String, McpServerSpec>,
+    containers: &mut SessionContainers,
+    mcp_plan: &SessionMcpPlan,
     log_dir: &Path,
     cli_env: &CliEnvEntries,
 ) -> Result<Vec<Arc<McpClient>>> {
-    let mut arcs = Vec::with_capacity(mcp.len());
-    for (mcp_name, spec) in mcp {
+    // Tagged with the hosting sidecar so a warn-path drop can find and shut
+    // down the sidecar's already-connected clients.
+    let mut connected: Vec<(Option<String>, Arc<McpClient>)> =
+        Vec::with_capacity(mcp_plan.servers.len());
+
+    for (mcp_name, placed) in &mcp_plan.servers {
+        let sidecar_name = match &placed.placement {
+            Placement::Primary => None,
+            Placement::Sidecar(sc) => Some(sc.clone()),
+        };
+        let Some(container) = containers.container_for(&placed.placement) else {
+            // The sidecar never started or was dropped earlier in this loop.
+            continue;
+        };
+
         let span = ProgressSpan::start(format!("MCP {mcp_name}: initializing"));
         let extra_env = cli_env.for_server(mcp_name);
-        let client =
-            McpClient::connect_via_podman_exec(container, spec, mcp_name, log_dir, &extra_env)
-                .await?;
-        span.done(format!("MCP {mcp_name}: initialized"));
-        arcs.push(Arc::new(client));
+        let result = McpClient::connect_via_podman_exec_with_source(
+            container,
+            &placed.spec,
+            mcp_name,
+            placed.source,
+            log_dir,
+            &extra_env,
+        )
+        .await;
+        match result {
+            Ok(client) => {
+                span.done(format!("MCP {mcp_name}: initialized"));
+                connected.push((sidecar_name, Arc::new(client)));
+            }
+            Err(e) => {
+                let warn = sidecar_name
+                    .as_deref()
+                    .and_then(|sc| mcp_plan.sidecars.get(sc))
+                    .is_some_and(|sc| sc.on_failure == SidecarOnFailure::Warn);
+                if !warn {
+                    return Err(e.into());
+                }
+                let sc = sidecar_name.expect("warn on-failure implies a sidecar placement");
+                eprintln!(
+                    "[outrig] warning: sidecar {sc}: MCP server {mcp_name} failed to \
+                     start: {e}; skipping the sidecar and its servers"
+                );
+                let mut kept = Vec::with_capacity(connected.len());
+                for (tag, arc) in connected.drain(..) {
+                    if tag.as_deref() == Some(sc.as_str()) {
+                        if let Ok(client) = Arc::try_unwrap(arc) {
+                            let _ = client.shutdown().await;
+                        }
+                    } else {
+                        kept.push((tag, arc));
+                    }
+                }
+                connected = kept;
+                if let Some(container) = containers.sidecars.remove(&sc) {
+                    let _ = container.stop(STOP_GRACE).await;
+                }
+            }
+        }
     }
-    Ok(arcs)
+    Ok(connected.into_iter().map(|(_, arc)| arc).collect())
 }
 
-/// Cleanup tail. Order: MCP shutdowns (so their `podman exec` pipes drain
-/// before the container goes away) -> container stop -> session finalize.
-/// Each step's failure is logged but never propagated; the caller's outcome
-/// owns the process exit code.
+/// Cleanup tail. Order: watcher disarm (so outrig's own stops are never
+/// mistaken for external death) -> MCP shutdowns (so their `podman exec`
+/// pipes drain before the containers go away) -> network interceptor
+/// shutdown (detaches every container) -> sidecar stops -> primary stop ->
+/// session finalize. Each step's failure is logged but never propagated;
+/// the caller's outcome owns the process exit code.
 ///
 /// Callers must drop any `Arc<McpClient>` clones (e.g. tool adapters) and
 /// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
 /// `Err` and the explicit `shutdown` is skipped in favor of `Drop`.
 pub async fn teardown(
     mcp_arcs: Vec<Arc<McpClient>>,
+    watcher: Option<SessionWatcher>,
     network: Option<NetworkInterceptor>,
-    container: Container,
+    containers: SessionContainers,
     store: &SessionStore,
     sid: &SessionId,
     final_exit: i32,
 ) {
+    if let Some(watcher) = watcher {
+        watcher.shutdown();
+    }
     for arc in mcp_arcs {
         match Arc::try_unwrap(arc) {
             Ok(client) => {
@@ -663,7 +991,18 @@ pub async fn teardown(
     if let Some(network) = network {
         network.shutdown().await;
     }
-    if let Err(e) = container.stop(STOP_GRACE).await {
+    let SessionContainers { sidecars, primary } = containers;
+    for (name, container) in sidecars {
+        // A watcher-reaped sidecar is already gone; podman's "no such
+        // container" lands here as a logged, non-fatal error.
+        if let Err(e) = container.stop(STOP_GRACE).await {
+            tracing::warn!(
+                target: "outrig::cli::session_setup",
+                "sidecar {name} stop failed: {e}"
+            );
+        }
+    }
+    if let Err(e) = primary.stop(STOP_GRACE).await {
         tracing::warn!(
             target: "outrig::cli::session_setup",
             "container stop failed: {e}"
@@ -689,6 +1028,7 @@ mod tests {
             build_args: BTreeMap::new(),
             security: Default::default(),
             mcp: BTreeMap::new(),
+            sidecars: BTreeMap::new(),
         }
     }
 

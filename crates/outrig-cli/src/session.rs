@@ -79,6 +79,11 @@ pub struct Session {
     )]
     pub ended_at: Option<SystemTime>,
     pub container_name: String,
+    /// Sidecar container names owned by this session, in start order. Empty
+    /// (and absent from disk) for single-container sessions, so pre-sidecar
+    /// records parse and sidecar-less records serialize unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecar_container_names: Vec<String>,
     pub image_tag: String,
     pub image_config_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +161,16 @@ impl SessionStore {
         let (dir, mut session) = self.get_by_id(id)?;
         session.ended_at = Some(ended_at);
         session.exit_code = Some(exit_code);
+        session.link_target = None; // never persist
+        write_session_json_atomic(&dir, &session)
+    }
+
+    /// Record the session's sidecar container names. Separate from `create`
+    /// because sidecars start after the session row exists; read-modify-write
+    /// like [`SessionStore::finalize`].
+    pub fn set_sidecar_containers(&self, id: &SessionId, names: &[String]) -> Result<()> {
+        let (dir, mut session) = self.get_by_id(id)?;
+        session.sidecar_container_names = names.to_vec();
         session.link_target = None; // never persist
         write_session_json_atomic(&dir, &session)
     }

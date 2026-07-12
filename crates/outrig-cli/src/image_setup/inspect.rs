@@ -110,8 +110,10 @@ mod tests {
         mcp.insert(
             "build".to_string(),
             McpServerSpec::Full {
-                command: vec!["cargo-mcp".to_string(), "--stdio".to_string()],
+                command: Some(vec!["cargo-mcp".to_string(), "--stdio".to_string()]),
                 env,
+                sidecar: None,
+                image: None,
             },
         );
         mcp.insert(

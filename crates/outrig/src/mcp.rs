@@ -75,7 +75,7 @@ impl McpClient {
             .await
     }
 
-    pub(crate) async fn connect_via_podman_exec_with_source(
+    pub async fn connect_via_podman_exec_with_source(
         container: &Container,
         server_cfg: &McpServerSpec,
         name: &str,

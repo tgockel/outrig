@@ -8,8 +8,9 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, NetworkAction,
-    NetworkEntry, NetworkMode, merge,
+    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, MountRuleViolation,
+    NetworkAction, NetworkEntry, NetworkMode, SidecarOnFailure, SidecarStart,
+    SidecarWorkspaceAccess, merge,
 };
 use outrig::error::OutrigError;
 
@@ -1512,5 +1513,368 @@ context = "."
             matches!(err, ConfigValidationError::ImageHalfBuilt { .. }),
             "expected ImageHalfBuilt, got: {err:?}"
         );
+    }
+}
+
+mod sidecar_config {
+    use super::*;
+
+    /// An `[images.<name>]` block with the given `.mcp` / `.sidecars`
+    /// sub-tables appended.
+    fn image_block(rest: &str) -> Config {
+        parse(&format!(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+{rest}
+"#
+        ))
+    }
+
+    #[test]
+    fn sidecar_block_parses_and_validates() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image      = "mcp-tools"
+  workspace  = "ro"
+  start      = "manual"
+  on-failure = "warn"
+
+  [[images.coding.sidecars.tools.mounts]]
+  host-path      = "cache"
+  container-path = "/cache"
+  access         = "read-write"
+
+  [images.coding.mcp]
+  fs = { command = ["mcp-fs"], sidecar = "tools" }
+"#,
+        );
+        cfg.validate(None).expect("valid sidecar config");
+        let sc = &cfg.images["coding"].sidecars["tools"];
+        assert_eq!(sc.image, "mcp-tools");
+        assert_eq!(sc.workspace, SidecarWorkspaceAccess::Ro);
+        assert_eq!(sc.start, SidecarStart::Manual);
+        assert_eq!(sc.on_failure, SidecarOnFailure::Warn);
+        assert_eq!(sc.mounts.len(), 1);
+        assert_eq!(cfg.images["coding"].mcp["fs"].sidecar(), Some("tools"));
+    }
+
+    #[test]
+    fn sidecar_defaults_are_none_auto_abort() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+"#,
+        );
+        let sc = &cfg.images["coding"].sidecars["tools"];
+        assert_eq!(sc.workspace, SidecarWorkspaceAccess::None);
+        assert_eq!(sc.start, SidecarStart::Auto);
+        assert_eq!(sc.on_failure, SidecarOnFailure::Abort);
+        assert!(sc.mounts.is_empty());
+    }
+
+    #[test]
+    fn sidecar_unknown_key_rejected() {
+        let err = Config::load_from_str(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+  [images.coding.sidecars.tools]
+  image   = "mcp-tools"
+  restart = "always"
+"#,
+        )
+        .expect_err("unknown sidecar key must be rejected");
+        assert!(
+            err.to_string().contains("restart"),
+            "error should name the unknown key: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_name_invalid_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars."bad.name"]
+  image = "mcp-tools"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::SidecarNameInvalid { image, sidecar } => {
+                assert_eq!(image, "coding");
+                assert_eq!(sidecar, "bad.name");
+            }
+            other => panic!("expected SidecarNameInvalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_name_may_start_with_digit() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.9tools]
+  image = "mcp-tools"
+"#,
+        );
+        cfg.validate(None)
+            .expect("digit-leading sidecar name is valid");
+    }
+
+    #[test]
+    fn sidecar_image_empty_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "  "
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::SidecarImageEmpty { .. }),
+            "expected SidecarImageEmpty, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn placement_conflict_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+
+  [images.coding.mcp]
+  fs = { command = ["mcp-fs"], sidecar = "tools", image = "other" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::McpPlacementConflict { .. }),
+            "expected McpPlacementConflict, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_sidecar_reference_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.mcp]
+  fs = { command = ["mcp-fs"], sidecar = "nope" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::McpUnknownSidecar { sidecar, .. } => {
+                assert_eq!(sidecar, "nope");
+            }
+            other => panic!("expected McpUnknownSidecar, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_without_command_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::McpSidecarRequiresCommand { .. }),
+            "expected McpSidecarRequiresCommand, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn entrypoint_stdio_form_parses_but_is_rejected_for_now() {
+        let cfg = image_block(
+            r#"
+  [images.coding.mcp]
+  fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
+"#,
+        );
+        // Parse-level: Full form with no command.
+        let spec = &cfg.images["coding"].mcp["fetch"];
+        assert!(!spec.has_command());
+        assert_eq!(spec.image(), Some("ghcr.io/example/mcp-fetch:2"));
+        // Validation-level: rejected until entrypoint-stdio ships.
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::McpEntrypointStdioUnsupported { .. }
+            ),
+            "expected McpEntrypointStdioUnsupported, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn inline_image_empty_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.mcp]
+  fs = { command = ["mcp-fs"], image = "" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::McpInlineImageEmpty { .. }),
+            "expected McpInlineImageEmpty, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_named_collision_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.grep]
+  image = "mcp-tools"
+
+  [images.coding.mcp]
+  grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::SidecarNameCollision { name, .. } => {
+                assert_eq!(name, "grep");
+            }
+            other => panic!("expected SidecarNameCollision, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_form_without_command_or_image_is_empty_command() {
+        let cfg = image_block(
+            r#"
+  [images.coding.mcp]
+  fs = { env = { A = "b" } }
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(err, ConfigValidationError::EmptyMcpCommand { .. }),
+            "expected EmptyMcpCommand, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_duplicate_errors() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+
+  [[images.coding.sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/cache"
+
+  [[images.coding.sidecars.tools.mounts]]
+  host-path      = "b"
+  container-path = "/cache"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::ContainerDuplicate(_),
+                    ..
+                }
+            ),
+            "expected a duplicate-container-path SidecarMount, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_collides_with_enabled_workspace() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image     = "mcp-tools"
+  workspace = "ro"
+
+  [[images.coding.sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/workspace"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::SidecarMount {
+                    violation: MountRuleViolation::ContainerDuplicate(_),
+                    ..
+                }
+            ),
+            "expected a duplicate-container-path SidecarMount, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_mount_on_workspace_path_ok_without_workspace_access() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+
+  [[images.coding.sidecars.tools.mounts]]
+  host-path      = "a"
+  container-path = "/workspace"
+"#,
+        );
+        cfg.validate(None)
+            .expect("workspace path is free when workspace access is none");
+    }
+
+    #[test]
+    fn sidecar_security_conflict_scopes_error_to_sidecar() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+
+  [images.coding.sidecars.tools.security]
+  cap-drop = ["NET_RAW"]
+  cap-add  = ["NET_RAW"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::CapabilityDropAddConflict { image, capability } => {
+                assert_eq!(image, "coding.sidecars.tools");
+                assert_eq!(capability, "NET_RAW");
+            }
+            other => panic!("expected CapabilityDropAddConflict, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placement_keys_round_trip_through_toml() {
+        let cfg = image_block(
+            r#"
+  [images.coding.sidecars.tools]
+  image = "mcp-tools"
+
+  [images.coding.mcp]
+  fs = { command = ["mcp-fs"], sidecar = "tools" }
+"#,
+        );
+        let rendered = toml::to_string(&cfg.images["coding"].mcp).expect("serialize");
+        assert!(rendered.contains("sidecar = \"tools\""), "got: {rendered}");
+        let back: std::collections::BTreeMap<String, McpServerSpec> =
+            toml::from_str(&rendered).expect("round-trip");
+        assert_eq!(back["fs"], cfg.images["coding"].mcp["fs"]);
     }
 }

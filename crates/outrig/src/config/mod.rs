@@ -17,7 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub use api_key::{ApiKeyError, ApiKeyRef};
 pub use env_value::{EnvValue, EnvValueError};
 pub use merge::merge;
-pub use validate::ConfigValidationError;
+pub use validate::{ConfigValidationError, MountRuleViolation};
 pub(crate) use validate::{is_valid_mcp_server_name, mcp_command_is_empty};
 
 use crate::error::{OutrigError, Result};
@@ -379,7 +379,7 @@ impl Default for Workspace {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct MountConfig {
     pub host_path: PathBuf,
@@ -388,7 +388,7 @@ pub struct MountConfig {
     pub access: MountAccess,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum MountAccess {
     #[default]
@@ -853,6 +853,60 @@ pub struct ImageConfig {
     pub security: ContainerSecurity,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sidecars: BTreeMap<String, SidecarConfig>,
+}
+
+/// A named sidecar container declared under `[images.<name>.sidecars.<sc>]`.
+/// Sidecars host MCP servers in their own container, lifecycle-coupled to
+/// the session's primary container.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SidecarConfig {
+    /// Image reference, resolved exactly like `--image`: a sibling
+    /// `[images.<name>]` config name first, else a raw podman ref that must
+    /// be present locally (`--pull=never` semantics).
+    pub image: String,
+    #[serde(default)]
+    pub workspace: SidecarWorkspaceAccess,
+    #[serde(default)]
+    pub start: SidecarStart,
+    #[serde(default)]
+    pub on_failure: SidecarOnFailure,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountConfig>,
+    #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
+    pub security: ContainerSecurity,
+}
+
+/// How much of the session workspace a sidecar sees. Default: nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SidecarWorkspaceAccess {
+    #[default]
+    None,
+    Ro,
+    Rw,
+}
+
+/// Whether a sidecar starts with the session or waits for an explicit
+/// `/sidecar add` / library call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SidecarStart {
+    #[default]
+    Auto,
+    Manual,
+}
+
+/// How a sidecar's start/bootstrap/connect failure is handled at session
+/// start. Mid-session death is uniform (log, tools error, no restart).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SidecarOnFailure {
+    #[default]
+    Abort,
+    Warn,
 }
 
 /// Discriminated view of the container source -- build-from-Dockerfile or
@@ -893,9 +947,24 @@ impl ImageConfig {
 pub enum McpServerSpec {
     Short(Vec<String>),
     Full {
-        command: Vec<String>,
+        /// Argv to exec. Optional so the entrypoint-stdio form
+        /// (`{ image = "...", env = {...} }`, no command) parses; validation
+        /// guarantees every exec path sees a non-empty command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<Vec<String>>,
+        /// Always serialized (no skip) so a `Full` entry can't collapse into
+        /// the `Short` shape on a round-trip.
         #[serde(default)]
         env: BTreeMap<String, EnvValue>,
+        /// exec-stdio in the named sidecar declared under
+        /// `[images.<name>.sidecars.<sc>]`. Mutually exclusive with `image`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sidecar: Option<String>,
+        /// A dedicated anonymous sidecar for this one server. With `command`
+        /// present: exec-stdio in that sidecar. Without: entrypoint-stdio
+        /// (a later release). Mutually exclusive with `sidecar`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
 }
 
@@ -907,7 +976,31 @@ impl McpServerSpec {
     pub fn normalize(&self) -> (Vec<String>, BTreeMap<String, EnvValue>) {
         match self {
             Self::Short(command) => (command.clone(), BTreeMap::new()),
-            Self::Full { command, env } => (command.clone(), env.clone()),
+            Self::Full { command, env, .. } => (command.clone().unwrap_or_default(), env.clone()),
+        }
+    }
+
+    /// Named-sidecar placement, if any. Always `None` for `Short`.
+    pub fn sidecar(&self) -> Option<&str> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full { sidecar, .. } => sidecar.as_deref(),
+        }
+    }
+
+    /// Inline anonymous-sidecar image, if any. Always `None` for `Short`.
+    pub fn image(&self) -> Option<&str> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full { image, .. } => image.as_deref(),
+        }
+    }
+
+    /// Whether the spec carries a command (`Short` always does).
+    pub fn has_command(&self) -> bool {
+        match self {
+            Self::Short(_) => true,
+            Self::Full { command, .. } => command.is_some(),
         }
     }
 }

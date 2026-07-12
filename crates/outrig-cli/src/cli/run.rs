@@ -20,7 +20,9 @@ use clap::{ArgAction, Parser};
 use rig::completion::Message;
 
 use crate::cli::env_arg::CliEnvEntries;
-use crate::cli::session_setup::{self, ProgressSpan, SessionSetup, SessionSetupArgs, plural};
+use crate::cli::session_setup::{
+    self, ProgressSpan, SessionContainers, SessionSetup, SessionSetupArgs, plural,
+};
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
@@ -32,8 +34,9 @@ use outrig::config::{
     Config, MistralrsDeviceSpec, NetworkMode, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
     TOOL_RESULT_MAX_FLOOR_BYTES,
 };
-use outrig::container::Container;
+use outrig::container::sidecar::SessionMcpPlan;
 use outrig::image::ImageTag;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
 pub struct RunArgs {
@@ -108,6 +111,7 @@ pub async fn execute(
         network_mode_override: args.network,
         device_override: args.device,
         volumes: &args.volume,
+        start_sidecars: true,
         verbose,
     })
     .await?;
@@ -120,23 +124,25 @@ pub async fn execute(
     let SessionSetup {
         cfg,
         image_cfg_name,
-        image_cfg,
         image_tag,
-        container,
+        mut containers,
         sid,
         log_dir,
         store,
         network,
+        mcp_plan,
+        watcher,
         attached: _,
         session: _,
         session_dir: _,
+        image_cfg: _,
     } = setup;
     let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
 
-    // Validate per-server env entries against the resolved MCP map.
-    let mcp = session_setup::merged_mcp(&container, &image_cfg).await?;
+    // Validate per-server env entries against the full merged plan (a
+    // skipped sidecar's servers are still declared names).
     for name in cli_env.per_server_names() {
-        if !mcp.contains_key(name) {
+        if !mcp_plan.servers.contains_key(name) {
             return Err(OutrigError::Configuration(format!(
                 "--env {name}:...: image '{}' has no MCP server '{name}'",
                 image_cfg_name
@@ -145,13 +151,14 @@ pub async fn execute(
         }
     }
 
+    let primary_died = watcher.as_ref().map(|w| w.primary_died());
     let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
     let outcome: Result<i32> = run_inner(
         &cfg,
         &agent_name,
         &image_cfg_name,
         &image_tag,
-        &container,
+        &mut containers,
         &log_dir,
         sid.as_str(),
         &cache_root,
@@ -160,13 +167,18 @@ pub async fn execute(
         args.max_tool_result_bytes,
         args.model.as_deref(),
         args.device,
-        &mcp,
+        &mcp_plan,
         &cli_env,
+        primary_died,
     )
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(mcp_arcs, network, container, &store, &sid, final_exit).await;
+    session_setup::teardown(
+        mcp_arcs, watcher, network, containers, &store, &sid, final_exit,
+    )
+    .await;
+    crate::cli::watcher::exit_if_monitor_stopped(&outcome, final_exit);
     outcome
 }
 
@@ -184,7 +196,7 @@ async fn run_inner(
     agent_name: &str,
     image_cfg_name: &str,
     image_tag: &ImageTag,
-    container: &Container,
+    containers: &mut SessionContainers,
     log_dir: &Path,
     session_id: &str,
     cache_root: &Path,
@@ -193,8 +205,9 @@ async fn run_inner(
     max_tool_result_bytes: Option<u32>,
     model_override: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
-    mcp: &std::collections::BTreeMap<String, outrig::config::McpServerSpec>,
+    mcp_plan: &SessionMcpPlan,
     cli_env: &CliEnvEntries,
+    primary_died: Option<CancellationToken>,
 ) -> Result<i32> {
     // `setup` already validated presence and used the resolved `.image`
     // for the image fallback. We re-resolve here for `build_agent` +
@@ -204,7 +217,8 @@ async fn run_inner(
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
-    let connected = session_setup::connect_mcp_clients(container, mcp, log_dir, cli_env).await?;
+    let connected =
+        session_setup::connect_mcp_clients(containers, mcp_plan, log_dir, cli_env).await?;
     mcp_arcs.extend(connected);
 
     let mut all_tools: Vec<McpToolAdapter> = Vec::new();
@@ -241,7 +255,7 @@ async fn run_inner(
         &resolved,
         image_cfg_name,
         image_tag,
-        container.name(),
+        containers.primary.name(),
         &per_server_counts,
         &all_tools,
         session_id,
@@ -249,7 +263,19 @@ async fn run_inner(
 
     let tools_summary = build_tools_summary(&all_tools);
     eprintln!("[outrig] entering REPL");
-    let result = run_repl(&agent, tools_summary).await;
+    // When a watcher is armed, external death of the primary ends the REPL
+    // with an error instead of leaving the agent talking to dead tools.
+    let result = match primary_died {
+        Some(died) => {
+            tokio::select! {
+                result = run_repl(&agent, tools_summary) => result,
+                _ = died.cancelled() => {
+                    Err(crate::cli::watcher::primary_death_error(containers.primary.name()))
+                }
+            }
+        }
+        None => run_repl(&agent, tools_summary).await,
+    };
 
     // Drop adapters and the agent before returning so teardown's
     // `Arc::try_unwrap` on each `mcp_arcs` entry succeeds.

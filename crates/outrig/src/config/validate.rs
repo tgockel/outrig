@@ -203,6 +203,65 @@ pub enum ConfigValidationError {
          that field belongs to mistralrs-style providers"
     )]
     OpenAiModelHasMistralrsField { model: String, field: &'static str },
+
+    #[error(
+        "image {image:?} has invalid sidecar name {sidecar:?} \
+         (must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ -- it embeds in container names)"
+    )]
+    SidecarNameInvalid { image: String, sidecar: String },
+
+    #[error("image {image:?} sidecar {sidecar:?}: `image` must not be empty")]
+    SidecarImageEmpty { image: String, sidecar: String },
+
+    #[error("image {image:?} sidecar {sidecar:?} mount {violation}")]
+    SidecarMount {
+        image: String,
+        sidecar: String,
+        violation: MountRuleViolation,
+    },
+
+    #[error(
+        "image {image:?} mcp server {server:?} sets both `sidecar` and `image`; \
+         they are mutually exclusive"
+    )]
+    McpPlacementConflict { image: String, server: String },
+
+    #[error(
+        "image {image:?} mcp server {server:?} has sidecar={sidecar:?} which does not \
+         match any [images.{image}.sidecars.<name>]"
+    )]
+    McpUnknownSidecar {
+        image: String,
+        server: String,
+        sidecar: String,
+    },
+
+    #[error(
+        "image {image:?} mcp server {server:?} sets sidecar={sidecar:?} without a \
+         `command`; named sidecars host exec-stdio servers only"
+    )]
+    McpSidecarRequiresCommand {
+        image: String,
+        server: String,
+        sidecar: String,
+    },
+
+    #[error(
+        "image {image:?} mcp server {server:?} sets `image` without a `command` \
+         (entrypoint-stdio); that form arrives in a later release -- add a `command` \
+         to run the server via exec-stdio"
+    )]
+    McpEntrypointStdioUnsupported { image: String, server: String },
+
+    #[error("image {image:?} mcp server {server:?}: `image` must not be empty")]
+    McpInlineImageEmpty { image: String, server: String },
+
+    #[error(
+        "image {image:?}: sidecar name {name:?} collides with mcp server {name:?}, \
+         which declares an anonymous sidecar via `image`; anonymous sidecars occupy \
+         their server's name"
+    )]
+    SidecarNameCollision { image: String, name: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,12 +366,17 @@ pub(super) fn validate_with_options(
                     server: server_name.clone(),
                 });
             }
+            validate_mcp_placement(image_name, image, server_name, spec)?;
             if mcp_command_is_empty(spec) {
                 return Err(ConfigValidationError::EmptyMcpCommand {
                     image: image_name.clone(),
                     server: server_name.clone(),
                 });
             }
+        }
+
+        for (sidecar_name, sidecar) in &image.sidecars {
+            validate_sidecar(cfg, repo_root, image_name, sidecar_name, sidecar)?;
         }
     }
 
@@ -374,17 +438,124 @@ fn validate_image_security(
     image_name: &str,
     image: &ImageConfig,
 ) -> Result<(), ConfigValidationError> {
-    let drops = validate_capability_list(image_name, "cap-drop", &image.security.cap_drop)?;
-    let adds = validate_capability_list(image_name, "cap-add", &image.security.cap_add)?;
+    validate_security(image_name, &image.security)
+}
+
+/// Validate a `[security]` block. `scope` names the owning block in errors --
+/// the image-config name, or `<image>.sidecars.<sc>` for a sidecar block.
+fn validate_security(
+    scope: &str,
+    security: &super::ContainerSecurity,
+) -> Result<(), ConfigValidationError> {
+    let drops = validate_capability_list(scope, "cap-drop", &security.cap_drop)?;
+    let adds = validate_capability_list(scope, "cap-add", &security.cap_add)?;
 
     if let Some(capability) = drops.intersection(&adds).next() {
         return Err(ConfigValidationError::CapabilityDropAddConflict {
-            image: image_name.to_string(),
+            image: scope.to_string(),
             capability: capability.clone(),
         });
     }
 
     Ok(())
+}
+
+/// Placement rules for one `[images.<name>.mcp]` entry: `sidecar`/`image`
+/// mutual exclusion, named sidecars must exist and are exec-stdio-only, the
+/// entrypoint-stdio form is rejected until it ships, and an anonymous sidecar
+/// must not collide with a named one (it occupies its server's name).
+fn validate_mcp_placement(
+    image_name: &str,
+    image: &ImageConfig,
+    server_name: &str,
+    spec: &McpServerSpec,
+) -> Result<(), ConfigValidationError> {
+    if spec.sidecar().is_some() && spec.image().is_some() {
+        return Err(ConfigValidationError::McpPlacementConflict {
+            image: image_name.to_string(),
+            server: server_name.to_string(),
+        });
+    }
+    if let Some(sidecar) = spec.sidecar() {
+        if !image.sidecars.contains_key(sidecar) {
+            return Err(ConfigValidationError::McpUnknownSidecar {
+                image: image_name.to_string(),
+                server: server_name.to_string(),
+                sidecar: sidecar.to_string(),
+            });
+        }
+        if !spec.has_command() {
+            return Err(ConfigValidationError::McpSidecarRequiresCommand {
+                image: image_name.to_string(),
+                server: server_name.to_string(),
+                sidecar: sidecar.to_string(),
+            });
+        }
+    }
+    if let Some(inline_image) = spec.image() {
+        if inline_image.trim().is_empty() {
+            return Err(ConfigValidationError::McpInlineImageEmpty {
+                image: image_name.to_string(),
+                server: server_name.to_string(),
+            });
+        }
+        if !spec.has_command() {
+            return Err(ConfigValidationError::McpEntrypointStdioUnsupported {
+                image: image_name.to_string(),
+                server: server_name.to_string(),
+            });
+        }
+        if image.sidecars.contains_key(server_name) {
+            return Err(ConfigValidationError::SidecarNameCollision {
+                image: image_name.to_string(),
+                name: server_name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `[images.<name>.sidecars.<sc>]` block: name shape, non-empty
+/// image ref, security caps, and its mount list. The sidecar's `image` value
+/// is deliberately *not* cross-checked against `[images.<name>]` blocks --
+/// like `--image`, an unmatched name falls through to raw-podman-ref
+/// semantics and fails at start time if the ref is absent locally.
+fn validate_sidecar(
+    cfg: &Config,
+    repo_root: Option<&Path>,
+    image_name: &str,
+    sidecar_name: &str,
+    sidecar: &super::SidecarConfig,
+) -> Result<(), ConfigValidationError> {
+    if !sidecar_name_re().is_match(sidecar_name) {
+        return Err(ConfigValidationError::SidecarNameInvalid {
+            image: image_name.to_string(),
+            sidecar: sidecar_name.to_string(),
+        });
+    }
+    if sidecar.image.trim().is_empty() {
+        return Err(ConfigValidationError::SidecarImageEmpty {
+            image: image_name.to_string(),
+            sidecar: sidecar_name.to_string(),
+        });
+    }
+
+    let scope = format!("{image_name}.sidecars.{sidecar_name}");
+    validate_security(&scope, &sidecar.security)?;
+
+    // The workspace mount (when enabled) reuses the session's container path,
+    // so extra mounts must not collide with it.
+    let mut reserved = BTreeSet::new();
+    if sidecar.workspace != super::SidecarWorkspaceAccess::None {
+        reserved.insert(cfg.workspace.container_path.clone());
+    }
+    check_mount_list(&sidecar.mounts, reserved, repo_root).map_err(|violation| {
+        ConfigValidationError::SidecarMount {
+            image: image_name.to_string(),
+            sidecar: sidecar_name.to_string(),
+            violation,
+        }
+    })
 }
 
 fn validate_capability_list(
@@ -425,22 +596,67 @@ pub(super) fn validate_workspace_mounts(
     cfg: &Config,
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
-    let mut container_paths = BTreeSet::new();
-    container_paths.insert(cfg.workspace.container_path.clone());
+    let mut reserved = BTreeSet::new();
+    reserved.insert(cfg.workspace.container_path.clone());
 
-    for mount in &cfg.workspace.mounts {
+    check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
+        |violation| match violation {
+            MountRuleViolation::ContainerNotAbsolute(path) => {
+                ConfigValidationError::WorkspaceMountContainerNotAbsolute { path }
+            }
+            MountRuleViolation::ContainerRoot => ConfigValidationError::WorkspaceMountContainerRoot,
+            MountRuleViolation::ContainerDuplicate(path) => {
+                ConfigValidationError::WorkspaceMountContainerDuplicate { path }
+            }
+            MountRuleViolation::HostMissing(path) => {
+                ConfigValidationError::WorkspaceMountHostMissing { path }
+            }
+            MountRuleViolation::HostNotDirectory(path) => {
+                ConfigValidationError::WorkspaceMountHostNotDirectory { path }
+            }
+        },
+    )
+}
+
+/// Scope-agnostic mount-list rule violation. The workspace caller maps it
+/// onto its pre-existing per-rule variants; sidecar (and future) callers
+/// wrap it whole and render via `Display`.
+#[derive(Debug, Error)]
+pub enum MountRuleViolation {
+    #[error("container-path {0:?} must be absolute")]
+    ContainerNotAbsolute(PathBuf),
+    #[error("container-path must not be /")]
+    ContainerRoot,
+    #[error("container-path {0:?} is declared more than once")]
+    ContainerDuplicate(PathBuf),
+    #[error("host-path {0:?} does not exist")]
+    HostMissing(PathBuf),
+    #[error("host-path {0:?} is not a directory")]
+    HostNotDirectory(PathBuf),
+}
+
+/// Shared rules for any bind-mount list: absolute container paths, never `/`,
+/// no duplicates (including against `reserved` paths already claimed by the
+/// owning block), and -- when a repo root is known -- host paths that exist
+/// and are directories.
+fn check_mount_list(
+    mounts: &[super::MountConfig],
+    mut reserved: BTreeSet<PathBuf>,
+    repo_root: Option<&Path>,
+) -> Result<(), MountRuleViolation> {
+    for mount in mounts {
         if !mount.container_path.is_absolute() {
-            return Err(ConfigValidationError::WorkspaceMountContainerNotAbsolute {
-                path: mount.container_path.clone(),
-            });
+            return Err(MountRuleViolation::ContainerNotAbsolute(
+                mount.container_path.clone(),
+            ));
         }
         if mount.container_path == Path::new("/") {
-            return Err(ConfigValidationError::WorkspaceMountContainerRoot);
+            return Err(MountRuleViolation::ContainerRoot);
         }
-        if !container_paths.insert(mount.container_path.clone()) {
-            return Err(ConfigValidationError::WorkspaceMountContainerDuplicate {
-                path: mount.container_path.clone(),
-            });
+        if !reserved.insert(mount.container_path.clone()) {
+            return Err(MountRuleViolation::ContainerDuplicate(
+                mount.container_path.clone(),
+            ));
         }
 
         if let Some(root) = repo_root {
@@ -450,14 +666,12 @@ pub(super) fn validate_workspace_mounts(
                 root.join(&mount.host_path)
             };
             if !resolved.exists() {
-                return Err(ConfigValidationError::WorkspaceMountHostMissing {
-                    path: mount.host_path.clone(),
-                });
+                return Err(MountRuleViolation::HostMissing(mount.host_path.clone()));
             }
             if !resolved.is_dir() {
-                return Err(ConfigValidationError::WorkspaceMountHostNotDirectory {
-                    path: mount.host_path.clone(),
-                });
+                return Err(MountRuleViolation::HostNotDirectory(
+                    mount.host_path.clone(),
+                ));
             }
         }
     }
@@ -478,7 +692,16 @@ pub(crate) fn is_valid_build_image_name(name: &str) -> bool {
 pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
     match spec {
         McpServerSpec::Short(cmd) => cmd.is_empty(),
-        McpServerSpec::Full { command, .. } => command.is_empty(),
+        McpServerSpec::Full {
+            command: Some(cmd), ..
+        } => cmd.is_empty(),
+        // The no-command entrypoint-stdio form is judged by its own
+        // validation rule, not the empty-command one.
+        McpServerSpec::Full {
+            command: None,
+            image,
+            ..
+        } => image.is_none(),
     }
 }
 
@@ -620,6 +843,15 @@ fn mcp_server_name_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"^[a-zA-Z][a-zA-Z0-9_-]*$").expect("mcp server-name regex compiles")
+    })
+}
+
+/// Sidecar names embed in container names (`outrig-<sid>-<sc>`), so they may
+/// start with a digit but are otherwise the server-name alphabet.
+fn sidecar_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$").expect("sidecar-name regex compiles")
     })
 }
 

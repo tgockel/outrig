@@ -125,6 +125,7 @@ pub fn sample_session(id: &SessionId) -> Session {
         started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         ended_at: None,
         container_name: format!("outrig-{}", id.as_str()),
+        sidecar_container_names: Vec::new(),
         image_tag: "outrig/test:abc123".to_string(),
         image_config_name: "coding".to_string(),
         agent_name: Some("default".to_string()),

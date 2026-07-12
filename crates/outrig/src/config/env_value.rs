@@ -60,12 +60,20 @@ impl EnvValue {
     }
 }
 
+impl EnvValue {
+    /// The config-file spelling this value round-trips through: the literal
+    /// text, or `${VAR}` for a reference. Inverse of [`EnvValue::from_raw`].
+    pub fn to_raw(&self) -> String {
+        match self {
+            Self::Literal(s) => s.clone(),
+            Self::EnvRef(var) => format!("${{{var}}}"),
+        }
+    }
+}
+
 impl Serialize for EnvValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        match self {
-            Self::Literal(s) => serializer.serialize_str(s),
-            Self::EnvRef(var) => serializer.collect_str(&format_args!("${{{var}}}")),
-        }
+        serializer.serialize_str(&self.to_raw())
     }
 }
 

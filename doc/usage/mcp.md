@@ -131,11 +131,22 @@ To inspect the effective table without serving MCP:
 outrig mcp show-merged --image coding
 ```
 
-In fresh mode this starts the selected container, reads the image's `org.outrig.mcp` label,
-applies `config.toml` overrides, prints the merged `[mcp]` table to stdout, then stops the
-container. For repo-local build images, the cache tag was already stamped with that merged label
-when it was built. With `--attach`, it borrows the existing container for the same read and leaves
-it running.
+In fresh mode this starts the selected container, reads the `org.outrig.mcp` label off the
+primary image and every named sidecar image, applies `config.toml` overrides, prints the merged
+`[mcp]` table to stdout, then stops the container. Sidecar containers are not launched for the
+read. Each server carries a comment naming its placement and provenance:
+
+```toml
+[mcp]
+# fs: primary (image label org.outrig.mcp)
+fs = ["mcp-server-filesystem", "/workspace"]
+# search: sidecar "tools" (config.toml)
+search = { command = ["mcp-search"], sidecar = "tools" }
+```
+
+For repo-local build images, the cache tag was already stamped with that merged label when it
+was built (placement-bearing entries excluded -- they belong to other containers). With
+`--attach`, it borrows the existing container for the same read and leaves it running.
 
 ## Attach Mode
 
@@ -149,6 +160,9 @@ outrig mcp --attach outrig-20260504T141907-a83f --image coding
 
 The first form resolves an existing outrig session id. The second form borrows a
 podman container directly, which is useful for containers not started by `outrig run`.
+
+Attach mode cannot own containers, so a config that declares sidecars (or places MCP
+entries in one) is rejected with `--attach`; start a fresh session instead.
 
 Attach mode shares the container, not the MCP protocol processes. The attacher starts
 its own `podman exec -i` children for each merged MCP server, so the external client
@@ -263,15 +277,17 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    `podman run -d --rm --name outrig-<sid> ...`. Attach mode probes the existing
    container with `podman inspect`, verifies that it is running, and does not build,
    start, stop, or remove it.
-4. **Start network interception, if enabled.** Fresh sessions can write
+4. **Merge MCP config and start sidecars.** Read the primary image's `org.outrig.mcp`
+   label if present, then overlay `[images.<name>.mcp]` from config by server name. Each
+   declared sidecar's image is resolved, its label merged (scoped to that sidecar), and
+   `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. Sidecar failures follow
+   the block's `on-failure` key.
+5. **Start network interception, if enabled.** The interceptor attaches to the primary
+   and every running sidecar. Fresh sessions can write
    `<session_dir>/logs/network.jsonl` and filter mode can enforce global policy; attach mode
    cannot install a new interceptor.
-5. **Merge MCP config.** Read the image's `org.outrig.mcp` label if present,
-   then overlay `[images.<name>.mcp]` from config by server name. Repo-local build images stamp
-   this merged table into their cache tags on build misses; raw image refs have no repo config
-   block, so their MCP entries come from labels only.
 6. **Connect MCP servers.** For each merged entry, `podman exec -i` the configured
-   command and run the MCP `initialize` handshake.
+   command in the container its placement names and run the MCP `initialize` handshake.
 7. **Build the proxy.** outrig advertises one merged tool list to its client, with
    each tool namespaced `<server>__<tool>`. See [Tool Names](#tool-names) below.
 8. **Serve MCP.** Without `--listen`, rmcp's stdio transport reads JSON-RPC frames
@@ -356,7 +372,13 @@ collision and sanitization rules.
 
 All paths cancel the rmcp service, wait for the dispatcher to settle, shut down each
 backing MCP server, and finalize the session record. Fresh-container mode then stops the
-container. Attach mode leaves the borrowed container running.
+containers -- sidecars first, primary last. Attach mode leaves the borrowed container
+running.
+
+Sessions with sidecars also watch the primary container: if it dies out from under outrig
+(a manual `podman kill`, the OOM killer), the sidecars are reaped and the process exits
+non-zero. A sidecar dying mid-session only degrades the tool set -- its tools return
+errors and the session continues.
 
 HTTP/SSE mode is daemon-shaped: client disconnects close only that MCP session. The
 `outrig mcp --listen` process stays alive until SIGINT, SIGTERM, or attached-container

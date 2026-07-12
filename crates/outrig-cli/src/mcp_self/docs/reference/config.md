@@ -460,6 +460,10 @@ shell = ["bash", "-lc", "exec shell-mcp-command"]
 # Full form -- table with command + optional env
 fs = { command = ["mcp-server-filesystem", "/workspace"] }
 build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
+
+# Full form with a placement key -- runs in a sidecar container
+lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
+grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 ```
 
 `shell-mcp-command` is a placeholder. Replace it with the shell MCP server you install in the
@@ -468,6 +472,10 @@ image, or declare any other MCP command that should run inside the container.
 - `command` (array of strings, required unless using short form): argv of the MCP server.
 - `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
   invocation.
+- `sidecar` (string, optional): run this server in the named
+  [`[images.<name>.sidecars.<sc>]`](#imagesnamesidecarssc) container instead of the primary.
+- `image` (string, optional): run this server in a dedicated anonymous sidecar created from
+  this image ref (resolved like the sidecar `image` key). Mutually exclusive with `sidecar`.
 
 Notes:
 
@@ -478,12 +486,50 @@ Notes:
   the server advertises (`<server>__<tool>`).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
   resolved from the host environment at MCP startup -- see the subsection below.
-- Images can provide the same table via their `org.outrig.mcp` OCI label. Repo config entries
-  override image entries by server name; see
+- Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
+  repo-config-only and rejected in labels). Repo config entries override image entries by
+  server name; see
   [Concepts -> MCP Servers](../concepts/mcp-servers.md#embedding-mcp-config-in-the-image).
 - Build-from-Dockerfile repo images are stamped with the merged `org.outrig.mcp` label on cache
   misses, so `outrig image inspect <name>:<content-hash>` can show their declared repo-local MCP
   entries without starting a container.
+
+### `[images.<name>.sidecars.<sc>]`
+
+Optional named sidecar containers hosting MCP servers away from the primary; see
+[Concepts -> Containers](../concepts/containers.md#sidecar-containers). The block key `<sc>`
+is the sidecar name; it embeds in the container name (`outrig-<sid>-<sc>`) and must match
+`^[A-Za-z0-9][A-Za-z0-9_-]*$`.
+
+```toml
+[images.coding.sidecars.tools]
+image      = "mcp-tools"
+workspace  = "ro"
+start      = "auto"
+on-failure = "warn"
+
+[[images.coding.sidecars.tools.mounts]]
+host-path      = "~/.cache/example"
+container-path = "/cache"
+access         = "read-write"
+
+[images.coding.sidecars.tools.security]
+capability-profile = "no-net-raw"
+```
+
+- `image` (string, required): resolved exactly like `--image` -- an `[images.<name>]` config
+  name first, else a raw podman ref that must be present locally.
+- `workspace` (string, optional, default: `"none"`): `"none"`, `"ro"`, or `"rw"`. Mounts the
+  session workspace at the primary's container path with that access.
+- `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
+  declares a sidecar that waits for a later-release start surface (its servers are skipped
+  with a notice until then).
+- `on-failure` (string, optional, default: `"abort"`): how a start/bootstrap/connect failure of
+  this sidecar is handled at session start. `"abort"` fails the session; `"warn"` logs, skips
+  the sidecar and its servers, and continues.
+- `mounts` (array of tables, optional): same shape and validation as
+  [`[[workspace.mounts]]`](#workspace).
+- `security` (table, optional): same keys as [`[images.<name>.security]`](#imagesnamesecurity).
 
 #### MCP `env` value syntax
 

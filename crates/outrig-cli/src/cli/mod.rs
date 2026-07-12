@@ -14,6 +14,7 @@ pub mod mcp_self;
 pub mod run;
 pub mod session_setup;
 pub mod volume_arg;
+pub mod watcher;
 
 use std::path::PathBuf;
 

@@ -64,6 +64,7 @@ async fn ensure_fixture_image() -> ImageTag {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
     };
     image::ensure_image(&cfg, &fixture_mcp_fs_dir(), false)
         .await
@@ -118,6 +119,7 @@ fn create_host_session(
         started_at: SystemTime::now(),
         ended_at: None,
         container_name: container.name().to_string(),
+        sidecar_container_names: Vec::new(),
         image_tag: image.to_string(),
         image_config_name: "smoke".to_string(),
         agent_name: Some("smoke".to_string()),

@@ -221,12 +221,59 @@ tag in that path. `--no-cache` on an image-name config re-runs `podman pull` eve
 image is already present locally. (The library `Outrig::launch` API, which builds from a raw
 Dockerfile with no image-config name, falls back to the `outrig-cache:<hash>` repository.)
 
+## Sidecar containers
+
+A session can own more than one container. Sidecars are extra podman containers declared under
+`[images.<name>.sidecars.<sc>]` (or implied by an inline `image` key on an MCP entry) that host
+MCP servers away from the workspace container; see
+[MCP Servers -> Sidecar placement](mcp-servers.md#sidecar-placement) for the config surface.
+
+```toml
+[images.dev.sidecars.tools]
+image      = "mcp-tools"        # sibling [images.mcp-tools] block first, else raw podman ref
+workspace  = "ro"               # "none" (default) | "ro" | "rw"
+start      = "auto"             # "auto" (default)  | "manual"
+on-failure = "abort"            # "abort" (default) | "warn"
+
+[[images.dev.sidecars.tools.mounts]]
+host-path      = "~/.cache/example"
+container-path = "/cache"
+access         = "read-write"   # "read-only" (default) | "read-write"
+```
+
+The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
+(Dockerfile-built sidecars get content-hash caching for free), then a raw podman ref, which
+must be present locally. An optional `[images.<name>.sidecars.<sc>.security]` block reuses the
+same capability keys as the primary. `start = "manual"` declares a sidecar that does not start
+with the session (a later release adds the surfaces that start one mid-session; until then its
+servers are skipped with a notice).
+
+**Naming and labels.** Sidecar containers are named `outrig-<sid>-<sc>`; an anonymous sidecar
+uses its server's name as `<sc>`. Every session container -- primary included -- carries the
+podman label `org.outrig.session=<session-id>`, and sidecars additionally carry
+`org.outrig.sidecar=<sc>`. The session record lists sidecar container names next to
+`container_name`.
+
+**Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
+after the primary and stop before it, and the same three cleanup layers -- explicit stop, Drop,
+and the panic-hook sweep -- cover every container. In addition, sessions with sidecars run a
+`podman wait` watcher on the primary: if the primary dies out from under outrig (manual
+`podman kill`, OOM), the watcher reaps all sidecars and ends the session with an error.
+A stray that survives even that (say, a SIGKILLed outrig) is caught by `outrig clean`, which
+sweeps stopped, record-less containers carrying `org.outrig.session`; see
+[Sessions -> outrig clean](../usage/sessions.md#outrig-clean).
+
+Session `[network]` policy applies to every container: the network interceptor attaches to each
+sidecar the same way it attaches to the primary, before any MCP server connects.
+
 ## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, `--security-opt=no-new-privileges`, the primary workspace
 bind-mount, any configured extra workspace mounts, and the runtime user-mapping bootstrap
 (see [Workspace](workspace.md)). Capability flags are emitted only when the selected
 image-config opts into a capability profile or explicit `cap-drop` / `cap-add` entries.
+Session containers additionally carry the `org.outrig.session` label (and sidecars
+`org.outrig.sidecar`).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode

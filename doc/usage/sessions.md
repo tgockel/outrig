@@ -30,13 +30,18 @@ random hex digits -- sortable, unambiguous across concurrent runs):
 ```
 ~/.local/share/outrig/sessions/
 └── 20260501T134412-3f2a/
-    ├── session.json              # id, timestamps, container, image, exit status
+    ├── session.json              # id, timestamps, containers, image, exit status
     └── logs/
         ├── container.log         # buildah/podman transcripts when --verbose is set
         ├── network.jsonl         # network audit/filter records when enabled
         ├── fs.stderr             # MCP "fs" server's captured stderr
         └── shell.stderr          # MCP "shell" server's captured stderr
 ```
+
+`session.json` names every container the session owns: `container_name` for the primary,
+plus `sidecar_container_names` when the config declares
+[sidecars](../concepts/containers.md#sidecar-containers). Sidecar-less sessions omit the
+field, so records from older versions read and write unchanged.
 
 When you run `outrig run --session-dir <path>`, outrig writes the session content into
 `<path>` directly and creates a symlink at `<root>/<sid> -> <path>` so `outrig ls` still finds
@@ -206,6 +211,21 @@ $ outrig clean --older-than 30d --yes
 remove the session directory, while sessions created with `--session-dir` remove both the
 symlink target and the symlink under the session root. Running sessions are skipped so cleanup
 doesn't race a live `outrig run` or `outrig mcp` writer.
+
+Alongside the record walk, `outrig clean` sweeps for *stray containers*: podman containers
+carrying the `org.outrig.session` label whose session record no longer exists (a lost record,
+a SIGKILLed outrig, a failed `--rm`). Stopped strays older than the cutoff are removed with
+`podman rm -f` and appear in the same preview/confirmation; running labeled containers are
+never removed, only reported:
+
+```sh
+$ outrig clean --older-than 7d
+[outrig] will remove 1 session older than 7d:
+  20260401T134412-3f2a  ended 2026-04-01 13:46:30  /tmp/old-a
+[outrig] will remove 1 stray container older than 7d (no session record):
+  outrig-20260330T101500-88aa-tools  sidecar tools, session 20260330T101500-88aa
+Clean 1 session and 1 stray container? [y/N]:
+```
 
 ## What sessions don't track
 

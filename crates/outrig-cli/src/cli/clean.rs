@@ -1,19 +1,25 @@
-//! `outrig clean` -- bulk-remove old session records.
+//! `outrig clean` -- bulk-remove old session records and stray containers.
 //!
-//! This is intentionally a session-store command, not a container lifecycle
-//! command: it removes old metadata/log directories and refuses to touch
-//! sessions whose container is still running.
+//! Two sweeps run together. The session-store walk removes old
+//! metadata/log directories, refusing to touch sessions whose container is
+//! still running. The label sweep catches *stray* containers -- ones
+//! carrying `org.outrig.session` whose session record is gone (lost record,
+//! SIGKILLed outrig, failed `--rm`) -- and `podman rm -f`s the stopped ones
+//! older than the cutoff. Running containers are never removed, labeled or
+//! not.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::error::Result;
+use crate::error::{OutrigError, Result};
 use crate::session::{self, Session, SessionStore};
-use outrig::container::Container;
+use outrig::container::{Container, LABEL_SESSION, LABEL_SIDECAR};
 
 const DAY: u64 = 24 * 60 * 60;
 pub const DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * DAY);
@@ -33,6 +39,17 @@ pub struct CleanArgs {
     pub yes: bool,
 }
 
+/// One `org.outrig.session`-labeled podman container, as reported by
+/// `podman ps -a`. Input to the stray sweep.
+#[derive(Debug, Clone)]
+pub struct LabeledContainer {
+    pub name: String,
+    pub session_label: String,
+    pub sidecar_label: Option<String>,
+    pub running: bool,
+    pub created: SystemTime,
+}
+
 pub async fn execute(
     args: &CleanArgs,
     session_root_flag: Option<&Path>,
@@ -47,6 +64,7 @@ pub async fn execute(
         cwd,
     )?;
     let store = SessionStore::new(root);
+    let labeled = list_labeled_containers().await?;
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stderr = tokio::io::stderr();
     execute_with(
@@ -56,53 +74,68 @@ pub async fn execute(
         args,
         SystemTime::now(),
         podman_is_running,
+        labeled,
+        podman_remove_force,
     )
     .await
 }
 
-pub async fn execute_with<E, R, F, Fut>(
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_with<E, R, F, Fut, D, DFut>(
     stderr: &mut E,
     stdin: R,
     store: &SessionStore,
     args: &CleanArgs,
     now: SystemTime,
     mut is_running: F,
+    labeled: Vec<LabeledContainer>,
+    mut remove_container: D,
 ) -> Result<i32>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<bool>>,
+    D: FnMut(String) -> DFut,
+    DFut: Future<Output = Result<()>>,
 {
+    let sessions = store.list()?;
     let mut targets = Vec::new();
     let mut skipped_running = Vec::new();
 
-    for session in store.list()? {
-        if !older_than(&session, args.older_than, now) {
+    for session in &sessions {
+        if !older_than(session, args.older_than, now) {
             continue;
         }
         if is_running(session.container_name.clone()).await? {
-            skipped_running.push(session);
+            skipped_running.push(session.clone());
             continue;
         }
         targets.push(CleanTarget {
             dir: session.session_dir.clone(),
-            session,
+            session: session.clone(),
         });
     }
 
+    let target_ids: BTreeSet<&str> = targets.iter().map(|t| t.session.id.as_str()).collect();
+    let (stray_targets, stray_running) =
+        classify_strays(&sessions, &target_ids, labeled, args.older_than, now);
+
     write_skipped_running(stderr, &skipped_running).await?;
+    write_stray_running(stderr, &stray_running).await?;
 
     let retention = format_retention(args.older_than);
-    if targets.is_empty() {
-        let msg = format!("[outrig] no stopped sessions older than {retention}\n");
+    if targets.is_empty() && stray_targets.is_empty() {
+        let msg =
+            format!("[outrig] no stopped sessions or stray containers older than {retention}\n");
         stderr.write_all(msg.as_bytes()).await?;
         return Ok(0);
     }
 
     write_preview(stderr, &targets, &retention).await?;
+    write_stray_preview(stderr, &stray_targets, &retention).await?;
 
-    if !args.yes && !confirm(stderr, stdin, targets.len()).await? {
+    if !args.yes && !confirm(stderr, stdin, targets.len(), stray_targets.len()).await? {
         stderr.write_all(b"[outrig] aborted\n").await?;
         return Ok(0);
     }
@@ -121,7 +154,18 @@ where
         }
     }
 
-    let summary = format!("[outrig] cleaned {}\n", session_count(removed));
+    let mut strays_removed = 0usize;
+    for stray in &stray_targets {
+        remove_container(stray.name.clone()).await?;
+        strays_removed += 1;
+        let msg = format!("[outrig] removed container {}\n", stray.name);
+        stderr.write_all(msg.as_bytes()).await?;
+    }
+
+    let summary = format!(
+        "[outrig] cleaned {}\n",
+        clean_summary(removed, strays_removed)
+    );
     stderr.write_all(summary.as_bytes()).await?;
     Ok(0)
 }
@@ -161,6 +205,42 @@ pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
 struct CleanTarget {
     session: Session,
     dir: PathBuf,
+}
+
+/// Split labeled containers into `(removable strays, running strays)`.
+/// A stray is a labeled container with no *surviving* session record -- a
+/// record being removed this run counts as gone, so a failed `--rm` and its
+/// record clean up together. Running containers are never removable, and
+/// stopped strays must be older than the cutoff (podman `Created` time).
+fn classify_strays(
+    sessions: &[Session],
+    removed_ids: &BTreeSet<&str>,
+    labeled: Vec<LabeledContainer>,
+    older_than: Duration,
+    now: SystemTime,
+) -> (Vec<LabeledContainer>, Vec<LabeledContainer>) {
+    let surviving_ids: BTreeSet<&str> = sessions
+        .iter()
+        .map(|s| s.id.as_str())
+        .filter(|id| !removed_ids.contains(id))
+        .collect();
+    let mut removable = Vec::new();
+    let mut running = Vec::new();
+    for container in labeled {
+        if surviving_ids.contains(container.session_label.as_str()) {
+            continue; // the record walk owns record-backed containers
+        }
+        if container.running {
+            running.push(container);
+        } else if now
+            .duration_since(container.created)
+            .map(|age| age >= older_than)
+            .unwrap_or(false)
+        {
+            removable.push(container);
+        }
+    }
+    (removable, running)
 }
 
 fn older_than(session: &Session, cutoff: Duration, now: SystemTime) -> bool {
@@ -214,18 +294,81 @@ where
     Ok(())
 }
 
-async fn confirm<E, R>(stderr: &mut E, mut stdin: R, count: usize) -> Result<bool>
+async fn confirm<E, R>(stderr: &mut E, mut stdin: R, sessions: usize, strays: usize) -> Result<bool>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    let prompt = format!("Clean {}? [y/N]: ", session_count(count));
+    let prompt = format!("Clean {}? [y/N]: ", clean_summary(sessions, strays));
     stderr.write_all(prompt.as_bytes()).await?;
     stderr.flush().await?;
     let mut line = String::new();
     stdin.read_line(&mut line).await?;
     let answer = line.trim().to_ascii_lowercase();
     Ok(answer == "y" || answer == "yes")
+}
+
+/// `"2 sessions"`, `"3 stray containers"`, or `"2 sessions and 3 stray
+/// containers"`.
+fn clean_summary(sessions: usize, strays: usize) -> String {
+    let stray_part = |count: usize| {
+        format!(
+            "{count} stray {}",
+            crate::cli::session_setup::plural(count, "container", "containers")
+        )
+    };
+    match (sessions, strays) {
+        (_, 0) => session_count(sessions),
+        (0, s) => stray_part(s),
+        (n, s) => format!("{} and {}", session_count(n), stray_part(s)),
+    }
+}
+
+async fn write_stray_running<E>(stderr: &mut E, strays: &[LabeledContainer]) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if strays.is_empty() {
+        return Ok(());
+    }
+    stderr
+        .write_all(b"[outrig] skipped running labeled containers (no session record):\n")
+        .await?;
+    for stray in strays {
+        let line = format!("  {}  session {}\n", stray.name, stray.session_label);
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+async fn write_stray_preview<E>(
+    stderr: &mut E,
+    strays: &[LabeledContainer],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if strays.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] will remove {} older than {retention} (no session record):\n",
+        clean_summary(0, strays.len())
+    );
+    stderr.write_all(header.as_bytes()).await?;
+    for stray in strays {
+        let role = match &stray.sidecar_label {
+            Some(sc) => format!("sidecar {sc}"),
+            None => "primary".to_string(),
+        };
+        let line = format!(
+            "  {}  {role}, session {}\n",
+            stray.name, stray.session_label
+        );
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
 }
 
 fn session_count(count: usize) -> String {
@@ -251,4 +394,143 @@ fn format_retention(duration: Duration) -> String {
 
 async fn podman_is_running(name: String) -> Result<bool> {
     Ok(Container::is_running(&name).await?)
+}
+
+/// `podman rm -f <name>`, propagating failure -- clean should report a
+/// container it could not remove rather than claiming success.
+async fn podman_remove_force(name: String) -> Result<()> {
+    let output = tokio::process::Command::new("podman")
+        .args(["rm", "-f", &name])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(OutrigError::Configuration(format!(
+            "podman rm -f {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// `podman ps -a --filter label=org.outrig.session --format json`, decoded
+/// into [`LabeledContainer`]s. Containers missing the expected fields are
+/// skipped rather than failing the sweep.
+async fn list_labeled_containers() -> Result<Vec<LabeledContainer>> {
+    let output = tokio::process::Command::new("podman")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={LABEL_SESSION}"),
+            "--format",
+            "json",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(OutrigError::Configuration(format!(
+            "podman ps for labeled containers failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
+    }
+    parse_labeled_containers(&output.stdout)
+}
+
+fn parse_labeled_containers(stdout: &[u8]) -> Result<Vec<LabeledContainer>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(stdout).map_err(|source| {
+        OutrigError::Configuration(format!("podman ps --format json: invalid JSON: {source}"))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(name) = row
+            .get("Names")
+            .and_then(|names| names.as_array())
+            .and_then(|names| names.first())
+            .and_then(|name| name.as_str())
+        else {
+            continue;
+        };
+        let labels = row.get("Labels").and_then(|labels| labels.as_object());
+        let Some(session_label) = labels
+            .and_then(|labels| labels.get(LABEL_SESSION))
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        let sidecar_label = labels
+            .and_then(|labels| labels.get(LABEL_SIDECAR))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let running = row
+            .get("State")
+            .and_then(|state| state.as_str())
+            .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+        let created = row
+            .get("Created")
+            .and_then(|created| created.as_i64())
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push(LabeledContainer {
+            name: name.to_string(),
+            session_label: session_label.to_string(),
+            sidecar_label,
+            running,
+            created,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_labeled_containers_decodes_podman_ps_json() {
+        let stdout = br#"[
+          {
+            "Names": ["outrig-abc"],
+            "Labels": {"org.outrig.session": "abc"},
+            "State": "running",
+            "Created": 1700000000
+          },
+          {
+            "Names": ["outrig-abc-tools"],
+            "Labels": {"org.outrig.session": "abc", "org.outrig.sidecar": "tools"},
+            "State": "exited",
+            "Created": 1700000100
+          },
+          {
+            "Names": ["unlabeled"],
+            "Labels": {},
+            "State": "exited",
+            "Created": 1700000200
+          }
+        ]"#;
+
+        let parsed = parse_labeled_containers(stdout).expect("parse");
+        assert_eq!(parsed.len(), 2, "unlabeled containers are skipped");
+
+        assert_eq!(parsed[0].name, "outrig-abc");
+        assert_eq!(parsed[0].session_label, "abc");
+        assert_eq!(parsed[0].sidecar_label, None);
+        assert!(parsed[0].running);
+        assert_eq!(
+            parsed[0].created,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+
+        assert_eq!(parsed[1].name, "outrig-abc-tools");
+        assert_eq!(parsed[1].sidecar_label.as_deref(), Some("tools"));
+        assert!(!parsed[1].running);
+    }
+
+    #[test]
+    fn parse_labeled_containers_rejects_bad_json() {
+        assert!(parse_labeled_containers(b"not json").is_err());
+    }
 }

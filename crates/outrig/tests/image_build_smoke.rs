@@ -51,6 +51,7 @@ async fn build_then_cache_hit_under_100ms() {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
     };
 
     let first = image::ensure_image(&cfg, ctx, false)

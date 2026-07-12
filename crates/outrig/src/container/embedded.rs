@@ -49,14 +49,14 @@ pub struct StandaloneImageLabels {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum McpDeclarationSource {
+pub enum McpDeclarationSource {
     ImageLabel,
     LaunchSpec,
     ConfigToml,
 }
 
 impl McpDeclarationSource {
-    pub(crate) fn description(self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
             Self::ImageLabel => "image label org.outrig.mcp",
             Self::LaunchSpec => "launch spec",
@@ -66,9 +66,9 @@ impl McpDeclarationSource {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct McpServerSpecWithSource {
-    pub(crate) spec: McpServerSpec,
-    pub(crate) source: McpDeclarationSource,
+pub struct McpServerSpecWithSource {
+    pub spec: McpServerSpec,
+    pub source: McpDeclarationSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +104,12 @@ pub enum EmbeddedImageConfigError {
 
     #[error("mcp server {server:?} has empty command")]
     EmptyMcpCommand { server: String },
+
+    #[error(
+        "mcp server {server:?} carries a placement key (sidecar/image); image labels \
+         declare servers for the image that carries them -- placement is repo-config-only"
+    )]
+    PlacementInLabel { server: String },
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +131,12 @@ pub enum StandaloneImageTomlError {
 
     #[error("mcp server {server:?} has empty command")]
     EmptyMcpCommand { server: String },
+
+    #[error(
+        "mcp server {server:?} carries a placement key (sidecar/image); image labels \
+         declare servers for the image that carries them -- placement is repo-config-only"
+    )]
+    PlacementInLabel { server: String },
 }
 
 pub fn parse_standalone_image_toml(
@@ -163,14 +175,30 @@ pub fn mcp_config_to_labels(
 /// Merge an already-built image's inherited/Dockerfile MCP label with repo
 /// config, then serialize the effective table back into labels. This preserves
 /// the runtime merge semantics for build-from-Dockerfile images: image-owned
-/// entries survive, and repo entries replace by server name.
+/// entries survive, and repo entries replace by server name. Placement-bearing
+/// config entries are excluded -- they declare servers for *other* containers,
+/// and labels are image-scoped.
 pub fn merged_mcp_config_to_labels(
     image: &str,
     labels: &BTreeMap<String, String>,
     config_mcp: &BTreeMap<String, McpServerSpec>,
 ) -> Result<BTreeMap<String, String>> {
     let image_mcp = embedded_mcp_from_labels(image, labels)?;
-    mcp_config_to_labels(&merge_mcp(image_mcp, config_mcp))
+    mcp_config_to_labels(&merge_mcp(image_mcp, &primary_scoped_mcp(config_mcp)))
+}
+
+/// The subset of a config MCP table that belongs to the image itself: entries
+/// without a `sidecar`/`image` placement key. Used when serializing config
+/// into an image's own `org.outrig.mcp` label (and its cache key), where
+/// placement keys are rejected on read.
+pub fn primary_scoped_mcp(
+    config: &BTreeMap<String, McpServerSpec>,
+) -> BTreeMap<String, McpServerSpec> {
+    config
+        .iter()
+        .filter(|(_, spec)| spec.sidecar().is_none() && spec.image().is_none())
+        .map(|(name, spec)| (name.clone(), spec.clone()))
+        .collect()
 }
 
 /// Serialize a validated standalone config into the OCI label map buildah
@@ -230,6 +258,18 @@ pub fn parse_standalone_image_labels(
 fn to_json_label<T: serde::Serialize>(key: &str, value: &T) -> Result<String> {
     serde_json::to_string(value)
         .map_err(|source| OutrigError::Configuration(format!("serialize {key} label: {source}")))
+}
+
+/// Lenient runtime read of an image's `org.outrig.mcp` label by tag: a
+/// missing label is an empty map, a malformed one is a hard error. Sidecar
+/// planning uses this to materialize label-declared servers before any
+/// sidecar container exists.
+pub async fn read_embedded_mcp(
+    tag: &crate::image::ImageTag,
+    transcript: Option<&crate::process::Transcript>,
+) -> Result<BTreeMap<String, McpServerSpec>> {
+    let labels = crate::image::read_image_labels(tag, transcript).await?;
+    embedded_mcp_from_labels(&tag.0, &labels)
 }
 
 pub async fn merged_mcp(
@@ -325,6 +365,11 @@ fn parse_mcp_table(
                 server: server.clone(),
             });
         }
+        if spec.sidecar().is_some() || spec.image().is_some() {
+            return Err(EmbeddedImageConfigError::PlacementInLabel {
+                server: server.clone(),
+            });
+        }
     }
     Ok(mcp)
 }
@@ -414,6 +459,11 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
                     server: server.clone(),
                 });
             }
+            if spec.sidecar().is_some() || spec.image().is_some() {
+                return Err(StandaloneImageTomlError::PlacementInLabel {
+                    server: server.clone(),
+                });
+            }
         }
 
         Ok(Self {
@@ -466,11 +516,13 @@ mod tests {
 
     fn full(cmd: &[&str], env: &[(&str, EnvValue)]) -> McpServerSpec {
         McpServerSpec::Full {
-            command: cmd.iter().map(|s| s.to_string()).collect(),
+            command: Some(cmd.iter().map(|s| s.to_string()).collect()),
             env: env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
+            sidecar: None,
+            image: None,
         }
     }
 
@@ -703,6 +755,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_table_rejects_placement_keys() {
+        // Image labels declare servers for the image that carries them;
+        // placement (`sidecar` / `image`) is repo-config-only.
+        let err =
+            parse_mcp_table(r#"{"fs": {"command": ["bin"], "sidecar": "tools"}}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedImageConfigError::PlacementInLabel { ref server } if server == "fs"
+        ));
+
+        let err =
+            parse_mcp_table(r#"{"fs": {"command": ["bin"], "image": "some-img"}}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedImageConfigError::PlacementInLabel { ref server } if server == "fs"
+        ));
+    }
+
+    #[test]
     fn embedded_mcp_missing_label_is_empty() {
         let mcp =
             embedded_mcp_from_labels("img", &BTreeMap::new()).expect("missing label is lenient");
@@ -930,6 +1001,25 @@ mod tests {
         assert!(matches!(
             err,
             StandaloneImageTomlError::EmptyMcpCommand { server } if server == "fs"
+        ));
+    }
+
+    #[test]
+    fn standalone_image_toml_rejects_placement_keys() {
+        let err = parse_standalone_image_toml(
+            r#"
+            [image]
+            ref = "rust-dev"
+
+            [mcp]
+            fs = { command = ["mcp"], sidecar = "tools" }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            StandaloneImageTomlError::PlacementInLabel { server } if server == "fs"
         ));
     }
 }

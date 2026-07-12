@@ -8,7 +8,6 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 | Task | Title                                      | Dependencies |
 |------|--------------------------------------------|--------------|
-| 0079 | Sidecar core + exec-stdio                  | 0078         |
 | 0080 | Sidecar entrypoint-stdio transport         | 0079         |
 | 0081 | Dynamic sidecar addition                   | 0079         |
 

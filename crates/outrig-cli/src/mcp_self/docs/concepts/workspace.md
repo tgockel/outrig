@@ -129,6 +129,19 @@ circumstances:
 The container has its own `/etc`, `/home`, `/tmp`, etc. coming from the image. The only windows
 onto the host filesystem are the primary workspace and the extra mounts you declare.
 
+### Sidecar containers see nothing by default
+
+MCP sidecar containers (see [Containers](containers.md#sidecar-containers)) get their own,
+stricter defaults: `workspace = "none"` -- a sidecar sees no host directory at all unless its
+block asks. `workspace = "ro"` mounts the session workspace read-only at the primary's
+container path (and makes it the working directory for the sidecar's servers);
+`workspace = "rw"` mounts it read-write. Extra `mounts` entries on a sidecar use the same
+shape and validation as `[[workspace.mounts]]`.
+
+Sidecars run with `--userns=keep-id` like the primary. The in-container user bootstrap runs
+only where identity matters: the sidecar hosts at least one exec-stdio server, sees the
+workspace, or declares mounts. A mount-less sidecar keeps the image's own `USER` untouched.
+
 ## Network is *not* part of the workspace
 
 By default, outrig grants the container full outbound network access. This means an agent with

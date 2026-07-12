@@ -47,6 +47,7 @@ async fn ensure_curl_image(context: &Path) -> ImageTag {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
     };
     image::ensure_image(&cfg, context, false)
         .await

@@ -73,6 +73,7 @@ async fn ensure_image_with_labels(labels: &[(&str, &str)]) -> ImageTag {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
     };
     image::ensure_image(&cfg, ctx.path(), false)
         .await
@@ -97,6 +98,7 @@ async fn ensure_label_free_image() -> ImageTag {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
     };
     image::ensure_image(&cfg, &fixture_mcp_fs_dir(), false)
         .await

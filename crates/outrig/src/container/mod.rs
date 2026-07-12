@@ -12,6 +12,7 @@
 //!    the process is unwinding from a panic and `Drop` cannot run.
 
 pub mod embedded;
+pub mod sidecar;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -64,12 +65,22 @@ pub struct ContainerInspect {
     pub running: bool,
 }
 
+/// Podman container label carrying the owning session id. Set on every
+/// session-owned container (primary and sidecars) so `outrig clean` can sweep
+/// strays even when the session record is lost.
+pub const LABEL_SESSION: &str = "org.outrig.session";
+
+/// Podman container label carrying a sidecar's config name. Set only on
+/// sidecar containers.
+pub const LABEL_SIDECAR: &str = "org.outrig.sidecar";
+
 /// Complete inputs for a `podman run`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerLaunchSpec {
     pub workspace: Option<ContainerWorkspace>,
     pub mounts: Vec<ContainerMount>,
     pub capabilities: ContainerCapabilities,
+    pub labels: BTreeMap<String, String>,
 }
 
 impl ContainerLaunchSpec {
@@ -78,18 +89,22 @@ impl ContainerLaunchSpec {
             workspace: Some(ContainerWorkspace {
                 host: host.into(),
                 container: container.into(),
+                access: MountAccess::ReadWrite,
             }),
             mounts: Vec::new(),
             capabilities: ContainerCapabilities::default(),
+            labels: BTreeMap::new(),
         }
     }
 }
 
-/// Primary read-write workspace mount. When present, this also sets `-w`.
+/// Primary workspace mount. When present, this also sets `-w`. The session's
+/// own container mounts it read-write; sidecars may take a read-only view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerWorkspace {
     pub host: PathBuf,
     pub container: PathBuf,
+    pub access: MountAccess,
 }
 
 /// Extra bind mount. These do not affect the container working directory.
@@ -495,6 +510,14 @@ fn first_colon_field(stdout: &[u8]) -> Option<String> {
     }
 }
 
+/// Best-effort, fire-and-forget `podman rm -f <name>`. Public form of the
+/// `Drop`/panic-hook sweeper for callers that must reap a container they do
+/// not hold a `Container` handle for (e.g. the session watcher reaping
+/// sidecars after the primary dies out from under outrig).
+pub fn force_remove_detached(name: &str) {
+    spawn_detached_rm(name);
+}
+
 /// Best-effort `podman rm -f <name>` with stdio nulled. Synchronous,
 /// detached, requires no tokio runtime -- safe from `Drop` and panic hooks.
 fn spawn_detached_rm(name: &str) {
@@ -516,12 +539,16 @@ fn build_podman_run_cmd(
         .args(["run", "-d", "--rm", "--name"])
         .arg(name);
 
+    for (key, value) in &launch.labels {
+        cmd = cmd.arg("--label").arg(format!("{key}={value}"));
+    }
+
     if let Some(workspace) = &launch.workspace {
         cmd = append_bind_mount(
             cmd,
             &workspace.host,
             &workspace.container,
-            MountAccess::ReadWrite,
+            workspace.access,
             selinux,
         );
     }
@@ -705,6 +732,7 @@ mod tests {
             workspace: Some(ContainerWorkspace {
                 host: "/host/repo".into(),
                 container: "/workspace".into(),
+                access: MountAccess::ReadWrite,
             }),
             mounts: vec![
                 ContainerMount {
@@ -719,6 +747,7 @@ mod tests {
                 },
             ],
             capabilities: ContainerCapabilities::default(),
+            labels: BTreeMap::new(),
         };
 
         let args = argv(build_podman_run_cmd(
@@ -756,6 +785,59 @@ mod tests {
     }
 
     #[test]
+    fn podman_run_args_include_labels_and_ro_workspace() {
+        let launch = ContainerLaunchSpec {
+            workspace: Some(ContainerWorkspace {
+                host: "/host/repo".into(),
+                container: "/workspace".into(),
+                access: MountAccess::ReadOnly,
+            }),
+            mounts: Vec::new(),
+            capabilities: ContainerCapabilities::default(),
+            labels: BTreeMap::from([
+                (
+                    LABEL_SESSION.to_string(),
+                    "20260711T000000-abcd".to_string(),
+                ),
+                (LABEL_SIDECAR.to_string(), "tools".to_string()),
+            ]),
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-20260711T000000-abcd-tools",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-20260711T000000-abcd-tools",
+                "--label",
+                "org.outrig.session=20260711T000000-abcd",
+                "--label",
+                "org.outrig.sidecar=tools",
+                "-v",
+                "/host/repo:/workspace:ro",
+                "--userns=keep-id",
+                "-w",
+                "/workspace",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    #[test]
     fn podman_run_args_apply_selinux_to_every_mount_without_workdir() {
         let launch = ContainerLaunchSpec {
             workspace: None,
@@ -765,6 +847,7 @@ mod tests {
                 access: MountAccess::ReadOnly,
             }],
             capabilities: ContainerCapabilities::default(),
+            labels: BTreeMap::new(),
         };
 
         let args = argv(build_podman_run_cmd(
@@ -805,6 +888,7 @@ mod tests {
                 cap_drop: Vec::new(),
                 cap_add: Vec::new(),
             },
+            labels: BTreeMap::new(),
         };
 
         let args = argv(build_podman_run_cmd(
@@ -844,6 +928,7 @@ mod tests {
                 cap_drop: vec!["CAP_MKNOD".to_string()],
                 cap_add: vec!["CAP_NET_BIND_SERVICE".to_string()],
             },
+            labels: BTreeMap::new(),
         };
 
         let args = argv(build_podman_run_cmd(

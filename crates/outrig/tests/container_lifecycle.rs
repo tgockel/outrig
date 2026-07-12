@@ -15,6 +15,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -141,6 +142,7 @@ async fn extra_mounts_enforce_access_modes() {
             workspace: Some(ContainerWorkspace {
                 host: host_ws.path().to_path_buf(),
                 container: PathBuf::from("/workspace"),
+                access: MountAccess::ReadWrite,
             }),
             mounts: vec![
                 ContainerMount {
@@ -155,6 +157,7 @@ async fn extra_mounts_enforce_access_modes() {
                 },
             ],
             capabilities: ContainerCapabilities::default(),
+            labels: BTreeMap::new(),
         },
     )
     .await
@@ -213,6 +216,7 @@ async fn capability_flags_are_recorded_in_podman_create_command() {
                 cap_drop: Vec::new(),
                 cap_add: vec!["NET_BIND_SERVICE".to_string()],
             },
+            labels: BTreeMap::new(),
         },
     )
     .await

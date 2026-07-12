@@ -85,3 +85,19 @@ build-args = { NODE_VERSION = "20" }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
+  grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+  lint  = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
+
+  [images.coding.sidecars.tools]
+  image      = "mcp-tools"
+  workspace  = "ro"
+  start      = "auto"
+  on-failure = "warn"
+
+  [[images.coding.sidecars.tools.mounts]]
+  host-path      = ".agents/outrig/resources/cache"
+  container-path = "/cache"
+  access         = "read-write"
+
+  [images.coding.sidecars.tools.security]
+  capability-profile = "no-net-raw"
