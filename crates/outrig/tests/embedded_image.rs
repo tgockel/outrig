@@ -51,6 +51,35 @@ fn mcp_label_json(mcp: &BTreeMap<String, McpServerSpec>) -> String {
     serde_json::to_string(mcp).expect("serialize mcp label json")
 }
 
+/// Tempdir image context whose Dockerfile carries only a malformed
+/// `org.outrig.mcp` label on the alpine base -- the parse failure under test
+/// never touches the layer contents, so no tooling is installed.
+fn malformed_label_context() -> tempfile::TempDir {
+    let ctx = tempfile::tempdir().expect("tempdir image context");
+    let dockerfile = format!(
+        "FROM docker.io/library/alpine:latest\n{}",
+        label_line(embedded::LABEL_MCP, r#"{"fs": ["#),
+    );
+    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
+    ctx
+}
+
+/// `ensure_image` over a Build-source config rooted at `project_dir` (which
+/// must contain a `Dockerfile`). Returns the result so tests can assert on
+/// build-time failures.
+async fn try_ensure_built_image(project_dir: &Path) -> outrig::error::Result<ImageTag> {
+    let cfg = ImageConfig {
+        image_name: None,
+        dockerfile: Some("Dockerfile".into()),
+        context: Some(".".into()),
+        build_args: BTreeMap::new(),
+        security: Default::default(),
+        mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
+    };
+    Ok(image::ensure_image(&cfg, project_dir, false).await?.tag)
+}
+
 /// Build an alpine + filesystem-MCP fixture image carrying `labels` (stamped via
 /// Dockerfile `LABEL`, mirroring what `outrig image build` stamps via
 /// `--label`). An empty slice builds a label-free image.
@@ -65,20 +94,9 @@ async fn ensure_image_with_labels(labels: &[(&str, &str)]) -> ImageTag {
         dockerfile.push_str(&label_line(key, value));
     }
     std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
-
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
-    image::ensure_image(&cfg, ctx.path(), false)
+    try_ensure_built_image(ctx.path())
         .await
         .expect("ensure embedded fixture image")
-        .tag
 }
 
 /// Convenience over [`ensure_image_with_labels`] for the common case: stamp just
@@ -91,19 +109,9 @@ async fn ensure_image_with_mcp(mcp: &BTreeMap<String, McpServerSpec>) -> ImageTa
 /// Build a label-free image (the committed mcp-fs fixture has the tool binaries
 /// but no `org.outrig.*` labels) -- runtime must fall back to repo config.
 async fn ensure_label_free_image() -> ImageTag {
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
-    image::ensure_image(&cfg, &fixture_mcp_fs_dir(), false)
+    try_ensure_built_image(&fixture_mcp_fs_dir())
         .await
         .expect("ensure mcp-fs fixture image")
-        .tag
 }
 
 async fn start_and_bootstrap(image: &ImageTag, host_ws: &Path) -> Container {
@@ -237,19 +245,64 @@ async fn missing_label_falls_back_to_config() {
 }
 
 #[tokio::test]
-async fn malformed_mcp_label_is_hard_error() {
+async fn malformed_mcp_label_fails_ensure_image() {
     common::init_tracing();
     let _guard = E2E_LOCK.lock().await;
-    let image = ensure_image_with_labels(&[(embedded::LABEL_MCP, r#"{"fs": ["#)]).await;
-    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
-    let container = start_and_bootstrap(&image, host_ws.path()).await;
+    // Repo builds re-merge inherited labels into the cache tag
+    // (stamp_repo_image_labels), so a malformed org.outrig.mcp label fails the
+    // build itself rather than the later runtime read.
+    let ctx = malformed_label_context();
 
+    let err = try_ensure_built_image(ctx.path())
+        .await
+        .expect_err("malformed org.outrig.mcp label should fail ensure_image");
+    assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+}
+
+#[tokio::test]
+async fn malformed_mcp_label_on_raw_image_fails_runtime_read() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    // A raw (non-built) image ref skips the build path's label re-merge, so a
+    // malformed label must still hard-error at the runtime read. The standalone
+    // build stamps nothing beyond the Dockerfile's own labels, and the fixed
+    // tag is rebuilt on every run, so nothing accumulates in local storage.
+    let ctx = malformed_label_context();
+    let tag = ImageTag("outrig-raw-malformed:e2e".to_string());
+    image::build_standalone(
+        ctx.path(),
+        Path::new("Dockerfile"),
+        Path::new("."),
+        &tag,
+        false,
+        &BTreeMap::new(),
+    )
+    .await
+    .expect("build raw fixture image");
+
+    // ensure_image on an image-ref config only probes/pulls -- it must not
+    // re-validate labels, so the malformed image passes here.
+    let cfg = ImageConfig {
+        image_name: Some(tag.0.clone()),
+        dockerfile: None,
+        context: None,
+        build_args: BTreeMap::new(),
+        security: Default::default(),
+        mcp: BTreeMap::new(),
+        sidecars: BTreeMap::new(),
+    };
+    let image = image::ensure_image(&cfg, ctx.path(), false)
+        .await
+        .expect("raw image ref should pass ensure_image without label validation")
+        .tag;
+
+    // merged_mcp reads labels off the handle's image tag without ever exec'ing
+    // into the container, so an attached handle stands in for a running one.
+    let container = Container::attach("raw-malformed-runtime-read", image, None, None);
     let err = embedded::merged_mcp(&container, &BTreeMap::new())
         .await
-        .expect_err("malformed org.outrig.mcp label should fail");
+        .expect_err("malformed org.outrig.mcp label should fail the runtime read");
     assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
-
-    container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
 #[tokio::test]

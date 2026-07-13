@@ -673,6 +673,15 @@ mod tests {
     }
 
     #[test]
+    fn merged_mcp_config_labels_reject_malformed_inherited_label() {
+        let inherited = BTreeMap::from([(LABEL_MCP.to_string(), r#"{"fs": ["#.to_string())]);
+
+        let err = merged_mcp_config_to_labels("img", &inherited, &BTreeMap::new()).unwrap_err();
+
+        assert!(matches!(err, OutrigError::EmbeddedImageConfigParse { .. }));
+    }
+
+    #[test]
     fn standalone_image_labels_read_metadata_and_mcp() {
         let mut mcp = BTreeMap::new();
         mcp.insert(
