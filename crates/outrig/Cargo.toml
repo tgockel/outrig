@@ -48,3 +48,4 @@ walkdir            = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json", "rustls"] }
+toml    = { workspace = true, features = ["parse", "serde"] }

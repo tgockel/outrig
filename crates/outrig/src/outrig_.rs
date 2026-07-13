@@ -11,14 +11,15 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::{
-    CapabilityProfile, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef, McpServerSpec,
-    MountAccess, NetworkMode, NetworkPolicy, SidecarWorkspaceAccess, Workspace,
+    CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef,
+    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, SidecarStart, SidecarWorkspaceAccess,
     is_valid_mcp_server_name, is_valid_sidecar_name,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     LABEL_SESSION, LABEL_SIDECAR,
     embedded::{self, McpDeclarationSource},
+    sidecar::{self, Placement, SessionMcpPlan},
 };
 use crate::error::{OutrigError, Result};
 use crate::image::{self, ImageTag};
@@ -263,22 +264,50 @@ impl LaunchSpec {
         }
     }
 
-    /// Build a `LaunchSpec` from a parsed `[images.<name>]` block plus
-    /// the project's `[workspace]`. Resolves repo-relative paths against
-    /// `repo_root` so the resulting spec carries absolute paths and is
-    /// independent of the caller's current directory.
-    pub fn from_image_config(
-        cfg: &ImageConfig,
-        workspace: &Workspace,
+    /// Build a `LaunchSpec` from a parsed [`Config`], selecting the primary
+    /// image by name. `image_name` must name an `[images.<name>]` block --
+    /// raw primary refs are [`LaunchSpec::from_image`]'s job. Repo-relative
+    /// paths resolve against `repo_root` so the spec carries absolute paths.
+    ///
+    /// Unlike a verbatim copy of the image's `[mcp]` map, this resolves MCP
+    /// placement into sidecars: `[images.<name>.sidecars.<sc>]` blocks and
+    /// placement-bearing entries (`sidecar = "<sc>"`, inline `image = "..."`
+    /// with a `command`) become [`SidecarSpec`]s on the returned spec, so
+    /// [`Outrig::launch`] no longer rejects them. Named-sidecar and anonymous
+    /// images resolve like `--image` (a sibling `[images.<name>]` block first,
+    /// else a raw local ref) and are **built/pulled eagerly here**; the primary
+    /// image is still built lazily by `launch`.
+    ///
+    /// Scope of the library translation (the CLI path is a strict superset):
+    /// - `start = "manual"` sidecars are skipped -- neither started nor carried.
+    ///   Rebuild a [`SidecarSpec`] and call [`Outrig::add_sidecar`] to start one
+    ///   mid-session.
+    /// - Entrypoint-stdio placements (an inline `image` with no `command`) have
+    ///   no exec-stdio library form and are rejected with an error; run those
+    ///   via the CLI (`outrig run` / `outrig mcp`).
+    /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
+    ///   servers come only from the repo config's placement entries.
+    ///
+    /// Assumes `config` has passed validation (see [`Config`]); an unvalidated
+    /// config can silently drop a server that names a missing sidecar block.
+    pub async fn from_config(
+        config: &Config,
+        image_name: &str,
         repo_root: &Path,
         log_dir: PathBuf,
-    ) -> Self {
-        let host = resolve_workspace_host(repo_root, &workspace.host_path);
+    ) -> Result<Self> {
+        let cfg = config.images.get(image_name).ok_or_else(|| {
+            OutrigError::Configuration(format!(
+                "image-config {image_name:?} does not match any [images.<name>]"
+            ))
+        })?;
+
         let ws = WorkspaceSpec {
-            host,
-            container: workspace.container_path.clone(),
+            host: resolve_workspace_host(repo_root, &config.workspace.host_path),
+            container: config.workspace.container_path.clone(),
         };
-        let mounts = workspace
+        let mounts = config
+            .workspace
             .mounts
             .iter()
             .map(|mount| MountSpec {
@@ -287,40 +316,38 @@ impl LaunchSpec {
                 access: mount.access,
             })
             .collect();
-        match cfg.source() {
+        let source = match cfg.source() {
             ImageSourceRef::Build {
                 dockerfile,
                 context,
                 build_args,
-            } => Self {
-                source: LaunchSource::Build {
-                    dockerfile: repo_root.join(dockerfile),
-                    context: repo_root.join(context),
-                    build_args: build_args.clone(),
-                },
-                workspace: Some(ws),
-                mounts,
-                security: SecuritySpec::from(&cfg.security),
-                network: NetworkSpec::default(),
-                embedded_mcp_policy: EmbeddedMcpPolicy::default(),
-                mcp: cfg.mcp.clone(),
-                sidecars: Vec::new(),
-                log_dir,
+            } => LaunchSource::Build {
+                dockerfile: repo_root.join(dockerfile),
+                context: repo_root.join(context),
+                build_args: build_args.clone(),
             },
-            ImageSourceRef::Image { image_name } => Self {
-                source: LaunchSource::Image {
-                    tag: image_name.to_string(),
-                },
-                workspace: Some(ws),
-                mounts,
-                security: SecuritySpec::from(&cfg.security),
-                network: NetworkSpec::default(),
-                embedded_mcp_policy: EmbeddedMcpPolicy::default(),
-                mcp: cfg.mcp.clone(),
-                sidecars: Vec::new(),
-                log_dir,
+            ImageSourceRef::Image { image_name } => LaunchSource::Image {
+                tag: image_name.to_string(),
             },
+        };
+
+        let plan = sidecar::plan_from_config(cfg);
+        let (mcp, mut sidecars) = plan_to_launch_parts(&plan, repo_root)?;
+        for sidecar in &mut sidecars {
+            sidecar.image = resolve_sidecar_image_tag(config, repo_root, &sidecar.image).await?;
         }
+
+        Ok(Self {
+            source,
+            workspace: Some(ws),
+            mounts,
+            security: SecuritySpec::from(&cfg.security),
+            network: NetworkSpec::default(),
+            embedded_mcp_policy: EmbeddedMcpPolicy::default(),
+            mcp,
+            sidecars,
+            log_dir,
+        })
     }
 
     pub fn with_workspace(mut self, workspace: WorkspaceSpec) -> Self {
@@ -385,6 +412,88 @@ fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         repo_root.join(path)
+    }
+}
+
+/// Split a planned session into the primary MCP map and the launch-time
+/// sidecars. Pure -- no image resolution, so each `SidecarSpec.image` still
+/// holds the unresolved config ref for [`LaunchSpec::from_config`] to rewrite.
+/// `start = "manual"` sidecars are dropped (their servers, being sidecar-placed,
+/// are already absent from the primary map); an entrypoint-stdio placement has
+/// no exec-stdio library form and is an error.
+fn plan_to_launch_parts(
+    plan: &SessionMcpPlan,
+    repo_root: &Path,
+) -> Result<(BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>)> {
+    let mcp = plan
+        .servers
+        .iter()
+        .filter(|(_, placed)| placed.placement == Placement::Primary)
+        .map(|(name, placed)| (name.clone(), placed.spec.clone()))
+        .collect();
+
+    let mut sidecars = Vec::new();
+    for sc in plan.sidecars.values() {
+        if sc.start != SidecarStart::Auto {
+            continue;
+        }
+        if let Some((server, _)) = plan.entrypoint_server_in(sc) {
+            return Err(OutrigError::Configuration(format!(
+                "mcp server {server:?} is entrypoint-stdio (an inline image with no command); \
+                 the library facade hosts exec-stdio servers only -- run it via the CLI \
+                 (outrig run / outrig mcp) or give the server a command"
+            )));
+        }
+        let servers = plan
+            .servers_in(&sc.name)
+            .map(|(name, placed)| {
+                let (command, env) = placed.spec.normalize();
+                (name.clone(), SidecarServerSpec { command, env })
+            })
+            .collect();
+        let mounts = sc
+            .mounts
+            .iter()
+            .map(|mount| MountSpec {
+                host: resolve_workspace_host(repo_root, &mount.host_path),
+                container: mount.container_path.clone(),
+                access: mount.access,
+            })
+            .collect();
+        sidecars.push(SidecarSpec {
+            name: sc.name.clone(),
+            image: sc.image.clone(),
+            workspace: sc.workspace,
+            mounts,
+            security: SecuritySpec::from(&sc.security),
+            servers,
+        });
+    }
+    Ok((mcp, sidecars))
+}
+
+/// Resolve a sidecar image ref like `--image`: a sibling `[images.<name>]`
+/// config builds/pulls through the content-hash cache; an unmatched name is a
+/// raw podman ref that must already be present locally (no pull). Returns the
+/// resolved tag used verbatim as [`SidecarSpec::image`]. Mirrors the CLI's
+/// `ensure_sidecar_image`.
+async fn resolve_sidecar_image_tag(
+    config: &Config,
+    repo_root: &Path,
+    image_ref: &str,
+) -> Result<String> {
+    match config.images.get(image_ref) {
+        Some(image_cfg) => {
+            let tag = image::compute_tag_for(image_ref, image_cfg, repo_root).await?;
+            image::ensure_tagged_image_for(image_ref, image_cfg, repo_root, &tag, false, None)
+                .await?;
+            Ok(tag.0)
+        }
+        None => {
+            let tag = ImageTag(image_ref.to_string());
+            image::ensure_local_image(&tag, None).await?;
+            Ok(tag.0)
+        }
     }
 }
 
@@ -509,10 +618,10 @@ impl Outrig {
         };
 
         // The effective MCP map runs in the primary; a placement-bearing
-        // entry (e.g. copied from a repo config by
-        // `LaunchSpec::from_image_config`) would silently run there
-        // otherwise. The library route for sidecar-hosted servers is a
-        // `SidecarSpec`, which carries its own servers.
+        // entry would silently run there otherwise. `LaunchSpec::from_config`
+        // translates config placement into `SidecarSpec`s, so this guards
+        // hand-built specs -- the library route for sidecar-hosted servers is
+        // a `SidecarSpec`, which carries its own servers.
         for (name, server) in &mcp {
             if server.spec.sidecar().is_some() || server.spec.image().is_some() {
                 return Err(OutrigError::Configuration(format!(
@@ -945,5 +1054,166 @@ mod tests {
         let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars)
             .expect_err("duplicate sidecar name must fail");
         assert!(err.to_string().contains("already running"), "{err}");
+    }
+
+    /// Translate the `[images.primary]` block of `toml_src` the way
+    /// `from_config` does, minus the async image resolution -- so sidecar
+    /// images stay their unresolved config refs.
+    fn launch_parts(toml_src: &str) -> Result<(BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>)> {
+        let config: Config = toml::from_str(toml_src).expect("parse config");
+        let cfg = config.images.get("primary").expect("primary image-config");
+        plan_to_launch_parts(&sidecar::plan_from_config(cfg), Path::new("/repo"))
+    }
+
+    #[test]
+    fn from_config_keeps_primary_servers_in_mcp() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fs = { command = ["mcp-fs", "/workspace"] }
+shell = ["bash", "-lc", "sh"]
+"#,
+        )
+        .expect("translation succeeds");
+
+        let names: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["fs", "shell"]);
+        assert!(sidecars.is_empty(), "no placement -> no sidecars");
+    }
+
+    #[test]
+    fn from_config_translates_named_sidecar() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fs = { command = ["mcp-fs"] }
+lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools", env = { LINT = "1" } }
+[images.primary.sidecars.tools]
+image = "mcp-tools"
+workspace = "ro"
+[[images.primary.sidecars.tools.mounts]]
+host-path = "cache"
+container-path = "/cache"
+access = "read-write"
+[images.primary.sidecars.tools.security]
+capability-profile = "no-net-raw"
+"#,
+        )
+        .expect("translation succeeds");
+
+        let primary: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
+        assert_eq!(primary, ["fs"], "placed server left the primary map");
+
+        assert_eq!(sidecars.len(), 1);
+        let tools = &sidecars[0];
+        assert_eq!(tools.name, "tools");
+        assert_eq!(
+            tools.image, "mcp-tools",
+            "image ref stays unresolved for the caller"
+        );
+        assert_eq!(tools.workspace, SidecarWorkspaceAccess::Ro);
+        assert_eq!(tools.mounts.len(), 1);
+        assert_eq!(tools.mounts[0].host, PathBuf::from("/repo/cache"));
+        assert_eq!(
+            tools.security.capabilities.profile,
+            CapabilityProfile::NoNetRaw
+        );
+        let lint = &tools.servers["lint"];
+        assert_eq!(lint.command, ["mcp-lint", "--stdio"]);
+        assert!(lint.env.contains_key("LINT"));
+    }
+
+    #[test]
+    fn from_config_translates_anonymous_exec_sidecar() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
+"#,
+        )
+        .expect("translation succeeds");
+
+        assert!(mcp.is_empty(), "anonymous server is sidecar-placed");
+        assert_eq!(sidecars.len(), 1);
+        assert_eq!(sidecars[0].name, "grep");
+        assert_eq!(sidecars[0].image, "ghcr.io/example/mcp-grep:1");
+        assert_eq!(sidecars[0].servers["grep"].command, ["mcp-grep"]);
+    }
+
+    #[test]
+    fn from_config_skips_manual_sidecars() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+lint = { command = ["mcp-lint"], sidecar = "tools" }
+[images.primary.sidecars.tools]
+image = "mcp-tools"
+start = "manual"
+"#,
+        )
+        .expect("translation succeeds");
+
+        assert!(
+            mcp.is_empty(),
+            "manual sidecar's server is not primary-hosted"
+        );
+        assert!(
+            sidecars.is_empty(),
+            "manual sidecar is not started at launch"
+        );
+    }
+
+    #[test]
+    fn from_config_rejects_entrypoint_stdio() {
+        let err = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "abc" } }
+"#,
+        )
+        .expect_err("entrypoint-stdio has no library form");
+        let msg = err.to_string();
+        assert!(msg.contains("fetch"), "{msg}");
+        assert!(msg.contains("entrypoint-stdio"), "{msg}");
+    }
+
+    #[test]
+    fn from_config_partitions_mixed_placements() {
+        let (mcp, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fs = { command = ["mcp-fs"] }
+lint = { command = ["mcp-lint"], sidecar = "tools" }
+grep = { command = ["mcp-grep"], image = "grep:1" }
+slow = { command = ["mcp-slow"], sidecar = "later" }
+[images.primary.sidecars.tools]
+image = "mcp-tools"
+[images.primary.sidecars.later]
+image = "mcp-later"
+start = "manual"
+"#,
+        )
+        .expect("translation succeeds");
+
+        let primary: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
+        assert_eq!(primary, ["fs"], "only the unplaced server stays primary");
+        let names: Vec<&str> = sidecars.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["grep", "tools"],
+            "manual `later` dropped; BTreeMap name order"
+        );
     }
 }

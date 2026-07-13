@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use outrig::config::McpServerSpec;
+use outrig::config::{Config, McpServerSpec};
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountAccess, MountSpec,
     NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarWorkspaceAccess,
@@ -328,6 +328,90 @@ async fn launch_with_sidecar_starts_it() {
     );
 
     outrig.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn from_config_resolves_and_starts_a_config_sidecar() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-from-config-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    // `[sidecars.tools].image = "toolsimg"` names a sibling `[images.toolsimg]`
+    // block, so `from_config` must resolve the config name like `--image`
+    // (here to the already-local fixture tag) before it can start the sidecar.
+    let config_toml = format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[images.primary]
+image-name = "{tag}"
+
+[images.toolsimg]
+image-name = "{tag}"
+
+[images.primary.mcp]
+sidefs = {{ command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }}
+
+[images.primary.sidecars.tools]
+image = "toolsimg"
+workspace = "ro"
+"#,
+        host_ws = host_ws.path().display(),
+    );
+    let config: Config = toml::from_str(&config_toml).expect("parse config");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "primary",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config resolves the sidecar image and translates placement");
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    assert!(
+        outrig.tools().iter().any(|t| t.server == "sidefs"),
+        "config sidecar server should appear in tools(): {:?}",
+        outrig
+            .tools()
+            .iter()
+            .map(|t| (&t.server, &t.name))
+            .collect::<Vec<_>>(),
+    );
+
+    let result = outrig
+        .call_tool(
+            "sidefs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool via config-declared sidecar server");
+    assert!(
+        result.content_text.contains("MARKER.txt"),
+        "sidecar list_directory should see the workspace, got: {}",
+        result.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("tools"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
 }
 
 #[tokio::test]
