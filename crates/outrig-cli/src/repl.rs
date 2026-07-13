@@ -1,11 +1,13 @@
 //! Interactive stdin/stdout REPL with slash commands.
 //!
 //! `Repl::run` drives the I/O loop: print a banner on stderr, prompt with `> `,
-//! and feed each non-slash line to a caller-supplied async callback. Slash
-//! commands (`/help`, `/quit`, `/tools`, `/reset`, `/sidecar`) are handled
-//! here; `/tools`, `/reset`, and `/sidecar` defer to caller-supplied
-//! callbacks for their text + side effects (history clearing, tool-list
-//! assembly, sidecar starts). EOF (Ctrl-D) and `/quit` exit cleanly. SIGINT
+//! and feed each non-slash line to a caller-supplied async callback. Only
+//! `/help` and `/quit` are built in; every other slash command belongs to the
+//! caller, which supplies its help line (via [`HelpEntry`]) and its semantics
+//! (via the `on_command` dispatcher). The dispatcher receives the command
+//! name and its whitespace-split arguments and returns the stderr text, or
+//! `None` for a command it doesn't know -- the REPL then prints the
+//! unknown-command notice. EOF (Ctrl-D) and `/quit` exit cleanly. SIGINT
 //! during a callback cancels the in-flight future, prints
 //! `[outrig] interrupted`, and returns to the prompt; a second consecutive
 //! SIGINT (no input typed in between) exits.
@@ -19,21 +21,49 @@
 //! can substitute `tokio::io::duplex` halves and a `tokio::sync::Notify`-driven
 //! interrupt source.
 
+use std::fmt::Write as _;
 use std::future::Future;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::error::Result;
 
-const HELP_TEXT: &str = "\
-[outrig] slash commands:
-  /help                 show this help
-  /tools                list registered tools
-  /reset                clear conversation history
-  /sidecar add <name>   start a config-declared manual sidecar
-  /sidecar list         show declared sidecars and their status
-  /quit                 exit the session
-";
+/// One caller-owned slash command's `/help` line. `syntax` carries the
+/// leading `/` and any argument placeholders (e.g. `/sidecar add <name>`);
+/// the REPL owns layout, so entries stay aligned with the built-in `/help`
+/// and `/quit` lines no matter how long the syntax column grows.
+pub struct HelpEntry {
+    pub syntax: &'static str,
+    pub description: &'static str,
+}
+
+const HELP_BUILTIN_FIRST: HelpEntry = HelpEntry {
+    syntax: "/help",
+    description: "show this help",
+};
+
+const HELP_BUILTIN_LAST: HelpEntry = HelpEntry {
+    syntax: "/quit",
+    description: "exit the session",
+};
+
+/// Compose the `/help` text: header, built-in `/help`, the caller's entries
+/// in order, built-in `/quit` -- one syntax column padded across all lines.
+pub(crate) fn compose_help(commands: &[HelpEntry]) -> String {
+    let all = std::iter::once(&HELP_BUILTIN_FIRST)
+        .chain(commands)
+        .chain(std::iter::once(&HELP_BUILTIN_LAST));
+    let pad = all
+        .clone()
+        .map(|entry| entry.syntax.len())
+        .max()
+        .expect("built-ins make the iterator non-empty");
+    let mut buf = String::from("[outrig] slash commands:\n");
+    for entry in all {
+        let _ = writeln!(buf, "  {:<pad$}   {}", entry.syntax, entry.description);
+    }
+    buf
+}
 
 const INTERRUPT_NOTICE: &[u8] = b"\n[outrig] interrupted\n";
 
@@ -46,28 +76,25 @@ impl Repl {
     /// for every non-slash, non-empty input line and its non-empty returned
     /// text is printed to stdout. Streaming callers may write incrementally
     /// during the callback and return an empty string to suppress trailing
-    /// reprint. `on_tools` and `on_reset` produce the stderr text for `/tools`
-    /// and `/reset` respectively (and `on_reset` is the side-effect site for
-    /// clearing whatever conversation state the caller owns). `on_sidecar`
-    /// receives `/sidecar`'s whitespace-split arguments (`["add", "tools"]`,
-    /// `["list"]`, possibly empty) and produces the stderr text; subcommand
-    /// parsing and side effects are the caller's.
-    pub async fn run<P, PFut, T, TFut, R, RFut, S, SFut>(
+    /// reprint.
+    ///
+    /// Slash commands other than the built-in `/help` and `/quit` go to
+    /// `on_command` as `(name, whitespace-split args)` -- `("sidecar",
+    /// ["add", "tools"])`, `("tools", [])`. `Some(text)` is printed to
+    /// stderr (side effects are the caller's); `None` means the command is
+    /// unknown and the REPL prints the notice. `commands` supplies the
+    /// caller commands' `/help` lines.
+    pub async fn run<P, PFut, C, CFut>(
         banner: &str,
+        commands: &[HelpEntry],
         on_prompt: P,
-        on_tools: T,
-        on_reset: R,
-        on_sidecar: S,
+        on_command: C,
     ) -> Result<()>
     where
         P: FnMut(String) -> PFut,
         PFut: Future<Output = Result<String>>,
-        T: FnMut() -> TFut,
-        TFut: Future<Output = String>,
-        R: FnMut() -> RFut,
-        RFut: Future<Output = String>,
-        S: FnMut(Vec<String>) -> SFut,
-        SFut: Future<Output = String>,
+        C: FnMut(String, Vec<String>) -> CFut,
+        CFut: Future<Output = Option<String>>,
     {
         let stdin = BufReader::new(tokio::io::stdin());
         let stdout = tokio::io::stdout();
@@ -78,10 +105,9 @@ impl Repl {
             stderr,
             ctrl_c_signal,
             banner,
+            commands,
             on_prompt,
-            on_tools,
-            on_reset,
-            on_sidecar,
+            on_command,
         )
         .await
     }
@@ -92,16 +118,15 @@ impl Repl {
     /// interrupt closure to exercise EOF, slash commands, and SIGINT
     /// handling without touching real signals or terminals.
     #[allow(clippy::too_many_arguments)]
-    pub async fn run_with<RD, W, E, I, IFut, P, PFut, T, TFut, R, RFut, S, SFut>(
+    pub async fn run_with<RD, W, E, I, IFut, P, PFut, C, CFut>(
         stdin: RD,
         mut stdout: W,
         mut stderr: E,
         mut interrupt: I,
         banner: &str,
+        commands: &[HelpEntry],
         mut on_prompt: P,
-        mut on_tools: T,
-        mut on_reset: R,
-        mut on_sidecar: S,
+        mut on_command: C,
     ) -> Result<()>
     where
         RD: AsyncBufRead + Unpin,
@@ -111,12 +136,8 @@ impl Repl {
         IFut: Future<Output = ()>,
         P: FnMut(String) -> PFut,
         PFut: Future<Output = Result<String>>,
-        T: FnMut() -> TFut,
-        TFut: Future<Output = String>,
-        R: FnMut() -> RFut,
-        RFut: Future<Output = String>,
-        S: FnMut(Vec<String>) -> SFut,
-        SFut: Future<Output = String>,
+        C: FnMut(String, Vec<String>) -> CFut,
+        CFut: Future<Output = Option<String>>,
     {
         if !banner.is_empty() {
             stderr.write_all(banner.as_bytes()).await?;
@@ -126,6 +147,7 @@ impl Repl {
             stderr.flush().await?;
         }
 
+        let help_text = compose_help(commands);
         let mut lines = stdin.lines();
         let mut last_was_interrupt = false;
 
@@ -160,32 +182,22 @@ impl Repl {
 
             last_was_interrupt = false;
 
-            if let Some(cmd) = trimmed.strip_prefix('/') {
-                match cmd {
-                    "quit" => return Ok(()),
-                    "help" => {
-                        stderr.write_all(HELP_TEXT.as_bytes()).await?;
-                        stderr.flush().await?;
-                    }
-                    "tools" => {
-                        write_stderr_line(&mut stderr, &on_tools().await).await?;
-                    }
-                    "reset" => {
-                        write_stderr_line(&mut stderr, &on_reset().await).await?;
-                    }
-                    _ if cmd == "sidecar" || cmd.starts_with("sidecar ") => {
-                        let args = cmd["sidecar".len()..]
-                            .split_whitespace()
-                            .map(str::to_string)
-                            .collect();
-                        write_stderr_line(&mut stderr, &on_sidecar(args).await).await?;
-                    }
-                    other => {
-                        stderr
-                            .write_all(format!("[outrig] unknown command: /{other}\n").as_bytes())
-                            .await?;
-                        stderr.flush().await?;
-                    }
+            if let Some(raw) = trimmed.strip_prefix('/') {
+                let mut tokens = raw.split_whitespace();
+                let name = tokens.next().unwrap_or("");
+                let args: Vec<String> = tokens.map(str::to_string).collect();
+                match (name, args.is_empty()) {
+                    ("quit", true) => return Ok(()),
+                    ("help", true) => write_stderr_line(&mut stderr, &help_text).await?,
+                    _ => match on_command(name.to_string(), args).await {
+                        Some(text) => write_stderr_line(&mut stderr, &text).await?,
+                        None => {
+                            // `raw`, not name + args: the notice echoes the
+                            // input as typed.
+                            let notice = format!("[outrig] unknown command: /{raw}");
+                            write_stderr_line(&mut stderr, &notice).await?;
+                        }
+                    },
                 }
                 continue;
             }

@@ -33,7 +33,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::env_arg::CliEnvEntries;
-use crate::cli::session_setup::{self, SessionContainers, SessionSetup, SessionSetupArgs};
+use crate::cli::session_setup::{
+    self, SessionContainers, SessionRuntime, SessionSetup, SessionSetupArgs,
+};
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::cli::watcher;
 use crate::error::{OutrigError, Result};
@@ -162,7 +164,7 @@ async fn serve(
     let SessionSetup {
         image_cfg_name,
         image_tag,
-        mut containers,
+        containers,
         sid,
         log_dir,
         store,
@@ -176,6 +178,7 @@ async fn serve(
         session_dir: _,
         repo_root: _,
     } = setup;
+    let mut runtime = SessionRuntime::new(watcher, network, containers);
 
     // Validate per-server env entries against the full merged plan (a
     // skipped sidecar's servers are still declared names).
@@ -189,15 +192,14 @@ async fn serve(
         }
     }
 
-    let primary_died = watcher.as_ref().map(|w| w.primary_died());
-    let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
+    let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(
         &image_cfg_name,
         &image_tag,
-        &mut containers,
+        &mut runtime.containers,
         &log_dir,
         sid.as_str(),
-        &mut mcp_arcs,
+        &mut runtime.mcp_arcs,
         &mcp_plan,
         &cli_env,
         attached,
@@ -207,10 +209,7 @@ async fn serve(
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(
-        mcp_arcs, watcher, network, containers, &store, &sid, final_exit,
-    )
-    .await;
+    session_setup::teardown(runtime, &store, &sid, final_exit).await;
     watcher::exit_if_monitor_stopped(&outcome, final_exit);
     outcome
 }
@@ -237,10 +236,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
     let outcome = write_merged_mcp(&mcp_plan).map(|()| 0);
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
     session_setup::teardown(
-        Vec::new(),
-        watcher,
-        network,
-        containers,
+        SessionRuntime::new(watcher, network, containers),
         &store,
         &sid,
         final_exit,

@@ -1,6 +1,8 @@
 //! Resolve agent -> model -> provider; build Rig agent.
 
+use std::cell::{Cell, Ref, RefCell};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -505,6 +507,90 @@ impl RigAgent {
                 tool_call_max,
             } => run_turn_streaming_mistralrs(agent, prompt, history, *tool_call_max).await,
         }
+    }
+}
+
+/// A [`RigAgent`] plus the recipe to rebuild it when `/sidecar add` grows
+/// the tool list mid-session. The rig agent's toolset is frozen at build
+/// time, so [`RebuildingAgent::extend_tools`] only marks the agent stale;
+/// the next [`RebuildingAgent::run_turn`] rebuilds over the full list
+/// (cheap -- the OpenAI arm is an HTTP client; mistralrs model loads are
+/// registry-cached).
+///
+/// Interior mutability (`RefCell`/`Cell`) because the wrapper is shared by
+/// `&` between the REPL's prompt path and its `/sidecar` command; the
+/// binary's runtime is current-thread and callbacks run sequentially, so
+/// borrows never overlap and none is held across an await.
+pub struct RebuildingAgent {
+    resolved: ResolvedAgent,
+    cache_root: PathBuf,
+    #[cfg(feature = "local-llm")]
+    registry: LlmRegistry,
+    tools: RefCell<Vec<McpToolAdapter>>,
+    dirty: Cell<bool>,
+    // The agent rides in an inner `Rc` so a turn clones it out and never
+    // holds the `RefCell` borrow across the run_turn await (a rebuild in a
+    // later turn just swaps the Rc).
+    agent: RefCell<Rc<RigAgent>>,
+}
+
+impl RebuildingAgent {
+    /// Wrap an already-built agent. The first build stays with the caller
+    /// so its progress reporting (and any model download) happens there.
+    pub fn new(
+        agent: RigAgent,
+        tools: Vec<McpToolAdapter>,
+        resolved: ResolvedAgent,
+        cache_root: PathBuf,
+        #[cfg(feature = "local-llm")] registry: LlmRegistry,
+    ) -> Self {
+        Self {
+            resolved,
+            cache_root,
+            #[cfg(feature = "local-llm")]
+            registry,
+            tools: RefCell::new(tools),
+            dirty: Cell::new(false),
+            agent: RefCell::new(Rc::new(agent)),
+        }
+    }
+
+    /// Append tool adapters and mark the agent stale; the next
+    /// [`RebuildingAgent::run_turn`] rebuilds over the extended list.
+    pub fn extend_tools(&self, new: Vec<McpToolAdapter>) {
+        self.tools.borrow_mut().extend(new);
+        self.dirty.set(true);
+    }
+
+    /// Snapshot view of the current tool list. Do not hold across an await.
+    pub fn tools(&self) -> Ref<'_, [McpToolAdapter]> {
+        Ref::map(self.tools.borrow(), Vec::as_slice)
+    }
+
+    /// The per-result byte ceiling the agent was resolved with; adapters
+    /// built for tools added mid-session use the same limit.
+    pub fn tool_result_max_bytes(&self) -> usize {
+        self.resolved.tool_result_max_bytes
+    }
+
+    /// Rebuild the agent if the tool list grew since the last turn, then
+    /// delegate to [`RigAgent::run_turn`].
+    pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
+        if self.dirty.get() {
+            let tools_snapshot = self.tools.borrow().clone();
+            let rebuilt = build_agent(
+                &self.resolved,
+                tools_snapshot,
+                &self.cache_root,
+                #[cfg(feature = "local-llm")]
+                &self.registry,
+            )
+            .await?;
+            *self.agent.borrow_mut() = Rc::new(rebuilt);
+            self.dirty.set(false);
+        }
+        let turn_agent = self.agent.borrow().clone();
+        turn_agent.run_turn(prompt, history).await
     }
 }
 

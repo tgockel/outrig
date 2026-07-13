@@ -15,25 +15,21 @@ use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
 
 use outrig_cli::error::Result as OutrigResult;
-use outrig_cli::repl::Repl;
+use outrig_cli::repl::{HelpEntry, Repl};
 
 const BUF: usize = 4096;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Every `(name, args)` pair a test dispatcher received, in order.
+type SeenCommands = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
 
 fn never_interrupt() -> impl FnMut() -> std::future::Pending<()> {
     || future::pending::<()>()
 }
 
-fn noop_tools() -> impl FnMut() -> std::future::Ready<String> {
-    || future::ready("[outrig] (no tools registered)\n".to_string())
-}
-
-fn noop_reset() -> impl FnMut() -> std::future::Ready<String> {
-    || future::ready("[outrig] (no history to reset)\n".to_string())
-}
-
-fn noop_sidecar() -> impl FnMut(Vec<String>) -> std::future::Ready<String> {
-    |_| future::ready("[outrig] (no sidecars declared)\n".to_string())
+/// Dispatcher that knows no commands: everything is reported unknown.
+fn no_commands() -> impl FnMut(String, Vec<String>) -> std::future::Ready<Option<String>> {
+    |_, _| future::ready(None)
 }
 
 #[tokio::test]
@@ -53,10 +49,9 @@ async fn processes_multiple_lines_in_order() {
         stderr_w,
         never_interrupt(),
         "BANNER",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        noop_sidecar(),
+        no_commands(),
     );
 
     let mut stdout_buf = Vec::new();
@@ -101,10 +96,9 @@ async fn eof_exits_cleanly() {
         stderr_w,
         never_interrupt(),
         "",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        noop_sidecar(),
+        no_commands(),
     );
 
     timeout(TEST_TIMEOUT, run)
@@ -130,10 +124,9 @@ async fn slash_quit_exits() {
         stderr_w,
         never_interrupt(),
         "",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        noop_sidecar(),
+        no_commands(),
     );
 
     let read_out = async {
@@ -180,10 +173,9 @@ async fn empty_line_is_ignored() {
         stderr_w,
         never_interrupt(),
         "",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        noop_sidecar(),
+        no_commands(),
     );
 
     let read_out = async {
@@ -217,10 +209,9 @@ async fn empty_prompt_reply_produces_no_stdout() {
         stderr_w,
         never_interrupt(),
         "",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        noop_sidecar(),
+        no_commands(),
     );
 
     let read_out = async {
@@ -275,10 +266,9 @@ async fn sigint_mid_callback_returns_to_prompt() {
             stderr_w,
             interrupt,
             "",
+            &[],
             on_prompt,
-            noop_tools(),
-            noop_reset(),
-            noop_sidecar(),
+            no_commands(),
         )
         .await
     });
@@ -307,84 +297,14 @@ async fn sigint_mid_callback_returns_to_prompt() {
     );
 }
 
+/// One dispatcher serves every caller command; it receives the command name
+/// plus whitespace-split args and its `Some(..)` text lands on stderr with a
+/// REPL-appended newline.
 #[tokio::test]
-async fn slash_tools_and_reset_invoke_callbacks() {
-    let (mut stdin_w, stdin_r) = duplex(BUF);
-    stdin_w.write_all(b"/tools\n/reset\n").await.unwrap();
-    drop(stdin_w);
-    let (stdout_w, mut stdout_r) = duplex(BUF);
-    let (stderr_w, mut stderr_r) = duplex(BUF);
-
-    let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
-
-    let tools_calls = Arc::new(AtomicUsize::new(0));
-    let reset_calls = Arc::new(AtomicUsize::new(0));
-    let tools_cb = tools_calls.clone();
-    let reset_cb = reset_calls.clone();
-
-    let on_tools = move || {
-        let c = tools_cb.clone();
-        async move {
-            c.fetch_add(1, Ordering::SeqCst);
-            "[outrig] tools available (1):\n  fs__list_directory   List a directory.\n".to_string()
-        }
-    };
-    let on_reset = move || {
-        let c = reset_cb.clone();
-        async move {
-            c.fetch_add(1, Ordering::SeqCst);
-            "[outrig] history cleared".to_string() // no trailing newline; REPL adds one
-        }
-    };
-
-    let run = Repl::run_with(
-        BufReader::new(stdin_r),
-        stdout_w,
-        stderr_w,
-        never_interrupt(),
-        "",
-        on_prompt,
-        on_tools,
-        on_reset,
-        noop_sidecar(),
-    );
-
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    let read_out = stdout_r.read_to_end(&mut stdout_buf);
-    let read_err = stderr_r.read_to_end(&mut stderr_buf);
-
-    let (run_res, _, _) = timeout(TEST_TIMEOUT, async {
-        tokio::join!(run, read_out, read_err)
-    })
-    .await
-    .expect("test must not hang");
-    run_res.expect("run_with must succeed");
-
-    assert_eq!(tools_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
-    assert!(
-        stdout_buf.is_empty(),
-        "slash output must not reach stdout, got: {:?}",
-        String::from_utf8_lossy(&stdout_buf)
-    );
-
-    let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
-    assert!(
-        stderr.contains("[outrig] tools available (1):"),
-        "stderr lacked /tools text: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("[outrig] history cleared\n"),
-        "stderr lacked /reset text (with REPL-appended newline): {stderr:?}"
-    );
-}
-
-#[tokio::test]
-async fn slash_sidecar_passes_split_args_to_callback() {
+async fn dispatcher_routes_commands_with_split_args() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
     stdin_w
-        .write_all(b"/sidecar add tools\n/sidecar list\n/sidecar\n")
+        .write_all(b"/tools\n/reset\n/sidecar add tools\n/sidecar list\n/sidecar\n")
         .await
         .unwrap();
     drop(stdin_w);
@@ -393,13 +313,18 @@ async fn slash_sidecar_passes_split_args_to_callback() {
 
     let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
 
-    let seen: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen: SeenCommands = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_cb = seen.clone();
-    let on_sidecar = move |args: Vec<String>| {
+    let on_command = move |cmd: String, args: Vec<String>| {
         let seen = seen_cb.clone();
         async move {
-            seen.lock().unwrap().push(args);
-            "[outrig] sidecar handled".to_string()
+            let text = match cmd.as_str() {
+                "tools" => "[outrig] tools available (0):\n".to_string(),
+                "reset" => "[outrig] history cleared".to_string(), // no trailing newline
+                _ => "[outrig] sidecar handled".to_string(),
+            };
+            seen.lock().unwrap().push((cmd, args));
+            Some(text)
         }
     };
 
@@ -409,10 +334,9 @@ async fn slash_sidecar_passes_split_args_to_callback() {
         stderr_w,
         never_interrupt(),
         "",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        on_sidecar,
+        on_command,
     );
 
     let mut stdout_buf = Vec::new();
@@ -427,12 +351,15 @@ async fn slash_sidecar_passes_split_args_to_callback() {
     .expect("test must not hang");
     run_res.expect("run_with must succeed");
 
+    let owned = |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
     assert_eq!(
         *seen.lock().unwrap(),
         vec![
-            vec!["add".to_string(), "tools".to_string()],
-            vec!["list".to_string()],
-            Vec::<String>::new(),
+            ("tools".to_string(), owned(&[])),
+            ("reset".to_string(), owned(&[])),
+            ("sidecar".to_string(), owned(&["add", "tools"])),
+            ("sidecar".to_string(), owned(&["list"])),
+            ("sidecar".to_string(), owned(&[])),
         ]
     );
     assert!(
@@ -440,22 +367,42 @@ async fn slash_sidecar_passes_split_args_to_callback() {
         "slash output must not reach stdout, got: {:?}",
         String::from_utf8_lossy(&stdout_buf)
     );
+
     let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
+    assert!(
+        stderr.contains("[outrig] tools available (0):"),
+        "stderr lacked /tools text: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("[outrig] history cleared\n"),
+        "stderr lacked /reset text (with REPL-appended newline): {stderr:?}"
+    );
     assert!(
         stderr.contains("[outrig] sidecar handled\n"),
         "stderr lacked /sidecar text: {stderr:?}"
     );
 }
 
+/// A `None` from the dispatcher produces the unknown-command notice echoing
+/// the input as typed -- including arguments and their original whitespace.
 #[tokio::test]
-async fn slash_help_lists_sidecar_commands() {
+async fn unknown_command_prints_raw_text() {
     let (mut stdin_w, stdin_r) = duplex(BUF);
-    stdin_w.write_all(b"/help\n").await.unwrap();
+    stdin_w
+        .write_all(b"/bogus one  two\n/tools extra\n")
+        .await
+        .unwrap();
     drop(stdin_w);
     let (stdout_w, _stdout_r) = duplex(BUF);
     let (stderr_w, mut stderr_r) = duplex(BUF);
 
     let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
+
+    // A `/tools` that rejects arguments by reporting itself unknown, the
+    // convention run.rs's dispatcher uses for zero-arg commands.
+    let on_command = |cmd: String, args: Vec<String>| async move {
+        (cmd == "tools" && args.is_empty()).then(|| "[outrig] tools".to_string())
+    };
 
     let run = Repl::run_with(
         BufReader::new(stdin_r),
@@ -463,10 +410,9 @@ async fn slash_help_lists_sidecar_commands() {
         stderr_w,
         never_interrupt(),
         "",
+        &[],
         on_prompt,
-        noop_tools(),
-        noop_reset(),
-        noop_sidecar(),
+        on_command,
     );
 
     let mut stderr_buf = Vec::new();
@@ -479,13 +425,70 @@ async fn slash_help_lists_sidecar_commands() {
 
     let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
     assert!(
-        stderr.contains("/sidecar add <name>"),
-        "help lacked /sidecar add: {stderr:?}"
+        stderr.contains("[outrig] unknown command: /bogus one  two\n"),
+        "notice must echo raw input: {stderr:?}"
     );
     assert!(
-        stderr.contains("/sidecar list"),
-        "help lacked /sidecar list: {stderr:?}"
+        stderr.contains("[outrig] unknown command: /tools extra\n"),
+        "args on a zero-arg command must stay unknown: {stderr:?}"
     );
+}
+
+#[tokio::test]
+async fn slash_help_composes_caller_entries() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    stdin_w.write_all(b"/help\n").await.unwrap();
+    drop(stdin_w);
+    let (stdout_w, _stdout_r) = duplex(BUF);
+    let (stderr_w, mut stderr_r) = duplex(BUF);
+
+    let on_prompt = |_: String| async move { OutrigResult::Ok(String::new()) };
+
+    const COMMANDS: &[HelpEntry] = &[
+        HelpEntry {
+            syntax: "/tools",
+            description: "list registered tools",
+        },
+        HelpEntry {
+            syntax: "/sidecar add <name>",
+            description: "start a sidecar",
+        },
+    ];
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        COMMANDS,
+        on_prompt,
+        no_commands(),
+    );
+
+    let mut stderr_buf = Vec::new();
+    let read_err = stderr_r.read_to_end(&mut stderr_buf);
+
+    let (run_res, _) = timeout(TEST_TIMEOUT, async { tokio::join!(run, read_err) })
+        .await
+        .expect("test must not hang");
+    run_res.expect("run_with must succeed");
+
+    let stderr = String::from_utf8(stderr_buf).expect("stderr utf-8");
+    assert!(
+        stderr.contains("[outrig] slash commands:"),
+        "help lacked header: {stderr:?}"
+    );
+    // Caller entries sandwiched between the built-in /help and /quit lines,
+    // all padded to the widest syntax (19 code points here).
+    for line in [
+        "  /help                 show this help",
+        "  /tools                list registered tools",
+        "  /sidecar add <name>   start a sidecar",
+        "  /quit                 exit the session",
+    ] {
+        assert!(stderr.contains(line), "help lacked {line:?}: {stderr:?}");
+    }
 }
 
 async fn read_until_contains(stream: &mut DuplexStream, sink: &mut Vec<u8>, needle: &str) {

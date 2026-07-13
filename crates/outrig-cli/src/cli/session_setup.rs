@@ -168,6 +168,36 @@ impl SessionContainers {
     }
 }
 
+/// The mutable session state that lives from setup to [`teardown`] and
+/// that `/sidecar add` grows mid-session. Assembled by each command after
+/// destructuring [`SessionSetup`] (`mcp_arcs` starts empty and fills as
+/// clients connect). Field order mirrors teardown order (watcher disarm ->
+/// MCP shutdown -> interceptor -> containers) so an implicit `Drop` on an
+/// abort path stays orderly.
+pub struct SessionRuntime {
+    pub watcher: Option<SessionWatcher>,
+    pub mcp_arcs: Vec<Arc<McpClient>>,
+    pub network: Option<NetworkInterceptor>,
+    pub containers: SessionContainers,
+}
+
+impl SessionRuntime {
+    /// Assemble a runtime from freshly set-up session pieces; `mcp_arcs`
+    /// starts empty and fills as clients connect.
+    pub fn new(
+        watcher: Option<SessionWatcher>,
+        network: Option<NetworkInterceptor>,
+        containers: SessionContainers,
+    ) -> Self {
+        Self {
+            watcher,
+            mcp_arcs: Vec::new(),
+            network,
+            containers,
+        }
+    }
+}
+
 /// Output of [`setup`]: every long-lived value the post-setup pipeline
 /// needs (REPL build, MCP children, teardown). The containers are already
 /// started + bootstrapped; the session row is already on disk.
@@ -1084,14 +1114,17 @@ pub async fn connect_mcp_clients(
 /// the agent before invoking this -- otherwise [`Arc::try_unwrap`] returns
 /// `Err` and the explicit `shutdown` is skipped in favor of `Drop`.
 pub async fn teardown(
-    mcp_arcs: Vec<Arc<McpClient>>,
-    watcher: Option<SessionWatcher>,
-    network: Option<NetworkInterceptor>,
-    containers: SessionContainers,
+    runtime: SessionRuntime,
     store: &SessionStore,
     sid: &SessionId,
     final_exit: i32,
 ) {
+    let SessionRuntime {
+        watcher,
+        mcp_arcs,
+        network,
+        containers,
+    } = runtime;
     if let Some(watcher) = watcher {
         watcher.shutdown();
     }

@@ -10,7 +10,7 @@
 //! ride through the container; tearing the container down first races
 //! them.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -21,15 +21,14 @@ use rig::completion::Message;
 
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{
-    self, ProgressSpan, STOP_GRACE, SessionContainers, SessionSetup, SessionSetupArgs,
+    self, ProgressSpan, STOP_GRACE, SessionRuntime, SessionSetup, SessionSetupArgs,
     SidecarStartCtx, plural,
 };
 use crate::cli::volume_arg::{CliVolume, parse_volume};
-use crate::cli::watcher::SessionWatcher;
 use crate::error::{OutrigError, Result};
 use crate::llm;
 use crate::paths::model_cache_root;
-use crate::repl::Repl;
+use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
 use outrig::McpClient;
@@ -40,7 +39,6 @@ use outrig::config::{
 use outrig::container::Container;
 use outrig::container::sidecar::{SessionMcpPlan, SidecarPlan};
 use outrig::image::ImageTag;
-use outrig::network::NetworkInterceptor;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -131,19 +129,20 @@ pub async fn execute(
         cfg,
         image_cfg_name,
         image_tag,
-        mut containers,
+        containers,
         sid,
         log_dir,
         store,
         repo_root,
-        mut network,
+        network,
         mcp_plan,
-        mut watcher,
+        watcher,
         attached: _,
         session: _,
         session_dir: _,
         image_cfg: _,
     } = setup;
+    let mut runtime = SessionRuntime::new(watcher, network, containers);
     let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
 
     // Validate per-server env entries against the full merged plan (a
@@ -158,35 +157,28 @@ pub async fn execute(
         }
     }
 
-    let mut mcp_arcs: Vec<Arc<McpClient>> = Vec::new();
     let outcome: Result<i32> = run_inner(RunInnerArgs {
         cfg: &cfg,
         agent_name: &agent_name,
         image_cfg_name: &image_cfg_name,
         image_tag: &image_tag,
-        containers: &mut containers,
         log_dir: &log_dir,
         sid: &sid,
         repo_root: &repo_root,
         cache_root: &cache_root,
-        mcp_arcs: &mut mcp_arcs,
         max_tool_calls: args.max_tool_calls,
         max_tool_result_bytes: args.max_tool_result_bytes,
         model_override: args.model.as_deref(),
         device_override: args.device,
         mcp_plan: &mcp_plan,
         cli_env: &cli_env,
-        network: &mut network,
-        watcher: &mut watcher,
+        runtime: &mut runtime,
         store: &store,
     })
     .await;
 
     let final_exit = outcome.as_ref().copied().unwrap_or(1);
-    session_setup::teardown(
-        mcp_arcs, watcher, network, containers, &store, &sid, final_exit,
-    )
-    .await;
+    session_setup::teardown(runtime, &store, &sid, final_exit).await;
     crate::cli::watcher::exit_if_monitor_stopped(&outcome, final_exit);
     outcome
 }
@@ -200,27 +192,24 @@ fn parse_mistralrs_device(s: &str) -> std::result::Result<MistralrsDeviceSpec, S
 }
 
 /// Inputs to [`run_inner`], grouped like [`SessionSetupArgs`]: the resolved
-/// session pieces plus the mutable state `/sidecar add` grows mid-session
-/// (containers, MCP clients, interceptor, watcher, session store).
+/// session pieces plus the [`SessionRuntime`] that `/sidecar add` grows
+/// mid-session.
 struct RunInnerArgs<'a> {
     cfg: &'a Config,
     agent_name: &'a str,
     image_cfg_name: &'a str,
     image_tag: &'a ImageTag,
-    containers: &'a mut SessionContainers,
     log_dir: &'a Path,
     sid: &'a SessionId,
     repo_root: &'a Path,
     cache_root: &'a Path,
-    mcp_arcs: &'a mut Vec<Arc<McpClient>>,
     max_tool_calls: Option<u32>,
     max_tool_result_bytes: Option<u32>,
     model_override: Option<&'a str>,
     device_override: Option<MistralrsDeviceSpec>,
     mcp_plan: &'a SessionMcpPlan,
     cli_env: &'a CliEnvEntries,
-    network: &'a mut Option<NetworkInterceptor>,
-    watcher: &'a mut Option<SessionWatcher>,
+    runtime: &'a mut SessionRuntime,
     store: &'a SessionStore,
 }
 
@@ -230,26 +219,24 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         agent_name,
         image_cfg_name,
         image_tag,
-        containers,
         log_dir,
         sid,
         repo_root,
         cache_root,
-        mcp_arcs,
         max_tool_calls,
         max_tool_result_bytes,
         model_override,
         device_override,
         mcp_plan,
         cli_env,
-        network,
-        watcher,
+        runtime,
         store,
     } = args;
 
-    // Grab the death token before `watcher` disappears into the REPL's
+    // Grab the death token before the watcher disappears into the REPL's
     // shared state; it pairs with the REPL select below.
-    let primary_died: Option<CancellationToken> = watcher.as_ref().map(|w| w.primary_died());
+    let primary_died: Option<CancellationToken> =
+        runtime.watcher.as_ref().map(|w| w.primary_died());
 
     // `setup` already validated presence and used the resolved `.image`
     // for the image fallback. We re-resolve here for `build_agent` +
@@ -260,12 +247,13 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
     let connected =
-        session_setup::connect_mcp_clients(containers, mcp_plan, log_dir, cli_env).await?;
-    mcp_arcs.extend(connected);
+        session_setup::connect_mcp_clients(&mut runtime.containers, mcp_plan, log_dir, cli_env)
+            .await?;
+    runtime.mcp_arcs.extend(connected);
 
     let mut all_tools: Vec<McpToolAdapter> = Vec::new();
     let mut per_server_counts: Vec<(String, usize)> = Vec::new();
-    for arc in mcp_arcs.iter() {
+    for arc in runtime.mcp_arcs.iter() {
         let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
         let adapters =
             McpToolAdapter::from_client_tools(arc.clone(), resolved.tool_result_max_bytes).await?;
@@ -297,41 +285,33 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         &resolved,
         image_cfg_name,
         image_tag,
-        containers.primary.name(),
+        runtime.containers.primary.name(),
         &per_server_counts,
         &all_tools,
         sid.as_str(),
     );
 
-    let primary_name = containers.primary.name().to_string();
-    // The agent rides in an inner `Rc` so a turn clones it out and never
-    // holds the `RefCell` borrow across the run_turn await.
-    let agent = Rc::new(RefCell::new(Rc::new(agent)));
+    let primary_name = runtime.containers.primary.name().to_string();
+    let agent = llm::RebuildingAgent::new(
+        agent,
+        all_tools,
+        resolved,
+        cache_root.to_path_buf(),
+        #[cfg(feature = "local-llm")]
+        registry,
+    );
 
     let session = ReplSession {
-        agent: agent.clone(),
-        resolved: &resolved,
-        cache_root,
-        #[cfg(feature = "local-llm")]
-        registry: &registry,
-        sidecar: SidecarCmdState {
-            containers: RefCell::new(containers),
-            mcp_arcs: RefCell::new(mcp_arcs),
-            network: RefCell::new(network),
-            watcher: RefCell::new(watcher),
-            store,
-            sid,
-            cfg,
-            repo_root,
-            log_dir,
-            cli_env,
-            mcp_plan,
-            tool_result_max_bytes: resolved.tool_result_max_bytes,
-            all_tools: Rc::new(RefCell::new(all_tools)),
-            tools_dirty: Rc::new(Cell::new(false)),
-        },
+        runtime: RefCell::new(runtime),
+        agent: &agent,
+        store,
+        sid,
+        cfg,
+        repo_root,
+        log_dir,
+        cli_env,
+        mcp_plan,
     };
-    let all_tools = session.sidecar.all_tools.clone();
 
     eprintln!("[outrig] entering REPL");
     // When a watcher is armed, external death of the primary ends the REPL
@@ -348,36 +328,21 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         None => run_repl(session).await,
     };
 
-    // Drop adapters and the agent before returning so teardown's
-    // `Arc::try_unwrap` on each `mcp_arcs` entry succeeds. `run_repl`
-    // consumed its clones, so these are the last refs.
-    drop(all_tools);
+    // Drop the agent (which owns the tool adapters) before returning so
+    // teardown's `Arc::try_unwrap` on each `mcp_arcs` entry succeeds.
+    // `run_repl` borrowed it, so this is the last ref.
     drop(agent);
 
     result
 }
 
-/// Everything the REPL callbacks close over: the rebuildable agent, the
-/// ingredients to rebuild it, and the session state behind the `/sidecar`
-/// command (which is also the single home of the shared tool list and
-/// dirty flag).
-struct ReplSession<'a> {
-    agent: Rc<RefCell<Rc<llm::RigAgent>>>,
-    resolved: &'a llm::ResolvedAgent,
-    cache_root: &'a Path,
-    #[cfg(feature = "local-llm")]
-    registry: &'a llm::LlmRegistry,
-    sidecar: SidecarCmdState<'a>,
-}
-
-/// Session state the `/sidecar` REPL command reads and grows. Mutable
-/// pieces sit in `RefCell`s: callbacks run strictly sequentially on the
+/// Everything the REPL callbacks close over: the rebuildable agent plus the
+/// session state the `/sidecar` command reads and grows. The runtime sits
+/// in a `RefCell`: callbacks run strictly sequentially on the
 /// current-thread runtime, so borrows never overlap.
-struct SidecarCmdState<'a> {
-    containers: RefCell<&'a mut SessionContainers>,
-    mcp_arcs: RefCell<&'a mut Vec<Arc<McpClient>>>,
-    network: RefCell<&'a mut Option<NetworkInterceptor>>,
-    watcher: RefCell<&'a mut Option<SessionWatcher>>,
+struct ReplSession<'a> {
+    runtime: RefCell<&'a mut SessionRuntime>,
+    agent: &'a llm::RebuildingAgent,
     store: &'a SessionStore,
     sid: &'a SessionId,
     cfg: &'a Config,
@@ -385,10 +350,29 @@ struct SidecarCmdState<'a> {
     log_dir: &'a Path,
     cli_env: &'a CliEnvEntries,
     mcp_plan: &'a SessionMcpPlan,
-    tool_result_max_bytes: usize,
-    all_tools: Rc<RefCell<Vec<McpToolAdapter>>>,
-    tools_dirty: Rc<Cell<bool>>,
 }
+
+/// The `outrig run` REPL command set: each command's name and `/help` line
+/// here, its semantics in the `on_command` dispatcher in [`run_repl`]
+/// directly below. `/help` and `/quit` are the [`Repl`]'s own.
+const REPL_COMMANDS: &[HelpEntry] = &[
+    HelpEntry {
+        syntax: "/tools",
+        description: "list registered tools",
+    },
+    HelpEntry {
+        syntax: "/reset",
+        description: "clear conversation history",
+    },
+    HelpEntry {
+        syntax: "/sidecar add <name>",
+        description: "start a config-declared manual sidecar",
+    },
+    HelpEntry {
+        syntax: "/sidecar list",
+        description: "show declared sidecars and their status",
+    },
+];
 
 async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
     // Single-task REPL: callbacks run sequentially. RefCell over the shared
@@ -396,82 +380,49 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
     // tokio runtime is current-thread.
     let history: Rc<RefCell<Vec<Message>>> = Rc::new(RefCell::new(Vec::new()));
 
-    let ReplSession {
-        agent,
-        resolved,
-        cache_root,
-        #[cfg(feature = "local-llm")]
-        registry,
-        sidecar,
-    } = session;
-    let all_tools = sidecar.all_tools.clone();
-    let tools_dirty = sidecar.tools_dirty.clone();
+    let agent = session.agent;
 
     let history_for_prompt = history.clone();
-    let agent_for_prompt = agent.clone();
-    let tools_for_prompt = all_tools.clone();
-    let dirty_for_prompt = tools_dirty.clone();
     let on_prompt = move |line: String| {
         let history = history_for_prompt.clone();
-        let agent = agent_for_prompt.clone();
-        let all_tools = tools_for_prompt.clone();
-        let dirty = dirty_for_prompt.clone();
         async move {
-            // `/sidecar add` extended the tool list since the last turn:
-            // rebuild the agent over the full list (cheap -- the OpenAI arm
-            // is an HTTP client; mistralrs model loads are registry-cached).
-            if dirty.get() {
-                let tools_snapshot = all_tools.borrow().clone();
-                let rebuilt = llm::build_agent(
-                    resolved,
-                    tools_snapshot,
-                    cache_root,
-                    #[cfg(feature = "local-llm")]
-                    registry,
-                )
-                .await?;
-                *agent.borrow_mut() = Rc::new(rebuilt);
-                dirty.set(false);
-            }
-            // Clone the inner Rc so the RefCell isn't borrowed across the
-            // run_turn await (a rebuild in a later turn just swaps the Rc).
-            let turn_agent = agent.borrow().clone();
             // Move the vec out so the RefCell isn't borrowed across the
             // await; restore it on completion. Prompt cancellation may add
             // partial history to `h`, so it must always be written back.
             let mut h = std::mem::take(&mut *history.borrow_mut());
-            let result = turn_agent.run_turn(&line, &mut h).await;
+            let result = agent.run_turn(&line, &mut h).await;
             *history.borrow_mut() = h;
             result
         }
     };
 
-    let on_tools = move || {
-        let all_tools = all_tools.clone();
-        async move { build_tools_summary(&all_tools.borrow()) }
-    };
-
-    let history_for_reset = history.clone();
-    let on_reset = move || {
-        let history = history_for_reset.clone();
+    let session = &session;
+    let on_command = move |cmd: String, args: Vec<String>| {
+        let history = history.clone();
         async move {
-            history.borrow_mut().clear();
-            "[outrig] history cleared".to_string()
+            match cmd.as_str() {
+                // Zero-arg commands with args fall through to None so the
+                // REPL reports e.g. `/tools foo` as unknown, as it always
+                // has.
+                "tools" if args.is_empty() => Some(build_tools_summary(&agent.tools())),
+                "reset" if args.is_empty() => {
+                    history.borrow_mut().clear();
+                    Some("[outrig] history cleared".to_string())
+                }
+                "sidecar" => Some(handle_sidecar_command(session, &args).await),
+                _ => None,
+            }
         }
     };
 
-    let sidecar_state = &sidecar;
-    let on_sidecar =
-        move |args: Vec<String>| async move { handle_sidecar_command(sidecar_state, &args).await };
-
-    Repl::run("", on_prompt, on_tools, on_reset, on_sidecar).await?;
+    Repl::run("", REPL_COMMANDS, on_prompt, on_command).await?;
     Ok(0)
 }
 
 /// Dispatch for the `/sidecar` slash command. Always returns stderr text --
 /// errors are reported to the user and never escape to the REPL loop, so a
 /// failed add cannot end the session.
-async fn handle_sidecar_command(state: &SidecarCmdState<'_>, args: &[String]) -> String {
+async fn handle_sidecar_command(state: &ReplSession<'_>, args: &[String]) -> String {
     match args {
         [sub, name] if sub == "add" => sidecar_add(state, name).await,
         [sub] if sub == "list" => sidecar_list(state).await,
@@ -482,7 +433,7 @@ async fn handle_sidecar_command(state: &SidecarCmdState<'_>, args: &[String]) ->
 /// `/sidecar add <name>`: start a config-declared `start = "manual"`
 /// sidecar mid-session. Declared-only by design (the library API is the
 /// arbitrary-spec surface); unknown and already-running names are errors.
-async fn sidecar_add(state: &SidecarCmdState<'_>, name: &str) -> String {
+async fn sidecar_add(state: &ReplSession<'_>, name: &str) -> String {
     let Some(sc) = state.mcp_plan.sidecars.get(name) else {
         let manual: Vec<&str> = state
             .mcp_plan
@@ -502,7 +453,13 @@ async fn sidecar_add(state: &SidecarCmdState<'_>, name: &str) -> String {
             )
         };
     };
-    if state.containers.borrow().sidecars.contains_key(name) {
+    if state
+        .runtime
+        .borrow()
+        .containers
+        .sidecars
+        .contains_key(name)
+    {
         return format!("[outrig] sidecar {name:?} is already running");
     }
     if sc.start != SidecarStart::Manual {
@@ -521,17 +478,14 @@ async fn sidecar_add(state: &SidecarCmdState<'_>, name: &str) -> String {
 /// connect servers -> commit. Any failure unwinds everything this call
 /// started (clients, interceptor attachment, container) and leaves the
 /// session state untouched.
-async fn try_sidecar_add(
-    state: &SidecarCmdState<'_>,
-    name: &str,
-    sc: &SidecarPlan,
-) -> Result<String> {
+async fn try_sidecar_add(state: &ReplSession<'_>, name: &str, sc: &SidecarPlan) -> Result<String> {
     let (host_workspace, container_workspace, transcript) = {
-        let containers = state.containers.borrow();
+        let runtime = state.runtime.borrow();
+        let primary = &runtime.containers.primary;
         (
-            containers.primary.host_workspace().to_path_buf(),
-            containers.primary.container_workspace().to_path_buf(),
-            containers.primary.transcript(),
+            primary.host_workspace().to_path_buf(),
+            primary.container_workspace().to_path_buf(),
+            primary.transcript(),
         )
     };
     let ctx = SidecarStartCtx {
@@ -547,10 +501,10 @@ async fn try_sidecar_add(
     // Take the interceptor out of the shared slot around the await so no
     // RefCell borrow is held across it; slash callbacks run sequentially,
     // so nothing observes the empty slot.
-    let taken = state.network.borrow_mut().take();
+    let taken = state.runtime.borrow_mut().network.take();
     if let Some(mut interceptor) = taken {
         let attached = interceptor.attach(&container).await;
-        **state.network.borrow_mut() = Some(interceptor);
+        state.runtime.borrow_mut().network = Some(interceptor);
         if let Err(e) = attached {
             let _ = container.stop(STOP_GRACE).await;
             return Err(e.into());
@@ -561,10 +515,10 @@ async fn try_sidecar_add(
         match connect_added_sidecar_servers(state, name, &container).await {
             Ok(connected) => connected,
             Err(e) => {
-                let taken = state.network.borrow_mut().take();
+                let taken = state.runtime.borrow_mut().network.take();
                 if let Some(mut interceptor) = taken {
                     let _ = interceptor.detach(container.name()).await;
-                    **state.network.borrow_mut() = Some(interceptor);
+                    state.runtime.borrow_mut().network = Some(interceptor);
                 }
                 let _ = container.stop(STOP_GRACE).await;
                 return Err(e);
@@ -575,17 +529,18 @@ async fn try_sidecar_add(
     let server_names: Vec<String> = new_arcs.iter().map(|arc| arc.name().to_string()).collect();
     let tool_count = new_adapters.len();
 
-    state
-        .containers
-        .borrow_mut()
-        .sidecars
-        .insert(name.to_string(), container);
-    state.mcp_arcs.borrow_mut().extend(new_arcs);
-    state.all_tools.borrow_mut().extend(new_adapters);
-    state.tools_dirty.set(true);
-    if let Some(watcher) = state.watcher.borrow_mut().as_mut() {
-        watcher.register_sidecar(container_name.clone());
+    {
+        let mut runtime = state.runtime.borrow_mut();
+        runtime
+            .containers
+            .sidecars
+            .insert(name.to_string(), container);
+        runtime.mcp_arcs.extend(new_arcs);
+        if let Some(watcher) = runtime.watcher.as_mut() {
+            watcher.register_sidecar(container_name.clone());
+        }
     }
+    state.agent.extend_tools(new_adapters);
 
     let mut text = format!(
         "[outrig] sidecar {name} started: {container_name}\n\
@@ -595,7 +550,7 @@ async fn try_sidecar_add(
         server_names.join(", "),
         plural(tool_count, "tool", "tools"),
     );
-    let names = state.containers.borrow().sidecar_names();
+    let names = state.runtime.borrow().containers.sidecar_names();
     if let Err(e) = state.store.set_sidecar_containers(state.sid, &names) {
         let _ = write!(
             text,
@@ -610,7 +565,7 @@ async fn try_sidecar_add(
 /// is shut down before the error propagates; the container and interceptor
 /// attachment are the caller's to unwind.
 async fn connect_added_sidecar_servers(
-    state: &SidecarCmdState<'_>,
+    state: &ReplSession<'_>,
     name: &str,
     container: &Container,
 ) -> Result<(Vec<Arc<McpClient>>, Vec<McpToolAdapter>)> {
@@ -635,7 +590,9 @@ async fn connect_added_sidecar_servers(
                 break;
             }
         };
-        match McpToolAdapter::from_client_tools(client.clone(), state.tool_result_max_bytes).await {
+        match McpToolAdapter::from_client_tools(client.clone(), state.agent.tool_result_max_bytes())
+            .await
+        {
             Ok(new) => {
                 adapters.extend(new);
                 arcs.push(client);
@@ -666,7 +623,7 @@ async fn connect_added_sidecar_servers(
 
 /// `/sidecar list`: every declared sidecar (auto and manual, named and
 /// anonymous) with its status and hosted servers.
-async fn sidecar_list(state: &SidecarCmdState<'_>) -> String {
+async fn sidecar_list(state: &ReplSession<'_>) -> String {
     if state.mcp_plan.sidecars.is_empty() {
         return "[outrig] no sidecars declared".to_string();
     }
@@ -680,8 +637,9 @@ async fn sidecar_list(state: &SidecarCmdState<'_>) -> String {
     let mut buf = String::from("[outrig] sidecars:");
     for name in state.mcp_plan.sidecars.keys() {
         let container_name = state
-            .containers
+            .runtime
             .borrow()
+            .containers
             .sidecars
             .get(name)
             .map(|container| container.name().to_string());
@@ -828,16 +786,52 @@ fn parse_tool_result_max(s: &str) -> std::result::Result<u32, String> {
 mod tests {
     use super::*;
 
+    /// A fully-populated [`llm::ResolvedAgent`]; tests override the fields
+    /// they exercise via struct-update syntax.
+    fn test_resolved_agent() -> llm::ResolvedAgent {
+        llm::ResolvedAgent {
+            agent_name: "coding".to_string(),
+            model_name: "fast".to_string(),
+            model_identifier: "gpt-4o-mini".to_string(),
+            provider_name: "local".to_string(),
+            provider: llm::ResolvedProvider::Mistralrs,
+            model_weights: None,
+            preamble: "test".to_string(),
+            temperature: None,
+            max_tokens: None,
+            tool_call_max: 100,
+            tool_result_max_bytes: llm::DEFAULT_TOOL_RESULT_MAX_BYTES,
+            image: None,
+        }
+    }
+
+    /// Locks `/help` to the exact text the REPL printed when it owned the
+    /// command list (pre-dispatcher `HELP_TEXT`).
+    #[test]
+    fn repl_help_is_byte_identical_to_the_pre_dispatcher_text() {
+        assert_eq!(
+            crate::repl::compose_help(REPL_COMMANDS),
+            "\
+[outrig] slash commands:
+  /help                 show this help
+  /tools                list registered tools
+  /reset                clear conversation history
+  /sidecar add <name>   start a config-declared manual sidecar
+  /sidecar list         show declared sidecars and their status
+  /quit                 exit the session
+"
+        );
+    }
+
     mod sidecar_cmd {
         use super::*;
+        use crate::cli::session_setup::SessionContainers;
         use outrig::container::sidecar::plan_from_config;
 
-        /// Owned session state backing a [`SidecarCmdState`]; no podman.
+        /// Owned session state backing a [`ReplSession`]; no podman.
         struct Fixture {
-            containers: SessionContainers,
-            mcp_arcs: Vec<Arc<McpClient>>,
-            network: Option<NetworkInterceptor>,
-            watcher: Option<SessionWatcher>,
+            runtime: SessionRuntime,
+            agent: llm::RebuildingAgent,
             store: SessionStore,
             sid: SessionId,
             cfg: Config,
@@ -845,12 +839,12 @@ mod tests {
             log_dir: PathBuf,
             cli_env: CliEnvEntries,
             mcp_plan: SessionMcpPlan,
-            all_tools: Rc<RefCell<Vec<McpToolAdapter>>>,
-            tools_dirty: Rc<Cell<bool>>,
         }
 
         impl Fixture {
-            fn new(image_toml: &str) -> Self {
+            /// Async because [`llm::build_agent`] is; the OpenAi arm does
+            /// no I/O, so the dummy agent builds instantly.
+            async fn new(image_toml: &str) -> Self {
                 let image_cfg: outrig::config::ImageConfig =
                     toml::from_str(image_toml).expect("image config parses");
                 let primary = Container::attach(
@@ -859,14 +853,43 @@ mod tests {
                     Some((Path::new("/host/ws"), Path::new("/workspace"))),
                     None,
                 );
-                Self {
-                    containers: SessionContainers {
-                        sidecars: std::collections::BTreeMap::new(),
-                        primary,
+                let resolved = llm::ResolvedAgent {
+                    provider: llm::ResolvedProvider::OpenAi {
+                        base_url: "http://127.0.0.1:9".to_string(),
+                        api_key: "test-key".to_string(),
+                        request_timeout_secs: None,
                     },
-                    mcp_arcs: Vec::new(),
-                    network: None,
-                    watcher: None,
+                    tool_result_max_bytes: 1024,
+                    ..test_resolved_agent()
+                };
+                #[cfg(feature = "local-llm")]
+                let registry = llm::LlmRegistry::new();
+                let rig_agent = llm::build_agent(
+                    &resolved,
+                    Vec::new(),
+                    Path::new("."),
+                    #[cfg(feature = "local-llm")]
+                    &registry,
+                )
+                .await
+                .expect("openai agent builds without I/O");
+                Self {
+                    runtime: SessionRuntime::new(
+                        None,
+                        None,
+                        SessionContainers {
+                            sidecars: std::collections::BTreeMap::new(),
+                            primary,
+                        },
+                    ),
+                    agent: llm::RebuildingAgent::new(
+                        rig_agent,
+                        Vec::new(),
+                        resolved,
+                        PathBuf::from("."),
+                        #[cfg(feature = "local-llm")]
+                        registry,
+                    ),
                     store: SessionStore::new(std::env::temp_dir()),
                     sid: SessionId::from("test".to_string()),
                     cfg: Config::default(),
@@ -874,17 +897,13 @@ mod tests {
                     log_dir: PathBuf::from("logs"),
                     cli_env: CliEnvEntries::parse(&[]).expect("empty env parses"),
                     mcp_plan: plan_from_config(&image_cfg),
-                    all_tools: Rc::new(RefCell::new(Vec::new())),
-                    tools_dirty: Rc::new(Cell::new(false)),
                 }
             }
 
-            fn state(&mut self) -> SidecarCmdState<'_> {
-                SidecarCmdState {
-                    containers: RefCell::new(&mut self.containers),
-                    mcp_arcs: RefCell::new(&mut self.mcp_arcs),
-                    network: RefCell::new(&mut self.network),
-                    watcher: RefCell::new(&mut self.watcher),
+            fn state(&mut self) -> ReplSession<'_> {
+                ReplSession {
+                    runtime: RefCell::new(&mut self.runtime),
+                    agent: &self.agent,
                     store: &self.store,
                     sid: &self.sid,
                     cfg: &self.cfg,
@@ -892,9 +911,6 @@ mod tests {
                     log_dir: &self.log_dir,
                     cli_env: &self.cli_env,
                     mcp_plan: &self.mcp_plan,
-                    tool_result_max_bytes: 1024,
-                    all_tools: self.all_tools.clone(),
-                    tools_dirty: self.tools_dirty.clone(),
                 }
             }
         }
@@ -920,7 +936,7 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
         #[tokio::test]
         async fn unknown_name_is_an_error_listing_manual_sidecars() {
-            let mut fixture = Fixture::new(DECLARED);
+            let mut fixture = Fixture::new(DECLARED).await;
             let text = handle_sidecar_command(&fixture.state(), &args(&["add", "nope"])).await;
             assert!(text.contains("no sidecar named \"nope\""), "{text}");
             assert!(text.contains("manual sidecars: tools"), "{text}");
@@ -928,15 +944,15 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
         #[tokio::test]
         async fn auto_sidecar_cannot_be_added() {
-            let mut fixture = Fixture::new(DECLARED);
+            let mut fixture = Fixture::new(DECLARED).await;
             let text = handle_sidecar_command(&fixture.state(), &args(&["add", "autos"])).await;
             assert!(text.contains("started by the session"), "{text}");
         }
 
         #[tokio::test]
         async fn already_running_sidecar_is_an_error() {
-            let mut fixture = Fixture::new(DECLARED);
-            fixture.containers.sidecars.insert(
+            let mut fixture = Fixture::new(DECLARED).await;
+            fixture.runtime.containers.sidecars.insert(
                 "tools".to_string(),
                 Container::attach(
                     "outrig-test-tools",
@@ -951,7 +967,7 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
         #[tokio::test]
         async fn bad_arguments_return_usage() {
-            let mut fixture = Fixture::new(DECLARED);
+            let mut fixture = Fixture::new(DECLARED).await;
             for bad in [
                 args(&[]),
                 args(&["add"]),
@@ -965,7 +981,7 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
         #[tokio::test]
         async fn list_shows_declared_sidecars_with_status_and_servers() {
-            let mut fixture = Fixture::new(DECLARED);
+            let mut fixture = Fixture::new(DECLARED).await;
             let text = handle_sidecar_command(&fixture.state(), &args(&["list"])).await;
             assert!(text.contains("tools"), "{text}");
             assert!(text.contains("autos"), "{text}");
@@ -975,7 +991,7 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
         #[tokio::test]
         async fn list_without_declared_sidecars_says_so() {
-            let mut fixture = Fixture::new("dockerfile = \"D\"\ncontext = \".\"\n");
+            let mut fixture = Fixture::new("dockerfile = \"D\"\ncontext = \".\"\n").await;
             let text = handle_sidecar_command(&fixture.state(), &args(&["list"])).await;
             assert!(text.contains("no sidecars declared"), "{text}");
         }
@@ -1041,20 +1057,7 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
     #[test]
     fn cli_override_replaces_resolved_tool_call_max() {
-        let mut resolved = llm::ResolvedAgent {
-            agent_name: "coding".to_string(),
-            model_name: "fast".to_string(),
-            model_identifier: "gpt-4o-mini".to_string(),
-            provider_name: "local".to_string(),
-            provider: llm::ResolvedProvider::Mistralrs,
-            model_weights: None,
-            preamble: "test".to_string(),
-            temperature: None,
-            max_tokens: None,
-            tool_call_max: 100,
-            tool_result_max_bytes: llm::DEFAULT_TOOL_RESULT_MAX_BYTES,
-            image: None,
-        };
+        let mut resolved = test_resolved_agent();
 
         apply_tool_call_max_override(&mut resolved, Some(50));
 
@@ -1064,18 +1067,8 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
     #[test]
     fn cli_override_replaces_resolved_tool_result_max() {
         let mut resolved = llm::ResolvedAgent {
-            agent_name: "coding".to_string(),
-            model_name: "fast".to_string(),
-            model_identifier: "gpt-4o-mini".to_string(),
-            provider_name: "local".to_string(),
-            provider: llm::ResolvedProvider::Mistralrs,
-            model_weights: None,
-            preamble: "test".to_string(),
-            temperature: None,
-            max_tokens: None,
-            tool_call_max: 100,
             tool_result_max_bytes: 262_144,
-            image: None,
+            ..test_resolved_agent()
         };
 
         apply_tool_result_max_override(&mut resolved, Some(65_536));
