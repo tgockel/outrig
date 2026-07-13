@@ -6,6 +6,7 @@
 //! No podman dependency: the discard tests inject their own running-check
 //! closure.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -634,7 +635,7 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -692,7 +693,7 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -729,7 +730,7 @@ async fn clean_without_yes_aborts_on_n() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -767,7 +768,7 @@ async fn clean_accepts_yes_at_prompt() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -798,10 +799,7 @@ async fn clean_skips_running_sessions() {
         &store,
         &args,
         now,
-        move |name| {
-            let is_running = name == running.as_str();
-            async move { Ok(is_running) }
-        },
+        BTreeSet::from([running]),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -837,7 +835,7 @@ async fn clean_removes_stale_unfinalized_non_running_sessions() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -880,7 +878,7 @@ async fn clean_removes_symlinked_session_target_and_link() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         Vec::new(),
         |_| async { Ok(()) },
     )
@@ -970,8 +968,8 @@ async fn clean_removes_old_stopped_stray_containers() {
         labeled("outrig-young", "young", None, false, days(1), now),
     ];
 
-    let removed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-    let removed_ref = removed.clone();
+    let batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let batches_ref = batches.clone();
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
@@ -981,12 +979,12 @@ async fn clean_removes_old_stopped_stray_containers() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         strays,
-        move |name| {
-            let removed = removed_ref.clone();
+        move |names: Vec<String>| {
+            let batches = batches_ref.clone();
             async move {
-                removed.lock().unwrap().push(name);
+                batches.lock().unwrap().push(names);
                 Ok(())
             }
         },
@@ -996,14 +994,14 @@ async fn clean_removes_old_stopped_stray_containers() {
     drop(ew);
     assert_eq!(rc, 0);
 
-    let removed = removed.lock().unwrap().clone();
+    let batches = batches.lock().unwrap().clone();
     assert_eq!(
-        removed,
-        vec![
+        batches,
+        vec![vec![
             "outrig-lost-1".to_string(),
             "outrig-lost-1-tools".to_string()
-        ],
-        "only the old stopped strays should be removed"
+        ]],
+        "both old stopped strays should be removed in a single batched podman rm -f"
     );
     let err = drain(stderr_r).await;
     assert!(
@@ -1050,8 +1048,8 @@ async fn clean_never_removes_running_or_record_backed_containers() {
         labeled("outrig-orphan", "orphan-sid", None, true, days(40), now),
     ];
 
-    let removed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-    let removed_ref = removed.clone();
+    let batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let batches_ref = batches.clone();
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
@@ -1061,12 +1059,15 @@ async fn clean_never_removes_running_or_record_backed_containers() {
         &store,
         &args,
         now,
-        |_| async { Ok(true) },
+        BTreeSet::from([
+            "outrig-20260501T134412-3f2a".to_string(),
+            "outrig-orphan".to_string(),
+        ]),
         strays,
-        move |name| {
-            let removed = removed_ref.clone();
+        move |names: Vec<String>| {
+            let batches = batches_ref.clone();
             async move {
-                removed.lock().unwrap().push(name);
+                batches.lock().unwrap().push(names);
                 Ok(())
             }
         },
@@ -1076,7 +1077,7 @@ async fn clean_never_removes_running_or_record_backed_containers() {
     drop(ew);
 
     assert!(
-        removed.lock().unwrap().is_empty(),
+        batches.lock().unwrap().is_empty(),
         "no container should be removed"
     );
     let err = drain(stderr_r).await;
@@ -1117,8 +1118,8 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
         now,
     )];
 
-    let removed: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
-    let removed_ref = removed.clone();
+    let batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let batches_ref = batches.clone();
     let (mut ew, stderr_r) = duplex(8192);
     let stdin = tokio::io::BufReader::new(tokio::io::empty());
     let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
@@ -1128,12 +1129,12 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
         &store,
         &args,
         now,
-        |_| async { Ok(false) },
+        BTreeSet::new(),
         strays,
-        move |name| {
-            let removed = removed_ref.clone();
+        move |names: Vec<String>| {
+            let batches = batches_ref.clone();
             async move {
-                removed.lock().unwrap().push(name);
+                batches.lock().unwrap().push(names);
                 Ok(())
             }
         },
@@ -1143,8 +1144,8 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
     drop(ew);
 
     assert_eq!(
-        removed.lock().unwrap().clone(),
-        vec!["outrig-20260501T134412-3f2a".to_string()],
+        batches.lock().unwrap().clone(),
+        vec![vec!["outrig-20260501T134412-3f2a".to_string()]],
         "the leftover container of a removed record should be swept"
     );
     let err = drain(stderr_r).await;

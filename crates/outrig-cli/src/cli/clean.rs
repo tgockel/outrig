@@ -1,12 +1,14 @@
 //! `outrig clean` -- bulk-remove old session records and stray containers.
 //!
-//! Two sweeps run together. The session-store walk removes old
-//! metadata/log directories, refusing to touch sessions whose container is
-//! still running. The label sweep catches *stray* containers -- ones
-//! carrying `org.outrig.session` whose session record is gone (lost record,
-//! SIGKILLed outrig, failed `--rm`) -- and `podman rm -f`s the stopped ones
-//! older than the cutoff. Running containers are never removed, labeled or
-//! not.
+//! Two sweeps run together, both answered from a single unfiltered `podman ps
+//! -a`. The session-store walk removes old metadata/log directories, refusing
+//! to touch a session whose recorded container name is among the running
+//! containers -- including an attach session's borrowed, outrig-unlabeled
+//! container, which a label-filtered listing would miss. The label sweep
+//! catches *stray* containers -- ones carrying `org.outrig.session` whose
+//! session record is gone (lost record, SIGKILLed outrig, failed `--rm`) --
+//! and `podman rm -f`s the stopped ones older than the cutoff in one
+//! invocation. Running containers are never removed, labeled or not.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -19,7 +21,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{OutrigError, Result};
 use crate::session::{self, Session, SessionStore};
-use outrig::container::{Container, LABEL_SESSION, LABEL_SIDECAR};
+use outrig::container::{LABEL_SESSION, LABEL_SIDECAR};
 
 const DAY: u64 = 24 * 60 * 60;
 pub const DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * DAY);
@@ -64,7 +66,7 @@ pub async fn execute(
         cwd,
     )?;
     let store = SessionStore::new(root);
-    let labeled = list_labeled_containers().await?;
+    let (labeled, running) = list_all_containers().await?;
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stderr = tokio::io::stderr();
     execute_with(
@@ -73,30 +75,28 @@ pub async fn execute(
         &store,
         args,
         SystemTime::now(),
-        podman_is_running,
+        running,
         labeled,
-        podman_remove_force,
+        podman_remove_force_batch,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_with<E, R, F, Fut, D, DFut>(
+pub async fn execute_with<E, R, D, DFut>(
     stderr: &mut E,
     stdin: R,
     store: &SessionStore,
     args: &CleanArgs,
     now: SystemTime,
-    mut is_running: F,
+    running: BTreeSet<String>,
     labeled: Vec<LabeledContainer>,
-    mut remove_container: D,
+    mut remove_containers: D,
 ) -> Result<i32>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<bool>>,
-    D: FnMut(String) -> DFut,
+    D: FnMut(Vec<String>) -> DFut,
     DFut: Future<Output = Result<()>>,
 {
     let sessions = store.list()?;
@@ -107,7 +107,7 @@ where
         if !older_than(session, args.older_than, now) {
             continue;
         }
-        if is_running(session.container_name.clone()).await? {
+        if running.contains(&session.container_name) {
             skipped_running.push(session.clone());
             continue;
         }
@@ -154,12 +154,16 @@ where
         }
     }
 
-    let mut strays_removed = 0usize;
-    for stray in &stray_targets {
-        remove_container(stray.name.clone()).await?;
-        strays_removed += 1;
-        let msg = format!("[outrig] removed container {}\n", stray.name);
-        stderr.write_all(msg.as_bytes()).await?;
+    // One `podman rm -f` for every stray. Guard the empty case -- `podman rm
+    // -f` with no names is an error -- and print the same per-container line
+    // for each on success, so the happy path stays byte-identical.
+    let strays_removed = stray_targets.len();
+    if !stray_targets.is_empty() {
+        remove_containers(stray_targets.iter().map(|s| s.name.clone()).collect()).await?;
+        for stray in &stray_targets {
+            let msg = format!("[outrig] removed container {}\n", stray.name);
+            stderr.write_all(msg.as_bytes()).await?;
+        }
     }
 
     let summary = format!(
@@ -392,21 +396,21 @@ fn format_retention(duration: Duration) -> String {
     }
 }
 
-async fn podman_is_running(name: String) -> Result<bool> {
-    Ok(Container::is_running(&name).await?)
-}
-
-/// `podman rm -f <name>`, propagating failure -- clean should report a
-/// container it could not remove rather than claiming success.
-async fn podman_remove_force(name: String) -> Result<()> {
+/// `podman rm -f <name>...` for every stray in one invocation, propagating
+/// failure -- clean should report a container it could not remove rather than
+/// claiming success. Callers guard the empty case (`podman rm -f` with no
+/// names is an error).
+async fn podman_remove_force_batch(names: Vec<String>) -> Result<()> {
     let output = tokio::process::Command::new("podman")
-        .args(["rm", "-f", &name])
+        .args(["rm", "-f"])
+        .args(&names)
         .stdin(Stdio::null())
         .output()
         .await?;
     if !output.status.success() {
         return Err(OutrigError::Configuration(format!(
-            "podman rm -f {name} failed: {}",
+            "podman rm -f {} failed: {}",
+            names.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
         .into());
@@ -414,37 +418,33 @@ async fn podman_remove_force(name: String) -> Result<()> {
     Ok(())
 }
 
-/// `podman ps -a --filter label=org.outrig.session --format json`, decoded
-/// into [`LabeledContainer`]s. Containers missing the expected fields are
-/// skipped rather than failing the sweep.
-async fn list_labeled_containers() -> Result<Vec<LabeledContainer>> {
+/// `podman ps -a --format json`, decoded into the labeled-container rows (the
+/// stray-sweep input) plus the set of *all* running container names (the
+/// record-walk running check). Unfiltered so an attach session's borrowed,
+/// outrig-unlabeled primary still shows up in the running set. Rows missing the
+/// expected fields are skipped rather than failing the sweep.
+async fn list_all_containers() -> Result<(Vec<LabeledContainer>, BTreeSet<String>)> {
     let output = tokio::process::Command::new("podman")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label={LABEL_SESSION}"),
-            "--format",
-            "json",
-        ])
+        .args(["ps", "-a", "--format", "json"])
         .stdin(Stdio::null())
         .output()
         .await?;
     if !output.status.success() {
         return Err(OutrigError::Configuration(format!(
-            "podman ps for labeled containers failed: {}",
+            "podman ps failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
         .into());
     }
-    parse_labeled_containers(&output.stdout)
+    parse_all_containers(&output.stdout)
 }
 
-fn parse_labeled_containers(stdout: &[u8]) -> Result<Vec<LabeledContainer>> {
+fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSet<String>)> {
     let rows: Vec<serde_json::Value> = serde_json::from_slice(stdout).map_err(|source| {
         OutrigError::Configuration(format!("podman ps --format json: invalid JSON: {source}"))
     })?;
-    let mut out = Vec::new();
+    let mut labeled = Vec::new();
+    let mut running = BTreeSet::new();
     for row in rows {
         let Some(name) = row
             .get("Names")
@@ -454,6 +454,13 @@ fn parse_labeled_containers(stdout: &[u8]) -> Result<Vec<LabeledContainer>> {
         else {
             continue;
         };
+        let is_running = row
+            .get("State")
+            .and_then(|state| state.as_str())
+            .is_some_and(|state| state.eq_ignore_ascii_case("running"));
+        if is_running {
+            running.insert(name.to_string());
+        }
         let labels = row.get("Labels").and_then(|labels| labels.as_object());
         let Some(session_label) = labels
             .and_then(|labels| labels.get(LABEL_SESSION))
@@ -465,24 +472,20 @@ fn parse_labeled_containers(stdout: &[u8]) -> Result<Vec<LabeledContainer>> {
             .and_then(|labels| labels.get(LABEL_SIDECAR))
             .and_then(|value| value.as_str())
             .map(str::to_string);
-        let running = row
-            .get("State")
-            .and_then(|state| state.as_str())
-            .is_some_and(|state| state.eq_ignore_ascii_case("running"));
         let created = row
             .get("Created")
             .and_then(|created| created.as_i64())
             .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64))
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        out.push(LabeledContainer {
+        labeled.push(LabeledContainer {
             name: name.to_string(),
             session_label: session_label.to_string(),
             sidecar_label,
-            running,
+            running: is_running,
             created,
         });
     }
-    Ok(out)
+    Ok((labeled, running))
 }
 
 #[cfg(test)]
@@ -490,7 +493,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_labeled_containers_decodes_podman_ps_json() {
+    fn parse_all_containers_splits_labeled_rows_and_running_names() {
         let stdout = br#"[
           {
             "Names": ["outrig-abc"],
@@ -505,32 +508,46 @@ mod tests {
             "Created": 1700000100
           },
           {
-            "Names": ["unlabeled"],
+            "Names": ["unlabeled-stopped"],
             "Labels": {},
             "State": "exited",
             "Created": 1700000200
+          },
+          {
+            "Names": ["borrowed-attach-container"],
+            "Labels": {},
+            "State": "running",
+            "Created": 1700000300
           }
         ]"#;
 
-        let parsed = parse_labeled_containers(stdout).expect("parse");
-        assert_eq!(parsed.len(), 2, "unlabeled containers are skipped");
+        let (labeled, running) = parse_all_containers(stdout).expect("parse");
 
-        assert_eq!(parsed[0].name, "outrig-abc");
-        assert_eq!(parsed[0].session_label, "abc");
-        assert_eq!(parsed[0].sidecar_label, None);
-        assert!(parsed[0].running);
+        // Only the two `org.outrig.session` rows are stray-sweep input.
+        assert_eq!(labeled.len(), 2, "unlabeled containers are not stray input");
+        assert_eq!(labeled[0].name, "outrig-abc");
+        assert_eq!(labeled[0].session_label, "abc");
+        assert_eq!(labeled[0].sidecar_label, None);
+        assert!(labeled[0].running);
         assert_eq!(
-            parsed[0].created,
+            labeled[0].created,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
         );
+        assert_eq!(labeled[1].name, "outrig-abc-tools");
+        assert_eq!(labeled[1].sidecar_label.as_deref(), Some("tools"));
+        assert!(!labeled[1].running);
 
-        assert_eq!(parsed[1].name, "outrig-abc-tools");
-        assert_eq!(parsed[1].sidecar_label.as_deref(), Some("tools"));
-        assert!(!parsed[1].running);
+        // The running set spans every running container, labeled or not, so an
+        // attach session's unlabeled primary is still seen as alive.
+        assert_eq!(running.len(), 2);
+        assert!(running.contains("outrig-abc"));
+        assert!(running.contains("borrowed-attach-container"));
+        assert!(!running.contains("outrig-abc-tools"), "exited sidecar");
+        assert!(!running.contains("unlabeled-stopped"));
     }
 
     #[test]
-    fn parse_labeled_containers_rejects_bad_json() {
-        assert!(parse_labeled_containers(b"not json").is_err());
+    fn parse_all_containers_rejects_bad_json() {
+        assert!(parse_all_containers(b"not json").is_err());
     }
 }

@@ -24,7 +24,7 @@
 //!
 //! [`run`]: crate::cli::run
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,12 +33,12 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::SessionWatcher;
-use crate::error::{OutrigError, Result};
+use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
-    Config, ImageConfig, MistralrsDeviceSpec, MountAccess, MountConfig, NetworkMode,
+    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountAccess, MountConfig, NetworkMode,
     SidecarOnFailure, SidecarStart,
 };
 use outrig::container::{
@@ -611,6 +611,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         Some(SessionWatcher::spawn(
             containers.primary.name().to_string(),
             session.sidecar_container_names.clone(),
+            sid.0.clone(),
+            session.started_at,
         ))
     } else {
         None
@@ -709,27 +711,43 @@ async fn setup_sidecars_and_network(
     let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
     sidecar::merge_primary_labels(&mut plan, image_mcp);
 
-    let sidecar_names: Vec<String> = plan.sidecars.keys().cloned().collect();
-    for name in &sidecar_names {
-        let sc = plan.sidecars[name].clone();
+    // Phase A -- ensure each distinct sidecar image (and read its labels when a
+    // non-anonymous sidecar needs them) concurrently. Sidecars are independent,
+    // so their podman-heavy ensure/inspect work overlaps; the results are
+    // consumed below in deterministic name order.
+    let resolutions =
+        resolve_sidecar_images(&plan, args.cfg, args.repo_root, args.transcript).await;
 
-        let tag = match ensure_sidecar_image(args.cfg, args.repo_root, &sc.image, args.transcript)
-            .await
-        {
-            Ok(tag) => tag,
-            Err(e) => {
-                warn_or_bail(&plan, &sc, e)?;
+    // Phase B -- merge sidecar labels and decide which sidecars start, serially
+    // in name order. Keeping this ordered preserves the deterministic
+    // label-collision errors that the concurrent Phase A must not perturb.
+    let mut to_start: Vec<(String, ImageTag, SidecarPlan)> = Vec::new();
+    for name in plan.sidecars.keys().cloned().collect::<Vec<_>>() {
+        let sc = plan.sidecars[&name].clone();
+        let resolution = &resolutions[&sc.image];
+
+        let tag = match &resolution.tag {
+            Ok(tag) => tag.clone(),
+            Err(message) => {
+                warn_or_bail(&plan, &sc, shared_image_error(message))?;
                 continue;
             }
         };
 
         if !sc.anonymous {
-            let label_mcp = embedded::read_embedded_mcp(&tag, args.transcript).await?;
-            sidecar::merge_sidecar_labels(&mut plan, name, label_mcp)?;
+            let label_mcp = match resolution
+                .labels
+                .as_ref()
+                .expect("non-anonymous sidecar image is label-read in Phase A")
+            {
+                Ok(label_mcp) => label_mcp.clone(),
+                Err(message) => return Err(shared_image_error(message)),
+            };
+            sidecar::merge_sidecar_labels(&mut plan, &name, label_mcp)?;
         }
 
         if !args.start_sidecars || sc.start != SidecarStart::Auto {
-            if args.start_sidecars && plan.servers_in(name).next().is_some() {
+            if args.start_sidecars && plan.servers_in(&name).next().is_some() {
                 eprintln!(
                     "[outrig] sidecar {name} is start = \"manual\"; skipping its MCP servers"
                 );
@@ -737,22 +755,11 @@ async fn setup_sidecars_and_network(
             continue;
         }
 
-        let started = match plan.entrypoint_server_in(&sc) {
-            Some((server_name, placed)) => {
-                create_one_entrypoint_sidecar(&args, &tag, &sc, server_name, &placed.spec).await
-            }
-            None => {
-                let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
-                start_one_sidecar(&args.start_ctx(), &tag, &sc, needs_bootstrap).await
-            }
-        };
-        match started {
-            Ok(container) => {
-                containers.sidecars.insert(name.clone(), container);
-            }
-            Err(e) => warn_or_bail(&plan, &sc, e)?,
-        }
+        to_start.push((name, tag, sc));
     }
+
+    // Phase C -- start the auto sidecars concurrently, inserting in name order.
+    start_auto_sidecars(&plan, &args, to_start, containers).await?;
 
     let network = match args.network_mode {
         NetworkMode::Default => None,
@@ -761,6 +768,114 @@ async fn setup_sidecars_and_network(
     };
 
     Ok((plan, network))
+}
+
+/// One distinct sidecar image resolved once and shared by every sidecar that
+/// references it (Phase A of [`setup_sidecars_and_network`]). `tag` is the
+/// image-ensure result; `labels` is the `org.outrig.mcp` read, present only
+/// when at least one *non-anonymous* sidecar uses the image -- anonymous
+/// sidecars never read labels, so an anonymous-only image is never inspected
+/// (inspecting it could newly fail a session on a malformed label). A failure
+/// is kept as its `Display` text -- one image feeds many sidecars but
+/// [`CliError`] is not `Clone` -- and [`shared_image_error`] re-wraps it
+/// verbatim per consumer.
+struct ImageResolution {
+    tag: std::result::Result<ImageTag, String>,
+    labels: Option<std::result::Result<BTreeMap<String, McpServerSpec>, String>>,
+}
+
+/// Ensure every distinct sidecar image (and read its labels when needed)
+/// concurrently, deduped by image ref so two sidecars sharing an image run the
+/// tag-compute + ensure + label-inspect once. `join_all` runs the futures on
+/// the current task, so the borrowed inputs need no `'static` and nothing is
+/// cloned beyond the image key.
+async fn resolve_sidecar_images(
+    plan: &SessionMcpPlan,
+    cfg: &Config,
+    repo_root: &Path,
+    transcript: Option<&Transcript>,
+) -> HashMap<String, ImageResolution> {
+    // Distinct images, each flagged for a label read iff a non-anonymous
+    // sidecar uses it (anonymous-only images are never inspected).
+    let mut images: BTreeMap<&str, bool> = BTreeMap::new();
+    for sc in plan.sidecars.values() {
+        *images.entry(sc.image.as_str()).or_default() |= !sc.anonymous;
+    }
+
+    futures_util::future::join_all(images.into_iter().map(|(image, read_labels)| async move {
+        let resolution = match ensure_sidecar_image(cfg, repo_root, image, transcript).await {
+            Ok(tag) => {
+                let labels = if read_labels {
+                    Some(
+                        embedded::read_embedded_mcp(&tag, transcript)
+                            .await
+                            .map_err(|e| e.to_string()),
+                    )
+                } else {
+                    None
+                };
+                ImageResolution {
+                    tag: Ok(tag),
+                    labels,
+                }
+            }
+            Err(e) => ImageResolution {
+                tag: Err(e.to_string()),
+                labels: None,
+            },
+        };
+        (image.to_string(), resolution)
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
+/// Start the `start = "auto"` sidecars concurrently, then insert them into
+/// `containers` in name order. The container starts (and any bootstrap) are
+/// independent; only the ordered insert and `warn`/`abort` routing run after
+/// the join, so a `warn` sidecar drops exactly as it did serially.
+async fn start_auto_sidecars(
+    plan: &SessionMcpPlan,
+    args: &SidecarPhaseArgs<'_>,
+    to_start: Vec<(String, ImageTag, SidecarPlan)>,
+    containers: &mut SessionContainers,
+) -> Result<()> {
+    let started =
+        futures_util::future::join_all(to_start.into_iter().map(|(name, tag, sc)| async move {
+            let result = match plan.entrypoint_server_in(&sc) {
+                Some((server_name, placed)) => {
+                    create_one_entrypoint_sidecar(args, &tag, &sc, server_name, &placed.spec).await
+                }
+                None => {
+                    let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
+                    start_one_sidecar(&args.start_ctx(), &tag, &sc, needs_bootstrap).await
+                }
+            };
+            (name, sc, result)
+        }))
+        .await;
+
+    for (name, sc, result) in started {
+        match result {
+            Ok(container) => {
+                containers.sidecars.insert(name, container);
+            }
+            Err(e) => warn_or_bail(plan, &sc, e)?,
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild an owned error from an [`ImageResolution`]'s shared failure text.
+/// Only the error's `Display` reaches the user (`app.rs` prints `error: {e}` and
+/// always exits 1), so preserving the exact message -- not the original variant
+/// -- is what keeps this observably identical to the serial path. `io::Error`
+/// displays its payload verbatim (`OutrigError::Io` and `CliError::Outrig` are
+/// both transparent); `OutrigError::Configuration` would instead prepend
+/// "configuration: ". Revisit if exit codes ever become variant-dependent.
+fn shared_image_error(message: &str) -> CliError {
+    CliError::from(std::io::Error::other(message.to_string()))
 }
 
 /// Start the network interceptor on the primary and attach every running
@@ -1177,6 +1292,16 @@ pub async fn teardown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_image_error_preserves_message_without_a_configuration_prefix() {
+        // The serial path surfaced an ensure/label failure verbatim; deduped
+        // Phase A keeps only its `Display` text, so re-wrapping must not add a
+        // variant prefix (`OutrigError::Configuration` would prepend
+        // "configuration: ").
+        let message = "process `buildah` exited with code 1";
+        assert_eq!(shared_image_error(message).to_string(), message);
+    }
 
     fn config_image(image_ref: &str) -> ImageConfig {
         ImageConfig {

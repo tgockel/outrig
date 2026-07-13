@@ -8,4 +8,3 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 | Task | Title                                              | Dependencies |
 |------|----------------------------------------------------|--------------|
-| 0086 | Sidecar startup and clean-sweep performance        | --           |
