@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "local-llm")]
 use futures_util::StreamExt;
-use rig::agent::{HookAction, PromptHook, ToolCallHookAction};
+use rig::agent::{AgentHook, Flow, HookContext, StepEvent, StepEventKind};
 #[cfg(feature = "local-llm")]
 use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
 #[cfg(feature = "local-llm")]
-use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use thiserror::Error;
 #[cfg(feature = "local-llm")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -22,9 +22,13 @@ use crate::error::Result;
 use crate::rig_tool::McpToolAdapter;
 use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
 
-/// Hard max on tool calls per turn. The hook below trips this; rig's own
-/// `max_turns` is set to the same value as a defense in depth, so whichever
-/// fires first surfaces a controllable message.
+/// Hard max on tool calls per turn. The per-turn [`OutrigPromptHook`] trips
+/// this and surfaces a controllable message. rig's own `max_turns` is a
+/// backstop set a little higher: as of rig 0.40 it counts *total* model calls
+/// (initial completion + one continuation per tool call) rather than the looser
+/// 0.39 budget, so callers pass `tool_call_max + 2` to preserve the previous
+/// effective allowance and keep the hook -- not rig -- the limiter that fires
+/// first.
 pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_MAX as usize;
 
 /// Default byte ceiling applied to each individual MCP tool result before it
@@ -603,9 +607,9 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     let hook = OutrigPromptHook::new(tool_call_max);
     let result = agent
         .prompt(prompt.to_string())
-        .with_history(history.clone())
-        .max_turns(tool_call_max)
-        .with_hook(hook)
+        .history(history.clone())
+        .max_turns(tool_call_max + 2)
+        .add_hook(hook)
         .extended_details()
         .await;
 
@@ -646,10 +650,9 @@ where
 {
     let hook = OutrigPromptHook::new(tool_call_max);
     let mut stream = agent
-        .stream_prompt(prompt.to_string())
-        .with_history(history.clone())
-        .multi_turn(tool_call_max)
-        .with_hook(hook)
+        .stream_chat(prompt.to_string(), history.clone())
+        .max_turns(tool_call_max + 2)
+        .add_hook(hook)
         .await;
 
     let mut streamed_reply = String::new();
@@ -668,7 +671,7 @@ where
                 stdout.flush().await?;
             }
             Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                final_history = response.history().map(|messages| messages.to_vec());
+                final_history = response.messages().map(|messages| messages.to_vec());
             }
             Ok(_) => {}
             Err(err) => {
@@ -762,36 +765,46 @@ impl OutrigPromptHook {
     }
 }
 
-impl<M: CompletionModel> PromptHook<M> for OutrigPromptHook {
-    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
-        if self.cap_reached.load(Ordering::SeqCst) {
-            return HookAction::terminate(format!(
-                "tool-call iteration max ({}) reached; ending turn",
-                self.max
-            ));
-        }
-        HookAction::cont()
+impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
+    // The hook only acts on `CompletionCall` and `ToolCall`; narrowing
+    // `observes` keeps it off the per-token `TextDelta`/`ToolCallDelta` stream
+    // in the streaming path, where `on_event` below would just no-op anyway.
+    fn observes(&self, kind: StepEventKind) -> bool {
+        matches!(
+            kind,
+            StepEventKind::CompletionCall | StepEventKind::ToolCall
+        )
     }
 
-    async fn on_tool_call(
-        &self,
-        tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        args: &str,
-    ) -> ToolCallHookAction {
-        let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        if n > self.max {
-            self.cap_reached.store(true, Ordering::SeqCst);
-            return ToolCallHookAction::skip(format!(
-                "[outrig] tool call not executed: per-turn tool-call max ({}) \
-                 was reached before this call could run. The user may continue \
-                 with a fresh max; repeat the tool call if still needed.",
-                self.max
-            ));
+    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        match event {
+            StepEvent::CompletionCall { .. } => {
+                if self.cap_reached.load(Ordering::SeqCst) {
+                    return Flow::terminate(format!(
+                        "tool-call iteration max ({}) reached; ending turn",
+                        self.max
+                    ));
+                }
+                Flow::cont()
+            }
+            StepEvent::ToolCall {
+                tool_name, args, ..
+            } => {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n > self.max {
+                    self.cap_reached.store(true, Ordering::SeqCst);
+                    return Flow::skip(format!(
+                        "[outrig] tool call not executed: per-turn tool-call max ({}) \
+                         was reached before this call could run. The user may continue \
+                         with a fresh max; repeat the tool call if still needed.",
+                        self.max
+                    ));
+                }
+                eprintln!("[outrig] tool call: {tool_name}({args})");
+                Flow::cont()
+            }
+            _ => Flow::cont(),
         }
-        eprintln!("[outrig] tool call: {tool_name}({args})");
-        ToolCallHookAction::cont()
     }
 }
 

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, JsonObject, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, JsonObject,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use schemars::JsonSchema;
@@ -117,7 +117,7 @@ impl SelfServer {
                 };
                 match docs::get_doc(&args.page) {
                     Some(doc) => json_result(doc),
-                    None => Ok(CallToolResult::error(vec![Content::text(format!(
+                    None => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "unknown doc page: {}",
                         args.page
                     ))])),
@@ -147,7 +147,7 @@ impl SelfServer {
                 };
                 json_result(validate::validate_image_toml(&args.toml))
             }
-            other => Ok(CallToolResult::error(vec![Content::text(format!(
+            other => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool: {other}"
             ))])),
         }
@@ -226,18 +226,22 @@ fn parse_args<T: DeserializeOwned>(
     arguments: Option<JsonObject>,
 ) -> std::result::Result<T, CallToolResult> {
     serde_json::from_value(serde_json::Value::Object(arguments.unwrap_or_default())).map_err(
-        |err| CallToolResult::error(vec![Content::text(format!("invalid arguments: {err}"))]),
+        |err| {
+            CallToolResult::error(vec![ContentBlock::text(format!(
+                "invalid arguments: {err}"
+            ))])
+        },
     )
 }
 
 fn json_result<T: Serialize>(value: T) -> std::result::Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::json(value)?]))
+    Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::RawContent;
+    use rmcp::model::ContentBlock;
     use serde_json::json;
 
     fn call(name: &str, args: serde_json::Value) -> CallToolResult {
@@ -254,8 +258,8 @@ mod tests {
     }
 
     fn text(result: &CallToolResult) -> &str {
-        match &result.content[0].raw {
-            RawContent::Text(t) => &t.text,
+        match &result.content[0] {
+            ContentBlock::Text(t) => &t.text,
             other => panic!("expected text content, got {other:?}"),
         }
     }

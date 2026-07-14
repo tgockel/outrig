@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded the `rmcp` MCP SDK from 1.x to 2.x. The proxy and client now build on
+  rmcp 2.2's flat `ContentBlock` content model (replacing `RawContent`), so
+  consumers of this library link against rmcp 2.x.
+
 ## [0.1.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.1.0) - 2026-06-26
 
 ### Added

@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::Value;
@@ -142,14 +141,12 @@ impl ToolDyn for McpToolAdapter {
         self.openai_name.clone()
     }
 
-    fn definition(&self, _prompt: String) -> WasmBoxedFuture<'_, ToolDefinition> {
-        Box::pin(async move {
-            ToolDefinition {
-                name: self.openai_name.clone(),
-                description: self.description.clone(),
-                parameters: self.input_schema.clone(),
-            }
-        })
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+
+    fn parameters(&self) -> Value {
+        self.input_schema.clone()
     }
 
     fn call(&self, args: String) -> WasmBoxedFuture<'_, std::result::Result<String, ToolError>> {

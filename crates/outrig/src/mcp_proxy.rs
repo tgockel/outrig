@@ -19,8 +19,8 @@ use std::sync::Arc;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, JsonObject, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, JsonObject,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
@@ -270,7 +270,7 @@ impl<C: BackingClient> ProxyServer<C> {
     pub async fn dispatch_call(&self, request: CallToolRequestParams) -> CallToolResult {
         let public_name = request.name.as_ref();
         let Some(&idx) = self.inner.by_public_name.get(public_name) else {
-            return CallToolResult::error(vec![Content::text(format!(
+            return CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool: {public_name}"
             ))]);
         };
@@ -280,9 +280,9 @@ impl<C: BackingClient> ProxyServer<C> {
         let client = &self.inner.clients[entry.client_idx];
         match client.call_tool(&entry.backend_tool, args).await {
             Ok(result) if result.is_error => {
-                CallToolResult::error(vec![Content::text(result.content_text)])
+                CallToolResult::error(vec![ContentBlock::text(result.content_text)])
             }
-            Ok(result) => CallToolResult::success(vec![Content::text(result.content_text)]),
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result.content_text)]),
             Err(e) => {
                 let server = client.name();
                 tracing::warn!(
@@ -290,7 +290,7 @@ impl<C: BackingClient> ProxyServer<C> {
                     "backing server {server:?} call to {tool:?} failed: {e}",
                     tool = entry.backend_tool,
                 );
-                CallToolResult::error(vec![Content::text(format!(
+                CallToolResult::error(vec![ContentBlock::text(format!(
                     "outrig: backing server `{server}` call failed: {e}"
                 ))])
             }

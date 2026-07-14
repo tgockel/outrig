@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, RawContent};
+use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::service::serve_client;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -240,8 +240,8 @@ where
     let body = result
         .content
         .iter()
-        .filter_map(|content| match &content.raw {
-            RawContent::Text(t) => Some(t.text.as_str()),
+        .filter_map(|content| match content {
+            ContentBlock::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

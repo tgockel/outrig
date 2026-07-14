@@ -17,7 +17,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, RawContent, ResourceContents};
+use rmcp::model::{CallToolRequestParams, ContentBlock, ResourceContents};
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use serde_json::Value;
 use tokio::process::Child;
@@ -270,9 +270,9 @@ impl McpClient {
             if i > 0 {
                 content_text.push('\n');
             }
-            match &content.raw {
-                RawContent::Text(t) => content_text.push_str(&t.text),
-                RawContent::Image(img) => {
+            match content {
+                ContentBlock::Text(t) => content_text.push_str(&t.text),
+                ContentBlock::Image(img) => {
                     let _ = write!(
                         content_text,
                         "[image: {}, {} base64 bytes]",
@@ -280,7 +280,7 @@ impl McpClient {
                         img.data.len()
                     );
                 }
-                RawContent::Resource(r) => match &r.resource {
+                ContentBlock::Resource(r) => match &r.resource {
                     ResourceContents::TextResourceContents { text, .. } => {
                         content_text.push_str(text)
                     }
@@ -290,8 +290,9 @@ impl McpClient {
                         let mime = mime_type.as_deref().unwrap_or("application/octet-stream");
                         let _ = write!(content_text, "[blob: {mime}, {} base64 bytes]", blob.len());
                     }
+                    _ => content_text.push_str("[unsupported resource contents]"),
                 },
-                RawContent::Audio(audio) => {
+                ContentBlock::Audio(audio) => {
                     let _ = write!(
                         content_text,
                         "[audio: {}, {} base64 bytes]",
@@ -299,9 +300,10 @@ impl McpClient {
                         audio.data.len()
                     );
                 }
-                RawContent::ResourceLink(link) => {
+                ContentBlock::ResourceLink(link) => {
                     let _ = write!(content_text, "[resource link: {}]", link.uri);
                 }
+                _ => content_text.push_str("[unsupported content block]"),
             }
         }
 

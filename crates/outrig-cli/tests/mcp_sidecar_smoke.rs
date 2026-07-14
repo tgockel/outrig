@@ -262,8 +262,8 @@ async fn sidecar_hosts_servers_with_labels_record_and_clean_reap() {
         let body = call
             .content
             .iter()
-            .filter_map(|c| match &c.raw {
-                rmcp::model::RawContent::Text(t) => Some(t.text.as_str()),
+            .filter_map(|c| match c {
+                rmcp::model::ContentBlock::Text(t) => Some(t.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

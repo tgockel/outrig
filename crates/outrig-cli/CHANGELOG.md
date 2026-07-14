@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded the LLM/agent stack: `rig-core` 0.39 -> 0.40 and the `rmcp` MCP SDK
+  1.x -> 2.x, plus routine dependency bumps (anyhow, ignore, jiff, rand, toml).
+  rig 0.40's `max_turns` now counts total model calls rather than tool-call
+  rounds; outrig compensates so the per-turn tool-call limit behaves as before.
+
 ## [0.1.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.1.0) - 2026-06-26
 
 ### Added

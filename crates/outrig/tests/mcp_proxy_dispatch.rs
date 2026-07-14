@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use outrig::error::OutrigError;
 use outrig::mcp_proxy::{BackingClient, ProxyServer};
 use outrig::{McpTool, McpToolResult};
-use rmcp::model::{CallToolRequestParams, RawContent};
+use rmcp::model::{CallToolRequestParams, ContentBlock};
 use serde_json::{Value, json};
 
 /// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
@@ -88,7 +88,7 @@ impl BackingClient for FakeClient {
 fn text_body(result: &rmcp::model::CallToolResult) -> String {
     let mut out = String::new();
     for content in &result.content {
-        if let RawContent::Text(t) = &content.raw {
+        if let ContentBlock::Text(t) = content {
             if !out.is_empty() {
                 out.push('\n');
             }
