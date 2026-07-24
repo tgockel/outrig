@@ -675,6 +675,98 @@ cap-add  = ["CAP_MKNOD"]
     }
 
     #[test]
+    fn empty_device_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["   "]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::DevicePathEmpty { image } => {
+                assert_eq!(image, "coding");
+            }
+            other => panic!("expected DevicePathEmpty, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_device_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["dev/fuse"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::DevicePathRelative { image, device } => {
+                assert_eq!(image, "coding");
+                assert_eq!(device, "dev/fuse");
+            }
+            other => panic!("expected DevicePathRelative, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_device_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+devices = ["/dev/fuse", "/dev/kvm", "/dev/fuse"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::DevicePathDuplicate { image, device } => {
+                assert_eq!(image, "coding");
+                assert_eq!(device, "/dev/fuse");
+            }
+            other => panic!("expected DevicePathDuplicate, got: {other:?}"),
+        }
+    }
+
+    /// Sidecars reuse the whole `[security]` block, so the device rules reach
+    /// them too -- and the error names the sidecar's scope, not the bare image.
+    #[test]
+    fn sidecar_device_path_errors_name_the_sidecar_scope() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.sidecars.tools]
+image = "mcp-tools"
+
+[images.coding.sidecars.tools.security]
+devices = ["dev/fuse"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::DevicePathRelative { image, device } => {
+                assert_eq!(image, "coding.sidecars.tools");
+                assert_eq!(device, "dev/fuse");
+            }
+            other => panic!("expected DevicePathRelative, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn top_level_tool_call_max_zero_errors() {
         let cfg = parse(
             r#"

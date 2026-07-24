@@ -91,8 +91,10 @@ The `[images.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
 ### Capability profiles
 
 By default, outrig preserves podman's default Linux capability set. That keeps existing
-toolchains and MCP servers working while still applying `--security-opt=no-new-privileges`.
-When a container can run with less privilege, add a security block:
+toolchains and MCP servers working while still applying `--security-opt=no-new-privileges`,
+which stays on unless an image-config turns it off (see
+[Devices and privilege escalation](#devices-and-privilege-escalation)). When a container can
+run with less privilege, add a security block:
 
 ```toml
 [images.coding.security]
@@ -116,6 +118,40 @@ cap-add = ["NET_BIND_SERVICE"]
 
 Explicit `cap-add` values are rendered last, so a container can start from `drop-all` and add
 back one narrow capability. Capability names may include or omit the `CAP_` prefix.
+
+### Devices and privilege escalation
+
+Two further keys in the same block cover what capabilities cannot express. A device node is
+not a capability, and `no_new_privs` is a separate process flag, so each gets its own key:
+
+```toml
+[images.coding.security]
+no-new-privileges = false          # default true
+devices           = ["/dev/fuse"]  # default []
+```
+
+**`no-new-privileges = false` weakens the container boundary.** Under `no_new_privs` the
+kernel ignores the setuid bit and file capabilities on every `execve`; clearing the flag puts
+them back, so a process that finds a setuid-root binary in the image can use it to become
+root inside the container. Treat this as a deliberate tradeoff rather than a neutral knob.
+
+Two things bound the damage. The key is opt-in per image-config and defaults to true, so a
+config that never mentions it keeps today's protection. And the container is still an
+unprivileged rootless podman container in a user namespace -- clearing the flag grants the
+container's own namespace-local root, not root on the host.
+
+`devices` passes host device nodes through, one `--device=<path>` per entry, in declaration
+order. This is the sharper of the two in the general case: `/dev/kvm` or a raw block device
+hands out real hardware access. It is explicit per path and per image-config, and outrig does
+not police which paths you may ask for.
+
+The motivating case for both is a **nested container runtime** -- an agent whose job is to
+build an image or run a throwaway container. A nested rootless podman needs `newuidmap` to
+map its subordinate UID range, and `newuidmap` is setuid-root, so `no_new_privs` breaks it.
+The session container's rootfs is overlayfs and the kernel refuses overlay-on-overlay, so the
+nested runtime also needs `fuse-overlayfs`, which needs `/dev/fuse`. outrig supplies the two
+primitives; assembling them into a working nested runtime (and installing the tools in your
+Dockerfile) is yours to do.
 
 ### Using a pre-built image
 
@@ -244,9 +280,11 @@ access         = "read-write"   # "read-only" (default) | "read-write"
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
 (Dockerfile-built sidecars get content-hash caching for free), then a raw podman ref, which
 must be present locally. An optional `[images.<name>.sidecars.<sc>.security]` block reuses the
-same capability keys as the primary. `start = "manual"` declares a sidecar that does not start
-with the session (a later release adds the surfaces that start one mid-session; until then its
-servers are skipped with a notice).
+whole security surface of the primary -- capability keys, `no-new-privileges`, and `devices`
+alike -- and each sidecar's block stands on its own, so opting one out of `no-new-privileges`
+leaves the others hardened. `start = "manual"` declares a sidecar that does not start with the
+session (a later release adds the surfaces that start one mid-session; until then its servers
+are skipped with a notice).
 
 **Naming and labels.** Sidecar containers are named `outrig-<sid>-<sc>`; an anonymous sidecar
 uses its server's name as `<sc>`. Every session container -- primary included -- carries the
@@ -268,12 +306,13 @@ sidecar the same way it attaches to the primary, before any MCP server connects.
 
 ## What outrig sets in the run
 
-outrig adds `--userns=keep-id`, `--security-opt=no-new-privileges`, the primary workspace
-bind-mount, any configured extra workspace mounts, and the runtime user-mapping bootstrap
-(see [Workspace](workspace.md)). Capability flags are emitted only when the selected
-image-config opts into a capability profile or explicit `cap-drop` / `cap-add` entries.
-Session containers additionally carry the `org.outrig.session` label (and sidecars
-`org.outrig.sidecar`).
+outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured extra
+workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)).
+`--security-opt=no-new-privileges` goes on too unless the selected image-config sets
+`no-new-privileges = false`. Capability flags are emitted only when that image-config opts
+into a capability profile or explicit `cap-drop` / `cap-add` entries, and `--device=<path>`
+flags only when it declares `devices`. Session containers additionally carry the
+`org.outrig.session` label (and sidecars `org.outrig.sidecar`).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode

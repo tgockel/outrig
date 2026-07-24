@@ -158,6 +158,7 @@ async fn extra_mounts_enforce_access_modes() {
             ],
             capabilities: ContainerCapabilities::default(),
             labels: BTreeMap::new(),
+            ..Default::default()
         },
     )
     .await
@@ -217,6 +218,7 @@ async fn capability_flags_are_recorded_in_podman_create_command() {
                 cap_add: vec!["NET_BIND_SERVICE".to_string()],
             },
             labels: BTreeMap::new(),
+            ..Default::default()
         },
     )
     .await

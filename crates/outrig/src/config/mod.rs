@@ -794,7 +794,7 @@ pub(crate) fn parse_network_host_pattern(
     Ok(NetworkHostPattern::HostGlob(host.to_ascii_lowercase()))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ContainerSecurity {
     pub capability_profile: CapabilityProfile,
@@ -802,6 +802,30 @@ pub struct ContainerSecurity {
     pub cap_drop: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_add: Vec<String>,
+    /// Whether to apply `--security-opt=no-new-privileges`. Setting this to
+    /// false restores setuid escalation inside the container, which a nested
+    /// rootless container runtime needs so that `newuidmap` can map its
+    /// subordinate UID range.
+    pub no_new_privileges: bool,
+    /// Host device nodes to pass through, one `--device=<path>` each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+}
+
+/// Hand-written rather than derived: `no_new_privileges` must default to
+/// `true`, and `bool::default()` is `false`. The container-level
+/// `#[serde(default)]` fills omitted keys from here, so an absent
+/// `no-new-privileges` deserializes to the safe value.
+impl Default for ContainerSecurity {
+    fn default() -> Self {
+        Self {
+            capability_profile: CapabilityProfile::default(),
+            cap_drop: Vec::new(),
+            cap_add: Vec::new(),
+            no_new_privileges: true,
+            devices: Vec::new(),
+        }
+    }
 }
 
 impl ContainerSecurity {

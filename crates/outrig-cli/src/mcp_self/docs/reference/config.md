@@ -430,6 +430,8 @@ Optional runtime security controls for the selected container:
 capability-profile = "no-net-raw"
 cap-drop = ["MKNOD", "SETFCAP"]
 cap-add  = ["NET_BIND_SERVICE"]
+no-new-privileges = false
+devices  = ["/dev/fuse"]
 ```
 
 - `capability-profile` (string, optional, default: `"default"`): named Linux capability
@@ -441,11 +443,18 @@ cap-add  = ["NET_BIND_SERVICE"]
 - `cap-drop` (array, optional, default: `[]`): extra Linux capabilities to drop.
 - `cap-add` (array, optional, default: `[]`): Linux capabilities to add after profile and
   explicit drops are rendered.
+- `no-new-privileges` (bool, optional, default: `true`): emit
+  `--security-opt=no-new-privileges`. Setting it to `false` restores setuid escalation inside
+  the container, which is what a nested rootless container runtime needs and which also lets
+  any setuid-root binary in the image be used; see
+  [Containers](../concepts/containers.md#devices-and-privilege-escalation) for the tradeoff.
+- `devices` (array, optional, default: `[]`): host device nodes to pass through, emitted as
+  one `--device=<path>` per entry in declaration order. Entries are plain absolute paths;
+  podman's `<src>:<dst>:<perms>` form is not accepted.
 
 Capability names may be written as `NET_RAW` or `CAP_NET_RAW`; outrig normalizes to the
-podman form without the `CAP_` prefix. The existing `--security-opt=no-new-privileges`
-setting is always applied. This section does not configure seccomp, AppArmor, SELinux,
-read-only roots, mount policy, or network egress filtering.
+podman form without the `CAP_` prefix. This section does not configure seccomp, AppArmor,
+SELinux, read-only roots, mount policy, or network egress filtering.
 
 ### `[images.<name>.mcp]`
 
@@ -731,6 +740,10 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Capability names must not be duplicated within `cap-drop` or within `cap-add`, after
   optional `CAP_` stripping.
 - The same normalized capability name must not appear in both `cap-drop` and `cap-add`.
+- Every `[images.<name>.security].devices` entry must be non-empty and an absolute path.
+  Whether the node exists is not checked -- validation may run on a machine that is not the
+  launch host, so podman reports a missing node at launch instead.
+- Device paths must not be duplicated within one `devices` list.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
   directory. Relative host paths resolve against the repo root.

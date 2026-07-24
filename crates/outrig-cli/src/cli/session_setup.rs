@@ -434,6 +434,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             cap_drop: image_cfg.security.cap_drop.clone(),
             cap_add: image_cfg.security.cap_add.clone(),
         },
+        devices: image_cfg.security.devices.clone(),
+        no_new_privileges: image_cfg.security.no_new_privileges,
         labels: BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]),
     };
 
@@ -954,7 +956,8 @@ async fn ensure_sidecar_image(
 }
 
 /// The launch inputs every sidecar container shares, whichever path starts
-/// it: session + sidecar labels and the block's capability policy. Workspace
+/// it: session + sidecar labels and the block's security policy -- capability
+/// profile, device passthrough, and privilege escalation alike. Workspace
 /// and mounts stay empty; `start_one_sidecar` fills them in (the entrypoint
 /// form cannot declare either).
 fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
@@ -966,6 +969,8 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
             cap_drop: sc.security.cap_drop.clone(),
             cap_add: sc.security.cap_add.clone(),
         },
+        devices: sc.security.devices.clone(),
+        no_new_privileges: sc.security.no_new_privileges,
         labels: BTreeMap::from([
             (LABEL_SESSION.to_string(), ctx.sid.to_string()),
             (LABEL_SIDECAR.to_string(), sc.name.clone()),

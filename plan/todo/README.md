@@ -6,6 +6,8 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
+The queue is currently empty. Drop follow-up work into `plan/next/` and run `/groom-plan` to
+fold it into the numbered queue.
+
 | Task | Title                                              | Dependencies |
 |------|----------------------------------------------------|--------------|
-| 0087 | Nested container runtimes in a session container   | --           |

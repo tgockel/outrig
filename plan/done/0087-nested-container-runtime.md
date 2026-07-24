@@ -192,6 +192,67 @@ in the reference, so that a reader deciding whether to set them meets the tradeo
 - **Device allowlist.** Whether a future policy layer should constrain which device paths an
   image-config may request. Not for this task.
 
+## Decisions
+
+- **The CLI needed wiring the plan did not name.** `crates/outrig-cli/src/cli/session_setup.rs`
+  builds `ContainerLaunchSpec` / `ContainerCapabilities` straight from `ImageConfig.security` at
+  both its primary-container site and `sidecar_launch_base`, bypassing `SecuritySpec` entirely.
+  Without edits there `outrig run` would have parsed both keys and silently dropped them. Both
+  sites now copy `devices` and `no_new_privileges` alongside the capability triple.
+
+- **Three hand-written `Default` impls, not one.** The plan flagged `ContainerSecurity`, but
+  `SecuritySpec` and `ContainerLaunchSpec` also derived `Default` and are reached through
+  `::default()` (`outrig_.rs` sidecar/launch specs, `sidecar.rs` anonymous plans, and the
+  minimal-argv unit test). A derived `Default` on any of the three yields `false` and silently
+  unhardens every container built that way. The alternative -- a `NoNewPrivileges(bool)` newtype
+  that keeps `#[derive(Default)]` working -- was rejected: it adds a public type and reads worse
+  at every call site. The field stays a plain `bool` with the same name at all three layers.
+
+- **No `default_true` helper was needed.** `ContainerSecurity` already carries container-level
+  `#[serde(default)]`, and serde fills *every* omitted field from `Self::default()`, so the
+  hand-written impl is what an absent `no-new-privileges` key resolves through. The plan's
+  fallback of `#[serde(default = "default_true")]` was not used; the crate still has zero uses of
+  `serde(default = "...")`. `empty_security_table_round_trips_to_hardened_defaults` pins this.
+
+- **Emission went in `append_launch_flags`, not `build_podman_run_cmd`.** The plan file named the
+  latter, but both the `run` and `create` builders delegate to the former. Putting devices and
+  the conditional hardening flag there is what makes the "sidecars get both keys for free" claim
+  true -- sidecars go out through `podman create`.
+  `podman_create_args_carry_devices_and_privileges` covers that path.
+
+- **Device entries are validated but not normalized.** Non-empty after trimming, absolute, and
+  unique within one list. Entries are passed to podman verbatim rather than trimmed, so a
+  leading space fails the absolute check rather than being silently repaired. Existence is not
+  checked, per the plan.
+
+- **`devices` was added to the sidecar block of `config-full.toml` but `no-new-privileges` was
+  not.** The fixture now exercises the primary with both keys and the sidecar with only
+  `devices`, which lets `config_schema` assert that a sidecar keeps the hardened default
+  independently of a primary that opted out.
+
+- **Acceptance criterion 1 was verified by hand rather than automated** (agreed scope: a
+  nested-podman fixture image needs subuid/subgid delegation and nested storage config, which is
+  multi-minute and host-sensitive). The automated e2e in `tests/container_security.rs` proves
+  both primitives reach the kernel: `/dev/fuse` is absent from a default container and present
+  with `devices`, and `NoNewPrivs` reads 1 by default and 0 when the key is cleared.
+
+  The manual check ran a Fedora image carrying `podman`, `fuse-overlayfs`, and `shadow-utils`
+  under `--userns=keep-id --device=/dev/fuse`, and produced a clean A/B on the same image with
+  only the one flag differing:
+
+  | Launch | `/proc/self/status` | setuid-root binary run as uid 1000 |
+  |----------------------------|---------------------|------------------------------------|
+  | default                    | `NoNewPrivs: 1`     | `uid=1000 gid=1000` -- setuid ignored |
+  | `no-new-privileges = false`| `NoNewPrivs: 0`     | `uid=1000 gid=1000 euid=0(root)`   |
+
+  That is exactly the mechanism `newuidmap` depends on, and it confirms the primitive does the
+  job the task set for it. The full `podman run --rm alpine true` did not complete inside that
+  throwaway image: `newuidmap` got past the setuid gate and then failed writing `uid_map`,
+  because the image's `/etc/subuid` range has to be a valid subset of the session container's
+  own namespace. That is image-recipe work, which this task deliberately leaves to the caller --
+  outrig ships the primitives, not the nested-runtime recipe. Recorded as a known gap rather
+  than papered over.
+
 ## Dependencies
 
 None. The change is self-contained in `config`, `outrig_`, and `container`, plus their docs.

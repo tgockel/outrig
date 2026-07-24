@@ -89,12 +89,32 @@ pub fn sidecar_container_name(session_suffix: &str, sidecar: &str) -> String {
 }
 
 /// Complete inputs for a `podman run`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerLaunchSpec {
     pub workspace: Option<ContainerWorkspace>,
     pub mounts: Vec<ContainerMount>,
     pub capabilities: ContainerCapabilities,
+    /// Host device nodes to pass through, one `--device=<path>` each.
+    pub devices: Vec<String>,
+    /// Whether to apply `--security-opt=no-new-privileges`.
+    pub no_new_privileges: bool,
     pub labels: BTreeMap<String, String>,
+}
+
+/// Hand-written rather than derived so that `no_new_privileges` defaults to
+/// `true` -- a derived `Default` would hand back `false` and silently drop the
+/// hardening flag from every caller that starts from `::default()`.
+impl Default for ContainerLaunchSpec {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            mounts: Vec::new(),
+            capabilities: ContainerCapabilities::default(),
+            devices: Vec::new(),
+            no_new_privileges: true,
+            labels: BTreeMap::new(),
+        }
+    }
 }
 
 impl ContainerLaunchSpec {
@@ -105,9 +125,7 @@ impl ContainerLaunchSpec {
                 container: container.into(),
                 access: MountAccess::ReadWrite,
             }),
-            mounts: Vec::new(),
-            capabilities: ContainerCapabilities::default(),
-            labels: BTreeMap::new(),
+            ..Self::default()
         }
     }
 }
@@ -664,8 +682,9 @@ fn build_podman_create_cmd(
 }
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
-/// extra bind mounts, keep-id, workspace workdir, capability policy, and the
-/// hardening tail.
+/// extra bind mounts, keep-id, workspace workdir, capability policy, device
+/// passthrough, and the hardening tail. `--security-opt=no-new-privileges` is
+/// part of that tail only when the launch spec keeps it.
 fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool) -> Cmd {
     for (key, value) in &launch.labels {
         cmd = cmd.arg("--label").arg(format!("{key}={value}"));
@@ -690,7 +709,13 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     }
 
     cmd = append_capability_flags(cmd, &launch.capabilities);
-    cmd.args(["--security-opt=no-new-privileges", "--pull=never"])
+    for device in &launch.devices {
+        cmd = cmd.arg(format!("--device={device}"));
+    }
+    if launch.no_new_privileges {
+        cmd = cmd.arg("--security-opt=no-new-privileges");
+    }
+    cmd.arg("--pull=never")
 }
 
 fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -> Cmd {
@@ -873,6 +898,7 @@ mod tests {
             ],
             capabilities: ContainerCapabilities::default(),
             labels: BTreeMap::new(),
+            ..Default::default()
         };
 
         let args = argv(build_podman_run_cmd(
@@ -926,6 +952,7 @@ mod tests {
                 ),
                 (LABEL_SIDECAR.to_string(), "tools".to_string()),
             ]),
+            ..Default::default()
         };
 
         let args = argv(build_podman_run_cmd(
@@ -973,6 +1000,7 @@ mod tests {
             }],
             capabilities: ContainerCapabilities::default(),
             labels: BTreeMap::new(),
+            ..Default::default()
         };
 
         let args = argv(build_podman_run_cmd(
@@ -1020,6 +1048,7 @@ mod tests {
                 ),
                 (LABEL_SIDECAR.to_string(), "fetch".to_string()),
             ]),
+            ..Default::default()
         };
         let env = BTreeMap::from([
             ("A_FIRST".to_string(), "1".to_string()),
@@ -1104,6 +1133,7 @@ mod tests {
                 cap_add: Vec::new(),
             },
             labels: BTreeMap::new(),
+            ..Default::default()
         };
 
         let args = argv(build_podman_run_cmd(
@@ -1144,6 +1174,7 @@ mod tests {
                 cap_add: vec!["CAP_NET_BIND_SERVICE".to_string()],
             },
             labels: BTreeMap::new(),
+            ..Default::default()
         };
 
         let args = argv(build_podman_run_cmd(
@@ -1171,6 +1202,153 @@ mod tests {
                 "local:test",
                 "sleep",
                 "infinity",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_run_args_render_devices_in_declaration_order() {
+        let launch = ContainerLaunchSpec {
+            devices: vec!["/dev/fuse".to_string(), "/dev/kvm".to_string()],
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--device=/dev/fuse",
+                "--device=/dev/kvm",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    /// Clearing `no_new_privileges` must remove exactly one flag. `--pull=never`
+    /// and `--userns=keep-id` are the neighbors most at risk from an edit to the
+    /// hardening tail, so this pins them explicitly.
+    #[test]
+    fn podman_run_args_drop_only_no_new_privileges_when_cleared() {
+        let launch = ContainerLaunchSpec {
+            no_new_privileges: false,
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    #[test]
+    fn podman_run_args_combine_devices_and_privileges_with_drop_all() {
+        let launch = ContainerLaunchSpec {
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::DropAll,
+                cap_drop: Vec::new(),
+                cap_add: vec!["SYS_ADMIN".to_string()],
+            },
+            devices: vec!["/dev/fuse".to_string()],
+            no_new_privileges: false,
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--cap-drop=ALL",
+                "--cap-add=SYS_ADMIN",
+                "--device=/dev/fuse",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    /// Sidecars go out through `podman create`, which shares
+    /// `append_launch_flags`, so both keys must reach them too.
+    #[test]
+    fn podman_create_args_carry_devices_and_privileges() {
+        let launch = ContainerLaunchSpec {
+            devices: vec!["/dev/fuse".to_string()],
+            no_new_privileges: false,
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_create_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test-fetch",
+            &launch,
+            false,
+            &BTreeMap::new(),
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--name",
+                "outrig-test-fetch",
+                "--userns=keep-id",
+                "--device=/dev/fuse",
+                "--pull=never",
+                "--interactive",
+                "--rm",
+                "local:test",
             ]
         );
     }

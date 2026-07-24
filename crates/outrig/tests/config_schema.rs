@@ -240,6 +240,13 @@ srv = { command = ["bin", "arg1"] }
         );
         assert_eq!(coding_ctr.security.cap_drop, ["MKNOD", "SETFCAP"]);
         assert_eq!(coding_ctr.security.cap_add, ["NET_BIND_SERVICE"]);
+        assert!(!coding_ctr.security.no_new_privileges);
+        assert_eq!(coding_ctr.security.devices, ["/dev/fuse"]);
+        // The sidecar block sets `devices` but leaves `no-new-privileges`
+        // alone, so it keeps the safe default independently of the primary.
+        let tools_security = &coding_ctr.sidecars["tools"].security;
+        assert_eq!(tools_security.devices, ["/dev/fuse"]);
+        assert!(tools_security.no_new_privileges);
 
         assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
         let (fs_cmd, fs_env) = coding_ctr.mcp["fs"].normalize();
@@ -275,6 +282,38 @@ context    = "ctx"
         assert_eq!(security.capability_profile, CapabilityProfile::Default);
         assert!(security.cap_drop.is_empty());
         assert!(security.cap_add.is_empty());
+        assert!(security.no_new_privileges);
+        assert!(security.devices.is_empty());
+    }
+
+    /// `no-new-privileges` defaults to `true`, which is the opposite of
+    /// `bool::default()`. The container-level `#[serde(default)]` on
+    /// `ContainerSecurity` is what fills the omitted key from the hand-written
+    /// `Default` impl -- swapping that impl back to a derive would silently
+    /// unhardened every container, so pin the whole round-trip: an empty
+    /// `[security]` table parses to the safe value and serializes back to
+    /// nothing at all.
+    #[test]
+    fn empty_security_table_round_trips_to_hardened_defaults() {
+        let cfg = Config::load_from_str(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+"#,
+        )
+        .expect("config parses");
+        let security = &cfg.images["coding"].security;
+        assert!(security.no_new_privileges);
+        assert!(security.devices.is_empty());
+
+        let rendered = toml::to_string(&cfg).expect("config serializes");
+        assert!(
+            !rendered.contains("no-new-privileges") && !rendered.contains("devices"),
+            "an untouched security block should be elided, got:\n{rendered}",
+        );
     }
 
     #[test]

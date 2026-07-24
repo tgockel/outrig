@@ -141,6 +141,15 @@ pub enum ConfigValidationError {
     )]
     CapabilityDropAddConflict { image: String, capability: String },
 
+    #[error("image {image:?}: `devices` entry must not be empty")]
+    DevicePathEmpty { image: String },
+
+    #[error("image {image:?}: `devices` entry {device:?} must be an absolute path")]
+    DevicePathRelative { image: String, device: String },
+
+    #[error("image {image:?}: `devices` entry {device:?} is declared more than once")]
+    DevicePathDuplicate { image: String, device: String },
+
     #[error("{path} must be between 1 and {max}; got {value}")]
     ToolCallMaxOutOfRange { path: String, value: u32, max: u32 },
 
@@ -448,6 +457,35 @@ fn validate_security(
             image: scope.to_string(),
             capability: capability.clone(),
         });
+    }
+
+    validate_device_list(scope, &security.devices)
+}
+
+/// Shape-check the `devices` list. Whether the node exists is deliberately not
+/// checked: validation runs on machines that are not the launch host, and
+/// podman's own error covers a missing node clearly enough.
+fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigValidationError> {
+    let mut seen = BTreeSet::new();
+
+    for device in devices {
+        if device.trim().is_empty() {
+            return Err(ConfigValidationError::DevicePathEmpty {
+                image: scope.to_string(),
+            });
+        }
+        if !Path::new(device).is_absolute() {
+            return Err(ConfigValidationError::DevicePathRelative {
+                image: scope.to_string(),
+                device: device.clone(),
+            });
+        }
+        if !seen.insert(device.clone()) {
+            return Err(ConfigValidationError::DevicePathDuplicate {
+                image: scope.to_string(),
+                device: device.clone(),
+            });
+        }
     }
 
     Ok(())

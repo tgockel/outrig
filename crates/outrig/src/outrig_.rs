@@ -59,9 +59,29 @@ pub struct MountSpec {
 }
 
 /// Container security policy applied at launch.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SecuritySpec {
     pub capabilities: CapabilitySpec,
+    /// Host device nodes to pass through, one `--device=<path>` each.
+    pub devices: Vec<String>,
+    /// Whether to apply `--security-opt=no-new-privileges`. Clearing this
+    /// restores setuid escalation inside the container, which is what a nested
+    /// rootless container runtime needs; see `doc/concepts/containers.md`.
+    pub no_new_privileges: bool,
+}
+
+/// Hand-written rather than derived so that `no_new_privileges` defaults to
+/// `true`. Devices and privilege escalation are deliberately siblings of
+/// `capabilities` rather than fields inside [`CapabilitySpec`]: a device node
+/// is not a capability, and `no_new_privs` is a separate process flag.
+impl Default for SecuritySpec {
+    fn default() -> Self {
+        Self {
+            capabilities: CapabilitySpec::default(),
+            devices: Vec::new(),
+            no_new_privileges: true,
+        }
+    }
 }
 
 /// Linux capability profile plus explicit capability overrides.
@@ -181,6 +201,8 @@ impl From<&ContainerSecurity> for SecuritySpec {
                 cap_drop: security.cap_drop.clone(),
                 cap_add: security.cap_add.clone(),
             },
+            devices: security.devices.clone(),
+            no_new_privileges: security.no_new_privileges,
         }
     }
 }
@@ -569,6 +591,8 @@ impl Outrig {
                 })
                 .collect(),
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
+            devices: spec.security.devices.clone(),
+            no_new_privileges: spec.security.no_new_privileges,
             labels: BTreeMap::new(),
         };
         let mut container = Container::start(&image_tag, launch).await?;
@@ -698,6 +722,8 @@ impl Outrig {
                 })
                 .collect(),
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
+            devices: spec.security.devices.clone(),
+            no_new_privileges: spec.security.no_new_privileges,
             labels: BTreeMap::from([
                 (
                     LABEL_SESSION.to_string(),

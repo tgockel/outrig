@@ -41,6 +41,9 @@ Issues that bear on **host integrity** are in scope, for example:
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
 - Capability handling that is more permissive than the selected capability profile
   (`default` / `no-net-raw` / `drop-all`).
+- A container launched more permissively than its `[images.<name>.security]` block asks for --
+  `--security-opt=no-new-privileges` missing when `no-new-privileges` was not set to `false`,
+  or a device reaching a container that did not list it in `devices`.
 
 ## Known boundaries (by design, not vulnerabilities)
 
@@ -51,6 +54,11 @@ Issues that bear on **host integrity** are in scope, for example:
   `--security-opt=no-new-privileges`, and the selected capability profile, it does not add
   seccomp, AppArmor, or SELinux policy, a read-only root filesystem, or network egress policy
   in the container launch path.
+- An image-config may opt out of `--security-opt=no-new-privileges` and may pass host device
+  nodes through with `devices`. Both default to off, and both weaken the boundary when set: a
+  container without `no_new_privs` can use a setuid-root binary in its own image to reach
+  namespace-local root, and a passed-through device is real hardware access. Configuring
+  either is a deliberate choice by whoever owns the config, not a vulnerability.
 - Network filtering in 0.1 is **host:port allow/deny plus DNS and audit logging**, not TLS
   interception. HTTPS MITM is explicitly deferred to a later release.
 
