@@ -28,7 +28,7 @@ name = "outrig"
 path = "src/main.rs"
 
 [dependencies]
-outrig = { path = "../outrig", version = "0.2.0" }
+outrig = { path = "../outrig", version = "0.2.0-rc.1" }
 
 anyhow             = { workspace = true, default-features = true }
 async-stream       = { workspace = true, default-features = true }

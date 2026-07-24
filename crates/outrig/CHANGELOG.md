@@ -7,11 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-07-24
+
+A release candidate. This is the first cycle to break the public surface, so it goes out for
+integration testing ahead of 0.2.0 final. The two items consumers hit first are the rmcp 2.x
+content model under **Changed** and the removed constructor under **Removed**.
+
+### Added
+
+- **MCP sidecar containers** -- an MCP server can run in its own container alongside the
+  primary. `LaunchSpec::with_sidecar` declares sidecars at launch (abort-only: any failure
+  tears down everything already started), and `Outrig::add_sidecar` starts one mid-session,
+  returning the new tool handles so callers need not diff `tools()`. `SidecarSpec` and
+  `SidecarServerSpec` are the builder types -- a raw podman image ref used verbatim, plus
+  workspace access, mounts, security, and exec-stdio servers.
+- **Entrypoint-stdio MCP servers** -- an image whose `ENTRYPOINT` is itself the server (an
+  inline image with no command) is now supported, so off-the-shelf MCP images work with no
+  repo-side command knowledge. Launch splits into `podman create` + `podman init` +
+  `podman start`, which lets the network interceptor attach to the held process before the
+  server's first packet.
+- **Config-driven sidecar placement** -- `LaunchSpec::from_config(&Config, image_name,
+  repo_root, log_dir)` translates an image config's `[mcp]` map into the primary MCP map plus
+  resolved `SidecarSpec`s, resolving a sidecar's image against sibling `[images.<name>]`
+  blocks. `start = "manual"` sidecars are skipped, and entrypoint-stdio placements are
+  rejected with an error naming the server.
+- `SidecarSpec`, `SidecarServerSpec`, `SidecarWorkspaceAccess`, and `resolve_mcp_env` are
+  exported from the crate root.
+
 ### Changed
 
-- Upgraded the `rmcp` MCP SDK from 1.x to 2.x. The proxy and client now build on
-  rmcp 2.2's flat `ContentBlock` content model (replacing `RawContent`), so
-  consumers of this library link against rmcp 2.x.
+- **Breaking:** upgraded the `rmcp` MCP SDK from 1.x to 2.x. The proxy and client now build on
+  rmcp 2.2's flat `ContentBlock` content model (replacing `RawContent`), so consumers of this
+  library link against rmcp 2.x.
+- The network interceptor spans N containers rather than one: a single policy and audit log
+  covers the primary and every sidecar, with traffic attributed to the container that
+  produced it.
+- The session watcher is a single `podman events` stream per session, replacing one
+  `podman wait` child per container.
+- Sidecar bring-up fans out -- distinct images are ensured and label-inspected concurrently
+  and only once each, then containers start concurrently. Label-collision errors stay
+  deterministic.
+
+### Removed
+
+- **Breaking:** `LaunchSpec::from_image_config`, which copied an image config's `[mcp]` map
+  verbatim and left placement-bearing entries to fail at launch. Use
+  `LaunchSpec::from_config`, which performs the translation faithfully.
+
+### Fixed
+
+- `Container::stop` passes `--ignore`, so an entrypoint sidecar that has already self-reaped
+  no longer fails session teardown.
+- A malformed `org.outrig.mcp` label on a repo-built image fails during the build rather than
+  at session start.
 
 ## [0.1.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.1.0) - 2026-06-26
 

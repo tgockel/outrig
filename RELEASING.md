@@ -3,7 +3,7 @@
 OutRig publishes two crates from this workspace: the `outrig` library and the `outrig-cli`
 binary. Releases are cut manually. This document is the checklist.
 
-`outrig-cli` depends on `outrig` (`outrig = { path = "../outrig", version = "0.1.0" }`), so
+`outrig-cli` depends on `outrig` (`outrig = { path = "../outrig", version = "X.Y.Z" }`), so
 the library is published first and the CLI second.
 
 ## Before you start
@@ -50,9 +50,11 @@ the library is published first and the CLI second.
    part of its own publish. It builds against the just-published `outrig`, so it can fail if
    the index has not updated yet -- wait a minute and retry if so.
 
-6. **Flip the install docs.** Remove the `TODO: Incomplete` note above the
-   `cargo install outrig-cli` block in [`doc/quickstart.md`](doc/quickstart.md) now that the
-   crate is live, and commit.
+6. **Refresh the version-bearing docs.** Update the sample `outrig --version` output in
+   [`doc/quickstart.md`](doc/quickstart.md) and the supported-version prose and table in
+   [`SECURITY.md`](SECURITY.md), then commit. Skip this step for a pre-release -- a bare
+   `cargo install outrig-cli` still lands on the latest stable, so both files should go on
+   describing that.
 
 7. **Tag and push.** Tag each crate independently, matching the links in the changelog
    headers:
@@ -74,6 +76,30 @@ the library is published first and the CLI second.
    cargo install outrig-cli
    outrig --version    # prints outrig X.Y.Z
    ```
+
+## Pre-releases
+
+Cut a release candidate (`X.Y.Z-rc.N`) when a cycle breaks the public surface, so downstream
+consumers can integration-test before the version becomes the recommended one. The checklist
+above applies, with these differences:
+
+- **The dependency pin must carry the exact pre-release.** Cargo excludes pre-releases from
+  ordinary version ranges -- a requirement of `0.2.0` does not match a published
+  `0.2.0-rc.1`, which sorts below it. So `crates/outrig-cli/Cargo.toml` needs
+  `outrig = { path = "../outrig", version = "X.Y.Z-rc.N" }`, exactly.
+- **The dry-run does not check that pin.** `cargo publish --dry-run -p outrig-cli` resolves
+  `outrig` from the workspace path, so a stale requirement passes the dry-run and fails only
+  on the real publish. Read the line before publishing.
+- Tags and changelog header links carry the full version: `outrig-vX.Y.Z-rc.N`.
+- Mark the GitHub release with `gh release create --prerelease`, which keeps it out of the
+  repository's "Latest release" slot.
+- Step 6 is skipped; see the note there.
+- The smoke test needs an explicit version, because a bare install will not resolve to a
+  pre-release: `cargo install outrig-cli --version X.Y.Z-rc.N`.
+
+Consumers opt in with `outrig = "X.Y.Z-rc.N"`. At final release, drop the `-rc.N` from both
+manifests, rename the changelog headers from `[X.Y.Z-rc.N]` to `[X.Y.Z]` (folding in whatever
+the rc cycle turned up), and do step 6.
 
 ## Notes
 

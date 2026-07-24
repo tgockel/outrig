@@ -3786,7 +3786,7 @@ dependencies = [
 
 [[package]]
 name = "outrig"
-version = "0.2.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3817,7 +3817,7 @@ dependencies = [
 
 [[package]]
 name = "outrig-cli"
-version = "0.2.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "async-stream",
