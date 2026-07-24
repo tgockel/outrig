@@ -134,8 +134,6 @@ async fn run_drives_one_tool_call_and_prints_reply() {
             "[outrig] container ready:",
             "[outrig] bootstrapping container user",
             "[outrig] container user ready",
-            "[outrig] reading and merging MCP configuration",
-            "[outrig] MCP configuration ready",
             "[outrig] MCP fs: initializing",
             "[outrig] MCP fs: initialized",
             "[outrig] MCP fs: listing tools",
