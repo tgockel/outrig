@@ -8,3 +8,4 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 | Task | Title                                              | Dependencies |
 |------|----------------------------------------------------|--------------|
+| 0087 | Nested container runtimes in a session container   | --           |

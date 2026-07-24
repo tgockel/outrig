@@ -1,4 +1,4 @@
-# Nested container runtimes inside a session container
+# 0087 -- Nested container runtimes inside a session container
 
 ## Context
 
@@ -63,7 +63,7 @@ OutRig's config schema.
 - `build_podman_run_cmd` emits one `--device=<path>` per entry and omits
   `--security-opt=no-new-privileges` when the key is false.
 - Config validation for `devices` in `crates/outrig/src/config/validate.rs`, alongside the
-  capability checks at line 378.
+  capability checks at line 550.
 - Doc updates in the same commit: `doc/concepts/containers.md` and `doc/reference/config.md`.
 
 ## Config surface
@@ -128,7 +128,7 @@ inferred.
 
 ## Validation
 
-In `crates/outrig/src/config/validate.rs`, next to `validate_capability_list` (line 378), check
+In `crates/outrig/src/config/validate.rs`, next to `validate_capability_list` (line 550), check
 each `devices` entry:
 
 - non-empty after trimming,
