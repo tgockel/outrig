@@ -27,28 +27,32 @@ the library is published first and the CLI second.
    section's tag link points at that crate's tag (`outrig-vX.Y.Z` /
    `outrig-cli-vX.Y.Z`).
 
-4. **Dry-run both crates** -- catches missing files, bad README paths, and a dirty tree:
+4. **Dry-run both crates in one invocation** -- catches missing files, bad README paths, a
+   dirty tree, and a stale `outrig` requirement in `outrig-cli`:
 
    ```sh
-   cargo publish --dry-run -p outrig
-   cargo publish --dry-run -p outrig-cli
+   cargo publish --dry-run -p outrig -p outrig-cli
    ```
 
-   The `outrig-cli` dry-run resolves the `outrig` dependency from the workspace path (cargo
-   packages the sibling crate locally for the verify build), so it works before `outrig` is
-   on the index. The real publish in step 5 still needs `outrig` published first.
+   Cargo packages both, unpacks `outrig` into a temporary registry under `target/package/`,
+   and verify-builds `outrig-cli` against that packaged copy -- so the dependency
+   requirement is genuinely exercised without `outrig` being on the index.
 
-5. **Publish, library first:**
+   Dry-running `outrig-cli` *on its own* fails until the matching `outrig` is published:
+   cargo resolves the requirement against crates.io and reports `failed to select a version
+   for the requirement`. That is expected, not a fault in the crate.
+
+5. **Publish.** One invocation does both in dependency order, waiting for the index between
+   them:
 
    ```sh
-   cargo publish -p outrig
-   # wait for the new version to appear in the crates.io index, then:
-   cargo publish -p outrig-cli
+   cargo publish -p outrig -p outrig-cli
    ```
 
-   `cargo publish` verify-builds each crate before uploading, so `outrig-cli` is checked as
-   part of its own publish. It builds against the just-published `outrig`, so it can fail if
-   the index has not updated yet -- wait a minute and retry if so.
+   Cargo verify-builds each crate before uploading. To do them separately instead, publish
+   `outrig` first and wait for the new version to reach the index before running
+   `cargo publish -p outrig-cli` -- that build resolves against the real index and fails if
+   the index has not caught up.
 
 6. **Refresh the version-bearing docs.** Update the sample `outrig --version` output in
    [`doc/quickstart.md`](doc/quickstart.md) and the supported-version prose and table in
@@ -87,9 +91,9 @@ above applies, with these differences:
   ordinary version ranges -- a requirement of `0.2.0` does not match a published
   `0.2.0-rc.1`, which sorts below it. So `crates/outrig-cli/Cargo.toml` needs
   `outrig = { path = "../outrig", version = "X.Y.Z-rc.N" }`, exactly.
-- **The dry-run does not check that pin.** `cargo publish --dry-run -p outrig-cli` resolves
-  `outrig` from the workspace path, so a stale requirement passes the dry-run and fails only
-  on the real publish. Read the line before publishing.
+- The combined dry-run in step 4 does exercise that pin -- it verify-builds `outrig-cli`
+  against a packaged `outrig` in a temporary registry, so a stale requirement fails there
+  rather than at publish time.
 - Tags and changelog header links carry the full version: `outrig-vX.Y.Z-rc.N`.
 - Mark the GitHub release with `gh release create --prerelease`, which keeps it out of the
   repository's "Latest release" slot.
