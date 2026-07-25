@@ -1,6 +1,7 @@
 [package]
 name        = "outrig"
 description = "Run LLM agents with podman-isolated MCP servers (library crate)."
+build       = "build.rs"
 version.workspace       = true
 edition.workspace       = true
 rust-version.workspace  = true

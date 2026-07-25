@@ -216,7 +216,12 @@ trust boundary, not beside it.
   made a named sidecar block able to be an entrypoint host, which is what gives `view` a place
   to live. See `plan/next/0090-config-surface-recheck.md`: the Config surface below is now
   legal as written, and the scope note wants re-deriving.
-- 0089 -- `outrig-enter`, the launcher this mounts and sets as the entrypoint.
+- 0089 -- `outrig-enter`, the launcher this mounts and sets as the entrypoint. It landed in the
+  **`outrig` library crate** (not `outrig-cli`, as 0089's original text guessed): call
+  `outrig::container::enter::materialize(&session_dir)` to write `<session-dir>/outrig-enter`
+  (mode 0755) for the `:ro` bind above, gated on `outrig::container::enter::is_available()`. The
+  "helper unavailable" row below surfaces as `OutrigError::FilesystemHelperUnavailable`. See
+  0089's `## Decisions` for why the packaging is a `build.rs` `rustc --target musl` compile.
 
 ## See also
 

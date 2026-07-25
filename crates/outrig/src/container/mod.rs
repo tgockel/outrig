@@ -12,6 +12,7 @@
 //!    the process is unwinding from a panic and `Drop` cannot run.
 
 pub mod embedded;
+pub mod enter;
 pub mod sidecar;
 
 use std::collections::{BTreeMap, BTreeSet};

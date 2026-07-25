@@ -163,3 +163,44 @@ None.
 - <https://github.com/tgockel/prototype-podman-shared-fs> -- `sidecar-enter.c` is the reference
   implementation; the README's "Gotchas found the hard way" is the list of things that cost time.
 - `plan/todo/0090-primary-view-sidecars.md` -- the only consumer.
+
+## Decisions
+
+- **Packaging deviates from the "recommended" plan above.** The launcher is *not* a separate
+  `crates/outrig-enter` workspace member built by a nested `cargo build -p ... --target musl`.
+  That design cannot satisfy a hard requirement: `cargo install outrig-cli` from crates.io must
+  be able to build the helper (no prebuilt binaries allowed). A sibling crate is absent from the
+  published tarball (`cargo package` ships only the package dir), so `build.rs` would have
+  nothing to compile. Instead the launcher source ships *inside* a published crate and `build.rs`
+  compiles it with a **direct `rustc --target <arch>-unknown-linux-musl`** on a single file --
+  no `cargo`, no dependency resolution, no package-cache/workspace lock (which also removes the
+  nested-cargo fragility the plan flagged). Spike + the acceptance test confirm this yields a
+  `static-pie` musl binary with no `PT_INTERP`.
+- **Lives in the `outrig` library crate, not `outrig-cli`.** The plan said `outrig-cli/build.rs`,
+  but the only consumer -- 0090's sidecar wiring -- is in `crates/outrig/src/container/sidecar.rs`,
+  so the bytes + `materialize` belong beside it under `crates/outrig/src/container/enter/`. A new
+  `crates/outrig/build.rs` hosts the compile+embed (`include_bytes!` must be in the crate that
+  owns the `build.rs`). `outrig` is also published, so the crates.io story holds.
+- **The launcher depends on nothing.** It self-declares the `extern "C"` musl symbols
+  (`setns`/`unshare`/`mount`/...) and the arch-specific syscall numbers (`SYS_execveat` 322 on
+  x86_64 / 281 on aarch64; `open_tree`/`move_mount` 428/429 shared), so no `libc` crate and no
+  workspace/`Cargo.toml` changes. Variadic `syscall()` args are cast to `c_long` to avoid
+  vararg-width UB. aarch64 supported alongside x86_64 via `cfg(target_arch)`.
+- **Graft only in the dynamic branch** (faithful to the prototype): a static payload needs
+  nothing from either rootfs, so it `execveat`s its fd directly after `setns`; only a dynamic
+  payload triggers `open_tree`/`unshare`/`MS_SLAVE`/`move_mount`.
+- **Single-source ELF parser.** `elf.rs` is the truth: compiled as `#[cfg(test)] mod elf` for
+  host unit tests, and `include!`d by `launcher.rs` for the musl build. Its header must be plain
+  `//` comments (inner `//!` docs are illegal mid-file); this is documented in the file.
+- **Stripped** (`-C strip=symbols`): 4.5 MB -> 463 KB embedded.
+- **Graceful degradation.** No musl target -> `build.rs` warns and embeds an empty artifact;
+  `is_available()` is false and `materialize` returns `OutrigError::FilesystemHelperUnavailable`
+  with a `rustup target add` hint. `build.rs` emits `rerun-if-changed` for the target's sysroot
+  lib dir (named by `rustc --print target-libdir` even when absent), so a later `rustup target
+  add` auto-triggers a rebuild -- verified by removing and re-adding the target.
+- **Container-level acceptance is manual / exercised by 0090.** 0089 alone cannot launch a
+  sidecar, so the setns/graft/MCP-handshake and the SYS_ADMIN/SYS_PTRACE negative cases are run
+  by hand against a live session (per the prototype's `21-`/`22-` scripts). Automated coverage:
+  static-ELF embedding + `0755` materialization + the ELF/shebang parser.
+- **No `doc/` changes:** the helper is internal; the user-facing `view = "primary"` surface lands
+  with 0090.

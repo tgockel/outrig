@@ -14,6 +14,13 @@ pub enum OutrigError {
     Configuration(String),
 
     #[error(
+        "this outrig was built without the filesystem-view helper\n\
+         help: install the musl target (`rustup target add x86_64-unknown-linux-musl`, or the \
+         aarch64 equivalent) and rebuild"
+    )]
+    FilesystemHelperUnavailable,
+
+    #[error(
         "no .agents/outrig/config.toml found in current directory or any parent\n\
          help: run `outrig init` to initialize"
     )]

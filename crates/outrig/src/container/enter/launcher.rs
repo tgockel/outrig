@@ -1,0 +1,328 @@
+//! `outrig-enter` -- run a program from THIS (sidecar) container's image with
+//! ANOTHER container's filesystem view.
+//!
+//!     outrig-enter [--target PID | --ns-file PATH] [--graft DIR] [--cwd DIR]
+//!                  -- PROGRAM [ARGS...]
+//!
+//! A Rust port of the prototype's `sidecar-enter.c`
+//! (<https://github.com/tgockel/prototype-podman-shared-fs>). It is the sidecar
+//! image's ENTRYPOINT, so it runs before any graft exists, against an image
+//! OutRig does not control -- hence it is compiled statically for
+//! `*-unknown-linux-musl` and depends on nothing but the kernel: it declares
+//! the handful of libc symbols and syscall numbers it needs itself, so the
+//! embedding `build.rs` can compile it with a single `rustc` invocation.
+//!
+//! Expected launch (0090 arranges it): `--userns=container:<target>` (so we are
+//! already in the user namespace that owns the target's mount namespace),
+//! `--cap-add=SYS_ADMIN` (setns is gated on it) and `--cap-add=SYS_PTRACE`
+//! (to open the target's nsfs file).
+//!
+//! This file is compiled only by the `outrig` crate's `build.rs`, always for a
+//! Linux musl target; it is not part of the normal `cargo build`. The pure ELF
+//! logic it relies on lives in `elf.rs`, pulled in below and unit-tested on the
+//! host.
+
+use std::ffi::{CString, OsString, c_char, c_int, c_long, c_ulong, c_void};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+include!("elf.rs");
+
+unsafe extern "C" {
+    fn open(path: *const c_char, flags: c_int) -> c_int;
+    fn close(fd: c_int) -> c_int;
+    fn pread(fd: c_int, buf: *mut c_void, count: usize, offset: i64) -> isize;
+    fn chdir(path: *const c_char) -> c_int;
+    fn setns(fd: c_int, nstype: c_int) -> c_int;
+    fn unshare(flags: c_int) -> c_int;
+    fn mount(
+        src: *const c_char,
+        target: *const c_char,
+        fstype: *const c_char,
+        flags: c_ulong,
+        data: *const c_void,
+    ) -> c_int;
+    fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
+    fn syscall(num: c_long, ...) -> c_long;
+}
+
+const O_RDONLY: c_int = 0;
+const AT_FDCWD: c_long = -100;
+const AT_EMPTY_PATH: c_long = 0x1000;
+const AT_RECURSIVE: c_long = 0x8000;
+const OPEN_TREE_CLONE: c_long = 1;
+const MOVE_MOUNT_F_EMPTY_PATH: c_long = 0x04;
+const CLONE_NEWNS: c_int = 0x0002_0000;
+const MS_REC: c_ulong = 0x4000;
+const MS_SLAVE: c_ulong = 1 << 19;
+const EPERM: i32 = 1;
+const EACCES: i32 = 13;
+
+#[cfg(target_arch = "x86_64")]
+const SYS_OPEN_TREE: c_long = 428;
+#[cfg(target_arch = "x86_64")]
+const SYS_MOVE_MOUNT: c_long = 429;
+#[cfg(target_arch = "x86_64")]
+const SYS_EXECVEAT: c_long = 322;
+#[cfg(target_arch = "x86_64")]
+const MULTIARCH: &str = "x86_64-linux-gnu";
+
+#[cfg(target_arch = "aarch64")]
+const SYS_OPEN_TREE: c_long = 428;
+#[cfg(target_arch = "aarch64")]
+const SYS_MOVE_MOUNT: c_long = 429;
+#[cfg(target_arch = "aarch64")]
+const SYS_EXECVEAT: c_long = 281;
+#[cfg(target_arch = "aarch64")]
+const MULTIARCH: &str = "aarch64-linux-gnu";
+
+/// Loader search directories, graft-relative -- the prototype's fixed list
+/// (Debian/Ubuntu multiarch, official node's `/usr/local/lib`, Alpine). The
+/// multiarch component follows the build arch so aarch64 works too.
+fn lib_dirs() -> [String; 7] {
+    [
+        "/usr/local/lib".to_string(),
+        format!("/lib/{MULTIARCH}"),
+        format!("/usr/lib/{MULTIARCH}"),
+        "/lib64".to_string(),
+        "/usr/lib64".to_string(),
+        "/lib".to_string(),
+        "/usr/lib".to_string(),
+    ]
+}
+
+/// Report `step` with the current errno (plus an optional capability hint) and
+/// exit. Never unwinds and never touches the target's filesystem.
+fn die(step: &str, hint: &str) -> ! {
+    let err = std::io::Error::last_os_error();
+    eprintln!("outrig-enter: {step}: {err}{hint}");
+    std::process::exit(1);
+}
+
+fn cstr(bytes: &[u8]) -> CString {
+    CString::new(bytes).unwrap_or_else(|_| die("argument contains an interior NUL", ""))
+}
+
+/// A NULL-terminated `argv`/`envp` array borrowing from `items`.
+fn arg_ptrs(items: &[CString]) -> Vec<*const c_char> {
+    let mut ptrs: Vec<*const c_char> = items.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    ptrs
+}
+
+/// The current environment as `KEY=VALUE` C strings; empty environment is fine.
+fn environ_cstrings() -> Vec<CString> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut kv = k.into_vec();
+            kv.push(b'=');
+            kv.extend_from_slice(v.as_bytes());
+            CString::new(kv).ok()
+        })
+        .collect()
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: outrig-enter [--target PID | --ns-file PATH] [--graft DIR] [--cwd DIR] \
+         -- PROGRAM [ARGS...]"
+    );
+    std::process::exit(2);
+}
+
+fn main() {
+    let args: Vec<OsString> = std::env::args_os().collect();
+
+    let mut target: i64 = 1; // PID 1 under --pid=container: is the target's init
+    let mut ns_file: Option<OsString> = None;
+    let mut graft = OsString::from("/mnt");
+    let mut cwd = OsString::from("/");
+
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_os_str();
+        let next = args.get(i + 1);
+        match (a.to_str(), next) {
+            (Some("--target"), Some(v)) => {
+                target = v
+                    .to_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("outrig-enter: --target: not an integer PID");
+                        std::process::exit(2);
+                    });
+                i += 2;
+            }
+            (Some("--ns-file"), Some(v)) => {
+                ns_file = Some(v.clone());
+                i += 2;
+            }
+            (Some("--graft"), Some(v)) => {
+                graft = v.clone();
+                i += 2;
+            }
+            (Some("--cwd"), Some(v)) => {
+                cwd = v.clone();
+                i += 2;
+            }
+            (Some("--"), _) => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    if i >= args.len() {
+        usage();
+    }
+
+    let prog_argv = &args[i..];
+    let program = prog_argv[0].as_os_str();
+
+    // Everything needing the sidecar's own filesystem happens before setns.
+    let prog_c = cstr(program.as_bytes());
+    let prog_fd = unsafe { open(prog_c.as_ptr(), O_RDONLY) };
+    if prog_fd < 0 {
+        die(&format!("open {}", program.to_string_lossy()), "");
+    }
+
+    // Read enough of the head to classify; the file header, program headers and
+    // any PT_INTERP string live at the very start of every real binary.
+    let mut head = vec![0u8; 65536];
+    let n = unsafe { pread(prog_fd, head.as_mut_ptr() as *mut c_void, head.len(), 0) };
+    if n < 0 {
+        die(&format!("read {}", program.to_string_lossy()), "");
+    }
+    head.truncate(n as usize);
+    let kind = match elf_interp(&head) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("outrig-enter: {}: {e}", program.to_string_lossy());
+            std::process::exit(1);
+        }
+    };
+
+    let root = cstr(b"/");
+    // A static payload resolves nothing through either rootfs, so it needs no
+    // graft -- only the dynamic path snapshots the sidecar's root before setns.
+    let tree_fd = if matches!(kind, ElfKind::Dynamic(_)) {
+        let fd = unsafe {
+            syscall(SYS_OPEN_TREE, AT_FDCWD, root.as_ptr(), OPEN_TREE_CLONE | AT_RECURSIVE)
+        } as c_int;
+        if fd < 0 {
+            die("open_tree(/)", " (missing CAP_SYS_ADMIN in this user namespace?)");
+        }
+        Some(fd)
+    } else {
+        None
+    };
+
+    let ns_path: OsString = ns_file.unwrap_or_else(|| OsString::from(format!("/proc/{target}/ns/mnt")));
+    let ns_c = cstr(ns_path.as_bytes());
+    let ns_fd = unsafe { open(ns_c.as_ptr(), O_RDONLY) };
+    if ns_fd < 0 {
+        let hint = if std::io::Error::last_os_error().raw_os_error() == Some(EACCES) {
+            " (missing --cap-add=SYS_PTRACE?)"
+        } else {
+            ""
+        };
+        die(&format!("open {}", ns_path.to_string_lossy()), hint);
+    }
+    if unsafe { setns(ns_fd, CLONE_NEWNS) } < 0 {
+        let hint = if std::io::Error::last_os_error().raw_os_error() == Some(EPERM) {
+            " (need --cap-add=SYS_ADMIN and --userns=container:<target>)"
+        } else {
+            ""
+        };
+        die("setns(CLONE_NEWNS)", hint);
+    }
+    unsafe { close(ns_fd) };
+    // From here the sidecar's own filesystem is gone, reachable only via the fds
+    // opened above.
+
+    if let Some(tree_fd) = tree_fd {
+        // Private copy first, so the graft is invisible to the target container.
+        if unsafe { unshare(CLONE_NEWNS) } < 0 {
+            die("unshare(CLONE_NEWNS)", "");
+        }
+        if unsafe {
+            mount(std::ptr::null(), root.as_ptr(), std::ptr::null(), MS_REC | MS_SLAVE, std::ptr::null())
+        } < 0
+        {
+            die("mount(MS_REC|MS_SLAVE)", "");
+        }
+        let graft_c = cstr(graft.as_bytes());
+        let empty = cstr(b"");
+        let r = unsafe {
+            syscall(
+                SYS_MOVE_MOUNT,
+                tree_fd as c_long,
+                empty.as_ptr(),
+                AT_FDCWD,
+                graft_c.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH,
+            )
+        };
+        if r < 0 {
+            let g = graft.to_string_lossy();
+            die(&format!("move_mount -> {g}"), &format!(" (does {g} exist in the target image?)"));
+        }
+        unsafe { close(tree_fd) };
+    }
+
+    let cwd_c = cstr(cwd.as_bytes());
+    if unsafe { chdir(cwd_c.as_ptr()) } < 0 {
+        die(&format!("chdir {}", cwd.to_string_lossy()), "");
+    }
+
+    match kind {
+        ElfKind::Static => {
+            // Run straight from the fd: nothing resolves through the target, so
+            // its libc is irrelevant.
+            let argv: Vec<CString> = prog_argv.iter().map(|a| cstr(a.as_bytes())).collect();
+            let envp = environ_cstrings();
+            let argv_p = arg_ptrs(&argv);
+            let envp_p = arg_ptrs(&envp);
+            let empty = cstr(b"");
+            unsafe {
+                syscall(
+                    SYS_EXECVEAT,
+                    prog_fd as c_long,
+                    empty.as_ptr(),
+                    argv_p.as_ptr(),
+                    envp_p.as_ptr(),
+                    AT_EMPTY_PATH,
+                );
+            }
+            die("execveat", "");
+        }
+        ElfKind::Dynamic(interp) => {
+            // Run through the sidecar's own loader, now under the graft point.
+            let g = graft.to_string_lossy();
+            let loader = format!("{g}{interp}");
+            let progpath = format!("{g}{}", program.to_string_lossy());
+            let libpath = lib_dirs()
+                .iter()
+                .map(|d| format!("{g}{d}"))
+                .collect::<Vec<_>>()
+                .join(":");
+
+            let mut launch: Vec<CString> = Vec::new();
+            launch.push(cstr(loader.as_bytes()));
+            // musl's loader takes --library-path but not glibc's --inhibit-cache,
+            // and MCP images are very often Alpine-based.
+            if !interp.contains("ld-musl") {
+                launch.push(cstr(b"--inhibit-cache"));
+            }
+            launch.push(cstr(b"--library-path"));
+            launch.push(cstr(libpath.as_bytes()));
+            launch.push(cstr(progpath.as_bytes()));
+            for a in &prog_argv[1..] {
+                launch.push(cstr(a.as_bytes()));
+            }
+            // launch[0] is the loader CString; reuse its pointer via launch_p.
+            let launch_p = arg_ptrs(&launch);
+            unsafe { execv(launch_p[0], launch_p.as_ptr()) };
+            die(&format!("execv {loader}"), "");
+        }
+    }
+}

@@ -14,6 +14,5 @@ files; 0091 points it outward, so OutRig stops requiring `useradd` in every imag
 
 | Task | Title                                                       | Dependencies |
 |------|-------------------------------------------------------------|--------------|
-| 0089 | `outrig-enter`, the static in-sidecar launcher              | none         |
 | 0090 | Sidecars that share the primary container's filesystem view | 0089         |
 | 0091 | Bootstrap the container user from the host, without useradd | none         |
