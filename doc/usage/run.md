@@ -262,7 +262,7 @@ Anything starting with `/` is a REPL command, not a model prompt:
 ### Manual sidecars
 
 A sidecar declared with `start = "manual"` (see
-[Config -> sidecars](../reference/config.md#imagesnamesidecarssc)) is planned at session start
+[Config -> sidecars](../reference/config.md#sidecarssc)) is planned at session start
 -- its image label is merged and its servers are reserved names -- but its container does not
 start and its tools are absent. `/sidecar add <name>` starts it mid-session: the container
 comes up with session labels, network policy attaches (in audit and filter modes), its MCP
