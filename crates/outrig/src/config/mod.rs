@@ -95,6 +95,8 @@ pub struct Config {
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub images: BTreeMap<String, ImageConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sidecars: BTreeMap<String, SidecarConfig>,
 }
 
 impl Config {
@@ -877,13 +879,16 @@ pub struct ImageConfig {
     pub security: ContainerSecurity,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sidecars: BTreeMap<String, SidecarConfig>,
 }
 
-/// A named sidecar container declared under `[images.<name>.sidecars.<sc>]`.
-/// Sidecars host MCP servers in their own container, lifecycle-coupled to
-/// the session's primary container.
+/// A named sidecar container declared under `[sidecars.<sc>]`. Sidecars host
+/// MCP servers in their own container, lifecycle-coupled to the session's
+/// primary container.
+///
+/// Declared once at the top level and referenced by name from any number of
+/// image-configs, exactly like `[models.<n>]` or `[providers.<n>]`. A session
+/// starts the sidecars its image-config's `[mcp]` entries name, and only
+/// those -- declaring a block instantiates nothing on its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SidecarConfig {
@@ -891,6 +896,11 @@ pub struct SidecarConfig {
     /// `[images.<name>]` config name first, else a raw podman ref that must
     /// be present locally (`--pull=never` semantics).
     pub image: String,
+    /// Positional arguments for the image's ENTRYPOINT, used only when this
+    /// block is an entrypoint host (its one MCP entry carries no `command`).
+    /// The same key exists on the MCP entry; setting both is a config error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
     #[serde(default)]
     pub workspace: SidecarWorkspaceAccess,
     #[serde(default)]
@@ -982,17 +992,20 @@ impl ImageConfig {
 pub enum McpServerSpec {
     Short(Vec<String>),
     Full {
-        /// Argv to exec. Optional so the entrypoint-stdio form
-        /// (`{ image = "...", env = {...} }`, no command) parses; validation
-        /// guarantees every exec path sees a non-empty command.
+        /// Argv to exec. Optional so the entrypoint-stdio form (a placed
+        /// entry with no command) parses; validation guarantees every exec
+        /// path sees a non-empty command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<Vec<String>>,
         /// Always serialized (no skip) so a `Full` entry can't collapse into
         /// the `Short` shape on a round-trip.
         #[serde(default)]
         env: BTreeMap<String, EnvValue>,
-        /// exec-stdio in the named sidecar declared under
-        /// `[images.<name>.sidecars.<sc>]`. Mutually exclusive with `image`.
+        /// The sidecar declared under `[sidecars.<sc>]` that hosts this
+        /// server. Naming it here is what starts that container for the
+        /// session. With `command` present: exec-stdio in it. Without:
+        /// entrypoint-stdio, and the block becomes an entrypoint host.
+        /// Mutually exclusive with `image`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sidecar: Option<String>,
         /// A dedicated anonymous sidecar for this one server. With `command`
@@ -1001,6 +1014,12 @@ pub enum McpServerSpec {
         /// `sidecar`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<String>,
+        /// Positional arguments for an entrypoint-stdio server, appended
+        /// after the image ref on `podman create`. Entrypoint-stdio only:
+        /// exec-stdio already carries a full argv in `command`. Elided when
+        /// empty, so an entry without it serializes exactly as before.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
     },
 }
 
@@ -1032,6 +1051,15 @@ impl McpServerSpec {
         }
     }
 
+    /// Positional arguments for the entrypoint-stdio form. Always empty for
+    /// `Short`, which is exec-stdio in the primary.
+    pub fn args(&self) -> &[String] {
+        match self {
+            Self::Short(_) => &[],
+            Self::Full { args, .. } => args,
+        }
+    }
+
     /// Whether the spec carries a command (`Short` always does).
     pub fn has_command(&self) -> bool {
         match self {
@@ -1040,12 +1068,21 @@ impl McpServerSpec {
         }
     }
 
-    /// Whether this entry is the entrypoint-stdio form: an inline `image`
-    /// with no `command`, meaning the image's ENTRYPOINT is the server. The
-    /// single definition of the transport classification -- placement
-    /// planning and MCP connection both dispatch on it.
+    /// Whether the entry names a container other than the primary -- an
+    /// inline `image` or a named `sidecar`. The single definition of "carries
+    /// a placement key", so a third placement would extend one predicate
+    /// rather than every site that tests for them pairwise.
+    pub fn is_placed(&self) -> bool {
+        self.image().is_some() || self.sidecar().is_some()
+    }
+
+    /// Whether this entry is the entrypoint-stdio form: a placed entry
+    /// (inline `image` or a named `sidecar`) with no `command`, meaning that
+    /// container's ENTRYPOINT is the server. The single definition of the
+    /// transport classification -- placement planning, MCP connection, and
+    /// the library facade's rejection all dispatch on it.
     pub fn is_entrypoint_stdio(&self) -> bool {
-        self.image().is_some() && !self.has_command()
+        !self.has_command() && self.is_placed()
     }
 }
 

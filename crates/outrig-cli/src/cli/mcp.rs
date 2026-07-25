@@ -715,6 +715,7 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
             env,
             sidecar,
             image,
+            args,
         } => {
             let mut table = toml_edit::InlineTable::new();
             if let Some(command) = command {
@@ -732,6 +733,9 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
             }
             if let Some(image) = image {
                 table.insert("image", image.as_str().into());
+            }
+            if !args.is_empty() {
+                table.insert("args", string_array(args));
             }
             toml_edit::Value::InlineTable(table)
         }
@@ -854,14 +858,15 @@ mod tests {
         assert_eq!(args.volume[0].container, std::path::PathBuf::from("/c"));
     }
 
-    /// A plan built exactly the way production builds it: parse the
-    /// `[images.<x>]` block body and run `plan_from_config`.
+    /// A plan built exactly the way production builds it: parse a whole
+    /// config (sidecar blocks are top-level) and run `plan_from_config` on
+    /// its `x` image-config.
     fn plan_from_toml(image_block_body: &str) -> SessionMcpPlan {
-        let image_cfg: outrig::config::ImageConfig = toml::from_str(&format!(
-            "dockerfile = \"D\"\ncontext = \".\"\n{image_block_body}"
+        let cfg: outrig::config::Config = toml::from_str(&format!(
+            "[images.x]\ndockerfile = \"D\"\ncontext = \".\"\n{image_block_body}"
         ))
-        .expect("image config parses");
-        outrig::container::sidecar::plan_from_config(&image_cfg)
+        .expect("config parses");
+        outrig::container::sidecar::plan_from_config(&cfg, &cfg.images["x"])
     }
 
     #[test]
@@ -871,7 +876,7 @@ mod tests {
 [sidecars.tools]
 image = "mcp-tools"
 
-[mcp]
+[images.x.mcp]
 fs     = ["mcp-fs", "/w"]
 search = { command = ["mcp-search"], sidecar = "tools" }
 "#,
@@ -898,7 +903,7 @@ search = { command = ["mcp-search"], sidecar = "tools" }
 image = "mcp-lint-img"
 start = "manual"
 
-[mcp]
+[images.x.mcp]
 lint = { command = ["mcp-lint"], env = { TOKEN = "${LINT_TOKEN}" }, sidecar = "lint" }
 "#,
         );
@@ -915,7 +920,7 @@ lint = { command = ["mcp-lint"], env = { TOKEN = "${LINT_TOKEN}" }, sidecar = "l
         // Anonymous placement comes from an inline `image` key.
         let plan = plan_from_toml(
             r#"
-[mcp]
+[images.x.mcp]
 grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 "#,
         );
@@ -924,6 +929,34 @@ grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
             rendered.contains("# grep: anonymous sidecar (image ghcr.io/example/mcp-grep:1)"),
             "anonymous sidecars should name their image: {rendered}"
         );
+    }
+
+    /// `args` survives the render as an inline table, so a `Full` entry never
+    /// collapses into the bare-array `Short` shape that means "primary".
+    #[test]
+    fn render_merged_mcp_carries_entrypoint_args() {
+        let plan = plan_from_toml(
+            r#"
+[sidecars.serve]
+image = "docker.io/mcp/filesystem:latest"
+args  = ["/from-block"]
+
+[images.x.mcp]
+inline = { image = "ghcr.io/example/mcp-fetch:2", args = ["/from-entry"] }
+named  = { sidecar = "serve" }
+"#,
+        );
+
+        let rendered = render_merged_mcp(&plan);
+        let expected = concat!(
+            "[mcp]\n",
+            "# inline: anonymous sidecar (image ghcr.io/example/mcp-fetch:2) (config.toml)\n",
+            "inline = { image = \"ghcr.io/example/mcp-fetch:2\", args = [\"/from-entry\"] }\n",
+            "# named: sidecar \"serve\" (config.toml)\n",
+            "named = { sidecar = \"serve\" }\n",
+        );
+        assert_eq!(rendered, expected);
+        toml::from_str::<toml::Value>(&rendered).expect("rendered output parses as TOML");
     }
 
     #[test]

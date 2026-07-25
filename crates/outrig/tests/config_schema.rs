@@ -244,7 +244,7 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding_ctr.security.devices, ["/dev/fuse"]);
         // The sidecar block sets `devices` but leaves `no-new-privileges`
         // alone, so it keeps the safe default independently of the primary.
-        let tools_security = &coding_ctr.sidecars["tools"].security;
+        let tools_security = &cfg.sidecars["tools"].security;
         assert_eq!(tools_security.devices, ["/dev/fuse"]);
         assert!(tools_security.no_new_privileges);
 

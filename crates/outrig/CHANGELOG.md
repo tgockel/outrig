@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Arguments for entrypoint-stdio MCP servers** -- an `args` key on `[images.<name>.mcp]`
+  entries and on `[images.<name>.sidecars.<sc>]` blocks supplies the container's trailing argv,
+  so images that take their configuration positionally (`docker.io/mcp/filesystem` and most of
+  the MCP catalog) can be named and run without spelling out their internal layout as an
+  exec-stdio `command`.
+- **Named sidecars can be entrypoint hosts** -- a `[images.<name>.sidecars.<sc>]` block whose
+  one MCP entry omits `command` runs that image's `ENTRYPOINT` as the server, which is how an
+  entrypoint-stdio server gets a workspace view, mounts, or its own security policy. Such a
+  block hosts exactly one server and must be `start = "auto"`.
+
+### Changed
+
+- **Breaking:** sidecars moved from `[images.<name>.sidecars.<sc>]` to a top-level
+  `[sidecars.<sc>]` map, matching every other cross-referenced entity in the config
+  (`[models.<n>]`, `[providers.<n>]`, `[images.<n>]`). One block can now be shared by any
+  number of image-configs, and the global config can declare sidecars a repo references,
+  because top-level maps merge global-then-repo by name. `ImageConfig::sidecars` is gone;
+  `Config::sidecars` replaces it, and `sidecar::plan_from_config` takes the `Config` too.
+  A config using the old nested form fails to parse with an unknown-field error.
+- **Breaking:** a sidecar starts only when some `[images.<name>.mcp]` entry names it.
+  Previously every declared block started. With blocks now shared and global, declaring one
+  can no longer mean "run it" -- a personal toolbox in the user config would otherwise start
+  in every repo. A block hosting no MCP servers, and one whose servers came only from its
+  image's `org.outrig.mcp` label, are no longer reachable.
+- **Breaking:** `McpServerSpec::Full` gained an `args` field and `SidecarConfig` an `args`
+  field; struct-literal constructions of either need it. `Container::create_initialized` takes
+  the entrypoint argv as a new trailing parameter.
+- `ConfigValidationError`'s `SidecarNameInvalid`, `SidecarImageEmpty`, `SidecarMount`, and
+  `SidecarArgsWithoutEntrypoint` lost their `image` field -- a sidecar block no longer belongs
+  to one image-config -- and their messages are scoped `sidecars.<sc>` rather than
+  `<image>.sidecars.<sc>`.
+- `sidecar = "<sc>"` without a `command` is no longer a config error -- it is the named
+  entrypoint-host form. `ConfigValidationError::McpSidecarRequiresCommand` is removed.
+- `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
+  placement keys.
+
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-07-24
 
 A release candidate. This is the first cycle to break the public surface, so it goes out for

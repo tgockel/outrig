@@ -844,9 +844,9 @@ mod tests {
         impl Fixture {
             /// Async because [`llm::build_agent`] is; the OpenAi arm does
             /// no I/O, so the dummy agent builds instantly.
-            async fn new(image_toml: &str) -> Self {
-                let image_cfg: outrig::config::ImageConfig =
-                    toml::from_str(image_toml).expect("image config parses");
+            async fn new(config_toml: &str) -> Self {
+                let cfg: Config = toml::from_str(config_toml).expect("config parses");
+                let image_cfg = cfg.images["x"].clone();
                 let primary = Container::attach(
                     "outrig-test",
                     ImageTag("img:latest".to_string()),
@@ -892,11 +892,11 @@ mod tests {
                     ),
                     store: SessionStore::new(std::env::temp_dir()),
                     sid: SessionId::from("test".to_string()),
-                    cfg: Config::default(),
+                    cfg: cfg.clone(),
                     repo_root: PathBuf::from("."),
                     log_dir: PathBuf::from("logs"),
                     cli_env: CliEnvEntries::parse(&[]).expect("empty env parses"),
-                    mcp_plan: plan_from_config(&image_cfg),
+                    mcp_plan: plan_from_config(&cfg, &image_cfg),
                 }
             }
 
@@ -916,6 +916,7 @@ mod tests {
         }
 
         const DECLARED: &str = r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
@@ -926,8 +927,9 @@ start = "manual"
 [sidecars.autos]
 image = "img-auto"
 
-[mcp]
-fs = { command = ["mcp-fs"], sidecar = "tools" }
+[images.x.mcp]
+fs   = { command = ["mcp-fs"], sidecar = "tools" }
+auto = { command = ["mcp-auto"], sidecar = "autos" }
 "#;
 
         fn args(items: &[&str]) -> Vec<String> {
@@ -991,7 +993,8 @@ fs = { command = ["mcp-fs"], sidecar = "tools" }
 
         #[tokio::test]
         async fn list_without_declared_sidecars_says_so() {
-            let mut fixture = Fixture::new("dockerfile = \"D\"\ncontext = \".\"\n").await;
+            let mut fixture =
+                Fixture::new("[images.x]\ndockerfile = \"D\"\ncontext = \".\"\n").await;
             let text = handle_sidecar_command(&fixture.state(), &args(&["list"])).await;
             assert!(text.contains("no sidecars declared"), "{text}");
         }

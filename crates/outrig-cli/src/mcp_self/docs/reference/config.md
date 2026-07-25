@@ -474,8 +474,9 @@ build = { command = ["cargo-mcp"], env = { CARGO_HOME = "/workspace/.cargo" } }
 lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
 grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 
-# entrypoint-stdio -- no command; the image's ENTRYPOINT is the server
+# entrypoint-stdio -- no command; the container's ENTRYPOINT is the server
 fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
+serve = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
 ```
 
 `shell-mcp-command` is a placeholder. Replace it with the shell MCP server you install in the
@@ -487,13 +488,23 @@ image, or declare any other MCP command that should run inside the container.
   invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env` (visible
   to `podman inspect` on the host, like exec argv).
 - `sidecar` (string, optional): run this server in the named
-  [`[images.<name>.sidecars.<sc>]`](#imagesnamesidecarssc) container instead of the primary.
+  [`[sidecars.<sc>]`](#sidecarssc) container instead of the primary.
+  With `command`, the server is exec-stdio in that container; *without* `command`, that
+  container's ENTRYPOINT is the server (entrypoint-stdio).
 - `image` (string, optional): give this server a dedicated anonymous sidecar created from this
   image ref (resolved like the sidecar `image` key). Mutually exclusive with `sidecar`. With
   `command`, the server is exec-stdio in that sidecar; *without* `command`, the image's
-  ENTRYPOINT is the server (entrypoint-stdio) and the entry may carry nothing but `env`. The
-  container's lifetime equals the server's: its exit surfaces as tool errors while the session
-  continues.
+  ENTRYPOINT is the server (entrypoint-stdio). The container's lifetime equals the server's:
+  its exit surfaces as tool errors while the session continues.
+- `args` (array of strings, optional, default: `[]`): positional arguments for an
+  entrypoint-stdio server, appended after the image ref on `podman create`. Requires `sidecar`
+  or `image` and rejects `command`, which is already a full argv. The same key exists on
+  [`[sidecars.<sc>]`](#sidecarssc); declaring it in both places for one
+  container is an error rather than a merge.
+
+  podman *appends* trailing arguments to an exec-form `ENTRYPOINT` and *replaces* `CMD`. So
+  `args` is for images whose server is an `ENTRYPOINT`: for an image that puts its server in
+  `CMD` instead, `args` replaces that `CMD` and the server never starts.
 
 Notes:
 
@@ -512,43 +523,70 @@ Notes:
   misses, so `outrig image inspect <name>:<content-hash>` can show their declared repo-local MCP
   entries without starting a container.
 
-### `[images.<name>.sidecars.<sc>]`
+## `[sidecars.<sc>]`
 
-Optional named sidecar containers hosting MCP servers away from the primary; see
+Named sidecar containers hosting MCP servers away from the primary; see
 [Concepts -> Containers](../concepts/containers.md#sidecar-containers). The block key `<sc>`
 is the sidecar name; it embeds in the container name (`outrig-<sid>-<sc>`) and must match
 `^[A-Za-z0-9][A-Za-z0-9_-]*$`.
 
+Top-level and referenced by name, like `[models.<n>]` or `[providers.<n>]`, so any number of
+image-configs can share one block. A session starts the blocks its image-config's `[mcp]`
+entries name and only those -- declaring a block instantiates nothing on its own.
+
 ```toml
-[images.coding.sidecars.tools]
+[sidecars.tools]
 image      = "mcp-tools"
 workspace  = "ro"
 start      = "auto"
 on-failure = "warn"
 
-[[images.coding.sidecars.tools.mounts]]
+[[sidecars.tools.mounts]]
 host-path      = "~/.cache/example"
 container-path = "/cache"
 access         = "read-write"
 
-[images.coding.sidecars.tools.security]
+[sidecars.tools.security]
 capability-profile = "no-net-raw"
 ```
 
 - `image` (string, required): resolved exactly like `--image` -- an `[images.<name>]` config
   name first, else a raw podman ref that must be present locally.
+- `args` (array of strings, optional, default: `[]`): positional arguments for the image's
+  `ENTRYPOINT`, used only when this block is an *entrypoint host* -- see below. Same semantics
+  and the same podman `ENTRYPOINT`/`CMD` rule as the `args` key on
+  [`[images.<name>.mcp]`](#imagesnamemcp); setting it in both places is an error.
 - `workspace` (string, optional, default: `"none"`): `"none"`, `"ro"`, or `"rw"`. Mounts the
   session workspace at the primary's container path with that access.
 - `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
   declares a sidecar that starts only when asked -- `/sidecar add <name>` in the REPL, or
   `Outrig::add_sidecar` / `LaunchSpec::with_sidecar` from the library API. Until then its
-  servers are skipped with a notice.
+  servers are skipped with a notice. Not available on an entrypoint host, whose container
+  lifetime is its server's.
 - `on-failure` (string, optional, default: `"abort"`): how a start/bootstrap/connect failure of
   this sidecar is handled at session start. `"abort"` fails the session; `"warn"` logs, skips
   the sidecar and its servers, and continues.
 - `mounts` (array of tables, optional): same shape and validation as
   [`[[workspace.mounts]]`](#workspace).
 - `security` (table, optional): same keys as [`[images.<name>.security]`](#imagesnamesecurity).
+
+A block is an **entrypoint host** when the one `[images.<name>.mcp]` entry naming it omits
+`command` -- the container process *is* the server, rather than a shell to `podman exec` into:
+
+```toml
+[sidecars.tools]
+image     = "docker.io/mcp/filesystem:latest"
+args      = ["/workspace"]
+workspace = "ro"
+
+[images.coding.mcp]
+fs = { sidecar = "tools" }
+```
+
+Container lifetime equals server lifetime, so such a block hosts exactly one server and cannot
+be `start = "manual"`. It also skips the in-container user bootstrap -- there is no `podman
+exec` window before the entrypoint runs -- so the image's own `USER` applies to `workspace` and
+`mounts`.
 
 #### MCP `env` value syntax
 
@@ -592,6 +630,9 @@ before the REPL starts.
 `container-path` win as a block. Extra `workspace.mounts` are combined instead of replaced:
 global mounts are kept first, followed by repo mounts. Duplicate final `container-path` values
 are rejected during validation.
+
+`[sidecars.<sc>]` merges by name like the other top-level maps, so a repo image-config can
+reference a sidecar the user declared globally.
 
 `[network].mode` follows repo precedence when the repo config declares the table. If the repo
 omits `[network]`, the global mode remains in effect. This matters when global config enables
@@ -724,6 +765,15 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.
+- `sidecar` and `image` are mutually exclusive on an MCP entry, `sidecar` must name a declared
+  `[sidecars.<sc>]` block, `image` must not be empty, and an `image` entry's server name must
+  not collide with a sidecar name (it occupies that name).
+- `args` on an MCP entry requires `sidecar` or `image`, and is rejected next to `command`.
+- `args` on `[sidecars.<sc>]` requires that some image-config host an entrypoint-stdio server
+  in that block, and the same container's arguments must not also be declared on the MCP entry.
+- An entrypoint host hosts exactly one MCP server and must be `start = "auto"`.
+- `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
+  placement keys: labels declare exec-stdio servers, whose arguments belong in `command`.
 - `dockerfile` and `context` must exist on disk relative to the repo root (build path only).
 - Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of

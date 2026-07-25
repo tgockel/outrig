@@ -944,7 +944,6 @@ mod tests {
             )]),
             security: Default::default(),
             mcp: BTreeMap::new(),
-            sidecars: BTreeMap::new(),
         };
         let resolved = BTreeMap::from([("GH_TOKEN".to_string(), "secret-token".to_string())]);
 

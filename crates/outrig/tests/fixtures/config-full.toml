@@ -90,17 +90,19 @@ build-args = { NODE_VERSION = "20" }
   grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
   lint  = { command = ["mcp-lint", "--stdio"], sidecar = "tools" }
 
-  [images.coding.sidecars.tools]
-  image      = "mcp-tools"
-  workspace  = "ro"
-  start      = "auto"
-  on-failure = "warn"
+# Sidecars are top level: declared once, referenced by name from any
+# image-config, and started only for the ones whose `[mcp]` entries name them.
+[sidecars.tools]
+image      = "mcp-tools"
+workspace  = "ro"
+start      = "auto"
+on-failure = "warn"
 
-  [[images.coding.sidecars.tools.mounts]]
+  [[sidecars.tools.mounts]]
   host-path      = ".agents/outrig/resources/cache"
   container-path = "/cache"
   access         = "read-write"
 
-  [images.coding.sidecars.tools.security]
+  [sidecars.tools.security]
   capability-profile = "no-net-raw"
   devices            = ["/dev/fuse"]

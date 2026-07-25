@@ -364,7 +364,7 @@ image-name = "{tag}"
 [images.primary.mcp]
 sidefs = {{ command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }}
 
-[images.primary.sidecars.tools]
+[sidecars.tools]
 image = "toolsimg"
 workspace = "ro"
 "#,

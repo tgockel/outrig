@@ -207,10 +207,11 @@ impl Container {
     /// PID before the server can emit a packet.
     ///
     /// `env` becomes `--env` flags on the create (there is no later exec to
-    /// carry them). `intercept_dns` bakes the interceptor's loopback resolver
-    /// into the container via `--dns` -- the exec-based resolv.conf install
-    /// is impossible before start. A `podman init` that fails to materialize
-    /// a PID surfaces later through the interceptor's pid probe.
+    /// carry them), and `args` the trailing argv the ENTRYPOINT receives.
+    /// `intercept_dns` bakes the interceptor's loopback resolver into the
+    /// container via `--dns` -- the exec-based resolv.conf install is
+    /// impossible before start. A `podman init` that fails to materialize a
+    /// PID surfaces later through the interceptor's pid probe.
     pub async fn create_initialized(
         image: &ImageTag,
         launch: ContainerLaunchSpec,
@@ -218,6 +219,7 @@ impl Container {
         transcript: Option<Transcript>,
         env: &BTreeMap<String, String>,
         intercept_dns: bool,
+        args: &[String],
     ) -> Result<Self> {
         // As in start_named: register before spawning so a SIGKILL between
         // the spawn call and its return can still be cleaned up.
@@ -230,6 +232,7 @@ impl Container {
             selinux_enforcing().await,
             env,
             intercept_dns,
+            args,
         );
         let init = Cmd::new("podman").arg("init").arg(&name);
         for cmd in [create, init] {
@@ -652,12 +655,17 @@ fn build_podman_run_cmd(
         .args(["sleep", "infinity"])
 }
 
-/// `podman create` argv for an entrypoint-stdio container: no trailing argv
-/// (the image's ENTRYPOINT is the process), `--interactive` so stdin stays
-/// open for the later `podman start --attach --interactive`, and `--rm` so
-/// container lifetime equals server lifetime. `env` becomes `--env` flags
-/// because there is no later exec to carry it; `intercept_dns` bakes the
-/// interceptor's resolver in via `--dns` for the same reason.
+/// `podman create` argv for an entrypoint-stdio container: the image's
+/// ENTRYPOINT is the process, `--interactive` so stdin stays open for the
+/// later `podman start --attach --interactive`, and `--rm` so container
+/// lifetime equals server lifetime. `env` becomes `--env` flags because there
+/// is no later exec to carry it; `intercept_dns` bakes the interceptor's
+/// resolver in via `--dns` for the same reason.
+///
+/// `args` is the trailing argv, after the image ref. podman appends it to an
+/// exec-form ENTRYPOINT and *replaces* CMD, so it is for images whose server
+/// is an ENTRYPOINT. Empty `args` emits nothing, leaving the argument vector
+/// byte-identical to the pre-`args` one.
 fn build_podman_create_cmd(
     image: &ImageTag,
     name: &str,
@@ -665,6 +673,7 @@ fn build_podman_create_cmd(
     selinux: bool,
     env: &BTreeMap<String, String>,
     intercept_dns: bool,
+    args: &[String],
 ) -> Cmd {
     let mut cmd = Cmd::new("podman").args(["create", "--name"]).arg(name);
     cmd = append_launch_flags(cmd, launch, selinux);
@@ -678,7 +687,9 @@ fn build_podman_create_cmd(
         cmd = cmd.arg("--env").arg(format!("{k}={v}"));
     }
 
-    cmd.args(["--interactive", "--rm"]).arg(image.0.as_str())
+    cmd.args(["--interactive", "--rm"])
+        .arg(image.0.as_str())
+        .args(args)
 }
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
@@ -1062,6 +1073,7 @@ mod tests {
             false,
             &env,
             true,
+            &[],
         ));
 
         assert_eq!(
@@ -1103,6 +1115,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             false,
+            &[],
         ));
 
         assert_eq!(
@@ -1118,6 +1131,41 @@ mod tests {
                 "--interactive",
                 "--rm",
                 "local:test",
+            ]
+        );
+    }
+
+    /// `args` is the trailing argv: strictly after the image ref, so podman
+    /// hands it to the ENTRYPOINT rather than reading it as a flag.
+    #[test]
+    fn podman_create_args_append_entrypoint_argv_after_the_image() {
+        let args = argv(build_podman_create_cmd(
+            &ImageTag("docker.io/mcp/filesystem:latest".to_string()),
+            "outrig-test-fs",
+            &ContainerLaunchSpec::default(),
+            false,
+            &BTreeMap::from([("MARKER".to_string(), "1".to_string())]),
+            false,
+            &["/workspace".to_string(), "--read-only".to_string()],
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--name",
+                "outrig-test-fs",
+                "--userns=keep-id",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "--env",
+                "MARKER=1",
+                "--interactive",
+                "--rm",
+                "docker.io/mcp/filesystem:latest",
+                "/workspace",
+                "--read-only",
             ]
         );
     }
@@ -1334,6 +1382,7 @@ mod tests {
             false,
             &BTreeMap::new(),
             false,
+            &[],
         ));
 
         assert_eq!(

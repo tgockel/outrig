@@ -110,6 +110,13 @@ pub enum EmbeddedImageConfigError {
          declare servers for the image that carries them -- placement is repo-config-only"
     )]
     PlacementInLabel { server: String },
+
+    #[error(
+        "mcp server {server:?} carries `args`; image labels declare exec-stdio servers, \
+         whose arguments belong in `command` -- `args` is the argv of a sidecar \
+         ENTRYPOINT and is repo-config-only"
+    )]
+    ArgsInLabel { server: String },
 }
 
 #[derive(Debug, Error)]
@@ -137,6 +144,13 @@ pub enum StandaloneImageTomlError {
          declare servers for the image that carries them -- placement is repo-config-only"
     )]
     PlacementInLabel { server: String },
+
+    #[error(
+        "mcp server {server:?} carries `args`; image labels declare exec-stdio servers, \
+         whose arguments belong in `command` -- `args` is the argv of a sidecar \
+         ENTRYPOINT and is repo-config-only"
+    )]
+    ArgsInLabel { server: String },
 }
 
 pub fn parse_standalone_image_toml(
@@ -196,7 +210,7 @@ pub fn primary_scoped_mcp(
 ) -> BTreeMap<String, McpServerSpec> {
     config
         .iter()
-        .filter(|(_, spec)| spec.sidecar().is_none() && spec.image().is_none())
+        .filter(|(_, spec)| !spec.is_placed())
         .map(|(name, spec)| (name.clone(), spec.clone()))
         .collect()
 }
@@ -360,12 +374,17 @@ fn parse_mcp_table(
                 server: server.clone(),
             });
         }
+        if !spec.args().is_empty() {
+            return Err(EmbeddedImageConfigError::ArgsInLabel {
+                server: server.clone(),
+            });
+        }
         if mcp_command_is_empty(spec) {
             return Err(EmbeddedImageConfigError::EmptyMcpCommand {
                 server: server.clone(),
             });
         }
-        if spec.sidecar().is_some() || spec.image().is_some() {
+        if spec.is_placed() {
             return Err(EmbeddedImageConfigError::PlacementInLabel {
                 server: server.clone(),
             });
@@ -454,12 +473,17 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
                     server: server.clone(),
                 });
             }
+            if !spec.args().is_empty() {
+                return Err(StandaloneImageTomlError::ArgsInLabel {
+                    server: server.clone(),
+                });
+            }
             if mcp_command_is_empty(spec) {
                 return Err(StandaloneImageTomlError::EmptyMcpCommand {
                     server: server.clone(),
                 });
             }
-            if spec.sidecar().is_some() || spec.image().is_some() {
+            if spec.is_placed() {
                 return Err(StandaloneImageTomlError::PlacementInLabel {
                     server: server.clone(),
                 });
@@ -523,6 +547,7 @@ mod tests {
                 .collect(),
             sidecar: None,
             image: None,
+            args: Vec::new(),
         }
     }
 
@@ -779,6 +804,27 @@ mod tests {
         assert!(matches!(
             err,
             EmbeddedImageConfigError::PlacementInLabel { ref server } if server == "fs"
+        ));
+    }
+
+    /// `args` is the argv of a sidecar's ENTRYPOINT, and a label cannot
+    /// declare a sidecar -- so it is rejected outright rather than parsed and
+    /// silently dropped. Checked before the empty-command rule so the error
+    /// names the real problem.
+    #[test]
+    fn parse_mcp_table_rejects_args() {
+        let err = parse_mcp_table(r#"{"fs": {"command": ["bin"], "args": ["/w"]}}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedImageConfigError::ArgsInLabel { ref server } if server == "fs"
+        ));
+
+        // Without a command there is nothing for the label to run either;
+        // `args` still names the actual mistake.
+        let err = parse_mcp_table(r#"{"fs": {"args": ["/w"]}}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            EmbeddedImageConfigError::ArgsInLabel { ref server } if server == "fs"
         ));
     }
 

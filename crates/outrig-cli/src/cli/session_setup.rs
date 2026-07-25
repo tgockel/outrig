@@ -355,11 +355,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
     let (image_cfg, raw_local_image) =
         resolve_image_config(&cfg, &image_cfg_name, allow_raw_image)?;
-    let declares_sidecars = !image_cfg.sidecars.is_empty()
-        || image_cfg
-            .mcp
-            .values()
-            .any(|spec| spec.sidecar().is_some() || spec.image().is_some());
+    let declares_sidecars = image_cfg.mcp.values().any(|spec| spec.is_placed());
     if attach.is_some() && declares_sidecars {
         return Err(OutrigError::Configuration(
             "sidecars cannot be used with `outrig mcp --attach`; an attached session \
@@ -419,16 +415,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             container: container_workspace.clone(),
             access: MountAccess::ReadWrite,
         }),
-        mounts: cfg
-            .workspace
-            .mounts
-            .iter()
-            .map(|mount| ContainerMount {
-                host: resolve_workspace_host(&repo_root, &mount.host_path),
-                container: mount.container_path.clone(),
-                access: mount.access,
-            })
-            .collect(),
+        mounts: container_mounts(&repo_root, &cfg.workspace.mounts),
         capabilities: ContainerCapabilities {
             profile: image_cfg.security.capability_profile,
             cap_drop: image_cfg.security.cap_drop.clone(),
@@ -687,6 +674,14 @@ pub(crate) struct SidecarStartCtx<'a> {
 /// -> bootstrap the user when identity matters. Session start uses the same
 /// pieces inline (it interleaves label merges between ensure and start);
 /// `/sidecar add` calls this composition mid-session.
+///
+/// **Exec-stdio only.** This is the `podman run <image> sleep infinity` path,
+/// and its caller execs servers into the result -- neither is right for an
+/// entrypoint host, whose container process *is* the server. The two never
+/// meet because validation rejects an entrypoint host that is not
+/// `start = "auto"` (`SidecarEntrypointNotAuto`), and only `start = "manual"`
+/// sidecars reach `/sidecar add`. Relaxing that rule means routing this
+/// through the same `entrypoint_server_in` fork `start_auto_sidecars` uses.
 pub(crate) async fn launch_declared_sidecar(
     ctx: &SidecarStartCtx<'_>,
     plan: &SessionMcpPlan,
@@ -709,12 +704,12 @@ async fn setup_sidecars_and_network(
     args: SidecarPhaseArgs<'_>,
     containers: &mut SessionContainers,
 ) -> Result<(SessionMcpPlan, Option<NetworkInterceptor>)> {
-    let mut plan = sidecar::plan_from_config(args.image_cfg);
+    let mut plan = sidecar::plan_from_config(args.cfg, args.image_cfg);
     let image_mcp = embedded::read_embedded_mcp(args.image_tag, args.transcript).await?;
     sidecar::merge_primary_labels(&mut plan, image_mcp);
 
     // Phase A -- ensure each distinct sidecar image (and read its labels when a
-    // non-anonymous sidecar needs them) concurrently. Sidecars are independent,
+    // label-honoring sidecar needs them) concurrently. Sidecars are independent,
     // so their podman-heavy ensure/inspect work overlaps; the results are
     // consumed below in deterministic name order.
     let resolutions =
@@ -736,11 +731,11 @@ async fn setup_sidecars_and_network(
             }
         };
 
-        if !sc.anonymous {
+        if plan.sidecar_honors_labels(&sc) {
             let label_mcp = match resolution
                 .labels
                 .as_ref()
-                .expect("non-anonymous sidecar image is label-read in Phase A")
+                .expect("a label-honoring sidecar image is label-read in Phase A")
             {
                 Ok(label_mcp) => label_mcp.clone(),
                 Err(message) => return Err(shared_image_error(message)),
@@ -775,9 +770,10 @@ async fn setup_sidecars_and_network(
 /// One distinct sidecar image resolved once and shared by every sidecar that
 /// references it (Phase A of [`setup_sidecars_and_network`]). `tag` is the
 /// image-ensure result; `labels` is the `org.outrig.mcp` read, present only
-/// when at least one *non-anonymous* sidecar uses the image -- anonymous
-/// sidecars never read labels, so an anonymous-only image is never inspected
-/// (inspecting it could newly fail a session on a malformed label). A failure
+/// when some sidecar using the image honors labels (see
+/// [`SessionMcpPlan::sidecar_honors_labels`]) -- otherwise it is never
+/// inspected, since inspecting it could newly fail a session on a malformed
+/// label nothing would have consumed. A failure
 /// is kept as its `Display` text -- one image feeds many sidecars but
 /// [`CliError`] is not `Clone` -- and [`shared_image_error`] re-wraps it
 /// verbatim per consumer.
@@ -797,11 +793,12 @@ async fn resolve_sidecar_images(
     repo_root: &Path,
     transcript: Option<&Transcript>,
 ) -> HashMap<String, ImageResolution> {
-    // Distinct images, each flagged for a label read iff a non-anonymous
-    // sidecar uses it (anonymous-only images are never inspected).
+    // Distinct images, each flagged for a label read iff some sidecar using
+    // it honors labels (an image only anonymous or entrypoint hosts use is
+    // never inspected).
     let mut images: BTreeMap<&str, bool> = BTreeMap::new();
     for sc in plan.sidecars.values() {
-        *images.entry(sc.image.as_str()).or_default() |= !sc.anonymous;
+        *images.entry(sc.image.as_str()).or_default() |= plan.sidecar_honors_labels(sc);
     }
 
     futures_util::future::join_all(images.into_iter().map(|(image, read_labels)| async move {
@@ -957,13 +954,21 @@ async fn ensure_sidecar_image(
 
 /// The launch inputs every sidecar container shares, whichever path starts
 /// it: session + sidecar labels and the block's security policy -- capability
-/// profile, device passthrough, and privilege escalation alike. Workspace
-/// and mounts stay empty; `start_one_sidecar` fills them in (the entrypoint
-/// form cannot declare either).
+/// profile, device passthrough, and privilege escalation alike -- plus the
+/// workspace view and extra mounts, which `podman create` and `podman run`
+/// accept alike, so a named block hosting an entrypoint server gets them too.
+/// An anonymous sidecar declares neither and lands on the empty defaults.
 fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
     ContainerLaunchSpec {
-        workspace: None,
-        mounts: Vec::new(),
+        workspace: sc
+            .workspace
+            .mount_access()
+            .map(|access| ContainerWorkspace {
+                host: ctx.host_workspace.to_path_buf(),
+                container: ctx.container_workspace.to_path_buf(),
+                access,
+            }),
+        mounts: container_mounts(ctx.repo_root, &sc.mounts),
         capabilities: ContainerCapabilities {
             profile: sc.security.capability_profile,
             cap_drop: sc.security.cap_drop.clone(),
@@ -978,6 +983,20 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
     }
 }
 
+/// Config `mounts` as launch-spec bind mounts, host paths resolved against the
+/// repo root. Shared by the primary launch and every sidecar; the two lists
+/// have the same shape and the same `~`/relative-path rules.
+fn container_mounts(repo_root: &Path, mounts: &[MountConfig]) -> Vec<ContainerMount> {
+    mounts
+        .iter()
+        .map(|mount| ContainerMount {
+            host: resolve_workspace_host(repo_root, &mount.host_path),
+            container: mount.container_path.clone(),
+            access: mount.access,
+        })
+        .collect()
+}
+
 fn sidecar_container_name(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> String {
     outrig::container::sidecar_container_name(ctx.sid, &sc.name)
 }
@@ -990,25 +1009,7 @@ async fn start_one_sidecar(
     sc: &SidecarPlan,
     needs_bootstrap: bool,
 ) -> Result<Container> {
-    let mut launch = sidecar_launch_base(ctx, sc);
-    launch.workspace = sc
-        .workspace
-        .mount_access()
-        .map(|access| ContainerWorkspace {
-            host: ctx.host_workspace.to_path_buf(),
-            container: ctx.container_workspace.to_path_buf(),
-            access,
-        });
-    launch.mounts = sc
-        .mounts
-        .iter()
-        .map(|mount| ContainerMount {
-            host: resolve_workspace_host(ctx.repo_root, &mount.host_path),
-            container: mount.container_path.clone(),
-            access: mount.access,
-        })
-        .collect();
-
+    let launch = sidecar_launch_base(ctx, sc);
     let container_name = sidecar_container_name(ctx, sc);
     let span = ProgressSpan::start(format!("starting sidecar {}", sc.name));
     let mut container =
@@ -1027,7 +1028,9 @@ async fn start_one_sidecar(
 /// [`connect_mcp_clients`]. The server's env (config + CLI `--env` overlay)
 /// is resolved here and baked in via `podman create --env`; when network
 /// interception is on, the loopback resolver rides in via `--dns` because
-/// the exec-based resolv.conf install needs a running container.
+/// the exec-based resolv.conf install needs a running container. The
+/// ENTRYPOINT's positional arguments come from the entry or its sidecar
+/// block, whichever declared them.
 async fn create_one_entrypoint_sidecar(
     args: &SidecarPhaseArgs<'_>,
     tag: &ImageTag,
@@ -1051,6 +1054,7 @@ async fn create_one_entrypoint_sidecar(
         args.transcript.cloned(),
         &env,
         intercept_dns,
+        sidecar::entrypoint_args(spec, sc),
     )
     .await?;
     span.done(format!("sidecar {} created: {}", sc.name, container.name()));
@@ -1092,7 +1096,6 @@ fn resolve_image_config(
             build_args: BTreeMap::new(),
             security: Default::default(),
             mcp: BTreeMap::new(),
-            sidecars: BTreeMap::new(),
         };
         return Ok((image_cfg, true));
     }
@@ -1316,7 +1319,6 @@ mod tests {
             build_args: BTreeMap::new(),
             security: Default::default(),
             mcp: BTreeMap::new(),
-            sidecars: BTreeMap::new(),
         }
     }
 

@@ -6,6 +6,10 @@
 //! connections happen in the caller (`session_setup` in the CLI) -- so the
 //! merge and collision rules here are unit-testable without podman.
 //!
+//! Sidecars are declared once at the top level (`[sidecars.<sc>]`) and shared
+//! across image-configs, so the plan holds the subset one image-config's
+//! `[mcp]` entries name, not every block in the config.
+//!
 //! Merge order is deterministic: config entries first (they win wholesale,
 //! placement included), then the primary image's `org.outrig.mcp` label, then
 //! each named sidecar's label in name order. A name two labels both declare,
@@ -15,8 +19,8 @@
 use std::collections::BTreeMap;
 
 use crate::config::{
-    ContainerSecurity, ImageConfig, McpServerSpec, MountConfig, SidecarOnFailure, SidecarStart,
-    SidecarWorkspaceAccess,
+    Config, ContainerSecurity, ImageConfig, McpServerSpec, MountConfig, SidecarOnFailure,
+    SidecarStart, SidecarWorkspaceAccess,
 };
 use crate::container::embedded::McpDeclarationSource;
 use crate::error::{OutrigError, Result};
@@ -54,6 +58,10 @@ pub struct PlacedServer {
 pub struct SidecarPlan {
     pub name: String,
     pub image: String,
+    /// Positional arguments for the image's ENTRYPOINT, meaningful only when
+    /// this sidecar is an entrypoint host. Anonymous sidecars leave it empty:
+    /// their arguments ride the declaring MCP entry's own `args`.
+    pub args: Vec<String>,
     pub workspace: SidecarWorkspaceAccess,
     pub start: SidecarStart,
     pub on_failure: SidecarOnFailure,
@@ -71,6 +79,7 @@ impl SidecarPlan {
         Self {
             name: server_name.to_string(),
             image: image.to_string(),
+            args: Vec::new(),
             workspace: SidecarWorkspaceAccess::None,
             start: SidecarStart::Auto,
             on_failure: SidecarOnFailure::Abort,
@@ -99,9 +108,14 @@ impl SessionMcpPlan {
     }
 
     /// Whether the sidecar needs the in-container user bootstrap; see
-    /// [`bootstrap_needed`]. A mount-less entrypoint-stdio sidecar keeps the
-    /// image's own `USER` untouched.
+    /// [`bootstrap_needed`]. An entrypoint host never does: bootstrap runs
+    /// over `podman exec`, and there is no window for it between `podman
+    /// create` and the `podman start --attach` that *is* the server. Such a
+    /// container keeps the image's own `USER`, mounts or not.
     pub fn sidecar_needs_bootstrap(&self, sidecar: &SidecarPlan) -> bool {
+        if self.entrypoint_server_in(sidecar).is_some() {
+            return false;
+        }
         bootstrap_needed(
             self.servers_in(&sidecar.name)
                 .any(|(_, placed)| placed.spec.has_command()),
@@ -110,25 +124,51 @@ impl SessionMcpPlan {
         )
     }
 
-    /// The single entrypoint-stdio server an anonymous sidecar hosts: the
-    /// sidecar came from an inline `image` key with no `command`, so the
-    /// image's ENTRYPOINT is the server and container lifetime equals server
-    /// lifetime. `None` for named sidecars (exec-stdio hosts only) and for
-    /// anonymous exec-stdio sidecars (inline `image` + `command`). Validation
-    /// guarantees an anonymous sidecar hosts exactly its declaring server.
+    /// The single entrypoint-stdio server this sidecar hosts: an entry with
+    /// no `command`, so the image's ENTRYPOINT is the server and container
+    /// lifetime equals server lifetime. Covers both the inline `image` form
+    /// (anonymous) and a named block whose one entry omits `command`. `None`
+    /// for exec-stdio hosts.
+    ///
+    /// The first match is the only one, kept true by two guards together:
+    /// validation rejects a config that places a second server in an
+    /// entrypoint host, and [`Self::sidecar_honors_labels`] keeps a label from
+    /// adding one behind validation's back.
     pub fn entrypoint_server_in(&self, sidecar: &SidecarPlan) -> Option<(&String, &PlacedServer)> {
-        if !sidecar.anonymous {
-            return None;
-        }
         self.servers_in(&sidecar.name)
             .find(|(_, placed)| placed.spec.is_entrypoint_stdio())
     }
+
+    /// Whether this sidecar's image `org.outrig.mcp` label participates in
+    /// the merge. Two kinds of sidecar run exactly one known server and so
+    /// ignore it: anonymous ones (the inline `image` key declares the single
+    /// server) and entrypoint hosts (the container process *is* the server).
+    /// The one predicate behind both the Phase-A label read and the Phase-B
+    /// merge, so an image is never inspected for a label nothing consumes.
+    pub fn sidecar_honors_labels(&self, sidecar: &SidecarPlan) -> bool {
+        !sidecar.anonymous && self.entrypoint_server_in(sidecar).is_none()
+    }
 }
 
-/// The single definition of "this sidecar needs the in-container user
-/// bootstrap": it hosts at least one exec-stdio server (exec needs `--user`
-/// and `HOME`), sees the workspace, or declares mounts. Shared by the
-/// config-plan path and `Outrig::add_sidecar`'s `SidecarSpec` path.
+/// The arguments an entrypoint host's container process receives: the
+/// declaring MCP entry's `args`, else the sidecar block's. Validation rejects
+/// setting both, so this is a choice, not a merge. Takes the spec directly --
+/// every caller has already matched [`SessionMcpPlan::entrypoint_server_in`]
+/// to know it is dealing with an entrypoint host.
+pub fn entrypoint_args<'a>(spec: &'a McpServerSpec, sidecar: &'a SidecarPlan) -> &'a [String] {
+    if spec.args().is_empty() {
+        &sidecar.args
+    } else {
+        spec.args()
+    }
+}
+
+/// Whether an *exec-stdio* sidecar needs the in-container user bootstrap: it
+/// hosts at least one exec-stdio server (exec needs `--user` and `HOME`), sees
+/// the workspace, or declares mounts. Shared by the config-plan path and
+/// `Outrig::add_sidecar`'s `SidecarSpec` path, which cannot declare entrypoint
+/// hosts at all. [`SessionMcpPlan::sidecar_needs_bootstrap`] short-circuits
+/// ahead of this for entrypoint hosts, which never bootstrap.
 pub fn bootstrap_needed(
     hosts_exec_server: bool,
     workspace: SidecarWorkspaceAccess,
@@ -137,18 +177,28 @@ pub fn bootstrap_needed(
     hosts_exec_server || workspace != SidecarWorkspaceAccess::None || has_mounts
 }
 
-/// Build the config-declared half of the plan: named sidecar blocks,
-/// anonymous sidecars from inline `image` keys, and every `[images.<x>.mcp]`
-/// entry with its placement. Assumes the config has passed validation.
-pub fn plan_from_config(image_cfg: &ImageConfig) -> SessionMcpPlan {
+/// Build the config-declared half of the plan: the `[sidecars.<sc>]` blocks
+/// this image-config's `[mcp]` entries name, anonymous sidecars from inline
+/// `image` keys, and every entry with its placement. Assumes the config has
+/// passed validation, which is what guarantees each named block resolves.
+///
+/// Instantiation follows reference: a declared block no `[mcp]` entry names is
+/// not in the plan and never starts. Blocks are top-level and shared, so most
+/// of them belong to some *other* image-config.
+pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan {
     let mut plan = SessionMcpPlan::default();
 
-    for (name, sidecar) in &image_cfg.sidecars {
+    let referenced = image_cfg.mcp.values().filter_map(|spec| spec.sidecar());
+    for sc in referenced {
+        let Some(sidecar) = cfg.sidecars.get(sc) else {
+            continue;
+        };
         plan.sidecars.insert(
-            name.clone(),
+            sc.to_string(),
             SidecarPlan {
-                name: name.clone(),
+                name: sc.to_string(),
                 image: sidecar.image.clone(),
+                args: sidecar.args.clone(),
                 workspace: sidecar.workspace,
                 start: sidecar.start,
                 on_failure: sidecar.on_failure,
@@ -199,7 +249,9 @@ pub fn merge_primary_labels(plan: &mut SessionMcpPlan, image_mcp: BTreeMap<Strin
 /// materialize as exec-stdio servers *in that sidecar*. Config overrides by
 /// name (whole entry, placement included). A leftover name that another
 /// container's label already claims is a startup error -- the namespace is
-/// flat. Never called for anonymous sidecars; their labels are inert.
+/// flat. Never called for entrypoint hosts (anonymous ones, and named blocks
+/// whose entry omits `command`); their labels are inert, because exactly the
+/// one declaring server runs there.
 pub fn merge_sidecar_labels(
     plan: &mut SessionMcpPlan,
     sidecar: &str,
@@ -231,6 +283,10 @@ pub fn merge_sidecar_labels(
                     env,
                     sidecar: Some(sidecar.to_string()),
                     image: None,
+                    // Labels are exec-stdio-only (`parse_mcp_table` rejects
+                    // `args` alongside the placement keys), so there is never
+                    // anything to carry across.
+                    args: Vec::new(),
                 },
                 source: McpDeclarationSource::ImageLabel,
                 placement: Placement::Sidecar(sidecar.to_string()),
@@ -244,8 +300,12 @@ pub fn merge_sidecar_labels(
 mod tests {
     use super::*;
 
-    fn image_cfg(toml_src: &str) -> ImageConfig {
-        toml::from_str(toml_src).expect("image config parses")
+    /// Parse a whole config and plan its `x` image-config, the way
+    /// production does. Sidecar blocks are top-level and shared, so a plan
+    /// only holds the ones `[images.x.mcp]` names.
+    fn plan_of(toml_src: &str) -> SessionMcpPlan {
+        let cfg: Config = toml::from_str(toml_src).expect("config parses");
+        plan_from_config(&cfg, &cfg.images["x"])
     }
 
     fn short(cmd: &[&str]) -> McpServerSpec {
@@ -254,21 +314,21 @@ mod tests {
 
     #[test]
     fn plan_places_servers_by_config_keys() {
-        let cfg = image_cfg(
+        let plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
 [sidecars.tools]
 image = "mcp-tools"
 
-[mcp]
+[images.x.mcp]
 local = ["mcp-local"]
 fs    = { command = ["mcp-fs"], sidecar = "tools" }
 grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 "#,
         );
-        let plan = plan_from_config(&cfg);
 
         assert_eq!(plan.servers["local"].placement, Placement::Primary);
         assert_eq!(
@@ -291,19 +351,19 @@ grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 
     #[test]
     fn primary_label_entries_yield_to_config() {
-        let cfg = image_cfg(
+        let mut plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
 [sidecars.tools]
 image = "mcp-tools"
 
-[mcp]
+[images.x.mcp]
 fs = { command = ["config-fs"], sidecar = "tools" }
 "#,
         );
-        let mut plan = plan_from_config(&cfg);
         merge_primary_labels(
             &mut plan,
             BTreeMap::from([
@@ -328,8 +388,9 @@ fs = { command = ["config-fs"], sidecar = "tools" }
 
     #[test]
     fn sidecar_label_entries_are_scoped_and_rewritten() {
-        let cfg = image_cfg(
+        let mut plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
@@ -337,7 +398,6 @@ context    = "."
 image = "mcp-tools"
 "#,
         );
-        let mut plan = plan_from_config(&cfg);
         merge_sidecar_labels(
             &mut plan,
             "tools",
@@ -358,19 +418,19 @@ image = "mcp-tools"
 
     #[test]
     fn config_overrides_sidecar_label_wholesale() {
-        let cfg = image_cfg(
+        let mut plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
 [sidecars.tools]
 image = "mcp-tools"
 
-[mcp]
+[images.x.mcp]
 fs = ["config-fs"]
 "#,
         );
-        let mut plan = plan_from_config(&cfg);
         merge_sidecar_labels(
             &mut plan,
             "tools",
@@ -387,8 +447,9 @@ fs = ["config-fs"]
 
     #[test]
     fn cross_label_duplicate_is_an_error() {
-        let cfg = image_cfg(
+        let mut plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
@@ -399,7 +460,6 @@ image = "img-a"
 image = "img-b"
 "#,
         );
-        let mut plan = plan_from_config(&cfg);
         merge_sidecar_labels(
             &mut plan,
             "a",
@@ -424,8 +484,9 @@ image = "img-b"
 
     #[test]
     fn primary_label_conflicts_with_sidecar_label() {
-        let cfg = image_cfg(
+        let mut plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
@@ -433,7 +494,6 @@ context    = "."
 image = "mcp-tools"
 "#,
         );
-        let mut plan = plan_from_config(&cfg);
         merge_primary_labels(
             &mut plan,
             BTreeMap::from([("fs".to_string(), short(&["primary-fs"]))]),
@@ -449,8 +509,9 @@ image = "mcp-tools"
 
     #[test]
     fn bootstrap_needed_for_exec_workspace_or_mounts() {
-        let cfg = image_cfg(
+        let plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
@@ -471,38 +532,61 @@ container-path = "/cache"
 [sidecars.hosting]
 image = "img"
 
-[mcp]
+[images.x.mcp]
+a     = { command = ["mcp-a"], sidecar = "bare" }
+b     = { command = ["mcp-b"], sidecar = "ws" }
+c     = { command = ["mcp-c"], sidecar = "mounted" }
 fs    = { command = ["mcp-fs"], sidecar = "hosting" }
 fetch = { image = "ghcr.io/example/mcp-fetch:2" }
 "#,
         );
-        let plan = plan_from_config(&cfg);
 
-        assert!(!plan.sidecar_needs_bootstrap(&plan.sidecars["bare"]));
-        assert!(plan.sidecar_needs_bootstrap(&plan.sidecars["ws"]));
-        assert!(plan.sidecar_needs_bootstrap(&plan.sidecars["mounted"]));
-        assert!(plan.sidecar_needs_bootstrap(&plan.sidecars["hosting"]));
+        // Every sidecar a config can reach hosts a server, so hosting an
+        // exec-stdio one is on its own enough -- workspace and mounts only
+        // ever add to it.
+        for name in ["bare", "ws", "mounted", "hosting"] {
+            assert!(
+                plan.sidecar_needs_bootstrap(&plan.sidecars[name]),
+                "{name} hosts an exec-stdio server"
+            );
+        }
         // An entrypoint-stdio sidecar keeps the image's own USER untouched.
         assert!(!plan.sidecar_needs_bootstrap(&plan.sidecars["fetch"]));
     }
 
+    /// The workspace and mounts axes in isolation. Only `Outrig::add_sidecar`
+    /// reaches them without an exec-stdio server -- a config-declared sidecar
+    /// is in the plan because some `[mcp]` entry named it.
     #[test]
-    fn entrypoint_server_found_only_in_anonymous_no_command_sidecars() {
-        let cfg = image_cfg(
+    fn bootstrap_needed_axes() {
+        use SidecarWorkspaceAccess::{None as NoWs, Ro};
+        assert!(!bootstrap_needed(false, NoWs, false));
+        assert!(bootstrap_needed(true, NoWs, false));
+        assert!(bootstrap_needed(false, Ro, false));
+        assert!(bootstrap_needed(false, NoWs, true));
+    }
+
+    #[test]
+    fn entrypoint_server_found_in_any_no_command_sidecar() {
+        let plan = plan_of(
             r#"
+[images.x]
 dockerfile = "D"
 context    = "."
 
 [sidecars.tools]
 image = "mcp-tools"
 
-[mcp]
+[sidecars.serve]
+image = "mcp-serve"
+
+[images.x.mcp]
 fs    = { command = ["mcp-fs"], sidecar = "tools" }
+srv   = { sidecar = "serve" }
 grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 fetch = { image = "ghcr.io/example/mcp-fetch:2" }
 "#,
         );
-        let plan = plan_from_config(&cfg);
 
         let (name, placed) = plan
             .entrypoint_server_in(&plan.sidecars["fetch"])
@@ -510,8 +594,100 @@ fetch = { image = "ghcr.io/example/mcp-fetch:2" }
         assert_eq!(name, "fetch");
         assert_eq!(placed.spec.image(), Some("ghcr.io/example/mcp-fetch:2"));
 
-        // Anonymous with a command is exec-stdio; named sidecars never match.
+        // A named block whose entry omits `command` is an entrypoint host too.
+        let (name, _) = plan
+            .entrypoint_server_in(&plan.sidecars["serve"])
+            .expect("no-command named sidecar is entrypoint-stdio");
+        assert_eq!(name, "srv");
+
+        // Anything carrying a command stays exec-stdio.
         assert!(plan.entrypoint_server_in(&plan.sidecars["grep"]).is_none());
         assert!(plan.entrypoint_server_in(&plan.sidecars["tools"]).is_none());
+    }
+
+    /// Only exec-stdio hosts read their image's `org.outrig.mcp`: the other
+    /// two kinds run exactly one already-known server.
+    #[test]
+    fn only_exec_stdio_named_sidecars_honor_labels() {
+        let plan = plan_of(
+            r#"
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[sidecars.tools]
+image = "mcp-tools"
+
+[sidecars.serve]
+image = "mcp-serve"
+
+[images.x.mcp]
+fs    = { command = ["mcp-fs"], sidecar = "tools" }
+srv   = { sidecar = "serve" }
+fetch = { image = "ghcr.io/example/mcp-fetch:2" }
+"#,
+        );
+
+        assert!(plan.sidecar_honors_labels(&plan.sidecars["tools"]));
+        assert!(!plan.sidecar_honors_labels(&plan.sidecars["serve"]));
+        assert!(!plan.sidecar_honors_labels(&plan.sidecars["fetch"]));
+    }
+
+    /// An entrypoint host never bootstraps: there is no exec window between
+    /// `podman create` and the `podman start --attach` that is the server, so
+    /// declaring a workspace does not conjure one.
+    #[test]
+    fn entrypoint_host_skips_bootstrap_even_with_a_workspace() {
+        let plan = plan_of(
+            r#"
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[sidecars.serve]
+image     = "mcp-serve"
+workspace = "ro"
+
+[images.x.mcp]
+srv = { sidecar = "serve" }
+"#,
+        );
+        assert!(!plan.sidecar_needs_bootstrap(&plan.sidecars["serve"]));
+    }
+
+    /// `args` may be declared on the entry or on the block; validation
+    /// rejects both, so the plan picks rather than merges.
+    #[test]
+    fn entrypoint_args_come_from_the_entry_else_the_block() {
+        let plan = plan_of(
+            r#"
+[images.x]
+dockerfile = "D"
+context    = "."
+
+[sidecars.blockside]
+image = "mcp-serve"
+args  = ["/from-block"]
+
+[sidecars.entryside]
+image = "mcp-serve"
+
+[images.x.mcp]
+a = { sidecar = "blockside" }
+b = { sidecar = "entryside", args = ["/from-entry"] }
+c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
+"#,
+        );
+        let args_for = |sc: &str| {
+            let sidecar = &plan.sidecars[sc];
+            let (_, placed) = plan
+                .entrypoint_server_in(sidecar)
+                .expect("sidecar is an entrypoint host");
+            entrypoint_args(&placed.spec, sidecar).to_vec()
+        };
+
+        assert_eq!(args_for("blockside"), ["/from-block"]);
+        assert_eq!(args_for("entryside"), ["/from-entry"]);
+        assert_eq!(args_for("c"), ["/inline"]);
     }
 }

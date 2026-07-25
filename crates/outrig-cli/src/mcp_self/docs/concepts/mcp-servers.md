@@ -51,9 +51,14 @@ traces, in the prefix that gets attached to every tool the server exposes.
 A full-form entry can name the container it runs in:
 
 ```toml
-[images.dev.sidecars.tools]
+[sidecars.tools]
 image     = "mcp-tools"        # sibling [images.mcp-tools] block first, else raw podman ref
 workspace = "ro"               # "none" (default) | "ro" | "rw"
+
+[sidecars.serve]
+image     = "docker.io/mcp/filesystem:latest"
+args      = ["/workspace"]     # argv for the image's ENTRYPOINT
+workspace = "ro"
 
 [images.dev.mcp]
 # Runs in the primary container, exactly as before.
@@ -64,32 +69,62 @@ fs    = { command = ["mcp-fs", "/workspace"], sidecar = "tools" }
 grep  = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 # entrypoint-stdio: no command; the image ENTRYPOINT is the server.
 fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "${FETCH_TOKEN}" } }
+# entrypoint-stdio in the named sidecar "serve", which supplies the argv.
+ws    = { sidecar = "serve" }
 ```
 
-The four placement shapes:
+The placement shapes:
 
 - **Primary (default).** No placement key. The short form (bare array) always runs in the
   primary.
-- **Named sidecar:** `sidecar = "<sc>"` names a block under `[images.<name>.sidecars]`; the
-  server is `podman exec`'d in that container. Named sidecars require a `command`.
+- **Named sidecar:** `sidecar = "<sc>"` names a top-level `[sidecars.<sc>]` block; with a
+  `command`, the server is `podman exec`'d in that container. Naming it is also what starts
+  it -- blocks are shared, so a session only runs the ones its `[mcp]` entries reference.
 - **Anonymous sidecar:** `image = "<ref>"` plus `command` gives this one server a dedicated
   container with all defaults (no workspace, no mounts, `on-failure = "abort"`). Anything
   fancier -- workspace access, mounts, security -- requires promoting to a named block.
   `sidecar` and `image` are mutually exclusive.
-- **Entrypoint sidecar:** `image = "<ref>"` *without* a `command` runs the image's ENTRYPOINT
-  as the server over piped stdio -- the off-the-shelf MCP image pattern, zero repo-side command
-  knowledge. Only `env` may accompany it, baked in at container create. Container lifetime
-  equals server lifetime: the server exiting removes the container, surfacing exactly like a
-  mid-session sidecar death (tools error, session survives).
+- **Entrypoint sidecar:** an entry *without* a `command` runs its container's ENTRYPOINT as the
+  server over piped stdio -- the off-the-shelf MCP image pattern, zero repo-side command
+  knowledge. Container lifetime equals server lifetime: the server exiting removes the
+  container, surfacing exactly like a mid-session sidecar death (tools error, session
+  survives). Two ways to write it:
+  - `image = "<ref>"` with no `command` -- the one-liner, all defaults.
+  - `sidecar = "<sc>"` with no `command` -- the named block becomes the entrypoint host, which
+    is how such a server gets a workspace view, mounts, or its own security policy.
+
+An entrypoint server's arguments come from `args`, on the entry or on its sidecar block --
+never both. Without it, `docker.io/mcp/filesystem` and most real MCP images cannot be reached
+at all, since they take their served directories positionally:
+
+```toml
+[images.dev.mcp]
+serve = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
+```
+
+`args` is for images whose server is an `ENTRYPOINT`. podman appends trailing arguments to an
+exec-form `ENTRYPOINT`, so `["node", "/app/dist/index.js"]` plus `args = ["/workspace"]` runs
+`node /app/dist/index.js /workspace`. But it *replaces* `CMD` -- an image that puts its server
+in `CMD` instead loses it, and nothing starts.
+
+Because the container process is the server, an entrypoint host serves exactly one server and
+cannot be `start = "manual"`. It also skips the in-container user bootstrap: that runs over
+`podman exec`, and there is no window for it between the container's creation and the attach
+that runs the entrypoint. The image's own `USER` therefore applies to any `workspace` or
+`mounts` the block declares.
 
 Entrypoint sidecars never race session network policy: the container is created and initialized
 with its entrypoint held un-executed, audit/filter interception attaches to its network
 namespace, and only then does the entrypoint run. Its first packet is already subject to policy.
 
-Named sidecars honor their image's `org.outrig.mcp` label with the usual semantics, scoped to
-that sidecar: label-declared servers materialize as exec-stdio servers *in that sidecar*, and
-repo config overrides by server name (the whole entry, placement included). Labels are inert on
-anonymous sidecars -- exactly the one declaring server runs there.
+Exec-stdio named sidecars honor their image's `org.outrig.mcp` label with the usual semantics,
+scoped to that sidecar: label-declared servers materialize as exec-stdio servers *in that
+sidecar*, and repo config overrides by server name (the whole entry, placement included). The
+label adds servers to a sidecar an `[mcp]` entry already started; it cannot start one itself.
+Labels are inert on anonymous sidecars and on entrypoint hosts -- exactly the one declaring
+server runs there. Labels may not carry `args` for the same reason they may not carry placement
+keys: they describe exec-stdio servers in the image that carries them, whose arguments belong
+in `command`.
 
 The server-name namespace stays flat per session, across the primary and every sidecar. If two
 sidecar images both advertise the same name and neither is overridden, session start fails with

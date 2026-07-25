@@ -292,7 +292,7 @@ impl LaunchSpec {
     /// paths resolve against `repo_root` so the spec carries absolute paths.
     ///
     /// Unlike a verbatim copy of the image's `[mcp]` map, this resolves MCP
-    /// placement into sidecars: `[images.<name>.sidecars.<sc>]` blocks and
+    /// placement into sidecars: top-level `[sidecars.<sc>]` blocks and
     /// placement-bearing entries (`sidecar = "<sc>"`, inline `image = "..."`
     /// with a `command`) become [`SidecarSpec`]s on the returned spec, so
     /// [`Outrig::launch`] no longer rejects them. Named-sidecar and anonymous
@@ -304,9 +304,10 @@ impl LaunchSpec {
     /// - `start = "manual"` sidecars are skipped -- neither started nor carried.
     ///   Rebuild a [`SidecarSpec`] and call [`Outrig::add_sidecar`] to start one
     ///   mid-session.
-    /// - Entrypoint-stdio placements (an inline `image` with no `command`) have
-    ///   no exec-stdio library form and are rejected with an error; run those
-    ///   via the CLI (`outrig run` / `outrig mcp`).
+    /// - Entrypoint-stdio placements (a placed entry with no `command`, whether
+    ///   it names an inline `image` or a `sidecar` block) have no exec-stdio
+    ///   library form and are rejected with an error; run those via the CLI
+    ///   (`outrig run` / `outrig mcp`).
     /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
     ///   servers come only from the repo config's placement entries.
     ///
@@ -353,7 +354,7 @@ impl LaunchSpec {
             },
         };
 
-        let plan = sidecar::plan_from_config(cfg);
+        let plan = sidecar::plan_from_config(config, cfg);
         let (mcp, mut sidecars) = plan_to_launch_parts(&plan, repo_root)?;
         for sidecar in &mut sidecars {
             sidecar.image = resolve_sidecar_image_tag(config, repo_root, &sidecar.image).await?;
@@ -461,9 +462,10 @@ fn plan_to_launch_parts(
         }
         if let Some((server, _)) = plan.entrypoint_server_in(sc) {
             return Err(OutrigError::Configuration(format!(
-                "mcp server {server:?} is entrypoint-stdio (an inline image with no command); \
-                 the library facade hosts exec-stdio servers only -- run it via the CLI \
-                 (outrig run / outrig mcp) or give the server a command"
+                "mcp server {server:?} is entrypoint-stdio (a placed entry with no command, \
+                 so the container's ENTRYPOINT is the server); the library facade hosts \
+                 exec-stdio servers only -- run it via the CLI (outrig run / outrig mcp) or \
+                 give the server a command"
             )));
         }
         let servers = plan
@@ -568,7 +570,6 @@ impl Outrig {
                     build_args: build_args.clone(),
                     security: ContainerSecurity::default(),
                     mcp: BTreeMap::new(),
-                    sidecars: BTreeMap::new(),
                 };
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
             }
@@ -908,6 +909,8 @@ async fn connect_sidecar_servers(
             env: server.env.clone(),
             sidecar: None,
             image: None,
+            // exec-stdio: `command` is the full argv.
+            args: Vec::new(),
         };
         let client = match McpClient::connect_via_podman_exec_with_source(
             container,
@@ -1088,7 +1091,7 @@ mod tests {
     fn launch_parts(toml_src: &str) -> Result<(BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>)> {
         let config: Config = toml::from_str(toml_src).expect("parse config");
         let cfg = config.images.get("primary").expect("primary image-config");
-        plan_to_launch_parts(&sidecar::plan_from_config(cfg), Path::new("/repo"))
+        plan_to_launch_parts(&sidecar::plan_from_config(&config, cfg), Path::new("/repo"))
     }
 
     #[test]
@@ -1118,14 +1121,14 @@ image-name = "primary:latest"
 [images.primary.mcp]
 fs = { command = ["mcp-fs"] }
 lint = { command = ["mcp-lint", "--stdio"], sidecar = "tools", env = { LINT = "1" } }
-[images.primary.sidecars.tools]
+[sidecars.tools]
 image = "mcp-tools"
 workspace = "ro"
-[[images.primary.sidecars.tools.mounts]]
+[[sidecars.tools.mounts]]
 host-path = "cache"
 container-path = "/cache"
 access = "read-write"
-[images.primary.sidecars.tools.security]
+[sidecars.tools.security]
 capability-profile = "no-net-raw"
 "#,
         )
@@ -1180,7 +1183,7 @@ grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 image-name = "primary:latest"
 [images.primary.mcp]
 lint = { command = ["mcp-lint"], sidecar = "tools" }
-[images.primary.sidecars.tools]
+[sidecars.tools]
 image = "mcp-tools"
 start = "manual"
 "#,
@@ -1224,9 +1227,9 @@ fs = { command = ["mcp-fs"] }
 lint = { command = ["mcp-lint"], sidecar = "tools" }
 grep = { command = ["mcp-grep"], image = "grep:1" }
 slow = { command = ["mcp-slow"], sidecar = "later" }
-[images.primary.sidecars.tools]
+[sidecars.tools]
 image = "mcp-tools"
-[images.primary.sidecars.later]
+[sidecars.later]
 image = "mcp-later"
 start = "manual"
 "#,

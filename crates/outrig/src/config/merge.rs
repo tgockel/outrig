@@ -6,9 +6,10 @@ use super::Config;
 
 /// Merge `global` and `repo`, with `repo` winning on every collision.
 ///
-/// - For each map (`providers`, `models`, `agents`, `images`): repo entries
-///   replace global entries with the same key. Entries unique to either side
-///   are preserved as-is.
+/// - For each map (`providers`, `models`, `agents`, `images`, `sidecars`):
+///   repo entries replace global entries with the same key. Entries unique to
+///   either side are preserved as-is. A repo image-config can therefore name a
+///   sidecar the user declared globally.
 /// - For top-level scalars (`default-image`, `default-agent`,
 ///   `default-model`, `session-root`, `model-cache-root`,
 ///   `tool-call-max`, `tool-result-max`): repo's value wins if set,
@@ -34,6 +35,9 @@ pub fn merge(global: Config, repo: Config) -> Config {
 
     let mut images = global.images;
     images.extend(repo.images);
+
+    let mut sidecars = global.sidecars;
+    sidecars.extend(repo.sidecars);
 
     let mut workspace = repo.workspace;
     let mut mounts = global.workspace.mounts;
@@ -62,5 +66,6 @@ pub fn merge(global: Config, repo: Config) -> Config {
         agents,
         workspace,
         images,
+        sidecars,
     }
 }

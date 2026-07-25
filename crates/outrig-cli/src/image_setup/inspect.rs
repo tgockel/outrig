@@ -114,6 +114,7 @@ mod tests {
                 env,
                 sidecar: None,
                 image: None,
+                args: Vec::new(),
             },
         );
         mcp.insert(

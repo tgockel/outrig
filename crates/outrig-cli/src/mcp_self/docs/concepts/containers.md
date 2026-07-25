@@ -260,18 +260,21 @@ Dockerfile with no image-config name, falls back to the `outrig-cache:<hash>` re
 ## Sidecar containers
 
 A session can own more than one container. Sidecars are extra podman containers declared under
-`[images.<name>.sidecars.<sc>]` (or implied by an inline `image` key on an MCP entry) that host
+the top-level `[sidecars.<sc>]` (or implied by an inline `image` key on an MCP entry) that host
 MCP servers away from the workspace container; see
 [MCP Servers -> Sidecar placement](mcp-servers.md#sidecar-placement) for the config surface.
 
+Blocks are declared once and shared by any number of image-configs. A session starts the ones
+its image-config's `[mcp]` entries name, so a block nothing references costs nothing.
+
 ```toml
-[images.dev.sidecars.tools]
+[sidecars.tools]
 image      = "mcp-tools"        # sibling [images.mcp-tools] block first, else raw podman ref
 workspace  = "ro"               # "none" (default) | "ro" | "rw"
 start      = "auto"             # "auto" (default)  | "manual"
 on-failure = "abort"            # "abort" (default) | "warn"
 
-[[images.dev.sidecars.tools.mounts]]
+[[sidecars.tools.mounts]]
 host-path      = "~/.cache/example"
 container-path = "/cache"
 access         = "read-write"   # "read-only" (default) | "read-write"
@@ -279,7 +282,7 @@ access         = "read-write"   # "read-only" (default) | "read-write"
 
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
 (Dockerfile-built sidecars get content-hash caching for free), then a raw podman ref, which
-must be present locally. An optional `[images.<name>.sidecars.<sc>.security]` block reuses the
+must be present locally. An optional `[sidecars.<sc>.security]` block reuses the
 whole security surface of the primary -- capability keys, `no-new-privileges`, and `devices`
 alike -- and each sidecar's block stands on its own, so opting one out of `no-new-privileges`
 leaves the others hardened. `start = "manual"` declares a sidecar that does not start with the

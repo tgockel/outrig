@@ -23,6 +23,13 @@
 //! - Stopping the entrypoint container mid-session degrades its tools to
 //!   errors while the session and primary-hosted tools survive.
 //!
+//! And task 0088's argument criterion:
+//!
+//! - A named block whose mcp entry omits `command` is an entrypoint host: its
+//!   `args` reach the ENTRYPOINT (the fixture exits 64 on an empty argv, and
+//!   the filesystem server denies every path outside the roots that argv
+//!   names) and its `workspace` is honored on the create path.
+//!
 //! Run with:
 //!
 //! ```sh
@@ -211,7 +218,7 @@ async fn sidecar_hosts_servers_with_labels_record_and_clean_reap() {
   fs  = ["mcp-server-filesystem", "/workspace"]
   fs2 = { command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }
 
-  [images.smoke.sidecars.tools]
+  [sidecars.tools]
   image     = "sidekick"
   workspace = "ro"
 "#,
@@ -342,7 +349,7 @@ async fn podman_kill_of_primary_reaps_sidecars_and_exits_nonzero() {
   fs  = ["mcp-server-filesystem", "/workspace"]
   fs2 = { command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }
 
-  [images.smoke.sidecars.tools]
+  [sidecars.tools]
   image     = "sidekick"
   workspace = "ro"
 "#,
@@ -510,7 +517,7 @@ async fn warn_on_failure_serves_reduced_toolset() {
   fs  = ["mcp-server-filesystem", "/workspace"]
   fs2 = { command = ["mcp-server-filesystem", "/workspace"], sidecar = "broken" }
 
-  [images.smoke.sidecars.broken]
+  [sidecars.broken]
   image      = "no-such-image-outrig-e2e:1"
   on-failure = "warn"
 "#,
@@ -580,7 +587,7 @@ async fn abort_on_failure_fails_fast_without_leftovers() {
   fs  = ["mcp-server-filesystem", "/workspace"]
   fs2 = { command = ["mcp-server-filesystem", "/workspace"], sidecar = "broken" }
 
-  [images.smoke.sidecars.broken]
+  [sidecars.broken]
   image = "no-such-image-outrig-e2e:1"
 "#,
     );
@@ -629,7 +636,7 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
             r#"
   [images.smoke.mcp]
   fs    = ["mcp-server-filesystem", "/workspace"]
-  fetch = {{ image = "entry", env = {{ MARKER = "smoke-value" }} }}
+  fetch = {{ image = "entry", args = ["/tmp"], env = {{ MARKER = "smoke-value" }} }}
 {}"#,
             entry_image_block()
         ),
@@ -746,7 +753,7 @@ async fn entrypoint_stdio_audit_covers_first_packet() {
         &format!(
             r#"
   [images.smoke.mcp]
-  fetch = {{ image = "entry" }}
+  fetch = {{ image = "entry", args = ["/tmp"] }}
 {}"#,
             entry_image_block()
         ),
@@ -822,7 +829,7 @@ async fn entrypoint_server_exit_surfaces_as_tool_errors_session_survives() {
             r#"
   [images.smoke.mcp]
   fs    = ["mcp-server-filesystem", "/workspace"]
-  fetch = {{ image = "entry" }}
+  fetch = {{ image = "entry", args = ["/tmp"] }}
 {}"#,
             entry_image_block()
         ),
@@ -906,6 +913,106 @@ async fn entrypoint_server_exit_surfaces_as_tool_errors_session_survives() {
     wait_until_gone(&[format!("outrig-{sid}")]).await;
 }
 
+/// A *named* block whose one MCP entry omits `command` is an entrypoint host.
+/// Two independent things fail if the block's `args` do not reach it: the
+/// fixture's ENTRYPOINT exits 64 on an empty argv, and the filesystem server
+/// denies any path outside the roots that argv named. So a successful listing
+/// of the workspace -- which only a named block can mount -- proves both the
+/// argument and the mount arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_sidecar_entrypoint_host_serves_workspace_from_args() {
+    common::init_tracing();
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_sidecar_config(
+        repo_dir.path(),
+        &format!(
+            r#"
+  [sidecars.served]
+  image     = "entry"
+  workspace = "ro"
+  args      = ["/workspace"]
+
+  [images.smoke.mcp]
+  ws = {{ sidecar = "served" }}
+{}"#,
+            entry_image_block()
+        ),
+    );
+    std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &[]);
+    let child_stdin = run.stdin.take().expect("stdin piped");
+    let child_stdout = run.stdout.take().expect("stdout piped");
+
+    let work = async {
+        let service = serve_client((), (child_stdout, child_stdin))
+            .await
+            .expect("serve_client handshake");
+
+        let names = tool_names(
+            &service
+                .list_tools(Default::default())
+                .await
+                .expect("tools/list"),
+        );
+        assert!(
+            names.iter().any(|n| n == "ws__list_directory"),
+            "named entrypoint host's tools missing: {names:?}"
+        );
+
+        // The server's one allowed root is /workspace, which it has only
+        // because the block's `args` named it and the block mounted it.
+        let call_args = serde_json::json!({"path": "/workspace"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let call = service
+            .call_tool(
+                CallToolRequestParams::new("ws__list_directory".to_string())
+                    .with_arguments(call_args),
+            )
+            .await
+            .expect("tools/call ws__list_directory");
+        assert!(
+            call.is_error != Some(true),
+            "workspace listing through the entrypoint host failed: {call:?}"
+        );
+        let listing = format!("{call:?}");
+        assert!(
+            listing.contains("HELLO.txt"),
+            "listing should show the repo file: {listing}"
+        );
+
+        let sid = wait_for_stderr_value(run.stderr_buf.clone(), "[outrig] session id:").await;
+        let sidecar = format!("outrig-{sid}-served");
+        let labeled = podman_names(&format!("label=org.outrig.session={sid}")).await;
+        assert!(labeled.contains(&sidecar), "sidecar missing: {labeled:?}");
+
+        let _ = service.cancel().await;
+        sid
+    };
+    let sid = timeout(TEST_TIMEOUT, work)
+        .await
+        .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
+
+    let status = timeout(TEST_TIMEOUT, run.child.wait())
+        .await
+        .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+        .expect("child.wait");
+    let _ = run.stderr_task.await;
+    let stderr = run.stderr_buf.lock().unwrap().clone();
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(status.success(), "clean EOF exit expected: {stderr}");
+
+    let leftovers = podman_names(&format!("label=org.outrig.session={sid}")).await;
+    assert!(
+        leftovers.is_empty(),
+        "teardown should reap primary and entrypoint sidecar: {leftovers:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn network_audit_attaches_interceptor_to_sidecar() {
     let _ = tracing_subscriber::fmt()
@@ -922,7 +1029,7 @@ async fn network_audit_attaches_interceptor_to_sidecar() {
   fs  = ["mcp-server-filesystem", "/workspace"]
   fs2 = { command = ["mcp-server-filesystem", "/workspace"], sidecar = "tools" }
 
-  [images.smoke.sidecars.tools]
+  [sidecars.tools]
   image     = "sidekick"
   workspace = "ro"
 "#,

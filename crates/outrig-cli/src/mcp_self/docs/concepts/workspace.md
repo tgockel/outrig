@@ -140,7 +140,9 @@ shape and validation as `[[workspace.mounts]]`.
 
 Sidecars run with `--userns=keep-id` like the primary. The in-container user bootstrap runs
 only where identity matters: the sidecar hosts at least one exec-stdio server, sees the
-workspace, or declares mounts. A mount-less sidecar keeps the image's own `USER` untouched.
+workspace, or declares mounts. A mount-less sidecar keeps the image's own `USER` untouched --
+as does an entrypoint host, mounts or not, since the bootstrap runs over `podman exec` and the
+container's first process is already the server.
 
 ## Network is *not* part of the workspace
 

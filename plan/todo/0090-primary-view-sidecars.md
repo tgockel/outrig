@@ -212,7 +212,10 @@ trust boundary, not beside it.
 
 ## Dependencies
 
-- 0088 -- `args`, which supplies the bare side of the argument asymmetry.
+- ~~0088~~ -- landed. It supplies `args`, the bare side of the argument asymmetry, and it also
+  made a named sidecar block able to be an entrypoint host, which is what gives `view` a place
+  to live. See `plan/next/0090-config-surface-recheck.md`: the Config surface below is now
+  legal as written, and the scope note wants re-deriving.
 - 0089 -- `outrig-enter`, the launcher this mounts and sets as the entrypoint.
 
 ## See also

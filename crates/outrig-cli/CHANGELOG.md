@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`args` for entrypoint-stdio MCP servers**, on an `[images.<name>.mcp]` entry or on the
+  sidecar block it names, so an off-the-shelf image that takes its configuration positionally
+  (`docker.io/mcp/filesystem` and most of the MCP catalog) runs from config alone:
+
+      [images.coding.mcp]
+      fs = { image = "docker.io/mcp/filesystem:latest", args = ["/workspace"] }
+
+- **A named sidecar can be an entrypoint host** -- omit `command` on the entry naming it and
+  that container's ENTRYPOINT is the server, which is how such a server gets a workspace view,
+  mounts, or its own security policy.
+
+### Changed
+
+- **Breaking (config):** sidecars are declared at the top level as `[sidecars.<sc>]`, not
+  `[images.<name>.sidecars.<sc>]`. Move the blocks up a level; the keys are unchanged. The old
+  form is now an unknown-field parse error. One block can be shared by several image-configs,
+  and the global config can declare sidecars a repo references.
+- **Breaking (config):** a sidecar starts only when an `[images.<name>.mcp]` entry names it.
+  Declaring a block no longer starts it -- with blocks shared and global, it cannot.
+
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0-rc.1) - 2026-07-24
 
 A release candidate, cut so the library's breaking changes get integration testing ahead of

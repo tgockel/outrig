@@ -214,17 +214,16 @@ pub enum ConfigValidationError {
     OpenAiModelHasMistralrsField { model: String, field: &'static str },
 
     #[error(
-        "image {image:?} has invalid sidecar name {sidecar:?} \
+        "invalid sidecar name {sidecar:?} \
          (must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ -- it embeds in container names)"
     )]
-    SidecarNameInvalid { image: String, sidecar: String },
+    SidecarNameInvalid { sidecar: String },
 
-    #[error("image {image:?} sidecar {sidecar:?}: `image` must not be empty")]
-    SidecarImageEmpty { image: String, sidecar: String },
+    #[error("sidecar {sidecar:?}: `image` must not be empty")]
+    SidecarImageEmpty { sidecar: String },
 
-    #[error("image {image:?} sidecar {sidecar:?} mount {violation}")]
+    #[error("sidecar {sidecar:?} mount {violation}")]
     SidecarMount {
-        image: String,
         sidecar: String,
         violation: MountRuleViolation,
     },
@@ -237,7 +236,7 @@ pub enum ConfigValidationError {
 
     #[error(
         "image {image:?} mcp server {server:?} has sidecar={sidecar:?} which does not \
-         match any [images.{image}.sidecars.<name>]"
+         match any [sidecars.<name>]"
     )]
     McpUnknownSidecar {
         image: String,
@@ -245,18 +244,62 @@ pub enum ConfigValidationError {
         sidecar: String,
     },
 
+    #[error("image {image:?} mcp server {server:?}: `image` must not be empty")]
+    McpInlineImageEmpty { image: String, server: String },
+
     #[error(
-        "image {image:?} mcp server {server:?} sets sidecar={sidecar:?} without a \
-         `command`; named sidecars host exec-stdio servers only"
+        "image {image:?} mcp server {server:?} sets both `command` and `args`; \
+         `args` is for entrypoint-stdio servers, and `command` is already a \
+         full argv"
     )]
-    McpSidecarRequiresCommand {
+    McpArgsWithCommand { image: String, server: String },
+
+    #[error(
+        "image {image:?} mcp server {server:?} sets `args` without `image` or \
+         `sidecar`; a server in the primary container is exec-stdio and takes \
+         its arguments in `command`"
+    )]
+    McpArgsWithoutPlacement { image: String, server: String },
+
+    #[error(
+        "image {image:?} mcp server {server:?} sets `args` and so does its \
+         sidecar {sidecar:?}; declare the arguments in one place"
+    )]
+    McpArgsDeclaredTwice {
         image: String,
         server: String,
         sidecar: String,
     },
 
-    #[error("image {image:?} mcp server {server:?}: `image` must not be empty")]
-    McpInlineImageEmpty { image: String, server: String },
+    #[error(
+        "sidecar {sidecar:?} sets `args` but no [images.<name>.mcp] entry hosts \
+         an entrypoint-stdio server in it; `args` is the argv of the image's \
+         ENTRYPOINT, which runs only for an entry that omits `command`"
+    )]
+    SidecarArgsWithoutEntrypoint { sidecar: String },
+
+    #[error(
+        "image {image:?} sidecar {sidecar:?} hosts entrypoint-stdio server \
+         {server:?} alongside {other:?}; the container process is the server, \
+         so an entrypoint host serves exactly one"
+    )]
+    SidecarEntrypointNotAlone {
+        image: String,
+        sidecar: String,
+        server: String,
+        other: String,
+    },
+
+    #[error(
+        "image {image:?} sidecar {sidecar:?} hosts entrypoint-stdio server \
+         {server:?} but is start = \"manual\"; container lifetime is the \
+         server's, so an entrypoint host must start with the session"
+    )]
+    SidecarEntrypointNotAuto {
+        image: String,
+        sidecar: String,
+        server: String,
+    },
 
     #[error(
         "image {image:?}: sidecar name {name:?} collides with mcp server {name:?}, \
@@ -346,6 +389,14 @@ pub(super) fn validate_with_options(
         }
     }
 
+    // Sidecar blocks stand on their own, so they validate before anything
+    // references them -- a malformed block is reported as such rather than as
+    // a broken reference from whichever image-config happened to sort first.
+    for (sidecar_name, sidecar) in &cfg.sidecars {
+        validate_sidecar(cfg, repo_root, sidecar_name, sidecar)?;
+        validate_sidecar_args_reachable(cfg, sidecar_name, sidecar)?;
+    }
+
     for (image_name, image) in &cfg.images {
         validate_image_source(image_name, image, repo_root)?;
         // A build image's name becomes its container image repository, so it
@@ -368,7 +419,7 @@ pub(super) fn validate_with_options(
                     server: server_name.clone(),
                 });
             }
-            validate_mcp_placement(image_name, image, server_name, spec)?;
+            validate_mcp_placement(cfg, image_name, server_name, spec)?;
             if mcp_command_is_empty(spec) {
                 return Err(ConfigValidationError::EmptyMcpCommand {
                     image: image_name.clone(),
@@ -377,8 +428,16 @@ pub(super) fn validate_with_options(
             }
         }
 
-        for (sidecar_name, sidecar) in &image.sidecars {
-            validate_sidecar(cfg, repo_root, image_name, sidecar_name, sidecar)?;
+        // Only the sidecars this image-config actually names: a declared block
+        // it never references is inert here, and never starts. Every name has
+        // resolved above, so the lookup cannot miss.
+        for (_, sidecar_name) in image
+            .mcp
+            .iter()
+            .filter_map(|(name, spec)| spec.sidecar().map(|sc| (name, sc)))
+        {
+            let sidecar = &cfg.sidecars[sidecar_name];
+            validate_sidecar_hosting(image_name, image, sidecar_name, sidecar)?;
         }
     }
 
@@ -492,14 +551,14 @@ fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigVal
 }
 
 /// Placement rules for one `[images.<name>.mcp]` entry: `sidecar`/`image`
-/// mutual exclusion, named sidecars must exist and are exec-stdio-only, and
-/// an anonymous sidecar must not collide with a named one (it occupies its
-/// server's name). An `image` entry without a `command` is the
-/// entrypoint-stdio form; it is structurally limited to `image` + `env`
-/// because [`McpServerSpec::Full`] has no other fields.
+/// mutual exclusion, a `sidecar` must name a declared `[sidecars.<sc>]` block,
+/// an anonymous sidecar must not collide with one (it occupies its server's
+/// name), and `args` belongs only to the entrypoint-stdio form. A placed entry
+/// without a `command` *is* that form -- the container's ENTRYPOINT is the
+/// server -- whether the container is an inline `image` or a named block.
 fn validate_mcp_placement(
+    cfg: &Config,
     image_name: &str,
-    image: &ImageConfig,
     server_name: &str,
     spec: &McpServerSpec,
 ) -> Result<(), ConfigValidationError> {
@@ -509,16 +568,30 @@ fn validate_mcp_placement(
             server: server_name.to_string(),
         });
     }
+    if !spec.args().is_empty() {
+        if spec.has_command() {
+            return Err(ConfigValidationError::McpArgsWithCommand {
+                image: image_name.to_string(),
+                server: server_name.to_string(),
+            });
+        }
+        if !spec.is_placed() {
+            return Err(ConfigValidationError::McpArgsWithoutPlacement {
+                image: image_name.to_string(),
+                server: server_name.to_string(),
+            });
+        }
+    }
     if let Some(sidecar) = spec.sidecar() {
-        if !image.sidecars.contains_key(sidecar) {
+        let Some(block) = cfg.sidecars.get(sidecar) else {
             return Err(ConfigValidationError::McpUnknownSidecar {
                 image: image_name.to_string(),
                 server: server_name.to_string(),
                 sidecar: sidecar.to_string(),
             });
-        }
-        if !spec.has_command() {
-            return Err(ConfigValidationError::McpSidecarRequiresCommand {
+        };
+        if !spec.args().is_empty() && !block.args.is_empty() {
+            return Err(ConfigValidationError::McpArgsDeclaredTwice {
                 image: image_name.to_string(),
                 server: server_name.to_string(),
                 sidecar: sidecar.to_string(),
@@ -532,7 +605,7 @@ fn validate_mcp_placement(
                 server: server_name.to_string(),
             });
         }
-        if image.sidecars.contains_key(server_name) {
+        if cfg.sidecars.contains_key(server_name) {
             return Err(ConfigValidationError::SidecarNameCollision {
                 image: image_name.to_string(),
                 name: server_name.to_string(),
@@ -542,32 +615,103 @@ fn validate_mcp_placement(
     Ok(())
 }
 
-/// Validate one `[images.<name>.sidecars.<sc>]` block: name shape, non-empty
-/// image ref, security caps, and its mount list. The sidecar's `image` value
-/// is deliberately *not* cross-checked against `[images.<name>]` blocks --
-/// like `--image`, an unmatched name falls through to raw-podman-ref
+/// The `[images.<name>.mcp]` entries hosted by `sidecar_name`, in name order.
+fn servers_hosted_in<'a>(
+    image: &'a ImageConfig,
+    sidecar_name: &'a str,
+) -> impl Iterator<Item = (&'a String, &'a McpServerSpec)> {
+    image
+        .mcp
+        .iter()
+        .filter(move |(_, spec)| spec.sidecar() == Some(sidecar_name))
+}
+
+/// Cross-check one image-config's use of a sidecar it references. An entry
+/// that omits `command` makes the block an *entrypoint host* for this session:
+/// the container process is the server, which bounds what else the block can
+/// do -- it serves exactly one server, and it cannot be `start = "manual"`,
+/// because `/sidecar add` starts a container and then execs into it.
+///
+/// Per image-config, not per block: a shared `[sidecars.<sc>]` may legitimately
+/// be an entrypoint host for one image-config and an exec-stdio host for
+/// another, since which it is follows from the referencing `[mcp]` entry.
+fn validate_sidecar_hosting(
+    image_name: &str,
+    image: &ImageConfig,
+    sidecar_name: &str,
+    sidecar: &super::SidecarConfig,
+) -> Result<(), ConfigValidationError> {
+    let Some((server, _)) =
+        servers_hosted_in(image, sidecar_name).find(|(_, spec)| spec.is_entrypoint_stdio())
+    else {
+        return Ok(());
+    };
+
+    if let Some((other, _)) = servers_hosted_in(image, sidecar_name).find(|(n, _)| *n != server) {
+        return Err(ConfigValidationError::SidecarEntrypointNotAlone {
+            image: image_name.to_string(),
+            sidecar: sidecar_name.to_string(),
+            server: server.clone(),
+            other: other.clone(),
+        });
+    }
+    if sidecar.start == super::SidecarStart::Manual {
+        return Err(ConfigValidationError::SidecarEntrypointNotAuto {
+            image: image_name.to_string(),
+            sidecar: sidecar_name.to_string(),
+            server: server.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// A block's `args` is its ENTRYPOINT's argv, so it needs *some* image-config
+/// to host an entrypoint-stdio server in it. Checked across the whole config
+/// rather than per image-config: a shared block used exec-stdio by one
+/// image-config and entrypoint-stdio by another has perfectly live `args`,
+/// inert only on the exec side.
+fn validate_sidecar_args_reachable(
+    cfg: &Config,
+    sidecar_name: &str,
+    sidecar: &super::SidecarConfig,
+) -> Result<(), ConfigValidationError> {
+    if sidecar.args.is_empty() {
+        return Ok(());
+    }
+    let reachable = cfg.images.values().any(|image| {
+        servers_hosted_in(image, sidecar_name).any(|(_, spec)| spec.is_entrypoint_stdio())
+    });
+    if reachable {
+        return Ok(());
+    }
+    Err(ConfigValidationError::SidecarArgsWithoutEntrypoint {
+        sidecar: sidecar_name.to_string(),
+    })
+}
+
+/// Validate one `[sidecars.<sc>]` block on its own terms: name shape,
+/// non-empty image ref, security caps, and its mount list. The sidecar's
+/// `image` value is deliberately *not* cross-checked against `[images.<name>]`
+/// blocks -- like `--image`, an unmatched name falls through to raw-podman-ref
 /// semantics and fails at start time if the ref is absent locally.
 fn validate_sidecar(
     cfg: &Config,
     repo_root: Option<&Path>,
-    image_name: &str,
     sidecar_name: &str,
     sidecar: &super::SidecarConfig,
 ) -> Result<(), ConfigValidationError> {
     if !sidecar_name_re().is_match(sidecar_name) {
         return Err(ConfigValidationError::SidecarNameInvalid {
-            image: image_name.to_string(),
             sidecar: sidecar_name.to_string(),
         });
     }
     if sidecar.image.trim().is_empty() {
         return Err(ConfigValidationError::SidecarImageEmpty {
-            image: image_name.to_string(),
             sidecar: sidecar_name.to_string(),
         });
     }
 
-    let scope = format!("{image_name}.sidecars.{sidecar_name}");
+    let scope = format!("sidecars.{sidecar_name}");
     validate_security(&scope, &sidecar.security)?;
 
     // The workspace mount (when enabled) reuses the session's container path,
@@ -578,7 +722,6 @@ fn validate_sidecar(
     }
     check_mount_list(&sidecar.mounts, reserved, repo_root).map_err(|violation| {
         ConfigValidationError::SidecarMount {
-            image: image_name.to_string(),
             sidecar: sidecar_name.to_string(),
             violation,
         }
@@ -726,13 +869,10 @@ pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
         McpServerSpec::Full {
             command: Some(cmd), ..
         } => cmd.is_empty(),
-        // The no-command form is entrypoint-stdio when `image` is set (the
-        // image's ENTRYPOINT is the server); without `image` it is empty.
-        McpServerSpec::Full {
-            command: None,
-            image,
-            ..
-        } => image.is_none(),
+        // The no-command form is entrypoint-stdio when the entry names a
+        // container -- inline `image` or a named `sidecar` -- whose ENTRYPOINT
+        // is then the server. Naming neither leaves nothing to run.
+        McpServerSpec::Full { command: None, .. } => !spec.is_placed(),
     }
 }
 
