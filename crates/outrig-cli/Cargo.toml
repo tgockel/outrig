@@ -61,6 +61,11 @@ tracing            = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter", "fmt"] }
 walkdir            = { workspace = true, default-features = true }
 
+[dev-dependencies]
+# `test-util` gives tests `start_paused`, so the subagent registry tests can
+# drive a round whose retry backoff would otherwise take seconds of real time.
+tokio = { workspace = true, default-features = true, features = ["test-util"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core    = { version = "=0.10.2", default-features = false, optional = true, features = ["metal"] }
 mistralrs-core = { version = "=0.8.1", default-features = false, optional = true, features = ["metal"] }

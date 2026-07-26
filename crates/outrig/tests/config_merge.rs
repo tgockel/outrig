@@ -141,6 +141,31 @@ default-agent = "ghost"
         );
     }
 
+    /// `outrig` is reserved so the built-in `outrig__<tool>` names cannot be
+    /// shadowed by a configured server's tools.
+    #[test]
+    fn mcp_server_named_outrig_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.mcp]
+outrig = ["some-server"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::ReservedMcpServerName { ref server, .. }
+                    if server == "outrig"
+            ),
+            "got: {err:?}",
+        );
+    }
+
     #[test]
     fn dangling_default_model_errors() {
         let cfg = parse(

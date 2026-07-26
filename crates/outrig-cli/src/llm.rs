@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "local-llm")]
 use futures_util::StreamExt;
-use rig::agent::{AgentHook, Flow, HookContext, StepEvent, StepEventKind};
+use rig::agent::{AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
 #[cfg(feature = "local-llm")]
 use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
@@ -19,7 +19,7 @@ use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::Result;
-use crate::rig_tool::McpToolAdapter;
+use crate::session_tool::{self, SessionTool};
 use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
 
 /// Hard max on tool calls per turn. The per-turn [`OutrigPromptHook`] trips
@@ -404,7 +404,7 @@ pub enum RigAgent {
 /// async, free.
 pub async fn build_agent(
     resolved: &ResolvedAgent,
-    tools: Vec<McpToolAdapter>,
+    tools: Vec<SessionTool>,
     cache_root: &Path,
     #[cfg(feature = "local-llm")] registry: &LlmRegistry,
 ) -> Result<RigAgent> {
@@ -504,12 +504,63 @@ impl RigAgent {
             RigAgent::OpenAi {
                 agent,
                 tool_call_max,
-            } => run_turn_inner(agent, prompt, history, *tool_call_max).await,
+            } => {
+                run_turn_inner(
+                    agent,
+                    prompt,
+                    history,
+                    OutrigPromptHook::new(*tool_call_max),
+                )
+                .await
+            }
             #[cfg(feature = "local-llm")]
             RigAgent::Mistralrs {
                 agent,
                 tool_call_max,
-            } => run_turn_streaming_mistralrs(agent, prompt, history, *tool_call_max).await,
+            } => {
+                let mut stdout = tokio::io::stdout();
+                run_turn_streaming_to(
+                    agent,
+                    prompt,
+                    history,
+                    OutrigPromptHook::new(*tool_call_max),
+                    &mut stdout,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Run one round for a subagent: nothing reaches stdout, traces carry
+    /// `label`, and each model call picks up whatever the parent has queued
+    /// through `injections`.
+    ///
+    /// Subagent outcomes come from `outrig__set_result`, not from this return
+    /// value -- the text is for the transcript log.
+    pub async fn run_turn_captured(
+        &self,
+        prompt: &str,
+        history: &mut Vec<Message>,
+        label: &str,
+        injections: InjectionSource,
+    ) -> Result<String> {
+        match self {
+            RigAgent::OpenAi {
+                agent,
+                tool_call_max,
+            } => {
+                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
+                run_turn_inner(agent, prompt, history, hook).await
+            }
+            #[cfg(feature = "local-llm")]
+            RigAgent::Mistralrs {
+                agent,
+                tool_call_max,
+            } => {
+                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
+                let mut sink = Vec::new();
+                run_turn_streaming_inner(agent, prompt, history, hook, &mut sink).await
+            }
         }
     }
 }
@@ -529,8 +580,8 @@ pub struct RebuildingAgent {
     resolved: ResolvedAgent,
     cache_root: PathBuf,
     #[cfg(feature = "local-llm")]
-    registry: LlmRegistry,
-    tools: RefCell<Vec<McpToolAdapter>>,
+    registry: Arc<LlmRegistry>,
+    tools: RefCell<Vec<SessionTool>>,
     dirty: Cell<bool>,
     // The agent rides in an inner `Rc` so a turn clones it out and never
     // holds the `RefCell` borrow across the run_turn await (a rebuild in a
@@ -543,10 +594,10 @@ impl RebuildingAgent {
     /// so its progress reporting (and any model download) happens there.
     pub fn new(
         agent: RigAgent,
-        tools: Vec<McpToolAdapter>,
+        tools: Vec<SessionTool>,
         resolved: ResolvedAgent,
         cache_root: PathBuf,
-        #[cfg(feature = "local-llm")] registry: LlmRegistry,
+        #[cfg(feature = "local-llm")] registry: Arc<LlmRegistry>,
     ) -> Self {
         Self {
             resolved,
@@ -561,13 +612,13 @@ impl RebuildingAgent {
 
     /// Append tool adapters and mark the agent stale; the next
     /// [`RebuildingAgent::run_turn`] rebuilds over the extended list.
-    pub fn extend_tools(&self, new: Vec<McpToolAdapter>) {
+    pub fn extend_tools(&self, new: Vec<SessionTool>) {
         self.tools.borrow_mut().extend(new);
         self.dirty.set(true);
     }
 
     /// Snapshot view of the current tool list. Do not hold across an await.
-    pub fn tools(&self) -> Ref<'_, [McpToolAdapter]> {
+    pub fn tools(&self) -> Ref<'_, [SessionTool]> {
         Ref::map(self.tools.borrow(), Vec::as_slice)
     }
 
@@ -602,13 +653,13 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
     history: &mut Vec<Message>,
-    tool_call_max: usize,
+    hook: OutrigPromptHook,
 ) -> Result<String> {
-    let hook = OutrigPromptHook::new(tool_call_max);
+    let max_turns = hook.max + 2;
     let result = agent
         .prompt(prompt.to_string())
         .history(history.clone())
-        .max_turns(tool_call_max + 2)
+        .max_turns(max_turns)
         .add_hook(hook)
         .extended_details()
         .await;
@@ -625,33 +676,51 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     }
 }
 
+/// The primary agent's streaming path. Returns the empty string on purpose:
+/// the reply already reached `sink` chunk by chunk while decoding, so handing
+/// it back would make the REPL print it a second time. Discarding here -- and
+/// not inside [`run_turn_streaming_inner`] -- is what lets subagents reuse the
+/// same loop and actually receive the text.
+///
+/// `sink` is a parameter rather than a captured `tokio::io::stdout()` purely so
+/// that suppression is testable: it is a one-line behavior the REPL's
+/// print-if-non-empty depends on, and a refactor could otherwise drop it
+/// silently.
 #[cfg(feature = "local-llm")]
-async fn run_turn_streaming_mistralrs(
-    agent: &rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
+async fn run_turn_streaming_to<M, W>(
+    agent: &rig::agent::Agent<M>,
     prompt: &str,
     history: &mut Vec<Message>,
-    tool_call_max: usize,
-) -> Result<String> {
-    let mut stdout = tokio::io::stdout();
-    run_turn_streaming_inner(agent, prompt, history, tool_call_max, &mut stdout).await
+    hook: OutrigPromptHook,
+    sink: &mut W,
+) -> Result<String>
+where
+    M: CompletionModel + 'static,
+    W: AsyncWrite + Unpin,
+{
+    run_turn_streaming_inner(agent, prompt, history, hook, sink).await?;
+    Ok(String::new())
 }
 
 #[cfg(feature = "local-llm")]
+/// Drives the streaming loop, writing decoded text to `stdout` and returning
+/// it. Callers choose the sink: the primary agent passes real stdout, a
+/// subagent passes a buffer, since only the primary's reply may reach stdout.
 async fn run_turn_streaming_inner<M, W>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
     history: &mut Vec<Message>,
-    tool_call_max: usize,
+    hook: OutrigPromptHook,
     stdout: &mut W,
 ) -> Result<String>
 where
     M: CompletionModel + 'static,
     W: AsyncWrite + Unpin,
 {
-    let hook = OutrigPromptHook::new(tool_call_max);
+    let max_turns = hook.max + 2;
     let mut stream = agent
         .stream_chat(prompt.to_string(), history.clone())
-        .max_turns(tool_call_max + 2)
+        .max_turns(max_turns)
         .add_hook(hook)
         .await;
 
@@ -689,7 +758,7 @@ where
         stdout.flush().await?;
     }
 
-    Ok(String::new())
+    Ok(streamed_reply)
 }
 
 #[cfg(feature = "local-llm")]
@@ -745,6 +814,15 @@ fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Mess
     }
 }
 
+/// Supplies messages to splice into a turn's history at its next model call.
+///
+/// A closure rather than a concrete type so this module stays unaware of the
+/// subagent registry: `subagent` hands one in that reads its queued steers.
+/// Called on *every* model call in the turn, because rig's `RequestPatch` is
+/// per-turn and non-sticky -- a steer applied once would vanish from the next
+/// call.
+pub type InjectionSource = Arc<dyn Fn() -> Vec<Message> + Send + Sync>;
+
 /// Per-request hook that traces every tool call to stderr and stops the agent
 /// loop after `max` calls. Cloned by rig per request; shared atomics keep a
 /// single turn's calls counting against the same max.
@@ -753,6 +831,10 @@ pub struct OutrigPromptHook {
     counter: Arc<AtomicUsize>,
     cap_reached: Arc<AtomicBool>,
     max: usize,
+    /// Prefixes trace lines so concurrent subagents are tellable apart. The
+    /// primary agent leaves it unset and its traces keep their original shape.
+    label: Option<Arc<str>>,
+    injections: Option<InjectionSource>,
 }
 
 impl OutrigPromptHook {
@@ -761,6 +843,25 @@ impl OutrigPromptHook {
             counter: Arc::new(AtomicUsize::new(0)),
             cap_reached: Arc::new(AtomicBool::new(false)),
             max,
+            label: None,
+            injections: None,
+        }
+    }
+
+    /// The subagent form: traces carry the subagent's name, and each model
+    /// call picks up whatever the parent has queued.
+    pub fn for_subagent(max: usize, label: &str, injections: InjectionSource) -> Self {
+        Self {
+            label: Some(Arc::from(label)),
+            injections: Some(injections),
+            ..Self::new(max)
+        }
+    }
+
+    fn trace_prefix(&self) -> String {
+        match &self.label {
+            Some(label) => format!("  [{label}] "),
+            None => String::new(),
         }
     }
 }
@@ -778,12 +879,22 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
 
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
-            StepEvent::CompletionCall { .. } => {
+            StepEvent::CompletionCall { history, .. } => {
                 if self.cap_reached.load(Ordering::SeqCst) {
                     return Flow::terminate(format!(
                         "tool-call iteration max ({}) reached; ending turn",
                         self.max
                     ));
+                }
+                // Steers are re-applied on every model call, not just the one
+                // after they arrive: the patch is per-turn and non-sticky.
+                if let Some(source) = &self.injections {
+                    let steers = source();
+                    if !steers.is_empty() {
+                        let mut patched = history.to_vec();
+                        patched.extend(steers);
+                        return Flow::patch_request(RequestPatch::new().history(patched));
+                    }
                 }
                 Flow::cont()
             }
@@ -800,7 +911,10 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                         self.max
                     ));
                 }
-                eprintln!("[outrig] tool call: {tool_name}({args})");
+                eprintln!(
+                    "[outrig] {}tool call: {tool_name}({args})",
+                    self.trace_prefix()
+                );
                 Flow::cont()
             }
             _ => Flow::cont(),
@@ -811,10 +925,9 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
 fn finish_agent<M: rig::completion::CompletionModel + 'static>(
     model: M,
     resolved: &ResolvedAgent,
-    tools: Vec<McpToolAdapter>,
+    tools: Vec<SessionTool>,
 ) -> rig::agent::Agent<M> {
     use rig::agent::AgentBuilder;
-    use rig::tool::ToolDyn;
 
     let mut builder = AgentBuilder::new(model).preamble(&resolved.preamble);
     if let Some(temperature) = resolved.temperature {
@@ -823,11 +936,7 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
     if let Some(max_tokens) = resolved.max_tokens {
         builder = builder.max_tokens(max_tokens as u64);
     }
-    let boxed: Vec<Box<dyn ToolDyn>> = tools
-        .into_iter()
-        .map(|t| Box::new(t) as Box<dyn ToolDyn>)
-        .collect();
-    builder.tools(boxed).build()
+    builder.tools(session_tool::boxed(&tools)).build()
 }
 
 #[cfg(test)]
@@ -937,11 +1046,20 @@ mod tests {
         let mut history = Vec::new();
         let mut stdout = Vec::new();
 
-        let reply = run_turn_streaming_inner(&agent, "hi", &mut history, 50, &mut stdout)
-            .await
-            .expect("streaming turn succeeds");
+        let reply = run_turn_streaming_inner(
+            &agent,
+            "hi",
+            &mut history,
+            OutrigPromptHook::new(50),
+            &mut stdout,
+        )
+        .await
+        .expect("streaming turn succeeds");
 
-        assert_eq!(reply, "");
+        // The inner loop hands back what it decoded so a subagent can capture
+        // it; suppressing the REPL's reprint is `run_turn_streaming_to`'s job,
+        // pinned by `primary_streaming_path_suppresses_the_reprint` below.
+        assert_eq!(reply, "hello world");
         assert_eq!(
             String::from_utf8(stdout).expect("stdout utf-8"),
             "hello world\n"
@@ -949,6 +1067,38 @@ mod tests {
         assert_eq!(
             history,
             vec![Message::user("hi"), Message::assistant("hello world")],
+        );
+    }
+
+    /// The REPL prints `on_prompt`'s return value when it is non-empty
+    /// (`repl.rs`), so the primary streaming path must return empty or the
+    /// reply appears twice: once streamed while decoding, once reprinted.
+    #[cfg(feature = "local-llm")]
+    #[tokio::test]
+    async fn primary_streaming_path_suppresses_the_reprint() {
+        let model = ScriptedStreamingModel::new(vec![
+            RawStreamingChoice::Message("hello ".to_string()),
+            RawStreamingChoice::Message("world".to_string()),
+        ]);
+        let agent = rig::agent::AgentBuilder::new(model).build();
+        let mut history = Vec::new();
+        let mut sink = Vec::new();
+
+        let reply = run_turn_streaming_to(
+            &agent,
+            "hi",
+            &mut history,
+            OutrigPromptHook::new(50),
+            &mut sink,
+        )
+        .await
+        .expect("streaming turn succeeds");
+
+        assert_eq!(reply, "", "a non-empty return would double-print the reply");
+        assert_eq!(
+            String::from_utf8(sink).expect("sink utf-8"),
+            "hello world\n",
+            "the reply should still have been streamed exactly once"
         );
     }
 }

@@ -301,11 +301,36 @@ names and already-running sidecars are errors, and there is no `/sidecar stop` i
 A failed add -- image missing, server crashing on connect -- is reported on stderr and changes
 nothing: the container set, tool list, and conversation stay as they were.
 
+## Subagents
+
+The agent can hand scoped work to subagents that share this session's container and tools, using
+the built-in `outrig__` tools. They are on by default; `subagents = false` on the
+`[agents.<name>]` block leaves them out. Their tool calls appear on stderr labeled by name, and
+each one's transcript is written to `<session_dir>/logs/subagent-<name>.log`.
+
+```
+> audit the config and the mcp wiring in parallel
+[outrig] tool call: outrig__subagent({"name": "audit-config", ...})
+[outrig] subagent audit-config started
+[outrig] tool call: outrig__subagent({"name": "audit-mcp", ...})
+[outrig] subagent audit-mcp started
+[outrig]   [audit-config] tool call: fs__read_file(...)
+[outrig]   [audit-mcp] tool call: shell__exec(...)
+[outrig] tool call: outrig__wait_results({"names": [...], "min_count": 1})
+[outrig]   [audit-mcp] tool call: outrig__set_result(...)
+[outrig] tool call: outrig__get_result({"name": "audit-mcp"})
+```
+
+Nothing a subagent produces reaches stdout, so `outrig run > out.txt` still captures only the
+primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
+
 ## Interrupting and exiting
 
 - **Ctrl-C** during a turn cancels the in-flight LLM/tool call. The REPL prints
   `[outrig] interrupted` to stderr and returns to a `> ` prompt with conversation history intact,
-  so you can redirect the agent.
+  so you can redirect the agent. It stops the agent *waiting*, not work already handed to the
+  container: a `shell__exec` that started a build runs to completion, and any
+  [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn.
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
 - A second Ctrl-C without an intervening prompt also exits.

@@ -10,6 +10,12 @@
 //! [`mcp_proxy`](crate::mcp_proxy) server share this so they advertise
 //! identical public names for the same upstream tool.
 
+/// Server name reserved for OutRig's own built-in tools, which reach the model
+/// as `outrig__<tool>` through the same [`sanitize`] path as MCP tools. A
+/// configured MCP server may not claim it, or its tools would collide with the
+/// built-ins.
+pub const RESERVED_SERVER: &str = "outrig";
+
 /// Maximum length OpenAI accepts for a tool name. Other providers are more
 /// liberal but this is the safe lower bound.
 const MAX_NAME_LEN: usize = 64;

@@ -1,0 +1,161 @@
+# Subagents
+
+A **subagent** is a second agent loop, launched by the agent itself, running against the same
+container and the same tools. It exists so a big task can be split up without every piece having to
+fit in one context under one preamble: the parent hands off a scoped job, the subagent works
+through it with a fresh context, and only its report comes back.
+
+The agent reaches subagents through the `outrig__` tools -- OutRig's own built-ins, which appear
+alongside MCP tools like `fs__read_file` and `shell__exec` and are called the same way. The
+`outrig` server name is reserved in config so nothing can shadow them.
+
+Subagents are enabled by default. Set `subagents = false` on an `[agents.<name>]` block to leave
+the tools out entirely; see [Reference -> Config](../reference/config.md).
+
+## What a subagent is
+
+A subagent is a headless REPL. `outrig run` drives one agent loop from lines you type; a subagent
+is the same loop driven by prompts from the parent instead, keeping its own conversation history
+across them. That is the whole idea -- the rest is bookkeeping.
+
+What it inherits, and what it does not:
+
+| Inherited                                | Not inherited                             |
+|------------------------------------------|-------------------------------------------|
+| The container, and everything in it      | Your conversation and context             |
+| The MCP tools, over the same connections | The session preamble -- the parent sets it |
+| The model, provider, and limits          | The `outrig__` launch tools (see below)   |
+| `/workspace`, at the same paths          | --                                        |
+
+Because it borrows the parent's MCP connections, launching one starts no container and connects no
+server. That keeps the [MCP trust model](mcp-trust-model.md) invariant intact: a subagent can only
+reach tools the operator already granted the session.
+
+## The tools
+
+```
+outrig__subagent({"name": "audit-config", "prompt": "..."})   -> returns immediately
+outrig__wait_results({"names": [...], "min_count": 1})        -> which ones have something
+outrig__get_result({"name": "audit-config"})                  -> that one's findings
+outrig__subagent_send({"name": "audit-config", "prompt": "..."})
+outrig__subagent_release({"names": ["audit-config"]})
+```
+
+Inside a subagent there is exactly one:
+
+```
+outrig__set_result({"status": "result", "body": "..."})    // findings
+outrig__set_result({"status": "error",  "body": "..."})    // could not finish
+```
+
+`name` is a short kebab-case handle the parent picks, and is how it refers to that subagent
+everywhere afterward.
+
+### Launching is not waiting
+
+`outrig__subagent` returns as soon as the subagent starts. Two calls in a row give two subagents
+running at once -- that is how fan-out works, and it does not depend on the model emitting parallel
+tool calls. The parent's own tool calls stay sequential and ordered.
+
+### Reporting is explicit
+
+A subagent reports by calling `outrig__set_result`, not by finishing with a nicely worded message.
+This matters more than it looks: a model's last message is whatever it happened to close with, and
+"Done, let me know if you need anything else" is a poor thing to hand another agent. Publishing
+explicitly also makes failure honest -- a subagent that runs out of tool calls never publishes, so
+the parent is told it stopped rather than handed a status string dressed up as an answer.
+
+A subagent may call it more than once. The inbox keeps only the latest value, so a later call
+simply supersedes an earlier one, and calling it does not end the subagent's round.
+
+Both fields are required, which is deliberate. An earlier shape took `{result}` or `{error}` as
+two optional strings, and models called it as `{}` constantly -- a schema where every field is
+optional *permits* the empty call, so the only rejection possible came from the runtime, after the
+subagent had already spent a tool call. `required` is the one constraint providers enforce and
+models reliably attend to, and an exclusive choice between two optional fields cannot use it.
+Folding the choice into a `status` enum makes both fields mandatory and the empty call
+unrepresentable.
+
+### When a report does not fit
+
+`body` carries the whole report, so it is the one argument in the toolset large enough to run into
+the model's output-token ceiling. A reply cut off part-way arrives as a `set_result` call with
+`status` present and `body` missing, because fields generate in schema order.
+
+OutRig recognizes that shape rather than passing a bare "missing field" back: the subagent is told
+its report was probably truncated and asked to shorten it, which is something it can act on. If the
+round still ends without publishing, the parent is told the subagent hit its output token limit --
+not merely that it stopped -- so it can re-ask with a narrower scope.
+
+The durable fix is a bigger ceiling. `max-tokens` is unset by default, which leaves the limit to
+the provider, and that default can be much lower than expected behind a gateway. Set
+`[agents.<name>].max-tokens` explicitly if subagents produce long reports.
+
+### Reading is edge-triggered
+
+Each subagent's inbox carries a version, and the parent keeps a read position against it.
+`outrig__get_result` blocks until there is something newer than what the parent last saw, returns
+it, and moves the read position past it. Reading twice with nothing new in between blocks rather
+than returning the same answer again.
+
+`outrig__wait_results` blocks on the same condition across several subagents and reports **names
+only**. Results can be large, so a call that returned three of them at once is exactly the
+oversized tool result worth avoiding; the parent pulls each one with `outrig__get_result` and can
+stop once it has enough. Use `min_count` to react to whichever finishes first:
+
+```
+outrig__subagent({"name": "audit-config", "prompt": "..."})
+outrig__subagent({"name": "audit-mcp",    "prompt": "..."})
+outrig__subagent({"name": "audit-net",    "prompt": "..."})
+
+outrig__wait_results({"names": ["audit-config", "audit-mcp", "audit-net"], "min_count": 1})
+  -> ["audit-mcp"]
+
+outrig__get_result({"name": "audit-mcp"})
+  -> what it found
+```
+
+> A subagent that is ready and left uncollected stays ready. Keep passing its name to
+> `outrig__wait_results` and every call returns it immediately and never blocks for the others --
+> drop names once they have been collected.
+
+### Subagents stay addressable
+
+Finishing a round does not end a subagent. It goes idle with its history intact, and
+`outrig__subagent_send` reopens it -- to follow up on a result, or to redirect one that is still
+working. A running subagent sees the message at its next step, so the parent never has to know
+whether it is busy. Idle subagents live until released or until the session ends.
+
+### Subagents cannot launch subagents
+
+A subagent's toolset is the session's MCP tools plus `outrig__set_result`. The launch tools are
+simply absent, so there is nothing to recurse with -- this falls out of the tool list rather than
+being a rule anyone enforces.
+
+## What you see
+
+Nothing reaches stdout except the primary agent's reply, so `outrig run > out.txt` still captures
+only the model's text. Subagent activity shows up two other ways:
+
+- On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name.
+- In `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr logs, holding that
+  subagent's prompts, replies, and published outcomes.
+
+Ctrl-C behaves as it always has: it abandons whatever the parent was waiting on and returns you to
+the prompt. Subagents keep running and are still collectable on the next turn -- the same way an
+abandoned `shell__exec` keeps running to completion inside the container. A second Ctrl-C ends the
+session, and everything shuts down with it.
+
+## The shared workspace
+
+Every subagent writes to the same bind-mounted `/workspace` as the parent and its siblings. Two
+subagents told to edit the same file will fight over it, and OutRig does not stop them -- keeping
+concurrent work disjoint is the parent's job. Read-only analysis fans out safely; parallel edits
+want non-overlapping scopes.
+
+## See also
+
+- [MCP Servers](mcp-servers.md) -- where a subagent's tools come from.
+- [MCP Trust Model](mcp-trust-model.md) -- why sharing the container keeps the boundary intact.
+- [Providers, Models, and Agents](llm-providers.md) -- the `[agents.<name>]` block.
+- [Usage -> outrig run](../usage/run.md) -- the REPL these run underneath.

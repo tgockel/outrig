@@ -20,3 +20,6 @@ where they're spelled out.
   model inside the outrig process itself, for questions whose content must not leave the
   host. Plumbing for the future egress filter, tool-use filter, and prompt-injection
   scanner.
+- **[Subagents](subagents.md)** -- extra agent loops the agent launches itself, sharing the
+  session's container and tools. The `outrig__` built-in tools, the explicit result inbox
+  they report through, and why a subagent cannot launch subagents.

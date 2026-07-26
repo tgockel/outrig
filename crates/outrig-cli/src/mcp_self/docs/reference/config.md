@@ -327,6 +327,9 @@ preamble = "You are a meticulous code reviewer..."
 - `max-tokens` (integer, optional, default: provider default): output token max per turn.
 - `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per turn.
 - `tool-result-max` (integer, optional, default: top-level value or `262144`): bytes per result.
+- `subagents` (bool, optional, default: `true`): whether this agent may launch subagents. When
+  `false`, the `outrig__` subagent tools are not registered at all, so the agent's tool list and
+  context cost are unchanged from a build without the feature.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
@@ -334,7 +337,12 @@ set, except `outrig run --model <name>` may supply the selected agent's model fo
 `agents.<a>.image` if set, otherwise `default-image`.
 `tool-call-max` is per turn, not per session; follow-up prompts start a fresh count.
 `tool-result-max` is per result and applies equally to successful MCP results and MCP error
-messages.
+messages. It also caps what `outrig__get_result` hands back from a subagent.
+
+`subagents` is on by default. A subagent shares this agent's container, MCP tools, model and
+limits, but not its preamble or context -- see
+[Concepts -> Subagents](../concepts/subagents.md). Turn it off for agents that should stay
+single-threaded, or to save the context the five tool schemas occupy.
 
 ## `[workspace]`
 

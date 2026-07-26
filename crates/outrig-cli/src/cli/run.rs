@@ -19,6 +19,7 @@ use std::sync::Arc;
 use clap::{ArgAction, Parser};
 use rig::completion::Message;
 
+use crate::builtin_tool;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{
     self, ProgressSpan, STOP_GRACE, SessionRuntime, SessionSetup, SessionSetupArgs,
@@ -31,6 +32,8 @@ use crate::paths::model_cache_root;
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
+use crate::session_tool::{self, SessionTool};
+use crate::subagent::{SubagentContext, SubagentRegistry};
 use outrig::McpClient;
 use outrig::config::{
     Config, MistralrsDeviceSpec, NetworkMode, SidecarStart, TOOL_CALL_MAX_LIMIT,
@@ -39,6 +42,7 @@ use outrig::config::{
 use outrig::container::Container;
 use outrig::container::sidecar::{SessionMcpPlan, SidecarPlan};
 use outrig::image::ImageTag;
+use rig::tool::ToolDyn;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -251,7 +255,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
             .await?;
     runtime.mcp_arcs.extend(connected);
 
-    let mut all_tools: Vec<McpToolAdapter> = Vec::new();
+    let mut all_tools: Vec<SessionTool> = Vec::new();
     let mut per_server_counts: Vec<(String, usize)> = Vec::new();
     for arc in runtime.mcp_arcs.iter() {
         let span = ProgressSpan::start(format!("MCP {}: listing tools", arc.name()));
@@ -264,16 +268,40 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
             arc.name()
         ));
         per_server_counts.push((arc.name().to_string(), tool_count));
-        all_tools.extend(adapters);
+        all_tools.extend(session_tool::erase(adapters));
     }
 
     #[cfg(feature = "local-llm")]
-    let registry = llm::LlmRegistry::new();
+    let registry = Arc::new(llm::LlmRegistry::new());
+
+    // Subagents borrow the session's MCP tools as they stand now. A sidecar
+    // added later grows the *primary* agent's tool list via `extend_tools`,
+    // but not this snapshot, so subagents launched afterwards still see the
+    // startup set.
+    let subagents = Arc::new(SubagentRegistry::new(SubagentContext {
+        resolved: resolved.clone(),
+        mcp_tools: all_tools.clone(),
+        cache_root: cache_root.to_path_buf(),
+        log_dir: log_dir.to_path_buf(),
+        #[cfg(feature = "local-llm")]
+        registry: registry.clone(),
+    }));
+    let mut agent_tools = all_tools;
+    if cfg
+        .agents
+        .get(agent_name)
+        .is_none_or(outrig::config::Agent::subagents_enabled)
+    {
+        agent_tools.extend(builtin_tool::parent_tools(
+            subagents.clone(),
+            resolved.tool_result_max_bytes,
+        ));
+    }
 
     let span = ProgressSpan::start("building agent");
     let agent = llm::build_agent(
         &resolved,
-        all_tools.clone(),
+        agent_tools.clone(),
         cache_root,
         #[cfg(feature = "local-llm")]
         &registry,
@@ -287,14 +315,14 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         image_tag,
         runtime.containers.primary.name(),
         &per_server_counts,
-        &all_tools,
+        &agent_tools,
         sid.as_str(),
     );
 
     let primary_name = runtime.containers.primary.name().to_string();
     let agent = llm::RebuildingAgent::new(
         agent,
-        all_tools,
+        agent_tools,
         resolved,
         cache_root.to_path_buf(),
         #[cfg(feature = "local-llm")]
@@ -327,6 +355,13 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         }
         None => run_repl(session).await,
     };
+
+    // Stop every subagent *and wait for the tasks to end* before teardown.
+    // An orphan would keep calling tools into a container being removed, and
+    // until each task is reaped it still holds tool clones that teardown's
+    // `Arc::try_unwrap` needs released to shut the MCP children down.
+    subagents.shutdown().await;
+    drop(subagents);
 
     // Drop the agent (which owns the tool adapters) before returning so
     // teardown's `Arc::try_unwrap` on each `mcp_arcs` entry succeeds.
@@ -568,7 +603,7 @@ async fn connect_added_sidecar_servers(
     state: &ReplSession<'_>,
     name: &str,
     container: &Container,
-) -> Result<(Vec<Arc<McpClient>>, Vec<McpToolAdapter>)> {
+) -> Result<(Vec<Arc<McpClient>>, Vec<SessionTool>)> {
     let mut arcs: Vec<Arc<McpClient>> = Vec::new();
     let mut adapters: Vec<McpToolAdapter> = Vec::new();
     let mut failure: Option<crate::error::CliError> = None;
@@ -606,7 +641,7 @@ async fn connect_added_sidecar_servers(
         }
     }
     match failure {
-        None => Ok((arcs, adapters)),
+        None => Ok((arcs, session_tool::erase(adapters))),
         Some(e) => {
             // Adapters hold client Arc clones; drop them first so the
             // unwrap below reaches each client.
@@ -672,7 +707,7 @@ fn print_banner(
     image_tag: &ImageTag,
     container_pod_name: &str,
     per_server_counts: &[(String, usize)],
-    all_tools: &[McpToolAdapter],
+    all_tools: &[SessionTool],
     session_id: &str,
 ) {
     let provider_label = match &resolved.provider {
@@ -705,7 +740,7 @@ fn print_banner(
         let plural = if *count == 1 { "tool" } else { "tools" };
         let _ = writeln!(buf, "[outrig] mcp {name}: initialized ({count} {plural})");
     }
-    let names: Vec<&str> = all_tools.iter().map(|t| t.openai_name.as_str()).collect();
+    let names: Vec<String> = all_tools.iter().map(ToolDyn::name).collect();
     let _ = writeln!(buf, "[outrig] tools available: {}", names.join(", "));
     let _ = writeln!(
         buf,
@@ -714,13 +749,16 @@ fn print_banner(
     eprint!("{buf}");
 }
 
-fn build_tools_summary(tools: &[McpToolAdapter]) -> String {
+fn build_tools_summary(tools: &[SessionTool]) -> String {
     let mut buf = String::new();
     let _ = writeln!(buf, "[outrig] tools available ({}):", tools.len());
-    let pad = tools.iter().map(|t| t.openai_name.len()).max().unwrap_or(0);
-    for t in tools {
-        let desc = truncate_description(&t.description, 60);
-        let _ = writeln!(buf, "  {:<pad$}   {}", t.openai_name, desc, pad = pad);
+    let rows: Vec<(String, String)> = tools
+        .iter()
+        .map(|t| (t.name(), truncate_description(&t.description(), 60)))
+        .collect();
+    let pad = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, desc) in &rows {
+        let _ = writeln!(buf, "  {name:<pad$}   {desc}");
     }
     buf
 }
@@ -863,7 +901,7 @@ mod tests {
                     ..test_resolved_agent()
                 };
                 #[cfg(feature = "local-llm")]
-                let registry = llm::LlmRegistry::new();
+                let registry = Arc::new(llm::LlmRegistry::new());
                 let rig_agent = llm::build_agent(
                     &resolved,
                     Vec::new(),

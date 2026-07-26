@@ -360,6 +360,18 @@ pub struct Agent {
     pub tool_call_max: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_max: Option<u32>,
+    /// Whether this agent may launch subagents. Unset means enabled -- the
+    /// `outrig__` subagent tools are registered unless an agent opts out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<bool>,
+}
+
+impl Agent {
+    /// Whether the parent-side `outrig__` subagent tools are registered for
+    /// this agent. Defaults to enabled when the key is absent.
+    pub fn subagents_enabled(&self) -> bool {
+        self.subagents.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

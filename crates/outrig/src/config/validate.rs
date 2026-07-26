@@ -53,6 +53,12 @@ pub enum ConfigValidationError {
     )]
     InvalidMcpServerName { image: String, server: String },
 
+    #[error(
+        "image {image:?} declares mcp server {server:?}, but that name is reserved \
+         for OutRig's built-in tools; its tools would collide with `{server}__*`"
+    )]
+    ReservedMcpServerName { image: String, server: String },
+
     #[error("image {image:?} mcp server {server:?} has empty command")]
     EmptyMcpCommand { image: String, server: String },
 
@@ -447,6 +453,12 @@ pub(super) fn validate_with_options(
         for (server_name, spec) in &image.mcp {
             if !is_valid_mcp_server_name(server_name) {
                 return Err(ConfigValidationError::InvalidMcpServerName {
+                    image: image_name.clone(),
+                    server: server_name.clone(),
+                });
+            }
+            if server_name == crate::RESERVED_SERVER {
+                return Err(ConfigValidationError::ReservedMcpServerName {
                     image: image_name.clone(),
                     server: server_name.clone(),
                 });

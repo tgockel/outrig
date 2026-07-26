@@ -367,6 +367,7 @@ fn render(
             max_tokens: None,
             tool_call_max: None,
             tool_result_max: None,
+            subagents: None,
         },
     );
     let cfg = Config {

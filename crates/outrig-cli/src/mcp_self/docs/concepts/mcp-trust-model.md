@@ -34,6 +34,12 @@ no agent-invocable tool that starts sidecars; new containers come from the confi
 operator. Session network policy covers every container, so a sidecar is not a way around
 audit or filter mode.
 
+[Subagents](subagents.md) do not bend this. An agent can launch one with `outrig__subagent`, but a
+subagent runs in the container that is already there, over the MCP connections that are already
+open. It starts no container, connects no server, and can call nothing the operator did not
+already grant the session -- it is a second consumer of a fixed environment, not a way to widen
+one.
+
 The one placement that *widens* rather than narrows is
 [`view = "primary"`](mcp-servers.md#primary-filesystem-view). Such a sidecar joins the primary's
 mount namespace with `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` and can read the primary's entire

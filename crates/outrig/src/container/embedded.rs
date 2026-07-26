@@ -102,6 +102,12 @@ pub enum EmbeddedImageConfigError {
     #[error("invalid mcp server name {server:?} (must match ^[a-zA-Z][a-zA-Z0-9_-]*$)")]
     InvalidMcpServerName { server: String },
 
+    #[error(
+        "mcp server {server:?} uses a name reserved for OutRig's built-in tools; \
+         its tools would shadow `{server}__*`"
+    )]
+    ReservedMcpServerName { server: String },
+
     #[error("mcp server {server:?} has empty command")]
     EmptyMcpCommand { server: String },
 
@@ -135,6 +141,12 @@ pub enum StandaloneImageTomlError {
 
     #[error("invalid mcp server name {server:?} (must match ^[a-zA-Z][a-zA-Z0-9_-]*$)")]
     InvalidMcpServerName { server: String },
+
+    #[error(
+        "mcp server {server:?} uses a name reserved for OutRig's built-in tools; \
+         its tools would shadow `{server}__*`"
+    )]
+    ReservedMcpServerName { server: String },
 
     #[error("mcp server {server:?} has empty command")]
     EmptyMcpCommand { server: String },
@@ -374,6 +386,11 @@ fn parse_mcp_table(
                 server: server.clone(),
             });
         }
+        if server == crate::RESERVED_SERVER {
+            return Err(EmbeddedImageConfigError::ReservedMcpServerName {
+                server: server.clone(),
+            });
+        }
         if !spec.args().is_empty() {
             return Err(EmbeddedImageConfigError::ArgsInLabel {
                 server: server.clone(),
@@ -470,6 +487,11 @@ impl TryFrom<StandaloneImageTomlRaw> for StandaloneImageToml {
         for (server, spec) in &mcp {
             if !is_valid_mcp_server_name(server) {
                 return Err(StandaloneImageTomlError::InvalidMcpServerName {
+                    server: server.clone(),
+                });
+            }
+            if server == crate::RESERVED_SERVER {
+                return Err(StandaloneImageTomlError::ReservedMcpServerName {
                     server: server.clone(),
                 });
             }
@@ -778,6 +800,23 @@ mod tests {
             err,
             EmbeddedImageConfigError::InvalidMcpServerName { server } if server == "bad.name"
         ));
+    }
+
+    /// The repo-config path rejects `outrig`; an image label is exactly where
+    /// a server with that name would otherwise arrive unnoticed and shadow the
+    /// built-in `outrig__*` tools.
+    #[test]
+    fn label_mcp_server_named_outrig_is_rejected() {
+        let err = parse_mcp_table(r#"{"outrig":{"command":["x"]}}"#)
+            .expect_err("reserved name in a label");
+        assert!(
+            matches!(
+                err,
+                EmbeddedImageConfigError::ReservedMcpServerName { ref server }
+                    if server == "outrig"
+            ),
+            "got: {err:?}"
+        );
     }
 
     #[test]

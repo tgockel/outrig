@@ -268,6 +268,39 @@ srv = { command = ["bin", "arg1"] }
         assert!(cfg.workspace.mounts.is_empty());
     }
 
+    /// The key is absent from nearly every real config, so the default is what
+    /// almost all agents get. It defaults to enabled, which is the opposite of
+    /// `bool::default()` -- pin both the default and the opt-out round-trip.
+    #[test]
+    fn subagents_absent_defaults_to_enabled() {
+        let cfg = Config::load_from_str(
+            r#"
+[agents.coding]
+preamble = "you are a coding agent"
+"#,
+        )
+        .expect("config parses");
+        let agent = &cfg.agents["coding"];
+        assert_eq!(agent.subagents, None);
+        assert!(agent.subagents_enabled());
+    }
+
+    #[test]
+    fn subagents_opt_out_round_trips() {
+        let cfg = Config::load_from_str(
+            r#"
+[agents.coding]
+subagents = false
+"#,
+        )
+        .expect("config parses");
+        assert!(!cfg.agents["coding"].subagents_enabled());
+
+        let reserialized = toml::to_string(&cfg).expect("config serializes");
+        let again = Config::load_from_str(&reserialized).expect("reserialized parses");
+        assert!(!again.agents["coding"].subagents_enabled());
+    }
+
     #[test]
     fn container_security_absent_yields_documented_defaults() {
         let cfg = Config::load_from_str(

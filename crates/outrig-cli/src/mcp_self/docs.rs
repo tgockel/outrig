@@ -42,6 +42,10 @@ pub const DOCS: &[Doc] = &[
         markdown: include_str!("docs/concepts/workspace.md"),
     },
     Doc {
+        page: "concepts/subagents",
+        markdown: include_str!("docs/concepts/subagents.md"),
+    },
+    Doc {
         page: "reference/config",
         markdown: include_str!("docs/reference/config.md"),
     },
@@ -113,6 +117,49 @@ mod tests {
             "doc list should include the trust model: {:?}",
             list.docs,
         );
+    }
+
+    /// The bundle is served by `outrig mcp self`, where a link to a page that
+    /// was never registered is a dead end for whatever AI tool is reading it.
+    /// This caught `concepts/subagents` being written into `doc/` as a real
+    /// file while two bundle pages already linked to it.
+    #[test]
+    fn every_internal_link_resolves_to_a_registered_page() {
+        fn resolve(from_page: &str, link: &str) -> Option<String> {
+            let mut parts: Vec<&str> = from_page.split('/').collect();
+            parts.pop(); // the page's own name; links are relative to its dir
+            for segment in link.trim_end_matches(".md").split('/') {
+                match segment {
+                    "." => {}
+                    ".." => {
+                        parts.pop()?;
+                    }
+                    other => parts.push(other),
+                }
+            }
+            Some(parts.join("/"))
+        }
+
+        for doc in DOCS {
+            for (_, rest) in doc.markdown.match_indices("](") {
+                let Some(end) = rest[2..].find(')') else {
+                    continue;
+                };
+                let link = &rest[2..2 + end];
+                if !link.ends_with(".md") || link.contains("://") {
+                    continue;
+                }
+                let Some(target) = resolve(doc.page, link) else {
+                    panic!("{}: link {link:?} escapes the bundle", doc.page);
+                };
+                assert!(
+                    DOCS.iter().any(|d| d.page == target),
+                    "{}: links to {link:?} -> {target:?}, which is not a \
+                     registered page. Either add it to DOCS or drop the link.",
+                    doc.page,
+                );
+            }
+        }
     }
 
     #[test]

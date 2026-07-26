@@ -24,7 +24,7 @@ pub use outrig_::{
     SidecarServerSpec, SidecarSpec, ToolHandle, WorkspaceSpec,
 };
 pub use process::Transcript;
-pub use tool_name::sanitize as sanitize_tool_name;
+pub use tool_name::{RESERVED_SERVER, sanitize as sanitize_tool_name};
 
 /// Load the project config rooted at `dir`. Walks up from `dir` looking
 /// for `.agents/outrig/config.toml`, then merges in the optional `global`
