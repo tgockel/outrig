@@ -38,6 +38,11 @@ enable trace-level logs from outrig's own modules for that invocation. It does n
 container, MCP, or agent behavior. Normal startup progress is printed to stderr without
 `--verbose`.
 
+`--verbose` controls command *output*; the tracing filter controls command *lines*. At
+`debug`, every buildah/podman invocation is logged before it is spawned and again on exit with
+its status and elapsed time (target `outrig::process`), which identifies the responsible child
+process when a startup phase stalls. The two are independent -- neither implies the other.
+
 ## Subcommands
 
 ### `outrig init`
@@ -437,8 +442,11 @@ target and the symlink under the session root.
 ## Environment variables
 
 - `[providers.<name>].api-key` references via `${VAR}`: provider API key.
-- `OUTRIG_LOG`: preferred `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`.
-- `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset.
+- `OUTRIG_LOG`: preferred `tracing-subscriber` filter, e.g. `OUTRIG_LOG=debug`. When set it
+  shadows `RUST_LOG` completely, including a value that filters out more than `RUST_LOG` would.
+- `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset. At `debug`, adds one line per
+  buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
+  how long it took.
 - `XDG_DATA_HOME`: default base for `session-root` if not set in config.
 - `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
 

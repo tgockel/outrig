@@ -10,6 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -140,6 +141,11 @@ pub(crate) async fn try_capture_logged(
         t.line(prefix, &format!("$ {}", cmd.render())).await?;
     }
 
+    // The `-v` transcript is opt-in and file-backed; this pair is what makes a
+    // stuck `podman run` visible under `RUST_LOG=debug` alone.
+    tracing::debug!(target: "outrig::process", command = %cmd.render(), "spawn");
+    let started = Instant::now();
+
     let mut child = cmd
         .to_tokio_command()
         .stdin(Stdio::null())
@@ -159,6 +165,13 @@ pub(crate) async fn try_capture_logged(
     let stderr_task = tokio::spawn(capture_stream(stderr, prefix, transcript));
 
     let status = child.wait().await?;
+    tracing::debug!(
+        target: "outrig::process",
+        program = cmd.program,
+        code = ?status.code(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "exit"
+    );
     let stdout = stdout_task.await.expect("stdout capture task panicked")?;
     let stderr = stderr_task.await.expect("stderr capture task panicked")?;
 
@@ -174,6 +187,9 @@ pub(crate) async fn try_capture_logged(
 /// the program, argv, exit code, and the last `STDERR_TAIL_LIMIT` bytes of
 /// stderr (lossy UTF-8, prefixed with a truncation marker if elision occurred).
 pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
+    tracing::debug!(target: "outrig::process", command = %cmd.render(), "spawn");
+    let started = Instant::now();
+
     let mut child = cmd
         .to_tokio_command()
         .stdin(Stdio::null())
@@ -193,6 +209,13 @@ pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
     let stderr_task = tokio::spawn(capture_stderr_tail(stderr));
 
     let status = child.wait().await?;
+    tracing::debug!(
+        target: "outrig::process",
+        program = cmd.program,
+        code = ?status.code(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "exit"
+    );
     let stdout = stdout_task.await.expect("stdout capture task panicked")?;
     let stderr_tail = stderr_task.await.expect("stderr capture task panicked")?;
 

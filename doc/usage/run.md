@@ -60,7 +60,25 @@ invocation.
 Normal startup progress is always printed to stderr so slow container or MCP startup is visible.
 `--verbose` adds the underlying buildah/podman command transcript; it is not required for the
 progress lines. Tracing filters come from `OUTRIG_LOG` first, then `RUST_LOG` if `OUTRIG_LOG`
-is unset.
+is unset -- a set `OUTRIG_LOG` shadows `RUST_LOG` entirely.
+
+Three levels of detail, in increasing order:
+
+| Setting               | What it adds                                                     |
+|-----------------------|------------------------------------------------------------------|
+| (none)                | Progress lines only: one per startup phase, with elapsed time.   |
+| `RUST_LOG=debug`      | Every buildah/podman command line, plus its exit code and timing. |
+| `--verbose` (`-v`)    | The full command *output* transcript, also written to `container.log`. |
+| `-vv`                 | Trace-level logs from outrig's own modules.                      |
+
+A phase that stalls between progress lines is a stalled child process. `RUST_LOG=debug` names
+the exact command it is waiting on, which is the fastest way to reproduce the stall by hand:
+
+```sh
+$ RUST_LOG=debug outrig run
+[outrig] starting container outrig-20260726T170454-da0c
+DEBUG outrig::process: spawn command=podman run -d --rm --name outrig-... sleep infinity
+```
 
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
 `<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`

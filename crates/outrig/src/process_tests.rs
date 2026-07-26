@@ -1,6 +1,7 @@
-//! Unit tests for `process`: covers all three call patterns
-//! (`run_capture`, `run_streamed`, `spawn_stdio`), the structured `Process`
-//! error variant, and the honest stderr-tail truncation behavior.
+//! Unit tests for `process`: covers all four call patterns (`run_capture`,
+//! `try_capture_logged`, `run_streamed`, `spawn_stdio`), the structured
+//! `Process` error variant, the spawn/exit tracing every podman invocation
+//! relies on, and the honest stderr-tail truncation behavior.
 
 use std::ffi::OsString;
 use std::io;
@@ -216,6 +217,43 @@ fn run_streamed_forwards_stderr_to_tracing() {
     assert!(
         captured.contains("[test] hello-from-stderr"),
         "tracing should receive prefixed stderr line, got: {captured}"
+    );
+}
+
+#[test]
+fn try_capture_logged_traces_spawn_and_exit_at_debug() {
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let writer = CaptureWriter(buf.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current_thread runtime");
+    rt.block_on(async {
+        super::try_capture_logged(Cmd::new("/bin/echo").arg("hi"), "test", None)
+            .await
+            .expect("try_capture_logged must succeed")
+    });
+
+    let captured = String::from_utf8(buf.lock().unwrap().clone())
+        .expect("captured tracing output must be UTF-8");
+    assert!(
+        captured.contains("spawn command=/bin/echo hi"),
+        "debug output should name the full command line, got: {captured}"
+    );
+    assert!(
+        captured.contains("program=\"/bin/echo\"")
+            && captured.contains("code=Some(0)")
+            && captured.contains("elapsed_ms=")
+            && captured.contains("exit"),
+        "debug output should record exit code and elapsed time, got: {captured}"
     );
 }
 
