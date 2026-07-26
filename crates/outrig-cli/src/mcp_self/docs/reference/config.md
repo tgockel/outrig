@@ -558,6 +558,15 @@ capability-profile = "no-net-raw"
   [`[images.<name>.mcp]`](#imagesnamemcp); setting it in both places is an error.
 - `workspace` (string, optional, default: `"none"`): `"none"`, `"ro"`, or `"rw"`. Mounts the
   session workspace at the primary's container path with that access.
+- `view` (string, optional, default: `"none"`): `"none"` or `"primary"`. `"primary"` runs the
+  sidecar against the *primary container's* filesystem view -- its rootfs and every mount, at
+  the primary's paths -- via the `outrig-enter` launcher, so an off-the-shelf MCP image serves
+  the primary's files without the primary image carrying that tool. Entrypoint-stdio only, and
+  mutually exclusive with `workspace` (the view already holds the workspace) and with
+  `capability-profile = "drop-all"` (the view needs the mount capabilities). It grants
+  `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace -- a real posture
+  change; see [MCP Trust Model](../concepts/mcp-trust-model.md) and `SECURITY.md`. The same key
+  exists on the inline [`[images.<name>.mcp]`](#imagesnamemcp) one-liner form.
 - `start` (string, optional, default: `"auto"`): `"auto"` starts with the session; `"manual"`
   declares a sidecar that starts only when asked -- `/sidecar add <name>` in the REPL, or
   `Outrig::add_sidecar` / `LaunchSpec::with_sidecar` from the library API. Until then its

@@ -310,7 +310,11 @@ sidecar the same way it attaches to the primary, before any MCP server connects.
 ## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured extra
-workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)).
+workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). A
+`view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
+to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
+`/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see
+[MCP Servers](mcp-servers.md#primary-filesystem-view)).
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
 into a capability profile or explicit `cap-drop` / `cap-add` entries, and `--device=<path>`

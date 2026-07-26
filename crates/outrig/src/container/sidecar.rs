@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use crate::config::{
     Config, ContainerSecurity, ImageConfig, McpServerSpec, MountConfig, SidecarOnFailure,
-    SidecarStart, SidecarWorkspaceAccess,
+    SidecarStart, SidecarView, SidecarWorkspaceAccess,
 };
 use crate::container::embedded::McpDeclarationSource;
 use crate::error::{OutrigError, Result};
@@ -63,6 +63,10 @@ pub struct SidecarPlan {
     /// their arguments ride the declaring MCP entry's own `args`.
     pub args: Vec<String>,
     pub workspace: SidecarWorkspaceAccess,
+    /// Whether the sidecar runs against the primary container's filesystem
+    /// view. `Primary` is entrypoint-stdio only (validation enforces it) and
+    /// mutually exclusive with a non-`None` `workspace`.
+    pub view: SidecarView,
     pub start: SidecarStart,
     pub on_failure: SidecarOnFailure,
     pub mounts: Vec<MountConfig>,
@@ -74,13 +78,16 @@ pub struct SidecarPlan {
 }
 
 impl SidecarPlan {
-    /// The all-defaults plan an inline `image` key implies.
-    fn anonymous(server_name: &str, image: &str) -> Self {
+    /// The all-defaults plan an inline `image` key implies. `view` rides the
+    /// declaring entry (the one-liner `image = ..., view = "primary"` form);
+    /// everything else takes defaults.
+    fn anonymous(server_name: &str, image: &str, view: SidecarView) -> Self {
         Self {
             name: server_name.to_string(),
             image: image.to_string(),
             args: Vec::new(),
             workspace: SidecarWorkspaceAccess::None,
+            view,
             start: SidecarStart::Auto,
             on_failure: SidecarOnFailure::Abort,
             mounts: Vec::new(),
@@ -163,6 +170,52 @@ pub fn entrypoint_args<'a>(spec: &'a McpServerSpec, sidecar: &'a SidecarPlan) ->
     }
 }
 
+/// Prefix `elem` with `graft` iff it is an absolute path. Relative elements
+/// (e.g. a bare `node` resolved through `PATH`) pass through unchanged: they
+/// are not files in the sidecar rootfs we can relocate under the graft.
+fn graft_prefix(elem: &str, graft: &str) -> String {
+    if elem.starts_with('/') {
+        format!("{graft}{elem}")
+    } else {
+        elem.to_string()
+    }
+}
+
+/// Build the trailing argv a `view = "primary"` sidecar hands `outrig-enter`:
+/// the launcher flags, `--`, then the payload command.
+///
+/// The payload is the sidecar image's ENTRYPOINT (graft-prefixed -- those name
+/// files in the sidecar's *own* rootfs, now under `graft`) followed by either
+/// the config-supplied `config_args` (bare -- they name paths in the *primary's*
+/// view) when present, or the image's CMD (graft-prefixed) otherwise. That
+/// mirrors OCI's "args replace CMD" while honoring the argument asymmetry:
+/// image-declared elements are grafted, user-declared ones are not.
+pub fn build_primary_view_argv(
+    entrypoint: &[String],
+    cmd: &[String],
+    config_args: &[String],
+    graft: &str,
+    cwd: &str,
+    ns_file: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        "--ns-file".to_string(),
+        ns_file.to_string(),
+        "--graft".to_string(),
+        graft.to_string(),
+        "--cwd".to_string(),
+        cwd.to_string(),
+        "--".to_string(),
+    ];
+    argv.extend(entrypoint.iter().map(|e| graft_prefix(e, graft)));
+    if config_args.is_empty() {
+        argv.extend(cmd.iter().map(|c| graft_prefix(c, graft)));
+    } else {
+        argv.extend(config_args.iter().cloned());
+    }
+    argv
+}
+
 /// Whether an *exec-stdio* sidecar needs the in-container user bootstrap: it
 /// hosts at least one exec-stdio server (exec needs `--user` and `HOME`), sees
 /// the workspace, or declares mounts. Shared by the config-plan path and
@@ -200,6 +253,7 @@ pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan
                 image: sidecar.image.clone(),
                 args: sidecar.args.clone(),
                 workspace: sidecar.workspace,
+                view: sidecar.view,
                 start: sidecar.start,
                 on_failure: sidecar.on_failure,
                 mounts: sidecar.mounts.clone(),
@@ -213,8 +267,10 @@ pub fn plan_from_config(cfg: &Config, image_cfg: &ImageConfig) -> SessionMcpPlan
         let placement = if let Some(sc) = spec.sidecar() {
             Placement::Sidecar(sc.to_string())
         } else if let Some(image) = spec.image() {
-            plan.sidecars
-                .insert(name.clone(), SidecarPlan::anonymous(name, image));
+            plan.sidecars.insert(
+                name.clone(),
+                SidecarPlan::anonymous(name, image, spec.view()),
+            );
             Placement::Sidecar(name.clone())
         } else {
             Placement::Primary
@@ -287,6 +343,7 @@ pub fn merge_sidecar_labels(
                     // `args` alongside the placement keys), so there is never
                     // anything to carry across.
                     args: Vec::new(),
+                    view: crate::config::SidecarView::None,
                 },
                 source: McpDeclarationSource::ImageLabel,
                 placement: Placement::Sidecar(sidecar.to_string()),
@@ -689,5 +746,76 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
         assert_eq!(args_for("blockside"), ["/from-block"]);
         assert_eq!(args_for("entryside"), ["/from-entry"]);
         assert_eq!(args_for("c"), ["/inline"]);
+    }
+
+    #[test]
+    fn graft_prefix_only_touches_absolute_paths() {
+        assert_eq!(
+            graft_prefix("/usr/local/bin/node", "/mnt"),
+            "/mnt/usr/local/bin/node"
+        );
+        // Relative elements (PATH-resolved) are left bare.
+        assert_eq!(graft_prefix("node", "/mnt"), "node");
+        assert_eq!(graft_prefix("/", "/mnt"), "/mnt/");
+    }
+
+    #[test]
+    fn primary_view_argv_grafts_entrypoint_passes_config_args_bare() {
+        // The task's worked example: image ENTRYPOINT grafted, config `args`
+        // (a target path) passed bare.
+        let argv = build_primary_view_argv(
+            &[
+                "/usr/local/bin/node".to_string(),
+                "/app/dist/index.js".to_string(),
+            ],
+            &[], // no CMD
+            &["/workspace".to_string()],
+            "/mnt",
+            "/workspace",
+            "/target-ns/mnt",
+        );
+        assert_eq!(
+            argv,
+            [
+                "--ns-file",
+                "/target-ns/mnt",
+                "--graft",
+                "/mnt",
+                "--cwd",
+                "/workspace",
+                "--",
+                "/mnt/usr/local/bin/node",
+                "/mnt/app/dist/index.js",
+                "/workspace",
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_view_argv_grafts_cmd_when_no_config_args() {
+        // No config args -> the image CMD is used, graft-prefixed (OCI: `args`
+        // replace CMD).
+        let argv = build_primary_view_argv(
+            &["/bin/server".to_string()],
+            &["/default/dir".to_string()],
+            &[],
+            "/mnt",
+            "/",
+            "/target-ns/mnt",
+        );
+        assert_eq!(
+            argv,
+            [
+                "--ns-file",
+                "/target-ns/mnt",
+                "--graft",
+                "/mnt",
+                "--cwd",
+                "/",
+                "--",
+                "/mnt/bin/server",
+                "/mnt/default/dir",
+            ]
+        );
     }
 }

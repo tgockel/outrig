@@ -284,7 +284,7 @@ impl NetworkInterceptor {
             )));
         }
 
-        let pid = container_pid(container).await?;
+        let pid = container.pid().await?;
         let sockets = bind_interceptor_sockets(pid)?;
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
@@ -904,32 +904,6 @@ fn select_host_resolvers(
     } else {
         primary
     }
-}
-
-async fn container_pid(container: &Container) -> Result<u32> {
-    let output = process::run_capture_logged(
-        Cmd::new("podman")
-            .args(["inspect", "--format", "{{.State.Pid}}"])
-            .arg(container.name()),
-        "podman",
-        container.transcript().as_ref(),
-    )
-    .await?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let pid = text.trim().parse::<u32>().map_err(|e| {
-        OutrigError::Configuration(format!(
-            "podman inspect {} returned invalid pid: {e}",
-            container.name()
-        ))
-    })?;
-    if pid == 0 {
-        return Err(OutrigError::Configuration(format!(
-            "container {:?} has no running network namespace (not running, and \
-             not materialized by `podman init`)",
-            container.name()
-        )));
-    }
-    Ok(pid)
 }
 
 async fn install_audit_resolv_conf(container: &Container) -> Result<()> {

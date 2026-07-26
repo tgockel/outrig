@@ -39,11 +39,12 @@ use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
     Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountAccess, MountConfig, NetworkMode,
-    SidecarOnFailure, SidecarStart,
+    SidecarOnFailure, SidecarStart, SidecarView,
 };
 use outrig::container::{
     Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
-    LABEL_SESSION, LABEL_SIDECAR, embedded,
+    LABEL_SESSION, LABEL_SIDECAR, PRIMARY_VIEW_GRAFT, PRIMARY_VIEW_NS_FILE, PRIMARY_VIEW_NS_MOUNT,
+    PrimaryView, embedded, enter,
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
 };
 use outrig::image::{self, ImageTag};
@@ -424,6 +425,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         devices: image_cfg.security.devices.clone(),
         no_new_privileges: image_cfg.security.no_new_privileges,
         labels: BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]),
+        primary_view: None,
     };
 
     if let Some(p) = args.explicit_session_dir
@@ -569,6 +571,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         host_workspace: &host_workspace,
         container_workspace: &container_workspace,
         log_dir: &log_dir,
+        session_dir: &session_dir,
         network_mode,
         start_sidecars: args.start_sidecars,
         cli_env: args.cli_env,
@@ -637,6 +640,9 @@ struct SidecarPhaseArgs<'a> {
     host_workspace: &'a Path,
     container_workspace: &'a Path,
     log_dir: &'a Path,
+    /// Session directory; a `view = "primary"` sidecar materializes the
+    /// `outrig-enter` launcher here for its read-only bind.
+    session_dir: &'a Path,
     network_mode: NetworkMode,
     start_sidecars: bool,
     cli_env: &'a CliEnvEntries,
@@ -840,11 +846,39 @@ async fn start_auto_sidecars(
     to_start: Vec<(String, ImageTag, SidecarPlan)>,
     containers: &mut SessionContainers,
 ) -> Result<()> {
+    // A `view = "primary"` sidecar joins the primary's namespaces, so it needs
+    // the primary's PID and the launcher materialized into the session dir.
+    // Resolve both once, up front, only when such a sidecar is starting -- the
+    // primary is already running and bootstrapped by Phase C. `materialize`
+    // fails here (helper not built) rather than emitting a broken container.
+    let primary_view = if to_start
+        .iter()
+        .any(|(_, _, sc)| sc.view == SidecarView::Primary)
+    {
+        let helper_host = enter::materialize(args.session_dir)?;
+        Some(PrimaryView {
+            primary_container: containers.primary.name().to_string(),
+            primary_pid: containers.primary.pid().await?,
+            helper_host,
+        })
+    } else {
+        None
+    };
+    let primary_view = primary_view.as_ref();
+
     let started =
         futures_util::future::join_all(to_start.into_iter().map(|(name, tag, sc)| async move {
             let result = match plan.entrypoint_server_in(&sc) {
                 Some((server_name, placed)) => {
-                    create_one_entrypoint_sidecar(args, &tag, &sc, server_name, &placed.spec).await
+                    create_one_entrypoint_sidecar(
+                        args,
+                        &tag,
+                        &sc,
+                        server_name,
+                        &placed.spec,
+                        primary_view,
+                    )
+                    .await
                 }
                 None => {
                     let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
@@ -980,6 +1014,9 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
             (LABEL_SESSION.to_string(), ctx.sid.to_string()),
             (LABEL_SIDECAR.to_string(), sc.name.clone()),
         ]),
+        // Set by `create_one_entrypoint_sidecar` for a `view = "primary"`
+        // sidecar; every other placement leaves it `None`.
+        primary_view: None,
     }
 }
 
@@ -1037,13 +1074,36 @@ async fn create_one_entrypoint_sidecar(
     sc: &SidecarPlan,
     server_name: &str,
     spec: &outrig::config::McpServerSpec,
+    primary_view: Option<&PrimaryView>,
 ) -> Result<Container> {
     let ctx = args.start_ctx();
-    let launch = sidecar_launch_base(&ctx, sc);
+    let mut launch = sidecar_launch_base(&ctx, sc);
     let (_, env_spec) = spec.normalize();
     let env =
         outrig::resolve_mcp_env(server_name, env_spec, &args.cli_env.for_server(server_name))?;
     let intercept_dns = args.network_mode != NetworkMode::Default;
+
+    // A `view = "primary"` sidecar runs `outrig-enter` as its ENTRYPOINT (set in
+    // the launch flags) and hands it the payload command: the image's own
+    // ENTRYPOINT/CMD graft-prefixed, then the config `args` bare (they name
+    // paths in the primary's view). Every other sidecar passes its entrypoint
+    // args straight through.
+    let create_args: Vec<String> = if sc.view == SidecarView::Primary {
+        let pv =
+            primary_view.expect("primary-view inputs are resolved before any view sidecar starts");
+        let (entrypoint, cmd) = image::read_image_entrypoint_cmd(tag, args.transcript).await?;
+        launch.primary_view = Some(pv.clone());
+        sidecar::build_primary_view_argv(
+            &entrypoint,
+            &cmd,
+            sidecar::entrypoint_args(spec, sc),
+            PRIMARY_VIEW_GRAFT,
+            &ctx.container_workspace.to_string_lossy(),
+            &format!("{PRIMARY_VIEW_NS_MOUNT}/{PRIMARY_VIEW_NS_FILE}"),
+        )
+    } else {
+        sidecar::entrypoint_args(spec, sc).to_vec()
+    };
 
     let container_name = sidecar_container_name(&ctx, sc);
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
@@ -1054,7 +1114,7 @@ async fn create_one_entrypoint_sidecar(
         args.transcript.cloned(),
         &env,
         intercept_dns,
-        sidecar::entrypoint_args(spec, sc),
+        &create_args,
     )
     .await?;
     span.done(format!("sidecar {} created: {}", sc.name, container.name()));

@@ -34,6 +34,17 @@ no agent-invocable tool that starts sidecars; new containers come from the confi
 operator. Session network policy covers every container, so a sidecar is not a way around
 audit or filter mode.
 
+The one placement that *widens* rather than narrows is
+[`view = "primary"`](mcp-servers.md#primary-filesystem-view). Such a sidecar joins the primary's
+mount namespace with `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` and can read the primary's entire
+filesystem -- which is the point, but it means the sidecar image is now **inside** the primary's
+trust boundary, as trusted as the primary image itself, not beside it. What still bounds it: the
+capabilities are scoped to the rootless user namespace (not host root) the primary already runs
+in; it is opt-in and defaults to `"none"`; it is still a container, so cgroups, seccomp, network
+policy, and `no-new-privileges` all still apply; and only the mount namespace is joined -- PID,
+network, and cgroup stay the sidecar's own. Grant it only to a sidecar image you trust with the
+primary's files.
+
 ## Shell tools
 
 Shell MCP servers do not need command allowlists inside a normal OutRig container. Arbitrary code

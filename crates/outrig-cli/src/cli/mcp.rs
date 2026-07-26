@@ -716,6 +716,7 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
             sidecar,
             image,
             args,
+            view,
         } => {
             let mut table = toml_edit::InlineTable::new();
             if let Some(command) = command {
@@ -736,6 +737,12 @@ fn spec_to_toml_value(spec: &McpServerSpec) -> toml_edit::Value {
             }
             if !args.is_empty() {
                 table.insert("args", string_array(args));
+            }
+            match view {
+                outrig::config::SidecarView::None => {}
+                outrig::config::SidecarView::Primary => {
+                    table.insert("view", "primary".into());
+                }
             }
             toml_edit::Value::InlineTable(table)
         }
@@ -856,6 +863,37 @@ mod tests {
         let args = McpArgs::try_parse_from(["mcp", "--volume", "/h:/c:rw"]).expect("arg parses");
         assert_eq!(args.volume.len(), 1);
         assert_eq!(args.volume[0].container, std::path::PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn show_merged_serializes_view_primary_and_elides_default() {
+        let with_view = McpServerSpec::Full {
+            command: None,
+            env: Default::default(),
+            sidecar: None,
+            image: Some("docker.io/mcp/filesystem:latest".to_string()),
+            args: vec!["/workspace".to_string()],
+            view: outrig::config::SidecarView::Primary,
+        };
+        let rendered = spec_to_toml_value(&with_view).to_string();
+        assert!(
+            rendered.contains("view = \"primary\""),
+            "view=primary should serialize: {rendered}"
+        );
+
+        let default_view = McpServerSpec::Full {
+            command: None,
+            env: Default::default(),
+            sidecar: None,
+            image: Some("img".to_string()),
+            args: Vec::new(),
+            view: outrig::config::SidecarView::None,
+        };
+        let rendered = spec_to_toml_value(&default_view).to_string();
+        assert!(
+            !rendered.contains("view"),
+            "default view should be elided: {rendered}"
+        );
     }
 
     /// A plan built exactly the way production builds it: parse a whole

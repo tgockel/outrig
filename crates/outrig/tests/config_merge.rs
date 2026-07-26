@@ -9,7 +9,7 @@ use tempfile::tempdir;
 
 use outrig::config::{
     Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, MountRuleViolation,
-    NetworkAction, NetworkEntry, NetworkMode, SidecarOnFailure, SidecarStart,
+    NetworkAction, NetworkEntry, NetworkMode, SidecarOnFailure, SidecarStart, SidecarView,
     SidecarWorkspaceAccess, merge,
 };
 use outrig::error::OutrigError;
@@ -1802,6 +1802,119 @@ context    = "ctx"
         // Validation-level: the image's ENTRYPOINT is the server.
         cfg.validate(None)
             .expect("entrypoint-stdio form validates clean");
+    }
+
+    #[test]
+    fn view_primary_named_block_validates_clean() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools", args = ["/workspace"] }
+"#,
+        );
+        cfg.validate(None)
+            .expect("view=primary entrypoint-stdio validates clean");
+        assert_eq!(cfg.sidecars["tools"].view, SidecarView::Primary);
+    }
+
+    #[test]
+    fn view_primary_inline_one_liner_validates_clean() {
+        let cfg = image_block(
+            r#"
+  [images.coding.mcp]
+  fs = { image = "docker.io/mcp/filesystem:latest", view = "primary", args = ["/workspace"] }
+"#,
+        );
+        cfg.validate(None)
+            .expect("inline view=primary validates clean");
+        assert_eq!(cfg.images["coding"].mcp["fs"].view(), SidecarView::Primary);
+    }
+
+    #[test]
+    fn view_primary_with_workspace_rejected() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image     = "docker.io/mcp/filesystem:latest"
+  view      = "primary"
+  workspace = "ro"
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::SidecarViewWorkspaceConflict { sidecar } => {
+                assert_eq!(sidecar, "tools");
+            }
+            other => panic!("expected SidecarViewWorkspaceConflict, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_primary_with_drop_all_rejected() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [sidecars.tools.security]
+  capability-profile = "drop-all"
+
+  [images.coding.mcp]
+  fs = { sidecar = "tools" }
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::SidecarViewDropsCaps { sidecar } => {
+                assert_eq!(sidecar, "tools");
+            }
+            other => panic!("expected SidecarViewDropsCaps, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn view_primary_hosting_exec_stdio_rejected() {
+        let cfg = image_block(
+            r#"
+  [sidecars.tools]
+  image = "docker.io/mcp/filesystem:latest"
+  view  = "primary"
+
+  [images.coding.mcp]
+  fs = { command = ["mcp-fs"], sidecar = "tools" }
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::SidecarViewRequiresEntrypoint {
+                sidecar, server, ..
+            } => {
+                assert_eq!(sidecar, "tools");
+                assert_eq!(server, "fs");
+            }
+            other => panic!("expected SidecarViewRequiresEntrypoint, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_view_primary_with_command_rejected() {
+        let cfg = image_block(
+            r#"
+  [images.coding.mcp]
+  fs = { image = "docker.io/mcp/filesystem:latest", command = ["mcp-fs"], view = "primary" }
+"#,
+        );
+        match expect_validation_err(&cfg, None) {
+            ConfigValidationError::McpViewNotInlineEntrypoint { server, .. } => {
+                assert_eq!(server, "fs");
+            }
+            other => panic!("expected McpViewNotInlineEntrypoint, got: {other:?}"),
+        }
     }
 
     #[test]

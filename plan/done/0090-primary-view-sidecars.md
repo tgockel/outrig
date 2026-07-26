@@ -231,3 +231,38 @@ trust boundary, not beside it.
 - `plan/done/0086-sidecar-startup-performance.md` -- the Phase A/B/C bring-up structure.
 - `plan/done/0087-nested-container-runtime.md` -- the precedent for adding launch flags through
   `append_launch_flags`, and for treating a security-relevant key as opt-in with docs.
+
+## Decisions
+
+- **Teardown reuses the existing `PrimaryDied` reap** (`watcher.rs`): a `view = "primary"`
+  sidecar registers in the shared sidecar-name list like any other, so killing the primary
+  already reaps it. No new watcher logic -- the e2e's kill/reap check exercises the existing
+  path.
+- **`SidecarSpec` / `add_sidecar` untouched.** `view` is entrypoint-stdio-only, and the
+  programmatic library facade (`plan_to_launch_parts`) structurally cannot host entrypoint
+  servers, so it never reaches the view placement.
+- **`view` on both forms.** The named `[sidecars.<sc>]` block and the inline one-liner
+  (`{ image = ..., view = "primary" }`) both carry `view`; the one-liner is the quickstart form.
+  `plan/next/0090-config-surface-recheck.md` folded in and removed (0088 already made the config
+  legal; the inline form is wanted).
+- **Launcher argv is a pure `build_primary_view_argv` in `sidecar.rs`**; the podman-level flags
+  (`--userns=container:`, `--cap-add`, the nsfs/helper binds, `--entrypoint`) ride
+  `ContainerLaunchSpec.primary_view` through `append_launch_flags` -- the same seam 0087 used for
+  `devices`/`no-new-privileges`. The graft-prefix rule: image ENTRYPOINT/CMD elements are
+  prefixed with `/mnt`, config `args` are passed bare (they name the primary's paths).
+- **nsfs + helper binds bypass `append_bind_mount`** to emit a plain `:ro`: podman's SELinux
+  `,Z` relabels the source, which is wrong (and fails) for `/proc/<pid>/ns`. The nsfs bind is of
+  the *directory*, not the file (podman forces `MS_REC`, which nsfs rejects on a file).
+- **`container_pid` promoted** to `Container::pid()` and reused by the network interceptor and
+  view sidecars, rather than a second copy.
+- **The launcher's flag-name contract (`--ns-file`/`--graft`/`--cwd`) is duplicated between
+  `sidecar.rs` and `enter/launcher.rs` by necessity**: the launcher is a dependency-free static
+  binary (0089) that cannot import crate constants. The `/target-ns/mnt` `--ns-file` names the
+  mount-ns file `mnt` inside the bound ns directory -- `PRIMARY_VIEW_NS_FILE`, deliberately
+  distinct from the graft `/mnt` despite the coincidence.
+- **Stacked on unmerged 0089** (its `outrig::container::enter` is the consumer target).
+- **Container-level acceptance is a gated e2e** (`primary_view_e2e.rs`, `--features e2e`): it
+  needs podman + image pulls, is not run in CI, and is run by hand. A new Debian/glibc primary
+  fixture (`fixtures/primary-cargo`, `rust:1-slim`) supplies the `/usr/local/cargo/bin/cargo`
+  path no bind mount provides. The e2e suite has unrelated pre-existing compile bit-rot filed in
+  `plan/next/e2e-imageconfig-sidecars-bitrot.md`; the new test compiles and runs in isolation.

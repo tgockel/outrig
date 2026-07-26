@@ -549,6 +549,41 @@ pub async fn read_image_labels(
     })
 }
 
+/// Read a local image's ENTRYPOINT and CMD (OCI `Config.Entrypoint` /
+/// `Config.Cmd`) via `podman image inspect`. Either is empty when the image
+/// leaves it unset (podman renders the field as `null`). Used to reconstruct
+/// the payload command for a `view = "primary"` sidecar, whose real ENTRYPOINT
+/// is replaced by the `outrig-enter` launcher.
+pub async fn read_image_entrypoint_cmd(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<(Vec<String>, Vec<String>)> {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(rename = "Entrypoint", default)]
+        entrypoint: Option<Vec<String>>,
+        #[serde(rename = "Cmd", default)]
+        cmd: Option<Vec<String>>,
+    }
+    let cmd = Cmd::new("podman")
+        .arg("image")
+        .arg("inspect")
+        .arg(&tag.0)
+        .arg("--format")
+        .arg("{{json .Config}}");
+    let output = process::run_capture_logged(cmd, "podman", transcript).await?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let config: Config = serde_json::from_str(text.trim()).map_err(|source| {
+        OutrigError::Configuration(format!(
+            "podman image inspect {tag}: invalid config JSON: {source}"
+        ))
+    })?;
+    Ok((
+        config.entrypoint.unwrap_or_default(),
+        config.cmd.unwrap_or_default(),
+    ))
+}
+
 /// Read OCI labels from a registry ref via `skopeo inspect` without pulling
 /// image layers. Plain image refs are inspected as `docker://<ref>`, and an
 /// already-prefixed `docker://...` ref is accepted. Other explicit skopeo

@@ -595,6 +595,9 @@ impl Outrig {
             devices: spec.security.devices.clone(),
             no_new_privileges: spec.security.no_new_privileges,
             labels: BTreeMap::new(),
+            // The programmatic path never hosts entrypoint-stdio servers, so
+            // it never uses the primary-view placement.
+            primary_view: None,
         };
         let mut container = Container::start(&image_tag, launch).await?;
         container.bootstrap_user().await?;
@@ -732,6 +735,9 @@ impl Outrig {
                 ),
                 (LABEL_SIDECAR.to_string(), spec.name.clone()),
             ]),
+            // The library facade hosts only exec-stdio sidecars, never the
+            // entrypoint-stdio primary-view placement.
+            primary_view: None,
         };
         let container_name =
             crate::container::sidecar_container_name(self.container.session_suffix(), &spec.name);
@@ -911,6 +917,8 @@ async fn connect_sidecar_servers(
             image: None,
             // exec-stdio: `command` is the full argv.
             args: Vec::new(),
+            // `view` is an entrypoint-stdio concern; exec-stdio never uses it.
+            view: crate::config::SidecarView::None,
         };
         let client = match McpClient::connect_via_podman_exec_with_source(
             container,

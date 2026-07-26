@@ -115,6 +115,7 @@ mod tests {
                 sidecar: None,
                 image: None,
                 args: Vec::new(),
+                view: outrig::config::SidecarView::None,
             },
         );
         mcp.insert(

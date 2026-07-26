@@ -117,6 +117,41 @@ Entrypoint sidecars never race session network policy: the container is created 
 with its entrypoint held un-executed, audit/filter interception attaches to its network
 namespace, and only then does the entrypoint run. Its first packet is already subject to policy.
 
+### Primary filesystem view
+
+An entrypoint sidecar can go one step further and run against the **primary container's
+filesystem view** with `view = "primary"` -- the primary's rootfs and every mount, at the
+primary's paths, with the sidecar image supplying its own runtime:
+
+```toml
+[images.dev.mcp]
+# The quickstart one-liner: an off-the-shelf filesystem server over the primary's view.
+fs = { image = "docker.io/mcp/filesystem:latest", view = "primary", args = ["/workspace"] }
+```
+
+The sidecar's `outrig-enter` entrypoint joins the primary's mount namespace and grafts the
+sidecar's own rootfs aside at `/mnt`, then execs the image's server. This is what lets an
+unmodified `docker.io/mcp/filesystem` (Alpine) index a Debian project's tree -- neither image
+knows about the other. `view = "primary"` is entrypoint-stdio only, and mutually exclusive with
+`workspace` (the view already contains it).
+
+**The argument asymmetry.** Because OutRig rebuilds the server's command line, two kinds of path
+in it mean different things:
+
+- Elements from the **sidecar image** -- its `ENTRYPOINT` and `CMD` -- name files in the
+  sidecar's own rootfs, now under the graft. OutRig prefixes absolute ones with `/mnt`.
+- Elements **you wrote in `args`** name paths in the *primary's* view. They are passed bare.
+
+So `args = ["/workspace"]` against an image whose entrypoint is `/usr/local/bin/node
+/app/dist/index.js` runs `/mnt/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
+from the sidecar, the directory from the primary.
+
+`view = "primary"` is a real posture change: the sidecar runs with `CAP_SYS_ADMIN` and
+`CAP_SYS_PTRACE` in the primary's user namespace and can read the primary's whole filesystem.
+See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the `outrig-enter` helper,
+compiled when the `<arch>-unknown-linux-musl` Rust target is installed; without it a
+`view = "primary"` session fails at start with a message naming the missing artifact.
+
 Exec-stdio named sidecars honor their image's `org.outrig.mcp` label with the usual semantics,
 scoped to that sidecar: label-declared servers materialize as exec-stdio servers *in that
 sidecar*, and repo config overrides by server name (the whole entry, placement included). The

@@ -302,6 +302,38 @@ pub enum ConfigValidationError {
     },
 
     #[error(
+        "sidecar {sidecar:?} sets view = \"primary\" and workspace access; the \
+         primary's view already contains the workspace at its real path, so the \
+         two are mutually exclusive"
+    )]
+    SidecarViewWorkspaceConflict { sidecar: String },
+
+    #[error(
+        "sidecar {sidecar:?} sets view = \"primary\" with capability-profile = \
+         \"drop-all\"; joining the primary's namespaces needs CAP_SYS_ADMIN and \
+         CAP_SYS_PTRACE, which drop-all removes"
+    )]
+    SidecarViewDropsCaps { sidecar: String },
+
+    #[error(
+        "image {image:?} sidecar {sidecar:?} sets view = \"primary\" but hosts \
+         exec-stdio server {server:?}; the view runs the launcher as the \
+         container ENTRYPOINT, so it is entrypoint-stdio only"
+    )]
+    SidecarViewRequiresEntrypoint {
+        image: String,
+        sidecar: String,
+        server: String,
+    },
+
+    #[error(
+        "image {image:?} mcp server {server:?} sets view = \"primary\" without \
+         the inline entrypoint-stdio form (an `image` and no `command`); for a \
+         named sidecar, set `view` on its [sidecars.<name>] block instead"
+    )]
+    McpViewNotInlineEntrypoint { image: String, server: String },
+
+    #[error(
         "image {image:?}: sidecar name {name:?} collides with mcp server {name:?}, \
          which declares an anonymous sidecar via `image`; anonymous sidecars occupy \
          their server's name"
@@ -612,6 +644,16 @@ fn validate_mcp_placement(
             });
         }
     }
+    // An entry's own `view` configures the inline anonymous sidecar, so it is
+    // meaningful only in the inline entrypoint-stdio form (an `image`, no
+    // `command`). On a named-sidecar entry the block carries `view`; on a
+    // commanded or unplaced entry there is nothing to view.
+    if spec.view() != super::SidecarView::None && (spec.image().is_none() || spec.has_command()) {
+        return Err(ConfigValidationError::McpViewNotInlineEntrypoint {
+            image: image_name.to_string(),
+            server: server_name.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -641,6 +683,19 @@ fn validate_sidecar_hosting(
     sidecar_name: &str,
     sidecar: &super::SidecarConfig,
 ) -> Result<(), ConfigValidationError> {
+    // `view = "primary"` runs the launcher as the container ENTRYPOINT, so
+    // every server this block hosts for this image must be entrypoint-stdio.
+    if sidecar.view == super::SidecarView::Primary
+        && let Some((exec_server, _)) =
+            servers_hosted_in(image, sidecar_name).find(|(_, spec)| !spec.is_entrypoint_stdio())
+    {
+        return Err(ConfigValidationError::SidecarViewRequiresEntrypoint {
+            image: image_name.to_string(),
+            sidecar: sidecar_name.to_string(),
+            server: exec_server.clone(),
+        });
+    }
+
     let Some((server, _)) =
         servers_hosted_in(image, sidecar_name).find(|(_, spec)| spec.is_entrypoint_stdio())
     else {
@@ -713,6 +768,23 @@ fn validate_sidecar(
 
     let scope = format!("sidecars.{sidecar_name}");
     validate_security(&scope, &sidecar.security)?;
+
+    if sidecar.view == super::SidecarView::Primary {
+        // The primary's view already holds the workspace at its real path;
+        // re-binding it over that is contradictory.
+        if sidecar.workspace != super::SidecarWorkspaceAccess::None {
+            return Err(ConfigValidationError::SidecarViewWorkspaceConflict {
+                sidecar: sidecar_name.to_string(),
+            });
+        }
+        // The view needs the mount capabilities; drop-all removes them, so the
+        // config is contradictory rather than silently re-added.
+        if sidecar.security.capability_profile == super::CapabilityProfile::DropAll {
+            return Err(ConfigValidationError::SidecarViewDropsCaps {
+                sidecar: sidecar_name.to_string(),
+            });
+        }
+    }
 
     // The workspace mount (when enabled) reuses the session's container path,
     // so extra mounts must not collide with it.

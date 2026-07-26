@@ -89,6 +89,36 @@ pub fn sidecar_container_name(session_suffix: &str, sidecar: &str) -> String {
     format!("outrig-{session_suffix}-{sidecar}")
 }
 
+/// Where `outrig-enter` grafts the sidecar's own rootfs -- its `--graft`, and
+/// the prefix OutRig applies to image-supplied program paths.
+pub const PRIMARY_VIEW_GRAFT: &str = "/mnt";
+/// Bind target for the primary's `/proc/<pid>/ns` directory; the launcher's
+/// `--ns-file` is this plus [`PRIMARY_VIEW_NS_FILE`].
+pub const PRIMARY_VIEW_NS_MOUNT: &str = "/target-ns";
+/// The mount-namespace entry inside a `/proc/<pid>/ns` directory. The launcher
+/// joins `<PRIMARY_VIEW_NS_MOUNT>/<this>`. It renders `mnt`, which is *not*
+/// [`PRIMARY_VIEW_GRAFT`] (`/mnt`) despite the coincidence -- this is the nsfs
+/// file named `mnt`, that is the graft directory.
+pub const PRIMARY_VIEW_NS_FILE: &str = "mnt";
+/// Bind target for the materialized launcher, and its `--entrypoint`.
+pub const PRIMARY_VIEW_HELPER_MOUNT: &str = "/outrig-enter";
+
+/// Inputs for a `view = "primary"` sidecar: which primary it joins and the
+/// launcher to bind in. Present only on that placement mode. It swaps
+/// `--userns=keep-id` for `--userns=container:<primary>`, adds
+/// `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE`, binds the primary's nsfs directory and the
+/// launcher (both plain `:ro`, never SELinux-relabeled), and sets
+/// `--entrypoint /outrig-enter`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimaryView {
+    /// Primary container name, for `--userns=container:<name>`.
+    pub primary_container: String,
+    /// Primary init PID, for `-v /proc/<pid>/ns:/target-ns:ro`.
+    pub primary_pid: u32,
+    /// Host path of the materialized `outrig-enter`, bound read-only.
+    pub helper_host: PathBuf,
+}
+
 /// Complete inputs for a `podman run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerLaunchSpec {
@@ -100,6 +130,9 @@ pub struct ContainerLaunchSpec {
     /// Whether to apply `--security-opt=no-new-privileges`.
     pub no_new_privileges: bool,
     pub labels: BTreeMap<String, String>,
+    /// Set for a `view = "primary"` sidecar; drives the namespace-joining
+    /// flags. `None` is every other container.
+    pub primary_view: Option<PrimaryView>,
 }
 
 /// Hand-written rather than derived so that `no_new_privileges` defaults to
@@ -114,6 +147,7 @@ impl Default for ContainerLaunchSpec {
             devices: Vec::new(),
             no_new_privileges: true,
             labels: BTreeMap::new(),
+            primary_view: None,
         }
     }
 }
@@ -339,6 +373,36 @@ impl Container {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The container's init PID via `podman inspect --format {{.State.Pid}}`.
+    /// Errors when the container is not running (`State.Pid == 0`): a created
+    /// but unstarted container has no namespaces to join or intercept. Reused
+    /// by the network interceptor and by `view = "primary"` sidecars.
+    pub async fn pid(&self) -> Result<u32> {
+        let output = process::run_capture_logged(
+            Cmd::new("podman")
+                .args(["inspect", "--format", "{{.State.Pid}}"])
+                .arg(&self.name),
+            "podman",
+            self.transcript.as_ref(),
+        )
+        .await?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let pid = text.trim().parse::<u32>().map_err(|e| {
+            OutrigError::Configuration(format!(
+                "podman inspect {} returned invalid pid: {e}",
+                self.name
+            ))
+        })?;
+        if pid == 0 {
+            return Err(OutrigError::Configuration(format!(
+                "container {:?} has no running namespaces (not running, and not \
+                 materialized by `podman init`)",
+                self.name
+            )));
+        }
+        Ok(pid)
     }
 
     /// Whether the interceptor's resolver was baked in at create time; see
@@ -715,17 +779,47 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
         cmd = append_bind_mount(cmd, &mount.host, &mount.container, mount.access, selinux);
     }
 
-    cmd = cmd.arg("--userns=keep-id");
+    // A `view = "primary"` sidecar binds the primary's nsfs directory and the
+    // launcher. Both use a plain `:ro` and bypass `append_bind_mount`: podman's
+    // SELinux `,Z` relabels the source, which is wrong (and fails) for
+    // `/proc/<pid>/ns`. Bind the nsfs *directory*, not the file -- podman forces
+    // `MS_REC` on a `-v`, which nsfs rejects on a single file.
+    // ...then the userns: a primary-view sidecar must be in the user namespace
+    // that *owns* the primary's mount namespace, so `setns` is permitted; every
+    // other container keeps `--userns=keep-id`. Emitted together with the binds
+    // since nothing goes between them.
+    match &launch.primary_view {
+        Some(pv) => {
+            cmd = cmd.arg("-v").arg(format!(
+                "/proc/{}/ns:{PRIMARY_VIEW_NS_MOUNT}:ro",
+                pv.primary_pid
+            ));
+            cmd = cmd.arg("-v").arg(format!(
+                "{}:{PRIMARY_VIEW_HELPER_MOUNT}:ro",
+                pv.helper_host.display()
+            ));
+            cmd = cmd.arg(format!("--userns=container:{}", pv.primary_container));
+        }
+        None => cmd = cmd.arg("--userns=keep-id"),
+    }
     if let Some(workspace) = &launch.workspace {
         cmd = cmd.arg("-w").arg(&workspace.container);
     }
 
     cmd = append_capability_flags(cmd, &launch.capabilities);
+    // `open_tree`/`setns(CLONE_NEWNS)` need CAP_SYS_ADMIN; opening the target's
+    // nsfs file needs CAP_SYS_PTRACE. Scoped to the rootless user namespace.
+    if launch.primary_view.is_some() {
+        cmd = cmd.arg("--cap-add=SYS_ADMIN").arg("--cap-add=SYS_PTRACE");
+    }
     for device in &launch.devices {
         cmd = cmd.arg(format!("--device={device}"));
     }
     if launch.no_new_privileges {
         cmd = cmd.arg("--security-opt=no-new-privileges");
+    }
+    if launch.primary_view.is_some() {
+        cmd = cmd.arg("--entrypoint").arg(PRIMARY_VIEW_HELPER_MOUNT);
     }
     cmd.arg("--pull=never")
 }
@@ -1167,6 +1261,112 @@ mod tests {
                 "docker.io/mcp/filesystem:latest",
                 "/workspace",
                 "--read-only",
+            ]
+        );
+    }
+
+    /// A `view = "primary"` sidecar joins the primary's namespaces: the nsfs
+    /// *directory* and the launcher bind in with a plain `:ro` (never `,Z`,
+    /// even under SELinux), `--userns=container:` replaces `keep-id`, the mount
+    /// caps are added, and the launcher is the `--entrypoint`. The launcher
+    /// argv (graft-prefixed program + bare target arg) rides the trailing slot.
+    #[test]
+    fn podman_create_args_for_primary_view_join_the_primary() {
+        let launch = ContainerLaunchSpec {
+            primary_view: Some(PrimaryView {
+                primary_container: "outrig-abc-primary".to_string(),
+                primary_pid: 4242,
+                helper_host: PathBuf::from("/sess/outrig-enter"),
+            }),
+            ..Default::default()
+        };
+        let launcher_argv: Vec<String> = [
+            "--ns-file",
+            "/target-ns/mnt",
+            "--graft",
+            "/mnt",
+            "--cwd",
+            "/workspace",
+            "--",
+            "/mnt/usr/local/bin/node",
+            "/mnt/app/dist/index.js",
+            "/workspace",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // selinux=true to prove the nsfs/helper binds stay a plain `:ro`.
+        let args = argv(build_podman_create_cmd(
+            &ImageTag("docker.io/mcp/filesystem:latest".to_string()),
+            "outrig-abc-tools",
+            &launch,
+            true,
+            &BTreeMap::new(),
+            false,
+            &launcher_argv,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--name",
+                "outrig-abc-tools",
+                "-v",
+                "/proc/4242/ns:/target-ns:ro",
+                "-v",
+                "/sess/outrig-enter:/outrig-enter:ro",
+                "--userns=container:outrig-abc-primary",
+                "--cap-add=SYS_ADMIN",
+                "--cap-add=SYS_PTRACE",
+                "--security-opt=no-new-privileges",
+                "--entrypoint",
+                "/outrig-enter",
+                "--pull=never",
+                "--interactive",
+                "--rm",
+                "docker.io/mcp/filesystem:latest",
+                "--ns-file",
+                "/target-ns/mnt",
+                "--graft",
+                "/mnt",
+                "--cwd",
+                "/workspace",
+                "--",
+                "/mnt/usr/local/bin/node",
+                "/mnt/app/dist/index.js",
+                "/workspace",
+            ]
+        );
+    }
+
+    /// Every non-view container keeps the pre-change argv exactly: `keep-id`,
+    /// no cap-adds, no nsfs bind, no `--entrypoint`.
+    #[test]
+    fn podman_create_args_without_view_are_byte_identical() {
+        let args = argv(build_podman_create_cmd(
+            &ImageTag("local:test".to_string()),
+            "outrig-test-noview",
+            &ContainerLaunchSpec::default(),
+            false,
+            &BTreeMap::new(),
+            false,
+            &[],
+        ));
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "create",
+                "--name",
+                "outrig-test-noview",
+                "--userns=keep-id",
+                "--security-opt=no-new-privileges",
+                "--pull=never",
+                "--interactive",
+                "--rm",
+                "local:test",
             ]
         );
     }

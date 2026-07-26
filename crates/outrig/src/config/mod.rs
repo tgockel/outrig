@@ -903,6 +903,12 @@ pub struct SidecarConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub workspace: SidecarWorkspaceAccess,
+    /// Whether the sidecar runs against the primary container's filesystem
+    /// view (`view = "primary"`) or its own image's (`"none"`, the default).
+    /// `"primary"` requires an entrypoint-stdio host and is mutually
+    /// exclusive with `workspace`.
+    #[serde(default)]
+    pub view: SidecarView,
     #[serde(default)]
     pub start: SidecarStart,
     #[serde(default)]
@@ -931,6 +937,27 @@ impl SidecarWorkspaceAccess {
             Self::Ro => Some(MountAccess::ReadOnly),
             Self::Rw => Some(MountAccess::ReadWrite),
         }
+    }
+}
+
+/// Whether a sidecar sees the primary container's filesystem view. Default:
+/// its own image's filesystem (`None`). `Primary` runs the sidecar's payload
+/// inside the primary's mount namespace via the `outrig-enter` launcher, so a
+/// third-party MCP image sees the primary's rootfs and paths without the
+/// primary image carrying that tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SidecarView {
+    #[default]
+    None,
+    Primary,
+}
+
+impl SidecarView {
+    /// Whether this is the default (`None`) view -- used to elide the key from
+    /// serialization so entries without it stay byte-identical.
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
     }
 }
 
@@ -1020,6 +1047,12 @@ pub enum McpServerSpec {
         /// empty, so an entry without it serializes exactly as before.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
+        /// Filesystem view for the inline anonymous entrypoint-stdio form
+        /// (`image` set, no `command`): `"primary"` runs the image against the
+        /// primary container's view. Elided when default, so an entry without
+        /// it serializes exactly as before.
+        #[serde(default, skip_serializing_if = "SidecarView::is_none")]
+        view: SidecarView,
     },
 }
 
@@ -1057,6 +1090,15 @@ impl McpServerSpec {
         match self {
             Self::Short(_) => &[],
             Self::Full { args, .. } => args,
+        }
+    }
+
+    /// Filesystem view for the inline anonymous entrypoint-stdio form.
+    /// Always `None` for `Short` and for `Full` without `view`.
+    pub fn view(&self) -> SidecarView {
+        match self {
+            Self::Short(_) => SidecarView::None,
+            Self::Full { view, .. } => *view,
         }
     }
 

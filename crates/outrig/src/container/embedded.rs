@@ -545,6 +545,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
+            view: crate::config::SidecarView::None,
             sidecar: None,
             image: None,
             args: Vec::new(),
