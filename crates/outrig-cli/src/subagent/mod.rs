@@ -119,7 +119,7 @@ impl SubagentRegistry {
         }
 
         let shared = Arc::new(SubagentShared::new());
-        let (agent, child) = build_subagent_agent(&self.ctx, &shared, preamble).await?;
+        let (agent, child) = build_subagent_agent(&self.ctx, &shared, name, preamble).await?;
 
         let (prompts, rx) = mpsc::unbounded_channel();
         prompts
@@ -388,6 +388,7 @@ impl Entry {
 async fn build_subagent_agent(
     ctx: &SubagentContext,
     shared: &Arc<SubagentShared>,
+    name: &str,
     preamble: Option<String>,
 ) -> Result<(crate::llm::RigAgent, Option<Arc<SubagentRegistry>>), String> {
     let mut resolved = ctx.resolved.clone();
@@ -396,6 +397,9 @@ async fn build_subagent_agent(
     let mut tools = ctx.mcp_tools.clone();
     tools.push(SessionTool::new(crate::builtin_tool::SetResultTool::new(
         shared.clone(),
+        name,
+        &ctx.resolved.agent_name,
+        ctx.resolved.max_tokens,
     )));
 
     // This subagent lives at `ctx.depth`. If that is under the max, hand it its
@@ -499,7 +503,17 @@ async fn run_rounds(
         );
 
         match outcome {
-            Ok(reply) => log.record_reply(&reply).await,
+            Ok(end) => {
+                log.record_reply(&end.reply).await;
+                // Recorded before `end_round` so that a round which published
+                // nothing can tell the parent *why* it stopped instead of only
+                // that it did. Does not displace a truncated report: running
+                // out of tool calls is what follows from a report that would
+                // not fit.
+                if let Some(reason) = end.stopped_early {
+                    shared.note_ended_early(reason);
+                }
+            }
             Err(e) => {
                 // Publish only; the transcript entry comes from the outcome
                 // block below, which would otherwise record this twice.

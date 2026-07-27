@@ -83,13 +83,51 @@ the model's output-token ceiling. A reply cut off part-way arrives as a `set_res
 `status` present and `body` missing, because fields generate in schema order.
 
 OutRig recognizes that shape rather than passing a bare "missing field" back: the subagent is told
-its report was probably truncated and asked to shorten it, which is something it can act on. If the
-round still ends without publishing, the parent is told the subagent hit its output token limit --
-not merely that it stopped -- so it can re-ask with a narrower scope.
+its report was probably truncated and asked to shorten it, which is something it can act on.
+
+That ask is bounded, because the ceiling does not move between attempts. A subagent that could
+have fit the report in `body` does it when first asked; past that it regenerates the same oversized
+body and fails the same way, so retrying only spends model calls:
+
+| Attempt | What the subagent is told                                                   |
+| ------- | --------------------------------------------------------------------------- |
+| 1st     | The report was probably cut off -- call again with a shorter `body`.        |
+| 2nd     | Stop chasing the report; send `status: "error"` with a one-sentence `body`. |
+| 3rd     | The failure has been reported upward already -- stop calling.               |
+| 4th on  | The same refusal, unchanged.                                                |
+
+The third attempt is what makes this end. OutRig publishes the truncation as that round's outcome
+on the subagent's behalf, so a parent blocked in `outrig__get_result` wakes with the cause
+immediately instead of once the subagent's whole tool-call budget has drained into one call that
+could not succeed.
+
+Having given up, the round stays given up: it publishes and warns once, and every later truncated
+call gets the same refusal. That refusal is a tool *failure*, not a success, so identical repeats
+keep accumulating against the breaker below -- which is what ends the round if the subagent will
+not take the hint.
 
 The durable fix is a bigger ceiling. `max-tokens` is unset by default, which leaves the limit to
-the provider, and that default can be much lower than expected behind a gateway. Set
+the provider, and that default can be much lower than expected behind a gateway. The first
+truncated attempt prints one line to stderr naming the agent and whether its `max-tokens` is set,
+because that is the part a human -- not the model -- has to act on. Set
 `[agents.<name>].max-tokens` explicitly if subagents produce long reports.
+
+### Repeating a failing call does not pay
+
+The same shape shows up beyond `set_result`: a model that cannot act on a tool error tends to
+re-emit the identical call rather than try something else. Within a subagent round, OutRig counts
+consecutive failures of the same tool called with **identical arguments**. The second such failure
+gets a note appended to the tool result saying that repeating will not change the outcome; the
+fourth ends the round. Changing the arguments, or any call that succeeds, resets the count -- a
+subagent taking the hint is making progress, not looping.
+
+A round ended this way publishes nothing, so its parent is told the reason it stopped rather than
+the bare "stopped without calling `outrig__set_result`". The same is true of a round that runs out
+of tool calls.
+
+This applies to subagents only. Nothing about it is specific to reporting -- any tool can be looped
+on -- but the primary agent has someone sitting in front of it who can interrupt, while a subagent
+loops unattended inside its parent's tool call.
 
 ### Reading is edge-triggered
 

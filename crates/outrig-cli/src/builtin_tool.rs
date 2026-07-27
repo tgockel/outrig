@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::rig_tool::truncate_for_llm;
 use crate::subagent::SubagentRegistry;
-use crate::subagent::state::{Outcome, SubagentShared};
+use crate::subagent::state::{Outcome, SubagentShared, TRUNCATED_REPORT};
 
 /// Wraps a failure as the model-visible tool error.
 #[derive(Debug, thiserror::Error)]
@@ -438,17 +438,102 @@ fn looks_truncated(args: &str) -> bool {
     map.contains_key("status") && !map.contains_key("body")
 }
 
+/// How many times a subagent is asked to retry a report that arrived without a
+/// `body` before OutRig gives up on its behalf.
+///
+/// Two, because the retry is a long shot and each one costs a model call. The
+/// ceiling that cut the report off does not move between attempts, so a model
+/// that could have fit the report in `body` would have done it when first
+/// asked; past that the same oversized body is regenerated and fails
+/// identically. Left unbounded this ran until the per-turn tool-call max --
+/// roughly fifty model calls spent to learn what the first failure already
+/// said.
+const TRUNCATION_RETRY_BUDGET: u32 = 2;
+
+/// The first ask: name the likely cause, because serde's own "missing field
+/// `body`" gives the model no reason to do anything differently.
+const SHORTEN_THE_REPORT: &str = "\
+    nothing was recorded: `status` arrived but `body` did not. That usually \
+    means the reply hit the output token limit part-way through the report. \
+    Call again with a shorter `body` -- summarize your findings rather than \
+    quoting at length. If it genuinely cannot be shortened, say so via \
+    `status: \"error\"` with a short `body`.";
+
+/// What every truncated call gets once the round has given up.
+///
+/// Deliberately a *failure* rather than a success. Returning `Ok` here read as
+/// "call handled" to the repeat breaker in [`crate::llm::RepeatTracker`], which
+/// clears its count on any success -- so the one backstop that could have ended
+/// the round was disarmed by the give-up it was meant to catch. Failing keeps
+/// identical calls accumulating until the breaker stops the round.
+const ALREADY_REPORTED: &str = "\
+    nothing further was recorded. The agent that launched you has already been \
+    told that your reply is being cut off at its output-token limit, so this \
+    report cannot be delivered. Stop calling outrig__set_result.";
+
+/// The last ask. Retrying the report is off the table by now, so this asks for
+/// the one thing that still fits: a short error the parent can act on.
+const SEND_A_SHORT_ERROR: &str = "\
+    still nothing recorded: `body` was missing again, so the report is being \
+    cut off before it is written. Do not attempt the full report a third time \
+    -- it will be cut off in the same place. Call once more with `status: \
+    \"error\"` and a one-sentence `body` naming what you found and that the \
+    report did not fit.";
+
 /// `outrig__set_result`: the subagent-side tool. Publishes into the inbox the
 /// parent reads, and does **not** end the round -- the subagent may keep
 /// working and publish again, in which case the later value wins.
 #[derive(Clone)]
 pub struct SetResultTool {
     shared: Arc<SubagentShared>,
+    /// This subagent's handle, for the trace prefix, matching the shape the
+    /// agent loop's own traces use.
+    label: Arc<str>,
+    /// The agent whose `max-tokens` governs the ceiling being hit, and that
+    /// setting's current value. Carried only to name the fix in the one
+    /// operator-facing warning below.
+    agent_name: Arc<str>,
+    max_tokens: Option<u32>,
 }
 
 impl SetResultTool {
-    pub fn new(shared: Arc<SubagentShared>) -> Self {
-        Self { shared }
+    pub fn new(
+        shared: Arc<SubagentShared>,
+        label: &str,
+        agent_name: &str,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            shared,
+            label: Arc::from(label),
+            agent_name: Arc::from(agent_name),
+            max_tokens,
+        }
+    }
+
+    /// Tell the operator what the model cannot: that this is a configuration
+    /// ceiling, and which knob moves it.
+    ///
+    /// The subagent's own retries are model-facing and say nothing useful to a
+    /// human reading the log; without this the only trace of the cause is a
+    /// wall of identical tool-call errors.
+    fn warn_about_the_ceiling(&self) {
+        let remedy = match self.max_tokens {
+            Some(limit) => format!(
+                "[agents.{}].max-tokens is {limit} -- raise it",
+                self.agent_name
+            ),
+            None => format!(
+                "[agents.{}].max-tokens is unset, so the provider's default \
+                 applies -- set it explicitly",
+                self.agent_name
+            ),
+        };
+        eprintln!(
+            "[outrig]   [{}] set_result was cut off before `body`: the model's \
+             output-token ceiling is too low for this report. {remedy}.",
+            self.label
+        );
     }
 }
 
@@ -496,15 +581,32 @@ impl ToolDyn for SetResultTool {
                 // Remember it on the subagent too: if the round goes on to end
                 // without publishing, the parent gets the cause rather than a
                 // bare "it stopped".
-                self.shared.note_truncated_attempt();
-                return fail(
-                    "nothing was recorded: `status` arrived but `body` did not. \
-                     That usually means the reply hit the output token limit \
-                     part-way through the report. Call again with a shorter \
-                     `body` -- summarize your findings rather than quoting at \
-                     length. If it genuinely cannot be shortened, say so via \
-                     `status: \"error\"` with a short `body`.",
-                );
+                let attempt = self.shared.note_truncated_attempt();
+                // Checked before the attempt count, and latched rather than
+                // derived from it, so that everything below happens exactly
+                // once per round however many truncated calls keep arriving.
+                if self.shared.has_given_up() {
+                    return fail(ALREADY_REPORTED);
+                }
+                return match attempt {
+                    1 => {
+                        self.warn_about_the_ceiling();
+                        fail(SHORTEN_THE_REPORT)
+                    }
+                    n if n <= TRUNCATION_RETRY_BUDGET => fail(SEND_A_SHORT_ERROR),
+                    // Out of retries. Publishing on the subagent's behalf is
+                    // what makes this converge: `end_round` sees a round that
+                    // published, and a parent blocked in `get_result` wakes now
+                    // with the cause instead of once the tool-call budget has
+                    // drained into the same failing call.
+                    _ => {
+                        if self.shared.give_up() {
+                            self.shared
+                                .publish(Outcome::Error(TRUNCATED_REPORT.to_string()));
+                        }
+                        fail(ALREADY_REPORTED)
+                    }
+                };
             }
             let args: SetResultArgs = parse_args(&args)?;
             // `required` keeps the fields present; it cannot keep `body`
@@ -516,6 +618,10 @@ impl ToolDyn for SetResultTool {
                      full report in `body`.",
                 );
             }
+            // A body that arrived whole is the only evidence that the ceiling
+            // is survivable, so it -- and not merely publishing -- is what
+            // restores the retry budget.
+            self.shared.note_report_fit();
             match args.status {
                 ResultStatus::Result => {
                     self.shared.publish(Outcome::Result(args.body));
@@ -580,10 +686,27 @@ mod tests {
     /// made that call constantly. `required` is the constraint that actually
     /// stops it -- if these fields ever become optional again, the empty call
     /// comes back.
+    /// A tool over a fresh inbox with a round already open, which is the state
+    /// every `set_result` call actually arrives in.
+    fn set_result_tool() -> (SetResultTool, Arc<SubagentShared>) {
+        let shared = Arc::new(SubagentShared::new());
+        shared.begin_round();
+        (
+            SetResultTool::new(shared.clone(), "audit", "primary", None),
+            shared,
+        )
+    }
+
+    /// The truncated shape, as it arrives from the provider: `status` present
+    /// because it generates first, `body` lost to the ceiling.
+    async fn truncated_call(tool: &SetResultTool) -> Result<String, ToolError> {
+        tool.call(r#"{"status":"result"}"#.to_string()).await
+    }
+
     #[test]
     fn set_result_schema_requires_both_fields() {
-        let shared = Arc::new(SubagentShared::new());
-        let schema = SetResultTool::new(shared).parameters();
+        let (tool, _shared) = set_result_tool();
+        let schema = tool.parameters();
 
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -615,8 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_result_publishes_under_the_status_it_was_given() {
-        let shared = Arc::new(SubagentShared::new());
-        let tool = SetResultTool::new(shared.clone());
+        let (tool, shared) = set_result_tool();
 
         tool.call(r#"{"status":"result","body":"found it"}"#.to_string())
             .await
@@ -642,11 +764,9 @@ mod tests {
     /// model regenerates the same oversized body forever.
     #[tokio::test]
     async fn a_missing_body_is_reported_as_probable_truncation() {
-        let shared = Arc::new(SubagentShared::new());
-        let tool = SetResultTool::new(shared.clone());
+        let (tool, shared) = set_result_tool();
 
-        let err = tool
-            .call(r#"{"status":"result"}"#.to_string())
+        let err = truncated_call(&tool)
             .await
             .expect_err("status without body");
         let message = err.to_string();
@@ -654,9 +774,126 @@ mod tests {
         assert!(message.contains("shorter"), "got: {message}");
         assert_eq!(shared.snapshot().version, 0, "nothing should publish");
         assert!(
-            shared.snapshot().truncated_attempt,
+            shared.snapshot().silent_cause.is_some(),
             "the cause must survive onto the subagent, so a round that ends \
              without publishing can explain itself to the parent"
+        );
+    }
+
+    /// The second ask stops chasing the report. The ceiling has not moved, so
+    /// asking again for a shorter version of the same thing is what produced
+    /// the original loop; the remaining useful action is a short error.
+    #[tokio::test]
+    async fn the_second_truncated_attempt_asks_for_a_short_error_instead() {
+        let (tool, shared) = set_result_tool();
+
+        truncated_call(&tool).await.expect_err("first attempt");
+        let err = truncated_call(&tool).await.expect_err("second attempt");
+
+        let message = err.to_string();
+        assert!(message.contains("one-sentence"), "got: {message}");
+        assert!(
+            message.contains("Do not attempt the full report"),
+            "got: {message}"
+        );
+        assert_eq!(shared.snapshot().version, 0, "still nothing published");
+    }
+
+    /// The bug this whole change exists for: the retry never converged, so the
+    /// subagent spent its entire tool-call budget on one call that could not
+    /// succeed. Past the budget OutRig reports on its behalf, which both ends
+    /// the loop and unblocks a parent waiting in `get_result`.
+    #[tokio::test]
+    async fn a_third_truncated_attempt_publishes_the_failure_and_stops_asking() {
+        let (tool, shared) = set_result_tool();
+
+        truncated_call(&tool).await.expect_err("first attempt");
+        truncated_call(&tool).await.expect_err("second attempt");
+        let err = truncated_call(&tool).await.expect_err("past the budget");
+
+        assert!(
+            err.to_string().contains("Stop calling outrig__set_result"),
+            "got: {err}"
+        );
+        assert_eq!(
+            shared.snapshot().outcome,
+            Some(Outcome::Error(TRUNCATED_REPORT.to_string())),
+            "the parent must be told the cause, not left waiting"
+        );
+        assert_eq!(
+            shared.snapshot().state,
+            crate::subagent::state::RunState::Running,
+            "publishing does not end the round"
+        );
+    }
+
+    /// The give-up used to reset its own budget, because it published and
+    /// `publish` cleared the tally -- so the fourth call counted as a first
+    /// attempt and the three-strike cycle restarted, re-warning and
+    /// re-publishing for the rest of the round. Stopping at the third call is
+    /// exactly what hid it, so this test keeps going.
+    #[tokio::test]
+    async fn giving_up_stays_given_up() {
+        let (tool, shared) = set_result_tool();
+
+        for _ in 0..3 {
+            truncated_call(&tool).await.expect_err("up to the give-up");
+        }
+        let version_at_give_up = shared.snapshot().version;
+
+        for call in 4..=9 {
+            let err = truncated_call(&tool)
+                .await
+                .expect_err("every later call is refused the same way");
+            assert!(
+                err.to_string().contains("already been told"),
+                "call {call} restarted the retry cycle: {err}"
+            );
+        }
+        assert_eq!(
+            shared.snapshot().version,
+            version_at_give_up,
+            "the failure is published once, not once per cycle"
+        );
+    }
+
+    /// Returning `Ok` from the give-up cleared [`crate::llm::RepeatTracker`]'s
+    /// count, disarming the one backstop that could still end the round. The
+    /// two mechanisms cancelled each other on the exact case both were written
+    /// for, so the give-up must read as a failure.
+    #[tokio::test]
+    async fn every_truncated_call_reads_as_a_failure_to_the_breaker() {
+        let (tool, _shared) = set_result_tool();
+
+        for call in 1..=6 {
+            assert!(
+                truncated_call(&tool).await.is_err(),
+                "call {call} succeeded, which would reset the repeat breaker"
+            );
+        }
+    }
+
+    /// The budget counts *consecutive* failures. A subagent that reports, then
+    /// truncates while revising, has shown it can produce a body that fits, so
+    /// it gets the full budget again rather than being cut off at once.
+    #[tokio::test]
+    async fn a_successful_report_restores_the_retry_budget() {
+        let (tool, shared) = set_result_tool();
+
+        truncated_call(&tool).await.expect_err("first attempt");
+        truncated_call(&tool).await.expect_err("second attempt");
+        tool.call(r#"{"status":"result","body":"the short version"}"#.to_string())
+            .await
+            .expect("a body that fits");
+
+        let err = truncated_call(&tool)
+            .await
+            .expect_err("the budget starts over, so this is asked to retry");
+        assert!(err.to_string().contains("shorter"), "got: {err}");
+        assert_eq!(
+            shared.snapshot().outcome,
+            Some(Outcome::Result("the short version".to_string())),
+            "the report that fit must survive the later truncation"
         );
     }
 
@@ -664,8 +901,7 @@ mod tests {
     /// would reach the parent looking like success.
     #[tokio::test]
     async fn set_result_rejects_an_empty_body_without_publishing() {
-        let shared = Arc::new(SubagentShared::new());
-        let tool = SetResultTool::new(shared.clone());
+        let (tool, shared) = set_result_tool();
 
         let err = tool
             .call(r#"{"status":"result","body":"   "}"#.to_string())

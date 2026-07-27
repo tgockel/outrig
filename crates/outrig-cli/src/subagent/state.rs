@@ -10,6 +10,7 @@
 //! with nothing new simply blocks.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use tokio::sync::watch;
 
@@ -19,6 +20,33 @@ use tokio::sync::watch;
 pub enum Outcome {
     Result(String),
     Error(String),
+}
+
+/// What the parent is told when a report is cut off at the output-token
+/// ceiling.
+///
+/// Shared because two places say it: [`Snapshot::read`], for a round that ends
+/// having published nothing, and `set_result` itself, which publishes this
+/// verbatim once it stops asking the subagent to retry. Near-duplicate wordings
+/// would drift, and the parent cannot tell which path it came down anyway.
+pub const TRUNCATED_REPORT: &str = "\
+    subagent hit its output token limit while writing its report, so nothing \
+    was recorded. Re-ask it for a narrower or shorter report, or raise \
+    max-tokens for this agent.";
+
+/// Why a round is heading for -- or ended in -- publishing nothing.
+///
+/// Recorded as it becomes known so that a silent round can say *why* instead of
+/// only that it stopped. Ordering matters: a truncated report is diagnosed
+/// mid-round and outranks the early exit that follows from it, since "it could
+/// not fit its report" explains "it ran out of tool calls" and not the reverse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SilentCause {
+    /// A `set_result` call arrived with `status` and no `body`.
+    TruncatedReport,
+    /// The agent loop was cut short -- the tool-call budget, or a hook that
+    /// stopped it. Carries the reason the loop gave.
+    EndedEarly(String),
 }
 
 /// Whether the subagent is working.
@@ -52,10 +80,10 @@ pub struct Snapshot {
     pub version: u64,
     pub state: RunState,
     pub outcome: Option<Outcome>,
-    /// Whether this round tried to report and was cut off part-way. Kept so a
-    /// round that ends up publishing nothing can say *why* instead of just
-    /// that it stopped.
-    pub truncated_attempt: bool,
+    /// Why this round looks like it will publish nothing, when that is known.
+    /// Kept so a round that ends up publishing nothing can say *why* instead of
+    /// just that it stopped.
+    pub silent_cause: Option<SilentCause>,
 }
 
 impl Snapshot {
@@ -81,13 +109,12 @@ impl Snapshot {
             // still uncollected; the unread result is the more useful answer.
             return self.outcome.clone();
         }
-        Some(Outcome::Error(if self.truncated_attempt {
-            "subagent hit its output token limit while writing its report, so \
-             nothing was recorded. Re-ask it for a narrower or shorter report, \
-             or raise max-tokens for this agent."
-                .to_string()
-        } else {
-            "subagent stopped without calling outrig__set_result".to_string()
+        Some(Outcome::Error(match &self.silent_cause {
+            Some(SilentCause::TruncatedReport) => TRUNCATED_REPORT.to_string(),
+            Some(SilentCause::EndedEarly(reason)) => {
+                format!("subagent stopped before reporting: {reason}")
+            }
+            None => "subagent stopped without calling outrig__set_result".to_string(),
         }))
     }
 }
@@ -101,6 +128,23 @@ pub struct SubagentShared {
     /// Version at the current round's start, so `end_round` can tell whether
     /// this round published.
     round_start_version: Mutex<u64>,
+    /// Consecutive truncated `set_result` attempts in the current round.
+    ///
+    /// Deliberately not in [`Snapshot`]: the parent needs the *fact* that the
+    /// report did not fit, never the tally. The tally exists only so
+    /// `set_result` can stop asking for a retry that keeps failing the same
+    /// way.
+    truncated_attempts: AtomicU32,
+    /// Whether this round already gave up on the subagent's report and told
+    /// the parent so.
+    ///
+    /// A latch, not a counter, and cleared only by [`Self::begin_round`]. It has
+    /// to survive the `publish` that giving up performs: without it that
+    /// publish reset the tally, so the very next truncated call counted as a
+    /// first attempt and the whole three-strike cycle began again -- the loop
+    /// slowed to a third of its old rate rather than stopped, re-warning and
+    /// re-publishing every three calls.
+    gave_up: AtomicBool,
     /// Prompts delivered by the parent mid-round, awaiting injection into the
     /// next model call. See [`crate::subagent::injection`].
     injections: Mutex<Vec<String>>,
@@ -112,11 +156,13 @@ impl SubagentShared {
             version: 0,
             state: RunState::Running,
             outcome: None,
-            truncated_attempt: false,
+            silent_cause: None,
         });
         Self {
             tx,
             round_start_version: Mutex::new(0),
+            truncated_attempts: AtomicU32::new(0),
+            gave_up: AtomicBool::new(false),
             injections: Mutex::new(Vec::new()),
         }
     }
@@ -139,10 +185,56 @@ impl SubagentShared {
         });
     }
 
-    /// Record that a report was cut off part-way. Per round, so a later
-    /// successful round does not inherit an earlier round's explanation.
-    pub fn note_truncated_attempt(&self) {
-        self.tx.send_modify(|snap| snap.truncated_attempt = true);
+    /// Note that a report arrived whole, restoring the truncation retry budget.
+    ///
+    /// Separate from [`Self::publish`] rather than folded into it, because not
+    /// every publish is evidence that the ceiling is survivable: giving up
+    /// publishes too, and resetting there re-armed the very loop the give-up
+    /// exists to end. Only a body that actually fit says anything about what
+    /// the model can produce.
+    pub fn note_report_fit(&self) {
+        self.truncated_attempts.store(0, Ordering::SeqCst);
+    }
+
+    /// Whether this round has already given up on reporting.
+    pub fn has_given_up(&self) -> bool {
+        self.gave_up.load(Ordering::SeqCst)
+    }
+
+    /// Give up on the subagent's report and tell the parent why, once.
+    ///
+    /// Returns whether this call was the one that gave up, so the caller can
+    /// publish and warn exactly once no matter how many more truncated calls
+    /// arrive behind it.
+    pub fn give_up(&self) -> bool {
+        !self.gave_up.swap(true, Ordering::SeqCst)
+    }
+
+    /// Record that a report was cut off part-way, and return how many
+    /// consecutive times that has now happened this round.
+    ///
+    /// The count is what lets `set_result` stop asking: the first failure is
+    /// worth a retry, the third is the same failure three times. Per round, so a
+    /// later successful round does not inherit an earlier round's explanation.
+    pub fn note_truncated_attempt(&self) -> u32 {
+        self.tx
+            .send_modify(|snap| snap.silent_cause = Some(SilentCause::TruncatedReport));
+        self.truncated_attempts.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Record that the agent loop was cut short, so a round that publishes
+    /// nothing can name the reason it stopped.
+    ///
+    /// Does not displace a truncated report: running out of tool calls is what
+    /// *follows* from a report that would not fit, and the report is the cause
+    /// worth reporting.
+    pub fn note_ended_early(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.tx.send_modify(|snap| {
+            if snap.silent_cause.is_none() {
+                snap.silent_cause = Some(SilentCause::EndedEarly(reason));
+            }
+        });
     }
 
     pub fn begin_round(&self) {
@@ -151,9 +243,11 @@ impl SubagentShared {
             .round_start_version
             .lock()
             .expect("round-version mutex poisoned") = version;
+        self.truncated_attempts.store(0, Ordering::SeqCst);
+        self.gave_up.store(false, Ordering::SeqCst);
         self.tx.send_modify(|snap| {
             snap.state = RunState::Running;
-            snap.truncated_attempt = false;
+            snap.silent_cause = None;
         });
     }
 
@@ -209,7 +303,16 @@ mod tests {
             version,
             state,
             outcome,
-            truncated_attempt: false,
+            silent_cause: None,
+        }
+    }
+
+    /// The error text a silent round reads as, or a panic -- every test below
+    /// that asks "what is the parent told?" wants the same unwrapping.
+    fn silent_message(shared: &SubagentShared) -> String {
+        match shared.snapshot().read(0) {
+            Some(Outcome::Error(message)) => message,
+            other => panic!("a silent round should read as an error, got: {other:?}"),
         }
     }
 
@@ -272,10 +375,11 @@ mod tests {
         shared.note_truncated_attempt();
         shared.end_round();
 
-        let Some(Outcome::Error(message)) = shared.snapshot().read(0) else {
-            panic!("a silent round should read as an error");
-        };
-        assert!(message.contains("output token limit"), "got: {message}");
+        assert!(
+            silent_message(&shared).contains("output token limit"),
+            "got: {}",
+            silent_message(&shared)
+        );
     }
 
     #[test]
@@ -287,10 +391,117 @@ mod tests {
 
         shared.begin_round();
         shared.end_round();
-        let Some(Outcome::Error(message)) = shared.snapshot().read(0) else {
-            panic!("a silent round should read as an error");
-        };
-        assert!(!message.contains("output token limit"), "got: {message}");
+        assert!(
+            !silent_message(&shared).contains("output token limit"),
+            "got: {}",
+            silent_message(&shared)
+        );
+    }
+
+    /// Without this the parent is told the subagent "stopped without calling
+    /// outrig__set_result", which names the symptom and hides the cause -- the
+    /// loop was cut short before it ever got the chance.
+    #[test]
+    fn an_early_exit_names_the_reason_it_stopped() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.note_ended_early("tool-call iteration max (50) reached");
+        shared.end_round();
+
+        let message = silent_message(&shared);
+        assert!(
+            message.contains("tool-call iteration max (50)"),
+            "got: {message}"
+        );
+    }
+
+    /// Both causes land in the same round constantly: a report that will not
+    /// fit is retried until the budget is gone. The truncation is the one worth
+    /// telling the parent, since the exhaustion follows from it.
+    #[test]
+    fn a_truncated_report_outranks_the_early_exit_it_causes() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.note_truncated_attempt();
+        shared.note_ended_early("tool-call iteration max (50) reached");
+        shared.end_round();
+
+        let message = silent_message(&shared);
+        assert!(message.contains("output token limit"), "got: {message}");
+        assert!(
+            !message.contains("tool-call iteration max"),
+            "got: {message}"
+        );
+    }
+
+    /// The retry budget keys off *consecutive* failures, so the count has to
+    /// climb across attempts and start over each round.
+    #[test]
+    fn truncated_attempts_count_up_and_reset_per_round() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        assert_eq!(shared.note_truncated_attempt(), 1);
+        assert_eq!(shared.note_truncated_attempt(), 2);
+        shared.end_round();
+
+        shared.begin_round();
+        assert_eq!(
+            shared.note_truncated_attempt(),
+            1,
+            "a fresh round gets a fresh retry budget"
+        );
+    }
+
+    /// A subagent that reports, then truncates while revising, has proven it
+    /// can produce a body that fits -- so the budget starts over rather than
+    /// counting the earlier failures against it.
+    #[test]
+    fn a_report_that_fit_resets_the_truncation_budget() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.note_truncated_attempt();
+        shared.note_truncated_attempt();
+        shared.note_report_fit();
+
+        assert_eq!(shared.note_truncated_attempt(), 1);
+    }
+
+    /// The reset deliberately does *not* ride on `publish`: giving up publishes
+    /// too, and resetting there re-armed the retry cycle the give-up exists to
+    /// end.
+    #[test]
+    fn publishing_alone_does_not_reset_the_truncation_budget() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.note_truncated_attempt();
+        shared.note_truncated_attempt();
+        shared.publish(Outcome::Error("gave up".into()));
+
+        assert_eq!(
+            shared.note_truncated_attempt(),
+            3,
+            "a publish that is not evidence of a body that fit must not restore the budget"
+        );
+    }
+
+    /// The latch is per round and one-shot: it tells the first caller it won,
+    /// every later one that the round has already given up, and resets when the
+    /// parent sends new work.
+    #[test]
+    fn giving_up_latches_once_per_round() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        assert!(!shared.has_given_up());
+        assert!(shared.give_up(), "the first caller gives up");
+        assert!(!shared.give_up(), "later callers do not publish again");
+        assert!(shared.has_given_up());
+
+        shared.end_round();
+        shared.begin_round();
+        assert!(
+            !shared.has_given_up(),
+            "new work from the parent deserves a fresh attempt"
+        );
     }
 
     #[test]
