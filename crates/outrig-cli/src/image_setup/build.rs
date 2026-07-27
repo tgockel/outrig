@@ -24,6 +24,7 @@ use outrig::image::{self, ImageTag};
 
 use crate::cli::session_setup::plural;
 use crate::error::{OutrigError, Result};
+use outrig::error::IoPathExt;
 
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -68,7 +69,7 @@ pub async fn run(
     // so discarding the happy-path logs is fine for a validation command.
     let scratch = tempfile::tempdir()?;
     let host_ws = scratch.path().join("workspace");
-    std::fs::create_dir_all(&host_ws)?;
+    std::fs::create_dir_all(&host_ws).path_ctx("create directory", &host_ws)?;
     let log_dir = scratch.path().join("logs");
 
     let mut container = Container::start(

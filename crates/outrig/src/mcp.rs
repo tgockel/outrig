@@ -24,7 +24,7 @@ use tokio::process::Child;
 
 use crate::config::{EnvValue, McpServerSpec};
 use crate::container::{Container, embedded::McpDeclarationSource};
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{Cmd, Transcript};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -166,9 +166,13 @@ impl McpClient {
         transcript: Option<Transcript>,
         display_command: &[String],
     ) -> Result<Self> {
-        tokio::fs::create_dir_all(log_dir).await?;
+        tokio::fs::create_dir_all(log_dir)
+            .await
+            .path_ctx("create directory", log_dir)?;
         let stderr_path = log_dir.join(format!("{name}.stderr"));
-        let stderr_file = tokio::fs::File::create(&stderr_path).await?;
+        let stderr_file = tokio::fs::File::create(&stderr_path)
+            .await
+            .path_ctx("create", &stderr_path)?;
         let stderr_std = stderr_file.into_std().await;
 
         if let Some(transcript) = transcript {

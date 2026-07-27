@@ -20,6 +20,7 @@ use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
 use outrig::config::{Agent, Config, LlmProvider, Model, Workspace};
+use outrig::error::IoPathExt;
 
 /// Idempotent. Returns `Some(image_name)` when this call wrote the
 /// repo config (the user named an image during the bootstrap), or
@@ -164,7 +165,7 @@ fn load_global_summary(global_path: &Path) -> Result<GlobalSummary> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(GlobalSummary::default());
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e).path_ctx("read", global_path).map_err(Into::into),
     };
     let cfg = Config::load_from_str(&text)?;
     Ok(GlobalSummary {

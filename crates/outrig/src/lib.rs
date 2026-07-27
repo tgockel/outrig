@@ -26,6 +26,11 @@ pub use outrig_::{
 pub use process::Transcript;
 pub use tool_name::{RESERVED_SERVER, sanitize as sanitize_tool_name};
 
+/// Base URL of the published book. User-facing messages must link here rather
+/// than to a `doc/` path -- the repo tree isn't present in an installed
+/// binary, so a relative path is a dead end for anyone who didn't clone.
+pub const PUBLIC_DOC_BASE_URL: &str = "https://tgockel.github.io/outrig/";
+
 /// Load the project config rooted at `dir`. Walks up from `dir` looking
 /// for `.agents/outrig/config.toml`, then merges in the optional `global`
 /// config (repo precedence) and validates the result. Returns the merged

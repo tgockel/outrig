@@ -18,7 +18,7 @@ use tokio::io::{
 use self::dialoguer::DialoguerPrompt;
 use crate::error::{OutrigError, Result};
 
-const PUBLIC_DOC_BASE_URL: &str = "https://tgockel.github.io/outrig/";
+use outrig::PUBLIC_DOC_BASE_URL;
 
 /// Static metadata for one interactive question.
 ///

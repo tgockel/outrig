@@ -33,7 +33,7 @@ use crate::config::{
     NetworkAction, NetworkEntry, NetworkHostPattern, NetworkPolicy, parse_network_host_pattern,
 };
 use crate::container::Container;
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
 const NETWORK_LOG: &str = "network.jsonl";
@@ -250,7 +250,9 @@ impl NetworkInterceptor {
         require_tool("nsenter")?;
         let policy = Arc::new(CompiledNetworkPolicy::new(policy)?);
 
-        tokio::fs::create_dir_all(log_dir).await?;
+        tokio::fs::create_dir_all(log_dir)
+            .await
+            .path_ctx("create directory", log_dir)?;
         let audit = AuditSink::open(log_dir.join(NETWORK_LOG), session_id.to_string()).await?;
 
         Ok(Self {
@@ -431,13 +433,16 @@ impl AuditSink {
     /// handle so records carry that container's name.
     async fn open(path: PathBuf, session_id: String) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .path_ctx("create directory", parent)?;
         }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
-            .await?;
+            .open(&path)
+            .await
+            .path_ctx("open", &path)?;
         Ok(Self {
             file: Arc::new(AsyncMutex::new(file)),
             session_id,
@@ -937,8 +942,10 @@ fn require_tool(name: &str) -> Result<()> {
 }
 
 fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
-    let user_ns = StdFile::open(format!("/proc/{pid}/ns/user"))?;
-    let net_ns = StdFile::open(format!("/proc/{pid}/ns/net"))?;
+    let user_ns_path = format!("/proc/{pid}/ns/user");
+    let net_ns_path = format!("/proc/{pid}/ns/net");
+    let user_ns = StdFile::open(&user_ns_path).path_ctx("open", &user_ns_path)?;
+    let net_ns = StdFile::open(&net_ns_path).path_ctx("open", &net_ns_path)?;
     let (tcp_fd, dns_fd) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
     let tcp = unsafe { std::net::TcpListener::from_raw_fd(tcp_fd) };
     let dns = unsafe { std::net::UdpSocket::from_raw_fd(dns_fd) };

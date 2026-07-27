@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::{default_session_root, resolve_repo_config};
 use outrig::config::Config;
-use outrig::error::{OutrigError, Result};
+use outrig::error::{IoPathExt, OutrigError, Result};
 
 const SESSION_JSON: &str = "session.json";
 
@@ -124,11 +124,11 @@ impl SessionStore {
         explicit_dir: Option<&Path>,
         session: &mut Session,
     ) -> Result<PathBuf> {
-        fs::create_dir_all(&self.root)?;
+        fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
 
         let actual_dir = match explicit_dir {
             Some(dir) => {
-                let canon = fs::canonicalize(dir)?;
+                let canon = fs::canonicalize(dir).path_ctx("resolve", dir)?;
                 let target_json = canon.join(SESSION_JSON);
                 if target_json.exists() {
                     return Err(OutrigError::Configuration(format!(
@@ -139,13 +139,13 @@ impl SessionStore {
                 session.session_dir = canon.clone();
                 write_session_json_atomic(&canon, session)?;
                 let link = self.root.join(&sid.0);
-                std::os::unix::fs::symlink(&canon, &link)?;
+                std::os::unix::fs::symlink(&canon, &link).path_ctx("symlink", &link)?;
                 canon
             }
             None => {
                 let dir = self.root.join(&sid.0);
                 session.session_dir = dir.clone();
-                fs::create_dir_all(&dir)?;
+                fs::create_dir_all(&dir).path_ctx("create directory", &dir)?;
                 write_session_json_atomic(&dir, session)?;
                 dir
             }
@@ -183,7 +183,7 @@ impl SessionStore {
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).path_ctx("read directory", &self.root),
         };
         for entry in entries {
             let entry = entry?;
@@ -195,7 +195,11 @@ impl SessionStore {
                     session.link_target = link_target;
                     out.push(session);
                 }
-                Err(OutrigError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(OutrigError::Path { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -224,15 +228,15 @@ impl SessionStore {
     /// Symlinked: remove the link target's contents *and* the symlink.
     pub fn remove_by_id(&self, id: &SessionId) -> Result<()> {
         let entry = self.root.join(&id.0);
-        let meta = fs::symlink_metadata(&entry)?;
+        let meta = fs::symlink_metadata(&entry).path_ctx("stat", &entry)?;
         if meta.file_type().is_symlink() {
-            let target = fs::read_link(&entry)?;
+            let target = fs::read_link(&entry).path_ctx("read symlink", &entry)?;
             if target.exists() {
-                fs::remove_dir_all(&target)?;
+                fs::remove_dir_all(&target).path_ctx("remove", &target)?;
             }
-            fs::remove_file(&entry)?;
+            fs::remove_file(&entry).path_ctx("remove", &entry)?;
         } else {
-            fs::remove_dir_all(&entry)?;
+            fs::remove_dir_all(&entry).path_ctx("remove", &entry)?;
         }
         Ok(())
     }
@@ -244,12 +248,12 @@ impl SessionStore {
         // even after the target is gone.
         let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         if dir.exists() {
-            fs::remove_dir_all(dir)?;
+            fs::remove_dir_all(dir).path_ctx("remove", dir)?;
         }
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).path_ctx("read directory", &self.root),
         };
         for entry in entries {
             let entry = entry?;
@@ -264,7 +268,7 @@ impl SessionStore {
                 continue;
             };
             if target == canon_dir {
-                fs::remove_file(&path)?;
+                fs::remove_file(&path).path_ctx("remove", &path)?;
             }
         }
         Ok(())
@@ -279,10 +283,10 @@ fn resolve_entry(path: &Path) -> Result<Option<(PathBuf, Option<PathBuf>)>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e).path_ctx("stat", path),
     };
     if meta.file_type().is_symlink() {
-        let tgt = fs::read_link(path)?;
+        let tgt = fs::read_link(path).path_ctx("read symlink", path)?;
         Ok(Some((tgt.clone(), Some(tgt))))
     } else if meta.is_dir() {
         Ok(Some((path.to_path_buf(), None)))
@@ -340,7 +344,7 @@ fn read_session_root(path: &Path) -> Result<Option<PathBuf>> {
     let text = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e).path_ctx("read", path),
     };
     let cfg = Config::load_from_str(&text)?;
     Ok(cfg.session_root)
@@ -374,7 +378,7 @@ pub fn format_duration(d: Duration) -> String {
 }
 
 fn read_session_json(path: &Path) -> Result<Session> {
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(path).path_ctx("read", path)?;
     serde_json::from_slice::<Session>(&bytes).map_err(|e| {
         OutrigError::Configuration(format!("session.json at {}: {}", path.display(), e))
     })

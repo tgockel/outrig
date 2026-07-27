@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 
 const STDERR_TAIL_LIMIT: usize = 1024 * 1024;
 const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
@@ -71,6 +71,17 @@ impl Cmd {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// Label a failure to start this command with the program and full argv.
+    /// Without this a missing `podman` / `buildah` / `git` surfaces as a bare
+    /// "No such file or directory (os error 2)" with nothing to act on.
+    fn spawn_error(&self, source: std::io::Error) -> OutrigError {
+        OutrigError::Spawn {
+            program: self.program,
+            command: self.render(),
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -85,14 +96,17 @@ impl Transcript {
     /// process's stderr.
     pub async fn create(path: &Path, stderr: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .path_ctx("create directory", parent)?;
         }
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)
-            .await?;
+            .await
+            .path_ctx("create", path)?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             stderr,
@@ -125,7 +139,10 @@ impl Transcript {
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
 pub(crate) async fn try_capture(cmd: Cmd) -> Result<Output> {
-    Ok(cmd.to_tokio_command().output().await?)
+    cmd.to_tokio_command()
+        .output()
+        .await
+        .map_err(|e| cmd.spawn_error(e))
 }
 
 /// Spawn the command, capture stdout and stderr, and optionally tee a
@@ -151,7 +168,8 @@ pub(crate) async fn try_capture_logged(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| cmd.spawn_error(e))?;
     let stdout = child
         .stdout
         .take()
@@ -195,7 +213,8 @@ pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| cmd.spawn_error(e))?;
     let stdout = child
         .stdout
         .take()
@@ -266,7 +285,8 @@ pub(crate) async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitS
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| cmd.spawn_error(e))?;
 
     let stderr = child
         .stderr
@@ -294,7 +314,8 @@ pub(crate) async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| cmd.spawn_error(e))?;
     Ok(child)
 }
 

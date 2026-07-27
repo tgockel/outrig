@@ -211,7 +211,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Cmd::Image(args) => match &args.cmd {
             ImageCmd::Add { name, force } => {
-                let cwd = std::env::current_dir()?;
+                let cwd = crate::paths::current_dir()?;
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -224,7 +224,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 Ok(0)
             }
             ImageCmd::Init { dir, force } => {
-                let cwd = std::env::current_dir()?;
+                let cwd = crate::paths::current_dir()?;
                 image_setup::init::run(&cwd, dir.as_deref(), *force)?;
                 Ok(0)
             }
@@ -234,7 +234,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 no_test,
                 no_cache,
             } => {
-                let cwd = std::env::current_dir()?;
+                let cwd = crate::paths::current_dir()?;
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -320,7 +320,7 @@ fn log_filter_spec<'a>(outrig_log: Option<&'a str>, rust_log: Option<&'a str>) -
 /// inside each handler because session lookups can substring-match across
 /// repos and shouldn't fail on a missing repo config.
 fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
-    let cwd = std::env::current_dir()?;
+    let cwd = crate::paths::current_dir()?;
     let global = global_config_path(cli.global_config.as_deref());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -337,7 +337,7 @@ fn repo_cmd_ctx(
     cli: &Cli,
     require_config: bool,
 ) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
-    let cwd = std::env::current_dir()?;
+    let cwd = crate::paths::current_dir()?;
     let repo_config = if require_config {
         resolve_repo_config(cli.config.as_deref(), &cwd)?
     } else {

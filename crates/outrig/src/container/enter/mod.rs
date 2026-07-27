@@ -18,7 +18,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 
 // The pure ELF parser is unit-tested on the host; `launcher.rs` pulls the same
 // file in with `include!` for the musl build. It has no non-test consumer in
@@ -44,7 +44,8 @@ pub fn materialize(session_dir: &Path) -> Result<PathBuf> {
         return Err(OutrigError::FilesystemHelperUnavailable);
     }
     let path = session_dir.join("outrig-enter");
-    std::fs::write(&path, OUTRIG_ENTER)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::write(&path, OUTRIG_ENTER).path_ctx("write", &path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .path_ctx("set permissions on", &path)?;
     Ok(path)
 }

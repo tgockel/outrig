@@ -47,6 +47,7 @@ use outrig::container::{
     PrimaryView, embedded, enter,
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
 };
+use outrig::error::IoPathExt;
 use outrig::image::{self, ImageTag};
 use outrig::network::NetworkInterceptor;
 use outrig::{McpClient, Transcript};
@@ -460,7 +461,9 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let log_dir = session_dir.join("logs");
     if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
         let _ = store.finalize(&sid, SystemTime::now(), 1);
-        return Err(e.into());
+        return Err(e)
+            .path_ctx("create directory", &log_dir)
+            .map_err(Into::into);
     }
 
     let transcript = if args.verbose > 0 {
@@ -1193,7 +1196,7 @@ fn resolve_attach_target(
                 image_cfg_name: image_cfg_name.to_string(),
             })
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e).path_ctx("stat", &session_entry).map_err(Into::into),
     }
 }
 

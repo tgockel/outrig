@@ -6,13 +6,26 @@ use std::path::{Path, PathBuf};
 use directories::{BaseDirs, ProjectDirs};
 use tempfile::NamedTempFile;
 
-use outrig::error::{OutrigError, Result};
+use outrig::error::{IoPathExt, OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
 const IMAGES_REL: &str = ".agents/outrig/images";
 const GLOBAL_CONFIG_FILE: &str = "config.toml";
 const GLOBAL_HOME_DIR: &str = ".outrig";
 const GLOBAL_XDG_DIR: &str = "outrig";
+
+/// The process working directory, with a message that says what went wrong.
+/// The bare `std::env::current_dir()` error is an unqualified ENOENT --
+/// indistinguishable from a missing file -- and it fires whenever the
+/// directory the user launched from has since been deleted or unmounted.
+pub(crate) fn current_dir() -> Result<PathBuf> {
+    std::env::current_dir().map_err(|source| {
+        OutrigError::Configuration(format!(
+            "cannot determine the current directory: {source}\n\
+             help: the directory may have been deleted or unmounted -- `cd` somewhere else and retry"
+        ))
+    })
+}
 
 pub(crate) fn find_repo_root_from(cwd: &Path) -> Result<PathBuf> {
     let mut cur = cwd;
@@ -43,7 +56,7 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         OutrigError::Configuration(format!("path has no parent: {}", path.display()))
     })?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).path_ctx("create directory", parent)?;
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(contents.as_bytes())?;
     tmp.as_file().sync_all()?;

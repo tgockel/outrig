@@ -122,6 +122,27 @@ fn list_includes_auto_and_symlinked_newest_first() {
     assert!(listed[1].link_target.is_none());
 }
 
+/// Foreign directories under the session root must not break listings. This
+/// is load-bearing for the error-context work: `read_session_json` reports a
+/// missing file as `OutrigError::Path`, and `list` skips on exactly that
+/// variant -- if the two ever drift apart, `outrig ls` starts failing outright
+/// instead of ignoring the stray directory.
+#[test]
+fn list_skips_directories_without_session_json() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let mut session = sample_session(&sid);
+    store.create(&sid, None, &mut session).expect("create");
+
+    std::fs::create_dir_all(root.path().join("not-a-session")).expect("foreign dir");
+
+    let listed = store.list().expect("list must not fail on foreign entries");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, sid);
+}
+
 #[test]
 fn get_by_id_and_get_by_path_round_trip() {
     let root = tempfile::tempdir().expect("tempdir root");

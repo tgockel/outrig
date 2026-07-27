@@ -20,7 +20,7 @@ pub use merge::merge;
 pub use validate::{ConfigValidationError, MountRuleViolation};
 pub(crate) use validate::{is_valid_mcp_server_name, is_valid_sidecar_name, mcp_command_is_empty};
 
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 
 /// True when the parse error is an "unknown field" complaint and its span
 /// lands on a `[<dotted.path>]` header whose path has an unquoted `.`. That's
@@ -154,7 +154,7 @@ impl Config {
         let repo_text = match fs::read_to_string(&repo_path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).path_ctx("read", &repo_path),
         };
         let repo_cfg = Self::load_from_str(&repo_text)?;
         reject_repo_network_policy(&repo_text)?;
@@ -163,7 +163,7 @@ impl Config {
             Some(g) => match fs::read_to_string(g) {
                 Ok(text) => Self::load_from_str(&text)?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e).path_ctx("read", g),
             },
             None => Self::default(),
         };

@@ -42,6 +42,7 @@ use crate::error::{OutrigError, Result};
 use outrig::McpClient;
 use outrig::config::{McpServerSpec, NetworkMode};
 use outrig::container::sidecar::{PlacedServer, Placement, SessionMcpPlan};
+use outrig::error::IoPathExt;
 use outrig::image::ImageTag;
 use outrig::mcp_proxy::ProxyServer;
 
@@ -625,7 +626,7 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
 
     match std::fs::metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
-            std::fs::remove_file(path)?;
+            std::fs::remove_file(path).path_ctx("remove", path)?;
             Ok(())
         }
         Ok(_) => Err(OutrigError::Configuration(format!(
@@ -634,7 +635,7 @@ fn prepare_unix_socket(path: &Path) -> Result<()> {
         ))
         .into()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(OutrigError::Io(e).into()),
+        Err(e) => Err(e).path_ctx("stat", path).map_err(Into::into),
     }
 }
 

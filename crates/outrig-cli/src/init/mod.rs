@@ -25,7 +25,7 @@ use crate::init::prompt::{Field, PromptSource};
 use crate::paths::global_config_path;
 
 pub async fn run(force: bool, global_override: Option<&Path>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+    let cwd = crate::paths::current_dir()?;
     let mut prompt = prompt::auto();
     let mut hf = hf::auto();
     run_with(force, global_override, &cwd, &mut prompt, &mut hf).await

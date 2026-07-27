@@ -18,6 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{OutrigError, Result};
 use crate::session::{self, SessionStore};
+use outrig::error::IoPathExt;
 
 const FOLLOW_POLL: Duration = Duration::from_millis(200);
 /// MCP server stderr captures land at `<session>/logs/<server>.stderr` (see
@@ -139,7 +140,11 @@ where
                 .await?;
             return Ok(());
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            return Err(e)
+                .path_ctx("read directory", logs_dir)
+                .map_err(Into::into);
+        }
     };
     while let Some(ent) = rd.next_entry().await? {
         let meta = ent.metadata().await?;
@@ -196,7 +201,7 @@ async fn cat_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Result<
             ))
             .into());
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e).path_ctx("open", path).map_err(Into::into),
     };
     let n = tokio::io::copy(&mut file, stdout).await?;
     stdout.flush().await?;
@@ -207,7 +212,10 @@ async fn cat_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Result<
 /// Loop: stat, if size grew read+write delta, if size shrank reopen from
 /// byte 0 (file was truncated/rotated). Terminates on `ctrl_c`.
 async fn follow_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Result<()> {
-    let mut pos: u64 = tokio::fs::metadata(path).await?.len();
+    let mut pos: u64 = tokio::fs::metadata(path)
+        .await
+        .path_ctx("stat", path)?
+        .len();
     let mut buf = [0u8; 8192];
     loop {
         tokio::select! {
@@ -217,14 +225,14 @@ async fn follow_file<W: AsyncWrite + Unpin>(stdout: &mut W, path: &Path) -> Resu
         let len = match tokio::fs::metadata(path).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).path_ctx("stat", path).map_err(Into::into),
         };
         if len < pos {
             // Truncation/rotation: re-read from the start.
             pos = 0;
         }
         if len > pos {
-            let mut file = tokio::fs::File::open(path).await?;
+            let mut file = tokio::fs::File::open(path).await.path_ctx("open", path)?;
             file.seek(std::io::SeekFrom::Start(pos)).await?;
             loop {
                 let n = file.read(&mut buf).await?;

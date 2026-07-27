@@ -18,6 +18,7 @@ use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::init::repo as init_repo;
 use crate::paths::{global_config_path, image_dir, image_dir_rel, repo_config_path, write_atomic};
+use outrig::error::IoPathExt;
 
 /// CLI entry point. Resolves the repo root from `cwd` (walking up, with a
 /// fallback prompt to bootstrap a fresh `.agents/outrig/config.toml` if
@@ -216,7 +217,7 @@ fn load_doc(cfg_path: &Path) -> Result<DocumentMut> {
     let text = match std::fs::read_to_string(cfg_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e).path_ctx("read", cfg_path).map_err(Into::into),
     };
     text.parse::<DocumentMut>().map_err(|e| {
         OutrigError::Configuration(format!("parsing {}: {e}", cfg_path.display())).into()

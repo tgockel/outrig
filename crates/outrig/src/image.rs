@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec};
 use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_to_labels};
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 
 /// Repository used for build-type images that have no image-config name (the
@@ -84,7 +84,9 @@ impl CacheKey {
     ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
 
-        let dockerfile_bytes = tokio::fs::read(dockerfile).await?;
+        let dockerfile_bytes = tokio::fs::read(dockerfile)
+            .await
+            .path_ctx("read", dockerfile)?;
         hasher.update(&dockerfile_bytes);
 
         let mut block = String::new();
@@ -118,7 +120,9 @@ impl CacheKey {
 
         let mut hasher = blake3::Hasher::new();
 
-        let dockerfile_bytes = tokio::fs::read(dockerfile).await?;
+        let dockerfile_bytes = tokio::fs::read(dockerfile)
+            .await
+            .path_ctx("read", dockerfile)?;
         hasher.update(&dockerfile_bytes);
 
         let mut block = String::new();
@@ -607,7 +611,7 @@ async fn read_remote_image_labels_with_program(
     .await
     {
         Ok(output) => output,
-        Err(OutrigError::Io(source)) if source.kind() == ErrorKind::NotFound => {
+        Err(OutrigError::Spawn { source, .. }) if source.kind() == ErrorKind::NotFound => {
             return Err(OutrigError::Configuration(
                 "`outrig image inspect --remote` requires `skopeo` on PATH".to_string(),
             ));
@@ -1151,7 +1155,9 @@ mod tests {
     ) -> Result<BTreeMap<String, String>> {
         for _ in 0..100 {
             match read_remote_image_labels_with_program(program, image_ref).await {
-                Err(OutrigError::Io(source)) if source.kind() == ErrorKind::ExecutableFileBusy => {
+                Err(OutrigError::Spawn { source, .. })
+                    if source.kind() == ErrorKind::ExecutableFileBusy =>
+                {
                     // Yield so the racing thread can finish its exec and close the
                     // inherited write fd, clearing the busy file.
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
