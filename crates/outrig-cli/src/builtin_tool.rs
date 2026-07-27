@@ -8,8 +8,11 @@
 //! them.
 //!
 //! The set is split by who may call it. The parent-side tools launch and
-//! collect subagents; a subagent gets only [`SetResultTool`]. That split is
-//! what makes recursion impossible -- a subagent has nothing to launch with.
+//! collect subagents; [`SetResultTool`] is how a subagent reports back, so only
+//! a subagent gets it. The two are not exclusive -- a subagent under the depth
+//! limit gets both and can launch subagents of its own. What terminates the
+//! recursion is that the launch tools are withheld at the maximum depth,
+//! leaving that subagent with nothing to launch with.
 
 use std::sync::Arc;
 

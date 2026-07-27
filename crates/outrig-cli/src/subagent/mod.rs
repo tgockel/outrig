@@ -18,6 +18,13 @@
 //! [`build_subagent_agent`] withholds the launch tools once the limit is
 //! reached. Shutdown and release therefore recurse through the whole tree.
 //!
+//! Task ownership deliberately does *not* run through the name map. A registry
+//! keeps a ledger of every task it has spawned ([`Spawned`]), and
+//! [`SubagentRegistry::shutdown`] joins that; the map keyed by name holds only
+//! what the parent agent interacts with. Freeing a name therefore cannot
+//! strand a task with the session's tool clones still in it -- which is the
+//! whole reason shutdown can promise anything to teardown.
+//!
 //! Coordination is on *results*, not run state: see [`state`] for the inbox
 //! and the readable predicate the parent blocks on.
 
@@ -68,18 +75,39 @@ pub struct SubagentContext {
     pub registry: Arc<crate::llm::LlmRegistry>,
 }
 
+/// One live subagent as the *parent* sees it: where to read its results, how
+/// to prompt it, how to stop it. Notably not where its task is owned -- see
+/// [`Spawned`].
 struct Entry {
     shared: Arc<SubagentShared>,
     prompts: mpsc::UnboundedSender<String>,
-    task: JoinHandle<()>,
+    /// Cancellation only. The [`JoinHandle`] lives in the ledger so that
+    /// freeing this name cannot detach the task.
+    abort: tokio::task::AbortHandle,
     /// The parent's read position. Deliberately here rather than on
     /// [`SubagentShared`]: it describes the *reader*, not the subagent.
     watermark: u64,
     /// This subagent's own registry, present only when it was given launch
-    /// tools (i.e. its depth was under the max). Holding it here is what lets
-    /// [`SubagentRegistry::shutdown`] and [`SubagentRegistry::release`] reach
-    /// the whole descendant tree; without it, aborting this task would leave
-    /// grandchildren detached and still holding the session's tool clones.
+    /// tools (i.e. its depth was under the max). An `Arc` clone of the one the
+    /// ledger holds, kept here so [`SubagentRegistry::release`] can cancel this
+    /// subagent's descendants without a search.
+    child: Option<Arc<SubagentRegistry>>,
+}
+
+/// One task this registry spawned, owned independently of the name it was
+/// launched under.
+///
+/// [`SubagentRegistry::shutdown`] joins these, which is why a subagent whose
+/// name was released -- or that lost the name race and was never registered at
+/// all -- is still reaped before teardown. Were the [`JoinHandle`] owned by
+/// [`Entry`] instead, every path that frees a name would have to remember to
+/// hand the task back, and one that forgot would drop an aborted-but-unreaped
+/// task still holding the session's `Arc<McpClient>` clones.
+struct Spawned {
+    task: JoinHandle<()>,
+    /// The registry this subagent launches through, when depth allowed it one.
+    /// Held here, not only on [`Entry`], so the descendant tree stays reachable
+    /// after the name goes away.
     child: Option<Arc<SubagentRegistry>>,
 }
 
@@ -90,6 +118,9 @@ struct Entry {
 pub struct SubagentRegistry {
     ctx: SubagentContext,
     entries: Mutex<BTreeMap<String, Entry>>,
+    /// Every task launched here that has not been swept as finished. The two
+    /// locks are never held at once, so their order is not a hazard.
+    spawned: Mutex<Vec<Spawned>>,
 }
 
 impl SubagentRegistry {
@@ -97,11 +128,16 @@ impl SubagentRegistry {
         Self {
             ctx,
             entries: Mutex::new(BTreeMap::new()),
+            spawned: Mutex::new(Vec::new()),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Entry>> {
         self.entries.lock().expect("subagent registry poisoned")
+    }
+
+    fn spawned_lock(&self) -> std::sync::MutexGuard<'_, Vec<Spawned>> {
+        self.spawned.lock().expect("subagent registry poisoned")
     }
 
     /// Launch a subagent under `name`, running `prompt` as its first round.
@@ -117,6 +153,10 @@ impl SubagentRegistry {
                 "subagent {name:?} is already live; release it first or pick another name"
             ));
         }
+        // Each launch pays for the previous ones' bookkeeping, so a session
+        // that cycles handles does not carry a record per launch for its whole
+        // life. A swept record's task is already reaped and holds nothing.
+        self.spawned_lock().retain(|s| !s.tree_finished());
 
         let shared = Arc::new(SubagentShared::new());
         let (agent, child) = build_subagent_agent(&self.ctx, &shared, name, preamble).await?;
@@ -133,12 +173,22 @@ impl SubagentRegistry {
             rx,
             self.ctx.log_dir.clone(),
         ));
+        let abort = task.abort_handle();
+        // Register before the name check below, not after it: the ledger is
+        // what makes shutdown's guarantee hold no matter which way the rest of
+        // this function exits.
+        self.spawned_lock().push(Spawned {
+            task,
+            child: child.clone(),
+        });
 
         // Re-check under the lock: an await happened above, so another launch
         // could have taken the name in the meantime.
         let mut entries = self.lock();
         if entries.contains_key(name) {
-            task.abort();
+            // The ledger still owns the handle, so shutdown will join this
+            // task rather than leave it detached with its tool clones.
+            abort.abort();
             return Err(format!("subagent {name:?} is already live"));
         }
         entries.insert(
@@ -146,7 +196,7 @@ impl SubagentRegistry {
             Entry {
                 shared,
                 prompts,
-                task,
+                abort,
                 watermark: 0,
                 child,
             },
@@ -286,7 +336,10 @@ impl SubagentRegistry {
     /// otherwise keep running, detached, still calling tools into the session.
     /// This is best-effort cancellation (no awaiting) -- the session is live and
     /// still needs its MCP children, so the awaited reap is left to
-    /// [`Self::shutdown`] at teardown.
+    /// [`Self::shutdown`] at teardown. That hand-off is structural rather than
+    /// a convention this function has to honor: the tasks stay in the ledger,
+    /// which only [`Self::shutdown`] drains, so freeing the names here cannot
+    /// put them out of its reach.
     pub fn release(&self, names: &[String]) -> Result<Vec<String>, String> {
         let mut entries = self.lock();
         let mut released = Vec::new();
@@ -303,14 +356,17 @@ impl SubagentRegistry {
     /// Stop every subagent -- and every subagent *they* launched -- and wait for
     /// all of those tasks to actually end.
     ///
-    /// The waiting is the point. `JoinHandle::abort` only schedules
-    /// cancellation; until the runtime reaps the task it still owns its agent,
-    /// and therefore clones of the session's `Arc<McpClient>`. Returning before
-    /// that happens means `teardown`'s `Arc::try_unwrap` finds outstanding
-    /// refs, skips the graceful MCP shutdown, and leaves the `podman exec`
-    /// children running -- which is what kept the process alive after Ctrl-C.
-    /// A nested subagent holds those clones just as a direct one does, so the
-    /// reap has to reach the whole tree, not only the first layer.
+    /// The waiting is the point. Aborting only schedules cancellation; until
+    /// the runtime reaps the task it still owns its agent, and therefore clones
+    /// of the session's `Arc<McpClient>`. Returning before that happens means
+    /// `teardown`'s `Arc::try_unwrap` finds outstanding refs, skips the
+    /// graceful MCP shutdown, and leaves the `podman exec` children running --
+    /// which is what kept the process alive after Ctrl-C.
+    ///
+    /// "Every subagent" means every task, not every live handle. A nested
+    /// subagent holds those clones just as a direct one does, and so does one
+    /// the parent released a moment ago, so the reap walks the ledger -- which
+    /// outlives names -- through the whole tree.
     pub async fn shutdown(&self) {
         // One grace budget for the entire tree: a wedged subagent anywhere
         // delays exit rather than preventing it.
@@ -326,20 +382,31 @@ impl SubagentRegistry {
         }
     }
 
-    /// Recursively abort this registry's subagents and all their descendants,
-    /// waiting for every task to be reaped. Descendants are drained before this
-    /// level's tasks are joined, so tool clones release bottom-up: the deepest
-    /// subagent must be gone before teardown's `Arc::try_unwrap` at the top.
+    /// Recursively abort every task this registry spawned and all their
+    /// descendants, waiting for each to be reaped. Descendants are drained
+    /// before this level's tasks are joined, so tool clones release bottom-up:
+    /// the deepest subagent must be gone before teardown's `Arc::try_unwrap`
+    /// at the top.
+    ///
+    /// The ledger, not the name map, is what gets drained -- a subagent
+    /// released mid-session is exactly as much of a teardown problem as a live
+    /// one, and by then it has no name.
     fn shutdown_tree(&self) -> futures_util::future::BoxFuture<'_, ()> {
         Box::pin(async move {
-            let entries = std::mem::take(&mut *self.lock());
+            // Names go first: nothing can be launched into a registry being
+            // torn down, and a read of a gone subagent should say so. Dropping
+            // the entries is safe for the recursion below, because each one's
+            // `child` is only an `Arc` clone of the ledger's.
+            self.lock().clear();
+            let spawned = std::mem::take(&mut *self.spawned_lock());
             // Abort every task at this level up front so the whole layer is
             // cancelling in parallel while we drain the layers beneath it.
-            for entry in entries.values() {
+            // Aborting an already-aborted or finished task is a no-op.
+            for entry in &spawned {
                 entry.task.abort();
             }
-            let mut handles = Vec::with_capacity(entries.len());
-            for (_, entry) in entries {
+            let mut handles = Vec::with_capacity(spawned.len());
+            for entry in spawned {
                 if let Some(child) = &entry.child {
                     child.shutdown_tree().await;
                 }
@@ -360,18 +427,39 @@ impl SubagentRegistry {
             entry.abort_tree();
         }
     }
+
+    /// Whether every task spawned here, at any depth, has been reaped -- and so
+    /// holds no tool clones and can be forgotten. The recursion into child
+    /// registries is what keeps [`Self::launch`]'s sweep honest: a subagent
+    /// whose grandchild is still cancelling has to stay in the ledger.
+    fn tree_finished(&self) -> bool {
+        self.spawned_lock().iter().all(Spawned::tree_finished)
+    }
 }
 
 impl Entry {
     /// Abort this subagent and, recursively, every descendant it launched.
-    /// Sync and best-effort: `JoinHandle::abort` only schedules cancellation,
-    /// which is enough mid-session -- the awaited reap belongs to
+    /// Sync and best-effort: aborting only schedules cancellation, which is
+    /// enough mid-session -- the awaited reap belongs to
     /// [`SubagentRegistry::shutdown`] at teardown.
     fn abort_tree(&self) {
         if let Some(child) = &self.child {
             child.abort_all();
         }
-        self.task.abort();
+        self.abort.abort();
+    }
+}
+
+impl Spawned {
+    /// `is_finished` is true only once the task has completed or been
+    /// cancelled, which means its future -- and every tool clone in it -- has
+    /// already been dropped.
+    fn tree_finished(&self) -> bool {
+        self.task.is_finished()
+            && self
+                .child
+                .as_ref()
+                .is_none_or(|child| child.tree_finished())
     }
 }
 
@@ -631,6 +719,79 @@ mod tests {
         (registry, log_dir)
     }
 
+    /// A stand-in for the session's MCP tools that counts how many copies are
+    /// alive, so a test can *observe* release rather than infer it. Every live
+    /// subagent task owns a clone of the session's tool list, which is what
+    /// teardown's `Arc::try_unwrap` needs released before it can shut the MCP
+    /// children down.
+    ///
+    /// Returns the counter seeded at 1 for the copy the caller installs on the
+    /// registry; a test reaches 0 only after dropping the registry too.
+    fn counted_tools() -> (Arc<std::sync::atomic::AtomicUsize>, Vec<SessionTool>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountedTool(Arc<AtomicUsize>);
+        impl Drop for CountedTool {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl rig::tool::ToolDyn for CountedTool {
+            fn name(&self) -> String {
+                "counted".to_string()
+            }
+            fn description(&self) -> String {
+                String::new()
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn call<'a>(
+                &'a self,
+                _args: String,
+            ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>>
+            {
+                Box::pin(async { Ok(String::new()) })
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(1));
+        let tools = vec![SessionTool::new(CountedTool(live.clone()))];
+        (live, tools)
+    }
+
+    /// How many copies of a [`counted_tools`] tool are still alive. Zero means
+    /// every clone has been dropped.
+    fn alive(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Launch `mid`, then reach into the registry it was given and launch a
+    /// grandchild `deep` through it, handing back that child registry.
+    ///
+    /// The nesting is arranged by hand rather than by the subagent: its round's
+    /// model call fails against the discard port, so it never gets as far as
+    /// calling a launch tool itself. Requires a registry whose depth is under
+    /// its limit, or `mid` is a leaf and has no registry to launch through.
+    async fn launch_nested(registry: &SubagentRegistry) -> Arc<SubagentRegistry> {
+        registry
+            .launch("mid", None, "work".to_string())
+            .await
+            .expect("launch");
+        let child = registry
+            .lock()
+            .get("mid")
+            .expect("live")
+            .child
+            .clone()
+            .expect("a subagent below the depth limit gets a registry");
+        child
+            .launch("deep", None, "work".to_string())
+            .await
+            .expect("grandchild launch");
+        child
+    }
+
     /// Exercises the whole path: launch spawns a round, the round fails, the
     /// driver publishes the failure, and the parent collects it.
     #[tokio::test(start_paused = true)]
@@ -786,38 +947,9 @@ mod tests {
     /// process running.
     #[tokio::test]
     async fn shutdown_releases_the_tool_clones_subagents_hold() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        /// Counts how many copies are alive, so the test can observe release
-        /// rather than infer it.
-        struct CountedTool(Arc<AtomicUsize>);
-        impl Drop for CountedTool {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        impl rig::tool::ToolDyn for CountedTool {
-            fn name(&self) -> String {
-                "counted".to_string()
-            }
-            fn description(&self) -> String {
-                String::new()
-            }
-            fn parameters(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object"})
-            }
-            fn call<'a>(
-                &'a self,
-                _args: String,
-            ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>>
-            {
-                Box::pin(async { Ok(String::new()) })
-            }
-        }
-
-        let live = Arc::new(AtomicUsize::new(1));
+        let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry();
-        registry.ctx.mcp_tools = vec![SessionTool::new(CountedTool(live.clone()))];
+        registry.ctx.mcp_tools = tools;
 
         registry
             .launch("audit", None, "work".to_string())
@@ -827,7 +959,7 @@ mod tests {
         drop(registry);
 
         assert_eq!(
-            live.load(Ordering::SeqCst),
+            alive(&live),
             0,
             "every tool clone must be released once subagents are shut down, or \
              teardown cannot close the MCP children"
@@ -866,62 +998,17 @@ mod tests {
     /// first layer, or teardown cannot close the MCP children.
     #[tokio::test]
     async fn shutdown_reaps_nested_subagents_and_releases_their_tool_clones() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountedTool(Arc<AtomicUsize>);
-        impl Drop for CountedTool {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        impl rig::tool::ToolDyn for CountedTool {
-            fn name(&self) -> String {
-                "counted".to_string()
-            }
-            fn description(&self) -> String {
-                String::new()
-            }
-            fn parameters(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object"})
-            }
-            fn call<'a>(
-                &'a self,
-                _args: String,
-            ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>>
-            {
-                Box::pin(async { Ok(String::new()) })
-            }
-        }
-
-        let live = Arc::new(AtomicUsize::new(1));
+        let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry_at(2, 3);
-        registry.ctx.mcp_tools = vec![SessionTool::new(CountedTool(live.clone()))];
+        registry.ctx.mcp_tools = tools;
 
-        // Launch a subagent, then reach into its registry and launch a
-        // grandchild -- the round never launches on its own (its model call
-        // fails), so the nesting is arranged by hand.
-        registry
-            .launch("mid", None, "work".to_string())
-            .await
-            .expect("launch");
-        let child = registry
-            .lock()
-            .get("mid")
-            .expect("live")
-            .child
-            .clone()
-            .expect("a depth-2 subagent gets a registry");
-        child
-            .launch("deep", None, "work".to_string())
-            .await
-            .expect("grandchild launch");
-
+        let child = launch_nested(&registry).await;
         registry.shutdown().await;
         drop(child);
         drop(registry);
 
         assert_eq!(
-            live.load(Ordering::SeqCst),
+            alive(&live),
             0,
             "shutdown must reap the whole tree; a grandchild left running keeps \
              a tool clone alive and teardown cannot close the MCP children"
@@ -933,22 +1020,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn release_aborts_the_descendant_tree() {
         let (registry, _log_dir) = test_registry_at(2, 3);
-        registry
-            .launch("mid", None, "work".to_string())
-            .await
-            .expect("launch");
-        let child = registry
-            .lock()
-            .get("mid")
-            .expect("live")
-            .child
-            .clone()
-            .expect("a depth-2 subagent gets a registry");
-        child
-            .launch("deep", None, "work".to_string())
-            .await
-            .expect("grandchild launch");
-        let grandchild_task = child.lock().get("deep").expect("live").task.abort_handle();
+        let child = launch_nested(&registry).await;
+        let grandchild_task = child.lock().get("deep").expect("live").abort.clone();
 
         registry.release(&["mid".to_string()]).expect("release");
 
@@ -964,6 +1037,107 @@ mod tests {
         assert!(
             grandchild_task.is_finished(),
             "releasing a subagent must abort its descendants"
+        );
+    }
+
+    /// Releasing frees a name, and `release` deliberately does not wait for the
+    /// cancellation it schedules. Shutdown still has to reap those tasks: a
+    /// subagent released just before exit holds the session's tool clones every
+    /// bit as much as a live one, and teardown's `Arc::try_unwrap` runs right
+    /// after shutdown returns.
+    #[tokio::test]
+    async fn shutdown_reaps_released_trees() {
+        let (live, tools) = counted_tools();
+        let (mut registry, _log_dir) = test_registry_at(2, 3);
+        registry.ctx.mcp_tools = tools;
+
+        let child = launch_nested(&registry).await;
+        registry.release(&["mid".to_string()]).expect("release");
+        registry.shutdown().await;
+        drop(child);
+        drop(registry);
+
+        assert_eq!(
+            alive(&live),
+            0,
+            "a released tree must still be reaped by shutdown; dropping its \
+             handles at release leaves aborted-but-unreaped tasks holding tool \
+             clones, and teardown cannot close the MCP children"
+        );
+    }
+
+    /// A task can be in the ledger with no name at all: [`SubagentRegistry::launch`]
+    /// registers before its re-check under the lock, so the loser of a name race
+    /// is spawned, aborted, and never inserted. Shutdown has to reap it anyway.
+    ///
+    /// The ledger state is built directly rather than by racing two launches:
+    /// `launch` never suspends between its pre-check and its insert when the
+    /// provider is offline, so the second call short-circuits at the pre-check
+    /// and the race window cannot be forced here. What this pins down is the
+    /// property the rollback path depends on -- shutdown drains the ledger, not
+    /// the name map.
+    #[tokio::test]
+    async fn shutdown_reaps_a_task_that_has_no_name() {
+        let (live, tools) = counted_tools();
+        let (registry, _log_dir) = test_registry();
+
+        // Stands in for a subagent task: it owns a clone of the session's tools
+        // and never finishes on its own, so only cancellation releases them.
+        let held = tools.clone();
+        let task = tokio::spawn(async move {
+            let _tools = held;
+            std::future::pending::<()>().await;
+        });
+        registry.spawned_lock().push(Spawned { task, child: None });
+        assert!(
+            registry.lock().is_empty(),
+            "this task is deliberately reachable only through the ledger"
+        );
+
+        registry.shutdown().await;
+        drop(tools);
+        drop(registry);
+
+        assert_eq!(
+            alive(&live),
+            0,
+            "a spawned task with no name still holds tool clones, so shutdown \
+             must join it rather than only the ones it can find by name"
+        );
+    }
+
+    /// The ledger outlives names, so it needs a sweep or a long session that
+    /// cycles handles would carry a record per launch forever.
+    #[tokio::test]
+    async fn the_ledger_is_swept_of_reaped_tasks() {
+        let (registry, _log_dir) = test_registry();
+        registry
+            .launch("audit-a", None, "work".to_string())
+            .await
+            .expect("launch");
+        registry.release(&["audit-a".to_string()]).expect("release");
+
+        // Abort lands at the next poll, so yield until the task is actually
+        // reaped -- only then is the record eligible to be swept.
+        for _ in 0..100 {
+            if registry.tree_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            registry.tree_finished(),
+            "the released task should be reaped"
+        );
+
+        registry
+            .launch("audit-b", None, "work".to_string())
+            .await
+            .expect("relaunch");
+        assert_eq!(
+            registry.spawned_lock().len(),
+            1,
+            "launching should sweep records whose tasks are already reaped"
         );
     }
 
