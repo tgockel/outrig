@@ -23,11 +23,12 @@ default-image = "coding"
 default-agent     = "coding"
 
 # global config (~/.outrig/config.toml):
-default-model     = "fast"
-session-root      = "/var/lib/outrig/sessions"        # optional; defaults to XDG data dir
-model-cache-root  = "/var/cache/outrig/models"        # optional; defaults to XDG cache dir
-tool-call-max     = 100                               # optional; defaults to 50
-tool-result-max   = 262144                            # optional; defaults to 256 KiB
+default-model      = "fast"
+session-root       = "/var/lib/outrig/sessions"       # optional; defaults to XDG data dir
+model-cache-root   = "/var/cache/outrig/models"       # optional; defaults to XDG cache dir
+tool-call-max      = 100                              # optional; defaults to 50
+tool-result-max    = 262144                           # optional; defaults to 256 KiB
+subagent-max-depth = 3                                # optional; defaults to 3
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -36,19 +37,20 @@ allow = ["github.com:443", "*.npmjs.org"]             # optional; global only
 deny  = ["*:22"]                                      # optional; global only
 ```
 
-| Key                | Type    | Required               | Where  | Description               |
-|--------------------|---------|------------------------|--------|---------------------------|
-| `default-image`    | string  | for `outrig run`       | repo   | Default `--image`.        |
-| `default-agent`    | string  | for `outrig run`       | repo   | Default `--agent`.        |
-| `default-model`    | string  | if agent omits `model` | global | Fallback model name.      |
-| `session-root`     | path    | no                     | global | Sessions root dir.        |
-| `model-cache-root` | path    | no                     | global | GGUF download cache dir.  |
-| `tool-call-max`    | integer | no                     | global | Per-turn tool-call max.   |
-| `tool-result-max`  | integer | no                     | global | Per-tool-result byte max. |
-| `network.mode`     | string  | no                     | either | Network mode.             |
-| `network.default`  | string  | no                     | global | Filter fallback action.   |
-| `network.allow`    | array   | no                     | global | Filter allow entries.     |
-| `network.deny`     | array   | no                     | global | Filter deny entries.      |
+| Key                  | Type    | Required               | Where  | Description               |
+|----------------------|---------|------------------------|--------|---------------------------|
+| `default-image`      | string  | for `outrig run`       | repo   | Default `--image`.        |
+| `default-agent`      | string  | for `outrig run`       | repo   | Default `--agent`.        |
+| `default-model`      | string  | if agent omits `model` | global | Fallback model name.      |
+| `session-root`       | path    | no                     | global | Sessions root dir.        |
+| `model-cache-root`   | path    | no                     | global | GGUF download cache dir.  |
+| `tool-call-max`      | integer | no                     | global | Per-turn tool-call max.   |
+| `tool-result-max`    | integer | no                     | global | Per-tool-result byte max. |
+| `subagent-max-depth` | integer | no                     | global | Max subagent nesting.     |
+| `network.mode`       | string  | no                     | either | Network mode.             |
+| `network.default`    | string  | no                     | global | Filter fallback action.   |
+| `network.allow`      | array   | no                     | global | Filter allow entries.     |
+| `network.deny`       | array   | no                     | global | Filter deny entries.      |
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-max`
@@ -81,6 +83,14 @@ config may set any value from `1024` through `16777216` bytes.
 `outrig run --max-tool-result-bytes <n>` overrides both for one invocation. Results larger than
 the max are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
 marker that reports the original size and max.
+
+`subagent-max-depth` bounds how deeply subagents may nest. The primary agent you talk to is the
+root at depth 1; an agent at depth `D` may launch subagents (which live at depth `D+1`) only
+while `D` is under the limit. So `1` disables subagents entirely, `2` allows a single layer, and
+the default `3` allows two. The compiled-in default is `3`; config may set any value from `1`
+through `16`. `[agents.<name>].subagent-max-depth` overrides the top-level value for one agent.
+The separate `[agents.<name>].subagents` toggle still applies: `false` withholds the launch
+tools regardless of depth.
 
 ## `[network]`
 
@@ -330,6 +340,8 @@ preamble = "You are a meticulous code reviewer..."
 - `subagents` (bool, optional, default: `true`): whether this agent may launch subagents. When
   `false`, the `outrig__` subagent tools are not registered at all, so the agent's tool list and
   context cost are unchanged from a build without the feature.
+- `subagent-max-depth` (integer, optional, default: top-level value or `3`): how deeply this
+  agent's subagents may nest. See the top-level `subagent-max-depth`.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
@@ -342,7 +354,9 @@ messages. It also caps what `outrig__get_result` hands back from a subagent.
 `subagents` is on by default. A subagent shares this agent's container, MCP tools, model and
 limits, but not its preamble or context -- see
 [Concepts -> Subagents](../concepts/subagents.md). Turn it off for agents that should stay
-single-threaded, or to save the context the five tool schemas occupy.
+single-threaded, or to save the context the five tool schemas occupy. A subagent may itself
+launch subagents up to `subagent-max-depth`; each launching agent only sees the subagents it
+launched.
 
 ## `[workspace]`
 
@@ -661,11 +675,12 @@ global-only; repo config cannot set `network.default`, `network.allow`, or `netw
 ### Global `~/.outrig/config.toml`
 
 ```toml
-default-model    = "fast"
-session-root     = "/var/lib/outrig/sessions"   # optional; default = XDG data dir
-model-cache-root = "/var/cache/outrig/models"   # optional; default = XDG cache dir
-tool-call-max    = 100                           # optional; default = 50
-tool-result-max  = 262144                        # optional; default = 256 KiB
+default-model      = "fast"
+session-root       = "/var/lib/outrig/sessions" # optional; default = XDG data dir
+model-cache-root   = "/var/cache/outrig/models" # optional; default = XDG cache dir
+tool-call-max      = 100                         # optional; default = 50
+tool-result-max    = 262144                      # optional; default = 256 KiB
+subagent-max-depth = 3                           # optional; default = 3
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -778,6 +793,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `tool-call-max`, if set at the top level or on an agent, must be between `1` and `2000`.
 - `tool-result-max`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.
+- `subagent-max-depth`, if set at the top level or on an agent, must be between `1` and `16`
+  (`1` disables subagents).
 - `[network].mode`, if set, must be `default` or `audit`.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.

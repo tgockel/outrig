@@ -8,6 +8,7 @@ session-root      = "/var/lib/outrig/sessions"
 model-cache-root  = "/var/cache/outrig/models"
 tool-call-max     = 100
 tool-result-max   = 524288
+subagent-max-depth = 4
 
 [providers.openai]
 style                = "openai"
@@ -53,6 +54,7 @@ temperature = 0.2
 max-tokens  = 4096
 tool-call-max = 300
 tool-result-max = 1048576
+subagent-max-depth = 2
 
 [agents.review]
 model    = "smart"

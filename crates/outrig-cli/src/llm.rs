@@ -179,6 +179,9 @@ pub struct ResolvedAgent {
     pub max_tokens: Option<u32>,
     pub tool_call_max: usize,
     pub tool_result_max_bytes: usize,
+    /// Maximum subagent nesting depth: the primary is the root at depth 1, and
+    /// an agent at depth `D` may launch subagents while `D < max_subagent_depth`.
+    pub max_subagent_depth: u32,
     pub image: Option<String>,
 }
 
@@ -326,6 +329,10 @@ pub fn resolve_agent_with_overrides(
             .or(cfg.tool_result_max)
             .unwrap_or(outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES)
             as usize,
+        max_subagent_depth: agent
+            .subagent_max_depth
+            .or(cfg.subagent_max_depth)
+            .unwrap_or(outrig::config::DEFAULT_SUBAGENT_MAX_DEPTH),
         image: agent.image.clone(),
     })
 }

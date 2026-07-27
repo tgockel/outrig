@@ -840,6 +840,70 @@ tool-call-max = 5000
     }
 
     #[test]
+    fn top_level_subagent_max_depth_zero_errors() {
+        let cfg = parse(
+            r#"
+subagent-max-depth = 0
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::SubagentMaxDepthOutOfRange { path, value, max } => {
+                assert_eq!(path, "top-level subagent-max-depth");
+                assert_eq!(value, 0);
+                assert_eq!(max, 16);
+            }
+            other => panic!("expected SubagentMaxDepthOutOfRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_subagent_max_depth_too_large_errors() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+subagent-max-depth = 99
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::SubagentMaxDepthOutOfRange { path, value, max } => {
+                assert_eq!(path, "agents.coding.subagent-max-depth");
+                assert_eq!(value, 99);
+                assert_eq!(max, 16);
+            }
+            other => panic!("expected SubagentMaxDepthOutOfRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_max_depth_repo_overrides_global() {
+        let global = parse(
+            r#"
+subagent-max-depth = 2
+"#,
+        );
+        let repo = parse(
+            r#"
+subagent-max-depth = 4
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(merged.subagent_max_depth, Some(4));
+    }
+
+    #[test]
     fn top_level_tool_result_max_too_small_errors() {
         let cfg = parse(
             r#"

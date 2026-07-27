@@ -63,6 +63,14 @@ pub const DEFAULT_TOOL_RESULT_MAX_BYTES: u32 = 256 * 1024;
 pub const TOOL_RESULT_MAX_FLOOR_BYTES: u32 = 1024;
 pub const TOOL_RESULT_MAX_CEILING_BYTES: u32 = 16 * 1024 * 1024;
 
+/// How deeply subagents may nest by default. The primary agent is the root at
+/// depth 1; an agent at depth `D` may launch subagents while `D < max`. A value
+/// of 1 disables subagents entirely, 2 is a single layer, 3 is two layers.
+pub const DEFAULT_SUBAGENT_MAX_DEPTH: u32 = 3;
+/// Upper bound accepted for `subagent-max-depth`, to keep a runaway config from
+/// authorizing an unbounded launch tree.
+pub const SUBAGENT_MAX_DEPTH_CEILING: u32 = 16;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
@@ -80,6 +88,9 @@ pub struct Config {
     pub tool_call_max: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_max: Option<u32>,
+    /// Maximum subagent nesting depth. See [`DEFAULT_SUBAGENT_MAX_DEPTH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_max_depth: Option<u32>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
 
@@ -364,6 +375,10 @@ pub struct Agent {
     /// `outrig__` subagent tools are registered unless an agent opts out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<bool>,
+    /// Per-agent override of the maximum subagent nesting depth. Falls back to
+    /// the top-level `subagent-max-depth`, then [`DEFAULT_SUBAGENT_MAX_DEPTH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_max_depth: Option<u32>,
 }
 
 impl Agent {

@@ -287,6 +287,59 @@ tool-result-max = 1048576
 }
 
 #[test]
+fn subagent_max_depth_resolves_from_default_then_top_level_then_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_SUBAGENT_DEPTH";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"
+default-model = "fast"
+subagent-max-depth = 4
+"#,
+        r#"
+[agents.coding]
+preamble = "code"
+
+[agents.review]
+preamble = "review"
+subagent-max-depth = 2
+"#,
+    ));
+
+    // Agent unset -> top-level; agent set -> agent wins.
+    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    assert_eq!(coding.max_subagent_depth, 4);
+    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    assert_eq!(review.max_subagent_depth, 2);
+
+    unset_env(var);
+}
+
+#[test]
+fn subagent_max_depth_absent_falls_back_to_default() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_SUBAGENT_DEPTH_DEFAULT";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"
+default-model = "fast"
+"#,
+        r#"
+[agents.coding]
+preamble = "code"
+"#,
+    ));
+
+    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    assert_eq!(
+        coding.max_subagent_depth,
+        outrig::config::DEFAULT_SUBAGENT_MAX_DEPTH
+    );
+
+    unset_env(var);
+}
+
+#[test]
 fn missing_preamble_falls_back_to_default() {
     let var = "OUTRIG_TEST_LLM_RESOLVE_PREAMBLE";
     set_env(var, "k");

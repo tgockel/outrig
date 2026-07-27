@@ -60,6 +60,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         model_cache_root: repo.model_cache_root.or(global.model_cache_root),
         tool_call_max: repo.tool_call_max.or(global.tool_call_max),
         tool_result_max: repo.tool_result_max.or(global.tool_result_max),
+        subagent_max_depth: repo.subagent_max_depth.or(global.subagent_max_depth),
         network,
         providers,
         models,

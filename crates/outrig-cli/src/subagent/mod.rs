@@ -12,6 +12,12 @@
 //! nearly free and why the trust-model invariant that "the agent cannot grow
 //! its own environment" still holds.
 //!
+//! A subagent may itself launch subagents, bounded by `max_subagent_depth`
+//! (the primary is the root at depth 1). Each launching agent gets its own
+//! registry, so it only ever sees the subagents it launched; the depth check in
+//! [`build_subagent_agent`] withholds the launch tools once the limit is
+//! reached. Shutdown and release therefore recurse through the whole tree.
+//!
 //! Coordination is on *results*, not run state: see [`state`] for the inbox
 //! and the readable predicate the parent blocks on.
 
@@ -41,6 +47,7 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything needed to build a subagent's agent loop, cloned from the
 /// session. Held by the registry so a launch needs only a name and a prompt.
+#[derive(Clone)]
 pub struct SubagentContext {
     /// The session's resolved agent. A subagent reuses its model, provider and
     /// limits; only the preamble is replaced, by whatever the parent passes.
@@ -50,6 +57,11 @@ pub struct SubagentContext {
     pub cache_root: PathBuf,
     /// Where per-subagent transcripts go, alongside `<server>.stderr`.
     pub log_dir: PathBuf,
+    /// The depth of the subagents *this* registry launches. The primary agent
+    /// is the root at depth 1, so the session's registry launches at depth 2. A
+    /// subagent at depth `D` may launch its own children (at `D + 1`) only while
+    /// `D < resolved.max_subagent_depth`.
+    pub depth: u32,
     /// Shared with the REPL agent rather than owned: a per-subagent registry
     /// would re-load the model's weights for every launch.
     #[cfg(feature = "local-llm")]
@@ -63,6 +75,12 @@ struct Entry {
     /// The parent's read position. Deliberately here rather than on
     /// [`SubagentShared`]: it describes the *reader*, not the subagent.
     watermark: u64,
+    /// This subagent's own registry, present only when it was given launch
+    /// tools (i.e. its depth was under the max). Holding it here is what lets
+    /// [`SubagentRegistry::shutdown`] and [`SubagentRegistry::release`] reach
+    /// the whole descendant tree; without it, aborting this task would leave
+    /// grandchildren detached and still holding the session's tool clones.
+    child: Option<Arc<SubagentRegistry>>,
 }
 
 /// The live subagents of one session.
@@ -101,7 +119,7 @@ impl SubagentRegistry {
         }
 
         let shared = Arc::new(SubagentShared::new());
-        let agent = build_subagent_agent(&self.ctx, &shared, preamble).await?;
+        let (agent, child) = build_subagent_agent(&self.ctx, &shared, preamble).await?;
 
         let (prompts, rx) = mpsc::unbounded_channel();
         prompts
@@ -130,6 +148,7 @@ impl SubagentRegistry {
                 prompts,
                 task,
                 watermark: 0,
+                child,
             },
         );
         Ok(())
@@ -262,6 +281,12 @@ impl SubagentRegistry {
 
     /// End these subagents and free their names. A relaunch under a freed name
     /// starts a fresh inbox at version 0.
+    ///
+    /// Descendants are aborted too: a released subagent's own subagents would
+    /// otherwise keep running, detached, still calling tools into the session.
+    /// This is best-effort cancellation (no awaiting) -- the session is live and
+    /// still needs its MCP children, so the awaited reap is left to
+    /// [`Self::shutdown`] at teardown.
     pub fn release(&self, names: &[String]) -> Result<Vec<String>, String> {
         let mut entries = self.lock();
         let mut released = Vec::new();
@@ -269,13 +294,14 @@ impl SubagentRegistry {
             let entry = entries
                 .remove(name)
                 .ok_or_else(|| unknown_name(name, &entries))?;
-            entry.task.abort();
+            entry.abort_tree();
             released.push(name.clone());
         }
         Ok(released)
     }
 
-    /// Stop every subagent and wait for the tasks to actually end.
+    /// Stop every subagent -- and every subagent *they* launched -- and wait for
+    /// all of those tasks to actually end.
     ///
     /// The waiting is the point. `JoinHandle::abort` only schedules
     /// cancellation; until the runtime reaps the task it still owns its agent,
@@ -283,23 +309,15 @@ impl SubagentRegistry {
     /// that happens means `teardown`'s `Arc::try_unwrap` finds outstanding
     /// refs, skips the graceful MCP shutdown, and leaves the `podman exec`
     /// children running -- which is what kept the process alive after Ctrl-C.
+    /// A nested subagent holds those clones just as a direct one does, so the
+    /// reap has to reach the whole tree, not only the first layer.
     pub async fn shutdown(&self) {
-        let entries = std::mem::take(&mut *self.lock());
-        let handles: Vec<JoinHandle<()>> = entries
-            .into_values()
-            .map(|entry| {
-                entry.task.abort();
-                entry.task
-            })
-            .collect();
-        if handles.is_empty() {
-            return;
-        }
-        // An aborted task ends at its next await point, so this is normally
-        // immediate; the bound is here so a wedged subagent delays exit rather
-        // than preventing it.
-        let reaped = futures_util::future::join_all(handles);
-        if tokio::time::timeout(SHUTDOWN_GRACE, reaped).await.is_err() {
+        // One grace budget for the entire tree: a wedged subagent anywhere
+        // delays exit rather than preventing it.
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.shutdown_tree())
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 target: "outrig::subagent",
                 "subagent tasks did not stop within {SHUTDOWN_GRACE:?}; \
@@ -307,20 +325,71 @@ impl SubagentRegistry {
             );
         }
     }
+
+    /// Recursively abort this registry's subagents and all their descendants,
+    /// waiting for every task to be reaped. Descendants are drained before this
+    /// level's tasks are joined, so tool clones release bottom-up: the deepest
+    /// subagent must be gone before teardown's `Arc::try_unwrap` at the top.
+    fn shutdown_tree(&self) -> futures_util::future::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let entries = std::mem::take(&mut *self.lock());
+            // Abort every task at this level up front so the whole layer is
+            // cancelling in parallel while we drain the layers beneath it.
+            for entry in entries.values() {
+                entry.task.abort();
+            }
+            let mut handles = Vec::with_capacity(entries.len());
+            for (_, entry) in entries {
+                if let Some(child) = &entry.child {
+                    child.shutdown_tree().await;
+                }
+                handles.push(entry.task);
+            }
+            // An aborted task ends at its next await point, so joining is
+            // normally immediate once its children are gone.
+            if !handles.is_empty() {
+                futures_util::future::join_all(handles).await;
+            }
+        })
+    }
+
+    /// Abort every live subagent and its descendants without awaiting. The
+    /// recursive step under [`Self::release`].
+    fn abort_all(&self) {
+        for entry in self.lock().values() {
+            entry.abort_tree();
+        }
+    }
 }
 
-/// Build the agent loop one subagent runs.
+impl Entry {
+    /// Abort this subagent and, recursively, every descendant it launched.
+    /// Sync and best-effort: `JoinHandle::abort` only schedules cancellation,
+    /// which is enough mid-session -- the awaited reap belongs to
+    /// [`SubagentRegistry::shutdown`] at teardown.
+    fn abort_tree(&self) {
+        if let Some(child) = &self.child {
+            child.abort_all();
+        }
+        self.task.abort();
+    }
+}
+
+/// Build the agent loop one subagent runs, and, when depth allows, the registry
+/// it launches its own subagents through.
 ///
 /// It reuses the session's model, provider and limits; only the preamble is
-/// replaced. The tool list is the session's MCP tools plus this subagent's own
-/// `outrig__set_result` -- and *not* the parent-side subagent tools, which is
-/// why a subagent cannot launch subagents. Recursion is impossible by
-/// construction rather than by a rule someone has to enforce.
+/// replaced. The tool list is always the session's MCP tools plus this
+/// subagent's own `outrig__set_result`. When the subagent's depth is under
+/// `max_subagent_depth`, it also gets its own [`SubagentRegistry`] and the
+/// parent-side launch tools, so it can launch children of its own; at the max
+/// depth those are withheld and the returned registry is `None`. Recursion is
+/// bounded by that depth check rather than impossible by construction.
 async fn build_subagent_agent(
     ctx: &SubagentContext,
     shared: &Arc<SubagentShared>,
     preamble: Option<String>,
-) -> Result<crate::llm::RigAgent, String> {
+) -> Result<(crate::llm::RigAgent, Option<Arc<SubagentRegistry>>), String> {
     let mut resolved = ctx.resolved.clone();
     resolved.preamble = compose_preamble(preamble.as_deref());
 
@@ -329,7 +398,25 @@ async fn build_subagent_agent(
         shared.clone(),
     )));
 
-    crate::llm::build_agent(
+    // This subagent lives at `ctx.depth`. If that is under the max, hand it its
+    // own registry and launch tools so it can launch children at `depth + 1`.
+    // The recursion is lazy: grandchildren are only built when this subagent
+    // actually calls a launch tool, which re-enters here one level deeper, and
+    // the depth gate terminates it.
+    let child = if ctx.depth < ctx.resolved.max_subagent_depth {
+        let mut child_ctx = ctx.clone();
+        child_ctx.depth = ctx.depth + 1;
+        let child = Arc::new(SubagentRegistry::new(child_ctx));
+        tools.extend(crate::builtin_tool::parent_tools(
+            child.clone(),
+            ctx.resolved.tool_result_max_bytes,
+        ));
+        Some(child)
+    } else {
+        None
+    };
+
+    let agent = crate::llm::build_agent(
         &resolved,
         tools,
         &ctx.cache_root,
@@ -337,7 +424,8 @@ async fn build_subagent_agent(
         &ctx.registry,
     )
     .await
-    .map_err(|e| format!("could not build subagent: {e}"))
+    .map_err(|e| format!("could not build subagent: {e}"))?;
+    Ok((agent, child))
 }
 
 /// The subagent's system prompt: the parent's text, if it passed any, over a
@@ -487,6 +575,15 @@ mod tests {
     /// make each round take seconds. Paused time auto-advances while the
     /// subagent sleeps, so the failure surfaces immediately.
     fn test_registry() -> (SubagentRegistry, tempfile::TempDir) {
+        test_registry_at(2, outrig::config::DEFAULT_SUBAGENT_MAX_DEPTH)
+    }
+
+    /// Like [`test_registry`] but with an explicit launch depth and depth limit,
+    /// so a test can place its subagents just under or right at the ceiling.
+    fn test_registry_at(
+        depth: u32,
+        max_subagent_depth: u32,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
         let log_dir = tempfile::tempdir().expect("tempdir");
         let resolved = ResolvedAgent {
             agent_name: "primary".to_string(),
@@ -505,6 +602,7 @@ mod tests {
             max_tokens: None,
             tool_call_max: 4,
             tool_result_max_bytes: 4096,
+            max_subagent_depth,
             image: None,
         };
         let registry = SubagentRegistry::new(SubagentContext {
@@ -512,6 +610,7 @@ mod tests {
             mcp_tools: Vec::new(),
             cache_root: PathBuf::from("."),
             log_dir: log_dir.path().to_path_buf(),
+            depth,
             #[cfg(feature = "local-llm")]
             registry: Arc::new(crate::llm::LlmRegistry::new()),
         });
@@ -718,6 +817,139 @@ mod tests {
             0,
             "every tool clone must be released once subagents are shut down, or \
              teardown cannot close the MCP children"
+        );
+    }
+
+    /// A subagent under the depth limit is handed its own registry (and, with
+    /// it, the launch tools); one at the limit is a leaf.
+    #[tokio::test(start_paused = true)]
+    async fn a_child_registry_is_handed_out_only_below_the_depth_limit() {
+        // depth 2 with max 3: 2 < 3, so the subagent may launch its own.
+        let (below, _log_a) = test_registry_at(2, 3);
+        below
+            .launch("mid", None, "work".to_string())
+            .await
+            .expect("launch");
+        assert!(
+            below.lock().get("mid").expect("live").child.is_some(),
+            "a subagent below the limit should get a registry to launch with"
+        );
+
+        // depth 3 with max 3: 3 == 3, so the subagent is a leaf.
+        let (at_limit, _log_b) = test_registry_at(3, 3);
+        at_limit
+            .launch("leaf", None, "work".to_string())
+            .await
+            .expect("launch");
+        assert!(
+            at_limit.lock().get("leaf").expect("live").child.is_none(),
+            "a subagent at the limit must not get a registry"
+        );
+    }
+
+    /// The nested version of the Ctrl-C hang: a grandchild holds the session's
+    /// tool clones too, so shutdown has to reap the whole tree, not just the
+    /// first layer, or teardown cannot close the MCP children.
+    #[tokio::test]
+    async fn shutdown_reaps_nested_subagents_and_releases_their_tool_clones() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountedTool(Arc<AtomicUsize>);
+        impl Drop for CountedTool {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl rig::tool::ToolDyn for CountedTool {
+            fn name(&self) -> String {
+                "counted".to_string()
+            }
+            fn description(&self) -> String {
+                String::new()
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn call<'a>(
+                &'a self,
+                _args: String,
+            ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>>
+            {
+                Box::pin(async { Ok(String::new()) })
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(1));
+        let (mut registry, _log_dir) = test_registry_at(2, 3);
+        registry.ctx.mcp_tools = vec![SessionTool::new(CountedTool(live.clone()))];
+
+        // Launch a subagent, then reach into its registry and launch a
+        // grandchild -- the round never launches on its own (its model call
+        // fails), so the nesting is arranged by hand.
+        registry
+            .launch("mid", None, "work".to_string())
+            .await
+            .expect("launch");
+        let child = registry
+            .lock()
+            .get("mid")
+            .expect("live")
+            .child
+            .clone()
+            .expect("a depth-2 subagent gets a registry");
+        child
+            .launch("deep", None, "work".to_string())
+            .await
+            .expect("grandchild launch");
+
+        registry.shutdown().await;
+        drop(child);
+        drop(registry);
+
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "shutdown must reap the whole tree; a grandchild left running keeps \
+             a tool clone alive and teardown cannot close the MCP children"
+        );
+    }
+
+    /// Releasing a subagent mid-session aborts the subagents it launched too,
+    /// rather than leaving them detached and still calling tools.
+    #[tokio::test(start_paused = true)]
+    async fn release_aborts_the_descendant_tree() {
+        let (registry, _log_dir) = test_registry_at(2, 3);
+        registry
+            .launch("mid", None, "work".to_string())
+            .await
+            .expect("launch");
+        let child = registry
+            .lock()
+            .get("mid")
+            .expect("live")
+            .child
+            .clone()
+            .expect("a depth-2 subagent gets a registry");
+        child
+            .launch("deep", None, "work".to_string())
+            .await
+            .expect("grandchild launch");
+        let grandchild_task = child.lock().get("deep").expect("live").task.abort_handle();
+
+        registry.release(&["mid".to_string()]).expect("release");
+
+        // The grandchild's task is cancelled even though it lived one level
+        // below the released subagent. Abort takes effect at the next poll, so
+        // yield until it lands rather than assuming a single scheduling step.
+        for _ in 0..100 {
+            if grandchild_task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            grandchild_task.is_finished(),
+            "releasing a subagent must abort its descendants"
         );
     }
 
