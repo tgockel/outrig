@@ -136,7 +136,7 @@ FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git build-essential passwd \
+      ca-certificates curl git build-essential \
  && rm -rf /var/lib/apt/lists/*
 
 # rust toolchain
@@ -156,10 +156,10 @@ WORKDIR /workspace
 CMD ["sleep", "infinity"]
 ```
 
-The Dockerfile is generic -- no `USER` directive, no hard-coded UID. outrig sets up a user
-matching your host UID/GID at run time (see
-[Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping)). The
-`passwd` package keeps `useradd`/`groupadd` available for that bootstrap step.
+The Dockerfile is generic -- no `USER` directive, no hard-coded UID, and nothing installed for
+user management. outrig sets up a user matching your host UID/GID at run time, writing the
+entries into the container from the host (see
+[Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping)).
 
 Appended to `.agents/outrig/config.toml`:
 

@@ -28,7 +28,32 @@ enum BaseFamily {
     Alpine,
 }
 
-pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
+/// Where the runtime user's `/etc/passwd` and `/etc/group` entries come from,
+/// which decides whether an image needs `useradd`/`groupadd` at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UserBootstrap {
+    /// OutRig writes them into the container from the host. The image needs
+    /// no user tooling.
+    #[default]
+    HostSide,
+    /// This host cannot enter container namespaces, so OutRig falls back to
+    /// running `useradd`/`groupadd` inside the image.
+    InImage,
+}
+
+impl UserBootstrap {
+    /// What this host will actually do, probed once (see
+    /// [`outrig::container::direct_bootstrap_supported`]).
+    pub async fn for_this_host() -> Self {
+        if outrig::container::direct_bootstrap_supported().await {
+            UserBootstrap::HostSide
+        } else {
+            UserBootstrap::InImage
+        }
+    }
+}
+
+pub fn validate_dockerfile(dockerfile: &str, bootstrap: UserBootstrap) -> DockerfileValidation {
     let mut warnings = Vec::new();
     let mut last_cmd: Option<(usize, String)> = None;
     let mut base_family = None;
@@ -69,22 +94,27 @@ pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
         _ => {}
     }
 
-    match base_family {
-        Some(BaseFamily::Debian) if !contains_token(dockerfile, "passwd") => {
-            warnings.push(ValidationMessage {
-                code: "user_bootstrap_package_missing",
-                message: "Known Debian-family images usually need the passwd package so useradd/groupadd are available for OutRig's host-UID bootstrap.".to_string(),
-                line: None,
-            });
+    // Only worth saying on a host that will run `useradd` inside the image.
+    // Everywhere else OutRig writes the entries itself and the package is
+    // dead weight -- the generated templates no longer install it.
+    if bootstrap == UserBootstrap::InImage {
+        match base_family {
+            Some(BaseFamily::Debian) if !contains_token(dockerfile, "passwd") => {
+                warnings.push(ValidationMessage {
+                    code: "user_bootstrap_package_missing",
+                    message: "This host cannot write the runtime user into a container directly, so OutRig falls back to useradd/groupadd inside the image; Debian-family images need the passwd package for that.".to_string(),
+                    line: None,
+                });
+            }
+            Some(BaseFamily::Alpine) if !contains_token(dockerfile, "shadow") => {
+                warnings.push(ValidationMessage {
+                    code: "user_bootstrap_package_missing",
+                    message: "This host cannot write the runtime user into a container directly, so OutRig falls back to useradd/groupadd inside the image; Alpine images need the shadow package for that.".to_string(),
+                    line: None,
+                });
+            }
+            _ => {}
         }
-        Some(BaseFamily::Alpine) if !contains_token(dockerfile, "shadow") => {
-            warnings.push(ValidationMessage {
-                code: "user_bootstrap_package_missing",
-                message: "Known Alpine-family images usually need the shadow package so useradd/groupadd are available for OutRig's host-UID bootstrap.".to_string(),
-                line: None,
-            });
-        }
-        _ => {}
     }
 
     DockerfileValidation { warnings }
@@ -180,10 +210,11 @@ mod tests {
         let out = validate_dockerfile(
             r#"
 FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends passwd
+RUN apt-get update && apt-get install -y --no-install-recommends curl
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
 "#,
+            UserBootstrap::HostSide,
         );
         assert_eq!(out.warnings, Vec::new());
     }
@@ -193,10 +224,11 @@ CMD ["sleep", "infinity"]
         let out = validate_dockerfile(
             r#"
 FROM debian:bookworm-slim
-RUN apt-get install -y passwd
+RUN apt-get install -y curl
 USER app
 CMD ["sleep", "infinity"]
 "#,
+            UserBootstrap::HostSide,
         );
         assert_eq!(out.warnings[0].code, "user_ignored");
         assert_eq!(out.warnings[0].line, Some(4));
@@ -207,21 +239,22 @@ CMD ["sleep", "infinity"]
         let out = validate_dockerfile(
             r#"
 FROM debian:bookworm-slim
-RUN apt-get install -y passwd
+RUN apt-get install -y curl
 CMD ["bash"]
 "#,
+            UserBootstrap::HostSide,
         );
         assert!(out.warnings.iter().any(|w| w.code == "cmd_may_exit"));
     }
 
-    #[test]
-    fn known_base_missing_user_package_warns() {
-        let out = validate_dockerfile(
-            r#"
+    const BARE_ALPINE: &str = r#"
 FROM alpine:latest
 CMD ["sleep", "infinity"]
-"#,
-        );
+"#;
+
+    #[test]
+    fn known_base_missing_user_package_warns_only_when_the_image_bootstraps() {
+        let out = validate_dockerfile(BARE_ALPINE, UserBootstrap::InImage);
         assert!(
             out.warnings
                 .iter()
@@ -229,6 +262,11 @@ CMD ["sleep", "infinity"]
             "expected user bootstrap warning: {:?}",
             out.warnings,
         );
+
+        // The same Dockerfile is fine on a host that writes the entries
+        // itself, which is every host that can enter container namespaces.
+        let out = validate_dockerfile(BARE_ALPINE, UserBootstrap::HostSide);
+        assert_eq!(out.warnings, Vec::new());
     }
 
     #[test]
@@ -238,6 +276,7 @@ CMD ["sleep", "infinity"]
 FROM registry.example.com/team/custom-dev:latest
 CMD ["sleep", "infinity"]
 "#,
+            UserBootstrap::HostSide,
         );
         assert_eq!(out.warnings, Vec::new());
     }

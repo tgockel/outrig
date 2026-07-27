@@ -124,9 +124,11 @@ never pulled. If the global config has no resolvable agent, startup fails with t
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
    --userns=keep-id ... <image> sleep infinity`. Any `[workspace.mounts]` and `--volume` entries
    become additional `-v` binds.
-5. **Bootstrap the user.** As in-container root, ensure a group with `$(id -g)` and a user with
-   `$(id -u)` exist (creating them via `groupadd`/`useradd` if not), and that
-   `/home/<user>` exists and is owned by them. See
+5. **Bootstrap the user.** From the host, inside the container's namespaces: ensure a group with
+   `$(id -g)` and a user with `$(id -u)` exist -- appending the entries to `/etc/group` and
+   `/etc/passwd` if not -- and that `/home/<user>` exists and is owned by them. The image needs
+   no `useradd`/`groupadd` for this; `OUTRIG_BOOTSTRAP` selects the older `podman exec` path if
+   ever needed. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
 6. **Start network interception, if enabled.** `--network audit`, `--network filter`, or

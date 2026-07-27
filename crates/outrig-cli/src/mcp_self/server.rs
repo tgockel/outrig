@@ -25,7 +25,12 @@ const VALIDATE_CONFIG: &str = "validate_config";
 const VALIDATE_IMAGE_TOML: &str = "validate_image_toml";
 
 #[derive(Debug, Clone, Default)]
-pub struct SelfServer;
+pub struct SelfServer {
+    /// How this host bootstraps a container's runtime user, resolved once at
+    /// server start: it costs a `podman info`, and no tool call should pay
+    /// for advice only `validate_dockerfile` gives.
+    bootstrap: validate::UserBootstrap,
+}
 
 #[derive(Debug, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -47,8 +52,10 @@ struct ValidateConfigArgs {
 
 pub async fn serve_stdio() -> Result<i32> {
     let ct = CancellationToken::new();
-    let service =
-        rmcp::service::serve_server_with_ct(SelfServer, rmcp::transport::stdio(), ct).await?;
+    let server = SelfServer {
+        bootstrap: validate::UserBootstrap::for_this_host().await,
+    };
+    let service = rmcp::service::serve_server_with_ct(server, rmcp::transport::stdio(), ct).await?;
     eprintln!("[outrig] mcp self server ready");
     match service.waiting().await {
         Ok(reason) => {
@@ -107,7 +114,10 @@ impl SelfServer {
         ]
     }
 
-    fn dispatch(request: CallToolRequestParams) -> std::result::Result<CallToolResult, McpError> {
+    fn dispatch(
+        &self,
+        request: CallToolRequestParams,
+    ) -> std::result::Result<CallToolResult, McpError> {
         match request.name.as_ref() {
             LIST_DOCS => json_result(docs::list_docs()),
             GET_DOC => {
@@ -131,7 +141,10 @@ impl SelfServer {
                     Ok(args) => args,
                     Err(result) => return Ok(result),
                 };
-                json_result(validate::validate_dockerfile(&args.dockerfile))
+                json_result(validate::validate_dockerfile(
+                    &args.dockerfile,
+                    self.bootstrap,
+                ))
             }
             VALIDATE_CONFIG => {
                 let args: ValidateConfigArgs = match parse_args(request.arguments) {
@@ -187,7 +200,7 @@ impl ServerHandler for SelfServer {
         request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        Self::dispatch(request)
+        self.dispatch(request)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -254,7 +267,7 @@ mod tests {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        SelfServer::dispatch(request).expect("dispatch")
+        SelfServer::default().dispatch(request).expect("dispatch")
     }
 
     fn text(result: &CallToolResult) -> &str {

@@ -191,7 +191,7 @@ User request: Rust development with filesystem and shell tools.
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm passwd \
+ && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm \
  && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
  | sh -s -- -y --default-toolchain stable --profile default
@@ -220,7 +220,7 @@ User request: Node 20 container with repo filesystem access.
 ```Dockerfile
 FROM docker.io/library/node:20-bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git passwd \
+ && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @modelcontextprotocol/server-filesystem
 WORKDIR /workspace
@@ -245,7 +245,7 @@ User request: Filesystem, git, and a project-specific build MCP.
 ```Dockerfile
 FROM docker.io/library/python:3.12-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git nodejs npm passwd \
+ && apt-get install -y --no-install-recommends git nodejs npm \
  && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @modelcontextprotocol/server-filesystem
 RUN pip install --break-system-packages mcp-server-git
@@ -276,7 +276,7 @@ User request: reusable Rust development image with filesystem and git MCP server
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm python3-pip passwd \
+ && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm python3-pip \
  && rm -rf /var/lib/apt/lists/*
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
  | sh -s -- -y --default-toolchain stable --profile default

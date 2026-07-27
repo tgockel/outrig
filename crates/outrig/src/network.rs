@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fs::File as StdFile;
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -34,6 +34,7 @@ use crate::config::{
 };
 use crate::container::Container;
 use crate::error::{IoPathExt, OutrigError, Result};
+use crate::nsfork;
 use crate::process::{self, Cmd, Transcript};
 
 const NETWORK_LOG: &str = "network.jsonl";
@@ -959,174 +960,44 @@ fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
 }
 
 fn bind_interceptor_socket_fds(user_ns: RawFd, net_ns: RawFd) -> io::Result<(RawFd, RawFd)> {
-    let mut sv = [0; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, sv.as_mut_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let child = unsafe { libc::fork() };
-    if child == -1 {
-        close_fd(sv[0]);
-        close_fd(sv[1]);
-        return Err(io::Error::last_os_error());
-    }
-
-    if child == 0 {
-        close_fd(sv[0]);
-        let status = child_bind_and_send_fds(sv[1], user_ns, net_ns);
-        unsafe { libc::_exit(status) };
-    }
-
-    close_fd(sv[1]);
-    let received = recv_fds(sv[0]);
-    close_fd(sv[0]);
-
-    let mut status = 0;
-    let _ = unsafe { libc::waitpid(child, &mut status, 0) };
-
-    let fds = received?;
-    if fds.len() != 2 {
-        return Err(io::Error::new(
+    let (_status, fds) =
+        nsfork::fork_collect(|sock| child_bind_and_send_fds(sock, user_ns, net_ns))?;
+    let mut fds = fds.into_iter();
+    match (fds.next(), fds.next()) {
+        (Some(tcp), Some(dns)) => Ok((tcp.into_raw_fd(), dns.into_raw_fd())),
+        _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "network namespace helper did not return listener sockets",
-        ));
+        )),
     }
-    Ok((fds[0], fds[1]))
 }
 
-fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) -> i32 {
-    if setns_raw(user_ns, libc::CLONE_NEWUSER).is_err() {
-        return 1;
+fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
+    if nsfork::setns_raw(user_ns, libc::CLONE_NEWUSER).is_err() {
+        return;
     }
     unsafe {
         let _ = libc::setgid(0);
         let _ = libc::setuid(0);
     }
-    if setns_raw(net_ns, libc::CLONE_NEWNET).is_err() {
-        return 1;
+    if nsfork::setns_raw(net_ns, libc::CLONE_NEWNET).is_err() {
+        return;
     }
 
     let tcp = match std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
         Ok(listener) => listener,
-        Err(_) => return 1,
+        Err(_) => return,
     };
     let dns = match std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 53))) {
         Ok(socket) => socket,
-        Err(_) => return 1,
+        Err(_) => return,
     };
 
-    match send_fds(sock, &[tcp.as_raw_fd(), dns.as_raw_fd()]) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
-}
-
-fn setns_raw(fd: RawFd, nstype: libc::c_int) -> io::Result<()> {
-    let rc = unsafe { libc::setns(fd, nstype) };
-    if rc == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn send_fds(sock: RawFd, fds: &[RawFd]) -> io::Result<()> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: byte.len(),
-    };
-    let mut control = vec![0u8; cmsg_space(std::mem::size_of_val(fds))];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
-
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() {
-            return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
-        }
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = cmsg_len(std::mem::size_of_val(fds));
-        std::ptr::copy_nonoverlapping(
-            fds.as_ptr().cast::<u8>(),
-            libc::CMSG_DATA(cmsg).cast::<u8>(),
-            std::mem::size_of_val(fds),
-        );
-        msg.msg_controllen = (*cmsg).cmsg_len;
-        if libc::sendmsg(sock, &msg, 0) == -1 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn recv_fds(sock: RawFd) -> io::Result<Vec<RawFd>> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: byte.len(),
-    };
-    let mut control = vec![0u8; cmsg_space(std::mem::size_of::<[RawFd; 2]>())];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
-
-    let n = unsafe { libc::recvmsg(sock, &mut msg, 0) };
-    if n == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "network namespace helper exited without returning sockets",
-        ));
-    }
-
-    let mut out = Vec::new();
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null()
-            || (*cmsg).cmsg_level != libc::SOL_SOCKET
-            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "network namespace helper returned no socket rights",
-            ));
-        }
-        let data_len = (*cmsg).cmsg_len.saturating_sub(cmsg_len(0));
-        let count = data_len / std::mem::size_of::<RawFd>();
-        let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-        for i in 0..count {
-            out.push(*data.add(i));
-        }
-    }
-    Ok(out)
-}
-
-fn cmsg_align(len: usize) -> usize {
-    let align = std::mem::size_of::<usize>();
-    (len + align - 1) & !(align - 1)
-}
-
-fn cmsg_space(data_len: usize) -> usize {
-    cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + cmsg_align(data_len)
-}
-
-fn cmsg_len(data_len: usize) -> usize {
-    cmsg_align(std::mem::size_of::<libc::cmsghdr>()) + data_len
-}
-
-fn close_fd(fd: RawFd) {
-    unsafe {
-        libc::close(fd);
-    }
+    let _ = nsfork::send_status(
+        sock,
+        nsfork::Status::OK,
+        &[tcp.as_raw_fd(), dns.as_raw_fd()],
+    );
 }
 
 async fn apply_nft_rules(cleanup: &Cleanup, tcp_port: u16, dns_port: u16) -> Result<()> {

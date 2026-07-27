@@ -54,34 +54,38 @@ outrig sidesteps this in two parts:
    tools that call `getpwuid()` (some shells, npm postinstall scripts, etc.) don't fail on a
    missing `/etc/passwd` entry.
 
-After `podman run -d` brings the container up, but before any MCP server starts, outrig (running as
-in-container root) does:
+After `podman run -d` brings the container up, but before any MCP server starts, outrig writes
+those entries itself -- from the host, without running anything inside the container. A forked
+child joins the container's user namespace (which makes it the container's root), then its mount
+namespace, and hands the two open files back; outrig reads them and appends what's missing:
 
 ```sh
-# Group: reuse if a group with this GID already exists, else create one.
-gid=$(id -g) ; gname=$(id -gn)
-existing=$(getent group "$gid" | cut -d: -f1)
-if [ -z "$existing" ]; then
-    # name collisions: append _ until groupadd succeeds
-    until groupadd --gid "$gid" "$gname"; do gname="${gname}_" ; done
-fi
+# Group: reuse if a group with this GID already exists, else append one.
+# Name collisions get a `_` suffix, retried up to ten times.
+tgockel:x:1000:
 
-# User: same dance.
-uid=$(id -u) ; uname=$(id -un)
-existing=$(getent passwd "$uid" | cut -d: -f1)
-if [ -z "$existing" ]; then
-    until useradd -u "$uid" -g "$gid" "$uname"; do uname="${uname}_" ; done
-fi
+# User: same dance. The home directory is named here but created separately,
+# exactly as `useradd` without `-m` behaves.
+tgockel:x:1000:1000::/home/tgockel:/bin/sh
 
-# Some tools assume $HOME exists.
-mkdir -p "/home/$uname"
-chown "$uname:$gname" "/home/$uname"
+# Some tools assume $HOME exists, and it must belong to you, not to root.
+mkdir -p /home/tgockel && chown 1000:1000 /home/tgockel
 ```
 
+Appending, rather than rewriting the files, is deliberate: it keeps their owner and mode, and it
+is safe against a concurrent writer. `/etc/shadow` gets no entry -- nothing in outrig
+authenticates as this user, and the entry `useradd` would write is a locked password.
+
 After bootstrap, every `podman exec` outrig issues -- to start MCP servers, to run anything else
--- uses `--user=$(id -u):$(id -g)`. Files written under `/workspace` therefore appear with your
-UID/GID on the host. The image itself doesn't need any user setup -- whatever base image you
-pick works as long as `useradd`/`groupadd` are available.
+-- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>`. Files written under `/workspace`
+therefore appear with your UID/GID on the host. The image itself needs no user setup and no user
+tooling: any base image works, including one with no `useradd`, `groupadd`, or `getent` at all.
+
+On a host that cannot enter container namespaces -- a remote podman service, most likely -- outrig
+falls back to the older path, which runs `getent`/`groupadd`/`useradd` over `podman exec` and does
+need those tools in the image. The fallback announces itself in the session transcript. Set
+`OUTRIG_BOOTSTRAP=exec` to select it by hand, or `OUTRIG_BOOTSTRAP=direct` to make an unavailable
+namespace a hard error instead of a silent downgrade.
 
 The collision dance handles the case where the image already has a group or user at your UID/GID
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,

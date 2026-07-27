@@ -8,9 +8,12 @@
 //! cargo test --features e2e runtime_user -- --nocapture
 //! ```
 //!
-//! `alpine:latest` is missing `useradd`/`groupadd` out of the box, so each
-//! test installs the `shadow` package via `apk` after start and before
-//! bootstrap.
+//! `alpine:latest` ships no `useradd`/`groupadd`, which is the point: the
+//! bootstrap writes `/etc/passwd` and `/etc/group` from the host and needs
+//! neither. The tests that still install the `shadow` package do so because
+//! they plant a conflicting entry with `useradd` before bootstrapping, not
+//! because bootstrap needs it. The `podman exec` fallback has its own binary,
+//! `runtime_user_fallback.rs`, since it is selected by a process-wide env var.
 
 #![cfg(feature = "e2e")]
 
@@ -19,76 +22,22 @@ mod common;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::process::{Command, Output};
 use std::time::Duration;
 
-use outrig::container::{Container, ContainerLaunchSpec};
-use outrig::image::ImageTag;
-use tokio::io::AsyncReadExt;
+use outrig::Transcript;
 
-const ALPINE: &str = "docker.io/library/alpine:latest";
-
-async fn pull_alpine() {
-    run_capture(Command::new("podman").arg("pull").arg(ALPINE));
-}
-
-async fn install_shadow(name: &str) {
-    run_capture(
-        Command::new("podman")
-            .args(["exec", "--user=0:0"])
-            .arg(name)
-            .args(["apk", "add", "--no-cache", "shadow"]),
-    );
-}
-
-async fn start_alpine(host_ws: &Path) -> Container {
-    let tag = ImageTag(ALPINE.to_string());
-    Container::start(
-        &tag,
-        ContainerLaunchSpec::workspace(host_ws, Path::new("/workspace")),
-    )
-    .await
-    .expect("start")
-}
-
-async fn read_stdout(child: &mut tokio::process::Child) -> String {
-    let mut out = String::new();
-    child
-        .stdout
-        .as_mut()
-        .expect("stdout was piped")
-        .read_to_string(&mut out)
-        .await
-        .expect("read stdout");
-    let status = child.wait().await.expect("wait child");
-    assert!(status.success(), "child exited non-zero: {status:?}");
-    out
-}
-
-fn run_capture(cmd: &mut Command) -> Output {
-    let output = cmd.output().expect("spawn command");
-    assert!(
-        output.status.success(),
-        "command exited non-zero: {:?}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn try_capture(cmd: &mut Command) -> Output {
-    cmd.output().expect("spawn command")
-}
+use common::{
+    entry_for_id, init_tracing, install_shadow, pull_alpine, read_stdout, root_cmd, root_stdout,
+    run_capture, start_alpine,
+};
 
 #[tokio::test]
 async fn bootstrap_then_id_matches_host() {
-    common::init_tracing();
-    pull_alpine().await;
+    init_tracing();
+    pull_alpine();
 
     let host_ws = tempfile::tempdir().expect("tempdir");
-    let mut container = start_alpine(host_ws.path()).await;
-    install_shadow(container.name()).await;
+    let mut container = start_alpine(host_ws.path(), None).await;
 
     container.bootstrap_user().await.expect("bootstrap_user");
     assert!(container.user_name().is_some());
@@ -116,12 +65,11 @@ async fn bootstrap_then_id_matches_host() {
 
 #[tokio::test]
 async fn workspace_writes_have_host_ownership() {
-    common::init_tracing();
-    pull_alpine().await;
+    init_tracing();
+    pull_alpine();
 
     let host_ws = tempfile::tempdir().expect("tempdir");
-    let mut container = start_alpine(host_ws.path()).await;
-    install_shadow(container.name()).await;
+    let mut container = start_alpine(host_ws.path(), None).await;
     container.bootstrap_user().await.expect("bootstrap_user");
 
     let mut child = container
@@ -159,69 +107,45 @@ async fn workspace_writes_have_host_ownership() {
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
-/// Look up the first-field name of an existing `getent <db> <id>` entry, or
-/// `None` if none exists. Used by the reuse test to decide whether the
-/// container already has an entry at the host UID/GID (e.g. `--userns=keep-id`
-/// auto-injects one in modern podman) or whether the test needs to plant one.
-async fn first_name_in_db(name: &str, db: &str, id: u32) -> Option<String> {
-    let probe = try_capture(
-        Command::new("podman")
-            .args(["exec", "--user=0:0"])
-            .arg(name)
-            .arg("getent")
-            .arg(db)
-            .arg(id.to_string()),
-    );
-    if !probe.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&probe.stdout);
-    Some(stdout.lines().next()?.split(':').next()?.to_string())
-}
-
 #[tokio::test]
 async fn bootstrap_reuses_existing_entry() {
-    common::init_tracing();
-    pull_alpine().await;
+    init_tracing();
+    pull_alpine();
 
     let host_ws = tempfile::tempdir().expect("tempdir");
-    let mut container = start_alpine(host_ws.path()).await;
-    install_shadow(container.name()).await;
+    let mut container = start_alpine(host_ws.path(), None).await;
+    install_shadow(container.name());
 
     // Bootstrap should reuse whatever entry is already at the host UID/GID,
     // whether that's an auto-injection from `--userns=keep-id` or one we
     // manually plant here. Probe first; plant only if absent.
-    let expected_grp = match first_name_in_db(container.name(), "group", container.gid()).await {
+    let groups = root_stdout(container.name(), &["cat", "/etc/group"]);
+    let expected_grp = match entry_for_id(&groups, container.gid()) {
         Some(existing) => existing,
         None => {
             let planted = "preexisting_grp";
-            run_capture(
-                Command::new("podman")
-                    .args(["exec", "--user=0:0"])
-                    .arg(container.name())
-                    .arg("groupadd")
-                    .arg("--gid")
-                    .arg(container.gid().to_string())
-                    .arg(planted),
-            );
+            run_capture(root_cmd(container.name()).args([
+                "groupadd",
+                "--gid",
+                &container.gid().to_string(),
+                planted,
+            ]));
             planted.to_string()
         }
     };
-    let expected_usr = match first_name_in_db(container.name(), "passwd", container.uid()).await {
+    let passwd = root_stdout(container.name(), &["cat", "/etc/passwd"]);
+    let expected_usr = match entry_for_id(&passwd, container.uid()) {
         Some(existing) => existing,
         None => {
             let planted = "preexisting_usr";
-            run_capture(
-                Command::new("podman")
-                    .args(["exec", "--user=0:0"])
-                    .arg(container.name())
-                    .arg("useradd")
-                    .arg("-u")
-                    .arg(container.uid().to_string())
-                    .arg("-g")
-                    .arg(container.gid().to_string())
-                    .arg(planted),
-            );
+            run_capture(root_cmd(container.name()).args([
+                "useradd",
+                "-u",
+                &container.uid().to_string(),
+                "-g",
+                &container.gid().to_string(),
+                planted,
+            ]));
             planted.to_string()
         }
     };
@@ -236,6 +160,176 @@ async fn bootstrap_reuses_existing_entry() {
         container.user_name(),
         Some(expected_usr.as_str()),
         "bootstrap should reuse the pre-existing user at the host UID"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// The headline acceptance case: a bare image with no `shadow`, no `passwd`,
+/// and nothing else added, bootstrapped and then exec'd into as the host user.
+#[tokio::test]
+async fn bootstrap_on_unadorned_alpine() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = start_alpine(host_ws.path(), None).await;
+    container.bootstrap_user().await.expect("bootstrap_user");
+
+    let user = container.user_name().expect("user name").to_string();
+    let group = container.group_name().expect("group name").to_string();
+
+    // Field-equivalent, not byte-identical: on podman 5 `--userns=keep-id`
+    // auto-injects an entry at the host UID before bootstrap ever looks, and
+    // bootstrap reuses it. Either way the databases must resolve the host ids
+    // to the names the container reports.
+    let passwd = root_stdout(container.name(), &["cat", "/etc/passwd"]);
+    assert_eq!(
+        entry_for_id(&passwd, container.uid()).as_deref(),
+        Some(user.as_str()),
+        "/etc/passwd should resolve the host uid to {user}:\n{passwd}"
+    );
+
+    let groups = root_stdout(container.name(), &["cat", "/etc/group"]);
+    assert_eq!(
+        entry_for_id(&groups, container.gid()).as_deref(),
+        Some(group.as_str()),
+        "/etc/group should resolve the host gid to {group}:\n{groups}"
+    );
+
+    // `$HOME` is set by `exec_stdio` and must exist and be writable as the
+    // host user -- that is what MCP servers land in.
+    let mut child = container
+        .exec_stdio(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "touch \"$HOME/probe\" && echo \"$HOME\"".to_string(),
+            ],
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("exec_stdio home probe");
+    assert_eq!(
+        read_stdout(&mut child).await.trim(),
+        format!("/home/{user}")
+    );
+
+    let owner = root_stdout(
+        container.name(),
+        &["stat", "-c", "%u %g", &format!("/home/{user}")],
+    );
+    assert_eq!(
+        owner.trim(),
+        format!("{} {}", container.uid(), container.gid()),
+        "the home directory should belong to the host uid/gid"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// Strip any entry at `id` from one of the container's databases, in place so
+/// the inode (and its owner and mode) survives. Undoes podman's `keep-id`
+/// auto-injection, so that a test can watch bootstrap write an entry rather
+/// than reuse one.
+fn drop_entry(container: &str, path: &str, id: u32) {
+    let script = format!("awk -F: '$3 != {id}' {path} > /tmp/db && cat /tmp/db > {path}");
+    run_capture(root_cmd(container).args(["sh", "-c", &script]));
+}
+
+/// What bootstrap writes when there is nothing to reuse: podman's auto-injected
+/// entry is removed first, so the append path runs and can be checked against
+/// the canonical `useradd`/`groupadd` forms.
+#[tokio::test]
+async fn bootstrap_writes_canonical_entries_when_absent() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = start_alpine(host_ws.path(), None).await;
+    drop_entry(container.name(), "/etc/passwd", container.uid());
+    drop_entry(container.name(), "/etc/group", container.gid());
+
+    container.bootstrap_user().await.expect("bootstrap_user");
+    let user = container.user_name().expect("user name").to_string();
+    let group = container.group_name().expect("group name").to_string();
+
+    let passwd = root_stdout(container.name(), &["cat", "/etc/passwd"]);
+    let expected_entry = format!(
+        "{user}:x:{}:{}::/home/{user}:/bin/sh",
+        container.uid(),
+        container.gid()
+    );
+    assert!(
+        passwd.lines().any(|line| line == expected_entry),
+        "expected `{expected_entry}` in /etc/passwd, got:\n{passwd}"
+    );
+
+    let groups = root_stdout(container.name(), &["cat", "/etc/group"]);
+    let expected_group = format!("{group}:x:{}:", container.gid());
+    assert!(
+        groups.lines().any(|line| line == expected_group),
+        "expected `{expected_group}` in /etc/group, got:\n{groups}"
+    );
+
+    // The written entry has to be usable, not just well-formed.
+    let mut child = container
+        .exec_stdio(&["id".to_string(), "-un".to_string()], &BTreeMap::new())
+        .await
+        .expect("exec_stdio id -un");
+    assert_eq!(read_stdout(&mut child).await.trim(), user);
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// The direct path must leave `/etc/passwd` and `/etc/group` on their original
+/// inodes: appended to, never replaced, so owner and mode survive.
+#[tokio::test]
+async fn bootstrap_preserves_etc_ownership_and_mode() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = start_alpine(host_ws.path(), None).await;
+
+    let stat = ["stat", "-c", "%u %g %a", "/etc/passwd", "/etc/group"];
+    let before = root_stdout(container.name(), &stat);
+    container.bootstrap_user().await.expect("bootstrap_user");
+    let after = root_stdout(container.name(), &stat);
+
+    assert_eq!(
+        before, after,
+        "bootstrap must not change the owner or mode of the user databases"
+    );
+}
+
+/// The round-trip reduction, asserted rather than eyeballed: the whole
+/// bootstrap issues no `podman exec` at all.
+#[tokio::test]
+async fn direct_bootstrap_issues_no_podman_exec() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let log_dir = tempfile::tempdir().expect("tempdir");
+    let log = log_dir.path().join("container.log");
+    let transcript = Transcript::create(&log, false).await.expect("transcript");
+    let mut container = start_alpine(host_ws.path(), Some(transcript)).await;
+
+    let before = fs::read_to_string(&log).expect("read transcript");
+    container.bootstrap_user().await.expect("bootstrap_user");
+    let after = fs::read_to_string(&log).expect("read transcript");
+    let during = after.strip_prefix(&before).unwrap_or(&after).to_string();
+
+    assert!(
+        !during
+            .lines()
+            .any(|line| line.starts_with("[podman] $ podman exec")),
+        "bootstrap should issue no `podman exec`, transcript said:\n{during}"
+    );
+    assert!(
+        during.contains("[bootstrap]"),
+        "bootstrap should record what it did, transcript said:\n{during}"
     );
 
     container.stop(Duration::from_secs(2)).await.expect("stop");

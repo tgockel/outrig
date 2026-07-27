@@ -82,6 +82,18 @@ pub enum OutrigError {
     #[error("could not allocate {kind} name during container bootstrap after retries")]
     BootstrapExhausted { kind: &'static str },
 
+    /// The user bootstrap entered the container's namespaces and then failed
+    /// inside them. Distinct from a failure on the way *in*, which is not an
+    /// error at all: that falls back to the `podman exec` bootstrap, because
+    /// nothing in the container has been touched yet.
+    #[error("container {container}: bootstrapping the runtime user failed at {step}: {source}")]
+    BootstrapNamespace {
+        container: String,
+        step: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("mcp service: {0}")]
     McpService(#[from] rmcp::service::ServiceError),
 

@@ -171,7 +171,7 @@ context    = ".agents/outrig/images/hello-outrig-standard"
 FROM docker.io/library/debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm passwd \
+ && apt-get install -y --no-install-recommends ca-certificates curl git nodejs npm \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @modelcontextprotocol/server-filesystem
 
@@ -182,8 +182,9 @@ CMD ["sleep", "infinity"]
 ```
 
 The Dockerfile is yours to edit -- `image add` produces a known-good starting point, not a
-finished spec. Note there's no `USER` directive and no `useradd`: outrig sets up a user matching
-your host UID/GID at run time, so the same image works for any host user without rebuilding.
+finished spec. Note there's no `USER` directive and no `useradd` -- not even the package that
+provides one: outrig writes a user matching your host UID/GID into the container at run time, so
+the same image works for any host user without rebuilding.
 See [Concepts -> Workspace](concepts/workspace.md#uidgid-runtime-user-mapping).
 
 ## Pre-build the image

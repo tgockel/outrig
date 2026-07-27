@@ -32,21 +32,16 @@ fn assert_invariants(out: &str, base: BaseImage, toolchains: &[Toolchain], mcps:
         "[{label}] generated Dockerfile must not set a USER:\n{out}",
     );
 
-    // The bootstrap user-creation tools must be available.
-    match base {
-        BaseImage::AlpineLatest => {
-            assert!(
-                out.contains("shadow"),
-                "[{label}] alpine header must install shadow (for useradd):\n{out}",
-            );
-        }
-        _ => {
-            assert!(
-                out.contains("passwd"),
-                "[{label}] debian-family header must install passwd:\n{out}",
-            );
-        }
-    }
+    // OutRig writes the runtime user's entries into the container itself, so
+    // the generated image must not carry `useradd`/`groupadd` on its account.
+    let user_tooling = match base {
+        BaseImage::AlpineLatest => "shadow",
+        _ => "passwd",
+    };
+    assert!(
+        !out.contains(user_tooling),
+        "[{label}] header should no longer install {user_tooling} for the user bootstrap:\n{out}",
+    );
 
     // No trailing whitespace on any line.
     for (i, line) in out.lines().enumerate() {

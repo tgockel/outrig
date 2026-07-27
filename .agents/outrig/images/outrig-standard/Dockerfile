@@ -12,7 +12,6 @@ RUN apt-get update \
       libssl-dev \
       nodejs \
       npm \
-      passwd \
       pkg-config \
       procps \
       python3 \

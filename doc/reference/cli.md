@@ -447,6 +447,12 @@ target and the symlink under the session root.
 - `RUST_LOG`: fallback tracing filter when `OUTRIG_LOG` is unset. At `debug`, adds one line per
   buildah/podman invocation (target `outrig::process`) naming the command, its exit status, and
   how long it took.
+- `OUTRIG_BOOTSTRAP`: how the runtime user is created inside a container -- `auto` (default:
+  write `/etc/passwd` and `/etc/group` from the host, fall back to `podman exec` if the host
+  cannot enter the container's namespaces), `direct` (never fall back; an unenterable namespace
+  becomes a startup error), or `exec` (always use `podman exec`, which needs `useradd`/`groupadd`
+  in the image). Unrecognized values mean `auto`. See
+  [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping).
 - `XDG_DATA_HOME`: default base for `session-root` if not set in config.
 - `XDG_CONFIG_HOME`: global config is checked here before `~/.outrig/config.toml`.
 

@@ -47,9 +47,13 @@ outrig handles user identity entirely at run time -- see [Workspace](workspace.m
 intentionally generic so the same image works for any host user (yours, a teammate's, CI's)
 without rebuilding.
 
-The image needs `useradd` and `groupadd` available (the standard `passwd`/`shadow` package on
-Debian/Ubuntu, `shadow` on Alpine). outrig calls them once at start-up to materialize an
-in-container user matching your host UID/GID.
+The image needs no user tooling for this. outrig writes the matching `/etc/passwd` and
+`/etc/group` entries into the container itself, from the host, so an image with no `useradd`,
+`groupadd`, or `getent` -- an unadorned `FROM docker.io/library/alpine`, or a distroless base --
+works unchanged. On the unusual hosts where that isn't possible (a remote podman service, say),
+outrig falls back to running `useradd`/`groupadd` inside the image and says so in the session
+transcript; only then does the image need the `passwd` package (Debian/Ubuntu) or `shadow`
+(Alpine).
 
 ### Install MCP servers
 
@@ -310,7 +314,11 @@ sidecar the same way it attaches to the primary, before any MCP server connects.
 ## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured extra
-workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). A
+workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). The
+bootstrap runs from the host: a forked child joins the container's user namespace, becomes its
+root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group` entries
+before creating `/home/<user>`. No `podman exec` is involved, and nothing is written when podman's
+`keep-id` mapping already planted the entries. A
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see
