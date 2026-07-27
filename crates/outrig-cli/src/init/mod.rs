@@ -110,4 +110,5 @@ const ADD_ANOTHER_IMAGE_FIELD: Field = Field {
 };
 
 /// Slice of every `Field` declared in this module, for `prompt_doc_sync.rs`.
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub const DOC_SYNC_FIELDS: &[&Field] = &[&ADD_FIRST_IMAGE_FIELD, &ADD_ANOTHER_IMAGE_FIELD];

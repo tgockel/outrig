@@ -174,9 +174,7 @@ async fn serve(
         mcp_plan,
         watcher,
         cfg: _,
-        image_cfg: _,
         session: _,
-        session_dir: _,
         repo_root: _,
     } = setup;
     let mut runtime = SessionRuntime::new(watcher, network, containers);
@@ -225,11 +223,9 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         mcp_plan,
         watcher,
         cfg: _,
-        image_cfg: _,
         image_cfg_name: _,
         image_tag: _,
         session: _,
-        session_dir: _,
         log_dir: _,
         repo_root: _,
     } = setup;

@@ -199,6 +199,7 @@ const MCP_FIELD: Field = Field {
 };
 
 /// Slice of every `Field` declared in this module, for `prompt_doc_sync.rs`.
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub const DOC_SYNC_FIELDS: &[&Field] = &[&NAME_FIELD, &BASE_FIELD, &TOOLCHAIN_FIELD, &MCP_FIELD];
 
 /// Index into `McpServer::ALL` of the default selection (the `fs`

@@ -47,7 +47,7 @@ outrig.shutdown().await?;
 ```
 
 `LaunchSpec` also has `LaunchSpec::build` (build an image from a `Dockerfile`) and
-`LaunchSpec::from_image_config` (drive it from a parsed config), plus builder methods for mounts,
+`LaunchSpec::from_config` (drive it from a parsed config), plus builder methods for mounts,
 capability profiles, network policy, and embedded MCP handling. By default, OutRig merges MCP
 servers from an image's `org.outrig.mcp` label with the launch spec. Library callers that want the
 launch spec's MCP map to be authoritative can opt out:

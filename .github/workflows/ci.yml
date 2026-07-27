@@ -43,6 +43,12 @@ jobs:
           key: ${{ matrix.name }}
           cache-on-failure: true
       - run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
+      # The shape `cargo install outrig-cli` builds: lib and bin only, so no
+      # dev-dependencies and `internal-test-api` off. Every other step here
+      # implies `--all-targets` or `test`, both of which pull dev-dependencies
+      # and turn that feature on, so this is the only place the published
+      # configuration gets compiled at all.
+      - run: cargo check ${{ matrix.cargo_args }}
       - run: cargo test ${{ matrix.cargo_args }} ${{ matrix.test_args }}
 
   doc-style:

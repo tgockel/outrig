@@ -13,6 +13,8 @@ documentation.workspace = true
 repository.workspace    = true
 keywords.workspace      = true
 categories.workspace    = true
+# A generated record of the published API, for review; of no use to a consumer.
+exclude                 = ["public-api.txt"]
 
 [features]
 e2e = []

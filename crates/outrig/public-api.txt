@@ -1,0 +1,901 @@
+# Public API surface of `outrig`, as reported by cargo-public-api 0.52.0:
+#
+#     cargo public-api -p outrig --omit blanket-impls,auto-trait-impls,auto-derived-impls
+#
+# Regenerate after any intentional surface change and review the diff. The tool's
+# output format shifts between releases, so a diff with no source change means the
+# pinned version above moved.
+
+pub mod outrig
+pub mod outrig::config
+pub enum outrig::config::ApiKeyError
+pub outrig::config::ApiKeyError::InvalidSyntax
+pub outrig::config::ApiKeyError::InvalidSyntax::value: alloc::string::String
+pub outrig::config::ApiKeyError::NotPresent
+pub outrig::config::ApiKeyError::NotPresent::var: alloc::string::String
+pub outrig::config::ApiKeyError::NotUnicode
+pub outrig::config::ApiKeyError::NotUnicode::var: alloc::string::String
+pub enum outrig::config::CapabilityProfile
+pub outrig::config::CapabilityProfile::Default
+pub outrig::config::CapabilityProfile::DropAll
+pub outrig::config::CapabilityProfile::NoNetRaw
+pub enum outrig::config::ConfigValidationError
+pub outrig::config::ConfigValidationError::AgentMissingModel
+pub outrig::config::ConfigValidationError::AgentMissingModel::agent: alloc::string::String
+pub outrig::config::ConfigValidationError::BuildImageNameInvalid
+pub outrig::config::ConfigValidationError::BuildImageNameInvalid::image: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityDropAddConflict
+pub outrig::config::ConfigValidationError::CapabilityDropAddConflict::capability: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityDropAddConflict::image: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityNameDuplicate
+pub outrig::config::ConfigValidationError::CapabilityNameDuplicate::capability: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityNameDuplicate::field: &'static str
+pub outrig::config::ConfigValidationError::CapabilityNameDuplicate::image: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityNameEmpty
+pub outrig::config::ConfigValidationError::CapabilityNameEmpty::field: &'static str
+pub outrig::config::ConfigValidationError::CapabilityNameEmpty::image: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityNameInvalid
+pub outrig::config::ConfigValidationError::CapabilityNameInvalid::capability: alloc::string::String
+pub outrig::config::ConfigValidationError::CapabilityNameInvalid::field: &'static str
+pub outrig::config::ConfigValidationError::CapabilityNameInvalid::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ContextMissing
+pub outrig::config::ConfigValidationError::ContextMissing::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ContextMissing::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::DevicePathDuplicate
+pub outrig::config::ConfigValidationError::DevicePathDuplicate::device: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathDuplicate::image: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathEmpty
+pub outrig::config::ConfigValidationError::DevicePathEmpty::image: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathRelative
+pub outrig::config::ConfigValidationError::DevicePathRelative::device: alloc::string::String
+pub outrig::config::ConfigValidationError::DevicePathRelative::image: alloc::string::String
+pub outrig::config::ConfigValidationError::DockerfileMissing
+pub outrig::config::ConfigValidationError::DockerfileMissing::image: alloc::string::String
+pub outrig::config::ConfigValidationError::DockerfileMissing::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::EmptyMcpCommand
+pub outrig::config::ConfigValidationError::EmptyMcpCommand::image: alloc::string::String
+pub outrig::config::ConfigValidationError::EmptyMcpCommand::server: alloc::string::String
+pub outrig::config::ConfigValidationError::ImageHalfBuilt
+pub outrig::config::ConfigValidationError::ImageHalfBuilt::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ImageHalfBuilt::missing: &'static str
+pub outrig::config::ConfigValidationError::ImageHalfBuilt::present: &'static str
+pub outrig::config::ConfigValidationError::ImageNameEmpty
+pub outrig::config::ConfigValidationError::ImageNameEmpty::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ImageNameWithBuildArgs
+pub outrig::config::ConfigValidationError::ImageNameWithBuildArgs::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ImageSourceConflict
+pub outrig::config::ConfigValidationError::ImageSourceConflict::fields: alloc::vec::Vec<&'static str>
+pub outrig::config::ConfigValidationError::ImageSourceConflict::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ImageSourceMissing
+pub outrig::config::ConfigValidationError::ImageSourceMissing::image: alloc::string::String
+pub outrig::config::ConfigValidationError::InvalidMcpServerName
+pub outrig::config::ConfigValidationError::InvalidMcpServerName::image: alloc::string::String
+pub outrig::config::ConfigValidationError::InvalidMcpServerName::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice
+pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsDeclaredTwice::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsWithCommand
+pub outrig::config::ConfigValidationError::McpArgsWithCommand::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsWithCommand::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsWithoutPlacement
+pub outrig::config::ConfigValidationError::McpArgsWithoutPlacement::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpArgsWithoutPlacement::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpInlineImageEmpty
+pub outrig::config::ConfigValidationError::McpInlineImageEmpty::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpInlineImageEmpty::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpPlacementConflict
+pub outrig::config::ConfigValidationError::McpPlacementConflict::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpPlacementConflict::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpUnknownSidecar
+pub outrig::config::ConfigValidationError::McpUnknownSidecar::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpUnknownSidecar::server: alloc::string::String
+pub outrig::config::ConfigValidationError::McpUnknownSidecar::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint
+pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint::image: alloc::string::String
+pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint::server: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsBothModelSources
+pub outrig::config::ConfigValidationError::MistralrsBothModelSources::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsDeviceInvalid
+pub outrig::config::ConfigValidationError::MistralrsDeviceInvalid::device: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsDeviceInvalid::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId
+pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId::field: &'static str
+pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsMissingModelSource
+pub outrig::config::ConfigValidationError::MistralrsMissingModelSource::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsModelHasOpenAiField
+pub outrig::config::ConfigValidationError::MistralrsModelHasOpenAiField::field: &'static str
+pub outrig::config::ConfigValidationError::MistralrsModelHasOpenAiField::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile
+pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model_id: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsModelPathMissing
+pub outrig::config::ConfigValidationError::MistralrsModelPathMissing::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsModelPathMissing::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute
+pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::NetworkPolicyInvalid
+pub outrig::config::ConfigValidationError::NetworkPolicyInvalid::message: alloc::string::String
+pub outrig::config::ConfigValidationError::OpenAiModelHasMistralrsField
+pub outrig::config::ConfigValidationError::OpenAiModelHasMistralrsField::field: &'static str
+pub outrig::config::ConfigValidationError::OpenAiModelHasMistralrsField::model: alloc::string::String
+pub outrig::config::ConfigValidationError::OpenAiModelMissingIdentifier
+pub outrig::config::ConfigValidationError::OpenAiModelMissingIdentifier::model: alloc::string::String
+pub outrig::config::ConfigValidationError::ReservedMcpServerName
+pub outrig::config::ConfigValidationError::ReservedMcpServerName::image: alloc::string::String
+pub outrig::config::ConfigValidationError::ReservedMcpServerName::server: alloc::string::String
+pub outrig::config::ConfigValidationError::SessionRootNotAbsolute
+pub outrig::config::ConfigValidationError::SessionRootNotAbsolute::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::SidecarArgsWithoutEntrypoint
+pub outrig::config::ConfigValidationError::SidecarArgsWithoutEntrypoint::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAlone
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAlone::image: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAlone::other: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAlone::server: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAlone::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAuto
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAuto::image: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAuto::server: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarEntrypointNotAuto::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarImageEmpty
+pub outrig::config::ConfigValidationError::SidecarImageEmpty::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarMount
+pub outrig::config::ConfigValidationError::SidecarMount::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarMount::violation: outrig::config::MountRuleViolation
+pub outrig::config::ConfigValidationError::SidecarNameCollision
+pub outrig::config::ConfigValidationError::SidecarNameCollision::image: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarNameCollision::name: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarNameInvalid
+pub outrig::config::ConfigValidationError::SidecarNameInvalid::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewDropsCaps
+pub outrig::config::ConfigValidationError::SidecarViewDropsCaps::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint
+pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::image: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::server: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewRequiresEntrypoint::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SidecarViewWorkspaceConflict
+pub outrig::config::ConfigValidationError::SidecarViewWorkspaceConflict::sidecar: alloc::string::String
+pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange
+pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange::max: u32
+pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange::path: alloc::string::String
+pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange::value: u32
+pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange
+pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange::max: u32
+pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange::path: alloc::string::String
+pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange::value: u32
+pub outrig::config::ConfigValidationError::ToolResultMaxTooLarge
+pub outrig::config::ConfigValidationError::ToolResultMaxTooLarge::max: u32
+pub outrig::config::ConfigValidationError::ToolResultMaxTooLarge::path: alloc::string::String
+pub outrig::config::ConfigValidationError::ToolResultMaxTooLarge::value: u32
+pub outrig::config::ConfigValidationError::ToolResultMaxTooSmall
+pub outrig::config::ConfigValidationError::ToolResultMaxTooSmall::min: u32
+pub outrig::config::ConfigValidationError::ToolResultMaxTooSmall::path: alloc::string::String
+pub outrig::config::ConfigValidationError::ToolResultMaxTooSmall::value: u32
+pub outrig::config::ConfigValidationError::UnknownAgentImage
+pub outrig::config::ConfigValidationError::UnknownAgentImage::agent: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownAgentImage::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownAgentModel
+pub outrig::config::ConfigValidationError::UnknownAgentModel::agent: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownAgentModel::model: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownDefaultAgent
+pub outrig::config::ConfigValidationError::UnknownDefaultAgent::name: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownDefaultImage
+pub outrig::config::ConfigValidationError::UnknownDefaultImage::name: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownDefaultModel
+pub outrig::config::ConfigValidationError::UnknownDefaultModel::name: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownModelProvider
+pub outrig::config::ConfigValidationError::UnknownModelProvider::model: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownModelProvider::provider: alloc::string::String
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerRoot
+pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing
+pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::path: std::path::PathBuf
+pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory
+pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::path: std::path::PathBuf
+pub enum outrig::config::EnvValue
+pub outrig::config::EnvValue::EnvRef(alloc::string::String)
+pub outrig::config::EnvValue::Literal(alloc::string::String)
+impl outrig::config::EnvValue
+pub fn outrig::config::EnvValue::from_raw(alloc::string::String) -> Self
+pub fn outrig::config::EnvValue::resolve(&self) -> core::result::Result<alloc::string::String, outrig::config::EnvValueError>
+impl outrig::config::EnvValue
+pub fn outrig::config::EnvValue::to_raw(&self) -> alloc::string::String
+impl schemars::JsonSchema for outrig::config::EnvValue
+pub fn outrig::config::EnvValue::inline_schema() -> bool
+pub fn outrig::config::EnvValue::json_schema(&mut schemars::generate::SchemaGenerator) -> schemars::schema::Schema
+pub fn outrig::config::EnvValue::schema_name() -> alloc::borrow::Cow<'static, str>
+impl serde_core::ser::Serialize for outrig::config::EnvValue
+pub fn outrig::config::EnvValue::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for outrig::config::EnvValue
+pub fn outrig::config::EnvValue::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub enum outrig::config::EnvValueError
+pub outrig::config::EnvValueError::NotPresent
+pub outrig::config::EnvValueError::NotPresent::var: alloc::string::String
+pub outrig::config::EnvValueError::NotUnicode
+pub outrig::config::EnvValueError::NotUnicode::var: alloc::string::String
+pub enum outrig::config::ImageSourceRef<'a>
+pub outrig::config::ImageSourceRef::Build
+pub outrig::config::ImageSourceRef::Build::build_args: &'a alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub outrig::config::ImageSourceRef::Build::context: &'a std::path::Path
+pub outrig::config::ImageSourceRef::Build::dockerfile: &'a std::path::Path
+pub outrig::config::ImageSourceRef::Image
+pub outrig::config::ImageSourceRef::Image::image_name: &'a str
+pub enum outrig::config::LlmProvider
+pub outrig::config::LlmProvider::Mistralrs
+pub outrig::config::LlmProvider::OpenAi
+pub outrig::config::LlmProvider::OpenAi::api_key: outrig::config::ApiKeyRef
+pub outrig::config::LlmProvider::OpenAi::base_url: alloc::string::String
+pub outrig::config::LlmProvider::OpenAi::request_timeout_secs: core::option::Option<u64>
+pub enum outrig::config::McpServerSpec
+pub outrig::config::McpServerSpec::Full
+pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::McpServerSpec::Full::command: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub outrig::config::McpServerSpec::Full::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub outrig::config::McpServerSpec::Full::image: core::option::Option<alloc::string::String>
+pub outrig::config::McpServerSpec::Full::sidecar: core::option::Option<alloc::string::String>
+pub outrig::config::McpServerSpec::Full::view: outrig::config::SidecarView
+pub outrig::config::McpServerSpec::Short(alloc::vec::Vec<alloc::string::String>)
+impl outrig::config::McpServerSpec
+pub fn outrig::config::McpServerSpec::args(&self) -> &[alloc::string::String]
+pub fn outrig::config::McpServerSpec::has_command(&self) -> bool
+pub fn outrig::config::McpServerSpec::image(&self) -> core::option::Option<&str>
+pub fn outrig::config::McpServerSpec::is_entrypoint_stdio(&self) -> bool
+pub fn outrig::config::McpServerSpec::is_placed(&self) -> bool
+pub fn outrig::config::McpServerSpec::normalize(&self) -> (alloc::vec::Vec<alloc::string::String>, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>)
+pub fn outrig::config::McpServerSpec::sidecar(&self) -> core::option::Option<&str>
+pub fn outrig::config::McpServerSpec::view(&self) -> outrig::config::SidecarView
+pub enum outrig::config::MistralrsDeviceSpec
+pub outrig::config::MistralrsDeviceSpec::Cpu
+pub outrig::config::MistralrsDeviceSpec::Cuda(usize)
+pub outrig::config::MistralrsDeviceSpec::Metal
+impl outrig::config::MistralrsDeviceSpec
+pub const outrig::config::MistralrsDeviceSpec::EXPECTED: &'static str
+impl core::fmt::Display for outrig::config::MistralrsDeviceSpec
+pub fn outrig::config::MistralrsDeviceSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for outrig::config::MistralrsDeviceSpec
+pub type outrig::config::MistralrsDeviceSpec::Err = outrig::config::MistralrsDeviceParseError
+pub fn outrig::config::MistralrsDeviceSpec::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub enum outrig::config::MountAccess
+pub outrig::config::MountAccess::ReadOnly
+pub outrig::config::MountAccess::ReadWrite
+pub enum outrig::config::MountRuleViolation
+pub outrig::config::MountRuleViolation::ContainerDuplicate(std::path::PathBuf)
+pub outrig::config::MountRuleViolation::ContainerNotAbsolute(std::path::PathBuf)
+pub outrig::config::MountRuleViolation::ContainerRoot
+pub outrig::config::MountRuleViolation::HostMissing(std::path::PathBuf)
+pub outrig::config::MountRuleViolation::HostNotDirectory(std::path::PathBuf)
+pub enum outrig::config::NetworkAction
+pub outrig::config::NetworkAction::Allow
+pub outrig::config::NetworkAction::Deny
+impl outrig::config::NetworkAction
+pub fn outrig::config::NetworkAction::as_str(self) -> &'static str
+impl core::fmt::Display for outrig::config::NetworkAction
+pub fn outrig::config::NetworkAction::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum outrig::config::NetworkMode
+pub outrig::config::NetworkMode::Audit
+pub outrig::config::NetworkMode::Default
+pub outrig::config::NetworkMode::Filter
+impl core::fmt::Display for outrig::config::NetworkMode
+pub fn outrig::config::NetworkMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for outrig::config::NetworkMode
+pub type outrig::config::NetworkMode::Err = alloc::string::String
+pub fn outrig::config::NetworkMode::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub enum outrig::config::SidecarOnFailure
+pub outrig::config::SidecarOnFailure::Abort
+pub outrig::config::SidecarOnFailure::Warn
+pub enum outrig::config::SidecarStart
+pub outrig::config::SidecarStart::Auto
+pub outrig::config::SidecarStart::Manual
+pub enum outrig::config::SidecarView
+pub outrig::config::SidecarView::None
+pub outrig::config::SidecarView::Primary
+impl outrig::config::SidecarView
+pub fn outrig::config::SidecarView::is_none(&self) -> bool
+pub enum outrig::config::SidecarWorkspaceAccess
+pub outrig::config::SidecarWorkspaceAccess::None
+pub outrig::config::SidecarWorkspaceAccess::Ro
+pub outrig::config::SidecarWorkspaceAccess::Rw
+impl outrig::config::SidecarWorkspaceAccess
+pub fn outrig::config::SidecarWorkspaceAccess::mount_access(self) -> core::option::Option<outrig::config::MountAccess>
+pub struct outrig::config::Agent
+pub outrig::config::Agent::image: core::option::Option<alloc::string::String>
+pub outrig::config::Agent::max_tokens: core::option::Option<u32>
+pub outrig::config::Agent::model: core::option::Option<alloc::string::String>
+pub outrig::config::Agent::preamble: core::option::Option<alloc::string::String>
+pub outrig::config::Agent::subagent_depth_max: core::option::Option<u32>
+pub outrig::config::Agent::subagents: core::option::Option<bool>
+pub outrig::config::Agent::temperature: core::option::Option<f32>
+pub outrig::config::Agent::tool_call_max: core::option::Option<u32>
+pub outrig::config::Agent::tool_result_max: core::option::Option<u32>
+impl outrig::config::Agent
+pub fn outrig::config::Agent::subagents_enabled(&self) -> bool
+pub struct outrig::config::ApiKeyRef(_)
+impl outrig::config::ApiKeyRef
+pub fn outrig::config::ApiKeyRef::parse(&str) -> outrig::error::Result<Self>
+pub fn outrig::config::ApiKeyRef::resolve(&self) -> outrig::error::Result<alloc::string::String>
+pub fn outrig::config::ApiKeyRef::var_name(&self) -> &str
+impl serde_core::ser::Serialize for outrig::config::ApiKeyRef
+pub fn outrig::config::ApiKeyRef::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for outrig::config::ApiKeyRef
+pub fn outrig::config::ApiKeyRef::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub struct outrig::config::Config
+pub outrig::config::Config::agents: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Agent>
+pub outrig::config::Config::default_agent: core::option::Option<alloc::string::String>
+pub outrig::config::Config::default_image: core::option::Option<alloc::string::String>
+pub outrig::config::Config::default_model: core::option::Option<alloc::string::String>
+pub outrig::config::Config::images: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ImageConfig>
+pub outrig::config::Config::model_cache_root: core::option::Option<std::path::PathBuf>
+pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
+pub outrig::config::Config::network: outrig::config::NetworkConfig
+pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::LlmProvider>
+pub outrig::config::Config::session_root: core::option::Option<std::path::PathBuf>
+pub outrig::config::Config::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::SidecarConfig>
+pub outrig::config::Config::subagent_depth_max: core::option::Option<u32>
+pub outrig::config::Config::tool_call_max: core::option::Option<u32>
+pub outrig::config::Config::tool_result_max: core::option::Option<u32>
+pub outrig::config::Config::workspace: outrig::config::Workspace
+impl outrig::config::Config
+pub fn outrig::config::Config::load(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
+pub fn outrig::config::Config::validate_workspace_mounts(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
+pub struct outrig::config::ContainerSecurity
+pub outrig::config::ContainerSecurity::cap_add: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::ContainerSecurity::cap_drop: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::ContainerSecurity::capability_profile: outrig::config::CapabilityProfile
+pub outrig::config::ContainerSecurity::devices: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::ContainerSecurity::no_new_privileges: bool
+impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::SecuritySpec
+pub fn outrig::SecuritySpec::from(&outrig::config::ContainerSecurity) -> Self
+impl core::default::Default for outrig::config::ContainerSecurity
+pub fn outrig::config::ContainerSecurity::default() -> Self
+pub struct outrig::config::ImageConfig
+pub outrig::config::ImageConfig::build_args: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub outrig::config::ImageConfig::context: core::option::Option<std::path::PathBuf>
+pub outrig::config::ImageConfig::dockerfile: core::option::Option<std::path::PathBuf>
+pub outrig::config::ImageConfig::image_name: core::option::Option<alloc::string::String>
+pub outrig::config::ImageConfig::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
+pub outrig::config::ImageConfig::security: outrig::config::ContainerSecurity
+impl outrig::config::ImageConfig
+pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
+pub struct outrig::config::MistralrsDeviceParseError
+impl core::error::Error for outrig::config::MistralrsDeviceParseError
+impl core::fmt::Display for outrig::config::MistralrsDeviceParseError
+pub fn outrig::config::MistralrsDeviceParseError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct outrig::config::Model
+pub outrig::config::Model::context_length: core::option::Option<u32>
+pub outrig::config::Model::device: core::option::Option<alloc::string::String>
+pub outrig::config::Model::identifier: core::option::Option<alloc::string::String>
+pub outrig::config::Model::model_file: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub outrig::config::Model::model_id: core::option::Option<alloc::string::String>
+pub outrig::config::Model::model_path: core::option::Option<std::path::PathBuf>
+pub outrig::config::Model::provider: alloc::string::String
+pub outrig::config::Model::revision: core::option::Option<alloc::string::String>
+pub struct outrig::config::MountConfig
+pub outrig::config::MountConfig::access: outrig::config::MountAccess
+pub outrig::config::MountConfig::container_path: std::path::PathBuf
+pub outrig::config::MountConfig::host_path: std::path::PathBuf
+pub struct outrig::config::NetworkConfig
+pub outrig::config::NetworkConfig::allow: alloc::vec::Vec<outrig::config::NetworkEntry>
+pub outrig::config::NetworkConfig::default: outrig::config::NetworkAction
+pub outrig::config::NetworkConfig::deny: alloc::vec::Vec<outrig::config::NetworkEntry>
+pub outrig::config::NetworkConfig::mode: outrig::config::NetworkMode
+impl outrig::config::NetworkConfig
+pub fn outrig::config::NetworkConfig::has_policy_entries(&self) -> bool
+pub fn outrig::config::NetworkConfig::policy(&self) -> outrig::config::NetworkPolicy
+impl core::cmp::Eq for outrig::config::NetworkConfig
+impl core::cmp::PartialEq for outrig::config::NetworkConfig
+pub fn outrig::config::NetworkConfig::eq(&self, &Self) -> bool
+impl core::default::Default for outrig::config::NetworkConfig
+pub fn outrig::config::NetworkConfig::default() -> Self
+pub struct outrig::config::NetworkEntry
+pub outrig::config::NetworkEntry::host: alloc::string::String
+pub outrig::config::NetworkEntry::port: core::option::Option<u16>
+impl outrig::config::NetworkEntry
+pub fn outrig::config::NetworkEntry::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::NetworkEntry::with_port(impl core::convert::Into<alloc::string::String>, u16) -> Self
+impl<'de> serde_core::de::Deserialize<'de> for outrig::config::NetworkEntry
+pub fn outrig::config::NetworkEntry::deserialize<D>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error> where D: serde_core::de::Deserializer<'de>
+pub struct outrig::config::NetworkPolicy
+pub outrig::config::NetworkPolicy::allow: alloc::vec::Vec<outrig::config::NetworkEntry>
+pub outrig::config::NetworkPolicy::default: outrig::config::NetworkAction
+pub outrig::config::NetworkPolicy::deny: alloc::vec::Vec<outrig::config::NetworkEntry>
+impl outrig::config::NetworkPolicy
+pub fn outrig::config::NetworkPolicy::builder() -> outrig::config::NetworkPolicyBuilder
+impl core::default::Default for outrig::config::NetworkPolicy
+pub fn outrig::config::NetworkPolicy::default() -> Self
+pub struct outrig::config::NetworkPolicyBuilder
+impl outrig::config::NetworkPolicyBuilder
+pub fn outrig::config::NetworkPolicyBuilder::allow_host(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::allow_host_port(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::build(self) -> outrig::error::Result<outrig::config::NetworkPolicy>
+pub fn outrig::config::NetworkPolicyBuilder::default_action(self, outrig::config::NetworkAction) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::deny_host(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::deny_host_port(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub struct outrig::config::SidecarConfig
+pub outrig::config::SidecarConfig::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::config::SidecarConfig::image: alloc::string::String
+pub outrig::config::SidecarConfig::mounts: alloc::vec::Vec<outrig::config::MountConfig>
+pub outrig::config::SidecarConfig::on_failure: outrig::config::SidecarOnFailure
+pub outrig::config::SidecarConfig::security: outrig::config::ContainerSecurity
+pub outrig::config::SidecarConfig::start: outrig::config::SidecarStart
+pub outrig::config::SidecarConfig::view: outrig::config::SidecarView
+pub outrig::config::SidecarConfig::workspace: outrig::config::SidecarWorkspaceAccess
+pub struct outrig::config::Workspace
+pub outrig::config::Workspace::container_path: std::path::PathBuf
+pub outrig::config::Workspace::host_path: std::path::PathBuf
+pub outrig::config::Workspace::mounts: alloc::vec::Vec<outrig::config::MountConfig>
+impl core::default::Default for outrig::config::Workspace
+pub fn outrig::config::Workspace::default() -> Self
+pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
+pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
+pub const outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES: u32
+pub const outrig::config::SUBAGENT_DEPTH_MAX_CEILING: u32
+pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32
+pub const outrig::config::TOOL_RESULT_MAX_CEILING_BYTES: u32
+pub const outrig::config::TOOL_RESULT_MAX_FLOOR_BYTES: u32
+pub fn outrig::config::merge(outrig::config::Config, outrig::config::Config) -> outrig::config::Config
+pub mod outrig::container
+pub mod outrig::container::embedded
+pub enum outrig::container::embedded::EmbeddedImageConfigError
+pub outrig::container::embedded::EmbeddedImageConfigError::ArgsInLabel
+pub outrig::container::embedded::EmbeddedImageConfigError::ArgsInLabel::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::EmptyMcpCommand
+pub outrig::container::embedded::EmbeddedImageConfigError::EmptyMcpCommand::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::InvalidMcpServerName
+pub outrig::container::embedded::EmbeddedImageConfigError::InvalidMcpServerName::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::Json(serde_json::error::Error)
+pub outrig::container::embedded::EmbeddedImageConfigError::PlacementInLabel
+pub outrig::container::embedded::EmbeddedImageConfigError::PlacementInLabel::server: alloc::string::String
+pub outrig::container::embedded::EmbeddedImageConfigError::ReservedMcpServerName
+pub outrig::container::embedded::EmbeddedImageConfigError::ReservedMcpServerName::server: alloc::string::String
+pub enum outrig::container::embedded::McpDeclarationSource
+pub outrig::container::embedded::McpDeclarationSource::ConfigToml
+pub outrig::container::embedded::McpDeclarationSource::ImageLabel
+pub outrig::container::embedded::McpDeclarationSource::LaunchSpec
+impl outrig::container::embedded::McpDeclarationSource
+pub fn outrig::container::embedded::McpDeclarationSource::description(self) -> &'static str
+pub enum outrig::container::embedded::StandaloneImageTomlError
+pub outrig::container::embedded::StandaloneImageTomlError::ArgsInLabel
+pub outrig::container::embedded::StandaloneImageTomlError::ArgsInLabel::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::BuildFieldMissing
+pub outrig::container::embedded::StandaloneImageTomlError::BuildFieldMissing::field: &'static str
+pub outrig::container::embedded::StandaloneImageTomlError::EmptyMcpCommand
+pub outrig::container::embedded::StandaloneImageTomlError::EmptyMcpCommand::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::InvalidMcpServerName
+pub outrig::container::embedded::StandaloneImageTomlError::InvalidMcpServerName::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::McpEmpty
+pub outrig::container::embedded::StandaloneImageTomlError::MissingImageRef
+pub outrig::container::embedded::StandaloneImageTomlError::PlacementInLabel
+pub outrig::container::embedded::StandaloneImageTomlError::PlacementInLabel::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::ReservedMcpServerName
+pub outrig::container::embedded::StandaloneImageTomlError::ReservedMcpServerName::server: alloc::string::String
+pub outrig::container::embedded::StandaloneImageTomlError::Toml(toml::de::error::Error)
+pub struct outrig::container::embedded::McpServerSpecWithSource
+pub outrig::container::embedded::McpServerSpecWithSource::source: outrig::container::embedded::McpDeclarationSource
+pub outrig::container::embedded::McpServerSpecWithSource::spec: outrig::config::McpServerSpec
+pub struct outrig::container::embedded::StandaloneBuildConfig
+pub outrig::container::embedded::StandaloneBuildConfig::context: std::path::PathBuf
+pub outrig::container::embedded::StandaloneBuildConfig::dockerfile: std::path::PathBuf
+impl core::default::Default for outrig::container::embedded::StandaloneBuildConfig
+pub fn outrig::container::embedded::StandaloneBuildConfig::default() -> Self
+pub struct outrig::container::embedded::StandaloneImageLabels
+pub outrig::container::embedded::StandaloneImageLabels::description: core::option::Option<alloc::string::String>
+pub outrig::container::embedded::StandaloneImageLabels::mcp: core::option::Option<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
+pub outrig::container::embedded::StandaloneImageLabels::tags: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::embedded::StandaloneImageLabels::version: core::option::Option<alloc::string::String>
+pub struct outrig::container::embedded::StandaloneImageMetadata
+pub outrig::container::embedded::StandaloneImageMetadata::description: core::option::Option<alloc::string::String>
+pub outrig::container::embedded::StandaloneImageMetadata::image_ref: alloc::string::String
+pub outrig::container::embedded::StandaloneImageMetadata::tags: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::embedded::StandaloneImageMetadata::version: core::option::Option<alloc::string::String>
+pub struct outrig::container::embedded::StandaloneImageToml
+pub outrig::container::embedded::StandaloneImageToml::build: outrig::container::embedded::StandaloneBuildConfig
+pub outrig::container::embedded::StandaloneImageToml::image: outrig::container::embedded::StandaloneImageMetadata
+pub outrig::container::embedded::StandaloneImageToml::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
+pub const outrig::container::embedded::LABEL_DESCRIPTION: &str
+pub const outrig::container::embedded::LABEL_MCP: &str
+pub const outrig::container::embedded::LABEL_SCHEMA: &str
+pub const outrig::container::embedded::LABEL_SCHEMA_VERSION: &str
+pub const outrig::container::embedded::LABEL_TAGS: &str
+pub const outrig::container::embedded::LABEL_VERSION: &str
+pub async fn outrig::container::embedded::merged_mcp(&outrig::container::Container, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
+pub fn outrig::container::embedded::parse_standalone_image_labels(&str, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<outrig::container::embedded::StandaloneImageLabels>
+pub fn outrig::container::embedded::parse_standalone_image_toml(&str) -> core::result::Result<outrig::container::embedded::StandaloneImageToml, outrig::container::embedded::StandaloneImageTomlError>
+pub async fn outrig::container::embedded::read_embedded_mcp(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
+pub async fn outrig::container::embedded::read_standalone_image_mcp(&outrig::container::Container) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>>
+pub fn outrig::container::embedded::standalone_config_to_labels(&outrig::container::embedded::StandaloneImageToml) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub mod outrig::container::enter
+pub fn outrig::container::enter::is_available() -> bool
+pub fn outrig::container::enter::materialize(&std::path::Path) -> outrig::error::Result<std::path::PathBuf>
+pub mod outrig::container::sidecar
+pub enum outrig::container::sidecar::Placement
+pub outrig::container::sidecar::Placement::Primary
+pub outrig::container::sidecar::Placement::Sidecar(alloc::string::String)
+impl outrig::container::sidecar::Placement
+pub fn outrig::container::sidecar::Placement::description(&self) -> alloc::string::String
+pub struct outrig::container::sidecar::PlacedServer
+pub outrig::container::sidecar::PlacedServer::placement: outrig::container::sidecar::Placement
+pub outrig::container::sidecar::PlacedServer::source: outrig::container::embedded::McpDeclarationSource
+pub outrig::container::sidecar::PlacedServer::spec: outrig::config::McpServerSpec
+pub struct outrig::container::sidecar::SessionMcpPlan
+pub outrig::container::sidecar::SessionMcpPlan::servers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::container::sidecar::PlacedServer>
+pub outrig::container::sidecar::SessionMcpPlan::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::container::sidecar::SidecarPlan>
+impl outrig::container::sidecar::SessionMcpPlan
+pub fn outrig::container::sidecar::SessionMcpPlan::entrypoint_server_in(&self, &outrig::container::sidecar::SidecarPlan) -> core::option::Option<(&alloc::string::String, &outrig::container::sidecar::PlacedServer)>
+pub fn outrig::container::sidecar::SessionMcpPlan::servers_in(&self, &str) -> impl core::iter::traits::iterator::Iterator<Item = (&alloc::string::String, &outrig::container::sidecar::PlacedServer)>
+pub fn outrig::container::sidecar::SessionMcpPlan::sidecar_honors_labels(&self, &outrig::container::sidecar::SidecarPlan) -> bool
+pub fn outrig::container::sidecar::SessionMcpPlan::sidecar_needs_bootstrap(&self, &outrig::container::sidecar::SidecarPlan) -> bool
+pub struct outrig::container::sidecar::SidecarPlan
+pub outrig::container::sidecar::SidecarPlan::anonymous: bool
+pub outrig::container::sidecar::SidecarPlan::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::sidecar::SidecarPlan::image: alloc::string::String
+pub outrig::container::sidecar::SidecarPlan::mounts: alloc::vec::Vec<outrig::config::MountConfig>
+pub outrig::container::sidecar::SidecarPlan::name: alloc::string::String
+pub outrig::container::sidecar::SidecarPlan::on_failure: outrig::config::SidecarOnFailure
+pub outrig::container::sidecar::SidecarPlan::security: outrig::config::ContainerSecurity
+pub outrig::container::sidecar::SidecarPlan::start: outrig::config::SidecarStart
+pub outrig::container::sidecar::SidecarPlan::view: outrig::config::SidecarView
+pub outrig::container::sidecar::SidecarPlan::workspace: outrig::config::SidecarWorkspaceAccess
+pub fn outrig::container::sidecar::build_primary_view_argv(&[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &str, &str, &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn outrig::container::sidecar::entrypoint_args<'a>(&'a outrig::config::McpServerSpec, &'a outrig::container::sidecar::SidecarPlan) -> &'a [alloc::string::String]
+pub fn outrig::container::sidecar::merge_primary_labels(&mut outrig::container::sidecar::SessionMcpPlan, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>)
+pub fn outrig::container::sidecar::merge_sidecar_labels(&mut outrig::container::sidecar::SessionMcpPlan, &str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>) -> outrig::error::Result<()>
+pub fn outrig::container::sidecar::plan_from_config(&outrig::config::Config, &outrig::config::ImageConfig) -> outrig::container::sidecar::SessionMcpPlan
+pub struct outrig::container::Container
+impl outrig::container::Container
+pub fn outrig::container::Container::attach(impl core::convert::Into<alloc::string::String>, outrig::image::ImageTag, core::option::Option<(&std::path::Path, &std::path::Path)>, core::option::Option<outrig::Transcript>) -> Self
+pub async fn outrig::container::Container::bootstrap_user(&mut self) -> outrig::error::Result<()>
+pub fn outrig::container::Container::container_workspace(&self) -> &std::path::Path
+pub async fn outrig::container::Container::create_initialized(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>, bool, &[alloc::string::String]) -> outrig::error::Result<Self>
+pub async fn outrig::container::Container::exec_stdio(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<tokio::process::Child>
+pub fn outrig::container::Container::gid(&self) -> u32
+pub fn outrig::container::Container::group_name(&self) -> core::option::Option<&str>
+pub fn outrig::container::Container::host_workspace(&self) -> &std::path::Path
+pub fn outrig::container::Container::image_tag(&self) -> &outrig::image::ImageTag
+pub async fn outrig::container::Container::inspect_existing(&str, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::container::ContainerInspect>
+pub async fn outrig::container::Container::is_running(&str) -> outrig::error::Result<bool>
+pub fn outrig::container::Container::name(&self) -> &str
+pub async fn outrig::container::Container::pid(&self) -> outrig::error::Result<u32>
+pub fn outrig::container::Container::session_suffix(&self) -> &str
+pub async fn outrig::container::Container::start(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec) -> outrig::error::Result<Self>
+pub async fn outrig::container::Container::start_named(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>) -> outrig::error::Result<Self>
+pub async fn outrig::container::Container::stop(self, core::time::Duration) -> outrig::error::Result<()>
+pub fn outrig::container::Container::transcript(&self) -> core::option::Option<outrig::Transcript>
+pub fn outrig::container::Container::uid(&self) -> u32
+pub fn outrig::container::Container::user_name(&self) -> core::option::Option<&str>
+impl core::ops::drop::Drop for outrig::container::Container
+pub fn outrig::container::Container::drop(&mut self)
+pub struct outrig::container::ContainerCapabilities
+pub outrig::container::ContainerCapabilities::cap_add: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::ContainerCapabilities::cap_drop: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::ContainerCapabilities::profile: outrig::config::CapabilityProfile
+impl core::convert::From<&outrig::CapabilitySpec> for outrig::container::ContainerCapabilities
+pub fn outrig::container::ContainerCapabilities::from(&outrig::CapabilitySpec) -> Self
+pub struct outrig::container::ContainerInspect
+pub outrig::container::ContainerInspect::image_tag: outrig::image::ImageTag
+pub outrig::container::ContainerInspect::running: bool
+pub struct outrig::container::ContainerLaunchSpec
+pub outrig::container::ContainerLaunchSpec::capabilities: outrig::container::ContainerCapabilities
+pub outrig::container::ContainerLaunchSpec::devices: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::ContainerLaunchSpec::labels: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::container::ContainerLaunchSpec::mounts: alloc::vec::Vec<outrig::container::ContainerMount>
+pub outrig::container::ContainerLaunchSpec::no_new_privileges: bool
+pub outrig::container::ContainerLaunchSpec::primary_view: core::option::Option<outrig::container::PrimaryView>
+pub outrig::container::ContainerLaunchSpec::workspace: core::option::Option<outrig::container::ContainerWorkspace>
+impl outrig::container::ContainerLaunchSpec
+pub fn outrig::container::ContainerLaunchSpec::workspace(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
+impl core::default::Default for outrig::container::ContainerLaunchSpec
+pub fn outrig::container::ContainerLaunchSpec::default() -> Self
+pub struct outrig::container::ContainerMount
+pub outrig::container::ContainerMount::access: outrig::config::MountAccess
+pub outrig::container::ContainerMount::container: std::path::PathBuf
+pub outrig::container::ContainerMount::host: std::path::PathBuf
+pub struct outrig::container::ContainerWorkspace
+pub outrig::container::ContainerWorkspace::access: outrig::config::MountAccess
+pub outrig::container::ContainerWorkspace::container: std::path::PathBuf
+pub outrig::container::ContainerWorkspace::host: std::path::PathBuf
+pub struct outrig::container::PrimaryView
+pub outrig::container::PrimaryView::helper_host: std::path::PathBuf
+pub outrig::container::PrimaryView::primary_container: alloc::string::String
+pub outrig::container::PrimaryView::primary_pid: u32
+pub const outrig::container::LABEL_SESSION: &str
+pub const outrig::container::LABEL_SIDECAR: &str
+pub const outrig::container::PRIMARY_VIEW_GRAFT: &str
+pub const outrig::container::PRIMARY_VIEW_HELPER_MOUNT: &str
+pub const outrig::container::PRIMARY_VIEW_NS_FILE: &str
+pub const outrig::container::PRIMARY_VIEW_NS_MOUNT: &str
+pub async fn outrig::container::direct_bootstrap_supported() -> bool
+pub fn outrig::container::force_remove_detached(&str)
+pub fn outrig::container::install_panic_hook()
+pub fn outrig::container::sidecar_container_name(&str, &str) -> alloc::string::String
+pub mod outrig::error
+pub enum outrig::error::OutrigError
+pub outrig::error::OutrigError::ApiKey(outrig::config::ApiKeyError)
+pub outrig::error::OutrigError::BootstrapExhausted
+pub outrig::error::OutrigError::BootstrapExhausted::kind: &'static str
+pub outrig::error::OutrigError::BootstrapNamespace
+pub outrig::error::OutrigError::BootstrapNamespace::container: alloc::string::String
+pub outrig::error::OutrigError::BootstrapNamespace::source: std::io::error::Error
+pub outrig::error::OutrigError::BootstrapNamespace::step: alloc::string::String
+pub outrig::error::OutrigError::BuildArgResolveFailed
+pub outrig::error::OutrigError::BuildArgResolveFailed::image: alloc::string::String
+pub outrig::error::OutrigError::BuildArgResolveFailed::key: alloc::string::String
+pub outrig::error::OutrigError::BuildArgResolveFailed::source: outrig::config::EnvValueError
+pub outrig::error::OutrigError::Config(toml::de::error::Error)
+pub outrig::error::OutrigError::ConfigDottedKey
+pub outrig::error::OutrigError::ConfigDottedKey::source: toml::de::error::Error
+pub outrig::error::OutrigError::ConfigValidation(outrig::config::ConfigValidationError)
+pub outrig::error::OutrigError::Configuration(alloc::string::String)
+pub outrig::error::OutrigError::EmbeddedImageConfigParse
+pub outrig::error::OutrigError::EmbeddedImageConfigParse::image: alloc::string::String
+pub outrig::error::OutrigError::EmbeddedImageConfigParse::source: alloc::boxed::Box<outrig::container::embedded::EmbeddedImageConfigError>
+pub outrig::error::OutrigError::FilesystemHelperUnavailable
+pub outrig::error::OutrigError::Io(std::io::error::Error)
+pub outrig::error::OutrigError::McpArgsNotObject
+pub outrig::error::OutrigError::McpArgsNotObject::kind: &'static str
+pub outrig::error::OutrigError::McpEnvResolveFailed
+pub outrig::error::OutrigError::McpEnvResolveFailed::key: alloc::string::String
+pub outrig::error::OutrigError::McpEnvResolveFailed::name: alloc::string::String
+pub outrig::error::OutrigError::McpEnvResolveFailed::source: outrig::config::EnvValueError
+pub outrig::error::OutrigError::McpServerInitialize(alloc::boxed::Box<rmcp::service::server::ServerInitializeError>)
+pub outrig::error::OutrigError::McpService(rmcp::service::ServiceError)
+pub outrig::error::OutrigError::McpStartupFailed(alloc::boxed::Box<outrig::error::McpStartupFailure>)
+pub outrig::error::OutrigError::McpToolsListFailed
+pub outrig::error::OutrigError::McpToolsListFailed::name: alloc::string::String
+pub outrig::error::OutrigError::McpToolsListFailed::source: alloc::boxed::Box<rmcp::service::ServiceError>
+pub outrig::error::OutrigError::NoRepoConfig
+pub outrig::error::OutrigError::Path
+pub outrig::error::OutrigError::Path::op: &'static str
+pub outrig::error::OutrigError::Path::path: std::path::PathBuf
+pub outrig::error::OutrigError::Path::source: std::io::error::Error
+pub outrig::error::OutrigError::Process
+pub outrig::error::OutrigError::Process::argv: alloc::vec::Vec<std::ffi::os_str::OsString>
+pub outrig::error::OutrigError::Process::exit_code: core::option::Option<i32>
+pub outrig::error::OutrigError::Process::program: &'static str
+pub outrig::error::OutrigError::Process::stderr_tail: alloc::string::String
+pub outrig::error::OutrigError::Spawn
+pub outrig::error::OutrigError::Spawn::command: alloc::string::String
+pub outrig::error::OutrigError::Spawn::program: &'static str
+pub outrig::error::OutrigError::Spawn::source: std::io::error::Error
+impl core::convert::From<rmcp::service::server::ServerInitializeError> for outrig::error::OutrigError
+pub fn outrig::error::OutrigError::from(rmcp::service::server::ServerInitializeError) -> Self
+impl core::convert::From<tempfile::file::PersistError> for outrig::error::OutrigError
+pub fn outrig::error::OutrigError::from(tempfile::file::PersistError) -> Self
+pub struct outrig::error::McpStartupFailure
+pub outrig::error::McpStartupFailure::command: alloc::string::String
+pub outrig::error::McpStartupFailure::declaration_source: core::option::Option<alloc::string::String>
+pub outrig::error::McpStartupFailure::exit: alloc::string::String
+pub outrig::error::McpStartupFailure::name: alloc::string::String
+pub outrig::error::McpStartupFailure::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
+pub outrig::error::McpStartupFailure::stderr_path: std::path::PathBuf
+pub outrig::error::McpStartupFailure::stderr_tail: alloc::string::String
+pub trait outrig::error::IoPathExt<T>
+pub fn outrig::error::IoPathExt::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
+impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, std::io::error::Error>
+pub fn core::result::Result<T, std::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
+pub type outrig::error::Result<T> = core::result::Result<T, outrig::error::OutrigError>
+pub mod outrig::image
+pub struct outrig::image::ImageBuildOutcome
+pub outrig::image::ImageBuildOutcome::cache_hit: bool
+pub outrig::image::ImageBuildOutcome::tag: outrig::image::ImageTag
+pub struct outrig::image::ImageTag(pub alloc::string::String)
+impl core::fmt::Display for outrig::image::ImageTag
+pub fn outrig::image::ImageTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub async fn outrig::image::build_image_for(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool) -> outrig::error::Result<()>
+pub async fn outrig::image::build_standalone(&std::path::Path, &std::path::Path, &std::path::Path, &outrig::image::ImageTag, bool, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<()>
+pub async fn outrig::image::compute_tag(&outrig::config::ImageConfig, &std::path::Path) -> outrig::error::Result<outrig::image::ImageTag>
+pub async fn outrig::image::compute_tag_for(&str, &outrig::config::ImageConfig, &std::path::Path) -> outrig::error::Result<outrig::image::ImageTag>
+pub async fn outrig::image::ensure_image(&outrig::config::ImageConfig, &std::path::Path, bool) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
+pub async fn outrig::image::ensure_local_image(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
+pub async fn outrig::image::ensure_tagged_image_for(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::image::ImageBuildOutcome>
+pub async fn outrig::image::probe_cached(&outrig::image::ImageTag) -> outrig::error::Result<bool>
+pub async fn outrig::image::probe_pulled(&outrig::image::ImageTag) -> outrig::error::Result<bool>
+pub async fn outrig::image::pull_image(&outrig::image::ImageTag) -> outrig::error::Result<()>
+pub async fn outrig::image::read_image_entrypoint_cmd(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<(alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<alloc::string::String>)>
+pub async fn outrig::image::read_image_labels(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub async fn outrig::image::read_remote_image_labels(&str) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub mod outrig::mcp_proxy
+pub struct outrig::mcp_proxy::ProxyServer<C>
+impl<C: outrig::mcp_proxy::BackingClient> outrig::mcp_proxy::ProxyServer<C>
+pub async fn outrig::mcp_proxy::ProxyServer<C>::build(alloc::vec::Vec<C>) -> outrig::error::Result<Self>
+pub async fn outrig::mcp_proxy::ProxyServer<C>::dispatch_call(&self, rmcp::model::CallToolRequestParams) -> rmcp::model::CallToolResult
+pub fn outrig::mcp_proxy::ProxyServer<C>::iter_public_names(&self) -> impl core::iter::traits::iterator::Iterator<Item = &str>
+pub fn outrig::mcp_proxy::ProxyServer<C>::list_tools_inner(&self) -> rmcp::model::ListToolsResult
+pub fn outrig::mcp_proxy::ProxyServer<C>::per_server_counts(&self) -> alloc::vec::Vec<(&str, usize)>
+impl<C: outrig::mcp_proxy::BackingClient> rmcp::handler::server::ServerHandler for outrig::mcp_proxy::ProxyServer<C>
+pub async fn outrig::mcp_proxy::ProxyServer<C>::call_tool(&self, rmcp::model::CallToolRequestParams, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>
+pub fn outrig::mcp_proxy::ProxyServer<C>::get_info(&self) -> rmcp::model::ServerInfo
+pub async fn outrig::mcp_proxy::ProxyServer<C>::list_tools(&self, core::option::Option<rmcp::model::PaginatedRequestParams>, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData>
+impl<C> core::clone::Clone for outrig::mcp_proxy::ProxyServer<C>
+pub fn outrig::mcp_proxy::ProxyServer<C>::clone(&self) -> Self
+pub trait outrig::mcp_proxy::BackingClient: core::marker::Send + core::marker::Sync + 'static
+pub fn outrig::mcp_proxy::BackingClient::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
+pub fn outrig::mcp_proxy::BackingClient::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
+pub fn outrig::mcp_proxy::BackingClient::name(&self) -> &str
+impl outrig::mcp_proxy::BackingClient for outrig::McpClient
+pub fn outrig::McpClient::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
+pub fn outrig::McpClient::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
+pub fn outrig::McpClient::name(&self) -> &str
+impl<T> outrig::mcp_proxy::BackingClient for alloc::sync::Arc<T> where T: outrig::mcp_proxy::BackingClient + ?core::marker::Sized
+pub fn alloc::sync::Arc<T>::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
+pub fn alloc::sync::Arc<T>::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
+pub fn alloc::sync::Arc<T>::name(&self) -> &str
+pub mod outrig::network
+pub struct outrig::network::NetworkInterceptor
+impl outrig::network::NetworkInterceptor
+pub async fn outrig::network::NetworkInterceptor::attach(&mut self, &outrig::container::Container) -> outrig::error::Result<()>
+pub async fn outrig::network::NetworkInterceptor::detach(&mut self, &str) -> outrig::error::Result<()>
+pub async fn outrig::network::NetworkInterceptor::new(&std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
+pub async fn outrig::network::NetworkInterceptor::shutdown(self)
+pub async fn outrig::network::NetworkInterceptor::start(&outrig::container::Container, &std::path::Path, &str) -> outrig::error::Result<Self>
+pub async fn outrig::network::NetworkInterceptor::start_with_policy(&outrig::container::Container, &std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
+impl core::ops::drop::Drop for outrig::network::NetworkInterceptor
+pub fn outrig::network::NetworkInterceptor::drop(&mut self)
+pub enum outrig::CapabilityProfile
+pub outrig::CapabilityProfile::Default
+pub outrig::CapabilityProfile::DropAll
+pub outrig::CapabilityProfile::NoNetRaw
+pub enum outrig::EmbeddedMcpPolicy
+pub outrig::EmbeddedMcpPolicy::Ignore
+pub outrig::EmbeddedMcpPolicy::Merge
+pub enum outrig::MountAccess
+pub outrig::MountAccess::ReadOnly
+pub outrig::MountAccess::ReadWrite
+pub enum outrig::NetworkAction
+pub outrig::NetworkAction::Allow
+pub outrig::NetworkAction::Deny
+impl outrig::config::NetworkAction
+pub fn outrig::config::NetworkAction::as_str(self) -> &'static str
+impl core::fmt::Display for outrig::config::NetworkAction
+pub fn outrig::config::NetworkAction::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum outrig::NetworkMode
+pub outrig::NetworkMode::Audit
+pub outrig::NetworkMode::Default
+pub outrig::NetworkMode::Filter
+impl core::fmt::Display for outrig::config::NetworkMode
+pub fn outrig::config::NetworkMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for outrig::config::NetworkMode
+pub type outrig::config::NetworkMode::Err = alloc::string::String
+pub fn outrig::config::NetworkMode::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub enum outrig::SidecarWorkspaceAccess
+pub outrig::SidecarWorkspaceAccess::None
+pub outrig::SidecarWorkspaceAccess::Ro
+pub outrig::SidecarWorkspaceAccess::Rw
+impl outrig::config::SidecarWorkspaceAccess
+pub fn outrig::config::SidecarWorkspaceAccess::mount_access(self) -> core::option::Option<outrig::config::MountAccess>
+pub struct outrig::CapabilitySpec
+pub outrig::CapabilitySpec::cap_add: alloc::vec::Vec<alloc::string::String>
+pub outrig::CapabilitySpec::cap_drop: alloc::vec::Vec<alloc::string::String>
+pub outrig::CapabilitySpec::profile: outrig::config::CapabilityProfile
+impl core::convert::From<&outrig::CapabilitySpec> for outrig::container::ContainerCapabilities
+pub fn outrig::container::ContainerCapabilities::from(&outrig::CapabilitySpec) -> Self
+pub struct outrig::LaunchSpec
+pub outrig::LaunchSpec::embedded_mcp_policy: outrig::EmbeddedMcpPolicy
+pub outrig::LaunchSpec::log_dir: std::path::PathBuf
+pub outrig::LaunchSpec::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
+pub outrig::LaunchSpec::mounts: alloc::vec::Vec<outrig::MountSpec>
+pub outrig::LaunchSpec::network: outrig::NetworkSpec
+pub outrig::LaunchSpec::security: outrig::SecuritySpec
+pub outrig::LaunchSpec::sidecars: alloc::vec::Vec<outrig::SidecarSpec>
+pub outrig::LaunchSpec::workspace: core::option::Option<outrig::WorkspaceSpec>
+impl outrig::LaunchSpec
+pub fn outrig::LaunchSpec::build(std::path::PathBuf, std::path::PathBuf, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>, outrig::WorkspaceSpec, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>, std::path::PathBuf) -> Self
+pub async fn outrig::LaunchSpec::from_config(&outrig::config::Config, &str, &std::path::Path, std::path::PathBuf) -> outrig::error::Result<Self>
+pub fn outrig::LaunchSpec::from_image(impl core::convert::Into<alloc::string::String>, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>, std::path::PathBuf) -> Self
+pub fn outrig::LaunchSpec::with_capabilities(self, outrig::CapabilitySpec) -> Self
+pub fn outrig::LaunchSpec::with_embedded_mcp_policy(self, outrig::EmbeddedMcpPolicy) -> Self
+pub fn outrig::LaunchSpec::with_mount(self, outrig::MountSpec) -> Self
+pub fn outrig::LaunchSpec::with_mounts(self, impl core::iter::traits::collect::IntoIterator<Item = outrig::MountSpec>) -> Self
+pub fn outrig::LaunchSpec::with_network_filter(self, outrig::config::NetworkPolicy) -> Self
+pub fn outrig::LaunchSpec::with_network_mode(self, outrig::config::NetworkMode) -> Self
+pub fn outrig::LaunchSpec::with_security(self, outrig::SecuritySpec) -> Self
+pub fn outrig::LaunchSpec::with_sidecar(self, outrig::SidecarSpec) -> Self
+pub fn outrig::LaunchSpec::with_workspace(self, outrig::WorkspaceSpec) -> Self
+pub fn outrig::LaunchSpec::without_workspace(self) -> Self
+pub struct outrig::McpClient
+impl outrig::McpClient
+pub async fn outrig::McpClient::call_tool(&self, &str, serde_json::value::Value) -> outrig::error::Result<outrig::McpToolResult>
+pub async fn outrig::McpClient::connect_via_podman_exec(&outrig::container::Container, &outrig::config::McpServerSpec, &str, &std::path::Path, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<Self>
+pub async fn outrig::McpClient::connect_via_podman_exec_with_source(&outrig::container::Container, &outrig::config::McpServerSpec, &str, outrig::container::embedded::McpDeclarationSource, &std::path::Path, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<Self>
+pub async fn outrig::McpClient::connect_via_podman_start(&outrig::container::Container, &str, outrig::container::embedded::McpDeclarationSource, &std::path::Path) -> outrig::error::Result<Self>
+pub async fn outrig::McpClient::list_tools(&self) -> outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>
+pub fn outrig::McpClient::name(&self) -> &str
+pub async fn outrig::McpClient::shutdown(self) -> outrig::error::Result<()>
+impl outrig::mcp_proxy::BackingClient for outrig::McpClient
+pub fn outrig::McpClient::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
+pub fn outrig::McpClient::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
+pub fn outrig::McpClient::name(&self) -> &str
+pub struct outrig::McpTool
+pub outrig::McpTool::description: core::option::Option<alloc::string::String>
+pub outrig::McpTool::input_schema: serde_json::value::Value
+pub outrig::McpTool::name: alloc::string::String
+pub struct outrig::McpToolResult
+pub outrig::McpToolResult::content_text: alloc::string::String
+pub outrig::McpToolResult::is_error: bool
+pub struct outrig::MountSpec
+pub outrig::MountSpec::access: outrig::config::MountAccess
+pub outrig::MountSpec::container: std::path::PathBuf
+pub outrig::MountSpec::host: std::path::PathBuf
+pub struct outrig::NetworkEntry
+pub outrig::NetworkEntry::host: alloc::string::String
+pub outrig::NetworkEntry::port: core::option::Option<u16>
+impl outrig::config::NetworkEntry
+pub fn outrig::config::NetworkEntry::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::NetworkEntry::with_port(impl core::convert::Into<alloc::string::String>, u16) -> Self
+impl<'de> serde_core::de::Deserialize<'de> for outrig::config::NetworkEntry
+pub fn outrig::config::NetworkEntry::deserialize<D>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error> where D: serde_core::de::Deserializer<'de>
+pub struct outrig::NetworkPolicy
+pub outrig::NetworkPolicy::allow: alloc::vec::Vec<outrig::config::NetworkEntry>
+pub outrig::NetworkPolicy::default: outrig::config::NetworkAction
+pub outrig::NetworkPolicy::deny: alloc::vec::Vec<outrig::config::NetworkEntry>
+impl outrig::config::NetworkPolicy
+pub fn outrig::config::NetworkPolicy::builder() -> outrig::config::NetworkPolicyBuilder
+impl core::default::Default for outrig::config::NetworkPolicy
+pub fn outrig::config::NetworkPolicy::default() -> Self
+pub struct outrig::NetworkPolicyBuilder
+impl outrig::config::NetworkPolicyBuilder
+pub fn outrig::config::NetworkPolicyBuilder::allow_host(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::allow_host_port(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::build(self) -> outrig::error::Result<outrig::config::NetworkPolicy>
+pub fn outrig::config::NetworkPolicyBuilder::default_action(self, outrig::config::NetworkAction) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::deny_host(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::NetworkPolicyBuilder::deny_host_port(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
+pub struct outrig::NetworkSpec
+pub outrig::NetworkSpec::mode: outrig::config::NetworkMode
+pub outrig::NetworkSpec::policy: core::option::Option<outrig::config::NetworkPolicy>
+pub struct outrig::Outrig
+impl outrig::Outrig
+pub async fn outrig::Outrig::add_sidecar(&mut self, outrig::SidecarSpec) -> outrig::error::Result<alloc::vec::Vec<outrig::ToolHandle>>
+pub async fn outrig::Outrig::call_tool(&self, &str, &str, serde_json::value::Value) -> outrig::error::Result<outrig::McpToolResult>
+pub async fn outrig::Outrig::launch(&outrig::LaunchSpec) -> outrig::error::Result<Self>
+pub async fn outrig::Outrig::shutdown(self) -> outrig::error::Result<()>
+pub fn outrig::Outrig::tools(&self) -> &[outrig::ToolHandle]
+pub struct outrig::SecuritySpec
+pub outrig::SecuritySpec::capabilities: outrig::CapabilitySpec
+pub outrig::SecuritySpec::devices: alloc::vec::Vec<alloc::string::String>
+pub outrig::SecuritySpec::no_new_privileges: bool
+impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::SecuritySpec
+pub fn outrig::SecuritySpec::from(&outrig::config::ContainerSecurity) -> Self
+impl core::default::Default for outrig::SecuritySpec
+pub fn outrig::SecuritySpec::default() -> Self
+pub struct outrig::SidecarServerSpec
+pub outrig::SidecarServerSpec::command: alloc::vec::Vec<alloc::string::String>
+pub outrig::SidecarServerSpec::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
+pub struct outrig::SidecarSpec
+pub outrig::SidecarSpec::mounts: alloc::vec::Vec<outrig::MountSpec>
+pub outrig::SidecarSpec::name: alloc::string::String
+pub outrig::SidecarSpec::security: outrig::SecuritySpec
+pub outrig::SidecarSpec::servers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::SidecarServerSpec>
+pub outrig::SidecarSpec::workspace: outrig::config::SidecarWorkspaceAccess
+impl outrig::SidecarSpec
+pub fn outrig::SidecarSpec::from_image(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::SidecarSpec::with_mount(self, outrig::MountSpec) -> Self
+pub fn outrig::SidecarSpec::with_mounts(self, impl core::iter::traits::collect::IntoIterator<Item = outrig::MountSpec>) -> Self
+pub fn outrig::SidecarSpec::with_security(self, outrig::SecuritySpec) -> Self
+pub fn outrig::SidecarSpec::with_server(self, impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<alloc::string::String>) -> Self
+pub fn outrig::SidecarSpec::with_server_env(self, impl core::convert::Into<alloc::string::String>, alloc::vec::Vec<alloc::string::String>, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
+pub fn outrig::SidecarSpec::with_workspace_access(self, outrig::config::SidecarWorkspaceAccess) -> Self
+pub struct outrig::ToolHandle
+pub outrig::ToolHandle::description: alloc::string::String
+pub outrig::ToolHandle::input_schema: serde_json::value::Value
+pub outrig::ToolHandle::name: alloc::string::String
+pub outrig::ToolHandle::server: alloc::string::String
+pub struct outrig::Transcript
+impl outrig::Transcript
+pub async fn outrig::Transcript::create(&std::path::Path, bool) -> outrig::error::Result<Self>
+pub async fn outrig::Transcript::line(&self, &'static str, &str) -> std::io::error::Result<()>
+pub struct outrig::WorkspaceSpec
+pub outrig::WorkspaceSpec::container: std::path::PathBuf
+pub outrig::WorkspaceSpec::host: std::path::PathBuf
+pub const outrig::PUBLIC_DOC_BASE_URL: &str
+pub const outrig::RESERVED_SERVER: &str
+pub fn outrig::load_project(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<(outrig::config::Config, std::path::PathBuf)>
+pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub fn outrig::sanitize_tool_name(&str, &str) -> alloc::string::String

@@ -24,6 +24,7 @@ use crate::session::{self, Session, SessionStore};
 use outrig::container::{LABEL_SESSION, LABEL_SIDECAR};
 
 const DAY: u64 = 24 * 60 * 60;
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub const DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * DAY);
 
 #[derive(Debug, Parser)]

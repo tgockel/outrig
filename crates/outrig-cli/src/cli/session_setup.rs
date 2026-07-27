@@ -206,12 +206,10 @@ impl SessionRuntime {
 pub struct SessionSetup {
     pub cfg: Config,
     pub image_cfg_name: String,
-    pub image_cfg: ImageConfig,
     pub image_tag: ImageTag,
     pub containers: SessionContainers,
     pub sid: SessionId,
     pub session: Session,
-    pub session_dir: PathBuf,
     pub log_dir: PathBuf,
     pub store: SessionStore,
     /// Directory the repo config was resolved against; mid-session sidecar
@@ -616,12 +614,10 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     Ok(SessionSetup {
         cfg,
         image_cfg_name,
-        image_cfg,
         image_tag,
         containers,
         sid,
         session,
-        session_dir,
         log_dir,
         store,
         repo_root,

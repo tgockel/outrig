@@ -13,10 +13,18 @@ documentation.workspace = true
 repository.workspace    = true
 keywords.workspace      = true
 categories.workspace    = true
+# `public-api.txt` is a generated record of the published API, for review.
+# `tests/` must be excluded, not just skipped: Cargo strips a path-only
+# dev-dependency when publishing, so the self-dependency that exposes
+# `internal-test-api` does not survive into the `.crate`, and a shipped
+# `tests/` would fail to compile for anyone who ran it.
+exclude                 = ["public-api.txt", "tests/"]
 
 [features]
 default   = []
 e2e       = []
+# Test-only; see the `src/lib.rs` module doc.
+internal-test-api = []
 local-llm = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap"]
 cuda      = ["candle-core?/cuda", "mistralrs-core?/cuda"]
 # Metal's upstream dependency features are Apple-only. The public feature
@@ -62,6 +70,10 @@ tracing-subscriber = { workspace = true, default-features = true, features = ["e
 walkdir            = { workspace = true, default-features = true }
 
 [dev-dependencies]
+# A dependency on self, so the integration tests -- separate crates -- see the
+# module tree `internal-test-api` exposes, without a plain build enabling it.
+outrig-cli = { path = ".", features = ["internal-test-api"] }
+
 # `test-util` gives tests `start_paused`, so the subagent registry tests can
 # drive a round whose retry backoff would otherwise take seconds of real time.
 tokio = { workspace = true, default-features = true, features = ["test-util"] }

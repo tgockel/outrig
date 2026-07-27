@@ -1,4 +1,12 @@
 #![doc = include_str!("../README.md")]
+//!
+//! # Supported surface
+//!
+//! The facade above is one of two supported tiers. `config`, `container`,
+//! `error`, `image`, `mcp_proxy`, and `network` are the other: a caller that
+//! wants the pieces rather than a whole managed session drives them directly,
+//! and downstream crates do. Both tiers are a SemVer commitment; every other
+//! module is private, reaching this root only through the re-exports below.
 
 use std::path::{Path, PathBuf};
 

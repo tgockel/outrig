@@ -1,0 +1,10 @@
+# Public API surface of `outrig-cli`, as reported by cargo-public-api 0.52.0:
+#
+#     cargo public-api -p outrig-cli --omit blanket-impls,auto-trait-impls,auto-derived-impls
+#
+# Regenerate after any intentional surface change and review the diff. The tool's
+# output format shifts between releases, so a diff with no source change means the
+# pinned version above moved.
+
+pub mod outrig_cli
+pub fn outrig_cli::run() -> std::process::ExitCode

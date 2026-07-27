@@ -7,16 +7,17 @@ branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 This queue is pre-freeze work for `0.2.0`. Everything in it either changes what an existing
-thing means or fixes a contract a release would otherwise freeze wrong. 0093-0095 settle the
+thing means or fixes a contract a release would otherwise freeze wrong. 0094-0095 settle the
 public surface: there is currently no `#[non_exhaustive]` anywhere in either crate, so every
 additive change to a public type is a breaking one. Landing them first is what makes 0096-0100
 additive rather than breaking -- each of those adds a field or a variant to a type the sweep
 insulates. The e2e suite compiles again and CI gates it (0092), so `library_surface.rs` -- the
-facade test the hardening work is measured against -- is runnable.
+facade test the hardening work is measured against -- is runnable. 0093 settled the reach
+question: all six of the library's public modules are supported API, so 0094-0095 cover more
+than first scoped, and `outrig-cli`'s internals are no longer public at all.
 
 | Task | Title                                                     | Dependencies     |
 |------|-----------------------------------------------------------|------------------|
-| 0093 | Shrink the reachable public surface                       | 0092             |
 | 0094 | `#[non_exhaustive]` sweep on what stays public            | 0093             |
 | 0095 | Options structs, trait sealing, ImageTag privatization    | 0093, 0094       |
 | 0096 | Resolve relative config paths against the declaring file  | 0094             |

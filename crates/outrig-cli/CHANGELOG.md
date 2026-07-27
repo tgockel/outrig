@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (config):** a sidecar starts only when an `[images.<name>.mcp]` entry names it.
   Declaring a block no longer starts it -- with blocks shared and global, it cannot.
 
+### Removed
+
+- **Breaking (library):** this crate's internals are no longer a public path. `builtin_tool`,
+  `cli`, `config_init`, `error`, `hf`, `image_setup`, `init`, `llm`, `mcp_self`, `repl`,
+  `rig_tool`, `session`, `session_tool`, and `subagent` were `pub` only so the integration tests
+  in `tests/` could reach them, which the crate's own module doc has always said. They are now
+  crate-private unless the `internal-test-api` feature is on, which only those tests enable.
+  `CliError`, `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`, `MistralrsWeights`,
+  `RigAgent`, and `resolve_agent_with_overrides` were the growth points this closes -- all of
+  them gained fields, variants, or parameters during `0.2`.
+
+  The published surface is now `outrig_cli::run() -> ExitCode`, which runs the CLI and returns
+  its exit code. Nothing else is covered by SemVer. Depend on the `outrig` crate for a supported
+  Rust API; **the `outrig` command-line interface itself is unaffected.**
+
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0-rc.1) - 2026-07-24
 
 A release candidate, cut so the library's breaking changes get integration testing ahead of

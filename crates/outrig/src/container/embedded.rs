@@ -189,7 +189,7 @@ pub async fn read_standalone_image_mcp(
 /// Serialize an MCP table into the common OutRig OCI labels. Repo-local image
 /// builds use this for cache-key input before build time; standalone builds
 /// add author-facing metadata labels on top.
-pub fn mcp_config_to_labels(
+pub(crate) fn mcp_config_to_labels(
     mcp: &BTreeMap<String, McpServerSpec>,
 ) -> Result<BTreeMap<String, String>> {
     let mut labels = BTreeMap::new();
@@ -204,7 +204,7 @@ pub fn mcp_config_to_labels(
 /// entries survive, and repo entries replace by server name. Placement-bearing
 /// config entries are excluded -- they declare servers for *other* containers,
 /// and labels are image-scoped.
-pub fn merged_mcp_config_to_labels(
+pub(crate) fn merged_mcp_config_to_labels(
     image: &str,
     labels: &BTreeMap<String, String>,
     config_mcp: &BTreeMap<String, McpServerSpec>,
@@ -217,7 +217,7 @@ pub fn merged_mcp_config_to_labels(
 /// without a `sidecar`/`image` placement key. Used when serializing config
 /// into an image's own `org.outrig.mcp` label (and its cache key), where
 /// placement keys are rejected on read.
-pub fn primary_scoped_mcp(
+pub(crate) fn primary_scoped_mcp(
     config: &BTreeMap<String, McpServerSpec>,
 ) -> BTreeMap<String, McpServerSpec> {
     config
@@ -298,6 +298,14 @@ pub async fn read_embedded_mcp(
     embedded_mcp_from_labels(&tag.0, &labels)
 }
 
+/// The MCP table a running container will actually serve: the servers
+/// declared by its image's `org.outrig.mcp` label, overlaid with `config_mcp`
+/// by server name. Reads the label off the live container, so it reflects the
+/// image that started rather than whatever the config now resolves to.
+///
+/// This is the read-side counterpart to the label writers above, and the entry
+/// point a caller driving a `Container` directly wants -- the merge stages
+/// beneath it are crate-private.
 pub async fn merged_mcp(
     container: &Container,
     config_mcp: &BTreeMap<String, McpServerSpec>,
@@ -344,7 +352,7 @@ fn strip_mcp_sources(
         .collect()
 }
 
-pub fn merge_mcp(
+pub(crate) fn merge_mcp(
     mut image: BTreeMap<String, McpServerSpec>,
     config: &BTreeMap<String, McpServerSpec>,
 ) -> BTreeMap<String, McpServerSpec> {

@@ -8,4 +8,5 @@ pub mod init;
 pub mod inspect;
 pub mod render;
 
+#[cfg_attr(not(feature = "internal-test-api"), allow(unused_imports))]
 pub use add::DOC_SYNC_FIELDS;

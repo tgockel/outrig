@@ -29,10 +29,12 @@ use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDevice
 /// 0.39 budget, so callers pass `tool_call_max + 2` to preserve the previous
 /// effective allowance and keep the hook -- not rig -- the limiter that fires
 /// first.
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_MAX as usize;
 
 /// Default byte ceiling applied to each individual MCP tool result before it
 /// is handed to Rig and appended to model-visible chat history.
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize =
     outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES as usize;
 
@@ -192,10 +194,12 @@ pub struct ResolvedAgent {
 /// Each lookup is re-checked here -- the function does not assume
 /// `cfg.validate()` was called -- so errors carry the resolution context
 /// (which agent, which model) regardless.
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
     resolve_agent_with_overrides(cfg, agent_name, None, None)
 }
 
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub fn resolve_agent_with_device_override(
     cfg: &Config,
     agent_name: &str,

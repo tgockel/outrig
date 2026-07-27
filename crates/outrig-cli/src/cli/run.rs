@@ -143,8 +143,6 @@ pub async fn execute(
         watcher,
         attached: _,
         session: _,
-        session_dir: _,
-        image_cfg: _,
     } = setup;
     let mut runtime = SessionRuntime::new(watcher, network, containers);
     let cache_root = model_cache_root(cfg.model_cache_root.as_deref());

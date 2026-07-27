@@ -3833,6 +3833,7 @@ dependencies = [
  "jiff",
  "mistralrs-core",
  "outrig",
+ "outrig-cli",
  "rand 0.10.2",
  "regex",
  "reqwest 0.13.4",

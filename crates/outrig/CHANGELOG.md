@@ -10,11 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Arguments for entrypoint-stdio MCP servers** -- an `args` key on `[images.<name>.mcp]`
-  entries and on `[images.<name>.sidecars.<sc>]` blocks supplies the container's trailing argv,
+  entries and on `[sidecars.<sc>]` blocks supplies the container's trailing argv,
   so images that take their configuration positionally (`docker.io/mcp/filesystem` and most of
   the MCP catalog) can be named and run without spelling out their internal layout as an
   exec-stdio `command`.
-- **Named sidecars can be entrypoint hosts** -- a `[images.<name>.sidecars.<sc>]` block whose
+- **Named sidecars can be entrypoint hosts** -- a `[sidecars.<sc>]` block whose
   one MCP entry omits `command` runs that image's `ENTRYPOINT` as the server, which is how an
   entrypoint-stdio server gets a workspace view, mounts, or its own security policy. Such a
   block hosts exactly one server and must be `start = "auto"`.
@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entrypoint-host form. `ConfigValidationError::McpSidecarRequiresCommand` is removed.
 - `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
   placement keys.
+
+### Removed
+
+- **Breaking:** four label-plumbing helpers left `container::embedded` --
+  `mcp_config_to_labels`, `merged_mcp_config_to_labels`, `primary_scoped_mcp`, and `merge_mcp` --
+  along with `container::sidecar::bootstrap_needed`. They served the crate's own build and launch
+  paths, never a caller: each takes the internal shape of a half-resolved MCP table, and none had
+  a consumer outside this crate. `standalone_config_to_labels` and `parse_standalone_image_labels`
+  remain for building and reading a standalone image's labels.
+
+  This is the only reachability `0.2.0` removes. The rest of the surface is now settled
+  deliberately: `config`, `container`, `error`, `image`, `mcp_proxy`, and `network` are all
+  supported API, so a caller can drive containers, images, and egress policy directly rather than
+  only through the `Outrig` facade.
 
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-07-24
 

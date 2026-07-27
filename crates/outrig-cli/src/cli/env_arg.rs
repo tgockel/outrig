@@ -105,6 +105,7 @@ impl CliEnvEntries {
     }
 
     /// Return `true` if there are no entries at all.
+    #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.global.is_empty() && self.per_server.is_empty()
     }
