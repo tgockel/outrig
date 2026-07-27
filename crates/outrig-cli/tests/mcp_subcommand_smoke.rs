@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use outrig::McpClient;
-use outrig::config::{ImageConfig, McpServerSpec};
+use outrig::config::McpServerSpec;
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig_cli::session::{Session, SessionId, SessionStore};
@@ -57,15 +57,7 @@ fn fs_spec() -> McpServerSpec {
 }
 
 async fn ensure_fixture_image() -> ImageTag {
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
+    let cfg = common::fixture_build_config();
     image::ensure_image(&cfg, &fixture_mcp_fs_dir(), false)
         .await
         .expect("ensure mcp-fs fixture image")

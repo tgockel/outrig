@@ -13,11 +13,13 @@ cargo test --workspace
 
 ## End-to-end tests
 
-Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. They are not
-run in CI. Run the full suite with:
+Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. CI compiles
+them but does not run them -- the runners have no podman, so the `e2e` matrix row stops at
+`cargo test --no-run`. Compilation failures are caught; behavior regressions are not. Run the
+full suite yourself with:
 
 ```sh
-cargo test --workspace --features outrig/e2e --features outrig-cli/e2e
+cargo test --workspace --features outrig/e2e,outrig-cli/e2e
 ```
 
 Prerequisites: rootless `podman` + `buildah` on `PATH`. The two run-time tests have

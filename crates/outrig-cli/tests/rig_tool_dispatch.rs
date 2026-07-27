@@ -17,13 +17,15 @@
 
 #![cfg(feature = "e2e")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use outrig::McpClient;
-use outrig::config::{ImageConfig, McpServerSpec};
+use outrig::config::McpServerSpec;
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig_cli::rig_tool::McpToolAdapter;
@@ -36,24 +38,8 @@ fn fixture_dir() -> PathBuf {
         .join("outrig/tests/fixtures/mcp-fs")
 }
 
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init();
-}
-
 async fn ensure_fixture_image() -> ImageTag {
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
+    let cfg = common::fixture_build_config();
     image::ensure_image(&cfg, &fixture_dir(), false)
         .await
         .expect("ensure_image for mcp-fs fixture")
@@ -73,7 +59,7 @@ async fn start_and_bootstrap(image: &ImageTag, host_ws: &Path) -> Container {
 
 #[tokio::test]
 async fn adapter_dispatches_tool_call_into_container() {
-    init_tracing();
+    common::init_tracing();
 
     let image = ensure_fixture_image().await;
     let host_ws = tempfile::tempdir().expect("tempdir host_ws");

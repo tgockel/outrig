@@ -2,17 +2,39 @@
 //! `tests/` as test binaries; subdirectories with `mod.rs` are
 //! conventional shared modules (no phantom `common` test binary).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
 
+use outrig::config::ImageConfig;
 use outrig::error::OutrigError;
 use outrig_cli::error::Result;
 use outrig_cli::hf::{HfFile, HfTreeFetcher};
 use outrig_cli::init::prompt::TerminalPrompt;
 use outrig_cli::session::{Session, SessionId};
+
+/// Build-source `ImageConfig` for a fixture directory that holds a
+/// `Dockerfile` -- the shape nearly every `ensure_image` test wants.
+///
+/// Shared so this crate's gated test binaries spell the literal once; a field
+/// moved off `ImageConfig` (as 0088 moved `sidecars`) then breaks one line
+/// rather than two. Task 0094 plans `#[non_exhaustive]` on `ImageConfig`,
+/// which forbids this literal outright from `tests/` and should replace it
+/// with a real constructor.
+#[allow(dead_code)]
+pub fn fixture_build_config() -> ImageConfig {
+    ImageConfig {
+        image_name: None,
+        dockerfile: Some("Dockerfile".into()),
+        context: Some(".".into()),
+        build_args: BTreeMap::new(),
+        security: Default::default(),
+        mcp: BTreeMap::new(),
+    }
+}
 
 /// Install a best-effort tracing subscriber for integration tests that
 /// surface process output under `--nocapture`.

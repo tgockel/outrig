@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use outrig::McpClient;
-use outrig::config::{ImageConfig, McpServerSpec};
+use outrig::config::McpServerSpec;
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::error::OutrigError;
 use outrig::image::{self, ImageTag};
@@ -33,15 +33,7 @@ fn fixture_dir() -> PathBuf {
 }
 
 async fn ensure_fixture_image() -> ImageTag {
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
+    let cfg = common::fixture_build_config();
     image::ensure_image(&cfg, &fixture_dir(), false)
         .await
         .expect("ensure_image for mcp-fs fixture")

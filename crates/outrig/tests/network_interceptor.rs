@@ -12,7 +12,6 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -21,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use outrig::config::{ImageConfig, NetworkAction, NetworkPolicy};
+use outrig::config::{NetworkAction, NetworkPolicy};
 use outrig::container::{Container, ContainerLaunchSpec};
 use outrig::image::{self, ImageTag};
 use outrig::network::NetworkInterceptor;
@@ -40,15 +39,7 @@ RUN apk add --no-cache ca-certificates curl shadow
 }
 
 async fn ensure_curl_image(context: &Path) -> ImageTag {
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
+    let cfg = common::fixture_build_config();
     image::ensure_image(&cfg, context, false)
         .await
         .expect("ensure curl image")

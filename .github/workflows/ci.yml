@@ -23,8 +23,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: default,   cargo_args: "" }
-          - { name: local-llm, cargo_args: "--features outrig-cli/local-llm" }
+          # The e2e row is a compile gate. Its tests drive real podman, which
+          # the runner has no way to provide, so `test_args` pins them at
+          # `--no-run`: they must build, never run. The other rows pass "" and
+          # run their tests as before. Features are package-qualified to match
+          # the local-llm row's style, not out of necessity -- Cargo fans an
+          # unqualified `--features e2e` out to every member declaring it.
+          - { name: default,   cargo_args: "", test_args: "" }
+          - { name: local-llm, cargo_args: "--features outrig-cli/local-llm", test_args: "" }
+          - { name: e2e,       cargo_args: "--features outrig/e2e,outrig-cli/e2e", test_args: "--no-run" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +43,7 @@ jobs:
           key: ${{ matrix.name }}
           cache-on-failure: true
       - run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
-      - run: cargo test ${{ matrix.cargo_args }}
+      - run: cargo test ${{ matrix.cargo_args }} ${{ matrix.test_args }}
 
   doc-style:
     name: doc-style

@@ -68,15 +68,7 @@ fn malformed_label_context() -> tempfile::TempDir {
 /// must contain a `Dockerfile`). Returns the result so tests can assert on
 /// build-time failures.
 async fn try_ensure_built_image(project_dir: &Path) -> outrig::error::Result<ImageTag> {
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
+    let cfg = common::fixture_build_config();
     Ok(image::ensure_image(&cfg, project_dir, false).await?.tag)
 }
 
@@ -289,7 +281,6 @@ async fn malformed_mcp_label_on_raw_image_fails_runtime_read() {
         build_args: BTreeMap::new(),
         security: Default::default(),
         mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
     };
     let image = image::ensure_image(&cfg, ctx.path(), false)
         .await

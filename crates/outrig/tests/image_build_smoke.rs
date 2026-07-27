@@ -20,10 +20,8 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::time::Instant;
 
-use outrig::config::ImageConfig;
 use outrig::image;
 
 #[tokio::test]
@@ -44,15 +42,7 @@ async fn build_then_cache_hit_under_100ms() {
     )
     .expect("write Dockerfile");
 
-    let cfg = ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-        sidecars: BTreeMap::new(),
-    };
+    let cfg = common::fixture_build_config();
 
     let first = image::ensure_image(&cfg, ctx, false)
         .await
