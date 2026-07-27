@@ -96,7 +96,7 @@ Re-resolution is a config lookup and produces the model-derived fields: `model_n
 | `model_identifier`               | `preamble` (composed from the parent's text) |
 | `provider_name`, `provider`      | `temperature`, `max_tokens`                  |
 | `model_weights`                  | `tool_call_max`, `tool_result_max_bytes`     |
-| --                               | `max_subagent_depth`, `image`                |
+| --                               | `subagent_depth_max`, `image`                |
 
 The split is exhaustive over `ResolvedAgent`'s fields on purpose -- it is what enforces the
 CLI-override invariant under Risks, so a field missing from it is a field nobody decided about.
@@ -128,7 +128,7 @@ happens before any registry entry is inserted, so a bad name costs a tool call a
 no half-registered handle, and the name stays free for a corrected retry.
 
 Depth, release, and shutdown are untouched. A subagent on another model is an ordinary subagent:
-it counts against `subagent-max-depth` identically, launches its own children under the parent's
+it counts against `subagent-depth-max` identically, launches its own children under the parent's
 default model unless they too name one, and is reaped by the same tree walk.
 
 ## Acceptance

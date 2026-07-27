@@ -2,7 +2,7 @@
 
 ## Context
 
-`subagent-max-depth` bounds how deeply subagents nest. Nothing bounds how many run side by side.
+`subagent-depth-max` bounds how deeply subagents nest. Nothing bounds how many run side by side.
 `SubagentRegistry::launch` inserts into a `BTreeMap` keyed by name and spawns a task; the only
 rejections are a malformed name and a name already live. An agent that emits twenty
 `outrig__subagent` calls gets twenty concurrent agent loops, each holding clones of the session's
@@ -36,8 +36,8 @@ refusal the launching agent can act on.
 
 ## Deliverables
 
-- A `subagent-max-width` config key, top-level with an `[agents.<name>]` override, mirroring how
-  `subagent-max-depth` is declared, merged, validated, and defaulted. `subagent-max-depth` is
+- A `subagent-width-max` config key, top-level with an `[agents.<name>]` override, mirroring how
+  `subagent-depth-max` is declared, merged, validated, and defaulted. `subagent-depth-max` is
   bounded to `1..=16`; pick and state the analogous width range rather than leaving "out of range"
   to the implementer.
 - Enforcement in `SubagentRegistry::launch` -- in **both** places the entry lock is taken, not
@@ -47,7 +47,7 @@ refusal the launching agent can act on.
   note under Risks about what that costs.
 - A refusal message that tells the launching agent what to do next -- collect and release
   something -- rather than only reporting a number.
-- Documentation in `doc/reference/config.md` beside `subagent-max-depth`, and a note in
+- Documentation in `doc/reference/config.md` beside `subagent-depth-max`, and a note in
   `doc/concepts/subagents.md` where fan-out is described. Both of those paths are **symlinks**
   into `crates/outrig-cli/src/mcp_self/docs/`; edit the files there. There are no second copies to
   keep in step.
@@ -95,7 +95,7 @@ check's belt-and-braces rather than reasoning that the guarantee makes it unnece
 - Releasing a subagent frees a slot, and a subsequent launch succeeds.
 - The limit is per-registry: a subagent at its own limit does not prevent its parent from
   launching, and vice versa.
-- `subagent-max-width` is settable top-level and per-agent, with the per-agent value winning, and
+- `subagent-width-max` is settable top-level and per-agent, with the per-agent value winning, and
   out-of-range values are a config error.
 - Idle-but-uncollected subagents count against the limit -- pinned by a test, since this is the
   part that surprises.
@@ -112,11 +112,11 @@ prototype should confirm), or **Open** (deferred).
    above any hand-written example, low enough that a model looping on `outrig__subagent` hits it
    quickly. Worth a sanity check against a real wide-fan-out session before committing, since the
    number should be "generous but finite", and picking it too low turns a supported pattern into
-   an error. As with depth, a low value should remain meaningful: `subagent-max-width = 1`
+   an error. As with depth, a low value should remain meaningful: `subagent-width-max = 1`
    serializes fan-out without disabling subagents.
 
    Multiply it out before committing, because the interaction with depth is not gentle. At width
-   8 and the default `subagent-max-depth = 3`, the session registry launches at depth 2 and those
+   8 and the default `subagent-depth-max = 3`, the session registry launches at depth 2 and those
    subagents each get their own registry (`2 < 3`), while depth-3 subagents do not -- so the
    permitted tree is 8 + 64 = **72 live subagents**, each holding clones of the session's MCP
    tools and each a node in the shutdown walk. That is the number to weigh against
@@ -165,6 +165,6 @@ prototype should confirm), or **Open** (deferred).
 
 - `doc/concepts/subagents.md` -- fan-out, release semantics, and the addressability guarantee
   fork 4 would bend.
-- `doc/reference/config.md` -- `subagent-max-depth`, whose config, merge, and validation shape
+- `doc/reference/config.md` -- `subagent-depth-max`, whose config, merge, and validation shape
   this key mirrors.
 - `plan/next/subagent-model-selection.md` -- launching a subagent under a different model.

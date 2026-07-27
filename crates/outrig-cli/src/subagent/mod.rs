@@ -12,7 +12,7 @@
 //! nearly free and why the trust-model invariant that "the agent cannot grow
 //! its own environment" still holds.
 //!
-//! A subagent may itself launch subagents, bounded by `max_subagent_depth`
+//! A subagent may itself launch subagents, bounded by `subagent_depth_max`
 //! (the primary is the root at depth 1). Each launching agent gets its own
 //! registry, so it only ever sees the subagents it launched; the depth check in
 //! [`build_subagent_agent`] withholds the launch tools once the limit is
@@ -67,7 +67,7 @@ pub struct SubagentContext {
     /// The depth of the subagents *this* registry launches. The primary agent
     /// is the root at depth 1, so the session's registry launches at depth 2. A
     /// subagent at depth `D` may launch its own children (at `D + 1`) only while
-    /// `D < resolved.max_subagent_depth`.
+    /// `D < resolved.subagent_depth_max`.
     pub depth: u32,
     /// Shared with the REPL agent rather than owned: a per-subagent registry
     /// would re-load the model's weights for every launch.
@@ -469,7 +469,7 @@ impl Spawned {
 /// It reuses the session's model, provider and limits; only the preamble is
 /// replaced. The tool list is always the session's MCP tools plus this
 /// subagent's own `outrig__set_result`. When the subagent's depth is under
-/// `max_subagent_depth`, it also gets its own [`SubagentRegistry`] and the
+/// `subagent_depth_max`, it also gets its own [`SubagentRegistry`] and the
 /// parent-side launch tools, so it can launch children of its own; at the max
 /// depth those are withheld and the returned registry is `None`. Recursion is
 /// bounded by that depth check rather than impossible by construction.
@@ -495,7 +495,7 @@ async fn build_subagent_agent(
     // The recursion is lazy: grandchildren are only built when this subagent
     // actually calls a launch tool, which re-enters here one level deeper, and
     // the depth gate terminates it.
-    let child = if ctx.depth < ctx.resolved.max_subagent_depth {
+    let child = if ctx.depth < ctx.resolved.subagent_depth_max {
         let mut child_ctx = ctx.clone();
         child_ctx.depth = ctx.depth + 1;
         let child = Arc::new(SubagentRegistry::new(child_ctx));
@@ -677,14 +677,14 @@ mod tests {
     /// make each round take seconds. Paused time auto-advances while the
     /// subagent sleeps, so the failure surfaces immediately.
     fn test_registry() -> (SubagentRegistry, tempfile::TempDir) {
-        test_registry_at(2, outrig::config::DEFAULT_SUBAGENT_MAX_DEPTH)
+        test_registry_at(2, outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX)
     }
 
     /// Like [`test_registry`] but with an explicit launch depth and depth limit,
     /// so a test can place its subagents just under or right at the ceiling.
     fn test_registry_at(
         depth: u32,
-        max_subagent_depth: u32,
+        subagent_depth_max: u32,
     ) -> (SubagentRegistry, tempfile::TempDir) {
         let log_dir = tempfile::tempdir().expect("tempdir");
         let resolved = ResolvedAgent {
@@ -704,7 +704,7 @@ mod tests {
             max_tokens: None,
             tool_call_max: 4,
             tool_result_max_bytes: 4096,
-            max_subagent_depth,
+            subagent_depth_max,
             image: None,
         };
         let registry = SubagentRegistry::new(SubagentContext {

@@ -1,14 +1,14 @@
 # Mirror of doc/reference/config.md "Full examples", flattened into one file
 # so the schema fixture exercises every legal section in a single round-trip.
 
-default-image = "coding"
-default-agent     = "coding"
-default-model     = "fast"
-session-root      = "/var/lib/outrig/sessions"
-model-cache-root  = "/var/cache/outrig/models"
-tool-call-max     = 100
-tool-result-max   = 524288
-subagent-max-depth = 4
+default-image      = "coding"
+default-agent      = "coding"
+default-model      = "fast"
+session-root       = "/var/lib/outrig/sessions"
+model-cache-root   = "/var/cache/outrig/models"
+tool-call-max      = 100
+tool-result-max    = 524288
+subagent-depth-max = 4
 
 [providers.openai]
 style                = "openai"
@@ -48,13 +48,13 @@ model-path     = ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
 context-length = 4096
 
 [agents.coding]
-image   = "coding"
-preamble    = "You are a careful coding assistant. Repo is at /workspace."
-temperature = 0.2
-max-tokens  = 4096
-tool-call-max = 300
-tool-result-max = 1048576
-subagent-max-depth = 2
+image              = "coding"
+preamble           = "You are a careful coding assistant. Repo is at /workspace."
+temperature        = 0.2
+max-tokens         = 4096
+tool-call-max      = 300
+tool-result-max    = 1048576
+subagent-depth-max = 2
 
 [agents.review]
 model    = "smart"

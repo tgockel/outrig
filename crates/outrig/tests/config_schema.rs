@@ -136,7 +136,7 @@ srv = { command = ["bin", "arg1"] }
         );
         assert_eq!(cfg.tool_call_max, Some(100));
         assert_eq!(cfg.tool_result_max, Some(524288));
-        assert_eq!(cfg.subagent_max_depth, Some(4));
+        assert_eq!(cfg.subagent_depth_max, Some(4));
 
         let LlmProvider::OpenAi {
             base_url,
@@ -196,7 +196,7 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding.max_tokens, Some(4096));
         assert_eq!(coding.tool_call_max, Some(300));
         assert_eq!(coding.tool_result_max, Some(1048576));
-        assert_eq!(coding.subagent_max_depth, Some(2));
+        assert_eq!(coding.subagent_depth_max, Some(2));
         assert_eq!(cfg.agents["review"].model.as_deref(), Some("smart"));
 
         assert_eq!(cfg.workspace.host_path, PathBuf::from("."));

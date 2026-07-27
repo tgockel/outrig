@@ -169,14 +169,14 @@ whether it is busy. Idle subagents live until released or until the session ends
 A subagent's toolset is the session's MCP tools plus `outrig__set_result`, and -- while there is
 depth left -- the same launch tools the primary has. The primary agent is the root at depth 1; a
 subagent it launches is at depth 2, one of theirs is at depth 3, and so on. An agent gets the
-launch tools only while its depth is under `subagent-max-depth` (default `3`), so nesting stops
+launch tools only while its depth is under `subagent-depth-max` (default `3`), so nesting stops
 on its own rather than running away.
 
 Each launching agent has its own private view: it sees only the subagents it launched, names them
 in its own namespace, and collects their results independently. A mid-tree subagent both reports
 upward with `outrig__set_result` and collects its own children with `outrig__get_result`.
 
-Set `subagent-max-depth = 1` to switch subagents off entirely, or `2` to allow only the single
+Set `subagent-depth-max = 1` to switch subagents off entirely, or `2` to allow only the single
 layer the primary launches -- see [Reference -> Config](../reference/config.md). Releasing a
 subagent, or ending the session, tears down everything it launched with it.
 

@@ -840,25 +840,25 @@ tool-call-max = 5000
     }
 
     #[test]
-    fn top_level_subagent_max_depth_zero_errors() {
+    fn top_level_subagent_depth_max_zero_errors() {
         let cfg = parse(
             r#"
-subagent-max-depth = 0
+subagent-depth-max = 0
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::SubagentMaxDepthOutOfRange { path, value, max } => {
-                assert_eq!(path, "top-level subagent-max-depth");
+            ConfigValidationError::SubagentDepthMaxOutOfRange { path, value, max } => {
+                assert_eq!(path, "top-level subagent-depth-max");
                 assert_eq!(value, 0);
                 assert_eq!(max, 16);
             }
-            other => panic!("expected SubagentMaxDepthOutOfRange, got: {other:?}"),
+            other => panic!("expected SubagentDepthMaxOutOfRange, got: {other:?}"),
         }
     }
 
     #[test]
-    fn agent_subagent_max_depth_too_large_errors() {
+    fn agent_subagent_depth_max_too_large_errors() {
         let cfg = parse(
             r#"
 default-model = "fast"
@@ -873,34 +873,34 @@ provider   = "openai"
 identifier = "gpt-4o-mini"
 
 [agents.coding]
-subagent-max-depth = 99
+subagent-depth-max = 99
 "#,
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::SubagentMaxDepthOutOfRange { path, value, max } => {
-                assert_eq!(path, "agents.coding.subagent-max-depth");
+            ConfigValidationError::SubagentDepthMaxOutOfRange { path, value, max } => {
+                assert_eq!(path, "agents.coding.subagent-depth-max");
                 assert_eq!(value, 99);
                 assert_eq!(max, 16);
             }
-            other => panic!("expected SubagentMaxDepthOutOfRange, got: {other:?}"),
+            other => panic!("expected SubagentDepthMaxOutOfRange, got: {other:?}"),
         }
     }
 
     #[test]
-    fn subagent_max_depth_repo_overrides_global() {
+    fn subagent_depth_max_repo_overrides_global() {
         let global = parse(
             r#"
-subagent-max-depth = 2
+subagent-depth-max = 2
 "#,
         );
         let repo = parse(
             r#"
-subagent-max-depth = 4
+subagent-depth-max = 4
 "#,
         );
         let merged = merge(global, repo);
-        assert_eq!(merged.subagent_max_depth, Some(4));
+        assert_eq!(merged.subagent_depth_max, Some(4));
     }
 
     #[test]

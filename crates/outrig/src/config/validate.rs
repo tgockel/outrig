@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use super::{
     Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
-    NetworkMode, SUBAGENT_MAX_DEPTH_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
+    NetworkMode, SUBAGENT_DEPTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES,
     TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
 
@@ -160,7 +160,7 @@ pub enum ConfigValidationError {
     ToolCallMaxOutOfRange { path: String, value: u32, max: u32 },
 
     #[error("{path} must be between 1 and {max} (1 disables subagents); got {value}")]
-    SubagentMaxDepthOutOfRange { path: String, value: u32, max: u32 },
+    SubagentDepthMaxOutOfRange { path: String, value: u32, max: u32 },
 
     #[error("{path} must be at least {min} bytes; got {value}")]
     ToolResultMaxTooSmall { path: String, value: u32, min: u32 },
@@ -506,8 +506,8 @@ pub(super) fn validate_with_options(
     if let Some(value) = cfg.tool_result_max {
         validate_tool_result_max("top-level tool-result-max", value)?;
     }
-    if let Some(value) = cfg.subagent_max_depth {
-        validate_subagent_max_depth("top-level subagent-max-depth", value)?;
+    if let Some(value) = cfg.subagent_depth_max {
+        validate_subagent_depth_max("top-level subagent-depth-max", value)?;
     }
     validate_network_policy(cfg)?;
 
@@ -519,9 +519,9 @@ pub(super) fn validate_with_options(
             if let Some(value) = agent.tool_result_max {
                 validate_tool_result_max(&format!("agents.{agent_name}.tool-result-max"), value)?;
             }
-            if let Some(value) = agent.subagent_max_depth {
-                validate_subagent_max_depth(
-                    &format!("agents.{agent_name}.subagent-max-depth"),
+            if let Some(value) = agent.subagent_depth_max {
+                validate_subagent_depth_max(
+                    &format!("agents.{agent_name}.subagent-depth-max"),
                     value,
                 )?;
             }
@@ -983,12 +983,12 @@ fn validate_tool_call_max(path: &str, value: u32) -> Result<(), ConfigValidation
     Ok(())
 }
 
-fn validate_subagent_max_depth(path: &str, value: u32) -> Result<(), ConfigValidationError> {
-    if !(1..=SUBAGENT_MAX_DEPTH_CEILING).contains(&value) {
-        return Err(ConfigValidationError::SubagentMaxDepthOutOfRange {
+fn validate_subagent_depth_max(path: &str, value: u32) -> Result<(), ConfigValidationError> {
+    if !(1..=SUBAGENT_DEPTH_MAX_CEILING).contains(&value) {
+        return Err(ConfigValidationError::SubagentDepthMaxOutOfRange {
             path: path.to_string(),
             value,
-            max: SUBAGENT_MAX_DEPTH_CEILING,
+            max: SUBAGENT_DEPTH_MAX_CEILING,
         });
     }
     Ok(())

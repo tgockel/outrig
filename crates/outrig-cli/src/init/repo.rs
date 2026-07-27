@@ -369,7 +369,7 @@ fn render(
             tool_call_max: None,
             tool_result_max: None,
             subagents: None,
-            subagent_max_depth: None,
+            subagent_depth_max: None,
         },
     );
     let cfg = Config {

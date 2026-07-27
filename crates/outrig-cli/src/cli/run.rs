@@ -291,12 +291,12 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     let mut agent_tools = all_tools;
     // The primary gets the launch tools when its agent opts in *and* the depth
     // limit leaves room for a first layer (root depth 1 < max). A
-    // `subagent-max-depth` of 1 disables subagents for everyone.
+    // `subagent-depth-max` of 1 disables subagents for everyone.
     let subagents_enabled = cfg
         .agents
         .get(agent_name)
         .is_none_or(outrig::config::Agent::subagents_enabled);
-    if subagents_enabled && resolved.max_subagent_depth > 1 {
+    if subagents_enabled && resolved.subagent_depth_max > 1 {
         agent_tools.extend(builtin_tool::parent_tools(
             subagents.clone(),
             resolved.tool_result_max_bytes,
@@ -844,7 +844,7 @@ mod tests {
             max_tokens: None,
             tool_call_max: 100,
             tool_result_max_bytes: llm::DEFAULT_TOOL_RESULT_MAX_BYTES,
-            max_subagent_depth: outrig::config::DEFAULT_SUBAGENT_MAX_DEPTH,
+            subagent_depth_max: outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
             image: None,
         }
     }
