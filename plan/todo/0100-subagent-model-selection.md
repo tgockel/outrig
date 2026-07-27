@@ -1,4 +1,4 @@
-# Launching a subagent under a different model
+# 0100 -- Launching a subagent under a different model
 
 ## Context
 
@@ -217,10 +217,9 @@ prototype should confirm), or **Open** (deferred).
   on the context is the obvious shape; the alternative -- pre-resolving every configured model at
   session start -- does needless work for models no subagent ever names, and would move in-process
   weight loading to startup.
-- **Fan-out times model choice is a spend multiplier.** Breadth is unbounded today (see
-  `subagent-width-cap.md`), and model choice makes the worst case more expensive rather than merely
-  slower. The two features are independent but compose badly; the width cap is the containment
-  half.
+- **Fan-out times model choice is a spend multiplier.** Breadth is unbounded today (see 0099),
+  and model choice makes the worst case more expensive rather than merely slower. The two
+  features compose badly, which is why the width cap is queued first as the containment half.
 - **Per-model failure behavior is not uniform.** In-flight work adds a repeat-failure breaker that
   ends a subagent round after N consecutive identical tool failures, and stop reasons that a round
   reports to its parent. Those thresholds were tuned against the parent's model; a cheaper or
@@ -231,16 +230,20 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **Soft: `subagent-width-cap.md`.** Independent, but the containment half of the same concern.
-  Either may land first.
+- **0093.** The deliverable list above leaves open whether to add a `known` field to
+  `LlmResolveError::UnknownModel` or to compose the enumeration at the tool boundary. If 0093
+  de-publishes the `outrig-cli` internals, `LlmResolveError` stops being a public commitment and
+  the question becomes a free internal choice rather than a SemVer decision.
+- **0097.** That task adds a third provider style and a third `RigAgent` variant, and already
+  lists auditing the provider matches in `subagent/mod.rs` among its deliverables. The two
+  compose without conflict -- a third arm on a runtime-dispatched enum is still no new dispatch
+  for this feature -- but whichever lands second inherits the other's match arms. Landing the
+  provider work first also makes the payoff here larger, since a cheap-model subagent under an
+  expensive parent is most compelling across providers.
+- **0099.** The containment half of the same concern: model choice makes wide fan-out more
+  expensive rather than merely slower, so the cap should already be in place.
 - **Soft: the `--model` override path.** `resolve_agent_with_overrides` and its
   `llm_resolve.rs` coverage are the machinery reused here.
-- **Soft: `anthropic-native-api.md`.** That entry adds a third provider style and a third
-  `RigAgent` variant, and already lists auditing the provider matches in `subagent/mod.rs` among
-  its deliverables. The two compose without conflict -- a third arm on a runtime-dispatched enum
-  is still no new dispatch for this feature -- but whichever lands second inherits the other's
-  match arms. Landing the provider work first makes the payoff here larger, since a cheap-model
-  subagent under an expensive parent is most compelling across providers.
 
 ## See also
 
@@ -248,6 +251,6 @@ prototype should confirm), or **Open** (deferred).
 - `doc/concepts/llm-providers.md` -- the provider / model / agent layering the argument names.
 - `doc/concepts/in-process-llm.md` -- engine-per-model-name lifecycle and first-use download
   stalls, both of which a model-selecting subagent can now trigger.
-- `plan/next/subagent-width-cap.md` -- bounding how many subagents run at once.
-- `plan/next/anthropic-native-api.md` -- the third provider style this feature would let a
+- `plan/todo/0099-subagent-width-cap.md` -- bounding how many subagents run at once.
+- `plan/todo/0097-anthropic-native-api.md` -- the third provider style this feature would let a
   subagent select independently of its parent.

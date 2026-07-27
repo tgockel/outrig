@@ -1,4 +1,4 @@
-# Releasing subagents is all-or-nothing in its report but not in its effect
+# 0098 -- Releasing subagents is all-or-nothing in its report but not in its effect
 
 ## Context
 
@@ -55,10 +55,18 @@ Atomic-reject is the right default over report-what-happened. Release is cheap t
 agent fixes the name, whereas a partial release is unrecoverable -- the subagent and its history
 are gone. The asymmetry favors doing nothing on a bad list.
 
+## Dependencies
+
+- **0092**, for the e2e suite to compile, so the acceptance test can actually be run.
+
+Otherwise none. The width cap (see also) shares `crates/outrig-cli/src/subagent/mod.rs` with this
+task and is queued immediately after: this one touches `release`, that one touches `launch`'s
+locking discipline, so landing the smaller change first keeps the two reviewable apart.
+
 ## See also
 
 - `crates/outrig-cli/src/subagent/mod.rs` -- `release`, and `wait_results` for the resolve-first
   pattern to copy.
 - `crates/outrig-cli/src/builtin_tool.rs` -- `SubagentReleaseTool`, which surfaces the message.
-- `plan/next/subagent-width-cap.md` -- also touches `launch`'s locking discipline; worth landing
-  in the same pass if both are picked up.
+- `plan/todo/0099-subagent-width-cap.md` -- also touches `launch`'s locking discipline; worth
+  landing in the same pass if both are picked up.

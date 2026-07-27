@@ -180,8 +180,8 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **Hard: `plan/next/config-path-provenance.md`**, transitively -- a `[mcp]` entry that
-  references a library image is only useful once library images resolve.
+- **Hard: 0096** (`plan/todo/0096-config-path-provenance.md`), transitively -- a `[mcp]` entry
+  that references a library image is only useful once library images resolve.
 - **Soft: `plan/next/user-image-library.md`.** The `[mcp]` library is independently useful over
   existing `[sidecars.<sc>]` blocks and raw image refs, but the motivating case is a user-library
   tool. Landing the library first makes the acceptance criteria here demonstrable end to end.

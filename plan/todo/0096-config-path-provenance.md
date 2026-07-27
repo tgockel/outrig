@@ -1,4 +1,4 @@
-# Config path provenance: resolve relative paths against the declaring file
+# 0096 -- Config path provenance: resolve relative paths against the declaring file
 
 ## Context
 
@@ -120,8 +120,13 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-None. This is independent of every entry currently in `plan/next/`, and is a strict prerequisite
-for `plan/next/user-image-library.md` and `plan/next/user-toolsets.md`.
+- **0094.** This task adds a `#[serde(skip)]` field to `ImageConfig` and changes the shape of
+  `DockerfileMissing` / `ContextMissing`. Both are breaking changes today and both are insulated
+  once 0094's `#[non_exhaustive]` sweep has landed, so the sweep goes first and this becomes
+  additive.
+
+Otherwise independent of everything in the queue, and a strict prerequisite for
+`plan/next/user-image-library.md` and `plan/next/user-toolsets.md`.
 
 ## See also
 
