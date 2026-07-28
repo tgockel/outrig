@@ -30,7 +30,6 @@ provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 | 0099 | Make subagent release atomic rather than partial          | 0092             |
 | 0100 | Cap how many subagents run at once                        | 0099             |
 | 0101 | Launch a subagent under a different model                 | 0093, 0098, 0100 |
-| 0103 | Resolve a bare ENTRYPOINT program through `PATH`          | 0102             |
 | 0104 | Move this repo's own MCP servers into sidecars            | 0102, 0103       |
 
 0102-0104 are one arc, and the last of them is why the first two are pre-freeze work rather
@@ -40,5 +39,7 @@ primary image, so nothing in daily use exercises sidecar placement, `view = "pri
 servers out found two defects that a release would otherwise freeze: a `view = "primary"`
 payload ran as root in the primary's user namespace and left subuid-owned files behind (0102,
 landed -- the launcher now drops to the session's ids once the graft is in place), and the
-launcher's missing `PATH` lookup makes the published quickstart image unusable, which is why
-`primary_view_e2e.rs` is still red on trunk (0103, pulled up from `plan/next/`).
+launcher's missing `PATH` lookup made the published quickstart image unusable, which is what
+kept `primary_view_e2e.rs` red on trunk (0103, landed -- a bare program name is resolved
+against the sidecar image's `PATH` before the namespace join, and that e2e now passes against
+the stock image). 0104 is what remains of the arc.

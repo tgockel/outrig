@@ -14,11 +14,14 @@ use std::path::Path;
 use std::process::Command;
 
 const LAUNCHER: &str = "src/container/enter/launcher.rs";
-const ELF: &str = "src/container/enter/elf.rs";
+/// The launcher and everything it `include!`s, watched as a directory: cargo
+/// scans it recursively, so a new pure helper needs no second registration
+/// here. Listing files one by one would put a silent failure mode in the way --
+/// forget one and a stale binary stays embedded with nothing to say so.
+const LAUNCHER_DIR: &str = "src/container/enter";
 
 fn main() {
-    println!("cargo:rerun-if-changed={LAUNCHER}");
-    println!("cargo:rerun-if-changed={ELF}");
+    println!("cargo:rerun-if-changed={LAUNCHER_DIR}");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");

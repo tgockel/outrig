@@ -188,8 +188,11 @@ pub fn entrypoint_args<'a>(spec: &'a McpServerSpec, sidecar: &'a SidecarPlan) ->
 }
 
 /// Prefix `elem` with `graft` iff it is an absolute path. Relative elements
-/// (e.g. a bare `node` resolved through `PATH`) pass through unchanged: they
-/// are not files in the sidecar rootfs we can relocate under the graft.
+/// pass through unchanged: they are not paths in the sidecar rootfs we can
+/// relocate under the graft. A bare program name is one such element, and the
+/// launcher resolves it against the sidecar image's `PATH` before the namespace
+/// join (`enter/path_search.rs`) -- so `ENTRYPOINT ["node", ...]` runs the
+/// sidecar's own `node`, not the primary's.
 fn graft_prefix(elem: &str, graft: &str) -> String {
     if elem.starts_with('/') {
         format!("{graft}{elem}")
@@ -213,7 +216,9 @@ fn graft_prefix(elem: &str, graft: &str) -> String {
 ///   though it is image-declared. The launcher opens it before the setns,
 ///   while the sidecar's own rootfs is still at `/`, and applies the graft
 ///   itself when handing the path to the loader. Prefixing it here would make
-///   the launcher look for `<graft><graft>/...`.
+///   the launcher look for `<graft><graft>/...`. A program named without a
+///   `/` is resolved along the sidecar image's `PATH` there too, so an
+///   `ENTRYPOINT ["node", ...]` image needs no rewriting.
 ///
 /// Relative elements pass through unprefixed either way -- they are not files
 /// in the sidecar rootfs we can relocate.

@@ -20,11 +20,14 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{IoPathExt, OutrigError, Result};
 
-// The pure ELF parser is unit-tested on the host; `launcher.rs` pulls the same
-// file in with `include!` for the musl build. It has no non-test consumer in
-// the library, so it is compiled only under `cfg(test)`.
+// The pure ELF parser and `PATH` expansion are unit-tested on the host;
+// `launcher.rs` pulls the same files in with `include!` for the musl build.
+// Neither has a non-test consumer in the library, so both are compiled only
+// under `cfg(test)`.
 #[cfg(test)]
 mod elf;
+#[cfg(test)]
+mod path_search;
 
 /// The launcher binary, statically linked for this build's architecture.
 /// Empty when the crate was built without the musl target (see module docs).

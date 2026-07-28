@@ -72,25 +72,20 @@ fn ensure_mcp_fs_image() {
     }
 }
 
-/// [`MCP_FS_IMAGE`] with its `ENTRYPOINT` restated as an absolute path.
-///
-/// The upstream image declares `ENTRYPOINT ["node", "/app/dist/index.js"]`.
-/// `outrig-enter` opens the payload program by literal path with no `PATH`
-/// search, and the graft rule deliberately leaves relative elements bare, so a
-/// bare `node` cannot resolve after the setns. That is a pre-existing gap in
-/// the `view = "primary"` mechanism itself -- it fails identically through
-/// `outrig run` -- filed as `plan/next/primary-view-relative-entrypoint.md`.
-/// Restating the same program absolutely keeps this test about the library
-/// reaching the placement rather than about that bug.
-fn build_absolute_entrypoint_mcp_fs_image(tag: &str) {
-    ensure_mcp_fs_image();
+/// A one-layer derivative of `base` that declares `entrypoint` instead of its
+/// own -- the cheap way to put a chosen program shape in front of
+/// `outrig-enter`, which decides how to open it before anything in the image
+/// runs.
+fn build_image_with_entrypoint(tag: &str, base: &str, entrypoint: &[&str]) {
     let ctx = tempfile::tempdir().expect("tempdir image context");
+    let entrypoint = entrypoint
+        .iter()
+        .map(|e| format!("\"{}\"", dockerfile_escape(e)))
+        .collect::<Vec<_>>()
+        .join(", ");
     std::fs::write(
         ctx.path().join("Dockerfile"),
-        format!(
-            "FROM {MCP_FS_IMAGE}\n\
-             ENTRYPOINT [\"/usr/local/bin/node\", \"/app/dist/index.js\"]\n"
-        ),
+        format!("FROM {base}\nENTRYPOINT [{entrypoint}]\n"),
     )
     .expect("write Dockerfile");
     podman_build(tag, ctx.path());
@@ -439,6 +434,11 @@ async fn launch_with_entrypoint_sidecar_serves_tools() {
 /// serving the *primary* container's tree, at the primary's paths. What
 /// distinguishes this from `workspace = "rw"` is that a file written into the
 /// primary's own rootfs -- which no bind mount provides -- is visible too.
+///
+/// The upstream image declares `ENTRYPOINT ["node", "/app/dist/index.js"]` and
+/// runs that way in `crates/outrig-cli/tests/primary_view_e2e.rs`; restating the
+/// same program absolutely here covers the launcher's other branch, where the
+/// program is opened as written and `PATH` is never consulted.
 #[tokio::test]
 async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
     let _guard = E2E_LOCK.lock().await;
@@ -448,7 +448,12 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         "localhost/outrig-library-surface-view-sidecar-{}:latest",
         std::process::id(),
     );
-    build_absolute_entrypoint_mcp_fs_image(&sidecar_tag);
+    ensure_mcp_fs_image();
+    build_image_with_entrypoint(
+        &sidecar_tag,
+        MCP_FS_IMAGE,
+        &["/usr/local/bin/node", "/app/dist/index.js"],
+    );
     let primary_tag = format!(
         "localhost/outrig-library-surface-view-primary-{}:latest",
         std::process::id(),
@@ -577,6 +582,61 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         Vec::<String>::new(),
         "shutdown should remove the sidecar container"
     );
+}
+
+/// A `view = "primary"` sidecar whose `ENTRYPOINT` names a program no `PATH`
+/// entry provides fails saying exactly that. The bare `open` errno this used to
+/// be ("open frobnicate: No such file or directory") reads like a missing file
+/// at a path the user never wrote; naming the searched `PATH` is what turns it
+/// into an actionable "that program is not in this image".
+///
+/// Both images are the local fixture: the launcher gives up in its `open` loop,
+/// before the namespace join and long before anything in either image runs, so
+/// what they contain is beside the point.
+#[tokio::test]
+async fn primary_view_sidecar_with_an_unresolvable_entrypoint_names_the_path() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-badentry-primary-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&primary_tag);
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-badentry-{}:latest",
+        std::process::id(),
+    );
+    build_image_with_entrypoint(&sidecar_tag, &primary_tag, &["outrig-no-such-program"]);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let err = outrig
+        .add_sidecar(
+            SidecarSpec::from_image("badentry", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("badentry", ["/"]),
+        )
+        .await
+        .expect_err("an entrypoint no PATH entry provides must fail the add");
+    let message = err.to_string();
+    assert!(
+        message.contains("outrig-no-such-program") && message.contains("PATH=/"),
+        "the failure should name the program and the PATH searched, got: {message}",
+    );
+
+    assert_eq!(
+        sidecar_containers_labeled("badentry"),
+        Vec::<String>::new(),
+        "a failed add should leave no container"
+    );
+    outrig.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

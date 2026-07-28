@@ -158,6 +158,13 @@ So `args = ["/workspace"]` against an image whose entrypoint is `/usr/local/bin/
 /app/dist/index.js` runs `/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
 from the sidecar, the directory from the primary.
 
+A program named without a `/` -- `ENTRYPOINT ["node", "/app/dist/index.js"]`, which is what
+the quickstart image above declares -- is searched along the **sidecar image's** `PATH`, in
+that same pre-join instant and for the same reason: the program is one of the sidecar's own
+files, so the sidecar's `PATH` is the one that can find it. Only absolute `PATH` entries are
+searched, since a relative hit could not be named under the graft afterwards. When nothing
+matches, startup fails with a message naming the program and the `PATH` that was walked.
+
 `view = "primary"` is a real posture change: the container starts with `CAP_SYS_ADMIN` and
 `CAP_SYS_PTRACE` in the primary's user namespace, and the server can read the primary's whole
 filesystem. See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the

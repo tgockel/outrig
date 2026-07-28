@@ -20,11 +20,14 @@
 //! **The argv contract, which the caller depends on:** `PROGRAM` is in *this*
 //! container's coordinates, ungrafted -- it is opened before the setns, while
 //! this image's rootfs is still at `/`, and the graft is applied to it here
-//! when handing the path to the loader. `ARGS...` are in the *target's*
-//! coordinates and are passed through untouched. `container::sidecar`'s
-//! `build_primary_view_argv` is the producer that honors this; changing either
-//! side alone silently breaks the other, and the failure looks like an image
-//! that cannot find its own interpreter.
+//! when handing the path to the loader. A `PROGRAM` with no `/` in it is
+//! searched along this process's own `PATH` first (see `path_search.rs`), which
+//! is the sidecar image's -- the same environment the image's `ENTRYPOINT`
+//! would have resolved against had podman run it directly. `ARGS...` are in the
+//! *target's* coordinates and are passed through untouched.
+//! `container::sidecar`'s `build_primary_view_argv` is the producer that honors
+//! this; changing either side alone silently breaks the other, and the failure
+//! looks like an image that cannot find its own interpreter.
 //!
 //! **The ordering contract, which the privilege drop depends on:** every step
 //! up to and including the `chdir` needs `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` --
@@ -39,14 +42,15 @@
 //! is not possible, because the exec is the last thing this process does.
 //!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
-//! Linux musl target; it is not part of the normal `cargo build`. The pure ELF
-//! logic it relies on lives in `elf.rs`, pulled in below and unit-tested on the
-//! host.
+//! Linux musl target; it is not part of the normal `cargo build`. The pure
+//! logic it relies on lives in `elf.rs` and `path_search.rs`, pulled in below
+//! and unit-tested on the host.
 
 use std::ffi::{CString, OsString, c_char, c_int, c_long, c_ulong, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 include!("elf.rs");
+include!("path_search.rs");
 
 unsafe extern "C" {
     fn open(path: *const c_char, flags: c_int) -> c_int;
@@ -249,27 +253,41 @@ fn main() {
     };
 
     let prog_argv = &args[i..];
-    let program = prog_argv[0].as_os_str();
+    let named = prog_argv[0].as_os_str();
 
-    // Everything needing the sidecar's own filesystem happens before setns.
-    let prog_c = cstr(program.as_bytes());
-    let prog_fd = unsafe { open(prog_c.as_ptr(), O_RDONLY) };
-    if prog_fd < 0 {
-        die(&format!("open {}", program.to_string_lossy()), "");
-    }
+    // Everything needing the sidecar's own filesystem happens before setns --
+    // the `PATH` search included, since the program is a file in *this* image.
+    let path_var = std::env::var_os("PATH");
+    let path_var = path_var.as_deref();
+    let opened = program_candidates(named, path_var)
+        .into_iter()
+        .find_map(|cand| {
+            let cand_c = cstr(cand.as_os_str().as_bytes());
+            let fd = unsafe { open(cand_c.as_ptr(), O_RDONLY) };
+            (fd >= 0).then_some((fd, cand))
+        });
+    let Some((prog_fd, resolved)) = opened else {
+        // errno is the last candidate's -- for a name nothing provides, the
+        // ENOENT the un-searched case would have reported anyway. The hint says
+        // where we looked, so "no such program" and "no such path" stay apart.
+        let hint = searched_path(named, path_var)
+            .map(|p| format!(" (not found in PATH={})", p.to_string_lossy()))
+            .unwrap_or_default();
+        die(&format!("open {}", named.to_string_lossy()), &hint);
+    };
 
     // Read enough of the head to classify; the file header, program headers and
     // any PT_INTERP string live at the very start of every real binary.
     let mut head = vec![0u8; 65536];
     let n = unsafe { pread(prog_fd, head.as_mut_ptr() as *mut c_void, head.len(), 0) };
     if n < 0 {
-        die(&format!("read {}", program.to_string_lossy()), "");
+        die(&format!("read {}", resolved.display()), "");
     }
     head.truncate(n as usize);
     let kind = match elf_interp(&head) {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("outrig-enter: {}: {e}", program.to_string_lossy());
+            eprintln!("outrig-enter: {}: {e}", resolved.display());
             std::process::exit(1);
         }
     };
@@ -355,7 +373,9 @@ fn main() {
     match kind {
         ElfKind::Static => {
             // Run straight from the fd: nothing resolves through the target, so
-            // its libc is irrelevant.
+            // its libc is irrelevant. `argv[0]` stays as the caller wrote it --
+            // a name found on `PATH` reaches the payload as that name, which is
+            // what `execvp` hands it too.
             let argv: Vec<CString> = prog_argv.iter().map(|a| cstr(a.as_bytes())).collect();
             let envp = environ_cstrings();
             let argv_p = arg_ptrs(&argv);
@@ -374,10 +394,11 @@ fn main() {
             die("execveat", "");
         }
         ElfKind::Dynamic(interp) => {
-            // Run through the sidecar's own loader, now under the graft point.
+            // Run through the sidecar's own loader, now under the graft
+            // point, at the path the lookup settled on.
             let g = graft.to_string_lossy();
             let loader = format!("{g}{interp}");
-            let progpath = format!("{g}{}", program.to_string_lossy());
+            let progpath = format!("{g}{}", resolved.display());
             let libpath = lib_dirs()
                 .iter()
                 .map(|d| format!("{g}{d}"))
