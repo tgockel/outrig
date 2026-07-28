@@ -1,8 +1,10 @@
 //! Transient-error retry wrapper around a [`CompletionModel`].
 //!
-//! [`RetryingModel`] wraps the OpenAi-backed completion model so that each
+//! [`RetryingModel`] wraps a remote provider's completion model so that each
 //! individual model call retries on transient HTTP failures (request timeouts,
-//! connection errors, 408/425/429/5xx) with bounded exponential backoff.
+//! connection errors, 408/425/429/5xx) with bounded exponential backoff. The
+//! classification is provider-neutral: rig maps a non-2xx response to the same
+//! `CompletionError::HttpError` for every HTTP-backed provider it ships.
 //!
 //! Retrying at the model-call layer -- rather than around `agent.prompt(...)`
 //! -- is deliberate: a single user turn drives a model -> tool -> model loop,
@@ -73,7 +75,7 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         request: CompletionRequest,
     ) -> std::result::Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
     {
-        // The OpenAi path is non-streaming in outrig; delegate without retry so
+        // OutRig's remote paths are non-streaming; delegate without retry so
         // the wrapper stays a faithful `CompletionModel` for any future caller.
         self.inner.stream(request).await
     }

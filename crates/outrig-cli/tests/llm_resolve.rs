@@ -640,6 +640,171 @@ preamble = "hi"
     );
 }
 
+/// Build a config naming an `anthropic` provider. `model_extra` lands inside
+/// `[models.sonnet]`, `agents` at the bottom.
+fn anthropic_cfg(env_name: &str, model_extra: &str, agents: &str) -> Config {
+    parse(&format!(
+        r#"
+default-model = "sonnet"
+
+[providers.claude]
+style                = "anthropic"
+base-url             = "https://api.anthropic.com"
+api-key              = "${{{env_name}}}"
+request-timeout-secs = 45
+
+[models.sonnet]
+provider   = "claude"
+identifier = "claude-sonnet-4-6"
+{model_extra}
+
+{agents}
+"#,
+    ))
+}
+
+#[test]
+fn anthropic_provider_resolves_connection_details() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ANTHROPIC";
+    set_env(var, "sk-ant-test");
+    let cfg = anthropic_cfg(
+        var,
+        "",
+        r#"
+[agents.coding]
+preamble = "you are a careful coder"
+"#,
+    );
+
+    let r = resolve_agent(&cfg, "coding").expect("resolves");
+    assert_eq!(r.model_identifier, "claude-sonnet-4-6");
+    assert_eq!(r.provider_name, "claude");
+    let ResolvedProvider::Anthropic {
+        base_url,
+        api_key,
+        request_timeout_secs,
+    } = &r.provider
+    else {
+        panic!("expected Anthropic resolved-provider, got {:?}", r.provider);
+    };
+    assert_eq!(base_url, "https://api.anthropic.com");
+    assert_eq!(api_key, "sk-ant-test");
+    assert_eq!(*request_timeout_secs, Some(45));
+    assert!(
+        r.model_weights.is_none(),
+        "a remote model carries no weight spec"
+    );
+
+    unset_env(var);
+}
+
+/// The model's ceiling covers every agent pointed at it; an agent that sets
+/// its own still wins.
+#[test]
+fn model_max_tokens_is_the_fallback_for_the_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ANTHROPIC_MAX_TOKENS";
+    set_env(var, "k");
+
+    let cfg = anthropic_cfg(
+        var,
+        "max-tokens = 16384",
+        r#"
+[agents.inherits]
+preamble = "hi"
+
+[agents.overrides]
+preamble   = "hi"
+max-tokens = 4096
+"#,
+    );
+    assert_eq!(
+        resolve_agent(&cfg, "inherits")
+            .expect("resolves")
+            .max_tokens,
+        Some(16384),
+    );
+    assert_eq!(
+        resolve_agent(&cfg, "overrides")
+            .expect("resolves")
+            .max_tokens,
+        Some(4096),
+    );
+
+    // Neither set: nothing is imposed, and the provider decides (which for
+    // an identifier rig does not recognize means the turn errors -- see
+    // tests/anthropic_mock.rs).
+    let cfg = anthropic_cfg(
+        var,
+        "",
+        r#"
+[agents.inherits]
+preamble = "hi"
+"#,
+    );
+    assert_eq!(
+        resolve_agent(&cfg, "inherits")
+            .expect("resolves")
+            .max_tokens,
+        None,
+    );
+
+    unset_env(var);
+}
+
+/// `--device` is a mistralrs knob; asking for one on a remote model is a
+/// mistake worth naming rather than ignoring.
+#[test]
+fn anthropic_model_rejects_device_override() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ANTHROPIC_DEVICE";
+    set_env(var, "k");
+    let cfg = anthropic_cfg(
+        var,
+        "",
+        r#"
+[agents.coding]
+preamble = "hi"
+"#,
+    );
+
+    let err = resolve_agent_with_device_override(&cfg, "coding", Some(MistralrsDeviceSpec::Cpu))
+        .expect_err("device override should be rejected");
+    unset_env(var);
+    assert!(
+        matches!(
+            &err,
+            CliError::LlmResolve(LlmResolveError::MistralrsDeviceOverrideUnsupported {
+                model,
+                provider,
+            }) if model == "sonnet" && provider == "claude"
+        ),
+        "got: {err:?}",
+    );
+}
+
+#[test]
+fn anthropic_unset_api_key_errors() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ANTHROPIC_UNSET";
+    unset_env(var);
+    let cfg = anthropic_cfg(
+        var,
+        "",
+        r#"
+[agents.coding]
+preamble = "hi"
+"#,
+    );
+
+    let err = resolve_agent(&cfg, "coding").expect_err("unset key should fail");
+    assert!(
+        matches!(err, CliError::Outrig(outrig::error::OutrigError::ApiKey(_))),
+        "got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains(var),
+        "error should name the missing var; got: {err}"
+    );
+}
+
 #[test]
 fn unset_api_key_errors() {
     let var = "OUTRIG_TEST_LLM_RESOLVE_UNSET_API_KEY";

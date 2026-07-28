@@ -150,13 +150,18 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(base_url, "https://api.openai.com/v1");
         assert_eq!(api_key.var_name(), "OPENAI_API_KEY");
         assert_eq!(*request_timeout_secs, Some(90));
-        let LlmProvider::OpenAi {
+        let LlmProvider::Anthropic {
+            base_url: anthropic_base_url,
+            api_key: anthropic_key,
             request_timeout_secs: anthropic_timeout,
             ..
         } = &cfg.providers["anthropic"]
         else {
-            panic!("expected OpenAi variant for [providers.anthropic]");
+            panic!("expected Anthropic variant for [providers.anthropic]");
         };
+        // The bare official endpoint: the client appends `/v1/messages`.
+        assert_eq!(anthropic_base_url, "https://api.anthropic.com");
+        assert_eq!(anthropic_key.var_name(), "ANTHROPIC_API_KEY");
         assert_eq!(*anthropic_timeout, None);
 
         assert_eq!(cfg.models["fast"].provider, "openai");
@@ -164,6 +169,12 @@ srv = { command = ["bin", "arg1"] }
             cfg.models["fast"].identifier.as_deref(),
             Some("gpt-4o-mini")
         );
+        assert_eq!(cfg.models["fast"].max_tokens, None);
+
+        let claude = &cfg.models["claude"];
+        assert_eq!(claude.provider, "anthropic");
+        assert_eq!(claude.identifier.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(claude.max_tokens, Some(16384));
 
         // mistralrs-side models carry weight fields and no identifier.
         let phi3 = &cfg.models["phi3-fast"];

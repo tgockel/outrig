@@ -17,8 +17,8 @@ api-key              = "${OPENAI_API_KEY}"
 request-timeout-secs = 90
 
 [providers.anthropic]
-style    = "openai"
-base-url = "https://api.anthropic.com/v1"
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
 [providers.local]
@@ -35,6 +35,7 @@ identifier = "gpt-4o"
 [models.claude]
 provider   = "anthropic"
 identifier = "claude-sonnet-4-6"
+max-tokens = 16384
 
 [models.phi3-fast]
 provider   = "local"

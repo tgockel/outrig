@@ -26,13 +26,13 @@ macro_rules! internal_modules {
 // Exactly the modules some integration test names.
 internal_modules! {
     cli, config_init, error, hf, image_setup, init, llm, repl, rig_tool, session,
+    session_tool,
 }
 
 // Reached only from inside the crate, so these stay private either way.
 pub(crate) mod builtin_tool;
 pub(crate) mod mcp_self;
 pub(crate) mod paths;
-pub(crate) mod session_tool;
 pub(crate) mod subagent;
 
 /// Run the `outrig` command-line tool, returning the process exit code.

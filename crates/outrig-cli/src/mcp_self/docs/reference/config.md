@@ -146,7 +146,8 @@ interceptor.
 
 A provider tells outrig how to reach a model -- either a remote HTTPS endpoint that speaks
 a known wire format, or a local in-process backend. Multiple providers in either file. Repo
-entries with the same name override globals. The accepted `style` values are `"openai"` and
+entries with the same name override globals, replacing the whole entry rather than merging
+field by field. The accepted `style` values are `"openai"`, `"anthropic"`, and
 `"mistralrs"`. Which other fields are valid depends on `style`.
 
 ### `style = "openai"`
@@ -174,6 +175,37 @@ Each LLM request that fails with a transient error -- a timeout, a dropped conne
 HTTP `408`/`429`/`5xx` -- is retried a few times with exponential backoff before the turn
 gives up. `request-timeout-secs` bounds each individual attempt, and defaults high enough not
 to cut off long reasoning completions.
+
+### `style = "anthropic"`
+
+Anthropic's native Messages API: requests go to `{base-url}/v1/messages` and authenticate
+with the `x-api-key` header. Use this to reach Claude directly. Reaching Claude through an
+OpenAI-compatible bridge (OpenRouter and friends) is a `style = "openai"` provider pointed
+at that bridge instead -- both work, and they are different rows.
+
+```toml
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+```
+
+| Key                    | Type         | Required | Default | Description                         |
+|------------------------|--------------|----------|---------|-------------------------------------|
+| `style`                | string       | yes      | --      | Must be `"anthropic"` for this row. |
+| `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider.    |
+| `api-key`              | string       | yes      | --      | Env-var reference, see below.       |
+| `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.         |
+
+`base-url` is the API root, without the `/v1/messages` path -- outrig appends that. A
+trailing `/v1`, `/messages`, or `/v1/messages` is trimmed if you write one anyway, so
+`https://api.anthropic.com` and `https://api.anthropic.com/v1` behave identically. Timeout
+and transient-retry behavior match `style = "openai"` exactly.
+
+Anthropic requires an output-token ceiling on every request. outrig knows one for the model
+identifiers it recognizes; any other identifier needs `max-tokens` on the model or the
+agent, or the first turn fails saying so. See
+[anthropic models](#anthropic-models).
 
 ### `style = "mistralrs"`
 
@@ -232,7 +264,10 @@ See [Concepts -> LLM Providers](../concepts/llm-providers.md).
 A model points at a provider and supplies whatever that provider needs to identify the
 weights or wire-format model name. The required fields depend on the provider's `style`.
 
-### openai-style models
+### Remote-provider models
+
+Models on a remote provider -- `style = "openai"` or `style = "anthropic"` -- name their
+model with an `identifier`. None of the mistralrs weight fields are allowed.
 
 ```toml
 [models.fast]
@@ -244,10 +279,42 @@ provider   = "openai"
 identifier = "gpt-4o"
 ```
 
-| Key          | Type   | Required | Default | Description                               |
-|--------------|--------|----------|---------|-------------------------------------------|
-| `provider`   | string | yes      | --      | Name of an entry in `[providers.<name>]`. |
-| `identifier` | string | yes      | --      | Model id passed to the provider API.      |
+| Key          | Type    | Required | Default | Description                                |
+|--------------|---------|----------|---------|--------------------------------------------|
+| `provider`   | string  | yes      | --      | Name of an entry in `[providers.<name>]`.  |
+| `identifier` | string  | yes      | --      | Model id passed to the provider API.       |
+| `max-tokens` | integer | no       | --      | Output-token ceiling per turn, see below.  |
+
+`max-tokens` on a model is the fallback for every agent that uses it;
+`[agents.<name>].max-tokens` wins where it is set. Leaving both unset lets the provider
+decide -- which is fine for OpenAI-compatible endpoints, and is what the next section is
+about for Anthropic.
+
+#### anthropic models
+
+```toml
+[models.sonnet]
+provider   = "anthropic"
+identifier = "claude-sonnet-4-6"
+
+[models.older]
+provider   = "anthropic"
+identifier = "claude-3-5-sonnet-20241022"
+max-tokens = 8192
+```
+
+The Messages API rejects a request with no `max_tokens`, so outrig has to send one. It
+knows the published ceiling for current Claude model identifiers -- the `claude-opus-4-6`
+and later families, and the `claude-sonnet-4` / `claude-haiku-4-5` families -- and uses it
+when neither the model nor the agent sets one. For any other identifier there is no such
+default, and a turn fails with `` `max_tokens` must be set for Anthropic ``. Set
+`max-tokens` on the model (as `[models.older]` does above) or on the agent.
+
+outrig deliberately has no fallback ceiling of its own. A number invented here would apply
+to models it was never chosen for, and the failure -- replies cut short mid-sentence, with
+nothing logged -- is far harder to recognize than an error naming the missing setting.
+`outrig config init` prompts for `max-tokens` when it writes an Anthropic model, so a
+generated config carries an explicit one.
 
 ### mistralrs models
 
@@ -334,7 +401,10 @@ preamble = "You are a meticulous code reviewer..."
 - `image` (string, optional, default: `default-image`): default image-config
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
-- `max-tokens` (integer, optional, default: provider default): output token max per turn.
+- `max-tokens` (integer, optional, default: the model's `max-tokens`, else the provider
+  default): output token max per turn. Required in one place or the other for an Anthropic
+  model whose identifier outrig does not recognize -- see
+  [anthropic models](#anthropic-models).
 - `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per turn.
 - `tool-result-max` (integer, optional, default: top-level value or `262144`): bytes per result.
 - `subagents` (bool, optional, default: `true`): whether this agent may launch subagents. When
@@ -723,6 +793,11 @@ style    = "openai"
 base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+
 [providers.local]
 # requires `cargo build --features local-llm` to actually use, but always parses.
 style = "mistralrs"
@@ -734,6 +809,11 @@ identifier = "gpt-4o-mini"
 [models.smart]
 provider   = "openai"
 identifier = "gpt-4o"
+
+[models.claude]
+provider   = "anthropic"
+identifier = "claude-sonnet-4-6"
+max-tokens = 16384
 
 [models.phi3-fast]
 provider   = "local"
@@ -800,15 +880,16 @@ image-config in the merged config but does not require agent/model/provider wiri
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.
 - Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
-- Every `providers.<name>.style` must be one of `{"openai", "mistralrs"}`. Other styles are
-  reserved for future Rig adapters and listed as TODO in the providers concept page. The
-  build-time feature gate (`--features local-llm`) is **not** checked at validate time --
-  see "Always parses, even without `--features local-llm`" above.
-- Every `providers.<name>.api-key` (on `style = "openai"`) must match
+- Every `providers.<name>.style` must be one of `{"openai", "anthropic", "mistralrs"}`. Other
+  styles are reserved for future Rig adapters and listed as TODO in the providers concept
+  page. The build-time feature gate (`--features local-llm`) is **not** checked at validate
+  time -- see "Always parses, even without `--features local-llm`" above.
+- Every `providers.<name>.api-key` (on a remote style) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
-- Every `[models.<name>]` whose provider has `style = "openai"` must set
+- Every `[models.<name>]` whose provider has a remote style must set
   `identifier` and must not set any of `model-id`, `model-path`, `model-file`,
-  `revision`, `context-length`, `device`.
+  `revision`, `context-length`, `device`. The error names the style of the
+  provider the model points at.
 - Every `[models.<name>]` whose provider has `style = "mistralrs"` must set
   exactly one of `model-id` / `model-path`. When `model-id` is set, `model-file`
   is **required** -- mistralrs's GGUF loader needs a specific filename and HF

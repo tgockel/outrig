@@ -8,7 +8,7 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use outrig::config::{Config, ConfigValidationError};
+use outrig::config::{Config, ConfigValidationError, LlmProvider};
 use outrig::error::OutrigError;
 
 fn parse(s: &str) -> Config {
@@ -20,6 +20,179 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
         Err(OutrigError::ConfigValidation(e)) => e,
         Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
         Ok(()) => panic!("expected validation error, got Ok"),
+    }
+}
+
+/// The native Anthropic style carries the same connection fields as `openai`
+/// and survives a serialize/parse round trip, including the model-level
+/// `max-tokens` its API needs.
+#[test]
+fn anthropic_provider_parses_validates_and_round_trips() {
+    let cfg = parse(
+        r#"
+[providers.claude]
+style                = "anthropic"
+base-url             = "https://api.anthropic.com"
+api-key              = "${ANTHROPIC_API_KEY}"
+request-timeout-secs = 120
+
+[models.sonnet]
+provider   = "claude"
+identifier = "claude-sonnet-4-6"
+max-tokens = 16384
+"#,
+    );
+    cfg.validate(None).expect("validates");
+
+    let LlmProvider::Anthropic {
+        base_url,
+        api_key,
+        request_timeout_secs,
+        ..
+    } = &cfg.providers["claude"]
+    else {
+        panic!("expected the Anthropic variant, got: {:?}", cfg.providers);
+    };
+    assert_eq!(base_url, "https://api.anthropic.com");
+    assert_eq!(api_key.var_name(), "ANTHROPIC_API_KEY");
+    assert_eq!(*request_timeout_secs, Some(120));
+    assert_eq!(cfg.models["sonnet"].max_tokens, Some(16384));
+
+    let serialized = toml::to_string(&cfg).expect("serializes");
+    assert!(
+        serialized.contains(r#"style = "anthropic""#),
+        "style should round-trip as the documented tag, got: {serialized}"
+    );
+    let again = Config::load_from_str(&serialized).expect("reserialized parses");
+    assert_eq!(cfg, again);
+}
+
+/// `request-timeout-secs` is the only optional connection field, and unknown
+/// keys are rejected by the tagged enum rather than silently ignored.
+#[test]
+fn anthropic_provider_field_rules() {
+    let cfg = parse(
+        r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+"#,
+    );
+    let LlmProvider::Anthropic {
+        request_timeout_secs,
+        ..
+    } = &cfg.providers["claude"]
+    else {
+        panic!("expected the Anthropic variant");
+    };
+    assert_eq!(*request_timeout_secs, None);
+
+    for (missing, toml) in [
+        (
+            "base-url",
+            r#"
+[providers.claude]
+style   = "anthropic"
+api-key = "${ANTHROPIC_API_KEY}"
+"#,
+        ),
+        (
+            "api-key",
+            r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+"#,
+        ),
+    ] {
+        let err = Config::load_from_str(toml).expect_err("missing field should fail");
+        assert!(
+            err.to_string().contains(missing),
+            "error should name the missing {missing}, got: {err}"
+        );
+    }
+
+    let err = Config::load_from_str(
+        r#"
+[providers.claude]
+style      = "anthropic"
+base-url   = "https://api.anthropic.com"
+api-key    = "${ANTHROPIC_API_KEY}"
+max-tokens = 4096
+"#,
+    )
+    .expect_err("unknown provider field should fail");
+    assert!(
+        err.to_string().contains("max-tokens"),
+        "error should name the unknown field, got: {err}"
+    );
+}
+
+#[test]
+fn anthropic_model_missing_identifier_fails_validate() {
+    let cfg = parse(
+        r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+
+[models.sonnet]
+provider = "claude"
+"#,
+    );
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            err,
+            ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
+                if model == "sonnet" && style == "anthropic"
+        ),
+        "got: {err:?}",
+    );
+    assert!(
+        err.to_string().contains("provider style=anthropic"),
+        "message should name the style the user wrote, got: {err}"
+    );
+}
+
+/// Every mistralrs weight field is rejected on an Anthropic model, and the
+/// diagnostic names `anthropic` rather than whichever remote style happens to
+/// share the rule.
+#[test]
+fn anthropic_model_rejects_every_mistralrs_field() {
+    for (field, line) in [
+        ("model-id", r#"model-id = "Qwen/Qwen2.5-7B-Instruct""#),
+        ("model-path", r#"model-path = "/tmp/model.gguf""#),
+        ("model-file", r#"model-file = "model.gguf""#),
+        ("revision", r#"revision = "main""#),
+        ("context-length", "context-length = 4096"),
+        ("device", r#"device = "cpu""#),
+    ] {
+        let cfg = parse(&format!(
+            r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${{ANTHROPIC_API_KEY}}"
+
+[models.sonnet]
+provider   = "claude"
+identifier = "claude-sonnet-4-6"
+{line}
+"#
+        ));
+        let err = expect_validation_err(&cfg, None);
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::RemoteModelHasMistralrsField {
+                    ref model, style, field: got, ..
+                } if model == "sonnet" && style == "anthropic" && got == field
+            ),
+            "{field} should be rejected, got: {err:?}",
+        );
     }
 }
 
@@ -226,7 +399,7 @@ model-id   = "Qwen/Qwen2.5-7B-Instruct"
     assert!(
         matches!(
             err,
-            ConfigValidationError::MistralrsModelHasOpenAiField { ref model, field }
+            ConfigValidationError::MistralrsModelHasRemoteField { ref model, field }
                 if model == "qwen" && field == "identifier"
         ),
         "got: {err:?}",
@@ -250,8 +423,8 @@ provider = "openai"
     assert!(
         matches!(
             err,
-            ConfigValidationError::OpenAiModelMissingIdentifier { ref model }
-                if model == "fast"
+            ConfigValidationError::RemoteModelMissingIdentifier { ref model, style, .. }
+                if model == "fast" && style == "openai"
         ),
         "got: {err:?}",
     );
@@ -276,8 +449,8 @@ model-id   = "should-not-be-here"
     assert!(
         matches!(
             err,
-            ConfigValidationError::OpenAiModelHasMistralrsField { ref model, field }
-                if model == "fast" && field == "model-id"
+            ConfigValidationError::RemoteModelHasMistralrsField { ref model, style, field, .. }
+                if model == "fast" && style == "openai" && field == "model-id"
         ),
         "got: {err:?}",
     );
@@ -302,8 +475,8 @@ device     = "cuda"
     assert!(
         matches!(
             err,
-            ConfigValidationError::OpenAiModelHasMistralrsField { ref model, field }
-                if model == "fast" && field == "device"
+            ConfigValidationError::RemoteModelHasMistralrsField { ref model, style, field, .. }
+                if model == "fast" && style == "openai" && field == "device"
         ),
         "got: {err:?}",
     );

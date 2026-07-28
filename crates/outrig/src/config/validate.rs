@@ -236,21 +236,27 @@ pub enum ConfigValidationError {
 
     #[error(
         "model {model:?} (provider style=mistralrs) must not set {field:?} -- \
-         that field belongs to openai-style providers"
+         that field belongs to remote providers (style=openai, style=anthropic)"
     )]
-    MistralrsModelHasOpenAiField { model: String, field: &'static str },
+    MistralrsModelHasRemoteField { model: String, field: &'static str },
 
     #[error(
-        "model {model:?} (provider style=openai) must set 'identifier' (the \
+        "model {model:?} (provider style={style}) must set 'identifier' (the \
          string sent to the provider API)"
     )]
-    OpenAiModelMissingIdentifier { model: String },
+    #[non_exhaustive]
+    RemoteModelMissingIdentifier { model: String, style: &'static str },
 
     #[error(
-        "model {model:?} (provider style=openai) must not set {field:?} -- \
+        "model {model:?} (provider style={style}) must not set {field:?} -- \
          that field belongs to mistralrs-style providers"
     )]
-    OpenAiModelHasMistralrsField { model: String, field: &'static str },
+    #[non_exhaustive]
+    RemoteModelHasMistralrsField {
+        model: String,
+        style: &'static str,
+        field: &'static str,
+    },
 
     #[error(
         "invalid sidecar name {sidecar:?} \
@@ -564,8 +570,14 @@ pub(super) fn validate_with_options(
                     provider: model.provider.clone(),
                 }
             })?;
+            // Deliberately without a `_` arm: this crate can match the enum
+            // exhaustively even though it is `#[non_exhaustive]`, so a new
+            // provider style has to stop here and say which field rules it
+            // follows rather than inheriting someone else's by default.
             match provider {
-                LlmProvider::OpenAi { .. } => validate_openai_model(model_name, model)?,
+                LlmProvider::OpenAi { .. } | LlmProvider::Anthropic { .. } => {
+                    validate_remote_model(provider.style(), model_name, model)?
+                }
                 LlmProvider::Mistralrs => validate_mistralrs_model(model_name, model, repo_root)?,
             }
         }
@@ -1098,10 +1110,19 @@ fn validate_tool_result_max(path: &str, value: u32) -> Result<(), ConfigValidati
     Ok(())
 }
 
-fn validate_openai_model(model_name: &str, model: &Model) -> Result<(), ConfigValidationError> {
+/// The field rules every remote (HTTP) provider style shares: an `identifier`
+/// is required, and every mistralrs weight field is rejected. `style` names the
+/// style in diagnostics, so the message points at the row the user wrote rather
+/// than at whichever remote provider happens to be listed first.
+fn validate_remote_model(
+    style: &'static str,
+    model_name: &str,
+    model: &Model,
+) -> Result<(), ConfigValidationError> {
     if model.identifier.is_none() {
-        return Err(ConfigValidationError::OpenAiModelMissingIdentifier {
+        return Err(ConfigValidationError::RemoteModelMissingIdentifier {
             model: model_name.to_string(),
+            style,
         });
     }
     let weight_fields: [(bool, &'static str); 6] = [
@@ -1114,8 +1135,9 @@ fn validate_openai_model(model_name: &str, model: &Model) -> Result<(), ConfigVa
     ];
     for (present, field) in weight_fields {
         if present {
-            return Err(ConfigValidationError::OpenAiModelHasMistralrsField {
+            return Err(ConfigValidationError::RemoteModelHasMistralrsField {
                 model: model_name.to_string(),
+                style,
                 field,
             });
         }
@@ -1129,7 +1151,7 @@ fn validate_mistralrs_model(
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
     if model.identifier.is_some() {
-        return Err(ConfigValidationError::MistralrsModelHasOpenAiField {
+        return Err(ConfigValidationError::MistralrsModelHasRemoteField {
             model: model_name.to_string(),
             field: "identifier",
         });

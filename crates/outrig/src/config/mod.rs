@@ -366,10 +366,33 @@ pub enum LlmProvider {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_timeout_secs: Option<u64>,
     },
+    /// Anthropic's native Messages API: `POST {base-url}/v1/messages` with
+    /// `x-api-key` auth. Distinct from reaching Claude through an
+    /// OpenAI-compatible bridge, which is a `style = "openai"` provider
+    /// pointed at that bridge.
+    #[non_exhaustive]
+    Anthropic {
+        base_url: String,
+        api_key: ApiKeyRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_timeout_secs: Option<u64>,
+    },
     Mistralrs,
 }
 
 impl LlmProvider {
+    /// The `style` tag this variant serializes as, for diagnostics and
+    /// user-facing labels. Written next to the serde attributes above so the
+    /// two cannot drift: a message naming a style the config file does not
+    /// accept sends the reader looking for the wrong key.
+    pub fn style(&self) -> &'static str {
+        match self {
+            Self::OpenAi { .. } => "openai",
+            Self::Anthropic { .. } => "anthropic",
+            Self::Mistralrs => "mistralrs",
+        }
+    }
+
     /// An OpenAI-compatible provider at `base_url`. `request_timeout_secs`
     /// falls back to the client default when `None`.
     pub fn openai(
@@ -378,6 +401,22 @@ impl LlmProvider {
         request_timeout_secs: Option<u64>,
     ) -> Self {
         Self::OpenAi {
+            base_url: base_url.into(),
+            api_key,
+            request_timeout_secs,
+        }
+    }
+
+    /// Anthropic's native Messages API at `base_url` -- the official endpoint
+    /// is `https://api.anthropic.com`. A trailing `/v1`, `/messages`, or
+    /// `/v1/messages` is normalized away by the client, so either form works.
+    /// `request_timeout_secs` falls back to the client default when `None`.
+    pub fn anthropic(
+        base_url: impl Into<String>,
+        api_key: ApiKeyRef,
+        request_timeout_secs: Option<u64>,
+    ) -> Self {
+        Self::Anthropic {
             base_url: base_url.into(),
             api_key,
             request_timeout_secs,
@@ -408,6 +447,12 @@ pub struct Model {
     pub context_length: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// Output-token ceiling for turns run against this model, used when the
+    /// agent does not set its own. Anthropic *requires* one per request and
+    /// only supplies a default for the model identifiers it recognizes, so a
+    /// Claude model naming anything else needs this (or the agent's) set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
 }
 
 impl Model {
@@ -424,6 +469,7 @@ impl Model {
             revision: None,
             context_length: None,
             device: None,
+            max_tokens: None,
         }
     }
 }

@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that container's ENTRYPOINT is the server, which is how such a server gets a workspace view,
   mounts, or its own security policy.
 
+- **Agents can run against Anthropic's native Messages API** by selecting a
+  `style = "anthropic"` provider. Turns take the same non-streaming path as `openai`, with
+  the MCP tool loop, tool-call cap, tool-result truncation, conversation history,
+  sidecar-added tools, and subagents all unchanged; only the wire format differs. The banner
+  reports `provider: anthropic`.
+
+  Anthropic requires an output-token ceiling on every request. outrig sends the published one
+  for the Claude identifiers it recognizes; for any other identifier the turn fails with
+  `` `max_tokens` must be set for Anthropic `` unless `max-tokens` is set on the model or the
+  agent. `outrig config init` offers `anthropic` as a provider style -- defaulting to
+  `https://api.anthropic.com` and `ANTHROPIC_API_KEY` -- and prompts for `max-tokens`
+  alongside the model identifier, so a generated config carries an explicit ceiling.
+
 ### Changed
 
 - **Breaking (config):** sidecars are declared at the top level as `[sidecars.<sc>]`, not

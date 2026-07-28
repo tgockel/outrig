@@ -71,6 +71,10 @@ const STYLES: &[(&str, &str)] = &[
         "OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM, Ollama.",
     ),
     (
+        "anthropic",
+        "Anthropic's native Messages wire format. Talks to Claude directly.",
+    ),
+    (
         "mistralrs",
         "In-process LLM via the mistralrs crate. Loads a local or HuggingFace model.",
     ),
@@ -93,6 +97,14 @@ const PROVIDER_NAME_FIELD: Field = Field {
 const BASE_URL_FIELD: Field = Field {
     name: "Base URL",
     description: "HTTPS endpoint for the OpenAI-compatible API.",
+    options: &[],
+    doc_link: "doc/concepts/llm-providers.md",
+};
+
+const ANTHROPIC_BASE_URL_FIELD: Field = Field {
+    name: "Base URL",
+    description: "HTTPS endpoint speaking Anthropic's native Messages API. \
+                  The official one is https://api.anthropic.com.",
     options: &[],
     doc_link: "doc/concepts/llm-providers.md",
 };
@@ -186,6 +198,17 @@ const MODEL_IDENTIFIER_FIELD: Field = Field {
     doc_link: "doc/reference/config.md",
 };
 
+const MODEL_MAX_TOKENS_FIELD: Field = Field {
+    name: "max-tokens for this model",
+    description: "Output-token ceiling per turn. Anthropic requires one on \
+                  every request, and outrig knows a default only for current \
+                  Claude identifiers -- any other one fails its first turn \
+                  without this. An agent's own max-tokens still wins. Blank \
+                  to omit.",
+    options: &[],
+    doc_link: "doc/reference/config.md",
+};
+
 const MODEL_PROVIDER_FIELD: Field = Field {
     name: "Provider for this model",
     description: "An LLM provider is a backend that hosts the model -- e.g. \
@@ -234,6 +257,7 @@ pub const DOC_SYNC_FIELDS: &[&Field] = &[
     &STYLE_FIELD,
     &PROVIDER_NAME_FIELD,
     &BASE_URL_FIELD,
+    &ANTHROPIC_BASE_URL_FIELD,
     &API_KEY_ENV_FIELD,
     &ADD_PROVIDER_FIELD,
     &AUTO_DOWNLOAD_FIELD,
@@ -246,6 +270,7 @@ pub const DOC_SYNC_FIELDS: &[&Field] = &[
     &DEFINE_MODEL_FIELD,
     &MODEL_NAME_FIELD,
     &MODEL_IDENTIFIER_FIELD,
+    &MODEL_MAX_TOKENS_FIELD,
     &MODEL_PROVIDER_FIELD,
     &ADD_NEW_PROVIDER_FIELD,
     &ADD_MODEL_FIELD,
@@ -285,6 +310,7 @@ pub(crate) async fn prompt_new_provider_for_name(
 async fn prompt_provider_body(prompt: &mut impl PromptSource, style: &str) -> Result<LlmProvider> {
     match style {
         "openai" => prompt_openai_provider(prompt).await,
+        "anthropic" => prompt_anthropic_provider(prompt).await,
         "mistralrs" => Ok(LlmProvider::Mistralrs),
         other => Err(OutrigError::Configuration(format!("unknown provider style: {other}")).into()),
     }
@@ -301,6 +327,19 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
         .await?;
     let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
     Ok(LlmProvider::openai(base_url, api_key, None))
+}
+
+async fn prompt_anthropic_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
+    // The bare official endpoint: rig appends `/v1/messages` itself, and
+    // normalizes a `/v1` suffix away if one is typed anyway.
+    let base_url = prompt
+        .ask_string(&ANTHROPIC_BASE_URL_FIELD, "https://api.anthropic.com")
+        .await?;
+    let env_name = prompt
+        .ask_string(&API_KEY_ENV_FIELD, "ANTHROPIC_API_KEY")
+        .await?;
+    let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
+    Ok(LlmProvider::anthropic(base_url, api_key, None))
 }
 
 async fn prompt_models(
@@ -369,9 +408,11 @@ pub(crate) async fn prompt_models_loop(
         // Only the local provider needs the weights walk-through. Every remote
         // one names its model with an identifier, so that arm is the fallback
         // rather than a dead `_ =>`: a provider added to the enum later gets a
-        // usable prompt instead of an error.
+        // usable prompt instead of an error. Anthropic gets its own arm on top
+        // of that, for the ceiling its API insists on.
         let model = match provider {
             LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, hf, provider_name).await?,
+            LlmProvider::Anthropic { .. } => prompt_anthropic_model(prompt, provider_name).await?,
             _ => {
                 let identifier = prompt
                     .ask_string(&MODEL_IDENTIFIER_FIELD, "gpt-4o-mini")
@@ -389,6 +430,45 @@ pub(crate) async fn prompt_models_loop(
     Ok((out, new_providers))
 }
 
+/// An Anthropic model: the identifier, plus the output-token ceiling its API
+/// requires on every request. The default matches the published ceiling for
+/// the Claude 4 family, so accepting it never lowers one outrig would have
+/// sent anyway -- and an identifier outrig has no default for still gets a
+/// config that works on its first turn.
+async fn prompt_anthropic_model(
+    prompt: &mut impl PromptSource,
+    provider_name: String,
+) -> Result<Model> {
+    let identifier = prompt
+        .ask_string(&MODEL_IDENTIFIER_FIELD, "claude-sonnet-4-6")
+        .await?;
+    let max_tokens = ask_optional_u32(prompt, &MODEL_MAX_TOKENS_FIELD, "64000", "max-tokens").await?;
+    let mut model = Model::new(provider_name);
+    model.identifier = Some(identifier);
+    model.max_tokens = max_tokens;
+    Ok(model)
+}
+
+/// Ask for an optional non-negative integer: blank leaves the key unset, and
+/// anything unparseable names `knob` in the error rather than the raw type.
+async fn ask_optional_u32(
+    prompt: &mut impl PromptSource,
+    field: &Field,
+    default: &str,
+    knob: &str,
+) -> Result<Option<u32>> {
+    blank_to_none(prompt.ask_string(field, default).await?)
+        .map(|s| {
+            s.parse::<u32>().map_err(|_| {
+                OutrigError::Configuration(format!(
+                    "{knob} must be a non-negative integer; got `{s}`"
+                ))
+                .into()
+            })
+        })
+        .transpose()
+}
+
 async fn prompt_mistralrs_model(
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
@@ -404,15 +484,8 @@ async fn prompt_mistralrs_model(
         let path = ask_required(prompt, &MODEL_PATH_FIELD).await?;
         (None, None, Some(PathBuf::from(path)), None)
     };
-    let context_length = blank_to_none(prompt.ask_string(&CONTEXT_LENGTH_FIELD, "").await?)
-        .map(|s| {
-            s.parse::<u32>().map_err(|_| {
-                OutrigError::Configuration(format!(
-                    "context-length must be a non-negative integer; got `{s}`"
-                ))
-            })
-        })
-        .transpose()?;
+    let context_length =
+        ask_optional_u32(prompt, &CONTEXT_LENGTH_FIELD, "", "context-length").await?;
     let mut model = Model::new(provider_name);
     model.model_id = model_id;
     model.model_path = model_path;

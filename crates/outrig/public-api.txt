@@ -115,9 +115,9 @@ pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId::f
 pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId::model: alloc::string::String
 pub outrig::config::ConfigValidationError::MistralrsMissingModelSource
 pub outrig::config::ConfigValidationError::MistralrsMissingModelSource::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsModelHasOpenAiField
-pub outrig::config::ConfigValidationError::MistralrsModelHasOpenAiField::field: &'static str
-pub outrig::config::ConfigValidationError::MistralrsModelHasOpenAiField::model: alloc::string::String
+pub outrig::config::ConfigValidationError::MistralrsModelHasRemoteField
+pub outrig::config::ConfigValidationError::MistralrsModelHasRemoteField::field: &'static str
+pub outrig::config::ConfigValidationError::MistralrsModelHasRemoteField::model: alloc::string::String
 pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile
 pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model: alloc::string::String
 pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model_id: alloc::string::String
@@ -128,11 +128,13 @@ pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute
 pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute::path: std::path::PathBuf
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid::message: alloc::string::String
-pub outrig::config::ConfigValidationError::OpenAiModelHasMistralrsField
-pub outrig::config::ConfigValidationError::OpenAiModelHasMistralrsField::field: &'static str
-pub outrig::config::ConfigValidationError::OpenAiModelHasMistralrsField::model: alloc::string::String
-pub outrig::config::ConfigValidationError::OpenAiModelMissingIdentifier
-pub outrig::config::ConfigValidationError::OpenAiModelMissingIdentifier::model: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField
+pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::field: &'static str
+pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::model: alloc::string::String
+pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::style: &'static str
+#[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
+pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
+pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
 pub outrig::config::ConfigValidationError::ReservedMcpServerName
 pub outrig::config::ConfigValidationError::ReservedMcpServerName::image: alloc::string::String
 pub outrig::config::ConfigValidationError::ReservedMcpServerName::server: alloc::string::String
@@ -236,13 +238,19 @@ pub outrig::config::ImageSourceRef::Build::dockerfile: &'a std::path::Path
 #[non_exhaustive] pub outrig::config::ImageSourceRef::Image
 pub outrig::config::ImageSourceRef::Image::image_name: &'a str
 #[non_exhaustive] pub enum outrig::config::LlmProvider
+#[non_exhaustive] pub outrig::config::LlmProvider::Anthropic
+pub outrig::config::LlmProvider::Anthropic::api_key: outrig::config::ApiKeyRef
+pub outrig::config::LlmProvider::Anthropic::base_url: alloc::string::String
+pub outrig::config::LlmProvider::Anthropic::request_timeout_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::Mistralrs
 #[non_exhaustive] pub outrig::config::LlmProvider::OpenAi
 pub outrig::config::LlmProvider::OpenAi::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::OpenAi::base_url: alloc::string::String
 pub outrig::config::LlmProvider::OpenAi::request_timeout_secs: core::option::Option<u64>
 impl outrig::config::LlmProvider
+pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
 pub fn outrig::config::LlmProvider::openai(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
+pub fn outrig::config::LlmProvider::style(&self) -> &'static str
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
 pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
@@ -401,6 +409,7 @@ pub fn outrig::config::MistralrsDeviceParseError::fmt(&self, &mut core::fmt::For
 pub outrig::config::Model::context_length: core::option::Option<u32>
 pub outrig::config::Model::device: core::option::Option<alloc::string::String>
 pub outrig::config::Model::identifier: core::option::Option<alloc::string::String>
+pub outrig::config::Model::max_tokens: core::option::Option<u32>
 pub outrig::config::Model::model_file: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub outrig::config::Model::model_id: core::option::Option<alloc::string::String>
 pub outrig::config::Model::model_path: core::option::Option<std::path::PathBuf>

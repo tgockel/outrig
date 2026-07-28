@@ -44,8 +44,10 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 ```
 
-`style` is the protocol. v0 wires `"openai"` for any OpenAI-compatible endpoint, and
-recognizes `"mistralrs"` for in-process LLMs (gated behind a Cargo feature -- see
+`style` is the protocol. v0 wires `"openai"` for any OpenAI-compatible endpoint and
+`"anthropic"` for Anthropic's native Messages API (see
+[Native Anthropic](#native-anthropic-style--anthropic) below), and recognizes `"mistralrs"`
+for in-process LLMs (gated behind a Cargo feature -- see
 [In-process providers](#in-process-providers-mistralrs) below). `base-url` is the HTTPS
 endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at run time,
 never reads a key from disk. See
@@ -102,7 +104,9 @@ under -- the place to encode role, scope, voice.
 
 `temperature` and `max-tokens` live on the agent because the same underlying model is often used
 with different sampling for different tasks (e.g. low temperature for code, higher for
-brainstorming).
+brainstorming). `max-tokens` may also be set on the model, which covers every agent pointed at
+it; the agent's value wins where both are set. That matters for Anthropic models, whose API
+requires a ceiling on every request -- see [Native Anthropic](#native-anthropic-style--anthropic).
 
 `tool-call-max` also lives on the agent when a role needs longer tool loops. If unset, the agent
 uses the top-level `tool-call-max`, then the compiled-in default of `50`. The max is per user
@@ -159,18 +163,47 @@ identifier = "anthropic/claude-sonnet-4-6"
 The agent loop is unchanged -- it's still tool calls in OpenAI's format, just routed somewhere
 else.
 
-## Other Rig provider styles
+## Native Anthropic (`style = "anthropic"`)
 
-> **TODO: Incomplete** -- only `style = "openai"` is wired up in v0. Native `"anthropic"` (which
-> would talk to the Anthropic API directly rather than via an OpenAI-compatible bridge), Cohere,
-> etc. are pending.
+`style = "anthropic"` talks to Anthropic's own Messages API rather than to an
+OpenAI-compatible translation of it. Requests go to `{base-url}/v1/messages` and carry the
+`x-api-key` header; tools are advertised in Anthropic's `input_schema` shape, the model
+answers with `tool_use` blocks, and outrig sends each result back as a `tool_result` block.
 
 ```toml
 [providers.anthropic]
 style    = "anthropic"
-base-url = "https://api.anthropic.com/v1"
+base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
+
+[models.sonnet]
+provider   = "anthropic"
+identifier = "claude-sonnet-4-6"
+max-tokens = 16384
 ```
+
+`base-url` is the API root; outrig appends `/v1/messages` itself. Both this endpoint and an
+OpenAI-compatible bridge to Claude (the `openrouter` provider above, with an
+`anthropic/claude-*` identifier) work, and they are genuinely different paths: the bridge
+translates to and from chat-completions on someone else's server, while this one is the
+native protocol end to end. Prefer the native style when you hold an Anthropic key.
+
+The one thing it asks of you is `max-tokens`. The Messages API requires an output-token
+ceiling on every request; outrig knows the published one for current Claude identifiers and
+sends it automatically, but for any other identifier -- an older model, a proxy's own naming
+-- there is nothing to fall back on and the turn fails saying so. Set `max-tokens` on the
+model (covering every agent that uses it) or on the agent. outrig does not invent a ceiling
+of its own, because a wrong one truncates replies silently.
+
+Everything else is shared with the other remote styles: `request-timeout-secs`, transient
+retries, tool-call limits, tool-result truncation, conversation history, and subagents all
+behave identically. Turns are non-streaming, as for `openai`.
+
+## Other Rig provider styles
+
+> **TODO: Incomplete** -- v0 wires `"openai"` and `"anthropic"`. The other styles Rig ships
+> adapters for (Cohere, Gemini, and friends) are not exposed yet, and neither are the
+> Anthropic-specific extras -- prompt caching, citations, and configurable API versions.
 
 ## In-process providers (`mistralrs`)
 

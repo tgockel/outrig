@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Anthropic's native Messages API is a provider style.** `style = "anthropic"` on a
+  `[providers.<name>]` block reaches Claude directly -- `POST {base-url}/v1/messages` with
+  `x-api-key` auth, tools advertised as `input_schema`, and `tool_use` / `tool_result` content
+  blocks -- rather than through an OpenAI-compatible bridge. It takes the same `base-url`,
+  `api-key`, and `request-timeout-secs` fields as `style = "openai"`, and the same timeout,
+  transient-retry, tool-call, history, and subagent behavior applies. `base-url` is the API
+  root (`https://api.anthropic.com`); a trailing `/v1`, `/messages`, or `/v1/messages` is
+  trimmed if present. Reaching Claude through a bridge is still an `openai` provider pointed
+  at that bridge, and both remain supported.
+
+  `LlmProvider::Anthropic` and its `LlmProvider::anthropic(..)` constructor are additive:
+  the enum and its variants have been `#[non_exhaustive]` since 0.2.0-rc.1, so a match with
+  a catch-all arm keeps compiling.
+
+- **`LlmProvider::style()`,** the `style` tag a provider serializes as. It lives next to the
+  serde attributes that define those tags, so a diagnostic or a label can name a style
+  without retyping the string somewhere it can drift out of agreement with what the config
+  file actually accepts.
+
+- **`[models.<name>].max-tokens`,** the output-token ceiling for turns run against that
+  model. `[agents.<name>].max-tokens` still wins where it is set; the model value covers
+  every agent that uses it and is `None` by default, so nothing changes for a config that
+  does not set it.
+
+  It exists because Anthropic requires `max_tokens` on every request and the ceiling is a
+  property of the model, not of the role using it. outrig sends the published ceiling for
+  the Claude identifiers it recognizes; any other identifier now has somewhere to declare
+  one other than every agent that names it. outrig does not fall back to a ceiling of its
+  own -- a wrong one truncates replies with nothing logged, which is much harder to
+  diagnose than the error naming the missing setting.
+
 - **Relative config paths resolve against the file that declared them.** A path in
   `~/.outrig/config.toml` (or a `--global-config` file) is now relative to that file's own
   directory rather than to the repo root. The practical effect is that a global
@@ -72,6 +103,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** the three provider-specific `ConfigValidationError` variants are now named
+  for what they check rather than for one style, and the two remote ones carry the style
+  they are reporting on: `OpenAiModelMissingIdentifier { model }` becomes
+  `RemoteModelMissingIdentifier { model, style }`, `OpenAiModelHasMistralrsField` becomes
+  `RemoteModelHasMistralrsField { model, style, field }`, and `MistralrsModelHasOpenAiField`
+  becomes `MistralrsModelHasRemoteField`. Both remote variants are now `#[non_exhaustive]`,
+  so a third remote style will not break them again.
+
+  The rendered messages for `openai` models are unchanged; an `anthropic` model now reports
+  `(provider style=anthropic)` instead of claiming to be an openai one.
 - **Breaking:** `SidecarServerSpec` is now a two-variant enum rather than a struct, since a
   sidecar server is either exec-stdio (a `command`) or entrypoint-stdio (`args`, no command).
   `SidecarServerSpec::new(command)` becomes `SidecarServerSpec::exec(command)`, mirroring

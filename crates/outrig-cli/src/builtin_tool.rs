@@ -492,9 +492,9 @@ pub struct SetResultTool {
     /// This subagent's handle, for the trace prefix, matching the shape the
     /// agent loop's own traces use.
     label: Arc<str>,
-    /// The agent whose `max-tokens` governs the ceiling being hit, and that
-    /// setting's current value. Carried only to name the fix in the one
-    /// operator-facing warning below.
+    /// The agent whose turns hit the ceiling, and the ceiling in effect for
+    /// it -- which may have come from the agent or from its model. Carried
+    /// only to name the fix in the one operator-facing warning below.
     agent_name: Arc<str>,
     max_tokens: Option<u32>,
 }
@@ -521,11 +521,15 @@ impl SetResultTool {
     /// human reading the log; without this the only trace of the cause is a
     /// wall of identical tool-call errors.
     fn warn_about_the_ceiling(&self) {
+        // The effective ceiling can come from the agent or from the model it
+        // uses, so name the knob without claiming which file set it.
         let remedy = match self.max_tokens {
             Some(limit) => format!(
-                "[agents.{}].max-tokens is {limit} -- raise it",
+                "the max-tokens in effect for agent {} is {limit} -- raise it",
                 self.agent_name
             ),
+            // Nothing set it anywhere, so there is no ambiguity about which
+            // table to name.
             None => format!(
                 "[agents.{}].max-tokens is unset, so the provider's default \
                  applies -- set it explicitly",

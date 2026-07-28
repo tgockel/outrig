@@ -38,7 +38,7 @@ pub const MAX_TOOL_CALLS: usize = DEFAULT_TOOL_CALL_MAX as usize;
 pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize =
     outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES as usize;
 
-/// Default per-request HTTP timeout for OpenAi-style providers when
+/// Default per-request HTTP timeout for remote providers when
 /// `request-timeout-secs` is unset (see `doc/reference/config.md`). Generous
 /// enough not to truncate long reasoning completions, and above typical proxy
 /// timeouts so a client-side timeout never races a still-in-flight server
@@ -141,10 +141,15 @@ pub enum LlmResolveError {
 
 /// Runtime-shaped provider view -- mirrors the config `LlmProvider` enum, but
 /// with the env-var-backed `ApiKeyRef` already resolved to a plain `String`
-/// for the OpenAi variant. Variants are kept in sync with `LlmProvider`'s.
+/// for the remote variants. Variants are kept in sync with `LlmProvider`'s.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedProvider {
     OpenAi {
+        base_url: String,
+        api_key: String,
+        request_timeout_secs: Option<u64>,
+    },
+    Anthropic {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
@@ -169,7 +174,7 @@ pub struct MistralrsWeights {
 /// Fully-resolved view of one agent: every knob the agent loop needs to
 /// build a Rig client and run a turn.
 ///
-/// For the `OpenAi` provider variant, the api-key is resolved from the env at
+/// For the remote provider variants, the api-key is resolved from the env at
 /// construction time. The struct lives in the agent loop, not in session
 /// metadata, so it should never get serialized.
 #[derive(Debug, Clone, PartialEq)]
@@ -179,7 +184,7 @@ pub struct ResolvedAgent {
     pub model_identifier: String,
     pub provider_name: String,
     pub provider: ResolvedProvider,
-    /// `Some` for mistralrs-style models, `None` for openai-style. Carries
+    /// `Some` for mistralrs-style models, `None` for remote ones. Carries
     /// the per-model weight spec that used to live on the provider config.
     pub model_weights: Option<MistralrsWeights>,
     pub preamble: String,
@@ -257,34 +262,54 @@ pub fn resolve_agent_with_overrides(
                 name: model.provider.clone(),
             })?;
 
+    // `--device` selects hardware for an in-process model, so it is a
+    // mistralrs-only knob. Checking it once here rather than per remote arm
+    // means a remote style added later cannot forget to reject it.
+    if device_override.is_some() && !matches!(provider, LlmProvider::Mistralrs) {
+        return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
+            model: model_name.to_string(),
+            provider: model.provider.clone(),
+        }
+        .into());
+    }
+    // Every remote style names its model the same way: the configured
+    // identifier, falling back to the model's own name.
+    let remote_identifier = || {
+        model
+            .identifier
+            .clone()
+            .unwrap_or_else(|| model_name.to_string())
+    };
+
     let (resolved_provider, model_weights, model_identifier) = match provider {
         LlmProvider::OpenAi {
             base_url,
             api_key,
             request_timeout_secs,
             ..
-        } => {
-            if device_override.is_some() {
-                return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
-                    model: model_name.to_string(),
-                    provider: model.provider.clone(),
-                }
-                .into());
-            }
-            let identifier = model
-                .identifier
-                .clone()
-                .unwrap_or_else(|| model_name.to_string());
-            (
-                ResolvedProvider::OpenAi {
-                    base_url: base_url.clone(),
-                    api_key: api_key.resolve()?,
-                    request_timeout_secs: *request_timeout_secs,
-                },
-                None,
-                identifier,
-            )
-        }
+        } => (
+            ResolvedProvider::OpenAi {
+                base_url: base_url.clone(),
+                api_key: api_key.resolve()?,
+                request_timeout_secs: *request_timeout_secs,
+            },
+            None,
+            remote_identifier(),
+        ),
+        LlmProvider::Anthropic {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            ..
+        } => (
+            ResolvedProvider::Anthropic {
+                base_url: base_url.clone(),
+                api_key: api_key.resolve()?,
+                request_timeout_secs: *request_timeout_secs,
+            },
+            None,
+            remote_identifier(),
+        ),
         LlmProvider::Mistralrs => {
             let device = match device_override {
                 Some(device) => validate_mistralrs_device(model_name, device)?,
@@ -316,9 +341,11 @@ pub fn resolve_agent_with_overrides(
                 .unwrap_or_else(|| model_name.to_string());
             (ResolvedProvider::Mistralrs, Some(weights), identifier)
         }
-        // `LlmProvider` is `#[non_exhaustive]`. There is no generic way to
-        // reach a provider style this build has no client for, so say so
-        // rather than guess at one.
+        // `LlmProvider` is `#[non_exhaustive]` and lives in another crate, so
+        // this match can never be exhaustive: a new style that forgets its arm
+        // above lands here instead of failing to compile. There is no generic
+        // way to reach a style this build has no client for, so say so rather
+        // than guess at one.
         _ => {
             return Err(LlmResolveError::UnsupportedProvider {
                 name: model.provider.clone(),
@@ -339,7 +366,11 @@ pub fn resolve_agent_with_overrides(
             .clone()
             .unwrap_or_else(|| DEFAULT_PREAMBLE.to_string()),
         temperature: agent.temperature,
-        max_tokens: agent.max_tokens,
+        // The agent's ceiling wins; the model's is the fallback. A model that
+        // carries one covers every agent pointed at it, which is what an
+        // Anthropic identifier rig does not recognize needs -- it has no
+        // provider-side default and errors without a ceiling from somewhere.
+        max_tokens: agent.max_tokens.or(model.max_tokens),
         tool_call_max: agent
             .tool_call_max
             .or(cfg.tool_call_max)
@@ -404,13 +435,20 @@ fn validate_mistralrs_device(
     }
 }
 
-/// Runtime-dispatched Rig agent. The OpenAi-backed and mistralrs-backed
-/// `CompletionModel` impls produce concretely different `Agent<M>` types
-/// (Rig's trait carries associated types, so a single concrete `RigAgent`
-/// can't carry both). Callers (the agent loop) match on the variant.
+/// Runtime-dispatched Rig agent. The OpenAi-backed, Anthropic-backed, and
+/// mistralrs-backed `CompletionModel` impls produce concretely different
+/// `Agent<M>` types (Rig's trait carries associated response and client types,
+/// so a single concrete `RigAgent` can't carry them all). Callers (the agent
+/// loop) match on the variant.
 pub enum RigAgent {
     OpenAi {
         agent: rig::agent::Agent<retry::RetryingModel<rig::providers::openai::CompletionModel>>,
+        tool_call_max: usize,
+    },
+    Anthropic {
+        agent: rig::agent::Agent<
+            retry::RetryingModel<rig::providers::anthropic::completion::CompletionModel>,
+        >,
         tool_call_max: usize,
     },
     #[cfg(feature = "local-llm")]
@@ -424,11 +462,23 @@ pub enum RigAgent {
 /// and the dynamic-tool list come from `resolved` plus the caller-supplied
 /// MCP-backed adapters. The `cache_root` argument is the directory into
 /// which the mistralrs HF-download path stages model files; it's ignored
-/// for OpenAi providers.
+/// for remote providers.
 ///
 /// The function is async because the mistralrs arm has to load (and on
-/// first use, download) a multi-gigabyte model. The OpenAi arm is sync-in-
-/// async, free.
+/// first use, download) a multi-gigabyte model. The remote arms do no I/O:
+/// they build an HTTP client and hand it to Rig.
+/// The HTTP client every remote provider gets: one per-request timeout, from
+/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+/// Shared so the default cannot drift between the styles.
+fn remote_http_client(request_timeout_secs: Option<u64>) -> Result<reqwest::Client> {
+    let timeout =
+        std::time::Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
+}
+
 pub async fn build_agent(
     resolved: &ResolvedAgent,
     tools: Vec<SessionTool>,
@@ -446,14 +496,7 @@ pub async fn build_agent(
             use rig::client::CompletionClient;
             use rig::providers::openai::CompletionsClient;
 
-            let timeout = std::time::Duration::from_secs(
-                request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
-            );
-            let http = reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
-
+            let http = remote_http_client(*request_timeout_secs)?;
             let client = CompletionsClient::builder()
                 .api_key(api_key.clone())
                 .base_url(base_url)
@@ -463,6 +506,39 @@ pub async fn build_agent(
             let model =
                 retry::RetryingModel::new(client.completion_model(&resolved.model_identifier));
             Ok(RigAgent::OpenAi {
+                agent: finish_agent(model, resolved, tools),
+                tool_call_max: resolved.tool_call_max,
+            })
+        }
+        ResolvedProvider::Anthropic {
+            base_url,
+            api_key,
+            request_timeout_secs,
+        } => {
+            use rig::client::CompletionClient;
+            use rig::providers::anthropic;
+
+            let http = remote_http_client(*request_timeout_secs)?;
+            // Rig's client owns the protocol: `x-api-key`, the
+            // `anthropic-version` header, `POST {base-url}/v1/messages`, and
+            // the native content blocks. It also normalizes a trailing `/v1`
+            // or `/messages` off the configured base URL.
+            let client = anthropic::Client::builder()
+                .api_key(api_key.clone())
+                .base_url(base_url)
+                .http_client(http)
+                .build()
+                .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
+            // `completion_model`, never `CompletionModel::with_model`: the two
+            // disagree about a model identifier rig does not recognize. This
+            // one leaves the default unset, so a turn with no `max-tokens`
+            // anywhere fails with rig's explicit "`max_tokens` must be set for
+            // Anthropic". `with_model` would instead cap every reply at 2048
+            // tokens silently, which looks like a bad model rather than a
+            // config gap. `tests/anthropic_mock.rs` pins the difference.
+            let model =
+                retry::RetryingModel::new(client.completion_model(&resolved.model_identifier));
+            Ok(RigAgent::Anthropic {
                 agent: finish_agent(model, resolved, tools),
                 tool_call_max: resolved.tool_call_max,
             })
@@ -539,6 +615,17 @@ impl RigAgent {
             )
             .await
             .map(|end| end.reply),
+            RigAgent::Anthropic {
+                agent,
+                tool_call_max,
+            } => run_turn_inner(
+                agent,
+                prompt,
+                history,
+                OutrigPromptHook::new(*tool_call_max),
+            )
+            .await
+            .map(|end| end.reply),
             #[cfg(feature = "local-llm")]
             RigAgent::Mistralrs {
                 agent,
@@ -580,6 +667,13 @@ impl RigAgent {
                 let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
                 run_turn_inner(agent, prompt, history, hook).await
             }
+            RigAgent::Anthropic {
+                agent,
+                tool_call_max,
+            } => {
+                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
+                run_turn_inner(agent, prompt, history, hook).await
+            }
             #[cfg(feature = "local-llm")]
             RigAgent::Mistralrs {
                 agent,
@@ -597,8 +691,9 @@ impl RigAgent {
 /// the tool list mid-session. The rig agent's toolset is frozen at build
 /// time, so [`RebuildingAgent::extend_tools`] only marks the agent stale;
 /// the next [`RebuildingAgent::run_turn`] rebuilds over the full list
-/// (cheap -- the OpenAI arm is an HTTP client; mistralrs model loads are
-/// registry-cached).
+/// (a remote arm builds a fresh HTTP client, so the first turn after a
+/// rebuild re-handshakes rather than reusing the pooled connection; mistralrs
+/// model loads are registry-cached).
 ///
 /// Interior mutability (`RefCell`/`Cell`) because the wrapper is shared by
 /// `&` between the REPL's prompt path and its `/sidecar` command; the

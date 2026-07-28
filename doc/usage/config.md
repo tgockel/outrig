@@ -50,6 +50,21 @@ $ outrig config init
 [outrig] wrote ~/.outrig/config.toml
 ```
 
+The prompts that follow depend on the style you pick.
+
+`anthropic` asks the same connection questions with its own defaults
+(`https://api.anthropic.com`, `ANTHROPIC_API_KEY`), and its models get one extra prompt:
+
+```sh
+? Model identifier [default: claude-sonnet-4-6]:
+? max-tokens for this model [default: 64000]:
+```
+
+Anthropic's API requires an output-token ceiling on every request, so the generated config
+carries one explicitly rather than leaving a model whose identifier outrig does not
+recognize to fail on its first turn. See
+[Concepts -> LLM Providers](../concepts/llm-providers.md#native-anthropic-style--anthropic).
+
 If you pick `mistralrs` as the provider style, the provider itself has no follow-up
 prompts -- it's just a tag. The weight-source prompts (`Use auto-download by model
 ID?`, `HuggingFace model-id` or `Local model-path`, `revision`, `context-length`) are
@@ -63,11 +78,10 @@ prompt is then re-displayed so you can answer:
 ```
 ? Pick a provider style [default: openai]: ?
 
-  A provider style is the wire format outrig uses to talk to your LLM endpoint.
-
-  openai     OpenAI Chat Completions wire format. Works with OpenAI itself, OpenRouter,
-             Together, vLLM, Ollama, and any compatible endpoint.
-  anthropic  (TODO: not yet wired in v0) Native Anthropic API.
+  Which wire format / runtime this provider speaks.
+  openai  OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM, Ollama.
+  anthropic  Anthropic's native Messages wire format. Talks to Claude directly.
+  mistralrs  In-process LLM via the mistralrs crate. Loads a local or HuggingFace model.
 
   See: https://tgockel.github.io/outrig/concepts/llm-providers.html
 

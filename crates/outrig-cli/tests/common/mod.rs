@@ -171,3 +171,200 @@ where
         }
     }
 }
+
+// ---- scripted HTTP mock ---------------------------------------------------
+//
+// A local stand-in for an LLM provider's HTTP endpoint: bind an ephemeral
+// loopback port, answer a scripted list of canned responses in order, and
+// record what each request actually carried. Enough HTTP/1.1 to satisfy
+// `reqwest`, and no more.
+//
+// Shared because asserting on the *request* is how a provider integration
+// proves it speaks the right wire format without a paid account. The e2e
+// smoke tests still carry their own older copies of this shape.
+
+/// One request as the mock saw it, before any client library is asked to
+/// interpret it.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct RecordedRequest {
+    pub method: String,
+    pub path: String,
+    /// Header names lowercased. HTTP header names are case-insensitive, so
+    /// pinning a particular casing would pin the wrong thing.
+    pub headers: Vec<(String, String)>,
+    pub body: serde_json::Value,
+}
+
+impl RecordedRequest {
+    /// The value of `name` (lowercase), or `None` if the request had no such
+    /// header -- which is itself worth asserting.
+    #[allow(dead_code)]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// One canned response. Status is separate from body so a script can put a
+/// transient failure ahead of a success.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct CannedResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+impl CannedResponse {
+    #[allow(dead_code)]
+    pub fn ok(body: serde_json::Value) -> Self {
+        Self { status: 200, body }
+    }
+}
+
+/// Start a mock HTTP server on an ephemeral loopback port. Returns its
+/// address and the channel on which every request arrives.
+///
+/// The server answers `script` in order, one response per connection. Past
+/// the end of the script it repeats the last entry rather than hanging, so an
+/// unexpected extra request fails a count assertion instead of a timeout.
+#[allow(dead_code)]
+pub async fn start_mock_http(
+    script: Vec<CannedResponse>,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock listener");
+    let addr = listener.local_addr().expect("mock local_addr");
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(serve_mock_http(listener, script, tx));
+    (addr, rx)
+}
+
+async fn serve_mock_http(
+    listener: tokio::net::TcpListener,
+    script: Vec<CannedResponse>,
+    tx: tokio::sync::mpsc::UnboundedSender<RecordedRequest>,
+) {
+    let mut served = 0usize;
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let Some(recorded) = read_http_request(&mut sock).await else {
+            continue;
+        };
+        if tx.send(recorded).is_err() {
+            return;
+        }
+        let Some(canned) = script.get(served).or(script.last()).cloned() else {
+            return;
+        };
+        served += 1;
+
+        let body = serde_json::to_string(&canned.body).expect("canned body serializes");
+        let response = format!(
+            "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            canned.status,
+            body.len(),
+            body,
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.flush().await;
+        let _ = sock.shutdown().await;
+    }
+}
+
+/// Read one HTTP/1.1 request: the request line, its headers, and a
+/// `Content-Length`-delimited JSON body.
+async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Option<RecordedRequest> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf = vec![0u8; 8192];
+    let mut total = Vec::new();
+
+    let header_end = loop {
+        let n = sock.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        total.extend_from_slice(&buf[..n]);
+        if let Some(idx) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+            break idx + 4;
+        }
+        if total.len() > 1 << 20 {
+            return None;
+        }
+    };
+
+    let head = String::from_utf8_lossy(&total[..header_end]).into_owned();
+    let mut lines = head.lines();
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let path = request_line.next()?.to_string();
+
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name == "content-length" {
+            content_length = value.parse().unwrap_or(0);
+        }
+        headers.push((name, value));
+    }
+
+    while total.len() < header_end + content_length {
+        let n = sock.read(&mut buf).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        total.extend_from_slice(&buf[..n]);
+    }
+    let body = serde_json::from_slice(&total[header_end..]).unwrap_or(serde_json::Value::Null);
+
+    Some(RecordedRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// Everything the mock has recorded so far. Call after the exchange under
+/// test finishes; the count is itself an assertion worth making.
+#[allow(dead_code)]
+pub fn drain_recorded(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) -> Vec<RecordedRequest> {
+    let mut out = Vec::new();
+    while let Ok(recorded) = rx.try_recv() {
+        out.push(recorded);
+    }
+    out
+}
+
+/// Set an environment variable for a test.
+///
+/// SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+/// races. Callers must use a variable name unique to the test, so no two
+/// tests in a binary race on one key.
+#[allow(dead_code)]
+pub fn set_test_env(var: &str, value: &str) {
+    unsafe { std::env::set_var(var, value) }
+}
+
+/// Clear a variable set by [`set_test_env`]. Same uniqueness requirement.
+#[allow(dead_code)]
+pub fn unset_test_env(var: &str) {
+    unsafe { std::env::remove_var(var) }
+}

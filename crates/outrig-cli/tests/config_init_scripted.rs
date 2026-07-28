@@ -64,6 +64,46 @@ async fn writes_minimal_openai_config() {
     );
 }
 
+/// The Anthropic style walks the same provider prompts as openai with its own
+/// defaults, and adds the `max-tokens` its API requires. Accepting every
+/// default has to yield a config that works on the first turn -- that is the
+/// whole reason the ceiling is prompted for here.
+#[tokio::test]
+async fn writes_anthropic_config_with_max_tokens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // style=anthropic, name=claude, then defaults: base-url, env-var, no
+    // extra provider, define a model, name=sonnet, provider (default), then
+    // identifier + max-tokens defaults, no extra models, use as default-model.
+    let script = b"anthropic\nclaude\n\n\n\n\nsonnet\n\n\n\n\n\n";
+    let (mut prompt, _stderr_r) = scripted_prompt(script).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    timeout(TEST_TIMEOUT, run_with(false, &target, &mut prompt, &mut hf))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    let text = std::fs::read_to_string(&target).unwrap();
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+
+    for expected in [
+        "[providers.claude]",
+        "style = \"anthropic\"",
+        // The bare endpoint: rig appends `/v1/messages` itself.
+        "base-url = \"https://api.anthropic.com\"",
+        "api-key = \"${ANTHROPIC_API_KEY}\"",
+        "[models.sonnet]",
+        "identifier = \"claude-sonnet-4-6\"",
+        "max-tokens = 64000",
+        "default-model = \"sonnet\"",
+    ] {
+        assert!(text.contains(expected), "missing {expected}:\n{text}");
+    }
+}
+
 #[tokio::test]
 async fn refuses_to_clobber_without_force() {
     let tmp = tempfile::tempdir().unwrap();

@@ -274,6 +274,68 @@ container environments.
    most of them. They are not required for the basic provider integration and should be planned
    separately when their user surface is clear.
 
+## Decisions
+
+1. **`max-tokens` became a `[models.<name>]` key rather than a config-init prompt with nowhere
+   to go.** The task asked `outrig config init` to prompt for `max-tokens` so a generated
+   Anthropic config survives its first turn. But `max-tokens` was an `[agents.<name>]` field and
+   `config init` writes no agents section at all -- only `default-model`, `[providers.*]`, and
+   `[models.*]`; agents come from `outrig init` per repo. Rather than grow the global file an
+   agents block (or prompt for a value with no home), `Model` gained `max_tokens`, resolved as
+   `agent.max_tokens.or(model.max_tokens)` in `resolve_agent_with_overrides`.
+
+   This is also the truer home: Anthropic's ceiling is a property of the model, so one
+   declaration covers every agent pointed at it, and 0101's per-subagent model selection gets
+   the right ceiling for free. The key is provider-neutral -- `finish_agent` applies it to every
+   style, and mistralrs consumes it as `sampling_params.max_len` -- so validation does not
+   restrict it to remote models.
+
+2. **The prompt default is `64000`, matching what rig sends for the Claude 4 family.** Accepting
+   the default therefore never *lowers* a ceiling outrig would have supplied on its own, while
+   an identifier rig does not recognize still gets a working config. A smaller "safe for every
+   model" default would silently truncate replies for the model `config init` itself suggests;
+   a too-large one fails loudly with an API 400, which is the better direction to be wrong in.
+
+3. **`completion_model`, never `CompletionModel::with_model`.** The two rig constructors disagree
+   about an unrecognized identifier: the former leaves `default_max_tokens` unset so the request
+   fails with rig's explicit error, the latter substitutes 2048 silently. `tests/anthropic_mock.rs`
+   pins both the rig-level contract (asserting on `default_max_tokens` directly, so an upgrade
+   that changes either value fails) and the OutRig-level behavior (an unrecognized identifier
+   with no ceiling sends *zero* requests -- `with_model` would send one carrying 2048).
+
+4. **The three provider-specific validation errors were renamed and now carry the style.**
+   `OpenAiModelMissingIdentifier`/`OpenAiModelHasMistralrsField` became
+   `RemoteModelMissingIdentifier { model, style }` / `RemoteModelHasMistralrsField { model, style,
+   field }`, and `MistralrsModelHasOpenAiField` became `MistralrsModelHasRemoteField`. Rendering
+   `{style}` unquoted keeps every openai message byte-identical, so only the variant names moved.
+   Both new remote variants are `#[non_exhaustive]` so a third remote style does not break them
+   again.
+
+5. **`LlmProvider::style()` exists so the style tag has one home.** The strings were being spelled
+   independently in the serde attributes, the validation dispatch, the banner label, and config
+   init's `STYLES` table. The accessor sits next to the serde attributes that define the tags;
+   validation sources its diagnostics from it. The banner label still matches on the CLI-side
+   `ResolvedProvider`, which is compiler-checked and exhaustive, so it was left alone.
+
+6. **The `--device` rejection moved above the provider match in the resolver.** It is really "this
+   is not mistralrs", not a rule each remote arm restates; hoisting it means a remote style added
+   later cannot forget it. That matters because `resolve_agent_with_overrides` matches a
+   `#[non_exhaustive]` enum across a crate boundary, so its `_ =>` arm makes the match permanently
+   inexhaustive -- a forgotten arm compiles and reports a config error as a missing client. Every
+   variant is spelled out above the catch-all for that reason, and the comment there says so.
+
+7. **The mock harness lives in `tests/common/`, not in the Anthropic test.** `start_mock_http` /
+   `RecordedRequest` / `CannedResponse` were the fourth hand-rolled HTTP/1.1 mock in this repo
+   (`run_smoke.rs` and `e2e_quickstart.rs` hold two more, both `e2e`-gated). The new one is a
+   superset -- scripted per-response status, and the request's method, path, and headers recorded
+   -- so it went to the shared module. The two e2e copies were left alone: rewriting them needs
+   podman to verify and is outside this task.
+
+8. **Not done here.** Remote streaming stays a provider-neutral follow-up; `anthropic-version` and
+   `anthropic-beta` remain rig's defaults; prompt caching, citations, and reasoning display have
+   no config surface yet. The `doc/concepts/llm-providers.md` TODO now names those rather than
+   claiming native Anthropic is unwired.
+
 ## Dependencies
 
 - **0094.** Adding an `Anthropic` variant to `LlmProvider` is a breaking change while the enum

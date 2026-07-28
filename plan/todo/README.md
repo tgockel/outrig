@@ -21,11 +21,12 @@ path has, which is what an external embedder was blocked on. The e2e suite compi
 CI gates it (0092), so `library_surface.rs` -- the facade test that work was measured against
 -- is runnable. 0093 settled the reach question: all six of the library's public modules are
 supported API, so 0094-0095 cover more than first scoped, and `outrig-cli`'s internals are no
-longer public at all.
+longer public at all. 0098 cashed the sweep in a second time, adding an `LlmProvider::Anthropic`
+variant and a `Model::max_tokens` field additively; the one break it did take -- renaming three
+provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
 | Task | Title                                                     | Dependencies     |
 |------|-----------------------------------------------------------|------------------|
-| 0098 | Native Anthropic Messages API provider                    | 0094             |
 | 0099 | Make subagent release atomic rather than partial          | 0092             |
 | 0100 | Cap how many subagents run at once                        | 0099             |
 | 0101 | Launch a subagent under a different model                 | 0093, 0098, 0100 |

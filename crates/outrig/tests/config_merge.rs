@@ -1029,6 +1029,47 @@ api-key  = "${OPENAI_API_KEY}"
         );
     }
 
+    /// Providers merge as whole enum values, not field by field: a repo entry
+    /// may change the style of a global name and takes none of its fields
+    /// along. Without that, a repo `anthropic` provider would inherit the
+    /// global `openai` base URL for keys it happens not to restate.
+    #[test]
+    fn repo_provider_replaces_a_global_of_a_different_style() {
+        let global = parse(
+            r#"
+[providers.claude]
+style                = "openai"
+base-url             = "https://openrouter.ai/api/v1"
+api-key              = "${OPENROUTER_API_KEY}"
+request-timeout-secs = 90
+"#,
+        );
+        let repo = parse(
+            r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${ANTHROPIC_API_KEY}"
+"#,
+        );
+        let merged = merge(global, repo);
+        let LlmProvider::Anthropic {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            ..
+        } = &merged.providers["claude"]
+        else {
+            panic!("repo entry should replace the global one wholesale");
+        };
+        assert_eq!(base_url, "https://api.anthropic.com");
+        assert_eq!(api_key.var_name(), "ANTHROPIC_API_KEY");
+        assert_eq!(
+            *request_timeout_secs, None,
+            "the global entry's timeout must not survive into the replacement"
+        );
+    }
+
     #[test]
     fn repo_keeps_global_entries_with_unique_names() {
         let global = parse(
@@ -1039,8 +1080,8 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 
 [providers.anthropic]
-style    = "openai"
-base-url = "https://api.anthropic.com/v1"
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 "#,
         );
