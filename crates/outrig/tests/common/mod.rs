@@ -44,7 +44,7 @@ pub fn pull_alpine() {
 /// Start an `alpine:latest` container over `host_ws`, optionally recording the
 /// podman transcript.
 pub async fn start_alpine(host_ws: &Path, transcript: Option<Transcript>) -> Container {
-    let tag = ImageTag(ALPINE.to_string());
+    let tag = ImageTag::new(ALPINE);
     let launch = ContainerLaunchSpec::workspace(host_ws, Path::new("/workspace"));
     match transcript {
         None => Container::start(&tag, launch).await.expect("start"),

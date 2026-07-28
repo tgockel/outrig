@@ -590,12 +590,12 @@ async fn resolve_sidecar_image_tag(
             let tag = image::compute_tag_for(image_ref, image_cfg, repo_root).await?;
             image::ensure_tagged_image_for(image_ref, image_cfg, repo_root, &tag, false, None)
                 .await?;
-            Ok(tag.0)
+            Ok(tag.into_string())
         }
         None => {
-            let tag = ImageTag(image_ref.to_string());
+            let tag = ImageTag::new(image_ref);
             image::ensure_local_image(&tag, None).await?;
-            Ok(tag.0)
+            Ok(tag.into_string())
         }
     }
 }
@@ -653,7 +653,7 @@ impl Outrig {
                 };
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
             }
-            LaunchSource::Image { tag } => ImageTag(tag.clone()),
+            LaunchSource::Image { tag } => ImageTag::new(tag.clone()),
         };
 
         let launch = ContainerLaunchSpec {
@@ -822,7 +822,7 @@ impl Outrig {
         let container_name =
             crate::container::sidecar_container_name(self.container.session_suffix(), &spec.name);
 
-        let image = ImageTag(spec.image.clone());
+        let image = ImageTag::new(spec.image.clone());
         let mut container = Container::start_named(&image, launch, container_name, None).await?;
 
         // Bootstrap only where identity matters; every SidecarSpec server is

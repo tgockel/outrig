@@ -48,9 +48,9 @@ async fn build_then_cache_hit_under_100ms() {
         .await
         .expect("first build must succeed");
     assert!(
-        first.tag.0.starts_with("outrig-cache:"),
+        first.tag.as_str().starts_with("outrig-cache:"),
         "tag should be outrig-cache:<key>, got {}",
-        first.tag.0
+        first.tag.as_str()
     );
     assert!(!first.cache_hit, "first call should miss the cache");
 

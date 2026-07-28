@@ -5,93 +5,6 @@
 # Regenerate after any intentional surface change and review the diff. The tool's
 # output format shifts between releases, so a diff with no source change means the
 # pinned version above moved.
-#[non_exhaustive] pub enum outrig::config::ApiKeyError
-#[non_exhaustive] pub enum outrig::config::CapabilityProfile
-#[non_exhaustive] pub enum outrig::config::ConfigValidationError
-#[non_exhaustive] pub outrig::config::ConfigValidationError::ContextMissing
-#[non_exhaustive] pub outrig::config::ConfigValidationError::DockerfileMissing
-#[non_exhaustive] pub enum outrig::config::EnvValue
-#[non_exhaustive] pub enum outrig::config::EnvValueError
-#[non_exhaustive] pub enum outrig::config::ImageSourceRef<'a>
-#[non_exhaustive] pub outrig::config::ImageSourceRef::Build
-#[non_exhaustive] pub outrig::config::ImageSourceRef::Image
-#[non_exhaustive] pub enum outrig::config::LlmProvider
-#[non_exhaustive] pub outrig::config::LlmProvider::OpenAi
-#[non_exhaustive] pub enum outrig::config::McpServerSpec
-#[non_exhaustive] pub outrig::config::McpServerSpec::Full
-#[non_exhaustive] pub enum outrig::config::MistralrsDeviceSpec
-#[non_exhaustive] pub enum outrig::config::MountAccess
-#[non_exhaustive] pub enum outrig::config::MountRuleViolation
-#[non_exhaustive] pub enum outrig::config::NetworkAction
-#[non_exhaustive] pub enum outrig::config::NetworkMode
-#[non_exhaustive] pub enum outrig::config::SidecarOnFailure
-#[non_exhaustive] pub enum outrig::config::SidecarStart
-#[non_exhaustive] pub enum outrig::config::SidecarView
-#[non_exhaustive] pub enum outrig::config::SidecarWorkspaceAccess
-#[non_exhaustive] pub struct outrig::config::Agent
-#[non_exhaustive] pub struct outrig::config::Config
-#[non_exhaustive] pub struct outrig::config::ContainerSecurity
-#[non_exhaustive] pub struct outrig::config::ImageConfig
-#[non_exhaustive] pub struct outrig::config::MistralrsDeviceParseError
-#[non_exhaustive] pub struct outrig::config::Model
-#[non_exhaustive] pub struct outrig::config::MountConfig
-#[non_exhaustive] pub struct outrig::config::NetworkConfig
-#[non_exhaustive] pub struct outrig::config::NetworkEntry
-#[non_exhaustive] pub struct outrig::config::NetworkPolicy
-#[non_exhaustive] pub struct outrig::config::SidecarConfig
-#[non_exhaustive] pub struct outrig::config::Workspace
-#[non_exhaustive] pub enum outrig::container::embedded::EmbeddedImageConfigError
-#[non_exhaustive] pub enum outrig::container::embedded::McpDeclarationSource
-#[non_exhaustive] pub enum outrig::container::embedded::StandaloneImageTomlError
-#[non_exhaustive] pub struct outrig::container::embedded::McpServerSpecWithSource
-#[non_exhaustive] pub struct outrig::container::embedded::StandaloneBuildConfig
-#[non_exhaustive] pub struct outrig::container::embedded::StandaloneImageLabels
-#[non_exhaustive] pub struct outrig::container::embedded::StandaloneImageMetadata
-#[non_exhaustive] pub struct outrig::container::embedded::StandaloneImageToml
-#[non_exhaustive] pub enum outrig::container::sidecar::Placement
-#[non_exhaustive] pub struct outrig::container::sidecar::PlacedServer
-#[non_exhaustive] pub struct outrig::container::sidecar::SessionMcpPlan
-#[non_exhaustive] pub struct outrig::container::sidecar::SidecarPlan
-#[non_exhaustive] pub struct outrig::container::ContainerCapabilities
-#[non_exhaustive] pub struct outrig::container::ContainerInspect
-#[non_exhaustive] pub struct outrig::container::ContainerLaunchSpec
-#[non_exhaustive] pub struct outrig::container::ContainerMount
-#[non_exhaustive] pub struct outrig::container::ContainerWorkspace
-#[non_exhaustive] pub struct outrig::container::PrimaryView
-#[non_exhaustive] pub enum outrig::error::OutrigError
-#[non_exhaustive] pub outrig::error::OutrigError::BootstrapExhausted
-#[non_exhaustive] pub outrig::error::OutrigError::BootstrapNamespace
-#[non_exhaustive] pub outrig::error::OutrigError::BuildArgResolveFailed
-#[non_exhaustive] pub outrig::error::OutrigError::ConfigDottedKey
-#[non_exhaustive] pub outrig::error::OutrigError::EmbeddedImageConfigParse
-#[non_exhaustive] pub outrig::error::OutrigError::McpArgsNotObject
-#[non_exhaustive] pub outrig::error::OutrigError::McpEnvResolveFailed
-#[non_exhaustive] pub outrig::error::OutrigError::McpToolsListFailed
-#[non_exhaustive] pub outrig::error::OutrigError::Path
-#[non_exhaustive] pub outrig::error::OutrigError::Process
-#[non_exhaustive] pub outrig::error::OutrigError::Spawn
-#[non_exhaustive] pub struct outrig::error::McpStartupFailure
-#[non_exhaustive] pub struct outrig::image::ImageBuildOutcome
-#[non_exhaustive] pub enum outrig::CapabilityProfile
-#[non_exhaustive] pub enum outrig::EmbeddedMcpPolicy
-#[non_exhaustive] pub enum outrig::MountAccess
-#[non_exhaustive] pub enum outrig::NetworkAction
-#[non_exhaustive] pub enum outrig::NetworkMode
-#[non_exhaustive] pub enum outrig::SidecarWorkspaceAccess
-#[non_exhaustive] pub struct outrig::CapabilitySpec
-#[non_exhaustive] pub struct outrig::LaunchSpec
-#[non_exhaustive] pub struct outrig::McpTool
-#[non_exhaustive] pub struct outrig::McpToolResult
-#[non_exhaustive] pub struct outrig::MountSpec
-#[non_exhaustive] pub struct outrig::NetworkEntry
-#[non_exhaustive] pub struct outrig::NetworkPolicy
-#[non_exhaustive] pub struct outrig::NetworkSpec
-#[non_exhaustive] pub struct outrig::SecuritySpec
-#[non_exhaustive] pub struct outrig::SidecarServerSpec
-#[non_exhaustive] pub struct outrig::SidecarSpec
-#[non_exhaustive] pub struct outrig::ToolHandle
-#[non_exhaustive] pub struct outrig::WorkspaceSpec
-
 pub mod outrig
 pub mod outrig::config
 #[non_exhaustive] pub enum outrig::config::ApiKeyError
@@ -663,7 +576,7 @@ impl outrig::container::Container
 pub fn outrig::container::Container::attach(impl core::convert::Into<alloc::string::String>, outrig::image::ImageTag, core::option::Option<(&std::path::Path, &std::path::Path)>, core::option::Option<outrig::Transcript>) -> Self
 pub async fn outrig::container::Container::bootstrap_user(&mut self) -> outrig::error::Result<()>
 pub fn outrig::container::Container::container_workspace(&self) -> &std::path::Path
-pub async fn outrig::container::Container::create_initialized(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>, bool, &[alloc::string::String]) -> outrig::error::Result<Self>
+pub async fn outrig::container::Container::create_initialized(outrig::container::ContainerCreateOptions) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::exec_stdio(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<tokio::process::Child>
 pub fn outrig::container::Container::gid(&self) -> u32
 pub fn outrig::container::Container::group_name(&self) -> core::option::Option<&str>
@@ -692,6 +605,20 @@ impl core::convert::From<&outrig::CapabilitySpec> for outrig::container::Contain
 pub fn outrig::container::ContainerCapabilities::from(&outrig::CapabilitySpec) -> Self
 impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::container::ContainerCapabilities
 pub fn outrig::container::ContainerCapabilities::from(&outrig::config::ContainerSecurity) -> Self
+#[non_exhaustive] pub struct outrig::container::ContainerCreateOptions
+pub outrig::container::ContainerCreateOptions::args: alloc::vec::Vec<alloc::string::String>
+pub outrig::container::ContainerCreateOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::container::ContainerCreateOptions::image: outrig::image::ImageTag
+pub outrig::container::ContainerCreateOptions::intercept_dns: bool
+pub outrig::container::ContainerCreateOptions::launch: outrig::container::ContainerLaunchSpec
+pub outrig::container::ContainerCreateOptions::name: alloc::string::String
+pub outrig::container::ContainerCreateOptions::transcript: core::option::Option<outrig::Transcript>
+impl outrig::container::ContainerCreateOptions
+pub fn outrig::container::ContainerCreateOptions::new(outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::container::ContainerCreateOptions::with_args(self, alloc::vec::Vec<alloc::string::String>) -> Self
+pub fn outrig::container::ContainerCreateOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ContainerCreateOptions::with_intercept_dns(self, bool) -> Self
+pub fn outrig::container::ContainerCreateOptions::with_transcript(self, core::option::Option<outrig::Transcript>) -> Self
 #[non_exhaustive] pub struct outrig::container::ContainerInspect
 pub outrig::container::ContainerInspect::image_tag: outrig::image::ImageTag
 pub outrig::container::ContainerInspect::running: bool
@@ -805,7 +732,13 @@ pub mod outrig::image
 #[non_exhaustive] pub struct outrig::image::ImageBuildOutcome
 pub outrig::image::ImageBuildOutcome::cache_hit: bool
 pub outrig::image::ImageBuildOutcome::tag: outrig::image::ImageTag
-pub struct outrig::image::ImageTag(pub alloc::string::String)
+pub struct outrig::image::ImageTag(_)
+impl outrig::image::ImageTag
+pub fn outrig::image::ImageTag::as_str(&self) -> &str
+pub fn outrig::image::ImageTag::into_string(self) -> alloc::string::String
+pub fn outrig::image::ImageTag::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::convert::From<alloc::string::String> for outrig::image::ImageTag
+pub fn outrig::image::ImageTag::from(alloc::string::String) -> Self
 impl core::fmt::Display for outrig::image::ImageTag
 pub fn outrig::image::ImageTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub async fn outrig::image::build_image_for(&str, &outrig::config::ImageConfig, &std::path::Path, &outrig::image::ImageTag, bool) -> outrig::error::Result<()>
@@ -835,7 +768,7 @@ pub fn outrig::mcp_proxy::ProxyServer<C>::get_info(&self) -> rmcp::model::Server
 pub async fn outrig::mcp_proxy::ProxyServer<C>::list_tools(&self, core::option::Option<rmcp::model::PaginatedRequestParams>, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData>
 impl<C> core::clone::Clone for outrig::mcp_proxy::ProxyServer<C>
 pub fn outrig::mcp_proxy::ProxyServer<C>::clone(&self) -> Self
-pub trait outrig::mcp_proxy::BackingClient: core::marker::Send + core::marker::Sync + 'static
+pub trait outrig::mcp_proxy::BackingClient: outrig::mcp_proxy::sealed::Sealed + core::marker::Send + core::marker::Sync + 'static
 pub fn outrig::mcp_proxy::BackingClient::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
 pub fn outrig::mcp_proxy::BackingClient::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
 pub fn outrig::mcp_proxy::BackingClient::name(&self) -> &str

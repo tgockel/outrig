@@ -260,7 +260,7 @@ async fn malformed_mcp_label_on_raw_image_fails_runtime_read() {
     // build stamps nothing beyond the Dockerfile's own labels, and the fixed
     // tag is rebuilt on every run, so nothing accumulates in local storage.
     let ctx = malformed_label_context();
-    let tag = ImageTag("outrig-raw-malformed:e2e".to_string());
+    let tag = ImageTag::new("outrig-raw-malformed:e2e");
     image::build_standalone(
         ctx.path(),
         Path::new("Dockerfile"),
@@ -274,7 +274,7 @@ async fn malformed_mcp_label_on_raw_image_fails_runtime_read() {
 
     // ensure_image on an image-ref config only probes/pulls -- it must not
     // re-validate labels, so the malformed image passes here.
-    let cfg = ImageConfig::from_image_name(tag.0.clone());
+    let cfg = ImageConfig::from_image_name(tag.into_string());
     let image = image::ensure_image(&cfg, ctx.path(), false)
         .await
         .expect("raw image ref should pass ensure_image without label validation")

@@ -58,5 +58,8 @@ async fn generated_alpine_image_builds() {
     let outcome = image::ensure_image(image, tmp.path(), false)
         .await
         .expect("ensure_image must succeed against generated config");
-    assert!(!outcome.tag.0.is_empty(), "image tag must not be empty");
+    assert!(
+        !outcome.tag.as_str().is_empty(),
+        "image tag must not be empty"
+    );
 }

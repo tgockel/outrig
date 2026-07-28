@@ -29,14 +29,23 @@ use crate::error::{OutrigError, Result};
 use crate::mcp::{self, McpClient, McpTool, McpToolResult};
 use crate::tool_name;
 
+/// Private supertrait bound: nothing outside this crate can name
+/// [`sealed::Sealed`], so nothing outside can implement [`BackingClient`].
+mod sealed {
+    pub trait Sealed {}
+}
+
 /// Abstraction over the MCP client surface the proxy actually depends on:
 /// a name, a `tools/list`, and a `tools/call`. `McpClient` is the production
-/// impl; the integration test in `tests/mcp_proxy_dispatch.rs`
-/// supplies an in-process fake.
+/// impl; the crate's own tests supply an in-process fake.
+///
+/// Sealed: implementable only inside this crate. Callers *use*
+/// [`ProxyServer`] rather than backing it, and sealing means a fourth method
+/// here is an addition rather than a break.
 ///
 /// The blanket `impl<T> BackingClient for Arc<T>` lets the proxy work with
 /// `Vec<Arc<McpClient>>` directly -- no manual upcast at the call site.
-pub trait BackingClient: Send + Sync + 'static {
+pub trait BackingClient: sealed::Sealed + Send + Sync + 'static {
     /// The local config name of this server (the prefix half of
     /// `<server>__<tool>`).
     fn name(&self) -> &str;
@@ -51,6 +60,8 @@ pub trait BackingClient: Send + Sync + 'static {
         args: Value,
     ) -> impl Future<Output = Result<McpToolResult>> + Send;
 }
+
+impl sealed::Sealed for McpClient {}
 
 impl BackingClient for McpClient {
     fn name(&self) -> &str {
@@ -69,6 +80,8 @@ impl BackingClient for McpClient {
         McpClient::call_tool(self, name, args)
     }
 }
+
+impl<T> sealed::Sealed for Arc<T> where T: BackingClient + ?Sized {}
 
 impl<T> BackingClient for Arc<T>
 where
@@ -238,10 +251,11 @@ impl<C: BackingClient> ProxyServer<C> {
     }
 
     /// Build a `tools/list` response: every backing server's tools, in
-    /// registration order, namespaced through [`crate::sanitize_tool_name`]. Exposed
+    /// registration order, namespaced through [`crate::sanitize_tool_name`]. Public
     /// (rather than living inline in [`ServerHandler::list_tools`]) so the
-    /// dispatch can be exercised in `tests/mcp_proxy_dispatch.rs` without
-    /// fabricating an rmcp [`RequestContext`].
+    /// listing can be read without fabricating an rmcp [`RequestContext`] --
+    /// what a caller driving the proxy outside an rmcp server needs, and what
+    /// the crate's own dispatch tests use.
     pub fn list_tools_inner(&self) -> ListToolsResult {
         let tools = self
             .inner
@@ -265,8 +279,9 @@ impl<C: BackingClient> ProxyServer<C> {
     /// Dispatch a `tools/call` to the appropriate backing client. Returns a
     /// [`CallToolResult`] in every case -- unknown tool names and
     /// backing-client errors surface as `is_error: Some(true)` results, not
-    /// rmcp protocol errors. Exposed for the same testability reason as
-    /// [`Self::list_tools_inner`].
+    /// rmcp protocol errors. Public for the same reason as
+    /// [`Self::list_tools_inner`]: it is the [`RequestContext`]-free half of
+    /// the dispatch path.
     pub async fn dispatch_call(&self, request: CallToolRequestParams) -> CallToolResult {
         let public_name = request.name.as_ref();
         let Some(&idx) = self.inner.by_public_name.get(public_name) else {
@@ -319,3 +334,7 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
         Ok(self.dispatch_call(request).await)
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_proxy_dispatch_tests.rs"]
+mod mcp_proxy_dispatch_tests;

@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use super::{CacheKey, ImageConfig, McpServerSpec, UNNAMED_IMAGE, compute_tag, compute_tag_for};
+use super::{
+    CacheKey, ImageConfig, ImageTag, McpServerSpec, UNNAMED_IMAGE, compute_tag, compute_tag_for,
+};
 
 fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -211,7 +213,10 @@ async fn named_build_tag_uses_image_config_name_as_repo() {
         .await
         .expect("compute_tag_for");
 
-    let (repo, hash) = tag.0.split_once(':').expect("tag has repo:hash form");
+    let (repo, hash) = tag
+        .as_str()
+        .split_once(':')
+        .expect("tag has repo:hash form");
     assert_eq!(repo, "outrig-standard");
     assert_eq!(
         hash.len(),
@@ -259,9 +264,9 @@ async fn unnamed_build_tag_falls_back_to_outrig_cache() {
 
     assert_eq!(named, unnamed);
     assert!(
-        named.0.starts_with("outrig-cache:"),
+        named.as_str().starts_with("outrig-cache:"),
         "nameless path keeps the outrig-cache repository, got {}",
-        named.0
+        named.as_str()
     );
 }
 
@@ -276,4 +281,15 @@ async fn key_length_is_16_hex_chars() {
             .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
         "key must be lowercase hex, got {k:?}"
     );
+}
+
+#[test]
+fn image_tag_reads_back_what_it_was_built_from() {
+    let from_str = ImageTag::new("docker.io/library/alpine:3.20");
+    let from_string = ImageTag::from("docker.io/library/alpine:3.20".to_string());
+
+    assert_eq!(from_str, from_string);
+    assert_eq!(from_str.as_str(), "docker.io/library/alpine:3.20");
+    assert_eq!(from_str.to_string(), "docker.io/library/alpine:3.20");
+    assert_eq!(from_string.into_string(), "docker.io/library/alpine:3.20");
 }

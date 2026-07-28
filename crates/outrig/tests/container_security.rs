@@ -47,7 +47,7 @@ async fn pull_alpine() {
 }
 
 async fn start_alpine(launch: ContainerLaunchSpec) -> Container {
-    Container::start(&ImageTag(ALPINE.to_string()), launch)
+    Container::start(&ImageTag::new(ALPINE), launch)
         .await
         .expect("start")
 }

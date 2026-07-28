@@ -266,6 +266,74 @@ impl ContainerLaunchSpec {
     }
 }
 
+/// Complete inputs for a `podman create` + `podman init`, the pair
+/// [`Container::create_initialized`] runs. One struct rather than a parameter
+/// list because this call has already grown a parameter once, and every knob
+/// podman's create step accepts but its run step does not lands here.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ContainerCreateOptions {
+    /// Image to create the container from.
+    pub image: ImageTag,
+    /// Mounts, capabilities, labels -- everything a `podman run` would take.
+    pub launch: ContainerLaunchSpec,
+    /// Container name, also the handle's identity for tracking and teardown.
+    pub name: String,
+    /// Where podman's own stdout/stderr is recorded, if anywhere.
+    pub transcript: Option<Transcript>,
+    /// Becomes `--env` flags on the create. There is no later exec to carry
+    /// them, so an entrypoint-stdio server's environment has to be baked in
+    /// here.
+    pub env: BTreeMap<String, String>,
+    /// Bakes the interceptor's loopback resolver in via `--dns`. The
+    /// exec-based resolv.conf install is impossible before start.
+    pub intercept_dns: bool,
+    /// Trailing argv the image's `ENTRYPOINT` receives.
+    pub args: Vec<String>,
+}
+
+impl ContainerCreateOptions {
+    /// Create `image` as a container named `name`, applying `launch`. The
+    /// remaining knobs default to empty / off; `with_*` sets them.
+    pub fn new(image: ImageTag, launch: ContainerLaunchSpec, name: impl Into<String>) -> Self {
+        Self {
+            image,
+            launch,
+            name: name.into(),
+            transcript: None,
+            env: BTreeMap::new(),
+            intercept_dns: false,
+            args: Vec::new(),
+        }
+    }
+
+    /// Record podman's output to `transcript`. Takes an `Option` rather than a
+    /// bare `Transcript` because every producer has one -- as
+    /// [`Container::start_named`]'s own parameter does.
+    pub fn with_transcript(mut self, transcript: Option<Transcript>) -> Self {
+        self.transcript = transcript;
+        self
+    }
+
+    /// Set the environment baked into the create.
+    pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Point the container's resolver at the interceptor.
+    pub fn with_intercept_dns(mut self, intercept_dns: bool) -> Self {
+        self.intercept_dns = intercept_dns;
+        self
+    }
+
+    /// Set the trailing argv for the image's `ENTRYPOINT`.
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args;
+        self
+    }
+}
+
 /// Primary workspace mount. When present, this also sets `-w`. The session's
 /// own container mounts it read-write; sidecars may take a read-only view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,55 +454,37 @@ impl Container {
     /// sidecars so the network interceptor can attach to the initialized
     /// PID before the server can emit a packet.
     ///
-    /// `env` becomes `--env` flags on the create (there is no later exec to
-    /// carry them), and `args` the trailing argv the ENTRYPOINT receives.
-    /// `intercept_dns` bakes the interceptor's loopback resolver into the
-    /// container via `--dns` -- the exec-based resolv.conf install is
-    /// impossible before start. A `podman init` that fails to materialize a
-    /// PID surfaces later through the interceptor's pid probe.
-    pub async fn create_initialized(
-        image: &ImageTag,
-        launch: ContainerLaunchSpec,
-        name: String,
-        transcript: Option<Transcript>,
-        env: &BTreeMap<String, String>,
-        intercept_dns: bool,
-        args: &[String],
-    ) -> Result<Self> {
+    /// A `podman init` that fails to materialize a PID surfaces later through
+    /// the interceptor's pid probe. See [`ContainerCreateOptions`] for what
+    /// each input does.
+    pub async fn create_initialized(options: ContainerCreateOptions) -> Result<Self> {
         // As in start_named: register before spawning so a SIGKILL between
         // the spawn call and its return can still be cleaned up.
-        track(&name);
+        track(&options.name);
 
-        let create = build_podman_create_cmd(
-            image,
-            &name,
-            &launch,
-            selinux_enforcing().await,
-            env,
-            intercept_dns,
-            args,
-        );
-        let init = Cmd::new("podman").arg("init").arg(&name);
+        let create = build_podman_create_cmd(&options, selinux_enforcing().await);
+        let init = Cmd::new("podman").arg("init").arg(&options.name);
         for cmd in [create, init] {
-            if let Err(e) = process::run_capture_logged(cmd, "podman", transcript.as_ref()).await {
+            let logged = process::run_capture_logged(cmd, "podman", options.transcript.as_ref());
+            if let Err(e) = logged.await {
                 // An init failure leaves the created container behind.
-                spawn_detached_rm(&name);
-                untrack(&name);
+                spawn_detached_rm(&options.name);
+                untrack(&options.name);
                 return Err(e);
             }
         }
 
-        let workspace = match &launch.workspace {
+        let workspace = match &options.launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
             None => (PathBuf::new(), PathBuf::new()),
         };
         Ok(Self::handle(
-            name,
-            image.clone(),
+            options.name,
+            options.image,
             workspace,
-            transcript,
+            options.transcript,
             ContainerOwnership::Owned,
-            intercept_dns,
+            options.intercept_dns,
         ))
     }
 
@@ -1052,7 +1102,7 @@ fn build_podman_run_cmd(
         .args(["run", "-d", "--rm", "--name"])
         .arg(name);
     append_launch_flags(cmd, launch, selinux)
-        .arg(image.0.as_str())
+        .arg(image.as_str())
         .args(["sleep", "infinity"])
 }
 
@@ -1067,30 +1117,24 @@ fn build_podman_run_cmd(
 /// exec-form ENTRYPOINT and *replaces* CMD, so it is for images whose server
 /// is an ENTRYPOINT. Empty `args` emits nothing, leaving the argument vector
 /// byte-identical to the pre-`args` one.
-fn build_podman_create_cmd(
-    image: &ImageTag,
-    name: &str,
-    launch: &ContainerLaunchSpec,
-    selinux: bool,
-    env: &BTreeMap<String, String>,
-    intercept_dns: bool,
-    args: &[String],
-) -> Cmd {
-    let mut cmd = Cmd::new("podman").args(["create", "--name"]).arg(name);
-    cmd = append_launch_flags(cmd, launch, selinux);
+fn build_podman_create_cmd(options: &ContainerCreateOptions, selinux: bool) -> Cmd {
+    let mut cmd = Cmd::new("podman")
+        .args(["create", "--name"])
+        .arg(&options.name);
+    cmd = append_launch_flags(cmd, &options.launch, selinux);
 
-    if intercept_dns {
+    if options.intercept_dns {
         cmd = cmd
             .args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
             .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION]);
     }
-    for (k, v) in env {
+    for (k, v) in &options.env {
         cmd = cmd.arg("--env").arg(format!("{k}={v}"));
     }
 
     cmd.args(["--interactive", "--rm"])
-        .arg(image.0.as_str())
-        .args(args)
+        .arg(options.image.as_str())
+        .args(&options.args)
 }
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
@@ -1282,7 +1326,7 @@ fn parse_container_inspect(name: &str, stdout: &[u8]) -> Result<ContainerInspect
         })?;
 
     Ok(ContainerInspect {
-        image_tag: ImageTag(image.to_string()),
+        image_tag: ImageTag::new(image),
         running,
     })
 }
@@ -1344,7 +1388,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             false,
@@ -1398,7 +1442,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-20260711T000000-abcd-tools",
             &launch,
             false,
@@ -1446,7 +1490,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             true,
@@ -1498,13 +1542,14 @@ mod tests {
         ]);
 
         let args = argv(build_podman_create_cmd(
-            &ImageTag("ghcr.io/example/mcp-fetch:2".to_string()),
-            "outrig-20260712T000000-abcd-fetch",
-            &launch,
+            &ContainerCreateOptions::new(
+                ImageTag::new("ghcr.io/example/mcp-fetch:2"),
+                launch,
+                "outrig-20260712T000000-abcd-fetch",
+            )
+            .with_env(env)
+            .with_intercept_dns(true),
             false,
-            &env,
-            true,
-            &[],
         ));
 
         assert_eq!(
@@ -1540,13 +1585,12 @@ mod tests {
     #[test]
     fn podman_create_args_omit_dns_and_env_when_unused() {
         let args = argv(build_podman_create_cmd(
-            &ImageTag("local:test".to_string()),
-            "outrig-test-fetch",
-            &ContainerLaunchSpec::default(),
+            &ContainerCreateOptions::new(
+                ImageTag::new("local:test"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-fetch",
+            ),
             false,
-            &BTreeMap::new(),
-            false,
-            &[],
         ));
 
         assert_eq!(
@@ -1571,13 +1615,14 @@ mod tests {
     #[test]
     fn podman_create_args_append_entrypoint_argv_after_the_image() {
         let args = argv(build_podman_create_cmd(
-            &ImageTag("docker.io/mcp/filesystem:latest".to_string()),
-            "outrig-test-fs",
-            &ContainerLaunchSpec::default(),
+            &ContainerCreateOptions::new(
+                ImageTag::new("docker.io/mcp/filesystem:latest"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-fs",
+            )
+            .with_env(BTreeMap::from([("MARKER".to_string(), "1".to_string())]))
+            .with_args(vec!["/workspace".to_string(), "--read-only".to_string()]),
             false,
-            &BTreeMap::from([("MARKER".to_string(), "1".to_string())]),
-            false,
-            &["/workspace".to_string(), "--read-only".to_string()],
         ));
 
         assert_eq!(
@@ -1633,13 +1678,13 @@ mod tests {
         .collect();
         // selinux=true to prove the nsfs/helper binds stay a plain `:ro`.
         let args = argv(build_podman_create_cmd(
-            &ImageTag("docker.io/mcp/filesystem:latest".to_string()),
-            "outrig-abc-tools",
-            &launch,
+            &ContainerCreateOptions::new(
+                ImageTag::new("docker.io/mcp/filesystem:latest"),
+                launch,
+                "outrig-abc-tools",
+            )
+            .with_args(launcher_argv),
             true,
-            &BTreeMap::new(),
-            false,
-            &launcher_argv,
         ));
 
         assert_eq!(
@@ -1682,13 +1727,12 @@ mod tests {
     #[test]
     fn podman_create_args_without_view_are_byte_identical() {
         let args = argv(build_podman_create_cmd(
-            &ImageTag("local:test".to_string()),
-            "outrig-test-noview",
-            &ContainerLaunchSpec::default(),
+            &ContainerCreateOptions::new(
+                ImageTag::new("local:test"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-noview",
+            ),
             false,
-            &BTreeMap::new(),
-            false,
-            &[],
         ));
         assert_eq!(
             args,
@@ -1722,7 +1766,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             false,
@@ -1763,7 +1807,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             false,
@@ -1799,7 +1843,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             false,
@@ -1837,7 +1881,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             false,
@@ -1875,7 +1919,7 @@ mod tests {
         };
 
         let args = argv(build_podman_run_cmd(
-            &ImageTag("local:test".to_string()),
+            &ImageTag::new("local:test"),
             "outrig-test",
             &launch,
             false,
@@ -1913,13 +1957,8 @@ mod tests {
         };
 
         let args = argv(build_podman_create_cmd(
-            &ImageTag("local:test".to_string()),
-            "outrig-test-fetch",
-            &launch,
+            &ContainerCreateOptions::new(ImageTag::new("local:test"), launch, "outrig-test-fetch"),
             false,
-            &BTreeMap::new(),
-            false,
-            &[],
         ));
 
         assert_eq!(
@@ -1936,6 +1975,43 @@ mod tests {
                 "--rm",
                 "local:test",
             ]
+        );
+    }
+
+    /// Each `with_*` is the only path to its field, and a field that never
+    /// reaches the command line is a silently-dropped knob -- the failure mode
+    /// an options struct makes easy. Asserts against the same builder
+    /// `create_initialized` calls.
+    #[test]
+    fn every_create_option_setter_reaches_the_podman_command() {
+        let options = ContainerCreateOptions::new(
+            ImageTag::new("docker.io/mcp/filesystem:latest"),
+            ContainerLaunchSpec::default(),
+            "outrig-test-fs",
+        )
+        .with_env(BTreeMap::from([(
+            "TOKEN".to_string(),
+            "secret".to_string(),
+        )]))
+        .with_intercept_dns(true)
+        .with_args(vec!["/workspace".to_string()]);
+
+        let args = argv(build_podman_create_cmd(&options, false));
+
+        assert!(args.contains(&"outrig-test-fs".to_string()), "{args:?}");
+        assert!(
+            args.contains(&"docker.io/mcp/filesystem:latest".to_string()),
+            "{args:?}"
+        );
+        assert!(args.contains(&"TOKEN=secret".to_string()), "{args:?}");
+        assert!(
+            args.contains(&crate::network::INTERCEPT_DNS_NAMESERVER.to_string()),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.last().expect("argv is non-empty"),
+            "/workspace",
+            "entrypoint args come last: {args:?}"
         );
     }
 }

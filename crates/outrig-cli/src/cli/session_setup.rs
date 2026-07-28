@@ -42,7 +42,7 @@ use outrig::config::{
     SidecarOnFailure, SidecarStart, SidecarView,
 };
 use outrig::container::{
-    Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+    Container, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     LABEL_SESSION, LABEL_SIDECAR, PRIMARY_VIEW_GRAFT, PRIMARY_VIEW_NS_FILE, PRIMARY_VIEW_NS_MOUNT,
     PrimaryView, embedded, enter,
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
@@ -411,7 +411,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     } else {
         let span = ProgressSpan::start("computing image tag");
         let image_tag = if raw_local_image {
-            ImageTag(image_cfg_name.clone())
+            ImageTag::new(image_cfg_name.clone())
         } else {
             image::compute_tag_for(&image_cfg_name, &image_cfg, &repo_root).await?
         };
@@ -986,7 +986,7 @@ async fn ensure_sidecar_image(
 ) -> Result<ImageTag> {
     let (image_cfg, raw_local) = resolve_image_config(cfg, image_name, true)?;
     if raw_local {
-        let tag = ImageTag(image_name.to_string());
+        let tag = ImageTag::new(image_name);
         image::ensure_local_image(&tag, transcript).await?;
         Ok(tag)
     } else {
@@ -1115,16 +1115,12 @@ async fn create_one_entrypoint_sidecar(
 
     let container_name = sidecar_container_name(&ctx, sc);
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
-    let container = Container::create_initialized(
-        tag,
-        launch,
-        container_name,
-        args.transcript.cloned(),
-        &env,
-        intercept_dns,
-        &create_args,
-    )
-    .await?;
+    let options = ContainerCreateOptions::new(tag.clone(), launch, container_name)
+        .with_transcript(args.transcript.cloned())
+        .with_env(env)
+        .with_intercept_dns(intercept_dns)
+        .with_args(create_args);
+    let container = Container::create_initialized(options).await?;
     span.done(format!("sidecar {} created: {}", sc.name, container.name()));
     Ok(container)
 }

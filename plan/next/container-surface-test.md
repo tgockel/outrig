@@ -10,9 +10,10 @@ the spec types, and one label constant.
 
 So the half of the surface that 0093 promoted to a contract has no test defining that contract.
 The existing runtime tests (`container_lifecycle.rs`, `container_security.rs`,
-`network_interceptor.rs`, `mcp_proxy_dispatch.rs`) do exercise these types, but they are written
-as internal tests of behavior -- they would happily keep passing through a signature change that
-broke every external caller.
+`network_interceptor.rs`) do exercise these types, but they are written as internal tests of
+behavior -- they would happily keep passing through a signature change that broke every external
+caller. The proxy's dispatch tests are no longer even out-of-crate: 0095 sealed `BackingClient`
+and moved them to `crates/outrig/src/mcp_proxy_dispatch_tests.rs`.
 
 ## Goal
 
@@ -24,15 +25,21 @@ breaking change to them fails a test rather than a downstream build.
 - Model it on the real consumer's shape: acquire an image (`image::compute_tag` /
   `probe_cached` / `ensure_image`), start a `Container` from a `ContainerLaunchSpec`, exec a
   server over it, aggregate through `mcp_proxy::ProxyServer`, and tear down.
-- Construct the spec types by struct literal, as an external caller must, so a new required field
-  breaks the test.
-- Build `ImageTag` through its public tuple field -- that is how `cococlaw` builds it, and 0095
-  may want to replace it with a constructor, which should be a deliberate break.
+- Construct the spec types through the constructors 0094 shipped (`ContainerWorkspace::new`,
+  `ContainerMount::new`, `ContainerCapabilities::new`) and by assigning `pub` fields on a
+  `Default` base. Struct literals are no longer available to an external caller -- every one of
+  these types is `#[non_exhaustive]` -- so the test must use the paths a consumer actually has.
+- Build `ImageTag` through `ImageTag::new` and read it through `as_str` / `into_string`; 0095 made
+  the tuple field private, so the `ImageTag(name)` form `cococlaw` used is gone.
+- Drive `create_initialized` through `ContainerCreateOptions`, which is the one entry point whose
+  shape 0095 changed.
 - Gate behind `e2e` alongside `library_surface.rs`.
 
 ## Notes
 
-Worth doing before 0095 changes any of these signatures, so the test is written against the
-current shape and the churn shows up as a diff.
+Originally written to land before 0095. It did not, so the churn 0095 introduced is already in
+the tree and this test gets written against the post-0095 shape -- which is the shape `0.2.0`
+freezes, and so the better target anyway.
 
-Related: `plan/done/0093-shrink-reachable-surface.md`, `plan/todo/0095-options-structs-and-sealing.md`.
+Related: `plan/done/0093-shrink-reachable-surface.md`,
+`plan/done/0095-options-structs-and-sealing.md`.

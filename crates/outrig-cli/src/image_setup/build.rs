@@ -40,11 +40,7 @@ pub async fn run(
     let project_dir = dir.map_or_else(|| cwd.to_path_buf(), |d| cwd.join(d));
     let parsed = load_project_image_toml(&project_dir)?;
     let labels = standalone_config_to_labels(&parsed)?;
-    let tag = ImageTag(
-        tag_override
-            .map(str::to_string)
-            .unwrap_or_else(|| parsed.image.image_ref.clone()),
-    );
+    let tag = ImageTag::new(tag_override.unwrap_or(parsed.image.image_ref.as_str()));
 
     eprintln!("[outrig] building image {tag}");
     eprintln!(

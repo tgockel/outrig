@@ -50,12 +50,42 @@ fn tag_repo(image: &str) -> &str {
     }
 }
 
+/// A resolved image reference -- either a registry name (`docker.io/x:1`) or a
+/// build-type cache tag (`<repo>:<key>`). The wrapped `String` is private so a
+/// future tag form, or validation of one, stays a crate-internal change;
+/// [`ImageTag::as_str`] and [`Display`](fmt::Display) are the read paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageTag(pub String);
+pub struct ImageTag(String);
+
+impl ImageTag {
+    /// Wrap an already-resolved image reference. Nothing is validated: the
+    /// only producers are this module's tag computation and a caller naming an
+    /// image podman will resolve.
+    pub fn new(tag: impl Into<String>) -> Self {
+        Self(tag.into())
+    }
+
+    /// The reference as podman and buildah want it on a command line.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the tag for its reference, for callers that hand a `String`
+    /// onward rather than borrowing it.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for ImageTag {
+    fn from(tag: String) -> Self {
+        Self(tag)
+    }
+}
 
 impl fmt::Display for ImageTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -195,7 +225,7 @@ pub async fn compute_tag(cfg: &ImageConfig, repo_root: &Path) -> Result<ImageTag
 /// need `${VAR}` resolution so errors can identify the source image-config.
 pub async fn compute_tag_for(image: &str, cfg: &ImageConfig, repo_root: &Path) -> Result<ImageTag> {
     match cfg.source() {
-        ImageSourceRef::Image { image_name } => Ok(ImageTag(image_name.to_string())),
+        ImageSourceRef::Image { image_name } => Ok(ImageTag::new(image_name)),
         ImageSourceRef::Build { .. } => {
             let build_args = resolve_build_args(image, cfg)?;
             compute_tag_with_build_args(tag_repo(image), cfg, repo_root, &build_args).await
@@ -213,7 +243,7 @@ async fn compute_tag_with_build_args(
     let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
     let labels = repo_build_cache_labels(cfg)?;
     let key = CacheKey::compute_with_labels(&dockerfile, build_args, &context, &labels).await?;
-    Ok(ImageTag(format!("{repo}:{key}")))
+    Ok(ImageTag::new(format!("{repo}:{key}")))
 }
 
 /// Returns `true` iff `tag` already exists in buildah's local image store.
@@ -221,8 +251,12 @@ async fn compute_tag_with_build_args(
 /// on a miss; either way exits 0, so we ignore the status and inspect
 /// stdout.
 pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
-    let probe =
-        process::try_capture(Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag.0)).await?;
+    let probe = process::try_capture(
+        Cmd::new("buildah")
+            .args(["images", "--quiet"])
+            .arg(tag.as_str()),
+    )
+    .await?;
     Ok(probe.status.success() && !probe.stdout.iter().all(u8::is_ascii_whitespace))
 }
 
@@ -230,7 +264,9 @@ pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
 /// mode records the cache probe alongside build/start lifecycle commands.
 async fn probe_cached_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
     let probe = process::try_capture_logged(
-        Cmd::new("buildah").args(["images", "--quiet"]).arg(&tag.0),
+        Cmd::new("buildah")
+            .args(["images", "--quiet"])
+            .arg(tag.as_str()),
         "buildah",
         transcript,
     )
@@ -241,15 +277,21 @@ async fn probe_cached_logged(tag: &ImageTag, transcript: Option<&Transcript>) ->
 /// Returns `true` iff `tag` (an image ref) already exists in podman's local
 /// image store. Uses `podman image exists <ref>`.
 pub async fn probe_pulled(tag: &ImageTag) -> Result<bool> {
-    let probe =
-        process::try_capture(Cmd::new("podman").args(["image", "exists"]).arg(&tag.0)).await?;
+    let probe = process::try_capture(
+        Cmd::new("podman")
+            .args(["image", "exists"])
+            .arg(tag.as_str()),
+    )
+    .await?;
     Ok(probe.status.success())
 }
 
 /// Logged sibling of [`probe_pulled`].
 async fn probe_pulled_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<bool> {
     let probe = process::try_capture_logged(
-        Cmd::new("podman").args(["image", "exists"]).arg(&tag.0),
+        Cmd::new("podman")
+            .args(["image", "exists"])
+            .arg(tag.as_str()),
         "podman",
         transcript,
     )
@@ -275,14 +317,15 @@ pub async fn ensure_local_image(
     }
     Err(OutrigError::Configuration(format!(
         "--image {:?} did not match any [images.<name>] and local podman image {:?} was not found",
-        tag.0, tag.0
+        tag.as_str(),
+        tag.as_str()
     )))
 }
 
 /// Pull an image by ref via `podman pull`. Stderr is streamed to
 /// `tracing::info!` with the `[podman]` prefix.
 pub async fn pull_image(tag: &ImageTag) -> Result<()> {
-    let cmd = Cmd::new("podman").arg("pull").arg(&tag.0);
+    let cmd = Cmd::new("podman").arg("pull").arg(tag.as_str());
     let argv_for_error = cmd.args.clone();
     let status = process::run_streamed(cmd, "podman").await?;
     if !status.success() {
@@ -299,7 +342,7 @@ pub async fn pull_image(tag: &ImageTag) -> Result<()> {
 /// Logged sibling of [`pull_image`] for session startup.
 async fn pull_image_logged(tag: &ImageTag, transcript: Option<&Transcript>) -> Result<()> {
     process::run_capture_logged(
-        Cmd::new("podman").arg("pull").arg(&tag.0),
+        Cmd::new("podman").arg("pull").arg(tag.as_str()),
         "podman",
         transcript,
     )
@@ -391,7 +434,7 @@ async fn ensure_image_for(
 ) -> Result<ImageBuildOutcome> {
     match cfg.source() {
         ImageSourceRef::Image { image_name } => {
-            let tag = ImageTag(image_name.to_string());
+            let tag = ImageTag::new(image_name);
             if !no_cache && probe_pulled(&tag).await? {
                 tracing::info!(target: "outrig::image", cache_hit = true, "ensured image {tag}");
                 return Ok(ImageBuildOutcome {
@@ -538,7 +581,7 @@ pub async fn read_image_labels(
     let cmd = Cmd::new("podman")
         .arg("image")
         .arg("inspect")
-        .arg(&tag.0)
+        .arg(tag.as_str())
         .arg("--format")
         .arg("{{json .Config.Labels}}");
     let output = process::run_capture_logged(cmd, "podman", transcript).await?;
@@ -573,7 +616,7 @@ pub async fn read_image_entrypoint_cmd(
     let cmd = Cmd::new("podman")
         .arg("image")
         .arg("inspect")
-        .arg(&tag.0)
+        .arg(tag.as_str())
         .arg("--format")
         .arg("{{json .Config}}");
     let output = process::run_capture_logged(cmd, "podman", transcript).await?;
@@ -669,10 +712,10 @@ struct SkopeoInspect {
 
 fn temporary_build_tag(final_tag: &ImageTag) -> ImageTag {
     let (repo, key) = final_tag
-        .0
+        .as_str()
         .rsplit_once(':')
         .unwrap_or((TAG_PREFIX, "image"));
-    ImageTag(format!(
+    ImageTag::new(format!(
         "{repo}:outrig-tmp-{}-{}-{key}",
         std::process::id(),
         temp_nonce()
@@ -697,7 +740,7 @@ async fn stamp_repo_image_labels(
     transcript: Option<&Transcript>,
 ) -> Result<()> {
     let inherited = read_image_labels(source_tag, transcript).await?;
-    let labels = merged_mcp_config_to_labels(&source_tag.0, &inherited, config_mcp)?;
+    let labels = merged_mcp_config_to_labels(source_tag.as_str(), &inherited, config_mcp)?;
     commit_image_with_labels(source_tag, final_tag, &labels, transcript).await
 }
 
@@ -715,7 +758,7 @@ async fn commit_image_with_labels(
                 .arg("--pull=never")
                 .arg("--name")
                 .arg(&builder)
-                .arg(&source_tag.0),
+                .arg(source_tag.as_str()),
             transcript,
         )
         .await?;
@@ -733,7 +776,7 @@ async fn commit_image_with_labels(
                 .arg("--rm")
                 .arg("--quiet")
                 .arg(&builder)
-                .arg(&final_tag.0),
+                .arg(final_tag.as_str()),
             transcript,
         )
         .await?;
@@ -766,7 +809,7 @@ async fn cleanup_builder(builder: &str, transcript: Option<&Transcript>) {
 }
 
 async fn cleanup_temp_image(tag: &ImageTag, transcript: Option<&Transcript>) {
-    let cmd = Cmd::new("buildah").arg("rmi").arg(&tag.0);
+    let cmd = Cmd::new("buildah").arg("rmi").arg(tag.as_str());
     if transcript.is_some() {
         let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
     } else {
@@ -815,7 +858,7 @@ fn buildah_build_cmd(
     let mut cmd = Cmd::new("buildah")
         .arg("build")
         .arg("--tag")
-        .arg(&tag.0)
+        .arg(tag.as_str())
         .arg("--file")
         .arg(dockerfile);
     if no_cache {
@@ -983,7 +1026,7 @@ mod tests {
         let cmd = build_image_cmd(
             &cfg,
             Path::new("/repo"),
-            &ImageTag("outrig-cache:test".to_string()),
+            &ImageTag::new("outrig-cache:test"),
             false,
             &resolved,
         );

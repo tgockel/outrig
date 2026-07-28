@@ -23,7 +23,7 @@ pub async fn run(image_ref: &str, remote: bool) -> Result<()> {
 }
 
 async fn read_local_image_labels(image_ref: &str) -> Result<BTreeMap<String, String>> {
-    let tag = ImageTag(image_ref.to_string());
+    let tag = ImageTag::new(image_ref);
     if !image::probe_pulled(&tag).await? {
         return Err(OutrigError::Configuration(format!(
             "local image {image_ref:?} not found; `outrig image inspect` is local-only and does not pull"

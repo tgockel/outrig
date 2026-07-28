@@ -68,8 +68,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in every repo. A block hosting no MCP servers, and one whose servers came only from its
   image's `org.outrig.mcp` label, are no longer reachable.
 - **Breaking:** `McpServerSpec::Full` gained an `args` field and `SidecarConfig` an `args`
-  field; struct-literal constructions of either need it. `Container::create_initialized` takes
-  the entrypoint argv as a new trailing parameter.
+  field; struct-literal constructions of either need it. The entrypoint argv reaches
+  `Container::create_initialized` through the new options struct described below.
+- **Breaking:** `Container::create_initialized` takes a single `ContainerCreateOptions` instead
+  of seven positional parameters. That list had already grown once this release (the entrypoint
+  argv), and a `#[non_exhaustive]` options struct means the next knob is an addition rather than
+  another break. Build it with `ContainerCreateOptions::new(image, launch, name)` plus
+  `with_transcript` / `with_env` / `with_intercept_dns` / `with_args`; the four omitted default
+  to none, empty, and off. `Container::start_named` is unchanged -- `podman run` takes none of
+  the create-only knobs, so one shared struct would have meant silently ignored fields.
+- **Breaking:** `mcp_proxy::BackingClient` is sealed and can no longer be implemented outside
+  this crate. Nothing about *using* `ProxyServer` changes; only an external `impl BackingClient`
+  is affected, and the only known one was this repo's own test fake, now a crate-internal
+  module. Sealing is what lets the trait gain a method later without a break.
+  `ProxyServer::list_tools_inner` and `dispatch_call` stay public: they are the
+  `RequestContext`-free half of the dispatch path, useful to a caller driving the proxy without
+  an rmcp server.
+- **Breaking:** `ImageTag`'s tuple field is private. `ImageTag::new` (taking anything
+  `Into<String>`) and `From<String>` construct one; `as_str` borrows the reference and
+  `into_string` takes it by value, replacing `.0` reads and moves respectively. `Display` is
+  unchanged and still covers the common read path. The field was the last thing freezing the
+  tag's representation into the contract -- `ApiKeyRef` has always been opaque this way.
 - `ConfigValidationError`'s `SidecarNameInvalid`, `SidecarImageEmpty`, `SidecarMount`, and
   `SidecarArgsWithoutEntrypoint` lost their `image` field -- a sidecar block no longer belongs
   to one image-config -- and their messages are scoped `sidecars.<sc>` rather than

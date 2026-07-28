@@ -891,7 +891,7 @@ mod tests {
                 let image_cfg = cfg.images["x"].clone();
                 let primary = Container::attach(
                     "outrig-test",
-                    ImageTag("img:latest".to_string()),
+                    ImageTag::new("img:latest"),
                     Some((Path::new("/host/ws"), Path::new("/workspace"))),
                     None,
                 );
@@ -1000,7 +1000,7 @@ auto = { command = ["mcp-auto"], sidecar = "autos" }
                 "tools".to_string(),
                 Container::attach(
                     "outrig-test-tools",
-                    ImageTag("img-tools".to_string()),
+                    ImageTag::new("img-tools"),
                     None,
                     None,
                 ),

@@ -95,7 +95,7 @@ async fn start_then_stop_leaves_no_container() {
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");
-    let tag = ImageTag(ALPINE.to_string());
+    let tag = ImageTag::new(ALPINE);
 
     let container = Container::start(
         &tag,
@@ -133,7 +133,7 @@ async fn extra_mounts_enforce_access_modes() {
     let rw_dir = tempfile::tempdir().expect("tempdir rw");
     std::fs::write(ro_dir.path().join("MARKER.txt"), "read-only marker\n")
         .expect("write ro marker");
-    let tag = ImageTag(ALPINE.to_string());
+    let tag = ImageTag::new(ALPINE);
 
     let mut launch = ContainerLaunchSpec::workspace(host_ws.path(), "/workspace");
     launch.mounts = vec![
@@ -184,7 +184,7 @@ async fn capability_flags_are_recorded_in_podman_create_command() {
     common::init_tracing();
     pull_alpine().await;
 
-    let tag = ImageTag(ALPINE.to_string());
+    let tag = ImageTag::new(ALPINE);
     let mut launch = ContainerLaunchSpec::default();
     launch.capabilities = ContainerCapabilities::new(CapabilityProfile::DropAll);
     launch.capabilities.cap_add = vec!["NET_BIND_SERVICE".to_string()];
@@ -214,7 +214,7 @@ async fn drop_without_stop_cleans_up() {
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");
-    let tag = ImageTag(ALPINE.to_string());
+    let tag = ImageTag::new(ALPINE);
 
     let name;
     {
@@ -257,7 +257,7 @@ async fn attached_handle_does_not_stop_or_cleanup_container() {
     pull_alpine().await;
 
     let host_ws = tempfile::tempdir().expect("tempdir");
-    let tag = ImageTag(ALPINE.to_string());
+    let tag = ImageTag::new(ALPINE);
 
     let container = Container::start(
         &tag,

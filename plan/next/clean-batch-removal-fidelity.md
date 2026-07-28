@@ -33,3 +33,11 @@ Worth pairing with test isolation: the stray sweep matches `org.outrig.session` 
 whole podman store, so any `outrig clean` test necessarily collides with other e2e tests
 running in parallel. Scoping the sweep test's assertions to its own container name (it
 already does) is not enough -- the batch it triggers still touches other tests' containers.
+
+Seen again 2026-07-28 during 0095, and it is worse than "flaky": it is self-perpetuating.
+Once one run leaves an `outrig-straytest-*` container behind, every subsequent full-file run
+fails the same way, because the leftover joins the batch that then skips names. Three
+consecutive runs failed; the same file passed on the first run of the day and passes when
+the test is run alone. Reproduced on unmodified trunk (stash the working tree, re-run), so
+it is not downstream of any surface change -- which also means it will keep costing a
+verification cycle in every task that runs this suite until the reporting is fixed.

@@ -77,7 +77,10 @@ async fn tag_for(repo: &Path, container: &str) -> String {
     let cfg_text = std::fs::read_to_string(repo.join(".agents/outrig/config.toml")).unwrap();
     let cfg = Config::load_from_str(&cfg_text).expect("config parses");
     let cc = cfg.images.get(container).expect("container exists");
-    image::compute_tag_for(container, cc, repo).await.unwrap().0
+    image::compute_tag_for(container, cc, repo)
+        .await
+        .unwrap()
+        .into_string()
 }
 
 #[tokio::test]

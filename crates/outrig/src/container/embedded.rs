@@ -303,7 +303,7 @@ pub async fn read_embedded_mcp(
     transcript: Option<&crate::process::Transcript>,
 ) -> Result<BTreeMap<String, McpServerSpec>> {
     let labels = crate::image::read_image_labels(tag, transcript).await?;
-    embedded_mcp_from_labels(&tag.0, &labels)
+    embedded_mcp_from_labels(tag.as_str(), &labels)
 }
 
 /// The MCP table a running container will actually serve: the servers
@@ -331,7 +331,7 @@ pub(crate) async fn merged_mcp_with_source(
     let labels =
         crate::image::read_image_labels(container.image_tag(), container.transcript().as_ref())
             .await?;
-    let image_mcp = embedded_mcp_from_labels(&container.image_tag().0, &labels)?;
+    let image_mcp = embedded_mcp_from_labels(container.image_tag().as_str(), &labels)?;
     Ok(merge_mcp_with_source(image_mcp, config_mcp, config_source))
 }
 

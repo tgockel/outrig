@@ -86,7 +86,7 @@ async fn build_single(
 ) -> Result<i32> {
     match cc.source() {
         ImageSourceRef::Image { image_name, .. } => {
-            let tag = image::ImageTag(image_name.to_string());
+            let tag = image::ImageTag::new(image_name);
             let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
             if already_pulled {
                 eprintln!("[outrig] image ready (already pulled: {tag})");
@@ -137,7 +137,7 @@ async fn build_all(
         })?;
         match cc.source() {
             ImageSourceRef::Image { image_name, .. } => {
-                let tag = image::ImageTag(image_name.to_string());
+                let tag = image::ImageTag::new(image_name);
                 let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
                 let suffix = if already_pulled {
                     "(already pulled)".to_string()

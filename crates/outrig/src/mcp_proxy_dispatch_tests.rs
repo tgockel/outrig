@@ -1,15 +1,17 @@
-//! Unit-style integration tests for `outrig::mcp_proxy::ProxyServer` driven
-//! against an in-process [`BackingClient`] fake. Exercises the namespace +
-//! dispatch contract without spinning up real MCP children.
+//! Tests for [`ProxyServer`] driven against an in-process [`BackingClient`]
+//! fake. Exercises the namespace + dispatch contract without spinning up real
+//! MCP children. In-crate rather than under `tests/` because `BackingClient`
+//! is sealed, so only this crate can supply the fake.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use outrig::error::OutrigError;
-use outrig::mcp_proxy::{BackingClient, ProxyServer};
-use outrig::{McpTool, McpToolResult};
 use rmcp::model::{CallToolRequestParams, ContentBlock};
 use serde_json::{Value, json};
+
+use super::{BackingClient, ProxyServer, sealed};
+use crate::error::OutrigError;
+use crate::mcp::{McpTool, McpToolResult};
 
 /// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
 /// `Err` becomes the "backing client failed" path that surfaces as
@@ -62,16 +64,18 @@ impl FakeClient {
     }
 }
 
+impl sealed::Sealed for FakeClient {}
+
 impl BackingClient for FakeClient {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn list_tools(&self) -> outrig::error::Result<Vec<McpTool>> {
+    async fn list_tools(&self) -> crate::error::Result<Vec<McpTool>> {
         Ok(self.tools.clone())
     }
 
-    async fn call_tool(&self, name: &str, args: Value) -> outrig::error::Result<McpToolResult> {
+    async fn call_tool(&self, name: &str, args: Value) -> crate::error::Result<McpToolResult> {
         self.received.lock().unwrap().push((name.to_string(), args));
         match self.responses.get(name) {
             Some(Ok(r)) => Ok(r.clone()),
