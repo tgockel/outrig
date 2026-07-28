@@ -10,8 +10,11 @@ This queue is pre-freeze work for `0.2.0`. Everything in it either changes what 
 thing means or fixes a contract a release would otherwise freeze wrong. The public surface is
 now settled and, with 0096 landed, every breaking change it will take is in: 0094 sealed every
 public type with `#[non_exhaustive]` and shipped the constructors that replace the struct
-literals it forbids, which is what makes 0097-0101 additive rather than breaking -- each of
-those adds a field or a variant to a type the sweep insulates. 0095 finished the other half --
+literals it forbids, which is what makes 0098-0101 additive rather than breaking -- each of
+those adds a field or a variant to a type the sweep insulates. 0097 was the first to cash that
+in, adding a `ConfigSource` to `ImageConfig` / `MountConfig` and a `declared_in` field to two
+sealed `ConfigValidationError` variants without a single breaking change. 0095 finished the
+other half --
 the options struct, the sealed `BackingClient`, and an opaque `ImageTag`. 0096 reshaped
 `SidecarServerSpec` into an enum and gave the library API every sidecar placement the config
 path has, which is what an external embedder was blocked on. The e2e suite compiles again and
@@ -22,7 +25,6 @@ longer public at all.
 
 | Task | Title                                                     | Dependencies     |
 |------|-----------------------------------------------------------|------------------|
-| 0097 | Resolve relative config paths against the declaring file  | 0094             |
 | 0098 | Native Anthropic Messages API provider                    | 0094             |
 | 0099 | Make subagent release atomic rather than partial          | 0092             |
 | 0100 | Cap how many subagents run at once                        | 0099             |

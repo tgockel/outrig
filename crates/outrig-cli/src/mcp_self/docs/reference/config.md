@@ -376,12 +376,15 @@ access         = "read-write"
 ```
 
 - `host-path` (path, optional, default: `"."`): primary workspace host path,
-  relative to the repo root.
+  relative to the repo root. Always the repo root -- the primary `[workspace]`
+  fields are repo-owned as a block.
 - `container-path` (path, optional, default: `"/workspace"`): where the primary
   workspace is mounted in the container.
 - `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
 - `mounts[*].host-path` (path, required): host directory to mount. Relative paths
-  resolve against the repo root.
+  resolve against the directory of the file that declared the entry -- see
+  [path resolution](#path-resolution). Global and repo mounts are concatenated,
+  so one list can hold entries with different base directories.
 - `mounts[*].container-path` (path, required): absolute in-container mount point.
 - `mounts[*].access` (string, optional, default: `"read-only"`): either
   `"read-only"` or `"read-write"`.
@@ -412,8 +415,11 @@ changes produce a new inspectable cache tag. Use a repo-specific, lowercase name
 `outrig-standard`, not `standard`) so `podman images` makes clear which repo it came from. The
 name must be a valid container image repository component -- see the validation rules below.
 
-- `dockerfile` (path, required\*): path to the Dockerfile, relative to the repo root.
-- `context` (path, required\*): path to the build context, relative to the repo root.
+- `dockerfile` (path, required\*): path to the Dockerfile, relative to the directory of the
+  file that declared the block -- see [path resolution](#path-resolution). For a repo
+  image-config that is the repo root; for one declared in the global config it is that file's
+  own directory.
+- `context` (path, required\*): path to the build context, same rule.
 - `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
   Keys are ARG names. Values are either literal strings or `${VAR}` references resolved
   from the host environment at `outrig build` time; see the MCP `env` value syntax
@@ -598,7 +604,9 @@ capability-profile = "no-net-raw"
   this sidecar is handled at session start. `"abort"` fails the session; `"warn"` logs, skips
   the sidecar and its servers, and continues.
 - `mounts` (array of tables, optional): same shape and validation as
-  [`[[workspace.mounts]]`](#workspace).
+  [`[[workspace.mounts]]`](#workspace), including
+  [path resolution](#path-resolution) -- a relative `host-path` resolves against
+  the directory of the file that declared the sidecar block.
 - `security` (table, optional): same keys as [`[images.<name>.security]`](#imagesnamesecurity).
 
 A block is an **entrypoint host** when the one `[images.<name>.mcp]` entry naming it omits
@@ -669,6 +677,28 @@ reference a sidecar the user declared globally.
 omits `[network]`, the global mode remains in effect. This matters when global config enables
 audit or filter mode and a repo explicitly sets `mode = "default"`. Network policy keys are
 global-only; repo config cannot set `network.default`, `network.allow`, or `network.deny`.
+
+### Path resolution
+
+A relative path is resolved against the directory of the config file that declared it, not
+against whichever repo is current. Provenance is recorded per entry before the merge, so a
+concatenated `workspace.mounts` list can hold entries with different base directories.
+
+| Declared in                  | Relative paths resolve against         |
+|------------------------------|----------------------------------------|
+| `.agents/outrig/config.toml` | the repo root                          |
+| `~/.outrig/config.toml`      | that file's directory (`~/.outrig/`)   |
+| `--global-config <path>`     | `<path>`'s parent directory            |
+
+Absolute paths are used as-is and ignore the rule entirely. This applies to
+`[images.<name>].dockerfile` and `.context`, and to `host-path` in both `[[workspace.mounts]]`
+and `[sidecars.<sc>.mounts]`. `[workspace].host-path` is always repo-relative, because the
+primary `[workspace]` fields are repo-owned as a block.
+
+The practical effect is that a global `[images.<name>]` can use the build shape: its Dockerfile
+and context live beside `~/.outrig/config.toml` and are found from any repo on the machine. One
+exception remains repo-relative: `[models.<name>].model-path`, which is documented under
+[Validation rules](#validation-rules).
 
 ## Full examples
 
@@ -808,7 +838,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An entrypoint host hosts exactly one MCP server and must be `start = "auto"`.
 - `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
   placement keys: labels declare exec-stdio servers, whose arguments belong in `command`.
-- `dockerfile` and `context` must exist on disk relative to the repo root (build path only).
+- `dockerfile` and `context` must exist on disk, resolved against the declaring file's directory
+  (build path only). The error names both the path as written and the file that declared it.
 - Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
@@ -830,7 +861,7 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Device paths must not be duplicated within one `devices` list.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
-  directory. Relative host paths resolve against the repo root.
+  directory. Relative host paths resolve against the declaring file's directory.
 - Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`.

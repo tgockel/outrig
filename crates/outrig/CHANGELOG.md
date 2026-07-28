@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Relative config paths resolve against the file that declared them.** A path in
+  `~/.outrig/config.toml` (or a `--global-config` file) is now relative to that file's own
+  directory rather than to the repo root. The practical effect is that a global
+  `[images.<name>]` can finally use the build shape: its `dockerfile` and `context` live beside
+  the global config and resolve identically from any repo on the machine. Before this, such a
+  block parsed and validated as legal but was joined onto the current repo root, so it either
+  failed with `DockerfileMissing` or -- worse -- silently picked up a same-named path inside the
+  repo. The same fix covers `host-path` in `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`,
+  which matters most for workspace mounts: global and repo mount lists are *concatenated*, so a
+  single base directory could never have been right for every element of the result.
+
+  Repo-declared paths are unchanged in every case, and absolute paths were never affected. An
+  entry that never went through `Config::load` -- anything hand-built from the library API --
+  records no source and keeps resolving against the `repo_root` it is passed.
+
+  The provenance is carried, not discarded after use: `ConfigSource` is public, with
+  `base_dir()` for the directory paths resolve against and `config_path()` for the file to name
+  in a diagnostic. `ImageConfig::config_source()`, `ImageConfig::base_dir()`,
+  `ImageConfig::resolved_build_paths()`, `MountConfig::config_source()`,
+  `MountConfig::resolved_host_path()`, and `Workspace::resolved_host_path()` expose it.
+
+  `ConfigValidationError::DockerfileMissing` and `ContextMissing` gained a
+  `declared_in: Option<PathBuf>` field, so a global entry's failure no longer reads as a repo
+  problem. Both variants were already `#[non_exhaustive]`, so this is additive. It is an
+  `Option` rather than a defaulted path because a filename in an error message is a claim: an
+  entry built by hand and validated directly has no declaring file, and the message omits the
+  `(declared in ...)` clause entirely rather than naming a config that never mentioned it.
+
 - **The library API reaches every sidecar placement.** A hand-built `SidecarSpec` can now host
   an entrypoint-stdio server -- one with no `command`, whose container's `ENTRYPOINT` is the
   server -- with `SidecarSpec::with_entrypoint_server(name, args)`, and can run it against the

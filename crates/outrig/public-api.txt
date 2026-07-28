@@ -18,6 +18,16 @@ pub outrig::config::ApiKeyError::NotUnicode::var: alloc::string::String
 pub outrig::config::CapabilityProfile::Default
 pub outrig::config::CapabilityProfile::DropAll
 pub outrig::config::CapabilityProfile::NoNetRaw
+#[non_exhaustive] pub enum outrig::config::ConfigSource
+pub outrig::config::ConfigSource::Global
+pub outrig::config::ConfigSource::Global::path: std::path::PathBuf
+pub outrig::config::ConfigSource::Project
+pub outrig::config::ConfigSource::Project::dir: std::path::PathBuf
+pub outrig::config::ConfigSource::Repo
+pub outrig::config::ConfigSource::Repo::root: std::path::PathBuf
+impl outrig::config::ConfigSource
+pub fn outrig::config::ConfigSource::base_dir(&self) -> &std::path::Path
+pub fn outrig::config::ConfigSource::config_path(&self) -> std::path::PathBuf
 #[non_exhaustive] pub enum outrig::config::ConfigValidationError
 pub outrig::config::ConfigValidationError::AgentMissingModel
 pub outrig::config::ConfigValidationError::AgentMissingModel::agent: alloc::string::String
@@ -38,6 +48,7 @@ pub outrig::config::ConfigValidationError::CapabilityNameInvalid::capability: al
 pub outrig::config::ConfigValidationError::CapabilityNameInvalid::field: &'static str
 pub outrig::config::ConfigValidationError::CapabilityNameInvalid::image: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::ContextMissing
+pub outrig::config::ConfigValidationError::ContextMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::ContextMissing::image: alloc::string::String
 pub outrig::config::ConfigValidationError::ContextMissing::path: std::path::PathBuf
 pub outrig::config::ConfigValidationError::DevicePathDuplicate
@@ -49,6 +60,7 @@ pub outrig::config::ConfigValidationError::DevicePathRelative
 pub outrig::config::ConfigValidationError::DevicePathRelative::device: alloc::string::String
 pub outrig::config::ConfigValidationError::DevicePathRelative::image: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::DockerfileMissing
+pub outrig::config::ConfigValidationError::DockerfileMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::DockerfileMissing::image: alloc::string::String
 pub outrig::config::ConfigValidationError::DockerfileMissing::path: std::path::PathBuf
 pub outrig::config::ConfigValidationError::EmptyMcpCommand
@@ -375,8 +387,11 @@ pub outrig::config::ImageConfig::image_name: core::option::Option<alloc::string:
 pub outrig::config::ImageConfig::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
 pub outrig::config::ImageConfig::security: outrig::config::ContainerSecurity
 impl outrig::config::ImageConfig
+pub fn outrig::config::ImageConfig::base_dir<'a>(&'a self, &'a std::path::Path) -> &'a std::path::Path
+pub fn outrig::config::ImageConfig::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
 pub fn outrig::config::ImageConfig::from_dockerfile(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::config::ImageConfig::from_image_name(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::ImageConfig::resolved_build_paths(&self, &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf)
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MistralrsDeviceParseError
 impl core::error::Error for outrig::config::MistralrsDeviceParseError
@@ -398,7 +413,9 @@ pub outrig::config::MountConfig::access: outrig::config::MountAccess
 pub outrig::config::MountConfig::container_path: std::path::PathBuf
 pub outrig::config::MountConfig::host_path: std::path::PathBuf
 impl outrig::config::MountConfig
+pub fn outrig::config::MountConfig::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
 pub fn outrig::config::MountConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
+pub fn outrig::config::MountConfig::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
 #[non_exhaustive] pub struct outrig::config::NetworkConfig
 pub outrig::config::NetworkConfig::allow: alloc::vec::Vec<outrig::config::NetworkEntry>
 pub outrig::config::NetworkConfig::default: outrig::config::NetworkAction
@@ -453,6 +470,7 @@ pub outrig::config::Workspace::host_path: std::path::PathBuf
 pub outrig::config::Workspace::mounts: alloc::vec::Vec<outrig::config::MountConfig>
 impl outrig::config::Workspace
 pub fn outrig::config::Workspace::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn outrig::config::Workspace::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
 impl core::default::Default for outrig::config::Workspace
 pub fn outrig::config::Workspace::default() -> Self
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32

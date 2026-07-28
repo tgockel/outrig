@@ -8,9 +8,9 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigValidationError, LlmProvider, McpServerSpec, MountAccess, MountRuleViolation,
-    NetworkAction, NetworkEntry, NetworkMode, SidecarOnFailure, SidecarStart, SidecarView,
-    SidecarWorkspaceAccess, merge,
+    Config, ConfigSource, ConfigValidationError, ImageConfig, LlmProvider, McpServerSpec,
+    MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode,
+    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, merge,
 };
 use outrig::error::OutrigError;
 
@@ -26,6 +26,29 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
         Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
         Ok(()) => panic!("expected validation error, got Ok"),
     }
+}
+
+/// Unwrap the validation error out of a failed `Config::load`.
+fn expect_load_validation_err(err: OutrigError) -> ConfigValidationError {
+    match err {
+        OutrigError::ConfigValidation(e) => e,
+        other => panic!("expected ConfigValidation, got: {other:?}"),
+    }
+}
+
+/// Write `body` to `<root>/.agents/outrig/config.toml`, creating the tree.
+fn write_repo_cfg(root: &Path, body: &str) {
+    let agents = root.join(".agents/outrig");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(agents.join("config.toml"), body).unwrap();
+}
+
+/// Write `body` to `<dir>/config.toml` and return the path, for use as a
+/// `--global-config` target.
+fn write_global_cfg(dir: &Path, body: &str) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    fs::write(&path, body).unwrap();
+    path
 }
 
 mod config_validate {
@@ -437,10 +460,27 @@ context    = "."
 "#,
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
+        let err_text = err.to_string();
         match err {
-            ConfigValidationError::DockerfileMissing { image, path, .. } => {
+            ConfigValidationError::DockerfileMissing {
+                image,
+                path,
+                declared_in,
+                ..
+            } => {
                 assert_eq!(image, "coding");
                 assert_eq!(path, std::path::PathBuf::from("Dockerfile"));
+                // Parsed with `load_from_str`, so nothing recorded a source.
+                // The diagnostic names no file rather than guessing one --
+                // there is no config file here that mentions this image.
+                assert_eq!(
+                    declared_in, None,
+                    "a sourceless entry must not invent a declaring file",
+                );
+                assert!(
+                    !err_text.contains("declared in"),
+                    "the clause is omitted entirely, not rendered as None: {err_text}",
+                );
             }
             other => panic!("expected DockerfileMissing, got: {other:?}"),
         }
@@ -460,9 +500,15 @@ context    = "missing-ctx"
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::ContextMissing { image, path, .. } => {
+            ConfigValidationError::ContextMissing {
+                image,
+                path,
+                declared_in,
+                ..
+            } => {
                 assert_eq!(image, "coding");
                 assert_eq!(path, std::path::PathBuf::from("missing-ctx"));
+                assert_eq!(declared_in, None);
             }
             other => panic!("expected ContextMissing, got: {other:?}"),
         }
@@ -1217,19 +1263,6 @@ mode = "audit"
 
 mod config_load {
     use super::*;
-
-    fn write_repo_cfg(root: &Path, body: &str) {
-        let agents = root.join(".agents/outrig");
-        fs::create_dir_all(&agents).unwrap();
-        fs::write(agents.join("config.toml"), body).unwrap();
-    }
-
-    fn expect_load_validation_err(err: OutrigError) -> ConfigValidationError {
-        match err {
-            OutrigError::ConfigValidation(e) => e,
-            other => panic!("expected ConfigValidation, got: {other:?}"),
-        }
-    }
 
     /// End-to-end load of `tests/fixtures/config-full.toml` (acceptance criterion).
     /// Writes the fixture to a tempdir, plus the dockerfile/context paths it
@@ -2385,5 +2418,326 @@ context    = "ctx"
             }
             other => panic!("expected SidecarEntrypointNotAuto, got: {other:?}"),
         }
+    }
+}
+
+/// Relative paths resolve against the directory of the file that declared them,
+/// not against whichever repo happens to be current. Every test here points
+/// `--global-config` at a tempdir, which is what makes the global-config
+/// behavior testable without touching a real `$HOME`.
+/// Relative paths resolve against the directory of the file that declared them,
+/// not against whichever repo happens to be current. Every test here points
+/// `--global-config` at a tempdir, which is what makes the global-config
+/// behavior testable without touching a real `$HOME`.
+mod config_path_provenance {
+    use super::*;
+
+    /// An empty repo and a global config holding `body`. Returns
+    /// `(repo_tmp, global_tmp, global_config_path)`; the tempdirs must stay
+    /// alive for the duration of the test.
+    fn repo_and_global(body: &str) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempdir().unwrap();
+        let global = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global_cfg = write_global_cfg(global.path(), body);
+        (repo, global, global_cfg)
+    }
+
+    /// The same, plus an `images/x/` project beside the global config -- the
+    /// `~/.outrig/images/<name>/` shape, from a repo somewhere else entirely.
+    fn global_image_project() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let (repo, global, global_cfg) = repo_and_global(
+            r#"
+[images.x]
+dockerfile = "images/x/Dockerfile"
+context    = "images/x"
+"#,
+        );
+        let proj = global.path().join("images/x");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("Dockerfile"), "FROM scratch\n").unwrap();
+        (repo, global, global_cfg)
+    }
+
+    #[test]
+    fn global_image_build_paths_resolve_against_global_dir() {
+        let (repo, global, global_cfg) = global_image_project();
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg))
+            .expect("a global build-shape image must validate from its own directory");
+
+        let image = &cfg.images["x"];
+        let src = image
+            .config_source()
+            .expect("a loaded entry carries its source");
+        assert_eq!(src.base_dir(), global.path());
+        assert_eq!(src.config_path(), global_cfg);
+        assert_eq!(
+            image.resolved_build_paths(repo.path()),
+            (
+                global.path().join("images/x/Dockerfile"),
+                global.path().join("images/x"),
+            ),
+        );
+    }
+
+    /// The same paths under the repo root do *not* exist, which is what made
+    /// this shape unusable before: the entry was legal to write and impossible
+    /// to load.
+    #[test]
+    fn global_image_paths_are_not_looked_for_under_the_repo() {
+        let (repo, _global, global_cfg) = global_image_project();
+        assert!(
+            !repo.path().join("images/x/Dockerfile").exists(),
+            "the fixture must not accidentally satisfy the old repo-root rule",
+        );
+
+        Config::load(repo.path(), Some(&global_cfg))
+            .expect("resolution must not consult the repo root at all");
+    }
+
+    /// Reading the Dockerfile and taring the context is pure filesystem work --
+    /// no podman, no buildah -- so the build path is reachable from an ungated
+    /// test up to the point where an image would actually be produced.
+    #[tokio::test]
+    async fn global_image_tag_computes_from_the_global_dir() {
+        let (repo, _global, global_cfg) = global_image_project();
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("global image config loads");
+
+        outrig::image::compute_tag_for("x", &cfg.images["x"], repo.path())
+            .await
+            .expect("cache key must read the Dockerfile from the global directory");
+    }
+
+    #[test]
+    fn global_dockerfile_missing_names_the_global_config() {
+        let (repo, _global, global_cfg) = repo_and_global(
+            r#"
+[images.x]
+dockerfile = "images/x/Dockerfile"
+context    = "images/x"
+"#,
+        );
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        assert!(
+            err.to_string().contains("declared in"),
+            "the rendered message must carry the clause: {err}",
+        );
+        match err {
+            ConfigValidationError::DockerfileMissing {
+                image,
+                path,
+                declared_in,
+                ..
+            } => {
+                assert_eq!(image, "x");
+                assert_eq!(
+                    path,
+                    std::path::PathBuf::from("images/x/Dockerfile"),
+                    "the reported path stays the raw config value",
+                );
+                assert_eq!(
+                    declared_in,
+                    Some(global_cfg),
+                    "a global entry's failure must not read as a repo problem",
+                );
+            }
+            other => panic!("expected DockerfileMissing, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_context_missing_names_the_global_config() {
+        let (repo, global, global_cfg) = repo_and_global(
+            r#"
+[images.x]
+dockerfile = "Dockerfile"
+context    = "missing-ctx"
+"#,
+        );
+        // Dockerfile exists beside the global config; only the context is gone.
+        fs::write(global.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::ContextMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("missing-ctx"));
+                assert_eq!(declared_in, Some(global_cfg));
+            }
+            other => panic!("expected ContextMissing, got: {other:?}"),
+        }
+    }
+
+    /// The concatenated case. `merge` splices the global and repo mount lists
+    /// into one `Vec`, so a single base directory provably cannot be right for
+    /// every element -- each entry has to carry its own.
+    #[test]
+    fn concatenated_mounts_resolve_against_their_own_files() {
+        let repo = tempdir().unwrap();
+        let global = tempdir().unwrap();
+
+        fs::create_dir_all(global.path().join("shared")).unwrap();
+        fs::create_dir_all(repo.path().join("local")).unwrap();
+
+        let global_cfg = write_global_cfg(
+            global.path(),
+            r#"
+[[workspace.mounts]]
+host-path      = "shared"
+container-path = "/shared"
+"#,
+        );
+        write_repo_cfg(
+            repo.path(),
+            r#"
+[[workspace.mounts]]
+host-path      = "local"
+container-path = "/local"
+"#,
+        );
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg))
+            .expect("each mount must resolve against the file that declared it");
+
+        let mounts = &cfg.workspace.mounts;
+        assert_eq!(mounts.len(), 2, "global mounts precede repo mounts");
+        assert_eq!(
+            mounts[0].resolved_host_path(repo.path()),
+            global.path().join("shared"),
+        );
+        assert_eq!(
+            mounts[1].resolved_host_path(repo.path()),
+            repo.path().join("local"),
+        );
+    }
+
+    /// The negative twin: satisfying a global mount's path under the *repo*
+    /// root must not make it validate. Before this change it would have.
+    #[test]
+    fn global_mount_is_not_satisfied_by_a_repo_path() {
+        let (repo, _global, global_cfg) = repo_and_global(
+            r#"
+[[workspace.mounts]]
+host-path      = "shared"
+container-path = "/shared"
+"#,
+        );
+        // Only the repo has `shared/`; the global config's own directory doesn't.
+        fs::create_dir_all(repo.path().join("shared")).unwrap();
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        assert!(
+            matches!(
+                err,
+                ConfigValidationError::WorkspaceMountHostMissing { ref path }
+                    if path == Path::new("shared")
+            ),
+            "expected WorkspaceMountHostMissing, got: {err:?}",
+        );
+    }
+
+    /// A sidecar block is replaced whole by `merge`, so its mount list is always
+    /// single-origin -- but that origin can still be the global file.
+    #[test]
+    fn global_sidecar_mounts_resolve_against_the_global_dir() {
+        let (repo, global, global_cfg) = repo_and_global(
+            r#"
+[images.x]
+image-name = "docker.io/library/alpine:3"
+
+[sidecars.tools]
+image = "docker.io/library/alpine:3"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "gh-config"
+  container-path = "/gh"
+"#,
+        );
+        fs::create_dir_all(global.path().join("gh-config")).unwrap();
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg))
+            .expect("a global sidecar mount resolves beside the global config");
+        assert_eq!(
+            cfg.sidecars["tools"].mounts[0].resolved_host_path(repo.path()),
+            global.path().join("gh-config"),
+        );
+    }
+
+    /// Repo-declared entries keep resolving exactly as before, and a hand-built
+    /// entry that never saw `Config::load` records no source and falls back to
+    /// the passed root. That fallback is what keeps every existing library
+    /// caller correct.
+    #[test]
+    fn repo_entries_and_sourceless_entries_use_the_repo_root() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".agents/outrig/images/coding")).unwrap();
+        fs::write(
+            repo.path().join(".agents/outrig/images/coding/Dockerfile"),
+            "FROM scratch\n",
+        )
+        .unwrap();
+        write_repo_cfg(
+            repo.path(),
+            r#"
+[images.coding]
+dockerfile = ".agents/outrig/images/coding/Dockerfile"
+context    = ".agents/outrig/images/coding"
+"#,
+        );
+
+        let cfg = Config::load(repo.path(), None).expect("repo config loads unchanged");
+        assert_eq!(cfg.images["coding"].base_dir(repo.path()), repo.path());
+        assert_eq!(
+            cfg.images["coding"]
+                .config_source()
+                .map(ConfigSource::config_path),
+            Some(repo.path().join(".agents/outrig/config.toml")),
+        );
+
+        let hand_built = ImageConfig::from_dockerfile("Dockerfile", ".");
+        assert!(hand_built.config_source().is_none());
+        assert_eq!(hand_built.base_dir(repo.path()), repo.path());
+
+        let hand_built_mount = MountConfig::new("data", "/data", MountAccess::ReadOnly);
+        assert!(hand_built_mount.config_source().is_none());
+        assert_eq!(
+            hand_built_mount.resolved_host_path(repo.path()),
+            repo.path().join("data"),
+        );
+    }
+
+    /// Absolute paths ignore the base directory entirely, whichever file they
+    /// came from. This is also what keeps `Outrig::launch`'s empty-root call
+    /// site a no-op.
+    #[test]
+    fn absolute_paths_ignore_the_declaring_directory() {
+        let repo = tempdir().unwrap();
+        let global = tempdir().unwrap();
+        let abs = global.path().join("abs-mount");
+        fs::create_dir_all(&abs).unwrap();
+
+        let global_cfg = write_global_cfg(
+            global.path(),
+            &format!(
+                r#"
+[[workspace.mounts]]
+host-path      = {abs:?}
+container-path = "/abs"
+"#,
+            ),
+        );
+        write_repo_cfg(repo.path(), "");
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("absolute host path loads");
+        assert_eq!(
+            cfg.workspace.mounts[0].resolved_host_path(Path::new("")),
+            abs,
+        );
     }
 }

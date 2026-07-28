@@ -74,6 +74,61 @@ pub const DEFAULT_SUBAGENT_DEPTH_MAX: u32 = 3;
 /// authorizing an unbounded launch tree.
 pub const SUBAGENT_DEPTH_MAX_CEILING: u32 = 16;
 
+/// Which config file an entry was declared in. Recorded per entry at load time
+/// -- before [`merge`], which is where origin would otherwise be lost -- so a
+/// relative path can resolve against the directory that gives it meaning
+/// rather than against whichever repo happens to be current.
+///
+/// The two accessors are not the same value and are not derivable from one
+/// another by a single `parent()`: the repo config sits three levels below the
+/// root its paths resolve against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigSource {
+    /// The repo config, `<root>/.agents/outrig/config.toml`.
+    Repo { root: PathBuf },
+    /// The global config, as resolved from `--global-config`,
+    /// `$XDG_CONFIG_HOME`, or `~/.outrig/`.
+    Global { path: PathBuf },
+    /// A standalone image project -- the directory holding an `image.toml`.
+    Project { dir: PathBuf },
+}
+
+impl ConfigSource {
+    /// Directory that this file's relative paths resolve against.
+    pub fn base_dir(&self) -> &Path {
+        match self {
+            Self::Repo { root } => root,
+            Self::Global { path } => path.parent().unwrap_or(Path::new("")),
+            Self::Project { dir } => dir,
+        }
+    }
+
+    /// The file that declared the entry, for diagnostics. A path reported
+    /// without this reads as a repo problem even when it came from elsewhere.
+    pub fn config_path(&self) -> PathBuf {
+        match self {
+            Self::Repo { root } => crate::repo::repo_config_path(root),
+            Self::Global { path } => path.clone(),
+            // The literal rather than a shared constant: the two sites that
+            // actually read this file live in `outrig-cli`, which cannot see a
+            // `pub(crate)` constant here, so a constant would centralize
+            // nothing while looking like it did.
+            Self::Project { dir } => dir.join("image.toml"),
+        }
+    }
+}
+
+/// Resolve `path` against `base`, leaving absolute paths alone. The one rule,
+/// shared by every config-declared host path.
+pub(crate) fn resolve_against(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -171,12 +226,21 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).path_ctx("read", &repo_path),
         };
-        let repo_cfg = Self::load_from_str(&repo_text)?;
+        let mut repo_cfg = Self::load_from_str(&repo_text)?;
         reject_repo_network_policy(&repo_text)?;
+        repo_cfg.stamp_source(&ConfigSource::Repo {
+            root: repo_root.to_path_buf(),
+        });
 
         let global_cfg = match global_path {
             Some(g) => match fs::read_to_string(g) {
-                Ok(text) => Self::load_from_str(&text)?,
+                Ok(text) => {
+                    let mut cfg = Self::load_from_str(&text)?;
+                    cfg.stamp_source(&ConfigSource::Global {
+                        path: g.to_path_buf(),
+                    });
+                    cfg
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
                 Err(e) => return Err(e).path_ctx("read", g),
             },
@@ -184,6 +248,33 @@ impl Config {
         };
 
         Ok(merge(global_cfg, repo_cfg))
+    }
+
+    /// Record `src` on every entry that carries a path, so the entry survives
+    /// [`merge`] knowing which directory its relative paths mean. Must run
+    /// before the merge: `extend` and the mount concatenation move whole
+    /// entries, and nothing afterwards can tell the two files apart.
+    ///
+    /// Only images and mounts are stamped. Providers and agents have no path
+    /// fields, so a base directory would buy them nothing. `models.<n>`
+    /// does have one -- `model-path` -- and is left out on purpose: it is
+    /// validated against a base the loader does not use, so giving it a
+    /// *better* validation base would only widen the disagreement. Both halves
+    /// get fixed together in `plan/next/model-path-runtime-unjoined.md`.
+    fn stamp_source(&mut self, src: &ConfigSource) {
+        for image in self.images.values_mut() {
+            image.set_config_source(src.clone());
+        }
+        // Every mount, wherever it lives -- one expression, so a future
+        // mount-bearing block extends here and nowhere else.
+        let mounts = self.workspace.mounts.iter_mut().chain(
+            self.sidecars
+                .values_mut()
+                .flat_map(|sidecar| sidecar.mounts.iter_mut()),
+        );
+        for mount in mounts {
+            mount.set_config_source(src.clone());
+        }
     }
 
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
@@ -463,6 +554,13 @@ impl Workspace {
             mounts: Vec::new(),
         }
     }
+
+    /// `host_path` made absolute. Always resolves against `repo_root`: [`merge`]
+    /// takes the repo's `[workspace]` block whole, so this key can only ever
+    /// have come from the repo config (or its serde default).
+    pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
+        resolve_against(repo_root, &self.host_path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -473,6 +571,10 @@ pub struct MountConfig {
     pub container_path: PathBuf,
     #[serde(default)]
     pub access: MountAccess,
+    /// Set at load time, never deserialized. See [`ConfigSource`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    source: Option<ConfigSource>,
 }
 
 impl MountConfig {
@@ -486,7 +588,33 @@ impl MountConfig {
             host_path: host_path.into(),
             container_path: container_path.into(),
             access,
+            source: None,
         }
+    }
+
+    /// The config file this mount was declared in, or `None` for a
+    /// hand-built entry that never went through [`Config::load`].
+    pub fn config_source(&self) -> Option<&ConfigSource> {
+        self.source.as_ref()
+    }
+
+    pub(crate) fn set_config_source(&mut self, source: ConfigSource) {
+        self.source = Some(source);
+    }
+
+    /// `host_path` made absolute, against the directory of the file that
+    /// declared it. `repo_root` is the fallback for an entry with no recorded
+    /// source, which is every hand-built [`MountConfig`].
+    ///
+    /// Global and repo mount lists are *concatenated* by [`merge`], so one base
+    /// directory provably cannot be right for every element of the result --
+    /// this is per-entry for that reason.
+    pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
+        let base = self
+            .source
+            .as_ref()
+            .map_or(repo_root, ConfigSource::base_dir);
+        resolve_against(base, &self.host_path)
     }
 }
 
@@ -986,6 +1114,10 @@ pub struct ImageConfig {
     pub build_args: BTreeMap<String, EnvValue>,
     #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
     pub security: ContainerSecurity,
+    /// Set at load time, never deserialized. See [`ConfigSource`].
+    #[serde(skip)]
+    #[schemars(skip)]
+    source: Option<ConfigSource>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
@@ -1169,8 +1301,53 @@ impl ImageConfig {
             context: None,
             build_args: BTreeMap::new(),
             security: ContainerSecurity::default(),
+            source: None,
             mcp: BTreeMap::new(),
         }
+    }
+
+    /// The config file this image-config was declared in, or `None` for a
+    /// hand-built entry that never went through [`Config::load`].
+    ///
+    /// Distinct from [`source`](Self::source), which discriminates the *shape*
+    /// of the container source rather than naming a file.
+    pub fn config_source(&self) -> Option<&ConfigSource> {
+        self.source.as_ref()
+    }
+
+    pub(crate) fn set_config_source(&mut self, source: ConfigSource) {
+        self.source = Some(source);
+    }
+
+    /// Directory that `dockerfile` and `context` resolve against. `repo_root`
+    /// is the fallback for an entry with no recorded source, which keeps every
+    /// hand-built [`ImageConfig`] resolving exactly as it did before.
+    pub fn base_dir<'a>(&'a self, repo_root: &'a Path) -> &'a Path {
+        self.source
+            .as_ref()
+            .map_or(repo_root, ConfigSource::base_dir)
+    }
+
+    /// `dockerfile` and `context` made absolute against
+    /// [`base_dir`](Self::base_dir). Like [`source`](Self::source), this is
+    /// only callable once validation has established the build shape.
+    pub fn resolved_build_paths(&self, repo_root: &Path) -> (PathBuf, PathBuf) {
+        let base = self.base_dir(repo_root);
+        let dockerfile = self.dockerfile.as_ref().expect("build path validated");
+        let context = self.context.as_ref().expect("build path validated");
+        (
+            resolve_against(base, dockerfile),
+            resolve_against(base, context),
+        )
+    }
+
+    /// The file to name in a diagnostic about one of this entry's paths, or
+    /// `None` for a hand-built entry. Deliberately not defaulted to the repo
+    /// config: unlike a base directory, a filename in an error message is a
+    /// *claim*, and naming a file that never mentioned this image would be a
+    /// fabrication.
+    pub(crate) fn declared_in(&self) -> Option<PathBuf> {
+        self.source.as_ref().map(ConfigSource::config_path)
     }
 
     /// Return the discriminated source variant. Panics if validation has not

@@ -18,6 +18,15 @@ use super::{
     TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
 
+/// Renders the trailing `(declared in <file>)` note, or nothing when the entry
+/// records no source. Kept out of the `#[error]` strings so an unrecorded
+/// source prints no clause rather than a `None`.
+fn declared_in_clause(declared_in: &Option<PathBuf>) -> String {
+    declared_in
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" (declared in {p:?})"))
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {
@@ -95,13 +104,31 @@ pub enum ConfigValidationError {
     #[error("image {image:?}: `build-args` cannot be used with `image-name`")]
     ImageNameWithBuildArgs { image: String },
 
-    #[error("image {image:?} dockerfile path {path:?} does not exist")]
+    #[error(
+        "image {image:?} dockerfile path {path:?} does not exist{}",
+        declared_in_clause(declared_in)
+    )]
     #[non_exhaustive]
-    DockerfileMissing { image: String, path: PathBuf },
+    DockerfileMissing {
+        image: String,
+        path: PathBuf,
+        /// The config file that declared `path`. A bare relative path reads as
+        /// a repo problem even when it came from the global config. `None` for
+        /// a hand-built config that never went through `Config::load`.
+        declared_in: Option<PathBuf>,
+    },
 
-    #[error("image {image:?} context path {path:?} does not exist")]
+    #[error(
+        "image {image:?} context path {path:?} does not exist{}",
+        declared_in_clause(declared_in)
+    )]
     #[non_exhaustive]
-    ContextMissing { image: String, path: PathBuf },
+    ContextMissing {
+        image: String,
+        path: PathBuf,
+        /// The config file that declared `path`, or `None` when unrecorded.
+        declared_in: Option<PathBuf>,
+    },
 
     #[error("session-root {path:?} must be an absolute path")]
     SessionRootNotAbsolute { path: PathBuf },
@@ -993,11 +1020,7 @@ fn check_mount_list(
         }
 
         if let Some(root) = repo_root {
-            let resolved = if mount.host_path.is_absolute() {
-                mount.host_path.clone()
-            } else {
-                root.join(&mount.host_path)
-            };
+            let resolved = mount.resolved_host_path(root);
             if !resolved.exists() {
                 return Err(MountRuleViolation::HostMissing(mount.host_path.clone()));
             }
@@ -1164,11 +1187,10 @@ fn validate_mistralrs_model(
     if let Some(path) = model.model_path.as_deref()
         && let Some(root) = repo_root
     {
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        };
+        // Still repo-root-relative: `models` was left out of the provenance
+        // sweep, and this validated base disagrees with the unjoined path the
+        // loader opens -- see `plan/next/model-path-runtime-unjoined.md`.
+        let resolved = super::resolve_against(root, path);
         if !resolved.exists() {
             return Err(ConfigValidationError::MistralrsModelPathMissing {
                 model: model_name.to_string(),
@@ -1265,22 +1287,24 @@ fn validate_image_source(
             (true, true) => {}
         }
 
-        // On-disk existence checks for the build path.
+        // On-disk existence checks for the build path. Both paths resolve
+        // against the directory of the file that declared them, so a global
+        // image-config is checked where it actually lives; `path` stays the
+        // raw config value and `declared_in` says which file to go edit.
         if let Some(root) = repo_root {
-            let dockerfile = image.dockerfile.as_ref().unwrap();
-            let df_path = root.join(dockerfile);
+            let (df_path, ctx_path) = image.resolved_build_paths(root);
             if !df_path.exists() {
                 return Err(ConfigValidationError::DockerfileMissing {
                     image: image_name.to_string(),
-                    path: dockerfile.clone(),
+                    path: image.dockerfile.clone().unwrap(),
+                    declared_in: image.declared_in(),
                 });
             }
-            let context = image.context.as_ref().unwrap();
-            let ctx_path = root.join(context);
             if !ctx_path.exists() {
                 return Err(ConfigValidationError::ContextMissing {
                     image: image_name.to_string(),
-                    path: context.clone(),
+                    path: image.context.clone().unwrap(),
+                    declared_in: image.declared_in(),
                 });
             }
         }

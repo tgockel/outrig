@@ -239,8 +239,7 @@ async fn compute_tag_with_build_args(
     repo_root: &Path,
     build_args: &BTreeMap<String, String>,
 ) -> Result<ImageTag> {
-    let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
-    let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
+    let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     let labels = repo_build_cache_labels(cfg)?;
     let key = CacheKey::compute_with_labels(&dockerfile, build_args, &context, &labels).await?;
     Ok(ImageTag::new(format!("{repo}:{key}")))
@@ -824,8 +823,7 @@ fn build_image_cmd(
     no_cache: bool,
     build_args: &BTreeMap<String, String>,
 ) -> Cmd {
-    let dockerfile = repo_root.join(cfg.dockerfile.as_ref().expect("build path validated"));
-    let context = repo_root.join(cfg.context.as_ref().expect("build path validated"));
+    let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     buildah_build_cmd(
         &dockerfile,
         &context,

@@ -101,7 +101,7 @@ host-path      = "."          # relative to the repo root containing .agents/out
 container-path = "/workspace"
 
 [[workspace.mounts]]
-host-path      = "../shared-docs"
+host-path      = "../shared-docs"   # relative to the file that declared it
 container-path = "/resources/shared-docs"
 
 [[workspace.mounts]]
@@ -140,7 +140,8 @@ stricter defaults: `workspace = "none"` -- a sidecar sees no host directory at a
 block asks. `workspace = "ro"` mounts the session workspace read-only at the primary's
 container path (and makes it the working directory for the sidecar's servers);
 `workspace = "rw"` mounts it read-write. Extra `mounts` entries on a sidecar use the same
-shape and validation as `[[workspace.mounts]]`.
+shape and validation as `[[workspace.mounts]]`, including path resolution: a relative
+`host-path` resolves against the directory of the file that declared the sidecar block.
 
 Sidecars run with `--userns=keep-id` like the primary. The in-container user bootstrap runs
 only where identity matters: the sidecar hosts at least one exec-stdio server, sees the

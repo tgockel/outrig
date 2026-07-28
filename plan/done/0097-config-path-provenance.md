@@ -139,3 +139,95 @@ Otherwise independent of everything in the queue, and a strict prerequisite for
 - `plan/next/user-image-library.md` -- the consumer that makes this load-bearing.
 - `plan/done/0007-image-build.md` -- why `ensure_image` joins against the root without
   `canonicalize` (intentional symlinks are preserved); the same rule applies to any new base.
+
+## Decisions
+
+1. **Fork 1 resolved as recommended: carry the provenance, do not rewrite paths to absolute.**
+   Confirmed against `plan/next/user-image-library.md` rather than in the abstract -- two of its
+   acceptance criteria need the origin itself, not a correct path: the shadow diagnostic must
+   "warn and name both paths", and `outrig image ls` prints a source column. Absolute rewriting
+   would have forced both to be re-derived by string-prefix comparison against the config
+   directories.
+
+2. **`ConfigSource` stores the natural value per variant, because `base_dir()` is not
+   `config_path().parent()`.** The repo config lives at `<root>/.agents/outrig/config.toml` but
+   its paths resolve against `<root>`, three levels up; the global config's paths resolve
+   against its own parent. A single stored `PathBuf` with one derivation rule cannot serve both,
+   so `Repo` stores the root, `Global` the file, `Project` the directory, and each accessor
+   matches. This was the first thing the "store the declaring file" answer ran into.
+
+3. **`Option<ConfigSource>`, with `repo_root` as the fallback.** `Config` derives `Deserialize`
+   publicly, so a non-optional field needs a `Default`, and the only honest default is
+   "unknown" -- `Option` with extra steps, plus a `base_dir()` that would have to return a
+   guess. The `None` case is exactly the hand-built entry from the library API, and the fallback
+   is what keeps every pre-existing caller resolving as before.
+
+4. **The derived `PartialEq` was kept, and the `NetworkConfig` hand-written-`PartialEq`
+   precedent was not needed.** The concern was `fixture_round_trips_through_serde`
+   (`crates/outrig/tests/config_schema.rs`), which compares a parse against a reparse. Stamping
+   happens in `load_unvalidated`, not `load_from_str`, so both sides of that comparison are
+   `None` and the test never sees a source. Verified by running it rather than by reasoning
+   alone. Two entries with identical content from different files are genuinely different
+   entries, so including the field in equality is also the right semantics.
+
+5. **`#[schemars(skip)]` is load-bearing, not decoration.** `schema_for!(ImageConfig)` is
+   published through the `get_config_schema` MCP tool
+   (`crates/outrig-cli/src/mcp_self/schema.rs`), and `ImageConfig` is `deny_unknown_fields`.
+   Without the attribute the skipped field would be advertised to an agent as a writable key and
+   then rejected on write. `NetworkConfig.declared` already pairs the two attributes for the
+   same reason.
+
+6. **`declared_in` is `Option<PathBuf>`, and this was a correction made during review.** The
+   first implementation defaulted a sourceless entry to `<repo_root>/.agents/outrig/config.toml`
+   and a test asserted "a sourceless entry must still name a file". That is the one place the
+   fallback is more than a defaulted path: everywhere else it yields a *path*, which can only be
+   right or wrong, but in an error message it yields a *claim about a file* -- and naming a
+   config that never mentioned the image is a fabrication. The clause is now rendered by a
+   helper (`declared_in_clause`) and omitted entirely when the source is unrecorded, rather than
+   printing `None`. This also makes CLI `--volume` mounts correct for free: they have no
+   declaring file and now say so, where stamping them `Repo` would have lied.
+
+7. **`models.<n>.model-path` was left out of the sweep on purpose, and the reason is not the one
+   fork 3 gives.** Fork 3 says "only images and mounts have paths today"; that is false --
+   `model-path` is a path and `validate_mistralrs_model` held the last hand-rolled copy of the
+   absolute-or-join rule. The real reason to leave it is that it is validated against the repo
+   root and then passed **verbatim** to the loader
+   (`crates/outrig-cli/src/llm/mistralrs.rs`), so giving it a *better* validation base would
+   only widen an existing disagreement. Both halves are specified together in
+   `plan/next/model-path-runtime-unjoined.md`. Its `resolve_against` call site was still
+   deduplicated.
+
+8. **`Workspace` gets no `ConfigSource`, and the justification is a bug rather than a design.**
+   `merge` takes `repo.workspace` wholesale and only splices `mounts`, so `host_path` can only
+   ever come from the repo config -- which makes the repo root always correct for it. But that
+   is true only because a global `[workspace]` block's primary fields are silently discarded,
+   which is itself wrong. Filed as `plan/next/global-workspace-block-dropped.md`, which records
+   that per-key precedence would require `Workspace` to gain a source after all.
+
+9. **Mount errors were left unable to name their declaring file.** `MountRuleViolation`'s
+   variants are plain tuples and the four `WorkspaceMount*` variants lack `#[non_exhaustive]`,
+   so widening them is breaking, and this task's acceptance names only the two image errors. The
+   deferral is on scope grounds only: `plan/next/mount-errors-lack-provenance.md` initially
+   claimed it needed a post-`0.2.0` breaking window, and that was wrong -- `[Unreleased]`
+   already reshapes five `ConfigValidationError` variants, so the window is open now. The entry
+   was corrected.
+
+10. **`ConfigSource::Project` ships with no producer, against three review objections.** Every
+    reviewer noted that the enum is `#[non_exhaustive]`, so adding the variant later is
+    non-breaking, which does undercut the task's stated rationale ("so `user-image-library`
+    needs no further change to this type"). Kept anyway: it is an explicit deliverable, its
+    consumer is one task away and already specifies `ConfigSource` as the project directory, and
+    the cost is two lines of frozen surface. The `STANDALONE_IMAGE_FILE` constant it dragged in
+    was **not** kept -- it was `pub(crate)` in `outrig` while the only two sites that read
+    `image.toml` are in `outrig-cli`, so it centralized nothing while looking like it did.
+
+11. **One rule, four call sites.** `resolve_against` replaced two byte-identical private copies
+    of `resolve_workspace_host` (`outrig_.rs` and `session_setup.rs`, in different crates) plus
+    two inline copies inside `validate.rs`. `Path::join` alone would have sufficed -- it already
+    discards the base for an absolute argument -- but the named function is where the
+    absolute-passthrough contract is written down, and it is now the only place it is written.
+
+12. **Verification that the tests test something.** With the global stamping disabled, 8 of the
+    10 new tests fail; the 2 that pass are the absolute-path and sourceless-fallback cases,
+    which legitimately do not depend on it. Run before trusting a green suite that would also
+    have been green without the feature.

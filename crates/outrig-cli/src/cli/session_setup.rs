@@ -91,14 +91,6 @@ fn format_elapsed(duration: Duration) -> String {
     format!("{}m{:02}s", secs / 60, secs % 60)
 }
 
-fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repo_root.join(path)
-    }
-}
-
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
 /// is the caller's stack frame.
 pub struct SessionSetupArgs<'a> {
@@ -419,7 +411,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     };
 
     let sid = SessionId::new();
-    let host_workspace = resolve_workspace_host(&repo_root, &cfg.workspace.host_path);
+    let host_workspace = cfg.workspace.resolved_host_path(&repo_root);
     let container_workspace = cfg.workspace.container_path.clone();
     let mut launch =
         ContainerLaunchSpec::workspace(host_workspace.clone(), container_workspace.clone());
@@ -1025,15 +1017,16 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
     launch
 }
 
-/// Config `mounts` as launch-spec bind mounts, host paths resolved against the
-/// repo root. Shared by the primary launch and every sidecar; the two lists
-/// have the same shape and the same `~`/relative-path rules.
+/// Config `mounts` as launch-spec bind mounts, each host path resolved against
+/// the directory of the file that declared it, with `repo_root` as the fallback
+/// for an entry carrying no source. Shared by the primary launch and every
+/// sidecar; the two lists have the same shape and the same rules.
 fn container_mounts(repo_root: &Path, mounts: &[MountConfig]) -> Vec<ContainerMount> {
     mounts
         .iter()
         .map(|mount| {
             ContainerMount::new(
-                resolve_workspace_host(repo_root, &mount.host_path),
+                mount.resolved_host_path(repo_root),
                 mount.container_path.clone(),
                 mount.access,
             )

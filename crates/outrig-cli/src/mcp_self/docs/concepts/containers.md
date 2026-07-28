@@ -21,7 +21,8 @@ under `.agents/outrig/images/<name>/`:
 Putting them under `.agents/outrig/` keeps outrig-specific build context separate from your
 project's own Dockerfiles (which often live at the repo root or under `containers/`,
 `docker/`, etc. for unrelated purposes). You can override the default by editing
-`[images.<name>].dockerfile` and `.context` to point anywhere relative to the repo root.
+`[images.<name>].dockerfile` and `.context` to point anywhere relative to the repo root -- or
+absolutely anywhere, with an absolute path.
 
 ## Dockerfile conventions
 
@@ -79,16 +80,22 @@ default-image = "coding"
 [images.coding]
 dockerfile = ".agents/outrig/images/coding/Dockerfile"   # relative to repo root
 context    = ".agents/outrig/images/coding"              # relative to repo root
-build-args = { NODE_VERSION = "20" }                          # extra Dockerfile ARGs
+build-args = { NODE_VERSION = "20" }                     # extra Dockerfile ARGs
 
   [images.coding.mcp]
   fs    = { command = ["mcp-server-filesystem", "/workspace"] }
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
 
-`dockerfile` and `context` are paths from the repo root (the directory containing
-`.agents/outrig/`). `build-args` are extra Dockerfile `ARG`s -- whatever your Dockerfile needs
-parameterized at build time.
+`dockerfile` and `context` are relative to the directory of the config file that declared the
+block. For this repo config that is the repo root (the directory containing `.agents/outrig/`).
+Declare the same block in `~/.outrig/config.toml` and the paths are relative to `~/.outrig/`
+instead, so a build-from-Dockerfile image can live in your global config and be used from every
+repo on the machine. See
+[Config -> path resolution](../reference/config.md#path-resolution).
+
+`build-args` are extra Dockerfile `ARG`s -- whatever your Dockerfile needs parameterized at
+build time.
 
 The `[images.<name>.mcp]` map is covered in [MCP Servers](mcp-servers.md).
 

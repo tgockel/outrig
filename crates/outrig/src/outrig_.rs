@@ -509,7 +509,7 @@ impl LaunchSpec {
         })?;
 
         let ws = WorkspaceSpec::new(
-            resolve_workspace_host(repo_root, &config.workspace.host_path),
+            config.workspace.resolved_host_path(repo_root),
             config.workspace.container_path.clone(),
         );
         let mounts = config
@@ -518,22 +518,21 @@ impl LaunchSpec {
             .iter()
             .map(|mount| {
                 MountSpec::new(
-                    resolve_workspace_host(repo_root, &mount.host_path),
+                    mount.resolved_host_path(repo_root),
                     mount.container_path.clone(),
                     mount.access,
                 )
             })
             .collect();
         let source = match cfg.source() {
-            ImageSourceRef::Build {
-                dockerfile,
-                context,
-                build_args,
-            } => LaunchSource::Build {
-                dockerfile: repo_root.join(dockerfile),
-                context: repo_root.join(context),
-                build_args: build_args.clone(),
-            },
+            ImageSourceRef::Build { build_args, .. } => {
+                let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
+                LaunchSource::Build {
+                    dockerfile,
+                    context,
+                    build_args: build_args.clone(),
+                }
+            }
             ImageSourceRef::Image { image_name } => LaunchSource::Image {
                 tag: image_name.to_string(),
             },
@@ -615,14 +614,6 @@ impl LaunchSpec {
     }
 }
 
-fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repo_root.join(path)
-    }
-}
-
 /// Split a planned session into the primary MCP map and the launch-time
 /// sidecars. Pure -- no image resolution, so each `SidecarSpec.image` still
 /// holds the unresolved config ref for [`LaunchSpec::from_config`] to rewrite.
@@ -667,7 +658,7 @@ fn plan_to_launch_parts(
             .iter()
             .map(|mount| {
                 MountSpec::new(
-                    resolve_workspace_host(repo_root, &mount.host_path),
+                    mount.resolved_host_path(repo_root),
                     mount.container_path.clone(),
                     mount.access,
                 )
@@ -752,16 +743,11 @@ impl Outrig {
                 build_args,
             } => {
                 // Reuse `ensure_image` by wrapping the raw inputs in a
-                // `ImageConfig`. Passing an empty `repo_root` makes
-                // its `repo_root.join(absolute)` calls no-ops.
-                let cfg = ImageConfig {
-                    image_name: None,
-                    dockerfile: Some(dockerfile.clone()),
-                    context: Some(context.clone()),
-                    build_args: build_args.clone(),
-                    security: ContainerSecurity::default(),
-                    mcp: BTreeMap::new(),
-                };
+                // `ImageConfig`. The spec's paths are already absolute and the
+                // config records no `ConfigSource`, so the empty `repo_root`
+                // fallback makes the resolution a no-op.
+                let mut cfg = ImageConfig::from_dockerfile(dockerfile.clone(), context.clone());
+                cfg.build_args = build_args.clone();
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
             }
             LaunchSource::Image { tag } => ImageTag::new(tag.clone()),
