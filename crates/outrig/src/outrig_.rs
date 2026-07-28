@@ -5,23 +5,27 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::process::Child;
 
 use crate::config::{
     CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef,
-    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, SidecarStart, SidecarWorkspaceAccess,
-    is_valid_mcp_server_name, is_valid_sidecar_name,
+    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, SidecarStart, SidecarView,
+    SidecarWorkspaceAccess, check_entrypoint_hosting, check_sidecar_image, check_sidecar_name,
+    check_view_exclusions, is_valid_mcp_server_name,
 };
 use crate::container::{
-    Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
-    LABEL_SESSION, LABEL_SIDECAR,
+    Container, ContainerCapabilities, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount,
+    ContainerWorkspace, LABEL_SESSION, LABEL_SIDECAR, PrimaryView,
     embedded::{self, McpDeclarationSource},
+    enter,
     sidecar::{self, Placement, SessionMcpPlan},
 };
-use crate::error::{OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result};
 use crate::image::{self, ImageTag};
 use crate::mcp::{McpClient, McpToolResult};
 use crate::network::NetworkInterceptor;
@@ -140,33 +144,111 @@ pub struct NetworkSpec {
     pub policy: Option<NetworkPolicy>,
 }
 
-/// One MCP server hosted by a [`SidecarSpec`] sidecar. Exec-stdio only:
-/// the server is spawned with `podman exec -i` inside the sidecar, so a
-/// command is always required (entrypoint-stdio has no library surface).
+/// One MCP server hosted by a [`SidecarSpec`] sidecar, in either of the two
+/// transports a sidecar supports.
+///
+/// The distinction is the same one the config path draws through
+/// [`McpServerSpec::is_entrypoint_stdio`]: an exec-stdio server is one process
+/// among many in a container that outlives it, while an entrypoint-stdio
+/// server *is* the container process. Modeling it as two variants rather than
+/// an optional command keeps "no command and no args" unrepresentable.
+///
+/// Deliberately not [`McpServerSpec`], which it otherwise resembles: that type
+/// also carries the placement keys (`sidecar`, `image`, `view`) that decide
+/// *which* container hosts a server, and here the enclosing [`SidecarSpec`]
+/// has already answered that. A caller building a sidecar cannot express a
+/// contradictory placement because there is nowhere to write one.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct SidecarServerSpec {
-    pub command: Vec<String>,
-    pub env: BTreeMap<String, EnvValue>,
+pub enum SidecarServerSpec {
+    /// Spawned with `podman exec -i` inside a running sidecar. Any number of
+    /// these can share one container.
+    #[non_exhaustive]
+    ExecStdio {
+        command: Vec<String>,
+        env: BTreeMap<String, EnvValue>,
+    },
+    /// The container's own `ENTRYPOINT`, spoken to over `podman start
+    /// --attach --interactive`. `args` are its positional arguments, which is
+    /// how off-the-shelf MCP images take the directories they serve. A
+    /// sidecar hosting one of these hosts nothing else: container lifetime is
+    /// server lifetime.
+    #[non_exhaustive]
+    Entrypoint {
+        args: Vec<String>,
+        env: BTreeMap<String, EnvValue>,
+    },
 }
 
 impl SidecarServerSpec {
-    /// A server exec'd as `command`, with no extra environment. Assign `env`
-    /// on the result, or go through
-    /// [`SidecarSpec::with_server_env`](SidecarSpec::with_server_env).
-    pub fn new(command: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
+    /// A server exec'd as `command`, with no extra environment. Mirrors
+    /// [`McpServerSpec::exec`].
+    pub fn exec(command: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::ExecStdio {
             command: command.into_iter().map(Into::into).collect(),
             env: BTreeMap::new(),
         }
     }
+
+    /// A server that is its container's `ENTRYPOINT`, handed `args`. Mirrors
+    /// [`McpServerSpec::entrypoint`] -- the image comes from the enclosing
+    /// [`SidecarSpec`], so it is not repeated here.
+    pub fn entrypoint(args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Entrypoint {
+            args: args.into_iter().map(Into::into).collect(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Environment for the server process, resolved at spawn time. Sealed
+    /// variants cannot be updated field-wise from outside, so this is the
+    /// only way to attach one.
+    pub fn with_env(mut self, env: BTreeMap<String, EnvValue>) -> Self {
+        match &mut self {
+            Self::ExecStdio { env: slot, .. } | Self::Entrypoint { env: slot, .. } => *slot = env,
+        }
+        self
+    }
+
+    /// The argv to exec, or `None` for the entrypoint form.
+    pub fn command(&self) -> Option<&[String]> {
+        match self {
+            Self::ExecStdio { command, .. } => Some(command),
+            Self::Entrypoint { .. } => None,
+        }
+    }
+
+    /// Positional arguments for the entrypoint form. Always empty for
+    /// exec-stdio, which carries a full argv already.
+    pub fn args(&self) -> &[String] {
+        match self {
+            Self::ExecStdio { .. } => &[],
+            Self::Entrypoint { args, .. } => args,
+        }
+    }
+
+    /// The declared (still-unresolved) environment.
+    pub fn env(&self) -> &BTreeMap<String, EnvValue> {
+        match self {
+            Self::ExecStdio { env, .. } | Self::Entrypoint { env, .. } => env,
+        }
+    }
+
+    /// Whether this server is its container's `ENTRYPOINT`.
+    pub fn is_entrypoint(&self) -> bool {
+        matches!(self, Self::Entrypoint { .. })
+    }
 }
 
 /// Description of one sidecar container: image (a raw podman ref, used
-/// verbatim like [`LaunchSpec::from_image`]), workspace visibility, extra
-/// mounts, security policy, and the MCP servers it hosts. Passed to
-/// [`Outrig::add_sidecar`] mid-session or declared at launch via
+/// verbatim like [`LaunchSpec::from_image`]), workspace visibility, filesystem
+/// view, extra mounts, security policy, and the MCP servers it hosts. Passed
+/// to [`Outrig::add_sidecar`] mid-session or declared at launch via
 /// [`LaunchSpec::with_sidecar`].
+///
+/// The fields mirror `[sidecars.<sc>]`, minus `start` and `on-failure`: a
+/// library caller starts a sidecar by calling [`Outrig::add_sidecar`], and
+/// [`LaunchSpec::with_sidecar`] is abort-only by design.
 ///
 /// Config-name image resolution (the `[images.<name>]` lookup the CLI
 /// performs) is out of facade scope: callers who want a built image run
@@ -177,6 +259,10 @@ pub struct SidecarSpec {
     pub name: String,
     pub(crate) image: String,
     pub workspace: SidecarWorkspaceAccess,
+    /// Whether the sidecar runs against the primary container's filesystem
+    /// view. [`SidecarView::Primary`] is entrypoint-stdio only, mutually
+    /// exclusive with `workspace`, and needs the `outrig-enter` helper.
+    pub view: SidecarView,
     pub mounts: Vec<MountSpec>,
     pub security: SecuritySpec,
     pub servers: BTreeMap<String, SidecarServerSpec>,
@@ -184,13 +270,14 @@ pub struct SidecarSpec {
 
 impl SidecarSpec {
     /// A sidecar named `name` running `image` (a podman ref used verbatim,
-    /// no build or pull): no workspace view, no mounts, default security,
-    /// no servers.
+    /// no build or pull): no workspace view, its own filesystem view, no
+    /// mounts, default security, no servers.
     pub fn from_image(name: impl Into<String>, image: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             image: image.into(),
             workspace: SidecarWorkspaceAccess::None,
+            view: SidecarView::None,
             mounts: Vec::new(),
             security: SecuritySpec::default(),
             servers: BTreeMap::new(),
@@ -200,6 +287,14 @@ impl SidecarSpec {
     /// How much of the session workspace the sidecar sees (default: none).
     pub fn with_workspace_access(mut self, access: SidecarWorkspaceAccess) -> Self {
         self.workspace = access;
+        self
+    }
+
+    /// Run the sidecar's server against the primary container's filesystem
+    /// view (default: its own image's). [`SidecarView::Primary`] is a real
+    /// posture change -- see [`Outrig::add_sidecar`].
+    pub fn with_view(mut self, view: SidecarView) -> Self {
+        self.view = view;
         self
     }
 
@@ -225,13 +320,30 @@ impl SidecarSpec {
 
     /// [`SidecarSpec::with_server`] plus per-server environment variables.
     pub fn with_server_env(
-        mut self,
+        self,
         name: impl Into<String>,
         command: Vec<String>,
         env: BTreeMap<String, EnvValue>,
     ) -> Self {
-        let mut server = SidecarServerSpec::new(command);
-        server.env = env;
+        self.with_server_spec(name, SidecarServerSpec::exec(command).with_env(env))
+    }
+
+    /// Host this container's `ENTRYPOINT` as an MCP server named `name`,
+    /// handing it `args`. No command is written anywhere: the image supplies
+    /// it. Such a sidecar hosts exactly this one server.
+    pub fn with_entrypoint_server(
+        self,
+        name: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.with_server_spec(name, SidecarServerSpec::entrypoint(args))
+    }
+
+    /// Host `server` under `name`. The general form the other `with_*server`
+    /// methods are shorthands for -- reach for it when a server needs
+    /// environment as well as the entrypoint form:
+    /// `with_server_spec("fs", SidecarServerSpec::entrypoint(args).with_env(env))`.
+    pub fn with_server_spec(mut self, name: impl Into<String>, server: SidecarServerSpec) -> Self {
         self.servers.insert(name.into(), server);
         self
     }
@@ -365,22 +477,20 @@ impl LaunchSpec {
     /// paths resolve against `repo_root` so the spec carries absolute paths.
     ///
     /// Unlike a verbatim copy of the image's `[mcp]` map, this resolves MCP
-    /// placement into sidecars: top-level `[sidecars.<sc>]` blocks and
-    /// placement-bearing entries (`sidecar = "<sc>"`, inline `image = "..."`
-    /// with a `command`) become [`SidecarSpec`]s on the returned spec, so
-    /// [`Outrig::launch`] no longer rejects them. Named-sidecar and anonymous
-    /// images resolve like `--image` (a sibling `[images.<name>]` block first,
-    /// else a raw local ref) and are **built/pulled eagerly here**; the primary
-    /// image is still built lazily by `launch`.
+    /// placement into sidecars: top-level `[sidecars.<sc>]` blocks and every
+    /// placement-bearing entry -- `sidecar = "<sc>"`, inline `image = "..."`,
+    /// entrypoint-stdio, and `view = "primary"` alike -- become [`SidecarSpec`]s
+    /// on the returned spec. Named-sidecar and anonymous images resolve like
+    /// `--image` (a sibling `[images.<name>]` block first, else a raw local ref)
+    /// and are **built/pulled eagerly here**; the primary image is still built
+    /// lazily by `launch`.
     ///
     /// Scope of the library translation (the CLI path is a strict superset):
     /// - `start = "manual"` sidecars are skipped -- neither started nor carried.
     ///   Rebuild a [`SidecarSpec`] and call [`Outrig::add_sidecar`] to start one
     ///   mid-session.
-    /// - Entrypoint-stdio placements (a placed entry with no `command`, whether
-    ///   it names an inline `image` or a `sidecar` block) have no exec-stdio
-    ///   library form and are rejected with an error; run those via the CLI
-    ///   (`outrig run` / `outrig mcp`).
+    /// - `on-failure = "warn"` is not honored: launch-time sidecars are
+    ///   abort-only here, per [`LaunchSpec::with_sidecar`].
     /// - A sidecar image's own `org.outrig.mcp` label is not merged; sidecar
     ///   servers come only from the repo config's placement entries.
     ///
@@ -430,7 +540,7 @@ impl LaunchSpec {
         };
 
         let plan = sidecar::plan_from_config(config, cfg);
-        let (mcp, mut sidecars) = plan_to_launch_parts(&plan, repo_root)?;
+        let (mcp, mut sidecars) = plan_to_launch_parts(&plan, repo_root);
         for sidecar in &mut sidecars {
             sidecar.image = resolve_sidecar_image_tag(config, repo_root, &sidecar.image).await?;
         }
@@ -517,12 +627,12 @@ fn resolve_workspace_host(repo_root: &Path, path: &Path) -> PathBuf {
 /// sidecars. Pure -- no image resolution, so each `SidecarSpec.image` still
 /// holds the unresolved config ref for [`LaunchSpec::from_config`] to rewrite.
 /// `start = "manual"` sidecars are dropped (their servers, being sidecar-placed,
-/// are already absent from the primary map); an entrypoint-stdio placement has
-/// no exec-stdio library form and is an error.
+/// are already absent from the primary map); every other placement lowers,
+/// entrypoint-stdio included.
 fn plan_to_launch_parts(
     plan: &SessionMcpPlan,
     repo_root: &Path,
-) -> Result<(BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>)> {
+) -> (BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>) {
     let mcp = plan
         .servers
         .iter()
@@ -535,23 +645,23 @@ fn plan_to_launch_parts(
         if sc.start != SidecarStart::Auto {
             continue;
         }
-        if let Some((server, _)) = plan.entrypoint_server_in(sc) {
-            return Err(OutrigError::Configuration(format!(
-                "mcp server {server:?} is entrypoint-stdio (a placed entry with no command, \
-                 so the container's ENTRYPOINT is the server); the library facade hosts \
-                 exec-stdio servers only -- run it via the CLI (outrig run / outrig mcp) or \
-                 give the server a command"
-            )));
-        }
-        let servers = plan
-            .servers_in(&sc.name)
-            .map(|(name, placed)| {
-                let (command, env) = placed.spec.normalize();
-                let mut server = SidecarServerSpec::new(command);
-                server.env = env;
-                (name.clone(), server)
-            })
-            .collect();
+        // An entrypoint host serves exactly one server, and its arguments come
+        // from the entry or the block -- `entrypoint_args` is the one place
+        // that picks between them, so the spec needs only the single slot.
+        let servers = match plan.entrypoint_server_in(sc) {
+            Some((name, placed)) => BTreeMap::from([(
+                name.clone(),
+                SidecarServerSpec::entrypoint(sidecar::entrypoint_args(&placed.spec, sc).to_vec())
+                    .with_env(placed.spec.env().clone()),
+            )]),
+            None => plan
+                .servers_in(&sc.name)
+                .map(|(name, placed)| {
+                    let (command, env) = placed.spec.normalize();
+                    (name.clone(), SidecarServerSpec::exec(command).with_env(env))
+                })
+                .collect(),
+        };
         let mounts = sc
             .mounts
             .iter()
@@ -567,12 +677,13 @@ fn plan_to_launch_parts(
             name: sc.name.clone(),
             image: sc.image.clone(),
             workspace: sc.workspace,
+            view: sc.view,
             mounts,
             security: SecuritySpec::from(&sc.security),
             servers,
         });
     }
-    Ok((mcp, sidecars))
+    (mcp, sidecars)
 }
 
 /// Resolve a sidecar image ref like `--image`: a sibling `[images.<name>]`
@@ -775,13 +886,29 @@ impl Outrig {
 
     /// Start a sidecar container mid-session: labels, keep-id, conditional
     /// user bootstrap, network-interceptor attachment (when the session
-    /// launched with one), and one exec-stdio MCP connection per server in
-    /// the spec. On success the new servers' tools are appended to
-    /// [`Outrig::tools`] and returned. On failure everything started by this
-    /// call is torn down (clients, interceptor attachment, container) and the
-    /// session is left exactly as it was -- errors reach only the caller.
+    /// launched with one), and one MCP connection per server in the spec. On
+    /// success the new servers' tools are appended to [`Outrig::tools`] and
+    /// returned. On failure everything started by this call is torn down
+    /// (clients, interceptor attachment, container) and the session is left
+    /// exactly as it was -- errors reach only the caller.
+    ///
+    /// Both sidecar transports are supported. An **exec-stdio** sidecar is
+    /// started and its servers are `podman exec`'d into it, so the container
+    /// outlives any one server. An **entrypoint-stdio** sidecar (a spec built
+    /// with [`SidecarSpec::with_entrypoint_server`]) is created with its
+    /// server's environment baked in and only starts when the server does:
+    /// container lifetime *is* server lifetime, so the server exiting removes
+    /// the container, surfacing like any mid-session sidecar death.
+    ///
+    /// With [`SidecarView::Primary`] the sidecar additionally joins the
+    /// primary's mount namespace through the `outrig-enter` helper, which is
+    /// materialized into the session's log directory. That is a real posture
+    /// change -- the sidecar runs with `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in
+    /// the primary's user namespace and can read the primary's whole
+    /// filesystem. A build without the helper fails here rather than emitting
+    /// a broken container.
     pub async fn add_sidecar(&mut self, spec: SidecarSpec) -> Result<Vec<ToolHandle>> {
-        validate_sidecar_spec(&spec, &self.clients, &self.sidecars)?;
+        validate_sidecar_spec(&spec, &self.clients, &self.sidecars, enter::is_available())?;
 
         let workspace_access = spec.workspace.mount_access();
         if workspace_access.is_some() && self.container.host_workspace().as_os_str().is_empty() {
@@ -815,19 +942,33 @@ impl Outrig {
                 ),
                 (LABEL_SIDECAR.to_string(), spec.name.clone()),
             ]),
-            // The library facade hosts only exec-stdio sidecars, never the
-            // entrypoint-stdio primary-view placement.
+            // Set by `create_entrypoint_sidecar` for a `view = "primary"`
+            // sidecar; every other placement leaves it `None`.
             primary_view: None,
         };
         let container_name =
             crate::container::sidecar_container_name(self.container.session_suffix(), &spec.name);
-
         let image = ImageTag::new(spec.image.clone());
-        let mut container = Container::start_named(&image, launch, container_name, None).await?;
 
-        // Bootstrap only where identity matters; every SidecarSpec server is
-        // exec-stdio, so any server implies bootstrap.
-        let needs_bootstrap = crate::container::sidecar::bootstrap_needed(
+        // Validation guarantees an entrypoint host serves exactly one server,
+        // so the first is the only one.
+        let entrypoint_server = spec
+            .servers
+            .iter()
+            .find(|(_, server)| server.is_entrypoint());
+
+        let mut container = match entrypoint_server {
+            Some((name, server)) => {
+                self.create_entrypoint_sidecar(&spec, name, server, launch, image, container_name)
+                    .await?
+            }
+            None => Container::start_named(&image, launch, container_name, None).await?,
+        };
+
+        // Bootstrap only where identity matters; `bootstrap_needed` owns the
+        // entrypoint-host exemption, so both paths get it from one place.
+        let needs_bootstrap = sidecar::bootstrap_needed(
+            entrypoint_server.is_some(),
             !spec.servers.is_empty(),
             spec.workspace,
             !spec.mounts.is_empty(),
@@ -862,12 +1003,100 @@ impl Outrig {
         }
     }
 
+    /// `podman create` + `podman init` an entrypoint-stdio sidecar without
+    /// running its ENTRYPOINT: the interceptor attaches to the initialized
+    /// network namespace first, and the `podman start --attach` that finally
+    /// runs the server happens later, in [`connect_sidecar_servers`]. The
+    /// server's environment is baked in here because `podman start` carries no
+    /// `--env`.
+    ///
+    /// A `view = "primary"` sidecar additionally resolves the primary's
+    /// namespaces and materializes the `outrig-enter` launcher *before*
+    /// anything is created, so a missing helper or a not-yet-running primary
+    /// fails without leaving a container behind.
+    async fn create_entrypoint_sidecar(
+        &self,
+        spec: &SidecarSpec,
+        server_name: &str,
+        server: &SidecarServerSpec,
+        mut launch: ContainerLaunchSpec,
+        image: ImageTag,
+        container_name: String,
+    ) -> Result<Container> {
+        let (image_entrypoint, image_cmd) = if spec.view == SidecarView::Primary {
+            // The log dir is otherwise created lazily by the first MCP
+            // connection, which for an entrypoint server happens after the
+            // helper is already needed.
+            tokio::fs::create_dir_all(&self.log_dir)
+                .await
+                .path_ctx("create directory", &self.log_dir)?;
+            // Two unrelated podman inspects -- the primary's PID and the
+            // sidecar image's config -- so they overlap.
+            let (pid, payload) = tokio::try_join!(
+                self.container.pid(),
+                image::read_image_entrypoint_cmd(&image, None),
+            )?;
+            launch.primary_view = Some(PrimaryView::new(
+                self.container.name(),
+                pid,
+                enter::materialize(&self.log_dir)?,
+            ));
+            payload
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let options = ContainerCreateOptions::new(image, launch, container_name)
+            .with_env(crate::mcp::resolve_mcp_env(
+                server_name,
+                server.env().clone(),
+                &BTreeMap::new(),
+            )?)
+            .with_intercept_dns(self.network.is_some())
+            .with_args(sidecar::entrypoint_create_args(
+                spec.view,
+                &image_entrypoint,
+                &image_cmd,
+                server.args(),
+                self.container.container_workspace(),
+            ));
+        Container::create_initialized(options).await
+    }
+
     /// Tools advertised by every connected MCP server: launch-time servers in
     /// `(server, name)` order matching the effective MCP map's `BTreeMap`
     /// iteration followed by each server's advertised order, then each
     /// [`Outrig::add_sidecar`]'s tools in call order.
     pub fn tools(&self) -> &[ToolHandle] {
         &self.tools
+    }
+
+    /// Run `argv` in the **primary** container as the session's runtime user,
+    /// with all three stdio streams piped back to the caller. `env` is added
+    /// to the environment podman already sets up (`HOME` and the mapped
+    /// user/group).
+    ///
+    /// This is the supported way to reach the primary: the `Container` itself
+    /// stays private, because the session owns it and will stop it at
+    /// [`Outrig::shutdown`]. For a command you just want the output of, use
+    /// [`Outrig::exec_capture`].
+    pub async fn exec_stdio(
+        &self,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<Child> {
+        self.container.exec_stdio(argv, env).await
+    }
+
+    /// [`Outrig::exec_stdio`], driven to completion: stdout and stderr are
+    /// drained concurrently and returned with the exit status. A non-zero
+    /// exit is data on the returned [`Output`], not an error.
+    pub async fn exec_capture(
+        &self,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<Output> {
+        self.container.exec_capture(argv, env).await
     }
 
     /// Dispatch an MCP `tools/call` to the named server. `server` must
@@ -931,30 +1160,31 @@ impl Outrig {
 /// Reject a [`SidecarSpec`] that could not start or would corrupt the
 /// session's flat server namespace. Pure checks, no podman. Generic over
 /// the map values so the checks are testable with plain name maps.
+///
+/// The name-shape, image-ref, and placement rules run through
+/// `config::validate`, so a hand-built spec is refused by the same code, with
+/// the same text, as the equivalent `[sidecars.<sc>]` block. Where those
+/// messages name an image-config, this path supplies its podman image ref
+/// instead -- a library spec has no image-config to name.
+///
+/// `helper_available` is [`enter::is_available`]'s answer, threaded in rather
+/// than read here so the missing-`outrig-enter` rejection is testable on a
+/// host that does have the helper.
 fn validate_sidecar_spec<C, S>(
     spec: &SidecarSpec,
     existing_clients: &BTreeMap<String, C>,
     existing_sidecars: &BTreeMap<String, S>,
+    helper_available: bool,
 ) -> Result<()> {
-    if !is_valid_sidecar_name(&spec.name) {
-        return Err(OutrigError::Configuration(format!(
-            "invalid sidecar name {:?} (must match ^[A-Za-z0-9][A-Za-z0-9_-]*$ -- it \
-             embeds in container names)",
-            spec.name
-        )));
-    }
+    check_sidecar_name(&spec.name)?;
     if existing_sidecars.contains_key(&spec.name) {
         return Err(OutrigError::Configuration(format!(
             "sidecar {:?} is already running",
             spec.name
         )));
     }
-    if spec.image.trim().is_empty() {
-        return Err(OutrigError::Configuration(format!(
-            "sidecar {:?} has an empty image ref",
-            spec.name
-        )));
-    }
+    check_sidecar_image(&spec.name, &spec.image)?;
+
     for (name, server) in &spec.servers {
         if !is_valid_mcp_server_name(name) {
             return Err(OutrigError::Configuration(format!(
@@ -962,7 +1192,14 @@ fn validate_sidecar_spec<C, S>(
                 spec.name
             )));
         }
-        if server.command.is_empty() {
+        if name == crate::tool_name::RESERVED_SERVER {
+            return Err(OutrigError::Configuration(format!(
+                "sidecar {:?}: mcp server name {name:?} is reserved for OutRig's \
+                 built-in tools; its tools would collide with `{name}__*`",
+                spec.name
+            )));
+        }
+        if server.command().is_some_and(<[String]>::is_empty) {
             return Err(OutrigError::Configuration(format!(
                 "sidecar {:?}: mcp server {name:?} has an empty command",
                 spec.name
@@ -975,6 +1212,26 @@ fn validate_sidecar_spec<C, S>(
                 spec.name
             )));
         }
+    }
+
+    check_view_exclusions(
+        &spec.name,
+        spec.view,
+        spec.workspace,
+        spec.security.capabilities.profile,
+    )?;
+    let hosted: Vec<(&str, bool)> = spec
+        .servers
+        .iter()
+        .map(|(name, server)| (name.as_str(), server.is_entrypoint()))
+        .collect();
+    check_entrypoint_hosting(&spec.image, &spec.name, spec.view, &hosted)?;
+
+    // Checked after the placement rules so a spec that is wrong on its own
+    // terms says so, rather than blaming a missing helper it would not have
+    // used anyway.
+    if spec.view == SidecarView::Primary && !helper_available {
+        return Err(OutrigError::FilesystemHelperUnavailable);
     }
     Ok(())
 }
@@ -990,26 +1247,36 @@ async fn connect_sidecar_servers(
     let mut clients: BTreeMap<String, McpClient> = BTreeMap::new();
     let mut tools: Vec<ToolHandle> = Vec::new();
     for (name, server) in &spec.servers {
-        let mcp_spec = McpServerSpec::Full {
-            command: Some(server.command.clone()),
-            env: server.env.clone(),
-            sidecar: None,
-            image: None,
-            // exec-stdio: `command` is the full argv.
-            args: Vec::new(),
-            // `view` is an entrypoint-stdio concern; exec-stdio never uses it.
-            view: crate::config::SidecarView::None,
+        // An entrypoint server's container was created with its env and args
+        // baked in; `podman start --attach` here is what finally runs it.
+        let connected = match server.command() {
+            Some(command) => {
+                // Through the constructor rather than a `Full` literal, so a
+                // field added to that variant is still filled in exactly one
+                // place. Placement is already settled -- this server's
+                // container is the one we were handed.
+                let mcp_spec = McpServerSpec::exec(command).with_env(server.env().clone());
+                McpClient::connect_via_podman_exec_with_source(
+                    container,
+                    &mcp_spec,
+                    name,
+                    McpDeclarationSource::LaunchSpec,
+                    log_dir,
+                    &BTreeMap::new(),
+                )
+                .await
+            }
+            None => {
+                McpClient::connect_via_podman_start(
+                    container,
+                    name,
+                    McpDeclarationSource::LaunchSpec,
+                    log_dir,
+                )
+                .await
+            }
         };
-        let client = match McpClient::connect_via_podman_exec_with_source(
-            container,
-            &mcp_spec,
-            name,
-            McpDeclarationSource::LaunchSpec,
-            log_dir,
-            &BTreeMap::new(),
-        )
-        .await
-        {
+        let client = match connected {
             Ok(client) => client,
             Err(e) => {
                 shutdown_partial_clients(clients).await;
@@ -1092,8 +1359,25 @@ mod tests {
         assert_eq!(spec.name, "tools");
         assert_eq!(spec.image, "ghcr.io/example/mcp-tools:1");
         assert_eq!(spec.workspace, SidecarWorkspaceAccess::Ro);
+        assert_eq!(spec.view, SidecarView::None);
         assert_eq!(spec.mounts.len(), 1);
-        assert_eq!(spec.servers["fs"].command[0], "mcp-fs");
+        assert_eq!(
+            spec.servers["fs"].command().expect("exec server")[0],
+            "mcp-fs"
+        );
+    }
+
+    #[test]
+    fn sidecar_spec_builder_hosts_an_entrypoint_server() {
+        let spec = SidecarSpec::from_image("fs", "docker.io/mcp/filesystem:latest")
+            .with_entrypoint_server("fs", ["/workspace"])
+            .with_view(SidecarView::Primary);
+
+        assert_eq!(spec.view, SidecarView::Primary);
+        let server = &spec.servers["fs"];
+        assert!(server.is_entrypoint());
+        assert_eq!(server.command(), None, "the image supplies the command");
+        assert_eq!(server.args(), ["/workspace"]);
     }
 
     #[test]
@@ -1110,56 +1394,71 @@ mod tests {
         (BTreeMap::new(), BTreeMap::new())
     }
 
+    /// `validate_sidecar_spec` against an otherwise-empty session, on a host
+    /// where `outrig-enter` is present.
+    fn validate_alone(spec: &SidecarSpec) -> Result<()> {
+        let (clients, sidecars) = no_existing();
+        validate_sidecar_spec(spec, &clients, &sidecars, true)
+    }
+
+    /// The message the equivalent `[sidecars.<sc>]` block would produce, so
+    /// the parity assertions below compare against the config path's own text
+    /// rather than a hand-copied literal.
+    fn config_error(toml_src: &str) -> String {
+        let config: Config = toml::from_str(toml_src).expect("parse config");
+        config
+            .validate(None)
+            .expect_err("config must fail validation")
+            .to_string()
+    }
+
     #[test]
     fn validate_accepts_a_plain_spec() {
-        let (clients, sidecars) = no_existing();
-        validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars).expect("spec is valid");
+        validate_alone(&tools_sidecar()).expect("spec is valid");
     }
 
     #[test]
     fn validate_rejects_bad_sidecar_name() {
-        let (clients, sidecars) = no_existing();
-        let err = validate_sidecar_spec(
-            &SidecarSpec::from_image("bad name!", "img:1"),
-            &clients,
-            &sidecars,
-        )
-        .expect_err("space in name must fail");
+        let err = validate_alone(&SidecarSpec::from_image("bad name!", "img:1"))
+            .expect_err("space in name must fail");
         assert!(err.to_string().contains("invalid sidecar name"), "{err}");
     }
 
     #[test]
     fn validate_rejects_empty_image() {
-        let (clients, sidecars) = no_existing();
-        let err = validate_sidecar_spec(&SidecarSpec::from_image("t", "  "), &clients, &sidecars)
-            .expect_err("blank image must fail");
-        assert!(err.to_string().contains("empty image ref"), "{err}");
+        let err =
+            validate_alone(&SidecarSpec::from_image("t", "  ")).expect_err("blank image must fail");
+        assert!(err.to_string().contains("must not be empty"), "{err}");
     }
 
     #[test]
     fn validate_rejects_empty_server_command() {
-        let (clients, sidecars) = no_existing();
         let spec = SidecarSpec::from_image("t", "img:1").with_server("fs", Vec::new());
-        let err =
-            validate_sidecar_spec(&spec, &clients, &sidecars).expect_err("empty command must fail");
+        let err = validate_alone(&spec).expect_err("empty command must fail");
         assert!(err.to_string().contains("empty command"), "{err}");
     }
 
     #[test]
     fn validate_rejects_invalid_server_name() {
-        let (clients, sidecars) = no_existing();
         let spec =
             SidecarSpec::from_image("t", "img:1").with_server("1bad", vec!["mcp-fs".to_string()]);
-        let err = validate_sidecar_spec(&spec, &clients, &sidecars)
-            .expect_err("digit-leading server name must fail");
+        let err = validate_alone(&spec).expect_err("digit-leading server name must fail");
         assert!(err.to_string().contains("invalid mcp server name"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_the_reserved_server_name() {
+        let spec = SidecarSpec::from_image("t", "img:1")
+            .with_server(crate::RESERVED_SERVER, vec!["mcp-fs".to_string()]);
+        let err = validate_alone(&spec).expect_err("the built-in tool namespace is reserved");
+        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     #[test]
     fn validate_rejects_server_name_collision() {
         let (mut clients, sidecars) = no_existing();
         clients.insert("fs".to_string(), ());
-        let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars)
+        let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars, true)
             .expect_err("flat namespace collision must fail");
         assert!(err.to_string().contains("already connected"), "{err}");
     }
@@ -1168,15 +1467,120 @@ mod tests {
     fn validate_rejects_running_sidecar_name() {
         let (clients, mut sidecars) = no_existing();
         sidecars.insert("tools".to_string(), ());
-        let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars)
+        let err = validate_sidecar_spec(&tools_sidecar(), &clients, &sidecars, true)
             .expect_err("duplicate sidecar name must fail");
         assert!(err.to_string().contains("already running"), "{err}");
+    }
+
+    fn view_sidecar() -> SidecarSpec {
+        SidecarSpec::from_image("fs", "docker.io/mcp/filesystem:latest")
+            .with_view(SidecarView::Primary)
+            .with_entrypoint_server("fs", ["/"])
+    }
+
+    #[test]
+    fn validate_accepts_a_primary_view_entrypoint_spec() {
+        validate_alone(&view_sidecar()).expect("spec is valid");
+    }
+
+    /// [`config_error`] for the `[sidecars.fs]` block [`view_sidecar`] mirrors,
+    /// with `tail` appended -- so each parity test below shows only the key
+    /// that makes its case.
+    fn view_config_error(tail: &str) -> String {
+        config_error(&format!(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+ws = {{ sidecar = "fs" }}
+[sidecars.fs]
+image = "docker.io/mcp/filesystem:latest"
+view = "primary"
+{tail}
+"#
+        ))
+    }
+
+    #[test]
+    fn validate_rejects_primary_view_with_workspace() {
+        let err = validate_alone(&view_sidecar().with_workspace_access(SidecarWorkspaceAccess::Ro))
+            .expect_err("view + workspace are mutually exclusive");
+        assert_eq!(
+            err.to_string(),
+            view_config_error(r#"workspace = "ro""#),
+            "the two paths must produce the same text from the same code"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_primary_view_with_dropped_caps() {
+        let spec = view_sidecar().with_security(SecuritySpec {
+            capabilities: CapabilitySpec::new(CapabilityProfile::DropAll),
+            ..SecuritySpec::default()
+        });
+        let err = validate_alone(&spec).expect_err("the view needs SYS_ADMIN / SYS_PTRACE");
+        assert_eq!(
+            err.to_string(),
+            view_config_error("[sidecars.fs.security]\ncapability-profile = \"drop-all\""),
+            "the two paths must produce the same text from the same code"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_entrypoint_host_with_a_second_server() {
+        let spec = SidecarSpec::from_image("fs", "img:1")
+            .with_entrypoint_server("fs", ["/"])
+            .with_server("extra", vec!["mcp-extra".to_string()]);
+        let err = validate_alone(&spec).expect_err("an entrypoint host serves exactly one");
+        assert!(
+            err.to_string().contains(
+                "the container process is the server, so an entrypoint host serves \
+                           exactly one"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_primary_view_over_an_exec_server() {
+        let spec = SidecarSpec::from_image("fs", "img:1")
+            .with_view(SidecarView::Primary)
+            .with_server("fs", vec!["mcp-fs".to_string()]);
+        let err = validate_alone(&spec).expect_err("the view is entrypoint-stdio only");
+        assert!(
+            err.to_string().contains("it is entrypoint-stdio only"),
+            "{err}"
+        );
+    }
+
+    /// A build without the musl target embeds no launcher, so a
+    /// `view = "primary"` spec has to fail before any container exists --
+    /// naming the artifact rather than surfacing an opaque podman error.
+    #[test]
+    fn validate_rejects_primary_view_without_the_helper() {
+        let (clients, sidecars) = no_existing();
+        let err = validate_sidecar_spec(&view_sidecar(), &clients, &sidecars, false)
+            .expect_err("no launcher, no view");
+        let msg = err.to_string();
+        assert!(msg.contains("filesystem-view helper"), "{msg}");
+        assert!(msg.contains("unknown-linux-musl"), "{msg}");
+    }
+
+    /// The helper check runs after the placement rules, so a spec that is
+    /// wrong on its own terms says so rather than blaming the toolchain.
+    #[test]
+    fn placement_errors_outrank_a_missing_helper() {
+        let (clients, sidecars) = no_existing();
+        let spec = view_sidecar().with_workspace_access(SidecarWorkspaceAccess::Ro);
+        let err = validate_sidecar_spec(&spec, &clients, &sidecars, false)
+            .expect_err("spec is invalid either way");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
     }
 
     /// Translate the `[images.primary]` block of `toml_src` the way
     /// `from_config` does, minus the async image resolution -- so sidecar
     /// images stay their unresolved config refs.
-    fn launch_parts(toml_src: &str) -> Result<(BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>)> {
+    fn launch_parts(toml_src: &str) -> (BTreeMap<String, McpServerSpec>, Vec<SidecarSpec>) {
         let config: Config = toml::from_str(toml_src).expect("parse config");
         let cfg = config.images.get("primary").expect("primary image-config");
         plan_to_launch_parts(&sidecar::plan_from_config(&config, cfg), Path::new("/repo"))
@@ -1192,8 +1596,7 @@ image-name = "primary:latest"
 fs = { command = ["mcp-fs", "/workspace"] }
 shell = ["bash", "-lc", "sh"]
 "#,
-        )
-        .expect("translation succeeds");
+        );
 
         let names: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
         assert_eq!(names, ["fs", "shell"]);
@@ -1219,8 +1622,7 @@ access = "read-write"
 [sidecars.tools.security]
 capability-profile = "no-net-raw"
 "#,
-        )
-        .expect("translation succeeds");
+        );
 
         let primary: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
         assert_eq!(primary, ["fs"], "placed server left the primary map");
@@ -1240,8 +1642,11 @@ capability-profile = "no-net-raw"
             CapabilityProfile::NoNetRaw
         );
         let lint = &tools.servers["lint"];
-        assert_eq!(lint.command, ["mcp-lint", "--stdio"]);
-        assert!(lint.env.contains_key("LINT"));
+        assert_eq!(
+            lint.command(),
+            Some(&["mcp-lint".into(), "--stdio".into()][..])
+        );
+        assert!(lint.env().contains_key("LINT"));
     }
 
     #[test]
@@ -1253,14 +1658,16 @@ image-name = "primary:latest"
 [images.primary.mcp]
 grep = { command = ["mcp-grep"], image = "ghcr.io/example/mcp-grep:1" }
 "#,
-        )
-        .expect("translation succeeds");
+        );
 
         assert!(mcp.is_empty(), "anonymous server is sidecar-placed");
         assert_eq!(sidecars.len(), 1);
         assert_eq!(sidecars[0].name, "grep");
         assert_eq!(sidecars[0].image, "ghcr.io/example/mcp-grep:1");
-        assert_eq!(sidecars[0].servers["grep"].command, ["mcp-grep"]);
+        assert_eq!(
+            sidecars[0].servers["grep"].command(),
+            Some(&["mcp-grep".into()][..])
+        );
     }
 
     #[test]
@@ -1275,8 +1682,7 @@ lint = { command = ["mcp-lint"], sidecar = "tools" }
 image = "mcp-tools"
 start = "manual"
 "#,
-        )
-        .expect("translation succeeds");
+        );
 
         assert!(
             mcp.is_empty(),
@@ -1289,19 +1695,115 @@ start = "manual"
     }
 
     #[test]
-    fn from_config_rejects_entrypoint_stdio() {
-        let err = launch_parts(
+    fn from_config_lowers_inline_entrypoint_stdio() {
+        let (mcp, sidecars) = launch_parts(
             r#"
 [images.primary]
 image-name = "primary:latest"
 [images.primary.mcp]
-fetch = { image = "ghcr.io/example/mcp-fetch:2", env = { TOKEN = "abc" } }
+fetch = { image = "ghcr.io/example/mcp-fetch:2", args = ["/workspace"], env = { TOKEN = "abc" } }
 "#,
-        )
-        .expect_err("entrypoint-stdio has no library form");
-        let msg = err.to_string();
-        assert!(msg.contains("fetch"), "{msg}");
-        assert!(msg.contains("entrypoint-stdio"), "{msg}");
+        );
+
+        assert!(mcp.is_empty(), "entrypoint server is sidecar-placed");
+        assert_eq!(sidecars.len(), 1);
+        let fetch = &sidecars[0];
+        assert_eq!(
+            fetch.name, "fetch",
+            "anonymous sidecar takes its server's name"
+        );
+        assert_eq!(fetch.image, "ghcr.io/example/mcp-fetch:2");
+        assert_eq!(fetch.view, SidecarView::None);
+
+        let server = &fetch.servers["fetch"];
+        assert!(
+            server.is_entrypoint(),
+            "no command -> the ENTRYPOINT is the server"
+        );
+        assert_eq!(server.command(), None);
+        assert_eq!(server.args(), ["/workspace"]);
+        assert!(server.env().contains_key("TOKEN"));
+    }
+
+    /// `args` on the `[sidecars.<sc>]` block reaches the spec just as an
+    /// entry's own does -- `entrypoint_args` picks between them at the
+    /// lowering boundary, so the spec carries one unambiguous slot.
+    #[test]
+    fn from_config_lowers_block_args_for_named_entrypoint_host() {
+        let (_, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+ws = { sidecar = "served" }
+[sidecars.served]
+image = "entry:1"
+workspace = "ro"
+args = ["/workspace"]
+"#,
+        );
+
+        let served = &sidecars[0];
+        assert_eq!(served.workspace, SidecarWorkspaceAccess::Ro);
+        assert_eq!(served.servers["ws"].args(), ["/workspace"]);
+    }
+
+    /// A config-declared entrypoint sidecar and the hand-built spec a library
+    /// caller would write for it lower to the same thing, which is what makes
+    /// the two paths produce the same containers, argv, and labels downstream:
+    /// everything after this point -- `sidecar_container_name`, the label map,
+    /// `entrypoint_create_args` -- reads only these fields.
+    #[test]
+    fn config_and_hand_built_entrypoint_specs_agree() {
+        let (_, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+ws = { sidecar = "served" }
+[sidecars.served]
+image = "entry:1"
+workspace = "ro"
+args = ["/workspace"]
+"#,
+        );
+        let lowered = &sidecars[0];
+        let hand_built = SidecarSpec::from_image("served", "entry:1")
+            .with_workspace_access(SidecarWorkspaceAccess::Ro)
+            .with_entrypoint_server("ws", ["/workspace"]);
+
+        assert_eq!(lowered.name, hand_built.name);
+        assert_eq!(lowered.image, hand_built.image);
+        assert_eq!(lowered.workspace, hand_built.workspace);
+        assert_eq!(lowered.view, hand_built.view);
+        assert_eq!(lowered.mounts.len(), hand_built.mounts.len());
+        assert_eq!(
+            lowered.servers.keys().collect::<Vec<_>>(),
+            hand_built.servers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            lowered.servers["ws"].args(),
+            hand_built.servers["ws"].args()
+        );
+        assert_eq!(
+            lowered.servers["ws"].command(),
+            hand_built.servers["ws"].command()
+        );
+    }
+
+    #[test]
+    fn from_config_lowers_primary_view() {
+        let (_, sidecars) = launch_parts(
+            r#"
+[images.primary]
+image-name = "primary:latest"
+[images.primary.mcp]
+fs = { image = "docker.io/mcp/filesystem:latest", view = "primary", args = ["/"] }
+"#,
+        );
+
+        assert_eq!(sidecars[0].view, SidecarView::Primary);
+        assert_eq!(sidecars[0].servers["fs"].args(), ["/"]);
     }
 
     #[test]
@@ -1321,8 +1823,7 @@ image = "mcp-tools"
 image = "mcp-later"
 start = "manual"
 "#,
-        )
-        .expect("translation succeeds");
+        );
 
         let primary: Vec<&str> = mcp.keys().map(|k| k.as_str()).collect();
         assert_eq!(primary, ["fs"], "only the unplaced server stays primary");

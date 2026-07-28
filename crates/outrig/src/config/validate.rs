@@ -710,41 +710,122 @@ fn validate_sidecar_hosting(
     sidecar_name: &str,
     sidecar: &super::SidecarConfig,
 ) -> Result<(), ConfigValidationError> {
-    // `view = "primary"` runs the launcher as the container ENTRYPOINT, so
-    // every server this block hosts for this image must be entrypoint-stdio.
-    if sidecar.view == super::SidecarView::Primary
-        && let Some((exec_server, _)) =
-            servers_hosted_in(image, sidecar_name).find(|(_, spec)| !spec.is_entrypoint_stdio())
+    let hosted: Vec<(&str, bool)> = servers_hosted_in(image, sidecar_name)
+        .map(|(name, spec)| (name.as_str(), spec.is_entrypoint_stdio()))
+        .collect();
+    check_entrypoint_hosting(image_name, sidecar_name, sidecar.view, &hosted)?;
+
+    // `start` has no library counterpart -- a `SidecarSpec` starts when the
+    // caller adds it -- so this rule stays here rather than in the shared
+    // check above.
+    if sidecar.start == super::SidecarStart::Manual
+        && let Some((server, _)) = hosted.iter().find(|(_, entrypoint)| *entrypoint)
     {
-        return Err(ConfigValidationError::SidecarViewRequiresEntrypoint {
-            image: image_name.to_string(),
-            sidecar: sidecar_name.to_string(),
-            server: exec_server.clone(),
-        });
-    }
-
-    let Some((server, _)) =
-        servers_hosted_in(image, sidecar_name).find(|(_, spec)| spec.is_entrypoint_stdio())
-    else {
-        return Ok(());
-    };
-
-    if let Some((other, _)) = servers_hosted_in(image, sidecar_name).find(|(n, _)| *n != server) {
-        return Err(ConfigValidationError::SidecarEntrypointNotAlone {
-            image: image_name.to_string(),
-            sidecar: sidecar_name.to_string(),
-            server: server.clone(),
-            other: other.clone(),
-        });
-    }
-    if sidecar.start == super::SidecarStart::Manual {
         return Err(ConfigValidationError::SidecarEntrypointNotAuto {
             image: image_name.to_string(),
             sidecar: sidecar_name.to_string(),
-            server: server.clone(),
+            server: (*server).to_string(),
         });
     }
     Ok(())
+}
+
+/// The placement rules that follow from *which* servers a sidecar hosts:
+/// `view = "primary"` runs the `outrig-enter` launcher as the container
+/// ENTRYPOINT, so every server must be entrypoint-stdio; and because the
+/// container process is the server, an entrypoint host serves exactly one.
+///
+/// `hosted` is `(server name, is entrypoint-stdio)` in name order. Taking that
+/// rather than an `ImageConfig` is what lets the library facade's hand-built
+/// [`SidecarSpec`] run the identical checks -- the config path passes its
+/// image-config name as `scope`, the library path its podman image ref.
+///
+/// [`SidecarSpec`]: crate::SidecarSpec
+pub(crate) fn check_entrypoint_hosting(
+    scope: &str,
+    sidecar_name: &str,
+    view: super::SidecarView,
+    hosted: &[(&str, bool)],
+) -> Result<(), ConfigValidationError> {
+    if view == super::SidecarView::Primary
+        && let Some((exec_server, _)) = hosted.iter().find(|(_, entrypoint)| !*entrypoint)
+    {
+        return Err(ConfigValidationError::SidecarViewRequiresEntrypoint {
+            image: scope.to_string(),
+            sidecar: sidecar_name.to_string(),
+            server: (*exec_server).to_string(),
+        });
+    }
+
+    let Some((server, _)) = hosted.iter().find(|(_, entrypoint)| *entrypoint) else {
+        return Ok(());
+    };
+    if let Some((other, _)) = hosted.iter().find(|(name, _)| name != server) {
+        return Err(ConfigValidationError::SidecarEntrypointNotAlone {
+            image: scope.to_string(),
+            sidecar: sidecar_name.to_string(),
+            server: (*server).to_string(),
+            other: (*other).to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The `view = "primary"` exclusions that hold however a sidecar was declared.
+/// Shared with the library facade so a hand-built [`SidecarSpec`] is rejected
+/// by this code, with this text, rather than by a parallel copy of it.
+///
+/// [`SidecarSpec`]: crate::SidecarSpec
+pub(crate) fn check_view_exclusions(
+    sidecar_name: &str,
+    view: super::SidecarView,
+    workspace: super::SidecarWorkspaceAccess,
+    capability_profile: super::CapabilityProfile,
+) -> Result<(), ConfigValidationError> {
+    if view != super::SidecarView::Primary {
+        return Ok(());
+    }
+    // The primary's view already holds the workspace at its real path;
+    // re-binding it over that is contradictory.
+    if workspace != super::SidecarWorkspaceAccess::None {
+        return Err(ConfigValidationError::SidecarViewWorkspaceConflict {
+            sidecar: sidecar_name.to_string(),
+        });
+    }
+    // The view needs the mount capabilities; drop-all removes them, so the
+    // config is contradictory rather than silently re-added.
+    if capability_profile == super::CapabilityProfile::DropAll {
+        return Err(ConfigValidationError::SidecarViewDropsCaps {
+            sidecar: sidecar_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// A sidecar name embeds in container names, so it has to match
+/// `^[A-Za-z0-9][A-Za-z0-9_-]*$` however it was declared.
+pub(crate) fn check_sidecar_name(sidecar_name: &str) -> Result<(), ConfigValidationError> {
+    if sidecar_name_re().is_match(sidecar_name) {
+        return Ok(());
+    }
+    Err(ConfigValidationError::SidecarNameInvalid {
+        sidecar: sidecar_name.to_string(),
+    })
+}
+
+/// A sidecar's image ref must be non-empty. Deliberately not resolved here:
+/// like `--image`, an unmatched name falls through to raw-podman-ref semantics
+/// and fails at start time if the ref is absent locally.
+pub(crate) fn check_sidecar_image(
+    sidecar_name: &str,
+    image: &str,
+) -> Result<(), ConfigValidationError> {
+    if !image.trim().is_empty() {
+        return Ok(());
+    }
+    Err(ConfigValidationError::SidecarImageEmpty {
+        sidecar: sidecar_name.to_string(),
+    })
 }
 
 /// A block's `args` is its ENTRYPOINT's argv, so it needs *some* image-config
@@ -782,36 +863,18 @@ fn validate_sidecar(
     sidecar_name: &str,
     sidecar: &super::SidecarConfig,
 ) -> Result<(), ConfigValidationError> {
-    if !sidecar_name_re().is_match(sidecar_name) {
-        return Err(ConfigValidationError::SidecarNameInvalid {
-            sidecar: sidecar_name.to_string(),
-        });
-    }
-    if sidecar.image.trim().is_empty() {
-        return Err(ConfigValidationError::SidecarImageEmpty {
-            sidecar: sidecar_name.to_string(),
-        });
-    }
+    check_sidecar_name(sidecar_name)?;
+    check_sidecar_image(sidecar_name, &sidecar.image)?;
 
     let scope = format!("sidecars.{sidecar_name}");
     validate_security(&scope, &sidecar.security)?;
 
-    if sidecar.view == super::SidecarView::Primary {
-        // The primary's view already holds the workspace at its real path;
-        // re-binding it over that is contradictory.
-        if sidecar.workspace != super::SidecarWorkspaceAccess::None {
-            return Err(ConfigValidationError::SidecarViewWorkspaceConflict {
-                sidecar: sidecar_name.to_string(),
-            });
-        }
-        // The view needs the mount capabilities; drop-all removes them, so the
-        // config is contradictory rather than silently re-added.
-        if sidecar.security.capability_profile == super::CapabilityProfile::DropAll {
-            return Err(ConfigValidationError::SidecarViewDropsCaps {
-                sidecar: sidecar_name.to_string(),
-            });
-        }
-    }
+    check_view_exclusions(
+        sidecar_name,
+        sidecar.view,
+        sidecar.workspace,
+        sidecar.security.capability_profile,
+    )?;
 
     // The workspace mount (when enabled) reuses the session's container path,
     // so extra mounts must not collide with it.
@@ -951,10 +1014,6 @@ fn check_mount_list(
 
 pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
     mcp_server_name_re().is_match(server)
-}
-
-pub(crate) fn is_valid_sidecar_name(name: &str) -> bool {
-    sidecar_name_re().is_match(name)
 }
 
 /// A build image's config name becomes the repository of its container image

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The library API reaches every sidecar placement.** A hand-built `SidecarSpec` can now host
+  an entrypoint-stdio server -- one with no `command`, whose container's `ENTRYPOINT` is the
+  server -- with `SidecarSpec::with_entrypoint_server(name, args)`, and can run it against the
+  primary container's filesystem view with `with_view(SidecarView::Primary)`. `SidecarView` is
+  re-exported from the crate root beside `SidecarWorkspaceAccess`. Both `Outrig::add_sidecar`
+  and `LaunchSpec::with_sidecar` accept them, so an embedding program reaches the same tool
+  topology as `outrig run` -- including serving an off-the-shelf MCP image over the primary's
+  own tree. `SidecarSpec::with_server_spec(name, server)` is the general form the other
+  `with_*server` methods are shorthands for, for a server that needs both a transport and an
+  environment.
+
+  `view = "primary"` from the library is the same posture change it is from the CLI
+  (`CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace), and a build without
+  the `<arch>-unknown-linux-musl` helper fails before any container is created, naming the
+  missing artifact. The helper is materialized into the `LaunchSpec`'s log directory.
+
+  The placement rules are no longer duplicated: a hand-built spec that sets `view = "primary"`
+  alongside workspace access, or hosts an entrypoint server next to another server, is rejected
+  by the same code and with the same message as the equivalent `[sidecars.<sc>]` block.
+- **`Outrig::exec_stdio` and `Outrig::exec_capture`** run a command in the *primary* container
+  as the session's runtime user -- the first streaming, the second returning a
+  `std::process::Output` with a non-zero exit reported as data rather than an error. The
+  primary `Container` stays private, so an embedder cannot stop a container the session owns.
 - **Arguments for entrypoint-stdio MCP servers** -- an `args` key on `[images.<name>.mcp]`
   entries and on `[sidecars.<sc>]` blocks supplies the container's trailing argv,
   so images that take their configuration positionally (`docker.io/mcp/filesystem` and most of
@@ -21,6 +44,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `SidecarServerSpec` is now a two-variant enum rather than a struct, since a
+  sidecar server is either exec-stdio (a `command`) or entrypoint-stdio (`args`, no command).
+  `SidecarServerSpec::new(command)` becomes `SidecarServerSpec::exec(command)`, mirroring
+  `McpServerSpec::exec`, and its sibling is `SidecarServerSpec::entrypoint(args)`. Both
+  variants are sealed, so `env` is attached with `with_env` instead of by field assignment, and
+  read back through the `command()` / `args()` / `env()` / `is_entrypoint()` accessors.
+  `SidecarSpec::with_server` and `with_server_env` are unchanged.
+
+  `SidecarSpec` also gained a `view` field. Because the type is `#[non_exhaustive]`, callers
+  that build it through `from_image` plus `with_*` need no change.
+- **Breaking:** `LaunchSpec::from_config` no longer errors on an entrypoint-stdio placement.
+  It lowers one into a `SidecarSpec` like any other placement, carrying `view` and resolving
+  `args` from whichever of the entry or the sidecar block declared them. Code matching on that
+  error to fall back to the CLI can drop the fallback.
+
+  Two config keys still have no library counterpart, and a repo config that uses them behaves
+  differently under `Outrig::launch` than under `outrig run`: `start = "manual"` sidecars are
+  skipped rather than carried, and `on-failure = "warn"` is not honored -- launch-time sidecars
+  are abort-only, so a config that degrades gracefully in the CLI fails the whole launch here.
+  Both were already true; they are called out now that entrypoint hosts (which cannot be
+  `start = "manual"` at all) make the surface worth stating.
 - **Breaking:** every public struct and enum that stays public is now `#[non_exhaustive]`, so
   adding a field or a variant stops being a breaking change. Downstream crates can no longer
   build these types with a struct literal -- including with `..Default::default()`, which the
@@ -111,6 +155,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately: `config`, `container`, `error`, `image`, `mcp_proxy`, and `network` are all
   supported API, so a caller can drive containers, images, and egress policy directly rather than
   only through the `Outrig` facade.
+
+### Fixed
+
+- A `view = "primary"` sidecar whose image declares an **absolute** `ENTRYPOINT` no longer
+  fails to start. `build_primary_view_argv` graft-prefixed the payload's program, but
+  `outrig-enter` opens that program before joining the primary's namespace -- while the
+  sidecar's own rootfs is still at `/` -- and applies the graft itself when handing the path to
+  the loader, so the program was being looked for under the graft twice. The program is now
+  passed bare and every other image-declared element keeps its prefix.
+
+  An image whose `ENTRYPOINT` is a *relative* program name (`["node", "/app/dist/index.js"]`,
+  which is `docker.io/mcp/filesystem:latest`) still fails: the launcher does no `PATH` search.
+  That is tracked separately.
 
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-07-24
 

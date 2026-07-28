@@ -19,7 +19,7 @@ mod userdb;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 use std::time::Duration;
@@ -993,6 +993,18 @@ impl Container {
         env: &BTreeMap<String, String>,
     ) -> Result<Child> {
         process::spawn_stdio(self.build_exec_argv(cmd, env)).await
+    }
+
+    /// [`Self::exec_stdio`], driven to completion: stdout and stderr are
+    /// drained concurrently and returned with the exit status. A non-zero
+    /// exit is reported in [`Output::status`], not as an error -- the command
+    /// ran, and what it made of its arguments is the caller's to judge.
+    pub async fn exec_capture(
+        &self,
+        cmd: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> Result<Output> {
+        process::try_capture(self.build_exec_argv(cmd, env)).await
     }
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {

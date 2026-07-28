@@ -17,6 +17,7 @@
 //! namespace is flat.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::config::{
     Config, ContainerSecurity, ImageConfig, McpServerSpec, MountConfig, SidecarOnFailure,
@@ -135,10 +136,8 @@ impl SessionMcpPlan {
     /// --attach` that *is* the server. Such a container keeps the image's own
     /// `USER`, mounts or not.
     pub fn sidecar_needs_bootstrap(&self, sidecar: &SidecarPlan) -> bool {
-        if self.entrypoint_server_in(sidecar).is_some() {
-            return false;
-        }
         bootstrap_needed(
+            self.entrypoint_server_in(sidecar).is_some(),
             self.servers_in(&sidecar.name)
                 .any(|(_, placed)| placed.spec.has_command()),
             sidecar.workspace,
@@ -199,12 +198,22 @@ fn graft_prefix(elem: &str, graft: &str) -> String {
 /// Build the trailing argv a `view = "primary"` sidecar hands `outrig-enter`:
 /// the launcher flags, `--`, then the payload command.
 ///
-/// The payload is the sidecar image's ENTRYPOINT (graft-prefixed -- those name
-/// files in the sidecar's *own* rootfs, now under `graft`) followed by either
-/// the config-supplied `config_args` (bare -- they name paths in the *primary's*
-/// view) when present, or the image's CMD (graft-prefixed) otherwise. That
-/// mirrors OCI's "args replace CMD" while honoring the argument asymmetry:
-/// image-declared elements are grafted, user-declared ones are not.
+/// The payload is the sidecar image's ENTRYPOINT followed by either the
+/// config-supplied `config_args` when present, or the image's CMD otherwise --
+/// mirroring OCI's "args replace CMD". Two prefixing rules apply on top:
+///
+/// - Image-declared elements are graft-prefixed; they name files in the
+///   sidecar's *own* rootfs, which lands under `graft` after the setns.
+///   Config-declared `config_args` are passed bare: they name paths in the
+///   *primary's* view.
+/// - The payload's **program** -- its first element -- is always bare, even
+///   though it is image-declared. The launcher opens it before the setns,
+///   while the sidecar's own rootfs is still at `/`, and applies the graft
+///   itself when handing the path to the loader. Prefixing it here would make
+///   the launcher look for `<graft><graft>/...`.
+///
+/// Relative elements pass through unprefixed either way -- they are not files
+/// in the sidecar rootfs we can relocate.
 pub fn build_primary_view_argv(
     entrypoint: &[String],
     cmd: &[String],
@@ -222,27 +231,88 @@ pub fn build_primary_view_argv(
         cwd.to_string(),
         "--".to_string(),
     ];
-    argv.extend(entrypoint.iter().map(|e| graft_prefix(e, graft)));
-    if config_args.is_empty() {
-        argv.extend(cmd.iter().map(|c| graft_prefix(c, graft)));
+    // Built in one pass rather than prefixing and then stripping back: a
+    // config arg is legitimately allowed to name a path under the graft point
+    // in the primary's view, and stripping would silently rewrite it.
+    let (image_tail, bare_tail): (&[String], &[String]) = if config_args.is_empty() {
+        (cmd, &[])
     } else {
-        argv.extend(config_args.iter().cloned());
-    }
+        (&[], config_args)
+    };
+    let mut image_declared = entrypoint.iter().chain(image_tail);
+    argv.extend(image_declared.next().cloned());
+    argv.extend(image_declared.map(|e| graft_prefix(e, graft)));
+    argv.extend(bare_tail.iter().cloned());
     argv
 }
 
-/// Whether an *exec-stdio* sidecar needs the in-container user bootstrap: it
-/// hosts at least one exec-stdio server (exec needs `--user` and `HOME`), sees
-/// the workspace, or declares mounts. Shared by the config-plan path and
-/// `Outrig::add_sidecar`'s `SidecarSpec` path, which cannot declare entrypoint
-/// hosts at all. [`SessionMcpPlan::sidecar_needs_bootstrap`] short-circuits
-/// ahead of this for entrypoint hosts, which never bootstrap.
+/// The trailing argv an entrypoint-stdio sidecar's container is created with,
+/// for either filesystem view.
+///
+/// With [`SidecarView::None`] the image's ENTRYPOINT runs directly and `args`
+/// are its positional arguments. With [`SidecarView::Primary`] the container's
+/// entrypoint is the `outrig-enter` launcher instead, so the real payload has
+/// to be reconstructed from the image's own ENTRYPOINT/CMD and handed over
+/// behind the launcher's flags -- which is what [`build_primary_view_argv`]
+/// does, with the `PRIMARY_VIEW_*` bind targets filled in here.
+///
+/// Both the CLI's session setup and the library facade's `add_sidecar` build
+/// their `podman create` arguments through this one function, so a session
+/// launched from a `Config` and one launched from a hand-built spec cannot
+/// drift.
+///
+/// `container_workspace` becomes the payload's working directory. A session
+/// without a workspace passes an empty path and lands on `/` -- the only
+/// directory the primary's view is guaranteed to have.
+pub fn entrypoint_create_args(
+    view: SidecarView,
+    image_entrypoint: &[String],
+    image_cmd: &[String],
+    args: &[String],
+    container_workspace: &Path,
+) -> Vec<String> {
+    match view {
+        SidecarView::Primary => {
+            let cwd = container_workspace.to_string_lossy();
+            build_primary_view_argv(
+                image_entrypoint,
+                image_cmd,
+                args,
+                super::PRIMARY_VIEW_GRAFT,
+                if cwd.is_empty() { "/" } else { &cwd },
+                &format!(
+                    "{}/{}",
+                    super::PRIMARY_VIEW_NS_MOUNT,
+                    super::PRIMARY_VIEW_NS_FILE
+                ),
+            )
+        }
+        // Spelled out rather than a catch-all: `#[non_exhaustive]` does not
+        // suppress exhaustiveness inside the defining crate, so a third view
+        // mode is a compile error here rather than silently meaning "no view",
+        // which would run the sidecar's own ENTRYPOINT instead of the launcher.
+        SidecarView::None => args.to_vec(),
+    }
+}
+
+/// Whether a sidecar needs the in-container user bootstrap: it hosts at least
+/// one exec-stdio server (exec needs `--user` and `HOME`), sees the workspace,
+/// or declares mounts.
+///
+/// An entrypoint host never does, whatever else it declares -- bootstrap runs
+/// over `podman exec`, and there is no window for it between `podman create`
+/// and the `podman start --attach` that *is* the server, so such a container
+/// keeps the image's own `USER`. That short-circuit lives here rather than in
+/// each caller: the config-plan path and `Outrig::add_sidecar`'s `SidecarSpec`
+/// path both host entrypoint servers, and the rule is the same for both.
 pub(crate) fn bootstrap_needed(
+    is_entrypoint_host: bool,
     hosts_exec_server: bool,
     workspace: SidecarWorkspaceAccess,
     has_mounts: bool,
 ) -> bool {
-    hosts_exec_server || workspace != SidecarWorkspaceAccess::None || has_mounts
+    !is_entrypoint_host
+        && (hosts_exec_server || workspace != SidecarWorkspaceAccess::None || has_mounts)
 }
 
 /// Build the config-declared half of the plan: the `[sidecars.<sc>]` blocks
@@ -632,10 +702,12 @@ fetch = { image = "ghcr.io/example/mcp-fetch:2" }
     #[test]
     fn bootstrap_needed_axes() {
         use SidecarWorkspaceAccess::{None as NoWs, Ro};
-        assert!(!bootstrap_needed(false, NoWs, false));
-        assert!(bootstrap_needed(true, NoWs, false));
-        assert!(bootstrap_needed(false, Ro, false));
-        assert!(bootstrap_needed(false, NoWs, true));
+        assert!(!bootstrap_needed(false, false, NoWs, false));
+        assert!(bootstrap_needed(false, true, NoWs, false));
+        assert!(bootstrap_needed(false, false, Ro, false));
+        assert!(bootstrap_needed(false, false, NoWs, true));
+        // An entrypoint host is exempt on every axis at once.
+        assert!(!bootstrap_needed(true, true, Ro, true));
     }
 
     #[test]
@@ -777,7 +849,8 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
     #[test]
     fn primary_view_argv_grafts_entrypoint_passes_config_args_bare() {
         // The task's worked example: image ENTRYPOINT grafted, config `args`
-        // (a target path) passed bare.
+        // (a target path) passed bare -- except the program itself, which the
+        // launcher opens pre-setns and grafts on its own.
         let argv = build_primary_view_argv(
             &[
                 "/usr/local/bin/node".to_string(),
@@ -799,7 +872,10 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
                 "--cwd",
                 "/workspace",
                 "--",
-                "/mnt/usr/local/bin/node",
+                // Bare: `outrig-enter` opens this before the setns, while the
+                // sidecar's own rootfs is still at `/`, then re-prefixes it
+                // with the graft when handing it to the loader.
+                "/usr/local/bin/node",
                 "/mnt/app/dist/index.js",
                 "/workspace",
             ]
@@ -828,9 +904,119 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
                 "--cwd",
                 "/",
                 "--",
-                "/mnt/bin/server",
+                "/bin/server",
                 "/mnt/default/dir",
             ]
         );
+    }
+
+    /// When the image declares no ENTRYPOINT, CMD supplies the program, so the
+    /// bare-program rule has to apply to the CMD element instead.
+    #[test]
+    fn primary_view_argv_leaves_a_cmd_supplied_program_bare() {
+        let argv = build_primary_view_argv(
+            &[],
+            &["/bin/server".to_string(), "/default/dir".to_string()],
+            &[],
+            "/mnt",
+            "/",
+            "/target-ns/mnt",
+        );
+        assert_eq!(&argv[7..], ["/bin/server", "/mnt/default/dir"]);
+    }
+
+    /// A config arg may legitimately name a path that starts with the graft
+    /// point -- `/mnt` is an ordinary directory in the primary's view. The
+    /// bare-program rule must not rewrite it, which a "prefix everything then
+    /// strip the program back" formulation would.
+    #[test]
+    fn primary_view_argv_does_not_rewrite_a_config_arg_under_the_graft_point() {
+        let argv = build_primary_view_argv(
+            &["/bin/server".to_string()],
+            &[],
+            &["/mnt/data".to_string()],
+            "/mnt",
+            "/",
+            "/target-ns/mnt",
+        );
+        assert_eq!(&argv[7..], ["/bin/server", "/mnt/data"]);
+
+        // Same, with the config arg in the program slot (no ENTRYPOINT).
+        let argv = build_primary_view_argv(
+            &[],
+            &[],
+            &["/mnt/data".to_string()],
+            "/mnt",
+            "/",
+            "/target-ns/mnt",
+        );
+        assert_eq!(&argv[7..], ["/mnt/data"]);
+    }
+
+    #[test]
+    fn entrypoint_create_args_passes_args_through_without_a_view() {
+        // No view: the image's own ENTRYPOINT runs, so its ENTRYPOINT/CMD are
+        // podman's business and only the positional arguments are ours.
+        assert_eq!(
+            entrypoint_create_args(
+                SidecarView::None,
+                &["/bin/server".to_string()],
+                &["/default/dir".to_string()],
+                &["/workspace".to_string()],
+                Path::new("/workspace"),
+            ),
+            ["/workspace"]
+        );
+    }
+
+    /// The config path and the library path build their `podman create`
+    /// arguments through this one function, so equivalent inputs cannot
+    /// produce different argv. Pinned against the constants rather than
+    /// against `build_primary_view_argv`'s hand-passed strings, which is the
+    /// duplication this function exists to remove.
+    #[test]
+    fn entrypoint_create_args_fills_in_the_primary_view_bind_targets() {
+        let argv = entrypoint_create_args(
+            SidecarView::Primary,
+            &["/usr/local/bin/node".to_string()],
+            &[],
+            &["/workspace".to_string()],
+            Path::new("/workspace"),
+        );
+        assert_eq!(
+            argv,
+            build_primary_view_argv(
+                &["/usr/local/bin/node".to_string()],
+                &[],
+                &["/workspace".to_string()],
+                super::super::PRIMARY_VIEW_GRAFT,
+                "/workspace",
+                &format!(
+                    "{}/{}",
+                    super::super::PRIMARY_VIEW_NS_MOUNT,
+                    super::super::PRIMARY_VIEW_NS_FILE
+                ),
+            )
+        );
+        assert_eq!(argv[0], "--ns-file");
+        assert_eq!(argv[1], "/target-ns/mnt");
+        assert_eq!(argv[3], "/mnt");
+    }
+
+    /// A session with no workspace has an empty container path. `--cwd ""`
+    /// would make the launcher `chdir("")` and die, so the fallback lives in
+    /// the function that owns the flag rather than in whichever caller happens
+    /// to be able to produce it.
+    #[test]
+    fn entrypoint_create_args_falls_back_to_root_without_a_workspace() {
+        let argv = entrypoint_create_args(
+            SidecarView::Primary,
+            &["/bin/server".to_string()],
+            &[],
+            &[],
+            Path::new(""),
+        );
+        assert_eq!(argv[4], "--cwd");
+        assert_eq!(argv[5], "/");
     }
 }

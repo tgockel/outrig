@@ -17,6 +17,15 @@
 //! `--cap-add=SYS_ADMIN` (setns is gated on it) and `--cap-add=SYS_PTRACE`
 //! (to open the target's nsfs file).
 //!
+//! **The argv contract, which the caller depends on:** `PROGRAM` is in *this*
+//! container's coordinates, ungrafted -- it is opened before the setns, while
+//! this image's rootfs is still at `/`, and the graft is applied to it here
+//! when handing the path to the loader. `ARGS...` are in the *target's*
+//! coordinates and are passed through untouched. `container::sidecar`'s
+//! `build_primary_view_argv` is the producer that honors this; changing either
+//! side alone silently breaks the other, and the failure looks like an image
+//! that cannot find its own interpreter.
+//!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
 //! Linux musl target; it is not part of the normal `cargo build`. The pure ELF
 //! logic it relies on lives in `elf.rs`, pulled in below and unit-tested on the

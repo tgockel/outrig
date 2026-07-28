@@ -25,7 +25,7 @@ mod tool_name;
 
 pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
-    NetworkPolicyBuilder, SidecarWorkspaceAccess,
+    NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,
 };
 pub use mcp::{McpClient, McpTool, McpToolResult, resolve_mcp_env};
 pub use outrig_::{

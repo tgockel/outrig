@@ -43,8 +43,7 @@ use outrig::config::{
 };
 use outrig::container::{
     Container, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
-    LABEL_SESSION, LABEL_SIDECAR, PRIMARY_VIEW_GRAFT, PRIMARY_VIEW_NS_FILE, PRIMARY_VIEW_NS_MOUNT,
-    PrimaryView, embedded, enter,
+    LABEL_SESSION, LABEL_SIDECAR, PrimaryView, embedded, enter,
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
 };
 use outrig::error::IoPathExt;
@@ -1092,26 +1091,24 @@ async fn create_one_entrypoint_sidecar(
     let intercept_dns = args.network_mode != NetworkMode::Default;
 
     // A `view = "primary"` sidecar runs `outrig-enter` as its ENTRYPOINT (set in
-    // the launch flags) and hands it the payload command: the image's own
-    // ENTRYPOINT/CMD graft-prefixed, then the config `args` bare (they name
-    // paths in the primary's view). Every other sidecar passes its entrypoint
-    // args straight through.
-    let create_args: Vec<String> = if sc.view == SidecarView::Primary {
+    // the launch flags) and hands it the payload command, which has to be
+    // reconstructed from the image's own ENTRYPOINT/CMD. Every other sidecar
+    // passes its entrypoint args straight through.
+    let (image_entrypoint, image_cmd) = if sc.view == SidecarView::Primary {
         let pv =
             primary_view.expect("primary-view inputs are resolved before any view sidecar starts");
-        let (entrypoint, cmd) = image::read_image_entrypoint_cmd(tag, args.transcript).await?;
         launch.primary_view = Some(pv.clone());
-        sidecar::build_primary_view_argv(
-            &entrypoint,
-            &cmd,
-            sidecar::entrypoint_args(spec, sc),
-            PRIMARY_VIEW_GRAFT,
-            &ctx.container_workspace.to_string_lossy(),
-            &format!("{PRIMARY_VIEW_NS_MOUNT}/{PRIMARY_VIEW_NS_FILE}"),
-        )
+        image::read_image_entrypoint_cmd(tag, args.transcript).await?
     } else {
-        sidecar::entrypoint_args(spec, sc).to_vec()
+        (Vec::new(), Vec::new())
     };
+    let create_args = sidecar::entrypoint_create_args(
+        sc.view,
+        &image_entrypoint,
+        &image_cmd,
+        sidecar::entrypoint_args(spec, sc),
+        ctx.container_workspace,
+    );
 
     let container_name = sidecar_container_name(&ctx, sc);
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));

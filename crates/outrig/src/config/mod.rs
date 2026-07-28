@@ -18,7 +18,10 @@ pub use api_key::{ApiKeyError, ApiKeyRef};
 pub use env_value::{EnvValue, EnvValueError};
 pub use merge::merge;
 pub use validate::{ConfigValidationError, MountRuleViolation};
-pub(crate) use validate::{is_valid_mcp_server_name, is_valid_sidecar_name, mcp_command_is_empty};
+pub(crate) use validate::{
+    check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
+    is_valid_mcp_server_name, mcp_command_is_empty,
+};
 
 use crate::error::{IoPathExt, OutrigError, Result};
 

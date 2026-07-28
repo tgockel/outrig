@@ -17,10 +17,15 @@ use std::path::{Path, PathBuf};
 use outrig::config::{Config, McpServerSpec};
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountAccess, MountSpec,
-    NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarWorkspaceAccess,
+    NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
+    SidecarWorkspaceAccess,
 };
 
 static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The off-the-shelf MCP image the `view = "primary"` case runs -- the whole
+/// point of that placement is that an unmodified third-party image works.
+const MCP_FS_IMAGE: &str = "docker.io/mcp/filesystem:latest";
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
@@ -34,15 +39,60 @@ fn init_tracing() {
         .try_init();
 }
 
-fn build_fixture_image(tag: &str) {
+fn podman_build(tag: &str, context: &Path) {
     let status = std::process::Command::new("podman")
         .arg("build")
         .arg("-t")
         .arg(tag)
-        .arg(fixture_dir())
+        .arg(context)
         .status()
         .expect("spawn podman build");
     assert!(status.success(), "podman build exited non-zero: {status:?}");
+}
+
+fn build_fixture_image(tag: &str) {
+    podman_build(tag, &fixture_dir());
+}
+
+/// Ensure the off-the-shelf MCP image is present locally; outrig launches it
+/// `--pull=never`, so the test pulls it on demand.
+fn ensure_mcp_fs_image() {
+    let present = std::process::Command::new("podman")
+        .args(["image", "exists", MCP_FS_IMAGE])
+        .status()
+        .expect("podman image exists")
+        .success();
+    if !present {
+        let status = std::process::Command::new("podman")
+            .args(["pull", MCP_FS_IMAGE])
+            .status()
+            .expect("podman pull");
+        assert!(status.success(), "failed to pull {MCP_FS_IMAGE}");
+    }
+}
+
+/// [`MCP_FS_IMAGE`] with its `ENTRYPOINT` restated as an absolute path.
+///
+/// The upstream image declares `ENTRYPOINT ["node", "/app/dist/index.js"]`.
+/// `outrig-enter` opens the payload program by literal path with no `PATH`
+/// search, and the graft rule deliberately leaves relative elements bare, so a
+/// bare `node` cannot resolve after the setns. That is a pre-existing gap in
+/// the `view = "primary"` mechanism itself -- it fails identically through
+/// `outrig run` -- filed as `plan/next/primary-view-relative-entrypoint.md`.
+/// Restating the same program absolutely keeps this test about the library
+/// reaching the placement rather than about that bug.
+fn build_absolute_entrypoint_mcp_fs_image(tag: &str) {
+    ensure_mcp_fs_image();
+    let ctx = tempfile::tempdir().expect("tempdir image context");
+    std::fs::write(
+        ctx.path().join("Dockerfile"),
+        format!(
+            "FROM {MCP_FS_IMAGE}\n\
+             ENTRYPOINT [\"/usr/local/bin/node\", \"/app/dist/index.js\"]\n"
+        ),
+    )
+    .expect("write Dockerfile");
+    podman_build(tag, ctx.path());
 }
 
 fn dockerfile_escape(value: &str) -> String {
@@ -66,15 +116,7 @@ fn build_fixture_image_with_mcp_label(tag: &str, mcp: &BTreeMap<String, McpServe
         ),
     );
     std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
-
-    let status = std::process::Command::new("podman")
-        .arg("build")
-        .arg("-t")
-        .arg(tag)
-        .arg(ctx.path())
-        .status()
-        .expect("spawn podman build");
-    assert!(status.success(), "podman build exited non-zero: {status:?}");
+    podman_build(tag, ctx.path());
 }
 
 fn fs_spec(path: &str) -> McpServerSpec {
@@ -317,6 +359,233 @@ async fn launch_with_sidecar_starts_it() {
         "sidecar list_directory should see the workspace, got: {}",
         result.content_text,
     );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// A `LaunchSpec` built entirely in code, hosting an off-the-shelf image whose
+/// ENTRYPOINT is the server: no `command` is written anywhere by the caller,
+/// and the served directory rides `args`.
+///
+/// Deliberately the real off-the-shelf image rather than a fixture: "an
+/// unmodified MCP image needs no repo-side command knowledge" is the whole
+/// claim, and a fixture with a hand-written ENTRYPOINT would not test it. The
+/// config path's equivalent (`mcp_sidecar_smoke.rs`) uses the `mcp-entrypoint`
+/// fixture, whose `entry.sh` exits 64 on an empty argv, so the louder
+/// "the args did not arrive" signal is covered there.
+#[tokio::test]
+async fn launch_with_entrypoint_sidecar_serves_tools() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    ensure_mcp_fs_image();
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-entrypoint-primary-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&primary_tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
+    .with_sidecar(
+        SidecarSpec::from_image("served", MCP_FS_IMAGE)
+            .with_workspace_access(SidecarWorkspaceAccess::Ro)
+            .with_entrypoint_server("ws", ["/workspace"]),
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    assert!(
+        outrig.tools().iter().any(|t| t.server == "ws"),
+        "entrypoint-stdio server should be in tools(): {:?}",
+        outrig
+            .tools()
+            .iter()
+            .map(|t| (&t.server, &t.name))
+            .collect::<Vec<_>>(),
+    );
+
+    let result = outrig
+        .call_tool(
+            "ws",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("call_tool via entrypoint-stdio server");
+    assert!(
+        result.content_text.contains("MARKER.txt"),
+        "the served directory came from `args`, got: {}",
+        result.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("served"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// `view = "primary"` from the library: an off-the-shelf Alpine MCP image
+/// serving the *primary* container's tree, at the primary's paths. What
+/// distinguishes this from `workspace = "rw"` is that a file written into the
+/// primary's own rootfs -- which no bind mount provides -- is visible too.
+#[tokio::test]
+async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_absolute_entrypoint_mcp_fs_image(&sidecar_tag);
+    let primary_tag = format!(
+        "localhost/outrig-library-surface-view-primary-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&primary_tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    std::fs::write(host_ws.path().join("MARKER.txt"), "hi\n").expect("write MARKER.txt");
+
+    let spec = LaunchSpec::from_image(
+        primary_tag,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"));
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // Written into the primary's own rootfs, outside every bind mount.
+    let touched = outrig
+        .exec_capture(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "echo hi > /tmp/IN-PRIMARY.txt".into(),
+            ],
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        touched.status.success(),
+        "writing into the primary failed: {}",
+        String::from_utf8_lossy(&touched.stderr),
+    );
+
+    outrig
+        .add_sidecar(
+            SidecarSpec::from_image("fs", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("fs", ["/"]),
+        )
+        .await
+        .expect("add a view = \"primary\" sidecar");
+
+    let workspace = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/workspace" }),
+        )
+        .await
+        .expect("list the primary's workspace through the view");
+    assert!(
+        workspace.content_text.contains("MARKER.txt"),
+        "the view should show the primary's workspace, got: {}",
+        workspace.content_text,
+    );
+
+    let tmp = outrig
+        .call_tool(
+            "fs",
+            "list_directory",
+            serde_json::json!({ "path": "/tmp" }),
+        )
+        .await
+        .expect("list the primary's own rootfs through the view");
+    assert!(
+        tmp.content_text.contains("IN-PRIMARY.txt"),
+        "the view should show a file only the primary container has, got: {}",
+        tmp.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("fs"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+#[tokio::test]
+async fn exec_capture_runs_a_command_in_the_primary() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-exec-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(tag, BTreeMap::new(), session_dir.path().join("logs"));
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let out = outrig
+        .exec_capture(
+            &["sh".into(), "-lc".into(), "printf %s \"$GREETING\"".into()],
+            &BTreeMap::from([("GREETING".to_string(), "hello".to_string())]),
+        )
+        .await
+        .expect("exec_capture");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+
+    // A non-zero exit is data on the Output, not an error.
+    let failed = outrig
+        .exec_capture(
+            &["sh".into(), "-lc".into(), "exit 3".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("a failing command still ran");
+    assert_eq!(failed.status.code(), Some(3));
+
+    // The streaming form hands back the child with all three pipes open.
+    let mut child = outrig
+        .exec_stdio(&["sh".into(), "-lc".into(), "cat".into()], &BTreeMap::new())
+        .await
+        .expect("exec_stdio");
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        stdin.write_all(b"ping\n").await.expect("write to stdin");
+        drop(stdin);
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout piped")
+            .read_to_string(&mut out)
+            .await
+            .expect("read stdout");
+        assert_eq!(out, "ping\n");
+    }
+    assert!(child.wait().await.expect("wait").success());
 
     outrig.shutdown().await.expect("shutdown");
 }

@@ -181,3 +181,126 @@ prototype should confirm), or **Open** (deferred).
   `from_config_resolves_and_starts_a_config_sidecar` (:334): where the new cases belong.
 - `plan/done/0079-sidecar-core-exec-stdio.md` and `plan/done/0088-entrypoint-stdio-args.md` --
   where the config-side placements came from.
+
+## Decisions
+
+- **Fork 1 resolved as recommended: `SidecarServerSpec` is a two-variant enum**
+  (`ExecStdio { command, env }` / `Entrypoint { args, env }`) with `view` on `SidecarSpec`,
+  mirroring `SidecarConfig`. Both variants are sealed per 0094 Decision 6, so they ship
+  constructors (`exec` / `entrypoint`, renaming `new` for symmetry with `McpServerSpec`),
+  `with_env`, and `command()` / `args()` / `env()` / `is_entrypoint()` accessors. The builder
+  chain stays infallible and the two `with_*_server` families coexist; "an entrypoint host
+  serves exactly one server" remains a validation rule rather than a type invariant. Rejected:
+  a hosting enum on `SidecarSpec` itself, which would make that rule structural but breaks the
+  public `servers` map and makes `with_server` / `with_entrypoint_server` silently conflict.
+- **`args` lives only on the entrypoint variant, not on `SidecarSpec`.** The config carries it
+  in two places because a block and an entry can each declare it; `sidecar::entrypoint_args` is
+  the one place that picks between them, and the lowering collapses the choice there. Mirroring
+  both slots into the library would reintroduce an ambiguity the library does not have.
+- **`start` and `on-failure` are deliberately absent from `SidecarSpec`.** A library sidecar
+  starts when `add_sidecar` is called, and `with_sidecar` was already documented as abort-only.
+  This makes `SidecarEntrypointNotAuto` structurally impossible on the library path rather than
+  a fourth rule to keep in sync.
+- **Fork 3 resolved as "allow", not deferred.** `Outrig::launch` starts launch-time sidecars by
+  calling `add_sidecar`, so supporting entrypoint specs there is strictly less code than
+  rejecting them (which would need a second launch path). The failure contract is unchanged:
+  create -> attach interceptor -> connect, and any failure detaches, stops the container, and
+  leaves the session as it was, which `failed_add_sidecar_leaves_session_usable` still pins.
+- **Fork 4 resolved by lifting, not by synthesizing a `Config`.** `ConfigValidationError` turned
+  out to be span-free, path-free and provenance-free, and the CLI only ever prints `Display`, so
+  the rules move into `pub(crate)` functions taking the minimal borrowed pieces --
+  `check_view_exclusions`, `check_entrypoint_hosting`, `check_sidecar_name`,
+  `check_sidecar_image` -- which both `validate_sidecar` and the facade's
+  `validate_sidecar_spec` call. Two unit tests assert the library's message is byte-identical to
+  the equivalent config's by generating the latter, not by copying a literal.
+  - Where `SidecarEntrypointNotAlone` / `SidecarViewRequiresEntrypoint` name an *image-config*,
+    the library passes its podman image ref into that slot -- a hand-built spec has no
+    image-config to name. Rejected: reshaping those variants to a neutral `scope` field, which
+    churns config-path error text for no gain.
+  - `validate_sidecar_spec` stopped hand-copying `SidecarNameInvalid`'s message, and
+    `is_valid_sidecar_name` went away as its only caller.
+- **`helper_available` is a parameter, not an `enter::is_available()` call inside the check.**
+  Threading it in makes "a build without the musl target rejects a `view = "primary"` spec,
+  naming the artifact" a CI-runnable unit test on a host that *does* have the helper. The check
+  runs after the placement rules, so a spec that is wrong on its own terms says so rather than
+  blaming the toolchain.
+- **`outrig-enter` materializes into `log_dir`** (fork 4 of the plan's questions). It is the one
+  writable directory a `LaunchSpec` names and `Outrig` keeps, so mid-session adds need no new
+  field. `add_sidecar` creates it first: the log dir is otherwise created lazily by the first
+  MCP connection, which for an entrypoint server happens *after* the helper is needed -- caught
+  by the e2e, not by review.
+- **`entrypoint_create_args` in `container::sidecar` is called by both crates.** It folds in the
+  `PRIMARY_VIEW_GRAFT` / `_NS_MOUNT` / `_NS_FILE` plumbing that `create_one_entrypoint_sidecar`
+  spelled inline, so "a config-launched and a spec-launched session produce the same argv" is a
+  shared code path rather than a coincidence, and is unit-testable without podman.
+- **`exec_capture` returns `std::process::Output`** rather than a new type: it already carries
+  exactly `status` / `stdout` / `stderr`, needs no `#[non_exhaustive]` deliberation, and adds
+  nothing to the surface being frozen. It is built on `process::try_capture`, not `run_capture`,
+  so a non-zero exit is data rather than an error.
+- **Fixed a pre-existing `view = "primary"` bug that blocked the acceptance criterion.**
+  `build_primary_view_argv` graft-prefixed the payload's *program*, but `outrig-enter` opens it
+  pre-setns (while the sidecar rootfs is still at `/`) and re-applies the graft itself when
+  invoking the loader -- so an absolute `ENTRYPOINT` was looked for under the graft twice. The
+  program is now passed bare. This was verified failing on an unmodified `43dea081` worktree
+  before the change, so it is not a regression from this task; it is fixed here because the
+  library's flagship placement could not otherwise be demonstrated at all.
+  - The *other* half of that bug is left alone and filed as
+    `plan/next/primary-view-relative-entrypoint.md`: the launcher does no `PATH` search, so an
+    image whose `ENTRYPOINT` is a bare `node` -- which is `docker.io/mcp/filesystem:latest`,
+    the docs' quickstart -- still cannot start. `crates/outrig-cli/tests/primary_view_e2e.rs`
+    consequently remains red, exactly as it is on trunk. Fixing it means changing the
+    standalone musl launcher, which is 0089's territory and well outside this task.
+  - The library's `view = "primary"` e2e therefore runs a `docker.io/mcp/filesystem:latest`
+    derivative that restates the same program absolutely, which exercises the placement end to
+    end without depending on the unfixed half. The plain entrypoint-stdio e2e uses the upstream
+    image unmodified -- with no view there is no graft, so podman resolves the relative
+    `ENTRYPOINT` normally, and the acceptance criterion's exact case is covered as written.
+- **The entrypoint e2e uses the real image, not the `mcp-entrypoint` fixture.** "An unmodified
+  off-the-shelf MCP image needs no repo-side command knowledge" is the claim, and a fixture with
+  a hand-written ENTRYPOINT would not test it. The louder "the args did not arrive" signal that
+  fixture provides (0088 made its `entry.sh` exit 64 on empty argv) is already covered on the
+  config path by `named_sidecar_entrypoint_host_serves_workspace_from_args`.
+
+## Decisions from the `/simplify` pass
+
+- **`build_primary_view_argv` builds the payload in one pass** rather than prefixing everything
+  and stripping the graft back off `argv[0]`. The strip formulation was wrong, not just
+  roundabout: when the image declares no `ENTRYPOINT` and `args` is non-empty, `argv[0]` is a
+  *config* arg -- bare by design, naming a path in the primary's view -- and a legitimate
+  `args = ["/mnt/data"]` would have been silently rewritten to `/data`. Pinned by
+  `primary_view_argv_does_not_rewrite_a_config_arg_under_the_graft_point`.
+- **The argv contract is now stated on the launcher too** (`enter/launcher.rs` module docs):
+  `PROGRAM` is in the sidecar's coordinates and ungrafted, `ARGS...` are in the target's. It was
+  written down only on the producer side, and `plan/next/primary-view-relative-entrypoint.md`
+  sends the next reader straight into the consumer.
+- **The empty-workspace `--cwd` fallback moved into `entrypoint_create_args`**, which now takes
+  `&Path`. `--cwd ""` makes the launcher `chdir("")` and die; the guard belongs to the function
+  that owns the flag, not to the one caller that can currently produce it (the CLI always has a
+  container path, the library need not).
+- **`bootstrap_needed` absorbed the entrypoint-host exemption** as a leading parameter, so
+  "an entrypoint host never bootstraps" is stated once instead of in `sidecar_needs_bootstrap`
+  and `add_sidecar` separately.
+- **`with_entrypoint_server_env` was replaced by a general `with_server_spec(name, server)`**
+  before it shipped. Four combinatorial builders for two transports x with/without env is
+  surface that a release freezing the API should not take on; the general form composes with
+  `SidecarServerSpec::{exec,entrypoint}(..).with_env(..)` and absorbs any future variant.
+- **`config::validate` stayed a private module.** The four shared checks are re-exported by name
+  through the existing `pub(crate) use` list rather than opening the whole module, which would
+  have exposed ~20 unrelated helpers with no per-item decision.
+- **`entrypoint_create_args` matches `SidecarView::None` explicitly** rather than with a
+  catch-all: `#[non_exhaustive]` does not suppress exhaustiveness inside the defining crate, and
+  `SidecarView::as_str` already establishes that convention -- a third view mode should be a
+  compile error here, not a silent "no view".
+- **The reserved server name is now rejected on the library path too.** `outrig` is refused by
+  config validation and by both label readers, but a `SidecarSpec` could host a server by that
+  name and collide with the built-in `outrig__*` tools. Found while making the rest of
+  `validate_sidecar_spec` delegate; small enough to fix in place.
+- **Not done, deliberately:** hoisting the remaining parallel structure between
+  `Outrig::add_sidecar` and the CLI's `create_one_entrypoint_sidecar` into a shared
+  container-creation helper. What is left parallel is mechanical field mapping from two
+  genuinely different source types, and sharing it would mean threading transcripts, progress
+  spans, `on-failure` routing and the `--env` overlay through as `Option`-shaped parameters --
+  and would give up the CLI's amortization of `enter::materialize` + `primary.pid()` across
+  concurrently-started sidecars. The parts where drift would be *silent* (argv text, the
+  placement rules, the bootstrap exemption) are shared; the parts where it would be a compile
+  error are not.

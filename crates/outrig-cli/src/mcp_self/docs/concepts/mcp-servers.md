@@ -93,6 +93,13 @@ The placement shapes:
   - `sidecar = "<sc>"` with no `command` -- the named block becomes the entrypoint host, which
     is how such a server gets a workspace view, mounts, or its own security policy.
 
+Every one of these is reachable from the library API as well as from a config file. A
+`SidecarSpec` carries the same `workspace`, `view`, mounts, and security a `[sidecars.<sc>]`
+block does, and hosts either exec-stdio servers (`with_server`) or a single entrypoint-stdio
+one (`with_entrypoint_server`, whose `args` become the container argv).
+`LaunchSpec::from_config` lowers a parsed config into those same specs, so an embedding
+program and `outrig run` reach the same placements and produce the same containers.
+
 An entrypoint server's arguments come from `args`, on the entry or on its sidecar block --
 never both. Without it, `docker.io/mcp/filesystem` and most real MCP images cannot be reached
 at all, since they take their served directories positionally:
@@ -139,11 +146,14 @@ knows about the other. `view = "primary"` is entrypoint-stdio only, and mutually
 in it mean different things:
 
 - Elements from the **sidecar image** -- its `ENTRYPOINT` and `CMD` -- name files in the
-  sidecar's own rootfs, now under the graft. OutRig prefixes absolute ones with `/mnt`.
+  sidecar's own rootfs, now under the graft. OutRig prefixes absolute ones with `/mnt`. The
+  program itself is the exception: `outrig-enter` opens it *before* joining the primary's
+  namespace, while the sidecar's own rootfs is still at `/`, so it stays bare and the helper
+  applies the graft itself when handing the path to the loader.
 - Elements **you wrote in `args`** name paths in the *primary's* view. They are passed bare.
 
 So `args = ["/workspace"]` against an image whose entrypoint is `/usr/local/bin/node
-/app/dist/index.js` runs `/mnt/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
+/app/dist/index.js` runs `/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
 from the sidecar, the directory from the primary.
 
 `view = "primary"` is a real posture change: the sidecar runs with `CAP_SYS_ADMIN` and
@@ -151,6 +161,11 @@ from the sidecar, the directory from the primary.
 See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the `outrig-enter` helper,
 compiled when the `<arch>-unknown-linux-musl` Rust target is installed; without it a
 `view = "primary"` session fails at start with a message naming the missing artifact.
+
+That posture is identical from the library. `SidecarSpec::with_view(SidecarView::Primary)`
+takes the same capabilities in the same namespace, and a build without the helper fails the
+same way, before any container is created. The helper is materialized into the session's log
+directory, which is the one writable location a `LaunchSpec` names.
 
 Exec-stdio named sidecars honor their image's `org.outrig.mcp` label with the usual semantics,
 scoped to that sidecar: label-declared servers materialize as exec-stdio servers *in that
@@ -259,10 +274,16 @@ of trying to relaunch it.
 
 Sidecars can also join a session after it starts. The primitive is the library API:
 `Outrig::add_sidecar(SidecarSpec)` accepts an arbitrary spec -- a raw podman image ref, a
-workspace view, mounts, a security block, and exec-stdio servers -- starts the container with
-session labels and keep-id, attaches the session's network interceptor, connects the servers,
-and extends `Outrig::tools`. `LaunchSpec::with_sidecar(SidecarSpec)` declares the same thing at
-launch time.
+workspace view, a filesystem view, mounts, a security block, and either exec-stdio servers or
+an entrypoint-stdio one -- starts the container with session labels and keep-id, attaches the
+session's network interceptor, connects the servers, and extends `Outrig::tools`.
+`LaunchSpec::with_sidecar(SidecarSpec)` declares the same thing at launch time.
+
+The two transports differ in what "starts the container" means. An exec-stdio sidecar is
+started and then exec'd into, so it outlives any one server. An entrypoint-stdio sidecar is
+created with its server's environment baked in and only runs when the server does, so adding
+one mid-session gives the session a container whose lifetime is that server's -- the same
+coupling a config-declared entrypoint host has.
 
 The REPL surface is narrower by design: `/sidecar add <name>` starts a sidecar the image config
 declared with `start = "manual"`, and nothing else -- unknown names and already-running sidecars

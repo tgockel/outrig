@@ -299,6 +299,11 @@ podman label `org.outrig.session=<session-id>`, and sidecars additionally carry
 `org.outrig.sidecar=<sc>`. The session record lists sidecar container names next to
 `container_name`.
 
+(A library caller declares the same containers with `SidecarSpec`, which mirrors this block
+minus `start` and `on-failure` -- a spec starts when `Outrig::add_sidecar` is called, and
+launch-time sidecars are abort-only. Naming, labels, and lifecycle coupling are identical,
+so `outrig clean` sweeps a library session's strays the same way.)
+
 **Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
 after the primary and stop before it, and the same three cleanup layers -- explicit stop, Drop,
 and the panic-hook sweep -- cover every container. In addition, sessions with sidecars run a
