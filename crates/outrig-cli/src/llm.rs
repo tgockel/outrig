@@ -81,6 +81,12 @@ pub enum LlmResolveError {
     UnknownProvider { name: String },
 
     #[error(
+        "provider {name:?} uses a provider style this build of outrig does \
+         not know how to reach"
+    )]
+    UnsupportedProvider { name: String },
+
+    #[error(
         "mistralrs provider {name:?} requested but this build of outrig \
          does not include the 'local-llm' feature; rebuild with \
          --features local-llm to enable"
@@ -256,6 +262,7 @@ pub fn resolve_agent_with_overrides(
             base_url,
             api_key,
             request_timeout_secs,
+            ..
         } => {
             if device_override.is_some() {
                 return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
@@ -308,6 +315,15 @@ pub fn resolve_agent_with_overrides(
                 })
                 .unwrap_or_else(|| model_name.to_string());
             (ResolvedProvider::Mistralrs, Some(weights), identifier)
+        }
+        // `LlmProvider` is `#[non_exhaustive]`. There is no generic way to
+        // reach a provider style this build has no client for, so say so
+        // rather than guess at one.
+        _ => {
+            return Err(LlmResolveError::UnsupportedProvider {
+                name: model.provider.clone(),
+            }
+            .into());
         }
     };
 

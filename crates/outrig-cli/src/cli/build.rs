@@ -85,7 +85,7 @@ async fn build_single(
     no_cache: bool,
 ) -> Result<i32> {
     match cc.source() {
-        ImageSourceRef::Image { image_name } => {
+        ImageSourceRef::Image { image_name, .. } => {
             let tag = image::ImageTag(image_name.to_string());
             let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
             if already_pulled {
@@ -109,7 +109,17 @@ async fn build_single(
             eprintln!("[outrig] image ready: {tag}");
             Ok(0)
         }
+        // `ImageSourceRef` is `#[non_exhaustive]`; a source kind this build
+        // cannot produce an image from is an error, not a silent no-op.
+        _ => Err(unsupported_image_source(name).into()),
     }
+}
+
+/// The error for an image-config whose source this build does not understand.
+fn unsupported_image_source(name: &str) -> OutrigError {
+    OutrigError::Configuration(format!(
+        "image-config {name:?} uses an image source this build does not support"
+    ))
 }
 
 async fn build_all(
@@ -126,7 +136,7 @@ async fn build_all(
             ))
         })?;
         match cc.source() {
-            ImageSourceRef::Image { image_name } => {
+            ImageSourceRef::Image { image_name, .. } => {
                 let tag = image::ImageTag(image_name.to_string());
                 let already_pulled = !no_cache && image::probe_pulled(&tag).await?;
                 let suffix = if already_pulled {
@@ -150,6 +160,7 @@ async fn build_all(
                 };
                 eprintln!("[outrig] image-config: {name:<pad$} -> {tag} {suffix}");
             }
+            _ => return Err(unsupported_image_source(name).into()),
         }
     }
     eprintln!("[outrig] all images ready");

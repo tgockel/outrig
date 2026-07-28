@@ -198,14 +198,7 @@ async fn tar_path_key_is_mtime_independent() {
 }
 
 fn build_cfg(ctx: &Path) -> ImageConfig {
-    ImageConfig {
-        image_name: None,
-        dockerfile: Some(ctx.join("Dockerfile")),
-        context: Some(ctx.to_path_buf()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-    }
+    ImageConfig::from_dockerfile(ctx.join("Dockerfile"), ctx)
 }
 
 #[tokio::test]

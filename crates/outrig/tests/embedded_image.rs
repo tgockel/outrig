@@ -274,14 +274,7 @@ async fn malformed_mcp_label_on_raw_image_fails_runtime_read() {
 
     // ensure_image on an image-ref config only probes/pulls -- it must not
     // re-validate labels, so the malformed image passes here.
-    let cfg = ImageConfig {
-        image_name: Some(tag.0.clone()),
-        dockerfile: None,
-        context: None,
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-    };
+    let cfg = ImageConfig::from_image_name(tag.0.clone());
     let image = image::ensure_image(&cfg, ctx.path(), false)
         .await
         .expect("raw image ref should pass ensure_image without label validation")

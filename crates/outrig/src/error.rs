@@ -9,6 +9,7 @@ use crate::config::{ApiKeyError, ConfigValidationError, EnvValueError};
 use crate::container::embedded::EmbeddedImageConfigError;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OutrigError {
     #[error("configuration: {0}")]
     Configuration(String),
@@ -36,6 +37,7 @@ pub enum OutrigError {
         "{source}\n\
          help: key names containing `.` must be quoted, e.g. `[models.\"opus-4.7\"]` instead of `[models.opus-4.7]`"
     )]
+    #[non_exhaustive]
     ConfigDottedKey {
         #[source]
         source: toml::de::Error,
@@ -48,6 +50,7 @@ pub enum OutrigError {
     ConfigValidation(#[from] ConfigValidationError),
 
     #[error("{}", format_process(program, argv, *exit_code, stderr_tail))]
+    #[non_exhaustive]
     Process {
         program: &'static str,
         argv: Vec<OsString>,
@@ -61,6 +64,7 @@ pub enum OutrigError {
     /// `command` is the [`crate::process::Cmd::render`] output, carried
     /// pre-rendered so this module stays independent of `process`.
     #[error("{}", format_spawn(program, command, source))]
+    #[non_exhaustive]
     Spawn {
         program: &'static str,
         command: String,
@@ -72,6 +76,7 @@ pub enum OutrigError {
     /// Prefer this over bare [`OutrigError::Io`]: the naked `io::Error` renders
     /// as "No such file or directory (os error 2)" with nothing to act on.
     #[error("failed to {op} `{}`: {source}", path.display())]
+    #[non_exhaustive]
     Path {
         op: &'static str,
         path: PathBuf,
@@ -80,6 +85,7 @@ pub enum OutrigError {
     },
 
     #[error("could not allocate {kind} name during container bootstrap after retries")]
+    #[non_exhaustive]
     BootstrapExhausted { kind: &'static str },
 
     /// The user bootstrap entered the container's namespaces and then failed
@@ -87,6 +93,7 @@ pub enum OutrigError {
     /// error at all: that falls back to the `podman exec` bootstrap, because
     /// nothing in the container has been touched yet.
     #[error("container {container}: bootstrapping the runtime user failed at {step}: {source}")]
+    #[non_exhaustive]
     BootstrapNamespace {
         container: String,
         step: String,
@@ -101,6 +108,7 @@ pub enum OutrigError {
     McpServerInitialize(#[source] Box<rmcp::service::ServerInitializeError>),
 
     #[error("mcp server {name:?} env key {key:?}: {source}")]
+    #[non_exhaustive]
     McpEnvResolveFailed {
         name: String,
         key: String,
@@ -109,6 +117,7 @@ pub enum OutrigError {
     },
 
     #[error("image {image:?} build-arg {key:?}: {source}")]
+    #[non_exhaustive]
     BuildArgResolveFailed {
         image: String,
         key: String,
@@ -117,6 +126,7 @@ pub enum OutrigError {
     },
 
     #[error("image {image:?} embedded config: {source}")]
+    #[non_exhaustive]
     EmbeddedImageConfigParse {
         image: String,
         #[source]
@@ -127,6 +137,7 @@ pub enum OutrigError {
     McpStartupFailed(Box<McpStartupFailure>),
 
     #[error("mcp server {name:?} tools/list failed: {source}")]
+    #[non_exhaustive]
     McpToolsListFailed {
         name: String,
         #[source]
@@ -134,6 +145,7 @@ pub enum OutrigError {
     },
 
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
+    #[non_exhaustive]
     McpArgsNotObject { kind: &'static str },
 }
 
@@ -161,6 +173,7 @@ impl From<rmcp::service::ServerInitializeError> for OutrigError {
     declaration = format_mcp_declaration_source(declaration_source),
     stderr_path = stderr_path.display(),
 )]
+#[non_exhaustive]
 pub struct McpStartupFailure {
     pub name: String,
     pub declaration_source: Option<String>,

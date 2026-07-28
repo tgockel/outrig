@@ -73,6 +73,7 @@ pub const SUBAGENT_DEPTH_MAX_CEILING: u32 = 16;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_image: Option<String>,
@@ -259,10 +260,12 @@ fn reject_repo_network_policy(text: &str) -> Result<()> {
     rename_all_fields = "kebab-case",
     deny_unknown_fields
 )]
+#[non_exhaustive]
 pub enum LlmProvider {
     // The kebab-case rule auto-converts `OpenAi` to `open-ai`; the doc'd
     // tag is `openai`, so override per-variant.
     #[serde(rename = "openai")]
+    #[non_exhaustive]
     OpenAi {
         base_url: String,
         api_key: ApiKeyRef,
@@ -272,8 +275,25 @@ pub enum LlmProvider {
     Mistralrs,
 }
 
+impl LlmProvider {
+    /// An OpenAI-compatible provider at `base_url`. `request_timeout_secs`
+    /// falls back to the client default when `None`.
+    pub fn openai(
+        base_url: impl Into<String>,
+        api_key: ApiKeyRef,
+        request_timeout_secs: Option<u64>,
+    ) -> Self {
+        Self::OpenAi {
+            base_url: base_url.into(),
+            api_key,
+            request_timeout_secs,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct Model {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -296,7 +316,26 @@ pub struct Model {
     pub device: Option<String>,
 }
 
+impl Model {
+    /// A model served by the `[providers.<provider>]` entry of that name.
+    /// Every other field is optional and stays unset; assign the ones the
+    /// provider needs.
+    pub fn new(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            identifier: None,
+            model_id: None,
+            model_path: None,
+            model_file: None,
+            revision: None,
+            context_length: None,
+            device: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MistralrsDeviceSpec {
     #[default]
     Cpu,
@@ -309,6 +348,7 @@ impl MistralrsDeviceSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MistralrsDeviceParseError;
 
 impl std::fmt::Display for MistralrsDeviceParseError {
@@ -354,8 +394,9 @@ impl std::fmt::Display for MistralrsDeviceSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -391,6 +432,7 @@ impl Agent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct Workspace {
     pub host_path: PathBuf,
     pub container_path: PathBuf,
@@ -408,8 +450,21 @@ impl Default for Workspace {
     }
 }
 
+impl Workspace {
+    /// A workspace mapping `host_path` to `container_path`, with no extra
+    /// mounts. [`Workspace::default`] is the `.` -> `/workspace` case.
+    pub fn new(host_path: impl Into<PathBuf>, container_path: impl Into<PathBuf>) -> Self {
+        Self {
+            host_path: host_path.into(),
+            container_path: container_path.into(),
+            mounts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct MountConfig {
     pub host_path: PathBuf,
     pub container_path: PathBuf,
@@ -417,8 +472,24 @@ pub struct MountConfig {
     pub access: MountAccess,
 }
 
+impl MountConfig {
+    /// An extra bind mount of `host_path` at `container_path`.
+    pub fn new(
+        host_path: impl Into<PathBuf>,
+        container_path: impl Into<PathBuf>,
+        access: MountAccess,
+    ) -> Self {
+        Self {
+            host_path: host_path.into(),
+            container_path: container_path.into(),
+            access,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MountAccess {
     #[default]
     ReadOnly,
@@ -427,6 +498,7 @@ pub enum MountAccess {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum NetworkMode {
     #[default]
     Default,
@@ -459,6 +531,7 @@ impl std::fmt::Display for NetworkMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum NetworkAction {
     Allow,
     #[default]
@@ -486,6 +559,7 @@ impl std::fmt::Display for NetworkAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct NetworkEntry {
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -608,6 +682,7 @@ fn parse_network_port(raw: &str) -> std::result::Result<u16, String> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct NetworkPolicy {
     #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
     pub default: NetworkAction,
@@ -701,6 +776,7 @@ impl NetworkPolicyBuilder {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct NetworkConfig {
     pub mode: NetworkMode,
     #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
@@ -825,6 +901,7 @@ pub(crate) fn parse_network_host_pattern(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct ContainerSecurity {
     pub capability_profile: CapabilityProfile,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -865,6 +942,7 @@ impl ContainerSecurity {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum CapabilityProfile {
     #[default]
     Default,
@@ -893,6 +971,7 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct ImageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
@@ -918,6 +997,7 @@ pub struct ImageConfig {
 /// those -- declaring a block instantiates nothing on its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
 pub struct SidecarConfig {
     /// Image reference, resolved exactly like `--image`: a sibling
     /// `[images.<name>]` config name first, else a raw podman ref that must
@@ -946,9 +1026,28 @@ pub struct SidecarConfig {
     pub security: ContainerSecurity,
 }
 
+impl SidecarConfig {
+    /// A sidecar running `image`, the one field with no default. Everything
+    /// else starts where the TOML defaults leave it: no workspace access, no
+    /// extra mounts, automatic start, abort on failure.
+    pub fn new(image: impl Into<String>) -> Self {
+        Self {
+            image: image.into(),
+            args: Vec::new(),
+            workspace: SidecarWorkspaceAccess::default(),
+            view: SidecarView::default(),
+            start: SidecarStart::default(),
+            on_failure: SidecarOnFailure::default(),
+            mounts: Vec::new(),
+            security: ContainerSecurity::default(),
+        }
+    }
+}
+
 /// How much of the session workspace a sidecar sees. Default: nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SidecarWorkspaceAccess {
     #[default]
     None,
@@ -974,6 +1073,7 @@ impl SidecarWorkspaceAccess {
 /// primary image carrying that tool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SidecarView {
     #[default]
     None,
@@ -986,12 +1086,23 @@ impl SidecarView {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
+
+    /// The kebab-case name this view is written as in TOML. Lives here rather
+    /// than at the rendering site so a new view is a compile error in the one
+    /// crate that defines it, instead of a silently-dropped key downstream.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Primary => "primary",
+        }
+    }
 }
 
 /// Whether a sidecar starts with the session or waits for an explicit
 /// `/sidecar add` / library call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SidecarStart {
     #[default]
     Auto,
@@ -1002,6 +1113,7 @@ pub enum SidecarStart {
 /// start. Mid-session death is uniform (log, tools error, no restart).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SidecarOnFailure {
     #[default]
     Abort,
@@ -1010,18 +1122,54 @@ pub enum SidecarOnFailure {
 
 /// Discriminated view of the container source -- build-from-Dockerfile or
 /// use-existing-image. Returned by [`ImageConfig::source`].
+#[non_exhaustive]
 pub enum ImageSourceRef<'a> {
+    #[non_exhaustive]
     Build {
         dockerfile: &'a Path,
         context: &'a Path,
         build_args: &'a BTreeMap<String, EnvValue>,
     },
-    Image {
-        image_name: &'a str,
-    },
+    #[non_exhaustive]
+    Image { image_name: &'a str },
 }
 
 impl ImageConfig {
+    /// Build-source config: a `Dockerfile` plus the build context it resolves
+    /// against. The counterpart of [`ImageSourceRef::Build`].
+    pub fn from_dockerfile(dockerfile: impl Into<PathBuf>, context: impl Into<PathBuf>) -> Self {
+        Self {
+            dockerfile: Some(dockerfile.into()),
+            context: Some(context.into()),
+            ..Self::sourceless()
+        }
+    }
+
+    /// Pull-source config naming an existing image. The counterpart of
+    /// [`ImageSourceRef::Image`].
+    pub fn from_image_name(image_name: impl Into<String>) -> Self {
+        Self {
+            image_name: Some(image_name.into()),
+            ..Self::sourceless()
+        }
+    }
+
+    /// Every field at its serde default, which means *neither* source shape is
+    /// set. Deliberately private, and deliberately not a `Default` impl: a
+    /// sourceless config is exactly the state [`source`](Self::source) panics
+    /// on, so it is a base for the two constructors above rather than a value
+    /// worth handing out.
+    fn sourceless() -> Self {
+        Self {
+            image_name: None,
+            dockerfile: None,
+            context: None,
+            build_args: BTreeMap::new(),
+            security: ContainerSecurity::default(),
+            mcp: BTreeMap::new(),
+        }
+    }
+
     /// Return the discriminated source variant. Panics if validation has not
     /// run (i.e. both or neither shape is set). Every real call path goes
     /// through `Config::load` which validates first.
@@ -1043,8 +1191,10 @@ impl ImageConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum McpServerSpec {
     Short(Vec<String>),
+    #[non_exhaustive]
     Full {
         /// Argv to exec. Optional so the entrypoint-stdio form (a placed
         /// entry with no command) parses; validation guarantees every exec
@@ -1084,14 +1234,116 @@ pub enum McpServerSpec {
 }
 
 impl McpServerSpec {
+    /// Exec-stdio server: `command` is spawned with `podman exec -i` inside
+    /// whichever container hosts it (the primary by default; a sidecar once
+    /// [`with_sidecar`](Self::with_sidecar) names one).
+    pub fn exec(command: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::full(Some(command.into_iter().map(Into::into).collect()), None)
+    }
+
+    /// Entrypoint-stdio server in a dedicated anonymous sidecar built from
+    /// `image`: the image's own ENTRYPOINT is the server, so there is no
+    /// command to exec.
+    pub fn entrypoint(image: impl Into<String>) -> Self {
+        Self::full(None, Some(image.into()))
+    }
+
+    /// Environment for the server process, resolved at spawn time.
+    pub fn with_env(self, env: BTreeMap<String, EnvValue>) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full { env: slot, .. } = spec {
+                *slot = env;
+            }
+        })
+    }
+
+    /// Host this server in the sidecar declared under `[sidecars.<sc>]`.
+    /// Mutually exclusive with the anonymous [`entrypoint`](Self::entrypoint)
+    /// form; validation rejects setting both.
+    pub fn with_sidecar(self, sidecar: impl Into<String>) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full { sidecar: slot, .. } = spec {
+                *slot = Some(sidecar.into());
+            }
+        })
+    }
+
+    /// Positional arguments appended after the image ref for an
+    /// entrypoint-stdio server. Ignored by the exec-stdio form, which carries
+    /// a full argv already.
+    pub fn with_args(self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full { args: slot, .. } = spec {
+                *slot = args.into_iter().map(Into::into).collect();
+            }
+        })
+    }
+
+    /// Filesystem view for the anonymous entrypoint-stdio form.
+    pub fn with_view(self, view: SidecarView) -> Self {
+        self.map_full(|spec| {
+            if let Self::Full { view: slot, .. } = spec {
+                *slot = view;
+            }
+        })
+    }
+
+    /// The one `Full` literal in this impl: the two constructors and the
+    /// `Short` promotion below all route through it, so a field added to the
+    /// variant is filled in exactly one place.
+    fn full(command: Option<Vec<String>>, image: Option<String>) -> Self {
+        Self::Full {
+            command,
+            env: BTreeMap::new(),
+            sidecar: None,
+            image,
+            args: Vec::new(),
+            view: SidecarView::None,
+        }
+    }
+
+    /// Promote `Short` to the equivalent `Full` and apply `set`. The
+    /// promotion is what keeps the `with_*` setters total: `Short` carries an
+    /// argv and nothing else, so it is exactly `Full { command, .. }`. The
+    /// match is spelled out rather than using a catch-all so that a third
+    /// shape is a compile error here instead of a silently-ignored setter.
+    fn map_full(self, set: impl FnOnce(&mut Self)) -> Self {
+        let mut spec = match self {
+            Self::Short(command) => Self::full(Some(command), None),
+            full @ Self::Full { .. } => full,
+        };
+        set(&mut spec);
+        spec
+    }
+
     /// Returns the argv and the (still-unresolved) env map. Resolution of any
     /// `EnvValue::EnvRef` entries happens at the call site that's about to
     /// spawn the MCP server, so a missing host env var is reported as an
     /// MCP-startup failure rather than a config-load failure.
     pub fn normalize(&self) -> (Vec<String>, BTreeMap<String, EnvValue>) {
+        (
+            self.command().unwrap_or_default().to_vec(),
+            self.env().clone(),
+        )
+    }
+
+    /// The argv to exec, if this entry carries one. `None` is the
+    /// entrypoint-stdio form, where the container's ENTRYPOINT is the server.
+    pub fn command(&self) -> Option<&[String]> {
         match self {
-            Self::Short(command) => (command.clone(), BTreeMap::new()),
-            Self::Full { command, env, .. } => (command.clone().unwrap_or_default(), env.clone()),
+            Self::Short(command) => Some(command),
+            Self::Full { command, .. } => command.as_deref(),
+        }
+    }
+
+    /// The declared (still-unresolved) environment. Always empty for `Short`.
+    pub fn env(&self) -> &BTreeMap<String, EnvValue> {
+        // `BTreeMap::new` is const, so the `Short` arm borrows a static empty
+        // map rather than forcing the caller to handle an `Option`.
+        static EMPTY: BTreeMap<String, EnvValue> = BTreeMap::new();
+        match self {
+            Self::Short(_) => &EMPTY,
+            Self::Full { env, .. } => env,
         }
     }
 

@@ -91,11 +91,9 @@ async fn no_new_privileges_reaches_the_kernel_in_both_directions() {
         "a default container should run under no_new_privs, got: {value:?}",
     );
 
-    let opted_out = start_alpine(ContainerLaunchSpec {
-        no_new_privileges: false,
-        ..Default::default()
-    })
-    .await;
+    let mut opted_out_spec = ContainerLaunchSpec::default();
+    opted_out_spec.no_new_privileges = false;
+    let opted_out = start_alpine(opted_out_spec).await;
     let value = sh(&opted_out, "grep NoNewPrivs /proc/1/status");
     opted_out.stop(Duration::from_secs(2)).await.expect("stop");
     assert!(
@@ -124,11 +122,9 @@ async fn declared_device_appears_inside_the_container() {
         "podman should not provide {FUSE} without --device",
     );
 
-    let with_device = start_alpine(ContainerLaunchSpec {
-        devices: vec![FUSE.to_string()],
-        ..Default::default()
-    })
-    .await;
+    let mut with_device_spec = ContainerLaunchSpec::default();
+    with_device_spec.devices = vec![FUSE.to_string()];
+    let with_device = start_alpine(with_device_spec).await;
     let probe = sh(
         &with_device,
         "test -c /dev/fuse && echo present || echo absent",

@@ -227,10 +227,7 @@ mod tests {
 
     #[test]
     fn adapt_tool_result_truncates_success_content() {
-        let result = McpToolResult {
-            content_text: "a".repeat(MAX + 1),
-            is_error: false,
-        };
+        let result = McpToolResult::ok("a".repeat(MAX + 1));
 
         let output = adapt_tool_result(result, MAX).expect("success result");
 
@@ -240,10 +237,7 @@ mod tests {
 
     #[test]
     fn adapt_tool_result_truncates_error_content() {
-        let result = McpToolResult {
-            content_text: "e".repeat(MAX + 1),
-            is_error: true,
-        };
+        let result = McpToolResult::error("e".repeat(MAX + 1));
 
         let err = adapt_tool_result(result, MAX).expect_err("error result");
         let ToolError::ToolCallError(source) = err else {

@@ -13,6 +13,7 @@ use super::env_ref::parse_env_ref;
 use crate::error::Result;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ApiKeyError {
     #[error(
         "api-key {value:?} is invalid; expected \"${{VAR}}\" where VAR matches \

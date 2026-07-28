@@ -300,11 +300,7 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
         .ask_string(&API_KEY_ENV_FIELD, "OPENAI_API_KEY")
         .await?;
     let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
-    Ok(LlmProvider::OpenAi {
-        base_url,
-        api_key,
-        request_timeout_secs: None,
-    })
+    Ok(LlmProvider::openai(base_url, api_key, None))
 }
 
 async fn prompt_models(
@@ -370,23 +366,20 @@ pub(crate) async fn prompt_models_loop(
             .get(&provider_name)
             .or_else(|| new_providers.get(&provider_name))
             .expect("validated above");
+        // Only the local provider needs the weights walk-through. Every remote
+        // one names its model with an identifier, so that arm is the fallback
+        // rather than a dead `_ =>`: a provider added to the enum later gets a
+        // usable prompt instead of an error.
         let model = match provider {
-            LlmProvider::OpenAi { .. } => {
+            LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, hf, provider_name).await?,
+            _ => {
                 let identifier = prompt
                     .ask_string(&MODEL_IDENTIFIER_FIELD, "gpt-4o-mini")
                     .await?;
-                Model {
-                    provider: provider_name,
-                    identifier: Some(identifier),
-                    model_id: None,
-                    model_path: None,
-                    model_file: None,
-                    revision: None,
-                    context_length: None,
-                    device: None,
-                }
+                let mut model = Model::new(provider_name);
+                model.identifier = Some(identifier);
+                model
             }
-            LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, hf, provider_name).await?,
         };
         out.insert(name, model);
         if !prompt.ask_bool(&ADD_MODEL_FIELD, false).await? {
@@ -420,16 +413,13 @@ async fn prompt_mistralrs_model(
             })
         })
         .transpose()?;
-    Ok(Model {
-        provider: provider_name,
-        identifier: None,
-        model_id,
-        model_path,
-        model_file,
-        revision,
-        context_length,
-        device: None,
-    })
+    let mut model = Model::new(provider_name);
+    model.model_id = model_id;
+    model.model_path = model_path;
+    model.model_file = model_file;
+    model.revision = revision;
+    model.context_length = context_length;
+    Ok(model)
 }
 
 /// Discover GGUF files in `model_id` via `hf` and pick one or more. On a

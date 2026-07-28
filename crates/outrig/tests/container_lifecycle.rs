@@ -15,15 +15,14 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use outrig::container::{
-    self, Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+    self, Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount,
 };
 use outrig::image::ImageTag;
 use outrig::{CapabilityProfile, MountAccess};
@@ -136,33 +135,12 @@ async fn extra_mounts_enforce_access_modes() {
         .expect("write ro marker");
     let tag = ImageTag(ALPINE.to_string());
 
-    let container = Container::start(
-        &tag,
-        ContainerLaunchSpec {
-            workspace: Some(ContainerWorkspace {
-                host: host_ws.path().to_path_buf(),
-                container: PathBuf::from("/workspace"),
-                access: MountAccess::ReadWrite,
-            }),
-            mounts: vec![
-                ContainerMount {
-                    host: ro_dir.path().to_path_buf(),
-                    container: PathBuf::from("/resources/ro"),
-                    access: MountAccess::ReadOnly,
-                },
-                ContainerMount {
-                    host: rw_dir.path().to_path_buf(),
-                    container: PathBuf::from("/resources/rw"),
-                    access: MountAccess::ReadWrite,
-                },
-            ],
-            capabilities: ContainerCapabilities::default(),
-            labels: BTreeMap::new(),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("start");
+    let mut launch = ContainerLaunchSpec::workspace(host_ws.path(), "/workspace");
+    launch.mounts = vec![
+        ContainerMount::new(ro_dir.path(), "/resources/ro", MountAccess::ReadOnly),
+        ContainerMount::new(rw_dir.path(), "/resources/rw", MountAccess::ReadWrite),
+    ];
+    let container = Container::start(&tag, launch).await.expect("start");
 
     let read = run_capture(
         Command::new("podman")
@@ -207,22 +185,10 @@ async fn capability_flags_are_recorded_in_podman_create_command() {
     pull_alpine().await;
 
     let tag = ImageTag(ALPINE.to_string());
-    let container = Container::start(
-        &tag,
-        ContainerLaunchSpec {
-            workspace: None,
-            mounts: Vec::new(),
-            capabilities: ContainerCapabilities {
-                profile: CapabilityProfile::DropAll,
-                cap_drop: Vec::new(),
-                cap_add: vec!["NET_BIND_SERVICE".to_string()],
-            },
-            labels: BTreeMap::new(),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("start");
+    let mut launch = ContainerLaunchSpec::default();
+    launch.capabilities = ContainerCapabilities::new(CapabilityProfile::DropAll);
+    launch.capabilities.cap_add = vec!["NET_BIND_SERVICE".to_string()];
+    let container = Container::start(&tag, launch).await.expect("start");
 
     let inspect = podman_inspect_json(container.name()).await;
     let create_command = inspect_string_array(&inspect, &[&["Config", "CreateCommand"]])

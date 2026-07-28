@@ -38,11 +38,11 @@ use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
-    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountAccess, MountConfig, NetworkMode,
+    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
     SidecarOnFailure, SidecarStart, SidecarView,
 };
 use outrig::container::{
-    Container, ContainerCapabilities, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
+    Container, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
     LABEL_SESSION, LABEL_SIDECAR, PRIMARY_VIEW_GRAFT, PRIMARY_VIEW_NS_FILE, PRIMARY_VIEW_NS_MOUNT,
     PrimaryView, embedded, enter,
     sidecar::{self, Placement, SessionMcpPlan, SidecarPlan},
@@ -158,6 +158,19 @@ impl SessionContainers {
         match placement {
             Placement::Primary => Some(&self.primary),
             Placement::Sidecar(name) => self.sidecars.get(name),
+            // `Placement` is `#[non_exhaustive]`, so this build may not know
+            // how to host a placement a newer library planned. That is not
+            // the same as the skipped sidecar the `None` above means, and the
+            // caller drops the server either way -- so log rather than let it
+            // vanish.
+            other => {
+                tracing::warn!(
+                    target: "outrig::cli::session",
+                    "no container for placement {}: unsupported by this build",
+                    other.description()
+                );
+                None
+            }
         }
     }
 
@@ -298,11 +311,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             .into());
         }
         for vol in args.volumes {
-            cfg.workspace.mounts.push(MountConfig {
-                host_path: vol.host.clone(),
-                container_path: vol.container.clone(),
-                access: vol.access,
-            });
+            cfg.workspace.mounts.push(MountConfig::new(
+                vol.host.clone(),
+                vol.container.clone(),
+                vol.access,
+            ));
         }
         cfg.validate_workspace_mounts(Some(&repo_root))?;
     }
@@ -409,23 +422,13 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let sid = SessionId::new();
     let host_workspace = resolve_workspace_host(&repo_root, &cfg.workspace.host_path);
     let container_workspace = cfg.workspace.container_path.clone();
-    let launch = ContainerLaunchSpec {
-        workspace: Some(ContainerWorkspace {
-            host: host_workspace.clone(),
-            container: container_workspace.clone(),
-            access: MountAccess::ReadWrite,
-        }),
-        mounts: container_mounts(&repo_root, &cfg.workspace.mounts),
-        capabilities: ContainerCapabilities {
-            profile: image_cfg.security.capability_profile,
-            cap_drop: image_cfg.security.cap_drop.clone(),
-            cap_add: image_cfg.security.cap_add.clone(),
-        },
-        devices: image_cfg.security.devices.clone(),
-        no_new_privileges: image_cfg.security.no_new_privileges,
-        labels: BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]),
-        primary_view: None,
-    };
+    let mut launch =
+        ContainerLaunchSpec::workspace(host_workspace.clone(), container_workspace.clone());
+    launch.mounts = container_mounts(&repo_root, &cfg.workspace.mounts);
+    launch.capabilities = (&image_cfg.security).into();
+    launch.devices = image_cfg.security.devices.clone();
+    launch.no_new_privileges = image_cfg.security.no_new_privileges;
+    launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
     if let Some(p) = args.explicit_session_dir
         && !p.is_dir()
@@ -767,6 +770,15 @@ async fn setup_sidecars_and_network(
         NetworkMode::Default => None,
         NetworkMode::Audit => Some(attach_interceptor("audit", &plan, containers, &args).await?),
         NetworkMode::Filter => Some(attach_interceptor("filter", &plan, containers, &args).await?),
+        // `NetworkMode` is `#[non_exhaustive]`. Refusing beats falling back to
+        // no interception, which would silently drop the monitoring the mode
+        // was asking for.
+        mode => {
+            return Err(OutrigError::Configuration(format!(
+                "network mode {mode} is not supported by this build"
+            ))
+            .into());
+        }
     };
 
     Ok((plan, network))
@@ -855,11 +867,11 @@ async fn start_auto_sidecars(
         .any(|(_, _, sc)| sc.view == SidecarView::Primary)
     {
         let helper_host = enter::materialize(args.session_dir)?;
-        Some(PrimaryView {
-            primary_container: containers.primary.name().to_string(),
-            primary_pid: containers.primary.pid().await?,
+        Some(PrimaryView::new(
+            containers.primary.name(),
+            containers.primary.pid().await?,
             helper_host,
-        })
+        ))
     } else {
         None
     };
@@ -992,31 +1004,26 @@ async fn ensure_sidecar_image(
 /// accept alike, so a named block hosting an entrypoint server gets them too.
 /// An anonymous sidecar declares neither and lands on the empty defaults.
 fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
-    ContainerLaunchSpec {
-        workspace: sc
-            .workspace
-            .mount_access()
-            .map(|access| ContainerWorkspace {
-                host: ctx.host_workspace.to_path_buf(),
-                container: ctx.container_workspace.to_path_buf(),
-                access,
-            }),
-        mounts: container_mounts(ctx.repo_root, &sc.mounts),
-        capabilities: ContainerCapabilities {
-            profile: sc.security.capability_profile,
-            cap_drop: sc.security.cap_drop.clone(),
-            cap_add: sc.security.cap_add.clone(),
-        },
-        devices: sc.security.devices.clone(),
-        no_new_privileges: sc.security.no_new_privileges,
-        labels: BTreeMap::from([
-            (LABEL_SESSION.to_string(), ctx.sid.to_string()),
-            (LABEL_SIDECAR.to_string(), sc.name.clone()),
-        ]),
-        // Set by `create_one_entrypoint_sidecar` for a `view = "primary"`
-        // sidecar; every other placement leaves it `None`.
-        primary_view: None,
-    }
+    // `primary_view` is left at its default here and set by
+    // `create_one_entrypoint_sidecar` for a `view = "primary"` sidecar; every
+    // other placement leaves it `None`.
+    let mut launch = ContainerLaunchSpec::default();
+    launch.workspace = sc.workspace.mount_access().map(|access| {
+        ContainerWorkspace::new(
+            ctx.host_workspace.to_path_buf(),
+            ctx.container_workspace.to_path_buf(),
+            access,
+        )
+    });
+    launch.mounts = container_mounts(ctx.repo_root, &sc.mounts);
+    launch.capabilities = (&sc.security).into();
+    launch.devices = sc.security.devices.clone();
+    launch.no_new_privileges = sc.security.no_new_privileges;
+    launch.labels = BTreeMap::from([
+        (LABEL_SESSION.to_string(), ctx.sid.to_string()),
+        (LABEL_SIDECAR.to_string(), sc.name.clone()),
+    ]);
+    launch
 }
 
 /// Config `mounts` as launch-spec bind mounts, host paths resolved against the
@@ -1025,10 +1032,12 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
 fn container_mounts(repo_root: &Path, mounts: &[MountConfig]) -> Vec<ContainerMount> {
     mounts
         .iter()
-        .map(|mount| ContainerMount {
-            host: resolve_workspace_host(repo_root, &mount.host_path),
-            container: mount.container_path.clone(),
-            access: mount.access,
+        .map(|mount| {
+            ContainerMount::new(
+                resolve_workspace_host(repo_root, &mount.host_path),
+                mount.container_path.clone(),
+                mount.access,
+            )
         })
         .collect()
 }
@@ -1148,15 +1157,7 @@ fn resolve_image_config(
     }
 
     if allow_raw_image && !image_cfg_name.trim().is_empty() {
-        let image_cfg = ImageConfig {
-            image_name: Some(image_cfg_name.to_string()),
-            dockerfile: None,
-            context: None,
-            build_args: BTreeMap::new(),
-            security: Default::default(),
-            mcp: BTreeMap::new(),
-        };
-        return Ok((image_cfg, true));
+        return Ok((ImageConfig::from_image_name(image_cfg_name), true));
     }
 
     Err(OutrigError::Configuration(format!(
@@ -1220,10 +1221,7 @@ pub async fn connect_mcp_clients(
         Vec::with_capacity(mcp_plan.servers.len());
 
     for (mcp_name, placed) in &mcp_plan.servers {
-        let sidecar_name = match &placed.placement {
-            Placement::Primary => None,
-            Placement::Sidecar(sc) => Some(sc.clone()),
-        };
+        let sidecar_name = placed.placement.sidecar_name().map(str::to_string);
         let Some(container) = containers.container_for(&placed.placement) else {
             // The sidecar never started or was dropped earlier in this loop.
             continue;
@@ -1371,14 +1369,7 @@ mod tests {
     }
 
     fn config_image(image_ref: &str) -> ImageConfig {
-        ImageConfig {
-            image_name: Some(image_ref.to_string()),
-            dockerfile: None,
-            context: None,
-            build_args: BTreeMap::new(),
-            security: Default::default(),
-            mcp: BTreeMap::new(),
-        }
+        ImageConfig::from_image_name(image_ref)
     }
 
     #[test]

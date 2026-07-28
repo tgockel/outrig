@@ -438,7 +438,7 @@ context    = "."
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::DockerfileMissing { image, path } => {
+            ConfigValidationError::DockerfileMissing { image, path, .. } => {
                 assert_eq!(image, "coding");
                 assert_eq!(path, std::path::PathBuf::from("Dockerfile"));
             }
@@ -460,7 +460,7 @@ context    = "missing-ctx"
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::ContextMissing { image, path } => {
+            ConfigValidationError::ContextMissing { image, path, .. } => {
                 assert_eq!(image, "coding");
                 assert_eq!(path, std::path::PathBuf::from("missing-ctx"));
             }

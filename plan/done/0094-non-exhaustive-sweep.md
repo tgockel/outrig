@@ -291,3 +291,108 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
   APIs rather than an attribute.
 - `plan/todo/0096-config-path-provenance.md`, `plan/todo/0097-anthropic-native-api.md` -- the two
   queued features whose changes become additive once this sweep lands.
+
+## Decisions
+
+1. **The task's central claim about `Default` is false, and the mitigation design changes with
+   it.** *Friction and caveats* asserts that downstream `SomeStruct { ..Default::default() }`
+   "**does** work on a `#[non_exhaustive]` struct that implements `Default`", and concludes that
+   implementing `Default` is therefore a good mitigation. The Rust Reference
+   (`attributes.type-system.non_exhaustive.construction`) says the opposite: a non-exhaustive
+   type "cannot be constructed with a StructExpression (**including with functional update
+   syntax**)". Verified against the local reference and by compiling. So `Default` alone buys an
+   external caller nothing; it only helps in-crate.
+
+   The two paths that actually survive are an associated constructor, and `Default::default()`
+   followed by `pub` field assignment. That is what made constructors a deliverable rather than
+   a nicety, and it is why the six `..Default::default()` sites in `crates/outrig/tests/` had to
+   be rewritten -- the task expected those to be free.
+
+2. **Scope: the full P0+P1+P2 table.** Anything left exhaustive is a commitment for the whole
+   `0.2.x` line, and the attribute is free inside the crate. 62 types and 17 variants.
+
+3. **`outrig-cli`'s rows were dropped, and no `container::*` row was.** 0093 kept all six
+   `pub mod`s, so every `container::*` row survived; it gated `outrig-cli`'s module tree behind
+   `internal-test-api`, so `CliError`, `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`,
+   `MistralrsWeights`, and `RigAgent` are no longer nameable and need nothing.
+
+4. **The type list came from the committed surface, not from this file's tables.** Walking every
+   `pub struct` / `pub enum` in `crates/outrig/public-api.txt` found four types the tables
+   predate: `EnvValue` (which `cococlaw` imports), `MistralrsDeviceSpec`, `McpTool`, and
+   `McpToolResult` -- all annotated. It also confirmed three more that are already opaque and
+   correctly on the do-not-touch list for the same reason as `ProxyServer`: `McpClient`,
+   `Transcript`, and `NetworkPolicyBuilder` all have private fields.
+
+5. **Variant-level sealing is targeted, not uniform.** Every public enum is sealed; variants are
+   sealed only where a field addition is proven or scheduled: `McpServerSpec::Full`,
+   `LlmProvider::OpenAi`, `ImageSourceRef`'s two, all 11 field-bearing `OutrigError` variants,
+   and `ConfigValidationError::{DockerfileMissing, ContextMissing}` -- the two 0096 reshapes.
+   The other ~60 `ConfigValidationError` variants stay plain: the enum *is* the validation
+   documentation, and 60 more attributes would bury it. The asymmetry is deliberate and is the
+   one place this sweep accepts a future break rather than paying for insulation.
+
+6. **Sealing a variant forces a constructor, which the task did not anticipate.** A
+   `#[non_exhaustive]` variant is unconstructible from outside *forever* -- there is no
+   equivalent of the struct's field-assignment escape hatch. Sealing `McpServerSpec::Full` and
+   `LlmProvider::OpenAi` would have removed a capability rather than insulated one, so both
+   gained construction paths in the same change: `McpServerSpec::exec` / `entrypoint` plus
+   `with_env` / `with_sidecar` / `with_args` / `with_view`, and `LlmProvider::openai`.
+
+7. **Which types get `Default` and which get `::new` follows the serde contract, with one
+   exception.** Every field already `#[serde(default)]` -> derive `Default`; some field required
+   -> `::new` taking exactly the required fields; return-only -> the attribute alone.
+   `ImageConfig` is the exception: all six fields are `#[serde(default)]`, but the all-default
+   value sets *neither* source shape, which is precisely the state `ImageConfig::source()`
+   panics on. Publishing that as `Default` would hand out a value that panics on use, so the
+   base is a private `sourceless()` and only `from_dockerfile` / `from_image_name` are public.
+   `--omit auto-derived-impls` in the snapshot command means a derived `Default` would not have
+   shown up in the surface diff either.
+
+8. **Return-only types get no constructor, and three written during execution were removed
+   again.** `StandaloneImageToml`, `StandaloneImageMetadata`, and `McpServerSpecWithSource` are
+   parse *outputs*; `parse_standalone_image_toml` is their constructor. Writing `::new` for them
+   was over-application of rule 7 -- caught in review, reverted, ~45 lines of frozen surface not
+   shipped.
+
+9. **The cost of the sweep is seven unreachable match arms in `outrig-cli`, and they are not
+   uniform.** `outrig-cli` consumes `outrig` as an ordinary dependency, so it pays the
+   downstream price despite shipping in lockstep. Each arm refuses in the way its domain calls
+   for rather than defaulting: an unsupported `NetworkMode` errors (falling back to no
+   interception would silently drop the monitoring that was asked for), an unsupported
+   `LlmProvider` errors through a new `LlmResolveError::UnsupportedProvider`, an unsupported
+   `MistralrsDeviceSpec` errors (a silent CPU fallback would just run slowly), and an unknown
+   `Placement` logs a warning -- because the caller's `None` already means "sidecar was
+   skipped", and an unhostable server must not disappear into that. Only `config_init`'s
+   provider match has a real fallback: it was inverted so the *remote* case is the default arm,
+   which means 0097's Anthropic variant gets a working `outrig init` prompt for free.
+
+10. **Three matches were deleted rather than given an arm.** Where the CLI hand-matched a type
+    the library owns, the answer belonged on the type: `SidecarView::as_str` (the wire name),
+    `Placement::sidecar_name`, and `McpServerSpec::command` / `env` -- the last filling a real
+    gap, since `sidecar()` / `image()` / `args()` / `view()` all borrowed but the two oldest
+    fields were reachable only through `normalize()`, which clones both. `normalize` is now
+    defined in terms of them. A new variant is now a compile error inside the defining crate
+    instead of a dropped key downstream.
+
+11. **`From<&ContainerSecurity> for ContainerCapabilities` moved into the library.** The CLI
+    needed this mapping at two sites and a private helper was the obvious fix, but both types
+    are now sealed, so every downstream consumer hits the same wall -- and a copy outside the
+    crate keeps compiling while silently dropping a security knob added later. It sits beside
+    the two `From` impls that already existed.
+
+12. **In-crate literals were migrated onto the new constructors.** Otherwise the crate's own
+    code exercises none of them and a wrong default is only discovered downstream. The
+    constructors are now the single construction path and the existing tests cover them.
+
+13. **Not done, deliberately.** `ContainerLaunchSpec` still takes `default()` plus field
+    assignment at both CLI sites rather than gaining a `launch_base` / `apply_security` helper:
+    0095 replaces its construction wholesale with an options struct, so a second construction
+    path now is churn. `spec_to_toml_value` also stays hand-rolled rather than delegating to the
+    derived `Serialize`; that would be less code but changes a serialization path with
+    round-trip tests, for no benefit this task needs.
+
+14. **Evidence.** The surface diff against 0093's baseline is exactly 86 items re-emitted with
+    the attribute plus 47 new constructors and accessors -- no removals, no signature changes.
+    `library_surface.rs` compiles through the new constructors and passes 9/9 against real
+    podman, as do `container_lifecycle`, `container_security`, and `embedded_image`, whose
+    literals this task rewrote.

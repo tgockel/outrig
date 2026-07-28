@@ -4,7 +4,6 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,20 +16,11 @@ use outrig::image::ImageTag;
 /// Build-source `ImageConfig` for a fixture directory that holds a
 /// `Dockerfile` -- the shape nearly every `ensure_image` test wants.
 ///
-/// Shared so this crate's gated test binaries spell the literal once; a field
-/// moved off `ImageConfig` (as 0088 moved `sidecars`) then breaks one line
-/// rather than four. Literals in `src/` are out of its reach. Task 0094 plans
-/// `#[non_exhaustive]` on `ImageConfig`, which forbids this literal outright
-/// from `tests/` and should replace it with a real constructor.
+/// Shared so this crate's gated test binaries name the shape once. Since
+/// `ImageConfig` is `#[non_exhaustive]`, `tests/` cannot spell the literal at
+/// all; the constructor is the whole construction path from out here.
 pub fn fixture_build_config() -> ImageConfig {
-    ImageConfig {
-        image_name: None,
-        dockerfile: Some("Dockerfile".into()),
-        context: Some(".".into()),
-        build_args: BTreeMap::new(),
-        security: Default::default(),
-        mcp: BTreeMap::new(),
-    }
+    ImageConfig::from_dockerfile("Dockerfile", ".")
 }
 
 /// Install a best-effort tracing subscriber for integration tests that

@@ -28,6 +28,7 @@ use crate::error::{OutrigError, Result};
 /// Which container hosts an MCP server. Anonymous sidecars are keyed by
 /// their declaring server's name, so `Sidecar` covers both forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Placement {
     Primary,
     Sidecar(String),
@@ -41,11 +42,22 @@ impl Placement {
             Self::Sidecar(name) => format!("sidecar {name:?}"),
         }
     }
+
+    /// The sidecar this placement names, or `None` for the primary. Lives
+    /// here so callers ask one question instead of matching an enum that is
+    /// `#[non_exhaustive]` to them.
+    pub fn sidecar_name(&self) -> Option<&str> {
+        match self {
+            Self::Primary => None,
+            Self::Sidecar(name) => Some(name),
+        }
+    }
 }
 
 /// One merged MCP server: its spec, where it was declared, and which
 /// container it runs in.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PlacedServer {
     pub spec: McpServerSpec,
     pub source: McpDeclarationSource,
@@ -55,6 +67,7 @@ pub struct PlacedServer {
 /// One sidecar container the session wants, named or anonymous. `image` is
 /// unresolved -- an `[images.<name>]` config name or a raw podman ref.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SidecarPlan {
     pub name: String,
     pub image: String,
@@ -99,6 +112,7 @@ impl SidecarPlan {
 
 /// The session's full MCP placement plan.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct SessionMcpPlan {
     /// Flat per-session server namespace, fully merged.
     pub servers: BTreeMap<String, PlacedServer>,

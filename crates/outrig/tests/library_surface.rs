@@ -150,10 +150,7 @@ async fn launch_lists_tools_calls_one_and_shuts_down() {
         dockerfile,
         context,
         BTreeMap::new(),
-        outrig::WorkspaceSpec {
-            host: host_ws.path().to_path_buf(),
-            container: PathBuf::from("/workspace"),
-        },
+        outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"),
         mcp,
         log_dir.clone(),
     );
@@ -218,10 +215,7 @@ async fn add_sidecar_extends_tools_and_serves_calls() {
     let mut mcp = BTreeMap::new();
     mcp.insert("fs".to_string(), fs_spec("/workspace"));
     let spec = LaunchSpec::from_image(tag.clone(), mcp, session_dir.path().join("logs"))
-        .with_workspace(outrig::WorkspaceSpec {
-            host: host_ws.path().to_path_buf(),
-            container: PathBuf::from("/workspace"),
-        });
+        .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"));
 
     let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
     let before = outrig.tools().len();
@@ -292,10 +286,7 @@ async fn launch_with_sidecar_starts_it() {
         BTreeMap::new(),
         session_dir.path().join("logs"),
     )
-    .with_workspace(outrig::WorkspaceSpec {
-        host: host_ws.path().to_path_buf(),
-        container: PathBuf::from("/workspace"),
-    })
+    .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
     .with_sidecar(
         SidecarSpec::from_image("tools", tag.as_str())
             .with_workspace_access(SidecarWorkspaceAccess::Ro)
@@ -432,10 +423,7 @@ async fn failed_add_sidecar_leaves_session_usable() {
     let mut mcp = BTreeMap::new();
     mcp.insert("fs".to_string(), fs_spec("/workspace"));
     let spec = LaunchSpec::from_image(tag.clone(), mcp, session_dir.path().join("logs"))
-        .with_workspace(outrig::WorkspaceSpec {
-            host: host_ws.path().to_path_buf(),
-            container: PathBuf::from("/workspace"),
-        });
+        .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"));
 
     let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
     let before: Vec<(String, String)> = outrig
@@ -512,10 +500,7 @@ async fn added_sidecar_egress_obeys_network_policy() {
         .build()
         .expect("policy builds");
     let spec = LaunchSpec::from_image(tag.clone(), BTreeMap::new(), log_dir.clone())
-        .with_workspace(outrig::WorkspaceSpec {
-            host: host_ws.path().to_path_buf(),
-            container: PathBuf::from("/workspace"),
-        })
+        .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
         .with_network_filter(policy);
 
     let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
@@ -603,16 +588,12 @@ async fn from_image_launches_with_extra_read_only_mount() {
     );
 
     let spec = LaunchSpec::from_image(tag, mcp, log_dir)
-        .with_mount(MountSpec {
-            host: resources.path().to_path_buf(),
-            container: PathBuf::from("/resources/readonly"),
-            access: MountAccess::ReadOnly,
-        })
-        .with_capabilities(CapabilitySpec {
-            profile: CapabilityProfile::NoNetRaw,
-            cap_drop: Vec::new(),
-            cap_add: Vec::new(),
-        })
+        .with_mount(MountSpec::new(
+            resources.path(),
+            "/resources/readonly",
+            MountAccess::ReadOnly,
+        ))
+        .with_capabilities(CapabilitySpec::new(CapabilityProfile::NoNetRaw))
         .with_network_mode(NetworkMode::Default);
 
     let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
@@ -665,10 +646,7 @@ async fn from_image_can_ignore_embedded_mcp_label() {
         explicit_mcp.clone(),
         merge_session_dir.path().join("logs"),
     )
-    .with_workspace(outrig::WorkspaceSpec {
-        host: host_ws.path().to_path_buf(),
-        container: PathBuf::from("/workspace"),
-    });
+    .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"));
 
     let merge_err = match Outrig::launch(&merge_spec).await {
         Ok(outrig) => {
@@ -686,10 +664,7 @@ async fn from_image_can_ignore_embedded_mcp_label() {
     let ignore_session_dir = tempfile::tempdir().expect("tempdir ignore session");
     let ignore_spec =
         LaunchSpec::from_image(tag, explicit_mcp, ignore_session_dir.path().join("logs"))
-            .with_workspace(outrig::WorkspaceSpec {
-                host: host_ws.path().to_path_buf(),
-                container: PathBuf::from("/workspace"),
-            })
+            .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"))
             .with_embedded_mcp_policy(EmbeddedMcpPolicy::Ignore);
 
     let outrig = Outrig::launch(&ignore_spec)

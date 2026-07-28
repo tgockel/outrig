@@ -45,21 +45,49 @@ pub(crate) enum LaunchSource {
 /// Host directory mounted into the container as the workspace, plus the
 /// in-container path it gets mounted at.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WorkspaceSpec {
     pub host: PathBuf,
     pub container: PathBuf,
 }
 
+impl WorkspaceSpec {
+    /// Mount `host` as the workspace, visible at `container` inside.
+    pub fn new(host: impl Into<PathBuf>, container: impl Into<PathBuf>) -> Self {
+        Self {
+            host: host.into(),
+            container: container.into(),
+        }
+    }
+}
+
 /// Extra host directory mounted into the container.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct MountSpec {
     pub host: PathBuf,
     pub container: PathBuf,
     pub access: MountAccess,
 }
 
+impl MountSpec {
+    /// Mount `host` at `container` with the given access.
+    pub fn new(
+        host: impl Into<PathBuf>,
+        container: impl Into<PathBuf>,
+        access: MountAccess,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            container: container.into(),
+            access,
+        }
+    }
+}
+
 /// Container security policy applied at launch.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SecuritySpec {
     pub capabilities: CapabilitySpec,
     /// Host device nodes to pass through, one `--device=<path>` each.
@@ -86,14 +114,27 @@ impl Default for SecuritySpec {
 
 /// Linux capability profile plus explicit capability overrides.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct CapabilitySpec {
     pub profile: CapabilityProfile,
     pub cap_drop: Vec<String>,
     pub cap_add: Vec<String>,
 }
 
+impl CapabilitySpec {
+    /// `profile` with no explicit per-capability overrides. Assign `cap_drop`
+    /// / `cap_add` on the result to add them.
+    pub fn new(profile: CapabilityProfile) -> Self {
+        Self {
+            profile,
+            ..Self::default()
+        }
+    }
+}
+
 /// Network monitoring policy applied at launch.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct NetworkSpec {
     pub mode: NetworkMode,
     pub policy: Option<NetworkPolicy>,
@@ -103,9 +144,22 @@ pub struct NetworkSpec {
 /// the server is spawned with `podman exec -i` inside the sidecar, so a
 /// command is always required (entrypoint-stdio has no library surface).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SidecarServerSpec {
     pub command: Vec<String>,
     pub env: BTreeMap<String, EnvValue>,
+}
+
+impl SidecarServerSpec {
+    /// A server exec'd as `command`, with no extra environment. Assign `env`
+    /// on the result, or go through
+    /// [`SidecarSpec::with_server_env`](SidecarSpec::with_server_env).
+    pub fn new(command: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            command: command.into_iter().map(Into::into).collect(),
+            env: BTreeMap::new(),
+        }
+    }
 }
 
 /// Description of one sidecar container: image (a raw podman ref, used
@@ -118,6 +172,7 @@ pub struct SidecarServerSpec {
 /// performs) is out of facade scope: callers who want a built image run
 /// `image::ensure_image` themselves and pass the resulting tag.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SidecarSpec {
     pub name: String,
     pub(crate) image: String,
@@ -175,8 +230,9 @@ impl SidecarSpec {
         command: Vec<String>,
         env: BTreeMap<String, EnvValue>,
     ) -> Self {
-        self.servers
-            .insert(name.into(), SidecarServerSpec { command, env });
+        let mut server = SidecarServerSpec::new(command);
+        server.env = env;
+        self.servers.insert(name.into(), server);
         self
     }
 }
@@ -184,6 +240,7 @@ impl SidecarSpec {
 /// How [`Outrig::launch`] handles MCP servers declared in an image's
 /// `org.outrig.mcp` label.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EmbeddedMcpPolicy {
     /// Merge image-embedded declarations with the launch spec's MCP map.
     /// Launch-spec entries replace image entries with the same server name.
@@ -217,9 +274,25 @@ impl From<&CapabilitySpec> for ContainerCapabilities {
     }
 }
 
+/// The capability third of a `[security]` block, in the shape `podman` wants.
+/// Lives here rather than at each call site because both types are
+/// `#[non_exhaustive]`: a new capability knob can only be wired through inside
+/// this crate, so a caller's own copy of this mapping would keep compiling
+/// while silently dropping it.
+impl From<&ContainerSecurity> for ContainerCapabilities {
+    fn from(security: &ContainerSecurity) -> Self {
+        Self {
+            profile: security.capability_profile,
+            cap_drop: security.cap_drop.clone(),
+            cap_add: security.cap_add.clone(),
+        }
+    }
+}
+
 /// Description of one container launch: image source, optional workspace
 /// mount, MCP servers to start inside, and the directory to land per-server
 /// stderr in.
+#[non_exhaustive]
 pub struct LaunchSpec {
     pub(crate) source: LaunchSource,
     pub workspace: Option<WorkspaceSpec>,
@@ -325,18 +398,20 @@ impl LaunchSpec {
             ))
         })?;
 
-        let ws = WorkspaceSpec {
-            host: resolve_workspace_host(repo_root, &config.workspace.host_path),
-            container: config.workspace.container_path.clone(),
-        };
+        let ws = WorkspaceSpec::new(
+            resolve_workspace_host(repo_root, &config.workspace.host_path),
+            config.workspace.container_path.clone(),
+        );
         let mounts = config
             .workspace
             .mounts
             .iter()
-            .map(|mount| MountSpec {
-                host: resolve_workspace_host(repo_root, &mount.host_path),
-                container: mount.container_path.clone(),
-                access: mount.access,
+            .map(|mount| {
+                MountSpec::new(
+                    resolve_workspace_host(repo_root, &mount.host_path),
+                    mount.container_path.clone(),
+                    mount.access,
+                )
             })
             .collect();
         let source = match cfg.source() {
@@ -472,16 +547,20 @@ fn plan_to_launch_parts(
             .servers_in(&sc.name)
             .map(|(name, placed)| {
                 let (command, env) = placed.spec.normalize();
-                (name.clone(), SidecarServerSpec { command, env })
+                let mut server = SidecarServerSpec::new(command);
+                server.env = env;
+                (name.clone(), server)
             })
             .collect();
         let mounts = sc
             .mounts
             .iter()
-            .map(|mount| MountSpec {
-                host: resolve_workspace_host(repo_root, &mount.host_path),
-                container: mount.container_path.clone(),
-                access: mount.access,
+            .map(|mount| {
+                MountSpec::new(
+                    resolve_workspace_host(repo_root, &mount.host_path),
+                    mount.container_path.clone(),
+                    mount.access,
+                )
             })
             .collect();
         sidecars.push(SidecarSpec {
@@ -525,6 +604,7 @@ async fn resolve_sidecar_image_tag(
 /// `server` is the local config name (`spec.mcp` key) and `name` is the
 /// tool name as advertised by the server (un-namespaced).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolHandle {
     pub server: String,
     pub name: String,
@@ -577,18 +657,18 @@ impl Outrig {
         };
 
         let launch = ContainerLaunchSpec {
-            workspace: spec.workspace.as_ref().map(|workspace| ContainerWorkspace {
-                host: workspace.host.clone(),
-                container: workspace.container.clone(),
-                access: MountAccess::ReadWrite,
+            workspace: spec.workspace.as_ref().map(|workspace| {
+                ContainerWorkspace::new(
+                    workspace.host.clone(),
+                    workspace.container.clone(),
+                    MountAccess::ReadWrite,
+                )
             }),
             mounts: spec
                 .mounts
                 .iter()
-                .map(|mount| ContainerMount {
-                    host: mount.host.clone(),
-                    container: mount.container.clone(),
-                    access: mount.access,
+                .map(|mount| {
+                    ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
                 })
                 .collect(),
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
@@ -711,18 +791,18 @@ impl Outrig {
             )));
         }
         let launch = ContainerLaunchSpec {
-            workspace: workspace_access.map(|access| ContainerWorkspace {
-                host: self.container.host_workspace().to_path_buf(),
-                container: self.container.container_workspace().to_path_buf(),
-                access,
+            workspace: workspace_access.map(|access| {
+                ContainerWorkspace::new(
+                    self.container.host_workspace(),
+                    self.container.container_workspace(),
+                    access,
+                )
             }),
             mounts: spec
                 .mounts
                 .iter()
-                .map(|mount| ContainerMount {
-                    host: mount.host.clone(),
-                    container: mount.container.clone(),
-                    access: mount.access,
+                .map(|mount| {
+                    ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
                 })
                 .collect(),
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
@@ -1003,11 +1083,11 @@ mod tests {
     fn sidecar_spec_builder_sets_fields() {
         let spec = tools_sidecar()
             .with_workspace_access(SidecarWorkspaceAccess::Ro)
-            .with_mount(MountSpec {
-                host: PathBuf::from("/host/cache"),
-                container: PathBuf::from("/cache"),
-                access: MountAccess::ReadWrite,
-            });
+            .with_mount(MountSpec::new(
+                "/host/cache",
+                "/cache",
+                MountAccess::ReadWrite,
+            ));
 
         assert_eq!(spec.name, "tools");
         assert_eq!(spec.image, "ghcr.io/example/mcp-tools:1");

@@ -35,20 +35,19 @@ impl FakeClient {
     }
 
     fn with_tool(mut self, tool_name: &str) -> Self {
-        self.tools.push(McpTool {
-            name: tool_name.to_string(),
-            description: Some(format!("desc for {tool_name}")),
-            input_schema: json!({"type": "object"}),
-        });
+        let mut tool = McpTool::new(tool_name, json!({"type": "object"}));
+        tool.description = Some(format!("desc for {tool_name}"));
+        self.tools.push(tool);
         self
     }
 
     fn respond_ok(mut self, tool_name: &str, body: &str, is_error: bool) -> Self {
         self.responses.insert(
             tool_name.to_string(),
-            Ok(McpToolResult {
-                content_text: body.to_string(),
-                is_error,
+            Ok(if is_error {
+                McpToolResult::error(body)
+            } else {
+                McpToolResult::ok(body)
             }),
         );
         self

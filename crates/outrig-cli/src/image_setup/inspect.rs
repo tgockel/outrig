@@ -109,14 +109,7 @@ mod tests {
         let mut mcp = BTreeMap::new();
         mcp.insert(
             "build".to_string(),
-            McpServerSpec::Full {
-                command: Some(vec!["cargo-mcp".to_string(), "--stdio".to_string()]),
-                env,
-                sidecar: None,
-                image: None,
-                args: Vec::new(),
-                view: outrig::config::SidecarView::None,
-            },
+            McpServerSpec::exec(["cargo-mcp", "--stdio"]).with_env(env),
         );
         mcp.insert(
             "fs".to_string(),
@@ -126,12 +119,11 @@ mod tests {
             ]),
         );
 
-        let labels = StandaloneImageLabels {
-            description: Some("Rust tooling".to_string()),
-            version: Some("0.1.0".to_string()),
-            tags: vec!["rust".to_string(), "build".to_string()],
-            mcp: Some(mcp),
-        };
+        let mut labels = StandaloneImageLabels::default();
+        labels.description = Some("Rust tooling".to_string());
+        labels.version = Some("0.1.0".to_string());
+        labels.tags = vec!["rust".to_string(), "build".to_string()];
+        labels.mcp = Some(mcp);
 
         assert_eq!(
             render_inspect("rust-dev", &labels),
@@ -154,12 +146,7 @@ mod tests {
 
     #[test]
     fn render_inspect_omits_absent_metadata_and_mcp() {
-        let labels = StandaloneImageLabels {
-            description: None,
-            version: None,
-            tags: Vec::new(),
-            mcp: None,
-        };
+        let labels = StandaloneImageLabels::default();
 
         assert_eq!(render_inspect("plain", &labels), "image: plain\n");
     }

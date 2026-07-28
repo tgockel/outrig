@@ -47,7 +47,7 @@ provider   = "anthropic"
 identifier = "claude-opus-4-7"
 "#;
         let err = Config::load_from_str(bad).unwrap_err();
-        let OutrigError::ConfigDottedKey { source } = &err else {
+        let OutrigError::ConfigDottedKey { source, .. } = &err else {
             panic!("expected OutrigError::ConfigDottedKey, got: {err:?}");
         };
         let inner = source.to_string();
@@ -142,6 +142,7 @@ srv = { command = ["bin", "arg1"] }
             base_url,
             api_key,
             request_timeout_secs,
+            ..
         } = &cfg.providers["openai"]
         else {
             panic!("expected OpenAi variant for [providers.openai]");

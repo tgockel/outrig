@@ -263,6 +263,15 @@ fn candle_device(model_name: &str, spec: MistralrsDeviceSpec) -> Result<candle_c
                 .into())
             }
         }
+        // `MistralrsDeviceSpec` is `#[non_exhaustive]`; a device kind this
+        // build has no candle backend for cannot be silently downgraded to
+        // CPU, which would run the model far slower than asked without
+        // saying so.
+        _ => Err(LlmResolveError::MistralrsLoad {
+            model: model_name.to_string(),
+            source: anyhow::anyhow!("device {spec} is not supported by this build"),
+        }
+        .into()),
     }
 }
 

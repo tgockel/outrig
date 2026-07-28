@@ -34,13 +34,15 @@ pub const LABEL_SCHEMA: &str = "org.outrig.schema";
 pub const LABEL_SCHEMA_VERSION: &str = "1";
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct StandaloneImageToml {
     pub image: StandaloneImageMetadata,
     pub build: StandaloneBuildConfig,
     pub mcp: BTreeMap<String, McpServerSpec>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct StandaloneImageLabels {
     pub description: Option<String>,
     pub version: Option<String>,
@@ -49,6 +51,7 @@ pub struct StandaloneImageLabels {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum McpDeclarationSource {
     ImageLabel,
     LaunchSpec,
@@ -66,12 +69,14 @@ impl McpDeclarationSource {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct McpServerSpecWithSource {
     pub spec: McpServerSpec,
     pub source: McpDeclarationSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StandaloneImageMetadata {
     pub image_ref: String,
     pub description: Option<String>,
@@ -80,6 +85,7 @@ pub struct StandaloneImageMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StandaloneBuildConfig {
     pub dockerfile: PathBuf,
     pub context: PathBuf,
@@ -95,6 +101,7 @@ impl Default for StandaloneBuildConfig {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EmbeddedImageConfigError {
     #[error("org.outrig.mcp is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
@@ -126,6 +133,7 @@ pub enum EmbeddedImageConfigError {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StandaloneImageTomlError {
     #[error("TOML parse failed: {0}")]
     Toml(#[from] toml::de::Error),

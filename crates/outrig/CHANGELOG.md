@@ -21,6 +21,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** every public struct and enum that stays public is now `#[non_exhaustive]`, so
+  adding a field or a variant stops being a breaking change. Downstream crates can no longer
+  build these types with a struct literal -- including with `..Default::default()`, which the
+  attribute blocks along with every other struct expression -- and `match` on a public enum now
+  needs a catch-all arm.
+
+  Two construction paths replace the literal, and this release ships both. Types whose fields
+  are all optional gained or kept `Default`, and their `pub` fields stay assignable:
+  `let mut cfg = Config::default(); cfg.default_image = Some(name);`. Types with a required
+  field gained a constructor naming exactly that field -- `ImageConfig::from_dockerfile` /
+  `from_image_name`, `SidecarConfig::new`, `Model::new`, `Workspace::new`, `MountConfig::new`,
+  `MountSpec::new`, `WorkspaceSpec::new`, `CapabilitySpec::new`, `SidecarServerSpec::new`,
+  `ContainerWorkspace::new`, `ContainerMount::new`, `ContainerCapabilities::new`,
+  `PrimaryView::new`, `McpTool::new`, and `McpToolResult::ok` / `error`. Types that only ever
+  come back out of the library -- `ToolHandle`, `ContainerInspect`, `ImageBuildOutcome`,
+  `McpStartupFailure`, the `sidecar` planning types, the `embedded` parse results, and every
+  error enum -- get the attribute alone, since nothing outside builds them.
+
+  Two enum variants are sealed the same way and so grew constructors of their own, since a
+  sealed variant is otherwise unconstructible from outside: `McpServerSpec::Full` is now reached
+  through `McpServerSpec::exec` / `entrypoint` plus `with_env` / `with_sidecar` / `with_args` /
+  `with_view`, and `LlmProvider::OpenAi` through `LlmProvider::openai`. `McpServerSpec::Short`
+  is unaffected. Variant-level sealing is otherwise limited to what is known to churn: every
+  field-bearing `OutrigError` variant, `ImageSourceRef`'s two, and
+  `ConfigValidationError::{DockerfileMissing, ContextMissing}`. Patterns that bind a sealed
+  variant's fields need a trailing `..`.
+
+  Nothing was removed and no signature changed; the surface diff is the attribute plus the new
+  constructors. Three additions exist so a caller need not match a sealed enum at all:
+  `McpServerSpec::command` / `env` borrow what only `normalize` used to clone,
+  `Placement::sidecar_name` answers the one question callers asked `Placement` for, and
+  `SidecarView::as_str` gives the wire name. `From<&ContainerSecurity> for ContainerCapabilities`
+  is also new: that mapping now has to live here, because a future security knob can only be
+  wired through inside this crate.
 - **Breaking:** sidecars moved from `[images.<name>.sidecars.<sc>]` to a top-level
   `[sidecars.<sc>]` map, matching every other cross-referenced entity in the config
   (`[models.<n>]`, `[providers.<n>]`, `[images.<n>]`). One block can now be shared by any

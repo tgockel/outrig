@@ -150,6 +150,7 @@ enum ContainerOwnership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContainerInspect {
     pub image_tag: ImageTag,
     pub running: bool,
@@ -192,6 +193,7 @@ pub const PRIMARY_VIEW_HELPER_MOUNT: &str = "/outrig-enter";
 /// launcher (both plain `:ro`, never SELinux-relabeled), and sets
 /// `--entrypoint /outrig-enter`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PrimaryView {
     /// Primary container name, for `--userns=container:<name>`.
     pub primary_container: String,
@@ -201,8 +203,25 @@ pub struct PrimaryView {
     pub helper_host: PathBuf,
 }
 
+impl PrimaryView {
+    /// Join the namespaces of `primary_container`, whose init runs as
+    /// `primary_pid`, using the `outrig-enter` helper at `helper_host`.
+    pub fn new(
+        primary_container: impl Into<String>,
+        primary_pid: u32,
+        helper_host: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            primary_container: primary_container.into(),
+            primary_pid,
+            helper_host: helper_host.into(),
+        }
+    }
+}
+
 /// Complete inputs for a `podman run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContainerLaunchSpec {
     pub workspace: Option<ContainerWorkspace>,
     pub mounts: Vec<ContainerMount>,
@@ -237,11 +256,11 @@ impl Default for ContainerLaunchSpec {
 impl ContainerLaunchSpec {
     pub fn workspace(host: impl Into<PathBuf>, container: impl Into<PathBuf>) -> Self {
         Self {
-            workspace: Some(ContainerWorkspace {
-                host: host.into(),
-                container: container.into(),
-                access: MountAccess::ReadWrite,
-            }),
+            workspace: Some(ContainerWorkspace::new(
+                host,
+                container,
+                MountAccess::ReadWrite,
+            )),
             ..Self::default()
         }
     }
@@ -250,26 +269,70 @@ impl ContainerLaunchSpec {
 /// Primary workspace mount. When present, this also sets `-w`. The session's
 /// own container mounts it read-write; sidecars may take a read-only view.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContainerWorkspace {
     pub host: PathBuf,
     pub container: PathBuf,
     pub access: MountAccess,
 }
 
+impl ContainerWorkspace {
+    /// Mount `host` as the workspace at `container`.
+    pub fn new(
+        host: impl Into<PathBuf>,
+        container: impl Into<PathBuf>,
+        access: MountAccess,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            container: container.into(),
+            access,
+        }
+    }
+}
+
 /// Extra bind mount. These do not affect the container working directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContainerMount {
     pub host: PathBuf,
     pub container: PathBuf,
     pub access: MountAccess,
 }
 
+impl ContainerMount {
+    /// Bind `host` at `container`.
+    pub fn new(
+        host: impl Into<PathBuf>,
+        container: impl Into<PathBuf>,
+        access: MountAccess,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            container: container.into(),
+            access,
+        }
+    }
+}
+
 /// Linux capability policy applied to the container at startup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContainerCapabilities {
     pub profile: CapabilityProfile,
     pub cap_drop: Vec<String>,
     pub cap_add: Vec<String>,
+}
+
+impl ContainerCapabilities {
+    /// `profile` with no explicit per-capability overrides. Assign `cap_drop`
+    /// / `cap_add` on the result to add them.
+    pub fn new(profile: CapabilityProfile) -> Self {
+        Self {
+            profile,
+            ..Self::default()
+        }
+    }
 }
 
 impl Container {

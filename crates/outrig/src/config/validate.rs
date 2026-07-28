@@ -19,6 +19,7 @@ use super::{
 };
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigValidationError {
     #[error("default-image {name:?} does not match any [images.<name>]")]
     UnknownDefaultImage { name: String },
@@ -95,9 +96,11 @@ pub enum ConfigValidationError {
     ImageNameWithBuildArgs { image: String },
 
     #[error("image {image:?} dockerfile path {path:?} does not exist")]
+    #[non_exhaustive]
     DockerfileMissing { image: String, path: PathBuf },
 
     #[error("image {image:?} context path {path:?} does not exist")]
+    #[non_exhaustive]
     ContextMissing { image: String, path: PathBuf },
 
     #[error("session-root {path:?} must be an absolute path")]
@@ -888,6 +891,7 @@ pub(super) fn validate_workspace_mounts(
 /// onto its pre-existing per-rule variants; sidecar (and future) callers
 /// wrap it whole and render via `Display`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum MountRuleViolation {
     #[error("container-path {0:?} must be absolute")]
     ContainerNotAbsolute(PathBuf),

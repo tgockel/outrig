@@ -64,6 +64,7 @@ impl fmt::Display for ImageTag {
 /// drive output -- a cache hit can print a one-line summary, a miss wants
 /// the verbose header + buildah stream.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ImageBuildOutcome {
     pub tag: ImageTag,
     pub cache_hit: bool,
@@ -966,24 +967,17 @@ async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
 mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
     use super::*;
     use crate::config::EnvValue;
 
     #[test]
     fn build_image_cmd_uses_resolved_build_args() {
-        let cfg = ImageConfig {
-            image_name: None,
-            dockerfile: Some(PathBuf::from("Dockerfile")),
-            context: Some(PathBuf::from(".")),
-            build_args: BTreeMap::from([(
-                "GH_TOKEN".to_string(),
-                EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
-            )]),
-            security: Default::default(),
-            mcp: BTreeMap::new(),
-        };
+        let mut cfg = ImageConfig::from_dockerfile("Dockerfile", ".");
+        cfg.build_args = BTreeMap::from([(
+            "GH_TOKEN".to_string(),
+            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+        )]);
         let resolved = BTreeMap::from([("GH_TOKEN".to_string(), "secret-token".to_string())]);
 
         let cmd = build_image_cmd(

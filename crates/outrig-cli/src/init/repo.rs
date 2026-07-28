@@ -357,37 +357,20 @@ fn render(
     model_choices: RepoModelChoices,
     preamble: String,
 ) -> Result<String> {
+    let mut agent = Agent::default();
+    agent.model = agent_model;
+    agent.preamble = Some(preamble);
     let mut agents = BTreeMap::new();
-    agents.insert(
-        agent_name.clone(),
-        Agent {
-            model: agent_model,
-            image: None,
-            preamble: Some(preamble),
-            temperature: None,
-            max_tokens: None,
-            tool_call_max: None,
-            tool_result_max: None,
-            subagents: None,
-            subagent_depth_max: None,
-        },
-    );
-    let cfg = Config {
-        default_image: Some(image_name),
-        default_agent: Some(agent_name),
-        default_model: model_choices.default_model,
-        tool_call_max: None,
-        tool_result_max: None,
-        workspace: Workspace {
-            host_path: PathBuf::from(host_path),
-            container_path: PathBuf::from(container_path),
-            mounts: Vec::new(),
-        },
-        providers: model_choices.providers,
-        models: model_choices.models,
-        agents,
-        ..Config::default()
-    };
+    agents.insert(agent_name.clone(), agent);
+
+    let mut cfg = Config::default();
+    cfg.default_image = Some(image_name);
+    cfg.default_agent = Some(agent_name);
+    cfg.default_model = model_choices.default_model;
+    cfg.workspace = Workspace::new(host_path, container_path);
+    cfg.providers = model_choices.providers;
+    cfg.models = model_choices.models;
+    cfg.agents = agents;
     toml::to_string_pretty(&cfg)
         .map_err(|e| OutrigError::Configuration(format!("rendering repo config: {e}")).into())
 }

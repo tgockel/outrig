@@ -30,16 +30,49 @@ use crate::process::{Cmd, Transcript};
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct McpTool {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
 }
 
+impl McpTool {
+    /// A tool named `name` taking `input_schema`. Assign `description` on the
+    /// result to add one.
+    pub fn new(name: impl Into<String>, input_schema: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            input_schema,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct McpToolResult {
     pub content_text: String,
     pub is_error: bool,
+}
+
+impl McpToolResult {
+    /// A successful call returning `content_text`.
+    pub fn ok(content_text: impl Into<String>) -> Self {
+        Self {
+            content_text: content_text.into(),
+            is_error: false,
+        }
+    }
+
+    /// A call the server itself reported as failed -- distinct from a
+    /// transport error, which surfaces as an `Err`.
+    pub fn error(content_text: impl Into<String>) -> Self {
+        Self {
+            content_text: content_text.into(),
+            is_error: true,
+        }
+    }
 }
 
 /// On `Drop` without an explicit [`McpClient::shutdown`], the underlying
@@ -238,11 +271,9 @@ impl McpClient {
                 let description = t.description.and_then(|description| {
                     (!description.is_empty()).then(|| description.into_owned())
                 });
-                McpTool {
-                    name: t.name.into_owned(),
-                    description,
-                    input_schema,
-                }
+                let mut tool = McpTool::new(t.name.into_owned(), input_schema);
+                tool.description = description;
+                tool
             })
             .collect())
     }
@@ -311,9 +342,10 @@ impl McpClient {
             }
         }
 
-        Ok(McpToolResult {
-            content_text,
-            is_error: result.is_error.unwrap_or(false),
+        Ok(if result.is_error.unwrap_or(false) {
+            McpToolResult::error(content_text)
+        } else {
+            McpToolResult::ok(content_text)
         })
     }
 

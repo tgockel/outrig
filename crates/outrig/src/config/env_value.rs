@@ -19,6 +19,7 @@ use thiserror::Error;
 use super::env_ref::parse_env_ref;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EnvValueError {
     #[error("env var {var} is not set")]
     NotPresent { var: String },
@@ -31,6 +32,7 @@ pub enum EnvValueError {
 /// through verbatim, or a reference to a host env var resolved at the call
 /// site that needs the concrete string.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EnvValue {
     Literal(String),
     EnvRef(String),
