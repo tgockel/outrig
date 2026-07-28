@@ -593,9 +593,9 @@ pub outrig::container::sidecar::SidecarPlan::security: outrig::config::Container
 pub outrig::container::sidecar::SidecarPlan::start: outrig::config::SidecarStart
 pub outrig::container::sidecar::SidecarPlan::view: outrig::config::SidecarView
 pub outrig::container::sidecar::SidecarPlan::workspace: outrig::config::SidecarWorkspaceAccess
-pub fn outrig::container::sidecar::build_primary_view_argv(&[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &str, &str, &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn outrig::container::sidecar::build_primary_view_argv(&[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &str, &str, &str, core::option::Option<(u32, u32)>) -> alloc::vec::Vec<alloc::string::String>
 pub fn outrig::container::sidecar::entrypoint_args<'a>(&'a outrig::config::McpServerSpec, &'a outrig::container::sidecar::SidecarPlan) -> &'a [alloc::string::String]
-pub fn outrig::container::sidecar::entrypoint_create_args(outrig::config::SidecarView, &[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &std::path::Path) -> alloc::vec::Vec<alloc::string::String>
+pub fn outrig::container::sidecar::entrypoint_create_args(outrig::config::SidecarView, &[alloc::string::String], &[alloc::string::String], &[alloc::string::String], &std::path::Path, core::option::Option<(u32, u32)>) -> alloc::vec::Vec<alloc::string::String>
 pub fn outrig::container::sidecar::merge_primary_labels(&mut outrig::container::sidecar::SessionMcpPlan, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>)
 pub fn outrig::container::sidecar::merge_sidecar_labels(&mut outrig::container::sidecar::SessionMcpPlan, &str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>) -> outrig::error::Result<()>
 pub fn outrig::container::sidecar::plan_from_config(&outrig::config::Config, &outrig::config::ImageConfig) -> outrig::container::sidecar::SessionMcpPlan

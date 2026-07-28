@@ -97,6 +97,80 @@ Always dropping, rather than adding a config key to opt in, is the right default
 wants root over the primary's filesystem is the unusual case, and it should have to say so. No
 such key today; add one when something needs it.
 
+## Decisions
+
+- **The producer mirrors the launcher's optionality: `ids: Option<(u32, u32)>`,** one parameter
+  on both `build_primary_view_argv` and `entrypoint_create_args` rather than two `u32`s that
+  always emit. It makes "omitting both flags reproduces today's argv exactly" a hermetic unit
+  test (`primary_view_argv_emits_the_drop_flags_ahead_of_the_separator` asserts both vectors),
+  which is otherwise unverifiable: `launcher.rs` is compiled by `build.rs` with a standalone
+  `rustc`, never into the crate, so its argument parsing has no in-crate test to pin it. Both
+  production callers pass `Some`.
+- **`--uid` and `--gid` are both-or-neither in the launcher.** Dropping the uid while keeping
+  gid 0 leaves every file the payload creates owned by the container's root group -- a
+  half-migration with no use case. One without the other is a usage error (exit 2), like a
+  non-integer value.
+- **The CLI resolves the ids where it already resolves `PrimaryView`** (`start_auto_sidecars`),
+  and passes them to `create_one_entrypoint_sidecar` as a parameter. Not a new `PrimaryView`
+  field: that struct feeds `podman create` flags, and these are launcher argv. The library reads
+  them straight off its `Container`, so both paths hand the launcher the same ids and
+  `entrypoint_create_args` keeps its "config and library cannot drift" property.
+- **`setgroups` failure is fatal, and that is the right direction.** A user namespace created by
+  a process mapping itself (`unshare -r`) has `/proc/self/setgroups` = `deny`, which makes
+  `setgroups(0, NULL)` return `EPERM` -- verified by hand against the built launcher. Rootless
+  podman does not produce such a namespace: it maps through `newuidmap`/`newgidmap`, and both a
+  `--userns=keep-id` container and a plain rootless one report `allow` (also verified). A root
+  payload there carries a real supplementary list (`0,1,2,3,4,6,10,11,20,26,27` on Alpine), so
+  the call is doing work rather than being ceremonial. Refusing to start beats exec'ing a payload
+  whose group list we could not clear.
+- **The e2e proof lives in two places, for one reason each.** The runnable one is in
+  `crates/outrig/tests/library_surface.rs`, whose `view = "primary"` test uses the
+  absolute-`ENTRYPOINT` derivative and therefore passes today; it was confirmed to fail without
+  the drop (the written file came back owned by `100000:100000`, the subuid) and to pass with it.
+  The same two assertions are also in `crates/outrig-cli/tests/primary_view_e2e.rs`, as this
+  task's Acceptance asks -- but that binary is red on trunk and stays red until
+  `plan/todo/0103-primary-view-relative-entrypoint.md` lands, because the stock image's bare
+  `node` `ENTRYPOINT` does not resolve. Those assertions ship written and unexecuted.
+- **The privileged-operation proof is a write to `/etc` through the server**, not a synthetic
+  probe. The served root is `/`, so the server's own policy permits the path and only the kernel
+  refuses -- which is what makes it evidence that the capabilities are gone rather than unused.
+- **One follow-up filed:** `plan/next/primary-view-payload-home.md`. The payload keeps the image's
+  `HOME` (usually `/root`), which the session user cannot write; exec-stdio servers get a correct
+  `HOME` from `build_exec_argv`, and entrypoint hosts have no equivalent. No shipped server needs
+  it yet.
+
+## Decisions from the `/simplify` pass
+
+- **The launcher's numeric-flag parse is one generic `num_arg`,** which `--target` now uses too
+  rather than keeping its own hand-inlined copy of the same parse-or-exit-2. The two messages
+  collapse into one (`--target: not a valid number`); generics cost nothing in a single-`rustc`
+  build.
+- **The ids are resolved with the `PrimaryView` inputs, under the same guard, as an
+  `Option<(u32, u32)>`.** They were briefly a bare tuple computed unconditionally and wrapped in
+  `Some` at the call: two view-only values with two different shapes and two resolution sites.
+  Now `create_one_entrypoint_sidecar` takes an `Option` that is `Some` exactly when
+  `primary_view` is.
+- **`bootstrap_needed` and `sidecar_needs_bootstrap` had to be corrected, not just left alone.**
+  Both stated that an entrypoint host "keeps the image's own `USER`" -- the pre-0102 answer, in
+  the one predicate a reader consults to ask who such a container runs as. Each now names the
+  `view = "primary"` exception and why it needs no bootstrap of its own: the graft puts the
+  primary's already-bootstrapped `/etc/passwd` at `/`.
+- **Rejected: folding the ids into `PrimaryView`** and having `entrypoint_create_args` read them
+  from it, which would make `SidecarView::Primary` + no-ids unrepresentable. It is the better
+  shape on its own terms -- `PrimaryView` already carries `helper_host`, so the "that struct is
+  create-flags, these are argv" line is blurrier than it looks -- but the `ids` parameter shape
+  was settled deliberately during planning, and the change would widen a second public type's
+  constructor for it. Recorded here for whoever revisits the surface.
+- **The CLI e2e's `list_dir` and the new `write_file` share a `call_tool` helper** rather than
+  each spelling out the `json!` -> `as_object` -> `CallToolRequestParams` -> panic-on-transport
+  chain. `write_file` returns the `CallToolResult` instead of an inverted "did it fail" bool: one
+  of its two call sites expects success and the other expects refusal, so the judgment belongs to
+  the caller.
+- **`mcp-trust-model.md`'s lead sentence was wrong after the first edit,** not merely redundant:
+  it still had the *sidecar* joining the namespace with the capabilities, which forced the
+  "what still bounds it" list to walk it back with two separate capability clauses. The sentence
+  now says what the join needs, and the list says who holds it and for how long.
+
 ## Dependencies
 
 - **0096**, which fixed the double-graft half of the argv contract and added the

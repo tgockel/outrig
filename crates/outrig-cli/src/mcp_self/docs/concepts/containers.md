@@ -334,7 +334,10 @@ before creating `/home/<user>`. No `podman exec` is involved, and nothing is wri
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see
-[MCP Servers](mcp-servers.md#primary-filesystem-view)).
+[MCP Servers](mcp-servers.md#primary-filesystem-view)). The launcher's argv carries
+`--uid`/`--gid` with the session user's ids: it holds those capabilities only until the graft is
+in place, then becomes that user for the exec, so the *server* runs unprivileged even though the
+container was created privileged.
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
 into a capability profile or explicit `cap-drop` / `cap-add` entries, and `--device=<path>`

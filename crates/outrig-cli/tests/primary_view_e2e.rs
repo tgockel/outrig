@@ -14,6 +14,10 @@
 //!   /mnt` is empty.
 //! - Killing the primary reaps its `view = "primary"` sidecar.
 //!
+//! Plus task 0102's: what the payload writes into the workspace belongs to the
+//! invoking user, and a root-owned path in the primary is refused -- the
+//! launcher drops its capabilities with the uid once the graft is in place.
+//!
 //! The served root is `/` (not the doc's `/workspace`) so the filesystem
 //! server can reach the primary-only cargo path through the view; both the
 //! workspace and the cargo path are then provable through the real server.
@@ -28,6 +32,7 @@
 
 #![cfg(feature = "e2e")]
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -131,25 +136,51 @@ fn tool_body(call: &rmcp::model::CallToolResult) -> String {
         .join("\n")
 }
 
+/// One `tools/call` against the sidecar's server. A transport failure panics;
+/// a result the *server* marked as an error is returned for the caller to
+/// judge, since some of these calls are expected to be refused.
+async fn call_tool(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tool: &str,
+    args: serde_json::Value,
+) -> rmcp::model::CallToolResult {
+    let args = args
+        .as_object()
+        .expect("tool arguments are an object")
+        .clone();
+    service
+        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args.clone()))
+        .await
+        .unwrap_or_else(|e| panic!("tools/call {tool} {args:?}: {e}"))
+}
+
 async fn list_dir(
     service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     path: &str,
 ) -> String {
-    let args = serde_json::json!({ "path": path })
-        .as_object()
-        .unwrap()
-        .clone();
-    let call = service
-        .call_tool(
-            CallToolRequestParams::new("fs__list_directory".to_string()).with_arguments(args),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("tools/call fs__list_directory {path}: {e}"));
+    let call = call_tool(
+        service,
+        "fs__list_directory",
+        serde_json::json!({ "path": path }),
+    )
+    .await;
     assert!(
         call.is_error != Some(true),
         "listing {path} through the primary view failed: {call:?}"
     );
     tool_body(&call)
+}
+
+/// Write through the view. The served root is `/`, so whether the result comes
+/// back as an error is the kernel's answer about what the payload's ids may
+/// touch, not the server's own policy -- which is why the caller judges it.
+async fn write_file(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    path: &str,
+    content: &str,
+) -> rmcp::model::CallToolResult {
+    let args = serde_json::json!({ "path": path, "content": content });
+    call_tool(service, "fs__write_file", args).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -237,6 +268,35 @@ context = "{context}"
         assert!(
             cargo_dir.contains("cargo"),
             "the view should show the primary image's cargo: {cargo_dir}"
+        );
+
+        // The payload runs as the session user: the launcher holds its
+        // capabilities only until the graft is in place, then drops to the
+        // `--uid`/`--gid` it was given. So a file it writes belongs to the
+        // invoking user rather than to a host subuid, and a root-owned path
+        // is out of reach.
+        let wrote = write_file(
+            &service,
+            "/workspace/FROM-SIDECAR.txt",
+            "through the view\n",
+        )
+        .await;
+        assert!(
+            wrote.is_error != Some(true),
+            "writing into the primary's workspace through the view failed: {wrote:?}"
+        );
+        let written = std::fs::metadata(repo_dir.path().join("FROM-SIDECAR.txt"))
+            .expect("stat the file the sidecar wrote");
+        let repo_meta = std::fs::metadata(repo_dir.path()).expect("stat the host repo dir");
+        assert_eq!(
+            (written.uid(), written.gid()),
+            (repo_meta.uid(), repo_meta.gid()),
+            "a file written through the view should belong to the invoking user"
+        );
+        let denied = write_file(&service, "/etc/outrig-privilege-probe", "never\n").await;
+        assert!(
+            denied.is_error == Some(true),
+            "a root-owned path must be unwritable after the privilege drop: {denied:?}"
         );
 
         let sid = wait_for_stderr_value(stderr_buf.clone(), "[outrig] session id:").await;

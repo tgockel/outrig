@@ -853,18 +853,21 @@ async fn start_auto_sidecars(
     // Resolve both once, up front, only when such a sidecar is starting -- the
     // primary is already running and bootstrapped by Phase C. `materialize`
     // fails here (helper not built) rather than emitting a broken container.
-    let primary_view = if to_start
+    let (primary_view, session_ids) = if to_start
         .iter()
         .any(|(_, _, sc)| sc.view == SidecarView::Primary)
     {
         let helper_host = enter::materialize(args.session_dir)?;
-        Some(PrimaryView::new(
-            containers.primary.name(),
-            containers.primary.pid().await?,
-            helper_host,
-        ))
+        (
+            Some(PrimaryView::new(
+                containers.primary.name(),
+                containers.primary.pid().await?,
+                helper_host,
+            )),
+            Some((containers.primary.uid(), containers.primary.gid())),
+        )
     } else {
-        None
+        (None, None)
     };
     let primary_view = primary_view.as_ref();
 
@@ -879,6 +882,7 @@ async fn start_auto_sidecars(
                         server_name,
                         &placed.spec,
                         primary_view,
+                        session_ids,
                     )
                     .await
                 }
@@ -1068,6 +1072,12 @@ async fn start_one_sidecar(
 /// the exec-based resolv.conf install needs a running container. The
 /// ENTRYPOINT's positional arguments come from the entry or its sidecar
 /// block, whichever declared them.
+///
+/// `session_ids` are the session user's `(uid, gid)`, which a `view =
+/// "primary"` payload drops to once the launcher has grafted. They are
+/// resolved off the primary with the [`PrimaryView`] inputs and present under
+/// the same condition, so this path and `Outrig::add_sidecar` hand the
+/// launcher the same ids.
 async fn create_one_entrypoint_sidecar(
     args: &SidecarPhaseArgs<'_>,
     tag: &ImageTag,
@@ -1075,6 +1085,7 @@ async fn create_one_entrypoint_sidecar(
     server_name: &str,
     spec: &outrig::config::McpServerSpec,
     primary_view: Option<&PrimaryView>,
+    session_ids: Option<(u32, u32)>,
 ) -> Result<Container> {
     let ctx = args.start_ctx();
     let mut launch = sidecar_launch_base(&ctx, sc);
@@ -1101,6 +1112,7 @@ async fn create_one_entrypoint_sidecar(
         &image_cmd,
         sidecar::entrypoint_args(spec, sc),
         ctx.container_workspace,
+        session_ids,
     );
 
     let container_name = sidecar_container_name(&ctx, sc);

@@ -1045,6 +1045,7 @@ impl Outrig {
                 &image_cmd,
                 server.args(),
                 self.container.container_workspace(),
+                Some((self.container.uid(), self.container.gid())),
             ));
         Container::create_initialized(options).await
     }

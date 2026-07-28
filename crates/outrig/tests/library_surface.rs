@@ -12,6 +12,7 @@
 #![cfg(feature = "e2e")]
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use outrig::config::{Config, McpServerSpec};
@@ -520,6 +521,54 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         tmp.content_text.contains("IN-PRIMARY.txt"),
         "the view should show a file only the primary container has, got: {}",
         tmp.content_text,
+    );
+
+    // The launcher drops to the session's uid/gid once the graft is in place,
+    // so what the server writes is the invoking user's -- not a host subuid
+    // that user could not chown back. Without the drop this file lands owned by
+    // the container root's mapping and the workspace tempdir cannot clean up.
+    let written = outrig
+        .call_tool(
+            "fs",
+            "write_file",
+            serde_json::json!({
+                "path": "/workspace/FROM-SIDECAR.txt",
+                "content": "written through the primary view\n",
+            }),
+        )
+        .await
+        .expect("write into the primary's workspace through the view");
+    assert!(
+        !written.is_error,
+        "writing into the workspace through the view failed: {}",
+        written.content_text,
+    );
+    let host_file = host_ws.path().join("FROM-SIDECAR.txt");
+    let meta = std::fs::metadata(&host_file).expect("stat the file the sidecar wrote");
+    let ws_meta = std::fs::metadata(host_ws.path()).expect("stat the host workspace");
+    assert_eq!(
+        (meta.uid(), meta.gid()),
+        (ws_meta.uid(), ws_meta.gid()),
+        "a file written through the view should belong to the invoking user",
+    );
+
+    // And the capabilities are gone, not merely unused: the served root is `/`,
+    // so the server's own policy allows this path and only the kernel refuses.
+    let denied = outrig
+        .call_tool(
+            "fs",
+            "write_file",
+            serde_json::json!({
+                "path": "/etc/outrig-privilege-probe",
+                "content": "should never be written\n",
+            }),
+        )
+        .await
+        .expect("attempt a privileged write through the view");
+    assert!(
+        denied.is_error,
+        "a root-owned path must be unwritable after the drop, got: {}",
+        denied.content_text,
     );
 
     outrig.shutdown().await.expect("shutdown");

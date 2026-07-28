@@ -2,7 +2,7 @@
 //! ANOTHER container's filesystem view.
 //!
 //!     outrig-enter [--target PID | --ns-file PATH] [--graft DIR] [--cwd DIR]
-//!                  -- PROGRAM [ARGS...]
+//!                  [--uid N --gid N] -- PROGRAM [ARGS...]
 //!
 //! A Rust port of the prototype's `sidecar-enter.c`
 //! (<https://github.com/tgockel/prototype-podman-shared-fs>). It is the sidecar
@@ -25,6 +25,18 @@
 //! `build_primary_view_argv` is the producer that honors this; changing either
 //! side alone silently breaks the other, and the failure looks like an image
 //! that cannot find its own interpreter.
+//!
+//! **The ordering contract, which the privilege drop depends on:** every step
+//! up to and including the `chdir` needs `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` --
+//! `open_tree`, `open(ns)`, `setns`, `unshare`, `mount`, `move_mount`, and a
+//! `--cwd` that may name a directory only root can enter. Nothing after it
+//! does, so `--uid`/`--gid` drop to the session's ids there, immediately
+//! before the exec. `PROGRAM` is opened at the very top, while this image's
+//! rootfs is still at `/` and while still privileged, so the `ElfKind::Static`
+//! `execveat` from that descriptor still works afterwards -- the kernel checks
+//! exec permission against the file's own mode, which for an image binary is
+//! `0755`. Reordering the drop earlier breaks the graft; reordering it later
+//! is not possible, because the exec is the last thing this process does.
 //!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
 //! Linux musl target; it is not part of the normal `cargo build`. The pure ELF
@@ -51,6 +63,9 @@ unsafe extern "C" {
         data: *const c_void,
     ) -> c_int;
     fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
+    fn setgroups(size: usize, list: *const u32) -> c_int;
+    fn setresgid(rgid: u32, egid: u32, sgid: u32) -> c_int;
+    fn setresuid(ruid: u32, euid: u32, suid: u32) -> c_int;
     fn syscall(num: c_long, ...) -> c_long;
 }
 
@@ -133,9 +148,43 @@ fn environ_cstrings() -> Vec<CString> {
 fn usage() -> ! {
     eprintln!(
         "usage: outrig-enter [--target PID | --ns-file PATH] [--graft DIR] [--cwd DIR] \
-         -- PROGRAM [ARGS...]"
+         [--uid N --gid N] -- PROGRAM [ARGS...]"
     );
     std::process::exit(2);
+}
+
+/// Parse a numeric flag value, or exit with the flag named. The bound is the
+/// target type's: `--target` takes a PID, `--uid`/`--gid` refuse negatives.
+fn num_arg<T: std::str::FromStr>(flag: &str, value: &OsString) -> T {
+    value
+        .to_str()
+        .and_then(|s| s.parse::<T>().ok())
+        .unwrap_or_else(|| {
+            eprintln!("outrig-enter: {flag}: not a valid number");
+            std::process::exit(2);
+        })
+}
+
+/// Become `gid`/`uid` for good: supplementary groups first (they survive a uid
+/// change on their own), then the group ids, then the user ids -- each `setres*`
+/// sets the real, effective *and* saved id, so there is nothing left to switch
+/// back to.
+///
+/// There is deliberately no `capset` here. The kernel clears the permitted,
+/// effective and ambient capability sets on a transition away from uid 0, so
+/// `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` are gone with the `setresuid` -- for this
+/// process and for everything it spawns. Spelling that out because the absence
+/// of a capability call is otherwise the first thing a reader will flag.
+fn drop_privileges(uid: u32, gid: u32) {
+    if unsafe { setgroups(0, std::ptr::null()) } < 0 {
+        die("setgroups(0)", "");
+    }
+    if unsafe { setresgid(gid, gid, gid) } < 0 {
+        die(&format!("setresgid({gid})"), "");
+    }
+    if unsafe { setresuid(uid, uid, uid) } < 0 {
+        die(&format!("setresuid({uid})"), "");
+    }
 }
 
 fn main() {
@@ -145,6 +194,8 @@ fn main() {
     let mut ns_file: Option<OsString> = None;
     let mut graft = OsString::from("/mnt");
     let mut cwd = OsString::from("/");
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -152,13 +203,7 @@ fn main() {
         let next = args.get(i + 1);
         match (a.to_str(), next) {
             (Some("--target"), Some(v)) => {
-                target = v
-                    .to_str()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("outrig-enter: --target: not an integer PID");
-                        std::process::exit(2);
-                    });
+                target = num_arg("--target", v);
                 i += 2;
             }
             (Some("--ns-file"), Some(v)) => {
@@ -173,6 +218,14 @@ fn main() {
                 cwd = v.clone();
                 i += 2;
             }
+            (Some("--uid"), Some(v)) => {
+                uid = Some(num_arg("--uid", v));
+                i += 2;
+            }
+            (Some("--gid"), Some(v)) => {
+                gid = Some(num_arg("--gid", v));
+                i += 2;
+            }
             (Some("--"), _) => {
                 i += 1;
                 break;
@@ -183,6 +236,17 @@ fn main() {
     if i >= args.len() {
         usage();
     }
+    // Both or neither: dropping the uid while keeping gid 0 leaves every file
+    // the payload creates owned by the container's root group, which is the
+    // half-migration this flag pair exists to avoid.
+    let drop_to = match (uid, gid) {
+        (Some(uid), Some(gid)) => Some((uid, gid)),
+        (None, None) => None,
+        _ => {
+            eprintln!("outrig-enter: --uid and --gid must be given together");
+            std::process::exit(2);
+        }
+    };
 
     let prog_argv = &args[i..];
     let program = prog_argv[0].as_os_str();
@@ -281,6 +345,11 @@ fn main() {
     let cwd_c = cstr(cwd.as_bytes());
     if unsafe { chdir(cwd_c.as_ptr()) } < 0 {
         die(&format!("chdir {}", cwd.to_string_lossy()), "");
+    }
+
+    // Last privileged instant; see the ordering contract in the module docs.
+    if let Some((uid, gid)) = drop_to {
+        drop_privileges(uid, gid);
     }
 
     match kind {

@@ -134,7 +134,10 @@ impl SessionMcpPlan {
     /// entrypoint host never does -- bootstrap runs over `podman exec`, and
     /// there is no window for it between `podman create` and the `podman start
     /// --attach` that *is* the server. Such a container keeps the image's own
-    /// `USER`, mounts or not.
+    /// `USER`, mounts or not -- except under [`SidecarView::Primary`], where
+    /// the launcher drops the payload to the session's ids itself (see
+    /// [`build_primary_view_argv`]) and reads the primary's `/etc/passwd`
+    /// through the graft rather than needing one of its own.
     pub fn sidecar_needs_bootstrap(&self, sidecar: &SidecarPlan) -> bool {
         bootstrap_needed(
             self.entrypoint_server_in(sidecar).is_some(),
@@ -214,6 +217,14 @@ fn graft_prefix(elem: &str, graft: &str) -> String {
 ///
 /// Relative elements pass through unprefixed either way -- they are not files
 /// in the sidecar rootfs we can relocate.
+///
+/// `ids` is the `(uid, gid)` the payload runs as: the launcher holds
+/// `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` only until the graft is in place, then
+/// becomes these ids -- so what the server may do and what it may own match an
+/// exec-stdio server's. `None` omits both flags, leaving the payload as
+/// whatever the image's `USER` says; every OutRig-launched sidecar passes the
+/// session's ids, and the option exists because the launcher is a standalone
+/// binary with a documented argv contract, not only an OutRig internal.
 pub fn build_primary_view_argv(
     entrypoint: &[String],
     cmd: &[String],
@@ -221,6 +232,7 @@ pub fn build_primary_view_argv(
     graft: &str,
     cwd: &str,
     ns_file: &str,
+    ids: Option<(u32, u32)>,
 ) -> Vec<String> {
     let mut argv = vec![
         "--ns-file".to_string(),
@@ -229,8 +241,16 @@ pub fn build_primary_view_argv(
         graft.to_string(),
         "--cwd".to_string(),
         cwd.to_string(),
-        "--".to_string(),
     ];
+    if let Some((uid, gid)) = ids {
+        argv.extend([
+            "--uid".to_string(),
+            uid.to_string(),
+            "--gid".to_string(),
+            gid.to_string(),
+        ]);
+    }
+    argv.push("--".to_string());
     // Built in one pass rather than prefixing and then stripping back: a
     // config arg is legitimately allowed to name a path under the graft point
     // in the primary's view, and stripping would silently rewrite it.
@@ -263,13 +283,16 @@ pub fn build_primary_view_argv(
 ///
 /// `container_workspace` becomes the payload's working directory. A session
 /// without a workspace passes an empty path and lands on `/` -- the only
-/// directory the primary's view is guaranteed to have.
+/// directory the primary's view is guaranteed to have. `ids` is forwarded to
+/// [`build_primary_view_argv`]; without a view there is no launcher to hand it
+/// to, and podman decides the user from the image.
 pub fn entrypoint_create_args(
     view: SidecarView,
     image_entrypoint: &[String],
     image_cmd: &[String],
     args: &[String],
     container_workspace: &Path,
+    ids: Option<(u32, u32)>,
 ) -> Vec<String> {
     match view {
         SidecarView::Primary => {
@@ -285,6 +308,7 @@ pub fn entrypoint_create_args(
                     super::PRIMARY_VIEW_NS_MOUNT,
                     super::PRIMARY_VIEW_NS_FILE
                 ),
+                ids,
             )
         }
         // Spelled out rather than a catch-all: `#[non_exhaustive]` does not
@@ -305,6 +329,11 @@ pub fn entrypoint_create_args(
 /// keeps the image's own `USER`. That short-circuit lives here rather than in
 /// each caller: the config-plan path and `Outrig::add_sidecar`'s `SidecarSpec`
 /// path both host entrypoint servers, and the rule is the same for both.
+///
+/// A [`SidecarView::Primary`] host is the exception to the `USER` half, not to
+/// the short-circuit: it still cannot be bootstrapped, but it does not need to
+/// be. [`build_primary_view_argv`] hands the launcher the session's ids, and
+/// the graft puts the primary's already-bootstrapped `/etc/passwd` at `/`.
 pub(crate) fn bootstrap_needed(
     is_entrypoint_host: bool,
     hosts_exec_server: bool,
@@ -861,6 +890,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             "/mnt",
             "/workspace",
             "/target-ns/mnt",
+            None,
         );
         assert_eq!(
             argv,
@@ -893,6 +923,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             "/mnt",
             "/",
             "/target-ns/mnt",
+            None,
         );
         assert_eq!(
             argv,
@@ -921,6 +952,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             "/mnt",
             "/",
             "/target-ns/mnt",
+            None,
         );
         assert_eq!(&argv[7..], ["/bin/server", "/mnt/default/dir"]);
     }
@@ -938,6 +970,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             "/mnt",
             "/",
             "/target-ns/mnt",
+            None,
         );
         assert_eq!(&argv[7..], ["/bin/server", "/mnt/data"]);
 
@@ -949,14 +982,67 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             "/mnt",
             "/",
             "/target-ns/mnt",
+            None,
         );
         assert_eq!(&argv[7..], ["/mnt/data"]);
+    }
+
+    /// The ids the payload drops to ride in the flag block, ahead of `--`, and
+    /// change nothing else. Omitting them reproduces the argv exactly as it was
+    /// before the launcher could drop at all -- the property that keeps the
+    /// launcher independently runnable against its documented contract.
+    #[test]
+    fn primary_view_argv_emits_the_drop_flags_ahead_of_the_separator() {
+        let argv = |ids| {
+            build_primary_view_argv(
+                &["/usr/local/bin/node".to_string()],
+                &[],
+                &["/workspace".to_string()],
+                "/mnt",
+                "/workspace",
+                "/target-ns/mnt",
+                ids,
+            )
+        };
+        assert_eq!(
+            argv(Some((1000, 1001))),
+            [
+                "--ns-file",
+                "/target-ns/mnt",
+                "--graft",
+                "/mnt",
+                "--cwd",
+                "/workspace",
+                "--uid",
+                "1000",
+                "--gid",
+                "1001",
+                "--",
+                "/usr/local/bin/node",
+                "/workspace",
+            ]
+        );
+        assert_eq!(
+            argv(None),
+            [
+                "--ns-file",
+                "/target-ns/mnt",
+                "--graft",
+                "/mnt",
+                "--cwd",
+                "/workspace",
+                "--",
+                "/usr/local/bin/node",
+                "/workspace",
+            ]
+        );
     }
 
     #[test]
     fn entrypoint_create_args_passes_args_through_without_a_view() {
         // No view: the image's own ENTRYPOINT runs, so its ENTRYPOINT/CMD are
-        // podman's business and only the positional arguments are ours.
+        // podman's business and only the positional arguments are ours -- as
+        // are the ids, which podman decides from the image's `USER`.
         assert_eq!(
             entrypoint_create_args(
                 SidecarView::None,
@@ -964,6 +1050,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
                 &["/default/dir".to_string()],
                 &["/workspace".to_string()],
                 Path::new("/workspace"),
+                Some((1000, 1001)),
             ),
             ["/workspace"]
         );
@@ -982,6 +1069,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             &[],
             &["/workspace".to_string()],
             Path::new("/workspace"),
+            Some((1000, 1001)),
         );
         assert_eq!(
             argv,
@@ -996,11 +1084,13 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
                     super::super::PRIMARY_VIEW_NS_MOUNT,
                     super::super::PRIMARY_VIEW_NS_FILE
                 ),
+                Some((1000, 1001)),
             )
         );
         assert_eq!(argv[0], "--ns-file");
         assert_eq!(argv[1], "/target-ns/mnt");
         assert_eq!(argv[3], "/mnt");
+        assert_eq!(&argv[6..10], ["--uid", "1000", "--gid", "1001"]);
     }
 
     /// A session with no workspace has an empty container path. `--cwd ""`
@@ -1015,6 +1105,7 @@ c = { image = "ghcr.io/example/mcp-fetch:2", args = ["/inline"] }
             &[],
             &[],
             Path::new(""),
+            Some((1000, 1001)),
         );
         assert_eq!(argv[4], "--cwd");
         assert_eq!(argv[5], "/");

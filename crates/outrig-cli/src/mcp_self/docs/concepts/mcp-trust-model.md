@@ -42,14 +42,17 @@ one.
 
 The one placement that *widens* rather than narrows is
 [`view = "primary"`](mcp-servers.md#primary-filesystem-view). Such a sidecar joins the primary's
-mount namespace with `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` and can read the primary's entire
-filesystem -- which is the point, but it means the sidecar image is now **inside** the primary's
-trust boundary, as trusted as the primary image itself, not beside it. What still bounds it: the
-capabilities are scoped to the rootless user namespace (not host root) the primary already runs
-in; it is opt-in and defaults to `"none"`; it is still a container, so cgroups, seccomp, network
-policy, and `no-new-privileges` all still apply; and only the mount namespace is joined -- PID,
-network, and cgroup stay the sidecar's own. Grant it only to a sidecar image you trust with the
-primary's files.
+mount namespace and can read the primary's entire filesystem -- which is the point, but it means
+the sidecar image is now **inside** the primary's trust boundary, as trusted as the primary image
+itself, not beside it. What still bounds it: the `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` the join needs
+belong to OutRig's `outrig-enter` launcher, scoped to the rootless user namespace (not host root)
+the primary already runs in, and the server is exec'd only after the launcher becomes the
+session's uid/gid -- which clears those capabilities, so the server owns what it writes and can
+pass no privilege to anything it spawns; it is opt-in and defaults to `"none"`; it is still a
+container, so cgroups, seccomp, network policy, and `no-new-privileges` all still apply; and only
+the mount namespace is joined -- PID, network, and cgroup stay the sidecar's own. Grant it only
+to a sidecar image you trust with the primary's files: it reads them all, even though it writes
+as you.
 
 ## Shell tools
 

@@ -118,7 +118,9 @@ Because the container process is the server, an entrypoint host serves exactly o
 cannot be `start = "manual"`. It also skips the in-container user bootstrap: that runs over
 `podman exec`, and there is no window for it between the container's creation and the attach
 that runs the entrypoint. The image's own `USER` therefore applies to any `workspace` or
-`mounts` the block declares.
+`mounts` the block declares. `view = "primary"` is the exception -- see below: its payload runs
+as the session user whatever the image says, because OutRig's own launcher is the process that
+starts it.
 
 Entrypoint sidecars never race session network policy: the container is created and initialized
 with its entrypoint held un-executed, audit/filter interception attaches to its network
@@ -156,16 +158,25 @@ So `args = ["/workspace"]` against an image whose entrypoint is `/usr/local/bin/
 /app/dist/index.js` runs `/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
 from the sidecar, the directory from the primary.
 
-`view = "primary"` is a real posture change: the sidecar runs with `CAP_SYS_ADMIN` and
-`CAP_SYS_PTRACE` in the primary's user namespace and can read the primary's whole filesystem.
-See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the `outrig-enter` helper,
-compiled when the `<arch>-unknown-linux-musl` Rust target is installed; without it a
-`view = "primary"` session fails at start with a message naming the missing artifact.
+`view = "primary"` is a real posture change: the container starts with `CAP_SYS_ADMIN` and
+`CAP_SYS_PTRACE` in the primary's user namespace, and the server can read the primary's whole
+filesystem. See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the
+`outrig-enter` helper, compiled when the `<arch>-unknown-linux-musl` Rust target is installed;
+without it a `view = "primary"` session fails at start with a message naming the missing
+artifact.
+
+**The capabilities belong to the launcher, not to the server.** `outrig-enter` needs them for
+the namespace join and the graft, and gives them up the moment that work is done: it becomes the
+session's uid/gid immediately before exec'ing the payload, which clears its capability sets with
+the uid transition. The server -- and anything it shells out to -- therefore runs as the same
+user every other OutRig-launched server runs as, so what it writes into the workspace is yours
+rather than a subuid you cannot chown back, and a root-owned path in the primary is out of
+reach. The image's `USER` does not enter into it.
 
 That posture is identical from the library. `SidecarSpec::with_view(SidecarView::Primary)`
-takes the same capabilities in the same namespace, and a build without the helper fails the
-same way, before any container is created. The helper is materialized into the session's log
-directory, which is the one writable location a `LaunchSpec` names.
+takes the same capabilities in the same namespace, drops to the same ids, and a build without
+the helper fails the same way, before any container is created. The helper is materialized into
+the session's log directory, which is the one writable location a `LaunchSpec` names.
 
 Exec-stdio named sidecars honor their image's `org.outrig.mcp` label with the usual semantics,
 scoped to that sidecar: label-declared servers materialize as exec-stdio servers *in that

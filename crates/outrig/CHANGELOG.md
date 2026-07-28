@@ -103,6 +103,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A `view = "primary"` sidecar's server now runs as the session user**, not as the sidecar
+  image's `USER`. That placement is entrypoint-stdio, so the container process *is* the server
+  and there is no `podman exec` window for the user bootstrap -- and because `outrig-enter` needs
+  `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` to join the primary's namespace, the image's `USER` was
+  effectively forced to root. Under `--userns=container:<primary>` that root is a host subuid, so
+  everything such a server wrote into the workspace came back owned by an id the invoking user
+  does not have, and every process it spawned inherited `CAP_SYS_ADMIN`.
+
+  The launcher now gives the privileges up as soon as the graft is in place: it clears its
+  supplementary groups and becomes the session's uid/gid immediately before exec'ing the payload,
+  which clears the permitted, effective and ambient capability sets with the uid transition. A
+  server placed this way is therefore indistinguishable from an exec-stdio one in what it may do
+  and what it may own. Servers that relied on writing to root-owned paths in the primary -- or to
+  the image's `HOME`, typically `/root` -- will now be refused.
+- **Breaking:** `container::sidecar::build_primary_view_argv` and
+  `container::sidecar::entrypoint_create_args` take a trailing `ids: Option<(u32, u32)>`, the
+  `(uid, gid)` the payload drops to, emitted as the launcher's `--uid`/`--gid`. `None` reproduces
+  the previous argv exactly and leaves the payload as whatever the image's `USER` says; every
+  OutRig-launched sidecar passes the session's ids. The flags are optional on the launcher too,
+  which is a standalone binary with a documented argv contract.
 - **Breaking:** the three provider-specific `ConfigValidationError` variants are now named
   for what they check rather than for one style, and the two remote ones carry the style
   they are reporting on: `OpenAiModelMissingIdentifier { model }` becomes
