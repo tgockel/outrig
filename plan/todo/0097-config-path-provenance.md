@@ -1,4 +1,4 @@
-# 0096 -- Config path provenance: resolve relative paths against the declaring file
+# 0097 -- Config path provenance: resolve relative paths against the declaring file
 
 ## Context
 

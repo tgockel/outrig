@@ -1,4 +1,4 @@
-# 0099 -- Capping how many subagents run at once
+# 0100 -- Capping how many subagents run at once
 
 ## Context
 
@@ -158,7 +158,7 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **0098.** Both edit `crates/outrig-cli/src/subagent/mod.rs`; that task makes `release`
+- **0099.** Both edit `crates/outrig-cli/src/subagent/mod.rs`; that task makes `release`
   resolve-before-mutate, this one adds a check to `launch`'s two lock sites. Landing the small
   one first keeps the two locking changes reviewable apart.
 
@@ -171,4 +171,4 @@ fan-out more expensive rather than merely slower, so the containment half belong
   fork 4 would bend.
 - `doc/reference/config.md` -- `subagent-depth-max`, whose config, merge, and validation shape
   this key mirrors.
-- `plan/todo/0100-subagent-model-selection.md` -- launching a subagent under a different model.
+- `plan/todo/0101-subagent-model-selection.md` -- launching a subagent under a different model.

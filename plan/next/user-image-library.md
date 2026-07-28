@@ -42,7 +42,7 @@ repo-local image-config.
   image-config name and must satisfy the existing `^[a-zA-Z][a-zA-Z0-9_-]*$` project-name check
   (`plan/done/0070-standalone-image-init.md`) -- it has to be both a clean image-ref token and a
   valid TOML bare key. Each hit synthesizes a build-shape `[images.<name>]` entry whose
-  `ConfigSource` is the project directory (`plan/todo/0096-config-path-provenance.md`).
+  `ConfigSource` is the project directory (`plan/todo/0097-config-path-provenance.md`).
 - **Precedence**, low to high: scanned library < global `[images.*]` < repo `[images.*]`. Same
   name-keyed, whole-entry, repo-wins rule as every other map in `merge.rs`.
 - **Shadow diagnostic**: when a higher layer overrides a library project, warn and name both
@@ -209,7 +209,7 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **Hard: 0096** (`plan/todo/0096-config-path-provenance.md`). A library project's `dockerfile`
+- **Hard: 0097** (`plan/todo/0097-config-path-provenance.md`). A library project's `dockerfile`
   and `context` are relative to the project directory. Until an image-config carries its own base
   directory, every path in the index resolves against the repo root.
 - **Soft: 0092** (`plan/todo/0092-e2e-imageconfig-sidecars-bitrot.md`). The e2e feature does not

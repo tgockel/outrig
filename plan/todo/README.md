@@ -9,19 +9,22 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 This queue is pre-freeze work for `0.2.0`. Everything in it either changes what an existing
 thing means or fixes a contract a release would otherwise freeze wrong. The public surface is
 now half settled: 0094 sealed every public type with `#[non_exhaustive]` and shipped the
-constructors that replace the struct literals it forbids, which is what makes 0096-0100
+constructors that replace the struct literals it forbids, which is what makes 0097-0101
 additive rather than breaking -- each of those adds a field or a variant to a type the sweep
-insulates. 0095 is the other half, and the only one left whose own changes are breaking. The
-e2e suite compiles again and CI gates it (0092), so `library_surface.rs` -- the facade test the
-hardening work is measured against -- is runnable. 0093 settled the reach question: all six of
-the library's public modules are supported API, so 0094-0095 cover more than first scoped, and
+insulates. 0095 and 0096 are the other half: the only two left whose own changes are breaking,
+which is why they are ordered first. 0096 is also the one item an external embedder blocks on,
+so it wants to land in the published 0.2.0 rather than a follow-on. The e2e suite compiles
+again and CI gates it (0092), so `library_surface.rs` -- the facade test the hardening work is
+measured against -- is runnable. 0093 settled the reach question: all six of the library's
+public modules are supported API, so 0094-0095 cover more than first scoped, and
 `outrig-cli`'s internals are no longer public at all.
 
 | Task | Title                                                     | Dependencies     |
 |------|-----------------------------------------------------------|------------------|
 | 0095 | Options structs, trait sealing, ImageTag privatization    | 0093, 0094       |
-| 0096 | Resolve relative config paths against the declaring file  | 0094             |
-| 0097 | Native Anthropic Messages API provider                    | 0094             |
-| 0098 | Make subagent release atomic rather than partial          | 0092             |
-| 0099 | Cap how many subagents run at once                        | 0098             |
-| 0100 | Launch a subagent under a different model                 | 0093, 0097, 0099 |
+| 0096 | Library parity for sidecar placements and primary exec    | --               |
+| 0097 | Resolve relative config paths against the declaring file  | 0094             |
+| 0098 | Native Anthropic Messages API provider                    | 0094             |
+| 0099 | Make subagent release atomic rather than partial          | 0092             |
+| 0100 | Cap how many subagents run at once                        | 0099             |
+| 0101 | Launch a subagent under a different model                 | 0093, 0098, 0100 |

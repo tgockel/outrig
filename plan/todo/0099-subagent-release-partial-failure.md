@@ -1,4 +1,4 @@
-# 0098 -- Releasing subagents is all-or-nothing in its report but not in its effect
+# 0099 -- Releasing subagents is all-or-nothing in its report but not in its effect
 
 ## Context
 
@@ -68,5 +68,5 @@ locking discipline, so landing the smaller change first keeps the two reviewable
 - `crates/outrig-cli/src/subagent/mod.rs` -- `release`, and `wait_results` for the resolve-first
   pattern to copy.
 - `crates/outrig-cli/src/builtin_tool.rs` -- `SubagentReleaseTool`, which surfaces the message.
-- `plan/todo/0099-subagent-width-cap.md` -- also touches `launch`'s locking discipline; worth
+- `plan/todo/0100-subagent-width-cap.md` -- also touches `launch`'s locking discipline; worth
   landing in the same pass if both are picked up.
