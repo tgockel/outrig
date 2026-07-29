@@ -604,6 +604,19 @@ image, or declare any other MCP command that should run inside the container.
   `args` is for images whose server is an `ENTRYPOINT`: for an image that puts its server in
   `CMD` instead, `args` replaces that `CMD` and the server never starts.
 
+- `view` (string, optional, default: `"none"`): `"none"` or `"primary"`, with the meaning and
+  the exclusions documented on [`[sidecars.<sc>]`](#sidecarssc). Legal here only on the inline
+  entrypoint form -- it needs `image` and rejects `command`, because the anonymous sidecar it
+  configures is the one `image` creates:
+
+  ```toml
+  [images.dev.mcp]
+  fs = { image = "docker.io/mcp/filesystem:latest", view = "primary", args = ["/workspace"] }
+  ```
+
+  The `args` written here and the elements the sidecar image declares end up meaning different
+  paths -- see [Concepts -> MCP Servers](../concepts/mcp-servers.md#primary-filesystem-view).
+
 Notes:
 
 - The first element of `command` must be on `$PATH` inside the container, or absolute.

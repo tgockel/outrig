@@ -10,22 +10,20 @@ RUN apt-get update \
       git \
       jq \
       libssl-dev \
-      nodejs \
-      npm \
       pkg-config \
       procps \
       python3 \
-      python3-pip \
-      python3-venv \
       ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
-RUN rustup component add clippy rustfmt
+# The musl target is not optional here: `crates/outrig/build.rs` compiles the `outrig-enter`
+# launcher for it, and without it embeds an empty artifact and warns. An `outrig` built in
+# this container would then fail to start its own `view = "primary"` sidecars -- which is
+# every MCP server this repo's config declares.
+RUN rustup component add clippy rustfmt \
+ && rustup target add "$(uname -m)-unknown-linux-musl"
 
 RUN cargo install mdbook mdbook-mermaid lychee --locked
-
-RUN npm install -g @modelcontextprotocol/server-filesystem \
- && pip install --break-system-packages mcp-server-git mcp-shell-server
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

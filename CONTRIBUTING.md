@@ -2,6 +2,17 @@
 
 ## Local checks
 
+Install the musl target once before building:
+
+```sh
+rustup target add x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
+```
+
+`crates/outrig/build.rs` compiles the `outrig-enter` launcher for it. Without the target the
+build still succeeds -- it emits a warning and embeds an empty artifact -- but every
+`view = "primary"` sidecar fails at session start, including the three this repo's own
+`.agents/outrig/config.toml` declares.
+
 CI runs the unit suite and `mdbook build` on every push and PR. Run the same checks locally
 before opening a PR:
 

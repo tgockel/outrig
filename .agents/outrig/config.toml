@@ -13,15 +13,34 @@ preamble = "You are a careful coding assistant. The repo is mounted at /workspac
 dockerfile = ".agents/outrig/images/outrig-standard/Dockerfile"
 context    = ".agents/outrig/images/outrig-standard"
 
+# Every MCP server is a `view = "primary"` sidecar: the primary image carries a Rust
+# toolchain and nothing else, and each server brings its own runtime. The published
+# filesystem image is wrapped in an image-config so that it *pulls* -- a bare registry ref
+# in an `image` position resolves `--pull=never` and would have to be present already.
+
+[images.mcp-filesystem]
+image-name = "docker.io/mcp/filesystem:latest"
+
+[images.mcp-git]
+dockerfile = ".agents/outrig/images/mcp-git/Dockerfile"
+context    = ".agents/outrig/images/mcp-git"
+
+[images.mcp-shell]
+dockerfile = ".agents/outrig/images/mcp-shell/Dockerfile"
+context    = ".agents/outrig/images/mcp-shell"
+
   [images.outrig-standard.mcp]
-  fs  = { command = ["mcp-server-filesystem", "/workspace"] }
-  git = { command = ["mcp-server-git", "--repository", "/workspace"] }
+  fs  = { image = "mcp-filesystem", view = "primary", args = ["/workspace"] }
+  git = { image = "mcp-git", view = "primary", args = ["--repository", "/workspace"] }
 
   [images.outrig-standard.mcp.shell]
-  command = ["mcp-shell-server"]
+  image = "mcp-shell"
+  view  = "primary"
 
+    # Every value here names a *primary* path, which is correct: the commands this server
+    # spawns resolve in the primary's view. Only the interpreter comes from the graft, and
+    # it finds its own prefix from its grafted path.
     [images.outrig-standard.mcp.shell.env]
-    ALLOW_COMMANDS = "cargo,mdbook,mdbook-mermaid,lychee,python3,git,rg,grep,sed,awk,find,ls,cat,pwd,wc,head,tail"
-    CARGO_HOME     = "/workspace/.cargo"
-    RUSTUP_HOME    = "/usr/local/rustup"
-    PATH           = "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    CARGO_HOME  = "/workspace/.cargo"
+    RUSTUP_HOME = "/usr/local/rustup"
+    PATH        = "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

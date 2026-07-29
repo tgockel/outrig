@@ -270,6 +270,16 @@ context = "{context}"
             "the view should show the primary image's cargo: {cargo_dir}"
         );
 
+        // `/proc` is the payload's own, mounted by the launcher over the one
+        // the target's PID namespace provides (see `enter/launcher.rs`).
+        // Without that mount this listing fails outright -- confirmed by hand --
+        // and rustup's `cargo` shim is the payload that notices first.
+        let proc_self = list_dir(&service, "/proc/self").await;
+        assert!(
+            proc_self.contains("cgroup"),
+            "the payload should see its own /proc/self: {proc_self}"
+        );
+
         // The payload runs as the session user: the launcher holds its
         // capabilities only until the graft is in place, then drops to the
         // `--uid`/`--gid` it was given. So a file it writes belongs to the

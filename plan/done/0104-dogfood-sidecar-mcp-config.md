@@ -129,6 +129,59 @@ shape, exercised three times a session, in the repo that ships the feature.
 - **0103**, for `docker.io/mcp/filesystem`'s bare `ENTRYPOINT` to resolve; without it `fs`
   needs a locally built image instead of the published one.
 
+## Decisions
+
+- **`docker.io/mcp/git` is unusable, and probing is what showed it.** Its `ENTRYPOINT` is
+  `["mcp-server-git"]`, which resolves on the image's own `PATH` to `/app/.venv/bin/mcp-server-git`
+  -- a `#!/app/.venv/bin/python` console script, read out of the published layer to confirm.
+  `elf.rs` refuses non-ELF64 by design, so `git` gets the local `python:3.13-slim` Dockerfile this
+  task listed as the fallback. `docker.io/mcp/filesystem` qualifies -- its entrypoint program is
+  `node`, an ELF binary.
+- **Both local images name the interpreter and pass the package's own console script as its
+  argument** -- `["/usr/local/bin/python3", "/usr/local/bin/mcp-server-git"]`, and the node
+  equivalent. `python3 -m mcp_server_git` would also have worked, but `mcp_shell_server` ships no
+  `__main__`, so `-m` was not a shape both images could share. Running each package's documented
+  entry point through a named interpreter is, and the two Dockerfiles now read the same.
+- **`shell` runs `mcp-server-commands`, not `mcp-shell-server`.** Two findings disqualified the
+  latter, both true of every published version (1.0.4 through 1.1.3): it rejects `python3`, `sed`,
+  and every shell/interpreter launcher regardless of `ALLOW_COMMANDS` -- two of those were dead
+  entries in our own config -- and it hands child processes only `PATH` plus keys named in
+  `MCP_SHELL_CHILD_ENV_ALLOWLIST`, so the `CARGO_HOME`/`RUSTUP_HOME` this config has always set
+  were never reaching `cargo`. Restricting commands earns nothing here: every one of them already
+  runs in a container the user defined. `mcp-server-commands` has no allowlist and spawns with the
+  inherited environment, which is what makes the `env` block above mean what it says.
+- **Pin the MCP SDK, not just the server.** `mcp-server-git` declares `mcp>=1.0.0`; `mcp` 2.0.0
+  (published 2026-07-28, the day before this task) dropped the low-level `Server.list_tools`
+  decorator it builds its tool list with, so the first unpinned build crashed on the first
+  request. The Dockerfile pins `mcp==1.29.0` alongside the server.
+- **`fs` uses `:latest`, not the diverging `1.0.2` tag.** They are different builds -- the amd64
+  manifests do not match -- and `:latest` is the ref `doc/concepts/mcp-servers.md` advertises in
+  the `view = "primary"` quickstart. Dogfooding the documented one-liner is the point.
+- **Dogfooding immediately paid for itself: `view = "primary"` could not run a rustup proxy.**
+  The launcher joins the primary's *mount* namespace only, so the primary's procfs -- an instance
+  of the primary's PID namespace -- has no entry for the payload and `/proc/self` resolves to
+  nothing. `cargo` and `rustc` are shims that read `/proc/self/exe`; both failed with "no
+  /proc/self/exe available. Is /proc mounted?" while `git` and `rg` worked, which is why nothing
+  had noticed. The e2e that exercises this path only ever *listed* `/usr/local/cargo/bin`.
+  Fixed in `outrig-enter`: it now unshares its mount namespace unconditionally (previously only
+  when a graft was needed) and mounts a fresh `proc` over the inherited one. Verified both ways --
+  with the mount, `cargo --version` and `cargo fmt --check` succeed through the shell server;
+  without it, `/proc/self` does not exist. `--pid=container:<primary>` also fixes it and was
+  tested, but 0090 rejected exactly that flag for isolation, and `SECURITY.md` ships the
+  promise that only the mount namespace is joined. The mount keeps that promise -- and in fact
+  closes the other half of the gap, since the inherited procfs let the payload read the
+  primary's process list while being unable to see itself.
+- **CI now installs the musl target.** `build.rs` degrades a launcher that will not compile
+  into a `cargo:warning` and an empty artifact, so ~25 lines of new `unsafe` shipped with no
+  compile gate at all: the workflow never installed the target. One `targets:` line makes "the
+  launcher builds" a check rather than an assumption. The image installs
+  `"$(uname -m)-unknown-linux-musl"` rather than the literal x86_64 triple for the same reason
+  the deliverable exists -- `rust:1-bookworm` is multi-arch, and the wrong target installs
+  silently.
+- **The `mcp` doc surface gained the `view` key it was missing.** `doc/reference/config.md`
+  documented `view` only under `[sidecars.<sc>]`, though the inline `[images.<name>.mcp]` form is
+  the one this config uses and the one the quickstart shows.
+
 ## See also
 
 - `doc/concepts/mcp-servers.md` -- the placement shapes and the `view = "primary"` section.

@@ -29,6 +29,10 @@
 //! this; changing either side alone silently breaks the other, and the failure
 //! looks like an image that cannot find its own interpreter.
 //!
+//! It also mounts a fresh `/proc`. The one it inherits belongs to the target's
+//! PID namespace, which this process never joined, so `/proc/self` resolves to
+//! nothing there and payloads that read it fail obscurely.
+//!
 //! **The ordering contract, which the privilege drop depends on:** every step
 //! up to and including the `chdir` needs `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` --
 //! `open_tree`, `open(ns)`, `setns`, `unshare`, `mount`, `move_mount`, and a
@@ -80,6 +84,9 @@ const AT_RECURSIVE: c_long = 0x8000;
 const OPEN_TREE_CLONE: c_long = 1;
 const MOVE_MOUNT_F_EMPTY_PATH: c_long = 0x04;
 const CLONE_NEWNS: c_int = 0x0002_0000;
+const MS_NOSUID: c_ulong = 2;
+const MS_NODEV: c_ulong = 4;
+const MS_NOEXEC: c_ulong = 8;
 const MS_REC: c_ulong = 0x4000;
 const MS_SLAVE: c_ulong = 1 << 19;
 const EPERM: i32 = 1;
@@ -194,7 +201,9 @@ fn drop_privileges(uid: u32, gid: u32) {
 fn main() {
     let args: Vec<OsString> = std::env::args_os().collect();
 
-    let mut target: i64 = 1; // PID 1 under --pid=container: is the target's init
+    // PID 1 is the target's init under --pid=container:, which OutRig does not
+    // use -- it passes --ns-file. The default is for a caller that does.
+    let mut target: i64 = 1;
     let mut ns_file: Option<OsString> = None;
     let mut graft = OsString::from("/mnt");
     let mut cwd = OsString::from("/");
@@ -330,17 +339,21 @@ fn main() {
     // From here the sidecar's own filesystem is gone, reachable only via the fds
     // opened above.
 
+    // Private copy first, so neither the graft nor the `/proc` below is visible
+    // to the target container. Unconditional: a static payload needs no graft
+    // but still gets its own `/proc`, and mounting that in the target's own
+    // namespace would replace the primary's.
+    if unsafe { unshare(CLONE_NEWNS) } < 0 {
+        die("unshare(CLONE_NEWNS)", "");
+    }
+    if unsafe {
+        mount(std::ptr::null(), root.as_ptr(), std::ptr::null(), MS_REC | MS_SLAVE, std::ptr::null())
+    } < 0
+    {
+        die("mount(MS_REC|MS_SLAVE)", "");
+    }
+
     if let Some(tree_fd) = tree_fd {
-        // Private copy first, so the graft is invisible to the target container.
-        if unsafe { unshare(CLONE_NEWNS) } < 0 {
-            die("unshare(CLONE_NEWNS)", "");
-        }
-        if unsafe {
-            mount(std::ptr::null(), root.as_ptr(), std::ptr::null(), MS_REC | MS_SLAVE, std::ptr::null())
-        } < 0
-        {
-            die("mount(MS_REC|MS_SLAVE)", "");
-        }
         let graft_c = cstr(graft.as_bytes());
         let empty = cstr(b"");
         let r = unsafe {
@@ -358,6 +371,29 @@ fn main() {
             die(&format!("move_mount -> {g}"), &format!(" (does {g} exist in the target image?)"));
         }
         unsafe { close(tree_fd) };
+    }
+
+    // The `/proc` we inherited is the target's: an instance of *its* PID
+    // namespace, which has no entry for this process because `setns` joined the
+    // mount namespace only. `/proc/self` there resolves to nothing, and a
+    // payload that reads it fails with something unrelated to what it asked for
+    // -- rustup's `cargo` shim reports "no /proc/self/exe available. Is /proc
+    // mounted?". A fresh mount is this process's own namespace instead. The
+    // target's process list goes out of view with it, which is right: this is a
+    // filesystem view.
+    let proc_fs = cstr(b"proc");
+    let proc_dst = cstr(b"/proc");
+    if unsafe {
+        mount(
+            proc_fs.as_ptr(),
+            proc_dst.as_ptr(),
+            proc_fs.as_ptr(),
+            MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            std::ptr::null(),
+        )
+    } < 0
+    {
+        die("mount(/proc)", " (does /proc exist in the target image?)");
     }
 
     let cwd_c = cstr(cwd.as_bytes());

@@ -144,6 +144,32 @@ unmodified `docker.io/mcp/filesystem` (Alpine) index a Debian project's tree -- 
 knows about the other. `view = "primary"` is entrypoint-stdio only, and mutually exclusive with
 `workspace` (the view already contains it).
 
+A ref written inline like that is resolved the way `--image` is: an `[images.<name>]` block
+first, else a raw podman ref that must already be present locally -- OutRig will not pull it,
+so that a typo cannot reach a registry. To have OutRig pull the image, name it in a block of
+its own and point the entry at that:
+
+```toml
+[images.mcp-filesystem]
+image-name = "docker.io/mcp/filesystem:latest"
+
+  [images.dev.mcp]
+  fs = { image = "mcp-filesystem", view = "primary", args = ["/workspace"] }
+```
+
+**The entrypoint program must be an ELF binary.** `outrig-enter` opens it before joining the
+primary's namespace and classifies it; a `#!` script is refused, because its interpreter line
+would resolve against the *primary's* rootfs and quietly run something other than the image's
+own. Published MCP images often ship a console script -- `docker.io/mcp/git`'s `ENTRYPOINT` is
+one -- and the fix is a two-line image of your own that names the interpreter and passes the
+script to it:
+
+```dockerfile
+FROM docker.io/library/python:3.13-slim
+RUN pip install --no-cache-dir mcp-server-git==2026.7.10 mcp==1.29.0
+ENTRYPOINT ["/usr/local/bin/python3", "/usr/local/bin/mcp-server-git"]
+```
+
 **The argument asymmetry.** Because OutRig rebuilds the server's command line, two kinds of path
 in it mean different things:
 
@@ -157,6 +183,14 @@ in it mean different things:
 So `args = ["/workspace"]` against an image whose entrypoint is `/usr/local/bin/node
 /app/dist/index.js` runs `/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
 from the sidecar, the directory from the primary.
+
+**`/proc` is the payload's own.** The launcher joins the primary's *mount* namespace and
+nothing else, so the primary's `/proc` -- an instance of the primary's PID namespace -- has no
+entry for the payload, and `/proc/self` there resolves to nothing. The launcher mounts a fresh
+`proc` over it in the private namespace it already holds, so `/proc/self` means the payload,
+which is what a program asking about itself intends. Programs that read it are more common
+than they look: rustup's `cargo` shim resolves its own toolchain that way. The trade is that
+the primary's process list is not visible through the view -- it is a filesystem view.
 
 A program named without a `/` -- `ENTRYPOINT ["node", "/app/dist/index.js"]`, which is what
 the quickstart image above declares -- is searched along the **sidecar image's** `PATH`, in

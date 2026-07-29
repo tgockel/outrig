@@ -37,6 +37,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          # `crates/outrig/build.rs` compiles the `outrig-enter` launcher for this
+          # target and degrades to a warning plus an empty artifact when it is
+          # absent -- so without it here, a launcher that does not compile is a
+          # green build.
+          targets: x86_64-unknown-linux-musl
       - uses: mozilla-actions/sccache-action@v0.0.3
       - uses: Swatinem/rust-cache@v2
         with:
