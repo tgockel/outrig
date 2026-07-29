@@ -184,6 +184,14 @@ So `args = ["/workspace"]` against an image whose entrypoint is `/usr/local/bin/
 /app/dist/index.js` runs `/usr/local/bin/node /mnt/app/dist/index.js /workspace` -- the tool
 from the sidecar, the directory from the primary.
 
+**`HOME` is the primary user's.** The payload runs as the session user, but the sidecar image
+sets `HOME` for whoever *it* expects to run as -- usually root, whose `/root` is `0700`. So the
+container gets `--env HOME=<primary's home>`, the same directory every exec-stdio server is
+given, and an `env` entry of your own for `HOME` still wins. Without it the breakage is oblique
+rather than obvious: `git` cannot read `core.excludesFile` under an unreadable `$HOME` and fails
+rather than skipping it, so `cargo` reports a fingerprint error -- and only a tool that *writes*
+to `$HOME` would have looked guilty.
+
 **`/proc` is the payload's own.** The launcher joins the primary's *mount* namespace and
 nothing else, so the primary's `/proc` -- an instance of the primary's PID namespace -- has no
 entry for the payload, and `/proc/self` there resolves to nothing. The launcher mounts a fresh

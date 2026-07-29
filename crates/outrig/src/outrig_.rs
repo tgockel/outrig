@@ -1022,10 +1022,20 @@ impl Outrig {
                 self.container.pid(),
                 image::read_image_entrypoint_cmd(&image, None),
             )?;
+            // `home_dir` is `Some` here: the session's primary is bootstrapped
+            // at start, and `add_sidecar` runs against a started session.
+            let payload_home = self.container.home_dir().ok_or_else(|| {
+                OutrigError::Configuration(
+                    "a view = \"primary\" sidecar needs the primary's user, which has not been \
+                     bootstrapped"
+                        .to_string(),
+                )
+            })?;
             launch.primary_view = Some(PrimaryView::new(
                 self.container.name(),
                 pid,
                 enter::materialize(&self.log_dir)?,
+                payload_home,
             ));
             payload
         } else {

@@ -18,6 +18,10 @@
 //! invoking user, and a root-owned path in the primary is refused -- the
 //! launcher drops its capabilities with the uid once the graft is in place.
 //!
+//! Plus task 0104's two: the payload's `/proc` is its own rather than the
+//! target's, and its `HOME` is the primary user's rather than the sidecar
+//! image's. Both are things a payload needs to be *running* to notice.
+//!
 //! The served root is `/` (not the doc's `/workspace`) so the filesystem
 //! server can reach the primary-only cargo path through the view; both the
 //! workspace and the cargo path are then provable through the real server.
@@ -171,6 +175,26 @@ async fn list_dir(
     tool_body(&call)
 }
 
+/// Read through the view, asserting the server did not refuse. Used for the
+/// payload's own `/proc` entries, which is how the test reads back the
+/// environment podman created the container with.
+async fn read_file(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    path: &str,
+) -> String {
+    let call = call_tool(
+        service,
+        "fs__read_file",
+        serde_json::json!({ "path": path }),
+    )
+    .await;
+    assert!(
+        call.is_error != Some(true),
+        "reading {path} through the primary view failed: {call:?}"
+    );
+    tool_body(&call)
+}
+
 /// Write through the view. The served root is `/`, so whether the result comes
 /// back as an error is the kernel's answer about what the payload's ids may
 /// touch, not the server's own policy -- which is why the caller judges it.
@@ -278,6 +302,17 @@ context = "{context}"
         assert!(
             proc_self.contains("cgroup"),
             "the payload should see its own /proc/self: {proc_self}"
+        );
+
+        // `HOME` is the primary user's, not the sidecar image's. The image runs
+        // as root and says `/root`, which is `0700` and belongs to a user the
+        // payload is not -- so anything reading per-user config through `$HOME`
+        // gets EACCES. `git` is in that set, and cargo surfaces it as a
+        // fingerprint failure, which is how it was found.
+        let environ = read_file(&service, "/proc/self/environ").await;
+        assert!(
+            environ.contains("HOME=/home/"),
+            "the payload should get the primary's home as HOME: {environ}"
         );
 
         // The payload runs as the session user: the launcher holds its

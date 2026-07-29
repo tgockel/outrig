@@ -178,6 +178,26 @@ shape, exercised three times a session, in the repo that ships the feature.
   `"$(uname -m)-unknown-linux-musl"` rather than the literal x86_64 triple for the same reason
   the deliverable exists -- `rust:1-bookworm` is multi-arch, and the wrong target installs
   silently.
+- **And a fourth defect, found by an agent running inside this changeset.**
+  `plan/next/primary-view-payload-home.md` predicted it after 0102 and closed with "not urgent:
+  no server OutRig ships or documents in this placement writes to `$HOME`" -- and then this task
+  shipped three. The payload keeps the
+  sidecar image's `HOME`, which for `node:22-slim` is `/root`, mode `0700`, owned by a user the
+  payload is not. The entry's severity was understated too: the casualty is not a server that
+  *writes* to `$HOME` but any tool that *reads* per-user config through it. libgit2 treats an
+  unstattable `core.excludesFile` as a hard error rather than skipping it, so `cargo clippy
+  --all-targets` fails on a cold fingerprint (and `cargo package --list` always) while `cargo
+  build` succeeds -- which is why it reads as environment noise rather than a repo bug. A
+  `view = "primary"` container now gets `--env HOME=<primary's home>` from `Container::home_dir`,
+  emitted in `build_podman_create_cmd` so the CLI and library paths cannot disagree, and placed
+  before the configured `env` so an explicit `HOME` still wins.
+- **`HOME` is `userdb::home_dir`, not what the primary's `/etc/passwd` says.** Three values were
+  in play: the image's `/root`, `/home/<name>` (what `build_exec_argv` gives every exec-stdio
+  server), and `/workspace` -- which is podman's `--userns=keep-id` synthesis, not OutRig's,
+  since its own `passwd_line` writes `/home/<name>` and the bootstrap skips writing when podman
+  already planted an entry. Matching `build_exec_argv` keeps the two placements agreeing and
+  keeps caches out of the user's checkout. That `getpwuid` still answers `/workspace` is a
+  separate, pre-existing inconsistency, left alone here.
 - **The `mcp` doc surface gained the `view` key it was missing.** `doc/reference/config.md`
   documented `view` only under `[sidecars.<sc>]`, though the inline `[images.<name>.mcp]` form is
   the one this config uses and the one the quickstart shows.

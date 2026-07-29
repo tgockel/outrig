@@ -858,11 +858,22 @@ async fn start_auto_sidecars(
         .any(|(_, _, sc)| sc.view == SidecarView::Primary)
     {
         let helper_host = enter::materialize(args.session_dir)?;
+        // `home_dir` is `Some` by Phase C, which bootstraps the primary's user;
+        // the payload's `HOME` has to name a directory *it* can write, not the
+        // one its own image expects to run as.
+        let payload_home = containers.primary.home_dir().ok_or_else(|| {
+            OutrigError::Configuration(
+                "a view = \"primary\" sidecar needs the primary's user, which has not been \
+                 bootstrapped"
+                    .to_string(),
+            )
+        })?;
         (
             Some(PrimaryView::new(
                 containers.primary.name(),
                 containers.primary.pid().await?,
                 helper_host,
+                payload_home,
             )),
             Some((containers.primary.uid(), containers.primary.gid())),
         )

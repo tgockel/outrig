@@ -190,8 +190,8 @@ pub const PRIMARY_VIEW_HELPER_MOUNT: &str = "/outrig-enter";
 /// launcher to bind in. Present only on that placement mode. It swaps
 /// `--userns=keep-id` for `--userns=container:<primary>`, adds
 /// `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE`, binds the primary's nsfs directory and the
-/// launcher (both plain `:ro`, never SELinux-relabeled), and sets
-/// `--entrypoint /outrig-enter`.
+/// launcher (both plain `:ro`, never SELinux-relabeled), sets
+/// `--entrypoint /outrig-enter`, and gives the payload a `HOME` it can write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PrimaryView {
@@ -201,20 +201,30 @@ pub struct PrimaryView {
     pub primary_pid: u32,
     /// Host path of the materialized `outrig-enter`, bound read-only.
     pub helper_host: PathBuf,
+    /// `HOME` for the payload, from [`Container::home_dir`]. The image's own
+    /// `HOME` is a home for the user the image expects to run as -- usually
+    /// root, and `/root` is `0700` -- while the payload runs as the session
+    /// user. Nothing else corrects it: an entrypoint host skips the exec that
+    /// carries `HOME` everywhere else.
+    pub payload_home: String,
 }
 
 impl PrimaryView {
     /// Join the namespaces of `primary_container`, whose init runs as
-    /// `primary_pid`, using the `outrig-enter` helper at `helper_host`.
+    /// `primary_pid`, using the `outrig-enter` helper at `helper_host`, with
+    /// the payload's `HOME` set to `payload_home` -- [`Container::home_dir`]
+    /// of the primary, so the two placements name the same directory.
     pub fn new(
         primary_container: impl Into<String>,
         primary_pid: u32,
         helper_host: impl Into<PathBuf>,
+        payload_home: impl Into<String>,
     ) -> Self {
         Self {
             primary_container: primary_container.into(),
             primary_pid,
             helper_host: helper_host.into(),
+            payload_home: payload_home.into(),
         }
     }
 }
@@ -640,6 +650,14 @@ impl Container {
 
     pub fn user_name(&self) -> Option<&str> {
         self.user_name.as_deref()
+    }
+
+    /// The in-container home directory of the bootstrapped user, or `None`
+    /// before [`Container::bootstrap_user`] has run. The same path
+    /// [`Container::build_exec_argv`] gives every exec-stdio server as `HOME`,
+    /// so a sidecar that takes it from here cannot disagree with them.
+    pub fn home_dir(&self) -> Option<String> {
+        self.user_name.as_deref().map(userdb::home_dir)
     }
 
     pub fn group_name(&self) -> Option<&str> {
@@ -1139,6 +1157,14 @@ fn build_podman_create_cmd(options: &ContainerCreateOptions, selinux: bool) -> C
         cmd = cmd
             .args(["--dns", crate::network::INTERCEPT_DNS_NAMESERVER])
             .args(["--dns-option", crate::network::INTERCEPT_DNS_OPTION]);
+    }
+    // `HOME` first, so a configured `env` entry of the same name wins: podman
+    // takes the last `--env` for a key. A `view = "primary"` payload is the
+    // only container process that gets one from here -- everything else is
+    // either exec'd (`build_exec_argv` carries it) or runs as the user its own
+    // image expects.
+    if let Some(pv) = &options.launch.primary_view {
+        cmd = cmd.arg("--env").arg(format!("HOME={}", pv.payload_home));
     }
     for (k, v) in &options.env {
         cmd = cmd.arg("--env").arg(format!("{k}={v}"));
@@ -1662,7 +1688,8 @@ mod tests {
     /// *directory* and the launcher bind in with a plain `:ro` (never `,Z`,
     /// even under SELinux), `--userns=container:` replaces `keep-id`, the mount
     /// caps are added, and the launcher is the `--entrypoint`. The launcher
-    /// argv (graft-prefixed program + bare target arg) rides the trailing slot.
+    /// argv (graft-prefixed program + bare target arg) rides the trailing slot,
+    /// and `HOME` names the primary's home rather than the sidecar image's.
     #[test]
     fn podman_create_args_for_primary_view_join_the_primary() {
         let launch = ContainerLaunchSpec {
@@ -1670,6 +1697,7 @@ mod tests {
                 primary_container: "outrig-abc-primary".to_string(),
                 primary_pid: 4242,
                 helper_host: PathBuf::from("/sess/outrig-enter"),
+                payload_home: "/home/tgockel".to_string(),
             }),
             ..Default::default()
         };
@@ -1717,6 +1745,8 @@ mod tests {
                 "--entrypoint",
                 "/outrig-enter",
                 "--pull=never",
+                "--env",
+                "HOME=/home/tgockel",
                 "--interactive",
                 "--rm",
                 "docker.io/mcp/filesystem:latest",
