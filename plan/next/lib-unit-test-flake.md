@@ -2,45 +2,90 @@
 
 ## Symptom
 
-Observed once while verifying 0092:
+`process::process_tests::try_capture_logged_traces_spawn_and_exit_at_debug` fails
+intermittently, in one of two complementary ways -- either assertion can be the one that
+trips, and whichever fails reports that the *other* event is the only one present:
 
 ```
-running 180 tests
-test result: FAILED. 179 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
-error: test failed, to rerun pass `-p outrig --lib`
+panicked at crates/outrig/src/process_tests.rs:251:5:
+debug output should record exit code and elapsed time, got:
+  DEBUG outrig::process: spawn command=/bin/echo hi
 ```
 
-The failing test's name was filtered out of the captured output, so it is not yet known.
+```
+panicked at crates/outrig/src/process_tests.rs:247:5:
+debug output should name the full command line, got:
+  DEBUG outrig::process: exit program="/bin/echo" code=Some(0) elapsed_ms=0
+```
 
-## What is known
+So the test's own command runs and its writer is wired correctly; exactly one of the two
+`tracing::debug!` events in `try_capture_logged` goes missing.
 
-- **Not caused by 0092.** `-p outrig --lib` compiles only `crates/outrig/src/`; 0092 touched
-  only `crates/*/tests/*.rs` and `.github/workflows/ci.yml`. The flake predates the branch.
-- **Rare.** Not reproduced in ~54 subsequent runs: 6 full `cargo test`, 5 `cargo test -p outrig
-  --lib`, 3 more under full CPU saturation (20 cores pegged), and 40 direct invocations of the
-  compiled test binary.
-- **Circumstantial timing.** The one failure landed on the first `cargo test` after building
-  with `--features outrig/e2e,outrig-cli/e2e`, i.e. while cargo was recompiling the default
-  feature set. That suggests sensitivity to concurrent build load or to shared filesystem
-  state under `target/`, rather than to CPU contention alone (which did not reproduce it).
+## Reproduction
 
-## Suspects
+Reproduces at roughly 1 run in 8 with the default thread count, on the compiled binary
+directly (no cargo, no build churn):
 
-Timing- or environment-sensitive spots in `crates/outrig/src/`, none yet confirmed:
+```sh
+for i in $(seq 1 40); do
+  ./target/debug/deps/outrig-<hash> 2>&1 | grep -q FAILED && echo "failed on $i"
+done
+```
 
-- `network.rs:987` -- binds a real `std::net::TcpListener` on port 0. Ephemeral-port
-  allocation is the classic source of this failure shape.
-- `mcp.rs:389` -- `tokio::time::timeout(Duration::from_millis(250), child.wait())`; a 250 ms
-  budget is thin on a loaded machine.
-- `image.rs:1163` -- a 1 ms `tokio::time::sleep` inside a retry loop.
-- `image.rs:686` -- `SystemTime::now()`, wall-clock dependent.
+Measured rates:
 
-## Suggested approach
+| Selection                                                     | Failures |
+|---------------------------------------------------------------|----------|
+| Full lib suite, default threads                               | ~1 in 8  |
+| Full lib suite, `--test-threads=1`                            | 0 / 10   |
+| Suite minus `logged_capture_tees_command_and_output_to_transcript` | 0 / 25   |
+| Only that test plus the failing one                            | 2 / 25   |
 
-Run the lib test binary in a loop with a concurrent `cargo build` churning `target/` (the
-condition under which it actually appeared), rather than with pure CPU load. Capture the full
-output on failure -- the immediate need is the test's name. Once named, decide between fixing
-the race and marking it `#[ignore]` with a tracking note.
+The third and fourth rows are the finding: removing one specific *other* test makes it
+disappear, and that one test alone is enough to bring it back.
 
-Consider `cargo test -- --nocapture --test-threads=1` on repro to rule out cross-test
-interference through shared state.
+## Cause
+
+Cross-test interference through tracing's global callsite state, not a timing race in the
+code under test.
+
+`logged_capture_tees_command_and_output_to_transcript` calls `run_capture_logged`, which
+delegates to `try_capture_logged` (`process.rs:264`) -- so it executes the *same two
+`tracing::debug!` callsites* as the failing test. It installs no subscriber. The failing
+test installs a `DEBUG` subscriber, but via `tracing::subscriber::set_default`, which is
+**thread-local**, while `tracing` caches per-callsite interest **globally**.
+
+When the two run on different threads, the subscriber-less test can have a callsite
+register or re-evaluate interest while no subscriber is visible on its thread, and the
+cached "not interested" answer is then honored on the thread that does have one. That the
+two events are cached independently is what produces the two complementary failure
+modes -- whichever callsite loses the race is the one missing from the capture.
+
+This supersedes the earlier suspect list (`network.rs` ephemeral port, `mcp.rs` 250 ms
+timeout, `image.rs` sleep / `SystemTime::now`); none of those is involved. It also
+explains why the original sighting resisted 54 repeats: the trigger is thread interleaving
+within one binary, so it is invisible to `--test-threads=1` and unrelated to the
+concurrent `cargo build` that happened to be running.
+
+## Suggested fix
+
+The test asserts on a global side channel from a thread-local subscriber, which is not
+sound however the assertions are written. Options, cheapest first:
+
+- Have the failing test use `tracing::subscriber::with_default` and drive the work on the
+  *same* thread, and give it a private callsite by asserting through a dedicated wrapper
+  rather than the shared `try_capture_logged` -- removes the sharing entirely.
+- Serialize the tracing-observing tests against every other test that touches those
+  callsites, with a shared `Mutex` (or the `serial_test` crate). Cheap, but it encodes an
+  ordering constraint that a future caller of `try_capture_logged` can silently violate.
+- Move both tracing-assertion tests into their own integration test binary, so they get a
+  process with no competing callers. Most robust; `relocate-unit-shaped-tests.md` is
+  adjacent work.
+
+Prefer the first: it fixes the unsoundness rather than hiding it, and needs no new
+dependency.
+
+## See also
+
+- `plan/next/relocate-unit-shaped-tests.md` -- the same tests are candidates to move.
+- `plan/next/test-helper-consolidation.md` -- other `init_tracing` / subscriber duplication.
