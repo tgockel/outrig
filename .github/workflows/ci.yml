@@ -54,6 +54,15 @@ jobs:
       # and turn that feature on, so this is the only place the published
       # configuration gets compiled at all.
       - run: cargo check ${{ matrix.cargo_args }}
+      # The library against musl's headers, where `msghdr`/`cmsghdr` length
+      # fields are `socklen_t` rather than glibc's `size_t` -- `nsfork.rs` is
+      # the only code that touches them, and nothing else here would notice it
+      # naming one. The target is installed above for the launcher, and the
+      # library's dependency tree needs no C cross-toolchain, unlike the
+      # binary's (aws-lc-sys). One row is enough: the difference is the libc,
+      # not the feature set.
+      - if: matrix.name == 'default'
+        run: cargo check -p outrig --target x86_64-unknown-linux-musl
       - run: cargo test ${{ matrix.cargo_args }} ${{ matrix.test_args }}
 
   doc-style:

@@ -125,7 +125,10 @@ pub(crate) fn send_status(sock: RawFd, payload: Status, fds: &[RawFd]) -> io::Re
     if !fds.is_empty() {
         let data_len = size_of_val(fds);
         msg.msg_control = control.0.as_mut_ptr().cast();
-        msg.msg_controllen = CTRL_LEN;
+        // `as _` rather than a named type: these two fields are `size_t` in
+        // glibc's headers and `socklen_t` in musl's, so naming either one
+        // breaks the other libc.
+        msg.msg_controllen = CTRL_LEN as _;
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             if cmsg.is_null() {
@@ -133,7 +136,7 @@ pub(crate) fn send_status(sock: RawFd, payload: Status, fds: &[RawFd]) -> io::Re
             }
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = cmsg_len(data_len);
+            (*cmsg).cmsg_len = cmsg_len(data_len) as _;
             std::ptr::copy_nonoverlapping(
                 fds.as_ptr().cast::<u8>(),
                 libc::CMSG_DATA(cmsg).cast::<u8>(),
@@ -162,7 +165,7 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.0.as_mut_ptr().cast();
-    msg.msg_controllen = CTRL_LEN;
+    msg.msg_controllen = CTRL_LEN as _;
 
     let n = unsafe { libc::recvmsg(sock, &mut msg, libc::MSG_CMSG_CLOEXEC) };
     if n == -1 {
@@ -188,7 +191,9 @@ fn recv_status(sock: RawFd) -> io::Result<(Status, Vec<OwnedFd>)> {
                 "namespace helper returned unexpected control data",
             ));
         }
-        let data_len = (*cmsg).cmsg_len.saturating_sub(cmsg_len(0));
+        // Widen before the arithmetic for the same reason: `cmsg_len` is
+        // `usize`, and on musl the field it is being compared against is not.
+        let data_len = ((*cmsg).cmsg_len as usize).saturating_sub(cmsg_len(0));
         let count = data_len / size_of::<RawFd>();
         let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
         for i in 0..count {
