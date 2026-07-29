@@ -195,6 +195,8 @@ pub struct ResolvedAgent {
     /// Maximum subagent nesting depth: the primary is the root at depth 1, and
     /// an agent at depth `D` may launch subagents while `D < subagent_depth_max`.
     pub subagent_depth_max: u32,
+    /// Maximum number of live subagents this agent may launch at once.
+    pub subagent_width_max: u32,
     pub image: Option<String>,
 }
 
@@ -384,6 +386,10 @@ pub fn resolve_agent_with_overrides(
             .subagent_depth_max
             .or(cfg.subagent_depth_max)
             .unwrap_or(outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX),
+        subagent_width_max: agent
+            .subagent_width_max
+            .or(cfg.subagent_width_max)
+            .unwrap_or(outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX),
         image: agent.image.clone(),
     })
 }

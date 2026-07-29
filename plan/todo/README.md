@@ -27,8 +27,14 @@ provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
 | Task | Title                                                     | Dependencies     |
 |------|-----------------------------------------------------------|------------------|
-| 0100 | Cap how many subagents run at once                        | --               |
 | 0101 | Launch a subagent under a different model                 | 0093, 0098, 0100 |
+
+0100 landed: `subagent-width-max` (default `8`, range `1..=16`) bounds how many live subagents one
+launching agent may hold, refusing past the limit rather than queueing. It was sequenced before
+0101 deliberately -- model selection makes wide fan-out expensive rather than merely slow, so the
+containment half belonged first, and 0101 can now assume a bounded tree. What the cap does not
+settle is whether the five-second teardown budget fits the tree it permits; that measurement is
+filed as `plan/next/subagent-tree-shutdown-grace.md`.
 
 0102-0104 were one arc, and the last of them is why the first two were pre-freeze work rather
 than polish. This repo's `.agents/outrig/config.toml` used to embed every MCP server in the

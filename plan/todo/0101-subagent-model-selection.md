@@ -251,6 +251,6 @@ prototype should confirm), or **Open** (deferred).
 - `doc/concepts/llm-providers.md` -- the provider / model / agent layering the argument names.
 - `doc/concepts/in-process-llm.md` -- engine-per-model-name lifecycle and first-use download
   stalls, both of which a model-selecting subagent can now trigger.
-- `plan/todo/0100-subagent-width-cap.md` -- bounding how many subagents run at once.
+- `plan/done/0100-subagent-width-cap.md` -- bounding how many subagents run at once.
 - `plan/todo/0098-anthropic-native-api.md` -- the third provider style this feature would let a
   subagent select independently of its parent.

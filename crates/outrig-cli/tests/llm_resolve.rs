@@ -119,6 +119,10 @@ max-tokens  = 4096
     assert_eq!(r.max_tokens, Some(4096));
     assert_eq!(r.tool_call_max, MAX_TOOL_CALLS);
     assert_eq!(r.tool_result_max_bytes, DEFAULT_TOOL_RESULT_MAX_BYTES);
+    assert_eq!(
+        r.subagent_width_max,
+        outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX
+    );
 
     unset_env(var);
 }
@@ -334,6 +338,56 @@ preamble = "code"
     assert_eq!(
         coding.subagent_depth_max,
         outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX
+    );
+
+    unset_env(var);
+}
+
+#[test]
+fn subagent_width_max_resolves_from_default_then_top_level_then_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_SUBAGENT_WIDTH";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"
+default-model = "fast"
+subagent-width-max = 6
+"#,
+        r#"
+[agents.coding]
+preamble = "code"
+
+[agents.review]
+preamble = "review"
+subagent-width-max = 3
+"#,
+    ));
+
+    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    assert_eq!(coding.subagent_width_max, 6);
+    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    assert_eq!(review.subagent_width_max, 3);
+
+    unset_env(var);
+}
+
+#[test]
+fn subagent_width_max_absent_falls_back_to_default() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_SUBAGENT_WIDTH_DEFAULT";
+    set_env(var, "k");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.coding]
+preamble = "code"
+"#,
+    ));
+
+    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    assert_eq!(
+        coding.subagent_width_max,
+        outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX
     );
 
     unset_env(var);

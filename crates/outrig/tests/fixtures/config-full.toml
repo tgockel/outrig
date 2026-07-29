@@ -9,6 +9,7 @@ model-cache-root   = "/var/cache/outrig/models"
 tool-call-max      = 100
 tool-result-max    = 524288
 subagent-depth-max = 4
+subagent-width-max = 6
 
 [providers.openai]
 style                = "openai"
@@ -56,6 +57,7 @@ max-tokens         = 4096
 tool-call-max      = 300
 tool-result-max    = 1048576
 subagent-depth-max = 2
+subagent-width-max = 3
 
 [agents.review]
 model    = "smart"

@@ -173,6 +173,10 @@ pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange
 pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange::max: u32
 pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange::path: alloc::string::String
 pub outrig::config::ConfigValidationError::SubagentDepthMaxOutOfRange::value: u32
+pub outrig::config::ConfigValidationError::SubagentWidthMaxOutOfRange
+pub outrig::config::ConfigValidationError::SubagentWidthMaxOutOfRange::max: u32
+pub outrig::config::ConfigValidationError::SubagentWidthMaxOutOfRange::path: alloc::string::String
+pub outrig::config::ConfigValidationError::SubagentWidthMaxOutOfRange::value: u32
 pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange
 pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange::max: u32
 pub outrig::config::ConfigValidationError::ToolCallMaxOutOfRange::path: alloc::string::String
@@ -337,6 +341,7 @@ pub outrig::config::Agent::max_tokens: core::option::Option<u32>
 pub outrig::config::Agent::model: core::option::Option<alloc::string::String>
 pub outrig::config::Agent::preamble: core::option::Option<alloc::string::String>
 pub outrig::config::Agent::subagent_depth_max: core::option::Option<u32>
+pub outrig::config::Agent::subagent_width_max: core::option::Option<u32>
 pub outrig::config::Agent::subagents: core::option::Option<bool>
 pub outrig::config::Agent::temperature: core::option::Option<f32>
 pub outrig::config::Agent::tool_call_max: core::option::Option<u32>
@@ -365,6 +370,7 @@ pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<
 pub outrig::config::Config::session_root: core::option::Option<std::path::PathBuf>
 pub outrig::config::Config::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::SidecarConfig>
 pub outrig::config::Config::subagent_depth_max: core::option::Option<u32>
+pub outrig::config::Config::subagent_width_max: core::option::Option<u32>
 pub outrig::config::Config::tool_call_max: core::option::Option<u32>
 pub outrig::config::Config::tool_result_max: core::option::Option<u32>
 pub outrig::config::Config::workspace: outrig::config::Workspace
@@ -483,9 +489,11 @@ pub fn outrig::config::Workspace::resolved_host_path(&self, &std::path::Path) ->
 impl core::default::Default for outrig::config::Workspace
 pub fn outrig::config::Workspace::default() -> Self
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
+pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES: u32
 pub const outrig::config::SUBAGENT_DEPTH_MAX_CEILING: u32
+pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32
 pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32
 pub const outrig::config::TOOL_RESULT_MAX_CEILING_BYTES: u32
 pub const outrig::config::TOOL_RESULT_MAX_FLOOR_BYTES: u32

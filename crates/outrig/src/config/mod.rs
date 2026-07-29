@@ -73,6 +73,10 @@ pub const DEFAULT_SUBAGENT_DEPTH_MAX: u32 = 3;
 /// Upper bound accepted for `subagent-depth-max`, to keep a runaway config from
 /// authorizing an unbounded launch tree.
 pub const SUBAGENT_DEPTH_MAX_CEILING: u32 = 16;
+/// How many live subagents one launching agent may hold by default.
+pub const DEFAULT_SUBAGENT_WIDTH_MAX: u32 = 8;
+/// Upper bound accepted for `subagent-width-max`, keeping fan-out finite.
+pub const SUBAGENT_WIDTH_MAX_CEILING: u32 = 16;
 
 /// Which config file an entry was declared in. Recorded per entry at load time
 /// -- before [`merge`], which is where origin would otherwise be lost -- so a
@@ -150,6 +154,10 @@ pub struct Config {
     /// Maximum subagent nesting depth. See [`DEFAULT_SUBAGENT_DEPTH_MAX`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_depth_max: Option<u32>,
+    /// Maximum number of live subagents per launching agent. See
+    /// [`DEFAULT_SUBAGENT_WIDTH_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_width_max: Option<u32>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
 
@@ -560,6 +568,11 @@ pub struct Agent {
     /// the top-level `subagent-depth-max`, then [`DEFAULT_SUBAGENT_DEPTH_MAX`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_depth_max: Option<u32>,
+    /// Per-agent override of the number of live subagents it may launch. Falls
+    /// back to the top-level `subagent-width-max`, then
+    /// [`DEFAULT_SUBAGENT_WIDTH_MAX`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_width_max: Option<u32>,
 }
 
 impl Agent {

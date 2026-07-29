@@ -844,6 +844,7 @@ mod tests {
             tool_call_max: 100,
             tool_result_max_bytes: llm::DEFAULT_TOOL_RESULT_MAX_BYTES,
             subagent_depth_max: outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+            subagent_width_max: outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX,
             image: None,
         }
     }

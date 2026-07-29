@@ -140,6 +140,46 @@ prototype should confirm), or **Open** (deferred).
    handle set that shutdown has to walk. If provider rate limiting turns out to be the real pain,
    this is the fork to revisit.
 
+## Decisions
+
+1. **Default 8, ceiling 16 -- fork 2 confirmed as recommended.** The ceiling mirrors
+   `subagent-depth-max`'s `1..=16` rather than picking a second, differently-argued bound: both
+   keys exist to keep a runaway config from authorizing an unbounded tree, and one range is one
+   thing to learn. `1` stays meaningful -- it serializes fan-out (launch, collect, release,
+   launch) without disabling subagents, which is what `subagent-depth-max = 1` does.
+
+2. **The limit is carried on `ResolvedAgent`, so it is per-registry by construction.**
+   `build_subagent_agent` clones the parent's `SubagentContext` for the child registry, so every
+   registry in a tree carries the same *limit* while keeping its own *count* -- its `entries` map
+   starts empty. That is exactly the per-registry rule the task asked for, and it falls out of the
+   existing shape rather than needing a counter threaded anywhere. It also means the per-agent
+   override is per *launching* agent: a subagent does not get its own `[agents.<name>]` entry, so
+   it inherits the width its launcher resolved, the same way it already inherits the depth max,
+   the model, and the tool-call budget.
+
+3. **Both lock sites check, and the post-await one aborts.** The pre-check refuses before anything
+   is built or spawned; the re-check after `build_subagent_agent` aborts the task the way the
+   duplicate-name path beside it already does, leaving the ledger to reap it. As the task
+   predicted, the second path should be unreachable while a parent's tool calls stay sequential --
+   it is written to match its neighbor rather than to catch a live race, so it is not covered by a
+   test. The tests cover the pre-check path, which is the one a session actually takes.
+
+4. **Two tests, aimed at the two things that surprise.**
+   `width_limit_counts_idle_handles_and_release_frees_a_slot` pins that collecting a result does
+   not free a slot but releasing does -- the acceptance list calls this out as the surprising part,
+   and it is the reason the refusal names `outrig__subagent_release`.
+   `width_limit_is_scoped_to_each_registry` fills a parent at `subagent-width-max = 1` and then
+   launches from its child, which is the half of "per-registry" that a shared counter would break.
+   The three-way fan-out in the concepts doc needs no test of its own: it is 3 against a default
+   of 8, and `shutdown_clears_every_subagent` already launches under the default without refusal.
+
+5. **`SHUTDOWN_GRACE` was not re-measured.** The Risks section asked for the worst-case tree (8
+   wide by the default depth 3, so 8 + 64 = 72 subagents) to be timed against the five-second
+   budget before committing to the default, and that measurement was not made -- 72 is an argued
+   bound, not an observed one. The cap only shrinks the worst case relative to today's unbounded
+   one, so this does not make anything worse, but the default was chosen on the reasoning in fork
+   2 rather than on a teardown measurement. Filed as `plan/next/subagent-tree-shutdown-grace.md`.
+
 ## Risks
 
 - **A too-low default turns a documented pattern into an error.** The concepts page teaches

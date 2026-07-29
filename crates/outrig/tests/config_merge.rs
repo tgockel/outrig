@@ -950,6 +950,70 @@ subagent-depth-max = 4
     }
 
     #[test]
+    fn top_level_subagent_width_max_zero_errors() {
+        let cfg = parse(
+            r#"
+subagent-width-max = 0
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::SubagentWidthMaxOutOfRange { path, value, max } => {
+                assert_eq!(path, "top-level subagent-width-max");
+                assert_eq!(value, 0);
+                assert_eq!(max, 16);
+            }
+            other => panic!("expected SubagentWidthMaxOutOfRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_subagent_width_max_too_large_errors() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+subagent-width-max = 99
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::SubagentWidthMaxOutOfRange { path, value, max } => {
+                assert_eq!(path, "agents.coding.subagent-width-max");
+                assert_eq!(value, 99);
+                assert_eq!(max, 16);
+            }
+            other => panic!("expected SubagentWidthMaxOutOfRange, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_width_max_repo_overrides_global() {
+        let global = parse(
+            r#"
+subagent-width-max = 2
+"#,
+        );
+        let repo = parse(
+            r#"
+subagent-width-max = 4
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(merged.subagent_width_max, Some(4));
+    }
+
+    #[test]
     fn top_level_tool_result_max_too_small_errors() {
         let cfg = parse(
             r#"

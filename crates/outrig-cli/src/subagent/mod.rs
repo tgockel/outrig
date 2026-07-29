@@ -148,10 +148,16 @@ impl SubagentRegistry {
         prompt: String,
     ) -> Result<(), String> {
         validate_name(name)?;
-        if self.lock().contains_key(name) {
-            return Err(format!(
-                "subagent {name:?} is already live; release it first or pick another name"
-            ));
+        {
+            let entries = self.lock();
+            if entries.contains_key(name) {
+                return Err(format!(
+                    "subagent {name:?} is already live; release it first or pick another name"
+                ));
+            }
+            if entries.len() >= self.ctx.resolved.subagent_width_max as usize {
+                return Err(width_limit_error(self.ctx.resolved.subagent_width_max));
+            }
         }
         // Each launch pays for the previous ones' bookkeeping, so a session
         // that cycles handles does not carry a record per launch for its whole
@@ -190,6 +196,13 @@ impl SubagentRegistry {
             // task rather than leave it detached with its tool clones.
             abort.abort();
             return Err(format!("subagent {name:?} is already live"));
+        }
+        if entries.len() >= self.ctx.resolved.subagent_width_max as usize {
+            // As with the duplicate-name race, the ledger owns this task and
+            // will reap it at shutdown; abort it now so it cannot run after
+            // launch refuses it.
+            abort.abort();
+            return Err(width_limit_error(self.ctx.resolved.subagent_width_max));
         }
         entries.insert(
             name.to_string(),
@@ -648,6 +661,13 @@ async fn run_rounds(
     }
 }
 
+fn width_limit_error(limit: u32) -> String {
+    format!(
+        "subagent width limit of {limit} reached; collect a result and release a subagent with \
+         outrig__subagent_release before launching another"
+    )
+}
+
 fn unknown_name(name: &str, entries: &BTreeMap<String, Entry>) -> String {
     if entries.is_empty() {
         return format!("no subagent named {name:?}; none are running");
@@ -724,6 +744,7 @@ mod tests {
             tool_call_max: 4,
             tool_result_max_bytes: 4096,
             subagent_depth_max,
+            subagent_width_max: outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX,
             image: None,
         };
         let registry = SubagentRegistry::new(SubagentContext {
@@ -887,6 +908,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn width_limit_counts_idle_handles_and_release_frees_a_slot() {
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.resolved.subagent_width_max = 1;
+
+        registry
+            .launch("audit", None, "work".to_string())
+            .await
+            .expect("first launch");
+        registry.get_result("audit").await.expect("collect result");
+
+        let err = registry
+            .launch("second", None, "more work".to_string())
+            .await
+            .expect_err("an idle but unreleased handle still consumes the slot");
+        assert!(err.contains("width limit of 1"), "got: {err}");
+        assert!(err.contains("outrig__subagent_release"), "got: {err}");
+
+        registry.release(&["audit".to_string()]).expect("release");
+        registry
+            .launch("second", None, "more work".to_string())
+            .await
+            .expect("release must free a width slot");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_live_name_cannot_be_reused() {
         let (registry, _log_dir) = test_registry();
         registry
@@ -1027,6 +1073,35 @@ mod tests {
             "every tool clone must be released once subagents are shut down, or \
              teardown cannot close the MCP children"
         );
+    }
+
+    /// A child registry has its own width budget: filling the parent's registry
+    /// does not consume slots in the child registry.
+    #[tokio::test(start_paused = true)]
+    async fn width_limit_is_scoped_to_each_registry() {
+        let (mut registry, _log_dir) = test_registry_at(2, 3);
+        registry.ctx.resolved.subagent_width_max = 1;
+
+        registry
+            .launch("mid", None, "work".to_string())
+            .await
+            .expect("the root registry's only slot");
+        let child = registry
+            .lock()
+            .get("mid")
+            .expect("live parent entry")
+            .child
+            .clone()
+            .expect("mid is below the depth limit");
+
+        // The root is at its cap, but the child registry starts empty and has
+        // its own cap, so it can launch independently.
+        child
+            .launch("deep", None, "work".to_string())
+            .await
+            .expect("the child registry has an independent width slot");
+
+        registry.shutdown().await;
     }
 
     /// A subagent under the depth limit is handed its own registry (and, with

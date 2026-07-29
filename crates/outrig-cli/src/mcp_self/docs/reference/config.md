@@ -29,6 +29,7 @@ model-cache-root   = "/var/cache/outrig/models"       # optional; defaults to XD
 tool-call-max      = 100                              # optional; defaults to 50
 tool-result-max    = 262144                           # optional; defaults to 256 KiB
 subagent-depth-max = 3                                # optional; defaults to 3
+subagent-width-max = 8                                # optional; defaults to 8
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -47,19 +48,20 @@ deny  = ["*:22"]                                      # optional; global only
 | `tool-call-max`      | integer | no                     | global | Per-turn tool-call max.   |
 | `tool-result-max`    | integer | no                     | global | Per-tool-result byte max. |
 | `subagent-depth-max` | integer | no                     | global | Max subagent nesting.     |
+| `subagent-width-max` | integer | no                     | global | Max live subagents/agent. |
 | `network.mode`       | string  | no                     | either | Network mode.             |
 | `network.default`    | string  | no                     | global | Filter fallback action.   |
 | `network.allow`      | array   | no                     | global | Filter allow entries.     |
 | `network.deny`       | array   | no                     | global | Filter deny entries.      |
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
-project-scoped. `default-model`, `session-root`, `model-cache-root`, and `tool-call-max`
-belong in the global config since they're user/machine-level. `tool-result-max` usually belongs
-there too, although repo or agent config can tighten it for a noisy project. `[network].mode`
-can live in either file; when both set it, the repo value wins for that repo. Network policy
-keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
-egress policy, not a project preference. Each may also appear in the other file; repo entries
-override global by name.
+project-scoped. `default-model`, `session-root`, `model-cache-root`, `tool-call-max`, and the
+subagent limits belong in the global config since they're user/machine-level. `tool-result-max`
+usually belongs there too, although repo or agent config can tighten it for a noisy project.
+`[network].mode` can live in either file; when both set it, the repo value wins for that repo.
+Network policy keys (`default`, `allow`, and `deny`) are global-only because they describe the
+machine's egress policy, not a project preference. Each may also appear in the other file; repo
+entries override global by name.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -91,6 +93,12 @@ the default `3` allows two. The compiled-in default is `3`; config may set any v
 through `16`. `[agents.<name>].subagent-depth-max` overrides the top-level value for one agent.
 The separate `[agents.<name>].subagents` toggle still applies: `false` withholds the launch
 tools regardless of depth.
+
+`subagent-width-max` bounds how many live subagents one launching agent may hold at once. The
+compiled-in default is `8`; config may set any value from `1` through `16`.
+`[agents.<name>].subagent-width-max` overrides the top-level value for one agent. The cap is per
+launching agent, so a subagent's own budget is independent of its parent's. A subagent stays live
+after it finishes, so `outrig__subagent_release` is what frees a slot.
 
 ## `[network]`
 
@@ -412,6 +420,8 @@ preamble = "You are a meticulous code reviewer..."
   context cost are unchanged from a build without the feature.
 - `subagent-depth-max` (integer, optional, default: top-level value or `3`): how deeply this
   agent's subagents may nest. See the top-level `subagent-depth-max`.
+- `subagent-width-max` (integer, optional, default: top-level value or `8`): how many live
+  subagents this agent may launch. See the top-level `subagent-width-max`.
 
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
@@ -794,6 +804,7 @@ model-cache-root   = "/var/cache/outrig/models" # optional; default = XDG cache 
 tool-call-max      = 100                         # optional; default = 50
 tool-result-max    = 262144                      # optional; default = 256 KiB
 subagent-depth-max = 3                           # optional; default = 3
+subagent-width-max = 8                           # optional; default = 8
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -919,6 +930,7 @@ image-config in the merged config but does not require agent/model/provider wiri
   `16777216` bytes.
 - `subagent-depth-max`, if set at the top level or on an agent, must be between `1` and `16`
   (`1` disables subagents).
+- `subagent-width-max`, if set at the top level or on an agent, must be between `1` and `16`.
 - `[network].mode`, if set, must be `default` or `audit`.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.

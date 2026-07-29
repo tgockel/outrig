@@ -57,6 +57,12 @@ everywhere afterward.
 running at once -- that is how fan-out works, and it does not depend on the model emitting parallel
 tool calls. The parent's own tool calls stay sequential and ordered.
 
+Fan-out has a ceiling. `subagent-width-max` (default `8`) bounds how many live subagents one agent
+may hold, and a launch past it is refused rather than queued. Every subagent counts against the
+budget until it is released -- including one that has finished and whose result the parent already
+collected -- so at the limit the remedy is `outrig__subagent_release`, not a retry. The budget is
+per launching agent: a parent that is full does not stop its own subagents from launching theirs.
+
 ### Reporting is explicit
 
 A subagent reports by calling `outrig__set_result`, not by finishing with a nicely worded message.

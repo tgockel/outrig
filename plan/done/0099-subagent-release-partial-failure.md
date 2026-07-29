@@ -95,5 +95,5 @@ locking discipline, so landing the smaller change first keeps the two reviewable
 - `crates/outrig-cli/src/subagent/mod.rs` -- `release`, and `wait_results` for the resolve-first
   pattern to copy.
 - `crates/outrig-cli/src/builtin_tool.rs` -- `SubagentReleaseTool`, which surfaces the message.
-- `plan/todo/0100-subagent-width-cap.md` -- also touches `launch`'s locking discipline; worth
+- `plan/done/0100-subagent-width-cap.md` -- also touches `launch`'s locking discipline; worth
   landing in the same pass if both are picked up.
