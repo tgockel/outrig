@@ -32,6 +32,10 @@ for i in $(seq 1 40); do
 done
 ```
 
+(Invoking the built binary directly also sidesteps the unrelated `$HOME` defect in
+`primary-view-payload-home.md`, which makes `cargo clippy` fail outright inside a
+`view = "primary"` shell sidecar.)
+
 Measured rates:
 
 | Selection                                                     | Failures |
