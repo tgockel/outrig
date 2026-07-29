@@ -152,6 +152,108 @@ default model unless they too name one, and is reaped by the same tree walk.
   under.
 - `doc/concepts/subagents.md` no longer claims the model is inherited.
 
+## User-level design
+
+Committed here ahead of implementation. This section resolves fork 2 and the discoverability
+question; the code design derives from it.
+
+### The argument
+
+`model` is an optional string property on `outrig__subagent` only -- not on `subagent_send` (fork
+3), and not a second tool. Omitted means "the model I am running under", so every existing call
+site is unchanged. Naming the parent's own model explicitly is legal and equals inheritance.
+
+### The enum lists only models that would work
+
+The `model` property carries a JSON-Schema `enum`. `enum` is one of the few constraints models
+reliably attend to -- the same reasoning that shaped `set_result`'s `status` -- and it makes the
+argument checkable before the call is generated rather than after it costs a tool call.
+
+The enum lists the models **usable in the running build**, not every `[models.<name>]` block. A
+name that is configured but cannot be reached is not offered:
+
+- a model on a `style = "mistralrs"` provider in a build without `local-llm`, which resolves to
+  `MistralrsFeatureDisabled`;
+- a model whose `provider` is dangling or whose style this build has no client for
+  (`UnknownProvider`, `UnsupportedProvider`).
+
+Advertising a name that is guaranteed to fail teaches the agent nothing it can act on and spends a
+tool call to say so. The feature-disabled error stays reachable -- a hand-written or stale call can
+still name a local model in a default build, and it must still fail with `MistralrsFeatureDisabled`
+rather than "unknown model", which is what the acceptance list already asks for.
+
+Ordering is `cfg.models`' own: it is a `BTreeMap`, so the enum is sorted and byte-stable across
+launches. An unstable tool schema would churn the parent's context for no reason.
+
+The usable set is never empty -- the parent's own model resolved, so it is in the set. When the set
+holds *only* the parent's model, the `model` property is **omitted from the schema entirely**: a
+choice of one is not a choice, and leaving it out keeps the schema honest and saves the context the
+property would occupy.
+
+### What the agent is told
+
+The property description states the default and the *reason to use it*, since an agent that does
+not know why the argument exists will not reach for it:
+
+```
+"model": {
+  "type": "string",
+  "enum": ["claude", "fast", "smart"],
+  "description": "Which configured model this subagent runs under. Omit to use
+                  yours (\"smart\"). Delegating mechanical work -- grepping a tree,
+                  summarizing logs, checking whether a symbol is still used -- to a
+                  cheaper model keeps your own context for synthesis."
+}
+```
+
+The parent's own model name is interpolated so "omit to use yours" is concrete rather than
+abstract.
+
+### Failure
+
+An unknown or unusable name is composed **at the tool boundary**, leaving
+`LlmResolveError::UnknownModel` and the `--model` CLI message untouched -- which also sidesteps the
+0093 SemVer question the Dependencies section raises. The message names the usable models, so a
+wrong guess is self-correcting on the next call:
+
+```
+no usable model named "gpt-4o-mini"; available: claude, fast, smart
+```
+
+The launch is refused before anything is registered, so a bad name costs one tool call, leaves no
+half-registered entry, and leaves the handle free for a corrected retry.
+
+### Attribution
+
+A subagent on a non-default model is visible in the three places a subagent already is:
+
+- the launch trace: `[outrig] subagent audit-config started (model: fast)`;
+- the tool result the parent reads back, which names the model so the agent can confirm it got
+  what it asked for rather than inferring it;
+- a transcript header, written once per open (the file is opened in append mode):
+  `=== subagent audit-config (model: fast / provider: openai / gpt-4o-mini) ===`.
+
+When the model was inherited the trace and tool result stay exactly as they read today, so the
+default path is unchanged in the logs as well as in behavior.
+
+### A cold in-process load is announced, not silent
+
+Naming a local model the session has never loaded stalls the parent's launch call for the whole
+multi-gigabyte load. The launch prints one line before awaiting the build when the named model is
+in-process and not already in the registry, so a multi-minute wait does not read as a hang. This is
+the Risks item; announcing is the cheap half and does not need a progress UI.
+
+### Documentation
+
+**Two** files claim the model is inherited, not one:
+
+- `concepts/subagents.md` -- the *Inherited* table, which lists "The model, provider, and limits".
+- `reference/config.md` -- the `[agents.<name>]` prose: "A subagent shares this agent's container,
+  MCP tools, model and limits". The task's deliverable list missed this one.
+
+Both are symlinked from `crates/outrig-cli/src/mcp_self/docs/`, so both are edited in one place
+and there is no second copy to reconcile.
+
 ## Design forks
 
 Each item leads with its status: **Resolved** (committed here), **Recommended** (a lean that a
@@ -193,6 +295,57 @@ prototype should confirm), or **Open** (deferred).
    different model inherits a `temperature` tuned for the parent's. That is usually harmless and
    occasionally wrong. If it becomes a real problem the fix is per-model sampling defaults in
    config, which is a config-schema change independent of this feature.
+
+## Decisions
+
+1. **The enum lists only usable models -- fork 2 resolved to its strict form, then narrowed.**
+   `enum` over description prose, for the reason `set_result`'s `status` is an enum: it is one of
+   the few constraints models attend to, and it makes a bad value catchable before the call is
+   generated. The narrowing is the part the fork did not anticipate -- the enum lists models usable
+   in the *running build*, excluding mistralrs-backed models without `local-llm` and models whose
+   provider is dangling or of an unsupported style. Advertising a name guaranteed to fail teaches
+   the agent nothing and costs a tool call. `MistralrsFeatureDisabled` stays reachable for a
+   hand-written or stale call, discriminated by matched variant rather than set membership, so the
+   remedy (a rebuild) stays legible.
+
+2. **The `model` property is omitted entirely when only one model is usable.** A choice of one is
+   not a choice; the set always holds at least the parent's own model. Not in the original task --
+   it falls out of deciding what the agent should see.
+
+3. **The enumeration is composed at the tool boundary.** `LlmResolveError::UnknownModel` is left
+   alone, so the `--model` CLI message and its `llm_resolve.rs` coverage do not move and the 0093
+   SemVer question in Dependencies never has to be answered. The usable set is a build-specific
+   fact, which belongs at the boundary rather than in the resolver.
+
+4. **The field split is enforced by overwrite direction.** `resolve_launch_model` re-resolves into a
+   fresh `ResolvedAgent`, then overwrites the eight carried-forward fields *from the parent*, rather
+   than cloning the parent and patching the model fields in. Both produce today's values; they
+   differ when someone adds a field, which then defaults to the parent's side -- the safe default,
+   and what preserves `run_inner`'s post-resolution `--max-tool-calls` /
+   `--max-tool-result-bytes` mutations. Pinned by `launch_with_model_preserves_cli_overrides` with
+   sentinel values (7 / 1234) no config path produces; deleting the two assignments makes it fail
+   with the config defaults, which was verified by mutation rather than assumed.
+
+5. **Attribution is keyed on "the caller named a model", not on "the model differs".** `ModelLabel`
+   is `Some` iff `model` was passed, so an inherited launch is byte-for-byte unchanged in all three
+   places -- stderr trace, tool result, transcript (which gains no bytes at all). Naming the
+   parent's own model does print the suffix: the agent asked, and confirmation is the useful answer.
+
+6. **`reference/config.md` also claimed the model was inherited.** The task named only the
+   *Inherited* table in `concepts/subagents.md`; the `[agents.<name>]` prose was a second stale
+   promise, found during design review. Both are symlink targets under `crates/outrig-cli/src/`, so
+   both were fixed in one place, and `docs_do_not_claim_model_is_inherited` greps the
+   `include_str!`'d bundle for both stale phrasings.
+
+7. **The cold-load stall is announced rather than instrumented.** One `#[cfg(feature =
+   "local-llm")]`-gated line before the build, guarded on `model_weights.is_some()` and a new
+   non-loading `LlmRegistry::is_loaded`. The Risks entry asked for a decision between reporting the
+   load and accepting the stall; announcing is the cheap half and needs no progress UI. An
+   inherited launch cannot reach it -- the parent's model is loaded by definition.
+
+8. **Forks 1, 4, and 5 remain open, as the task sequenced them.** No allowlist, no device argument,
+   no per-model sampling defaults. Adding a constraint later cannot break a config that never had
+   one.
 
 ## Risks
 

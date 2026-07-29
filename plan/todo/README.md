@@ -25,16 +25,28 @@ longer public at all. 0098 cashed the sweep in a second time, adding an `LlmProv
 variant and a `Model::max_tokens` field additively; the one break it did take -- renaming three
 provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
-| Task | Title                                                     | Dependencies     |
-|------|-----------------------------------------------------------|------------------|
-| 0101 | Launch a subagent under a different model                 | 0093, 0098, 0100 |
+**The queue is empty.** Every numbered task through 0104 has landed; `plan/todo/` holds nothing
+but this file. The pre-freeze work for `0.2.0` is done, and the next entries come from
+`plan/next/` via `/groom-plan` rather than from an existing backlog.
 
 0100 landed: `subagent-width-max` (default `8`, range `1..=16`) bounds how many live subagents one
 launching agent may hold, refusing past the limit rather than queueing. It was sequenced before
 0101 deliberately -- model selection makes wide fan-out expensive rather than merely slow, so the
-containment half belonged first, and 0101 can now assume a bounded tree. What the cap does not
+containment half belonged first, and 0101 could then assume a bounded tree. What the cap does not
 settle is whether the five-second teardown budget fits the tree it permits; that measurement is
 filed as `plan/next/subagent-tree-shutdown-grace.md`.
+
+0101 landed, and closed the arc: `outrig__subagent` takes an optional `model` naming a
+`[models.<name>]`, so an expensive parent can farm mechanical work out to a cheap subagent instead
+of running the whole session cheap. Omitting it inherits the launching agent's model and is
+byte-for-byte the old path, in behavior and in the logs. The schema's `enum` lists only the models
+the running build can actually reach, and disappears entirely when that set holds one name.
+Sampling and limits stay with the launching agent -- carried forward by overwrite direction, which
+is what keeps the session's `--max-tool-calls` / `--max-tool-result-bytes` alive across a
+re-resolution. Three of its forks were left open on purpose: the device override and per-model
+sampling defaults have no pressing audience, and the operator allowlist -- the one that matters,
+since an agent can escalate *itself* onto the expensive model -- is filed as
+`plan/next/subagent-model-allowlist.md`.
 
 0102-0104 were one arc, and the last of them is why the first two were pre-freeze work rather
 than polish. This repo's `.agents/outrig/config.toml` used to embed every MCP server in the

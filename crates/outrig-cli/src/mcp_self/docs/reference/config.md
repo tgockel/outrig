@@ -431,8 +431,8 @@ set, except `outrig run --model <name>` may supply the selected agent's model fo
 `tool-result-max` is per result and applies equally to successful MCP results and MCP error
 messages. It also caps what `outrig__get_result` hands back from a subagent.
 
-`subagents` is on by default. A subagent shares this agent's container, MCP tools, model and
-limits, but not its preamble or context -- see
+`subagents` is on by default. A subagent shares this agent's container, MCP tools and limits, but
+not its preamble or context, and may name a different `[models.<name>]` at launch -- see
 [Concepts -> Subagents](../concepts/subagents.md). Turn it off for agents that should stay
 single-threaded, or to save the context the five tool schemas occupy. A subagent may itself
 launch subagents up to `subagent-depth-max`; each launching agent only sees the subagents it

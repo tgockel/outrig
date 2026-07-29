@@ -167,4 +167,30 @@ mod tests {
         let doc = get_doc("concepts/containers").expect("containers doc exists");
         assert!(doc.markdown.starts_with("# Containers"));
     }
+
+    /// Both pages promised the model was inherited, which stopped being true
+    /// when `outrig__subagent` grew a `model` argument. The bundle is what an AI
+    /// tool reads to decide how to call the tools, so a stale promise here is
+    /// worse than no documentation.
+    #[test]
+    fn docs_do_not_claim_model_is_inherited() {
+        let stale = [
+            ("concepts/subagents", "The model, provider, and limits"),
+            ("reference/config", "MCP tools, model and"),
+        ];
+        for (page, phrasing) in stale {
+            let doc = get_doc(page).unwrap_or_else(|| panic!("{page} is a registered page"));
+            assert!(
+                !doc.markdown.contains(phrasing),
+                "{page} still claims the model is inherited: {phrasing:?}"
+            );
+        }
+        assert!(
+            get_doc("concepts/subagents")
+                .expect("page")
+                .markdown
+                .contains("Choosing the subagent's model"),
+            "the argument that replaced the promise has to be documented"
+        );
+    }
 }

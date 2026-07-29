@@ -59,6 +59,13 @@ fn name_of(tool: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct LaunchArgs {
     name: String,
+    /// Present in both schema shapes. When the schema omits the property --
+    /// because only one model is usable -- a caller that sends it anyway still
+    /// deserializes and gets the "no usable model named ..." refusal, which is
+    /// the safe direction of drift: the hazard the standing comment names is a
+    /// field the schema advertises and the decoder refuses.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     preamble: Option<String>,
     prompt: String,
@@ -68,11 +75,27 @@ struct LaunchArgs {
 #[derive(Clone)]
 pub struct SubagentTool {
     registry: Arc<SubagentRegistry>,
+    /// The models this build could reach, read straight into the schema's
+    /// `enum`.
+    usable_models: Vec<String>,
+    /// The launching agent's own model, so "omit to use yours" is concrete.
+    parent_model: String,
 }
 
 impl SubagentTool {
     pub fn new(registry: Arc<SubagentRegistry>) -> Self {
-        Self { registry }
+        // Read from the registry's own context, once, at construction: the
+        // schema has to be byte-stable across calls, since an unstable one
+        // churns the parent's context for nothing. Doing it here rather than in
+        // `parent_tools` also means the nested-launch path cannot describe a
+        // different launching agent than the session path does.
+        let usable_models = crate::subagent::usable_model_names(registry.config());
+        let parent_model = registry.parent_model_name().to_string();
+        Self {
+            registry,
+            usable_models,
+            parent_model,
+        }
     }
 }
 
@@ -93,26 +116,43 @@ impl ToolDyn for SubagentTool {
     }
 
     fn parameters(&self) -> Value {
+        let mut properties = json!({
+            "name": {
+                "type": "string",
+                "description": "Short kebab-case handle used to refer to this \
+                                subagent later, e.g. \"audit-config\"."
+            },
+            "preamble": {
+                "type": "string",
+                "description": "Optional system prompt: the role or standing \
+                                context this subagent should work under. Omit \
+                                it when the prompt alone is enough."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "The task, stated in full. The subagent cannot \
+                                see your conversation."
+            }
+        });
+        // A choice of one is not a choice, and the set always holds at least
+        // the parent's own model -- so leave the property out entirely rather
+        // than spend the parent's context advertising it.
+        if self.usable_models.len() > 1 {
+            properties["model"] = json!({
+                "type": "string",
+                "enum": self.usable_models,
+                "description": format!(
+                    "Which configured model this subagent runs under. Omit to use \
+                     yours (\"{}\"). Delegating mechanical work -- grepping a tree, \
+                     summarizing logs, checking whether a symbol is still used -- to \
+                     a cheaper model keeps your own context for synthesis.",
+                    self.parent_model
+                )
+            });
+        }
         json!({
             "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Short kebab-case handle used to refer to this \
-                                    subagent later, e.g. \"audit-config\"."
-                },
-                "preamble": {
-                    "type": "string",
-                    "description": "Optional system prompt: the role or standing \
-                                    context this subagent should work under. Omit \
-                                    it when the prompt alone is enough."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The task, stated in full. The subagent cannot \
-                                    see your conversation."
-                }
-            },
+            "properties": properties,
             "required": ["name", "prompt"],
             "additionalProperties": false
         })
@@ -123,13 +163,23 @@ impl ToolDyn for SubagentTool {
             let args: LaunchArgs = parse_args(&args)?;
             match self
                 .registry
-                .launch(&args.name, args.preamble, args.prompt)
+                .launch(
+                    &args.name,
+                    args.model.as_deref(),
+                    args.preamble,
+                    args.prompt,
+                )
                 .await
             {
                 Ok(()) => {
-                    eprintln!("[outrig] subagent {} started", args.name);
+                    // Empty unless the launch named a model, so an inherited one
+                    // reads exactly as it always has.
+                    let suffix = args
+                        .model
+                        .map_or(String::new(), |model| format!(" (model: {model})"));
+                    eprintln!("[outrig] subagent {} started{suffix}", args.name);
                     Ok(format!(
-                        "subagent {:?} started; collect it with outrig__get_result",
+                        "subagent {:?} started{suffix}; collect it with outrig__get_result",
                         args.name
                     ))
                 }
@@ -680,6 +730,116 @@ mod tests {
             parse_args(r#"{"name":"audit","prompt":"check the config"}"#).expect("parses");
         assert_eq!(args.name, "audit");
         assert!(args.preamble.is_none());
+        assert!(args.model.is_none(), "an omitted model means \"mine\"");
+    }
+
+    /// The `outrig__subagent` schema as `parent_tools` builds it, over a
+    /// registry whose context is the fixture session's.
+    fn subagent_schema(cfg: outrig::config::Config) -> Value {
+        let (registry, log_dir) = crate::subagent::fixtures::registry_with(
+            cfg,
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+        let tools = parent_tools(Arc::new(registry), 4096);
+        let schema = tools
+            .iter()
+            .find(|tool| tool.name() == "outrig__subagent")
+            .expect("the launch tool is advertised")
+            .parameters();
+        drop(log_dir);
+        schema
+    }
+
+    /// The enum is what the model reliably attends to, so it must list exactly
+    /// the names a launch would accept -- and in a stable order, since an
+    /// unstable schema churns the parent's context for nothing.
+    #[test]
+    fn subagent_schema_model_enum_lists_usable_models_only() {
+        let mut cfg = crate::subagent::fixtures::test_config();
+        // Dangling provider: resolution would fail with UnknownProvider, so the
+        // name is not offered.
+        cfg.models
+            .insert("orphan".to_string(), outrig::config::Model::new("nowhere"));
+
+        let schema = subagent_schema(cfg.clone());
+        assert_eq!(
+            schema["properties"]["model"]["enum"],
+            json!(["fast", "smart"]),
+            "got: {schema}"
+        );
+        assert_eq!(
+            schema,
+            subagent_schema(cfg),
+            "the schema must be byte-stable across calls"
+        );
+    }
+
+    /// A choice of one is not a choice: the set always holds the parent's own
+    /// model, so a lone entry means the property earns nothing.
+    #[test]
+    fn subagent_schema_omits_model_when_only_one_usable() {
+        let schema = subagent_schema(crate::subagent::fixtures::test_config_single());
+        assert!(schema["properties"].get("model").is_none(), "got: {schema}");
+        assert_eq!(schema["required"], json!(["name", "prompt"]));
+    }
+
+    /// "Omit to use yours" is only actionable if it names the model concretely.
+    #[test]
+    fn subagent_schema_model_description_names_parent_model() {
+        let schema = subagent_schema(crate::subagent::fixtures::test_config());
+        let description = schema["properties"]["model"]["description"]
+            .as_str()
+            .expect("the model property carries a description");
+        assert!(
+            description.contains("Omit to use yours (\"smart\")"),
+            "got: {description}"
+        );
+    }
+
+    /// The launch tool over the fixture session, plus the temp dir it writes
+    /// transcripts into -- held by the caller so it outlives the launch.
+    fn subagent_tool() -> (SubagentTool, tempfile::TempDir) {
+        let (registry, log_dir) = crate::subagent::fixtures::registry_with(
+            crate::subagent::fixtures::test_config(),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+        (SubagentTool::new(Arc::new(registry)), log_dir)
+    }
+
+    /// The result string is what the parent model reads back, so it is where
+    /// "did I get the model I asked for" gets answered -- inferring it from the
+    /// absence of an error is not the same thing. The stderr trace carries the
+    /// same suffix from the same value.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_that_named_a_model_says_so_in_its_result() {
+        let (tool, _log_dir) = subagent_tool();
+
+        let result = tool
+            .call(r#"{"name":"audit","prompt":"check the config","model":"fast"}"#.to_string())
+            .await
+            .expect("launch succeeds -- the client is built offline");
+        assert_eq!(
+            result,
+            "subagent \"audit\" started (model: fast); collect it with outrig__get_result"
+        );
+    }
+
+    /// The other half: an inherited launch must read byte-for-byte as it did
+    /// before the argument existed, which only a literal comparison pins down.
+    #[tokio::test(start_paused = true)]
+    async fn an_inherited_launch_reads_exactly_as_it_did_before() {
+        let (tool, _log_dir) = subagent_tool();
+
+        let result = tool
+            .call(r#"{"name":"audit","prompt":"check the config"}"#.to_string())
+            .await
+            .expect("launch succeeds");
+        assert_eq!(
+            result,
+            "subagent \"audit\" started; collect it with outrig__get_result"
+        );
     }
 
     #[test]

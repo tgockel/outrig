@@ -63,4 +63,18 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
             .await?;
         Ok(arc.clone())
     }
+
+    /// Whether this model already has a slot, i.e. a load has been started for
+    /// it. Takes the same lock [`Self::get_or_init`] does and constructs
+    /// nothing, so it is safe to ask on a path that must not load.
+    ///
+    /// Racing a concurrent load is acceptable: the caller uses this to decide
+    /// whether to *announce* a cold load, and the worst case is a spurious or
+    /// missing advisory line.
+    pub(crate) fn is_loaded(&self, model_name: &str) -> bool {
+        self.models
+            .lock()
+            .expect("registry mutex poisoned")
+            .contains_key(model_name)
+    }
 }

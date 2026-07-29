@@ -145,6 +145,10 @@ pub async fn execute(
         session: _,
     } = setup;
     let mut runtime = SessionRuntime::new(watcher, network, containers);
+    // Shared from here on: the subagent registry keeps a handle so a launch can
+    // re-resolve the agent against another `[models.<name>]`, against the same
+    // merged config the session resolved from.
+    let cfg = Arc::new(cfg);
     let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
 
     // Validate per-server env entries against the full merged plan (a
@@ -160,7 +164,7 @@ pub async fn execute(
     }
 
     let outcome: Result<i32> = run_inner(RunInnerArgs {
-        cfg: &cfg,
+        cfg: Arc::clone(&cfg),
         agent_name: &agent_name,
         image_cfg_name: &image_cfg_name,
         image_tag: &image_tag,
@@ -197,7 +201,9 @@ fn parse_mistralrs_device(s: &str) -> std::result::Result<MistralrsDeviceSpec, S
 /// session pieces plus the [`SessionRuntime`] that `/sidecar add` grows
 /// mid-session.
 struct RunInnerArgs<'a> {
-    cfg: &'a Config,
+    /// Shared rather than borrowed: the subagent registry keeps a handle so a
+    /// launch can re-resolve the agent against another `[models.<name>]`.
+    cfg: Arc<Config>,
     agent_name: &'a str,
     image_cfg_name: &'a str,
     image_tag: &'a ImageTag,
@@ -243,8 +249,11 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     // `setup` already validated presence and used the resolved `.image`
     // for the image fallback. We re-resolve here for `build_agent` +
     // banner; cheap (config table lookups, no I/O).
+    // Wrapped by the caller so the subagent registry can hold it and
+    // re-resolve a launch against a different model, against the same merged
+    // config the session resolved from.
     let mut resolved =
-        llm::resolve_agent_with_overrides(cfg, agent_name, model_override, device_override)?;
+        llm::resolve_agent_with_overrides(&cfg, agent_name, model_override, device_override)?;
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
@@ -278,6 +287,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     // startup set.
     let subagents = Arc::new(SubagentRegistry::new(SubagentContext {
         resolved: resolved.clone(),
+        cfg: cfg.clone(),
         mcp_tools: all_tools.clone(),
         cache_root: cache_root.to_path_buf(),
         log_dir: log_dir.to_path_buf(),
@@ -337,7 +347,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         agent: &agent,
         store,
         sid,
-        cfg,
+        cfg: &cfg,
         repo_root,
         log_dir,
         cli_env,

@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures_util::future::select_all;
+use outrig::config::{Config, LlmProvider};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -56,9 +57,15 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// session. Held by the registry so a launch needs only a name and a prompt.
 #[derive(Clone)]
 pub struct SubagentContext {
-    /// The session's resolved agent. A subagent reuses its model, provider and
-    /// limits; only the preamble is replaced, by whatever the parent passes.
+    /// The session's resolved agent. A subagent reuses its limits and sampling;
+    /// the preamble is replaced by whatever the parent passes, and the model is
+    /// re-resolved when the launch names one.
     pub resolved: ResolvedAgent,
+    /// The merged session config, kept so a launch can re-resolve the agent
+    /// against a different `[models.<name>]`. An `Arc` because the context is
+    /// cloned per nesting level, and because a grandchild must re-resolve
+    /// against the same config the session did.
+    pub cfg: Arc<Config>,
     /// The session's MCP-backed tools. Cloning shares the live connections.
     pub mcp_tools: Vec<SessionTool>,
     pub cache_root: PathBuf,
@@ -140,14 +147,40 @@ impl SubagentRegistry {
         self.spawned.lock().expect("subagent registry poisoned")
     }
 
+    /// The merged config a launch through this registry re-resolves against.
+    /// Read by [`crate::builtin_tool::parent_tools`] to build the `model`
+    /// enum, so the schema and the launch agree on which names exist.
+    pub(crate) fn config(&self) -> &Config {
+        &self.ctx.cfg
+    }
+
+    /// The model the *launching* agent runs under -- what "omit to use yours"
+    /// in the tool schema names.
+    pub(crate) fn parent_model_name(&self) -> &str {
+        &self.ctx.resolved.model_name
+    }
+
     /// Launch a subagent under `name`, running `prompt` as its first round.
+    /// `model` names a `[models.<name>]` to run it under; `None` inherits the
+    /// launching agent's.
     pub async fn launch(
         &self,
         name: &str,
+        model: Option<&str>,
         preamble: Option<String>,
         prompt: String,
     ) -> Result<(), String> {
         validate_name(name)?;
+        // Resolved before the entries lock, and before anything is registered:
+        // a bad model name costs one tool call and leaves the handle free for a
+        // corrected retry, with no half-built entry or spawned task to unwind.
+        // It is a config lookup and a struct build -- no I/O, no await -- so the
+        // lock scope below stays as narrow as it was.
+        let resolved = resolve_launch_model(&self.ctx, model)?;
+        // `Some` iff the caller named a model, not by comparing against the
+        // parent's: an inherited launch must read exactly as it did before, and
+        // an agent that names its own model asked and wants confirmation.
+        let label = model.map(|_| ModelLabel::of(&resolved));
         {
             let entries = self.lock();
             if entries.contains_key(name) {
@@ -165,7 +198,19 @@ impl SubagentRegistry {
         self.spawned_lock().retain(|s| !s.tree_finished());
 
         let shared = Arc::new(SubagentShared::new());
-        let (agent, child) = build_subagent_agent(&self.ctx, &shared, name, preamble).await?;
+        // A multi-gigabyte weight load would otherwise stall the parent's tool
+        // call with no output at all, which reads as a hang. The parent's own
+        // model is loaded by definition, so an inherited launch cannot get here.
+        #[cfg(feature = "local-llm")]
+        if resolved.model_weights.is_some() && !self.ctx.registry.is_loaded(&resolved.model_name) {
+            eprintln!(
+                "[outrig] subagent {name}: loading in-process model {} (first use; this may take \
+                 several minutes)",
+                resolved.model_name
+            );
+        }
+        let (agent, child) =
+            build_subagent_agent(&self.ctx, &resolved, &shared, name, preamble).await?;
 
         let (prompts, rx) = mpsc::unbounded_channel();
         prompts
@@ -178,6 +223,7 @@ impl SubagentRegistry {
             shared.clone(),
             rx,
             self.ctx.log_dir.clone(),
+            label,
         ));
         let abort = task.abort_handle();
         // Register before the name check below, not after it: the ledger is
@@ -495,23 +541,158 @@ impl Spawned {
     }
 }
 
+/// The configured models this build could actually reach, in `cfg.models`'
+/// `BTreeMap` order -- so both the tool schema's `enum` and the unknown-model
+/// message are sorted and byte-stable across launches.
+///
+/// A name is kept only when resolution would not reject it out of hand: the
+/// three exclusions mirror the resolver's own `UnknownProvider`,
+/// `UnsupportedProvider` and `MistralrsFeatureDisabled` failures. Membership
+/// does not prove a model *works* -- credentials may be wrong, an endpoint may
+/// be down, a GGUF path may not exist -- only that it is not a guaranteed
+/// failure, which is the right bar for something advertised to the model.
+///
+/// Pure inspection of `Config`: no registry touch, no weight load, no client
+/// construction, so the synchronous schema-building path can call it.
+pub(crate) fn usable_model_names(cfg: &Config) -> Vec<String> {
+    cfg.models
+        .iter()
+        .filter(|(_, model)| {
+            cfg.providers
+                .get(&model.provider)
+                .is_some_and(|provider| match provider {
+                    LlmProvider::OpenAi { .. } | LlmProvider::Anthropic { .. } => true,
+                    // A compile-time decision, not a runtime one. `cfg!` keeps
+                    // one body compiling in both builds, so the two cannot
+                    // drift apart.
+                    LlmProvider::Mistralrs => cfg!(feature = "local-llm"),
+                    // `LlmProvider` is `#[non_exhaustive]`: a style this
+                    // function has not been taught about is not advertised.
+                    _ => false,
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The model a subagent was launched under, for the three places a subagent is
+/// already visible: the launch trace, the tool result the parent reads, and the
+/// transcript header. One value carries all three so they cannot drift.
+///
+/// `None` wherever the launch inherited the parent's model, which is what keeps
+/// the default path byte-for-byte -- and byte-free in the transcript -- as it
+/// was before this argument existed.
+pub(crate) struct ModelLabel {
+    name: String,
+    provider: String,
+    identifier: String,
+}
+
+impl ModelLabel {
+    fn of(resolved: &ResolvedAgent) -> Self {
+        Self {
+            name: resolved.model_name.clone(),
+            provider: resolved.provider_name.clone(),
+            identifier: resolved.model_identifier.clone(),
+        }
+    }
+
+    /// The transcript header's parenthesized detail: the name the agent asked
+    /// for, plus the provider and wire identifier it landed on.
+    fn detail(&self) -> String {
+        format!(
+            "model: {} / provider: {} / {}",
+            self.name, self.provider, self.identifier
+        )
+    }
+}
+
+/// The tool-boundary message for a name no configured model can serve.
+///
+/// Composed here rather than by widening `LlmResolveError::UnknownModel`: the
+/// enumeration is build-specific, which is a tool-boundary fact and not a
+/// resolver one, and leaving the resolver alone keeps the `--model` CLI message
+/// untouched. The list comes from [`usable_model_names`], so this text and the
+/// schema's `enum` can never disagree.
+fn unusable_model_message(cfg: &Config, model: &str) -> String {
+    format!(
+        "no usable model named {model:?}; available: {}",
+        usable_model_names(cfg).join(", ")
+    )
+}
+
+/// The whole model decision for one launch.
+///
+/// `None` clones the context's `ResolvedAgent` and does nothing else -- the same
+/// clone a launch has always made. `Some(model)` re-resolves the *parent's*
+/// agent against that model, then overwrites the carried-forward fields from the
+/// parent.
+///
+/// The overwrite direction is deliberate: assigning the parent's values onto the
+/// fresh resolution means a field added to `ResolvedAgent` later arrives on the
+/// carried-forward side, which is the safe default. It is also what preserves
+/// `run_inner`'s post-resolution `--max-tool-calls` / `--max-tool-result-bytes`
+/// overrides, which a fresh resolution would replace with config defaults.
+fn resolve_launch_model(
+    ctx: &SubagentContext,
+    model: Option<&str>,
+) -> Result<ResolvedAgent, String> {
+    let Some(model) = model else {
+        return Ok(ctx.resolved.clone());
+    };
+    // `None` for the device override: a subagent names a model, not hardware.
+    match crate::llm::resolve_agent_with_overrides(
+        &ctx.cfg,
+        &ctx.resolved.agent_name,
+        Some(model),
+        None,
+    ) {
+        Ok(mut resolved) => {
+            let parent = &ctx.resolved;
+            resolved.preamble = parent.preamble.clone();
+            resolved.temperature = parent.temperature;
+            resolved.max_tokens = parent.max_tokens;
+            resolved.tool_call_max = parent.tool_call_max;
+            resolved.tool_result_max_bytes = parent.tool_result_max_bytes;
+            resolved.subagent_depth_max = parent.subagent_depth_max;
+            resolved.subagent_width_max = parent.subagent_width_max;
+            resolved.image = parent.image.clone();
+            Ok(resolved)
+        }
+        // Discriminated by matched variant, not by membership in the usable
+        // set: membership would collapse a local model in a default build into
+        // "unknown", and that case has to keep surfacing
+        // `MistralrsFeatureDisabled` so the remedy (a rebuild) is legible. That
+        // variant is merely unconstructible without the feature rather than
+        // `cfg`-gated, so this match compiles identically in both builds.
+        Err(crate::error::CliError::LlmResolve(
+            crate::llm::LlmResolveError::UnknownModel { .. }
+            | crate::llm::LlmResolveError::UnknownProvider { .. }
+            | crate::llm::LlmResolveError::UnsupportedProvider { .. },
+        )) => Err(unusable_model_message(&ctx.cfg, model)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Build the agent loop one subagent runs, and, when depth allows, the registry
 /// it launches its own subagents through.
 ///
-/// It reuses the session's model, provider and limits; only the preamble is
-/// replaced. The tool list is always the session's MCP tools plus this
-/// subagent's own `outrig__set_result`. When the subagent's depth is under
+/// The `resolved` handed in is whatever [`resolve_launch_model`] decided, so a
+/// launch that named a model arrives here already re-resolved; only the
+/// preamble is replaced. The tool list is always the session's MCP tools plus
+/// this subagent's own `outrig__set_result`. When the subagent's depth is under
 /// `subagent_depth_max`, it also gets its own [`SubagentRegistry`] and the
 /// parent-side launch tools, so it can launch children of its own; at the max
 /// depth those are withheld and the returned registry is `None`. Recursion is
 /// bounded by that depth check rather than impossible by construction.
 async fn build_subagent_agent(
     ctx: &SubagentContext,
+    resolved: &ResolvedAgent,
     shared: &Arc<SubagentShared>,
     name: &str,
     preamble: Option<String>,
 ) -> Result<(crate::llm::RigAgent, Option<Arc<SubagentRegistry>>), String> {
-    let mut resolved = ctx.resolved.clone();
+    let mut resolved = resolved.clone();
     resolved.preamble = compose_preamble(preamble.as_deref());
 
     let mut tools = ctx.mcp_tools.clone();
@@ -586,9 +767,10 @@ async fn run_rounds(
     shared: Arc<SubagentShared>,
     mut prompts: mpsc::UnboundedReceiver<String>,
     log_dir: PathBuf,
+    label: Option<ModelLabel>,
 ) {
     let mut history = Vec::new();
-    let mut log = transcript::Transcript::open(&log_dir, &name).await;
+    let mut log = transcript::Transcript::open(&log_dir, &name, label.as_ref()).await;
 
     while let Some(prompt) = prompts.recv().await {
         shared.begin_round();
@@ -701,10 +883,135 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Fixtures shared by this module's tests and [`crate::builtin_tool`]'s schema
+/// tests, which have to build a registry exactly the way a launch test does or
+/// the schema they assert on is not the one a launch would produce.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
     use crate::llm::ResolvedProvider;
+    use outrig::config::{Agent, ApiKeyRef, LlmProvider, Model};
+
+    /// The env var the fixture provider's api-key points at. Unique to this
+    /// module so concurrent tests cannot race another fixture on the same key.
+    const KEY_VAR: &str = "OUTRIG_TEST_SUBAGENT_MODEL_KEY";
+
+    /// Provider and agent tables shared by both configs below: one hosted
+    /// provider at the discard port, so a round fails immediately, and the one
+    /// agent the contexts name.
+    fn base_config() -> Config {
+        // SAFETY: edition 2024 marks `env::set_var` unsafe because of
+        // multi-thread races. The name is unique to this fixture and the value
+        // never varies, so a concurrent write is writing the same bytes.
+        unsafe { std::env::set_var(KEY_VAR, "test-key") };
+
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "openai".to_string(),
+            LlmProvider::openai(
+                "http://127.0.0.1:9",
+                ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
+                Some(1),
+            ),
+        );
+        let mut agent = Agent::default();
+        agent.model = Some("smart".to_string());
+        agent.preamble = Some("session preamble".to_string());
+        cfg.agents.insert("primary".to_string(), agent);
+        cfg
+    }
+
+    fn hosted_model(identifier: &str) -> Model {
+        let mut model = Model::new("openai");
+        model.identifier = Some(identifier.to_string());
+        model
+    }
+
+    /// Two usable models, so the schema advertises a choice and a launch has
+    /// something other than the parent's model to name.
+    pub(crate) fn test_config() -> Config {
+        let mut cfg = base_config();
+        cfg.models
+            .insert("fast".to_string(), hosted_model("gpt-4o-mini"));
+        cfg.models
+            .insert("smart".to_string(), hosted_model("gpt-4o"));
+        cfg
+    }
+
+    /// Only the parent's own model, which is the case where the `model`
+    /// property is left out of the schema entirely.
+    pub(crate) fn test_config_single() -> Config {
+        let mut cfg = base_config();
+        cfg.models
+            .insert("smart".to_string(), hosted_model("gpt-4o"));
+        cfg
+    }
+
+    /// [`test_config`] plus an in-process model, `onprem`. Usable only in a
+    /// `local-llm` build, which is exactly what makes it useful in both: one
+    /// build resolves it, the other must refuse it with the feature-disabled
+    /// error rather than "unknown model".
+    pub(crate) fn local_model_config() -> Config {
+        let mut cfg = test_config();
+        cfg.providers
+            .insert("local".to_string(), LlmProvider::Mistralrs);
+        let mut model = Model::new("local");
+        model.model_id = Some("Qwen/Qwen2.5-7B-Instruct".to_string());
+        cfg.models.insert("onprem".to_string(), model);
+        cfg
+    }
+
+    /// The session's resolved agent as the context carries it: `smart`, the
+    /// model the fixture agent is configured on, against the discard port.
+    pub(crate) fn test_resolved(subagent_depth_max: u32) -> ResolvedAgent {
+        ResolvedAgent {
+            agent_name: "primary".to_string(),
+            model_name: "smart".to_string(),
+            model_identifier: "gpt-4o".to_string(),
+            provider_name: "openai".to_string(),
+            provider: ResolvedProvider::OpenAi {
+                // Discard port: connects are refused immediately.
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "test-key".to_string(),
+                request_timeout_secs: Some(1),
+            },
+            model_weights: None,
+            preamble: "session preamble".to_string(),
+            temperature: None,
+            max_tokens: None,
+            tool_call_max: 4,
+            tool_result_max_bytes: 4096,
+            subagent_depth_max,
+            subagent_width_max: outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX,
+            image: None,
+        }
+    }
+
+    /// A registry over `cfg`, launching at `depth` under `subagent_depth_max`.
+    pub(crate) fn registry_with(
+        cfg: Config,
+        depth: u32,
+        subagent_depth_max: u32,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        let registry = SubagentRegistry::new(SubagentContext {
+            resolved: test_resolved(subagent_depth_max),
+            cfg: Arc::new(cfg),
+            mcp_tools: Vec::new(),
+            cache_root: PathBuf::from("."),
+            log_dir: log_dir.path().to_path_buf(),
+            depth,
+            #[cfg(feature = "local-llm")]
+            registry: Arc::new(crate::llm::LlmRegistry::new()),
+        });
+        (registry, log_dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
     use std::time::Duration;
 
     /// A registry whose subagents talk to a closed port, so every round fails
@@ -725,38 +1032,7 @@ mod tests {
         depth: u32,
         subagent_depth_max: u32,
     ) -> (SubagentRegistry, tempfile::TempDir) {
-        let log_dir = tempfile::tempdir().expect("tempdir");
-        let resolved = ResolvedAgent {
-            agent_name: "primary".to_string(),
-            model_name: "m".to_string(),
-            model_identifier: "m".to_string(),
-            provider_name: "p".to_string(),
-            provider: ResolvedProvider::OpenAi {
-                // Discard port: connects are refused immediately.
-                base_url: "http://127.0.0.1:9".to_string(),
-                api_key: "test-key".to_string(),
-                request_timeout_secs: Some(1),
-            },
-            model_weights: None,
-            preamble: "session preamble".to_string(),
-            temperature: None,
-            max_tokens: None,
-            tool_call_max: 4,
-            tool_result_max_bytes: 4096,
-            subagent_depth_max,
-            subagent_width_max: outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX,
-            image: None,
-        };
-        let registry = SubagentRegistry::new(SubagentContext {
-            resolved,
-            mcp_tools: Vec::new(),
-            cache_root: PathBuf::from("."),
-            log_dir: log_dir.path().to_path_buf(),
-            depth,
-            #[cfg(feature = "local-llm")]
-            registry: Arc::new(crate::llm::LlmRegistry::new()),
-        });
-        (registry, log_dir)
+        registry_with(test_config(), depth, subagent_depth_max)
     }
 
     /// A stand-in for the session's MCP tools that counts how many copies are
@@ -815,7 +1091,7 @@ mod tests {
     /// its limit, or `mid` is a leaf and has no registry to launch through.
     async fn launch_nested(registry: &SubagentRegistry) -> Arc<SubagentRegistry> {
         registry
-            .launch("mid", None, "work".to_string())
+            .launch("mid", None, None, "work".to_string())
             .await
             .expect("launch");
         let child = registry
@@ -826,7 +1102,7 @@ mod tests {
             .clone()
             .expect("a subagent below the depth limit gets a registry");
         child
-            .launch("deep", None, "work".to_string())
+            .launch("deep", None, None, "work".to_string())
             .await
             .expect("grandchild launch");
         child
@@ -838,7 +1114,7 @@ mod tests {
     async fn a_failed_round_reaches_the_parent_as_an_error() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "check the config".to_string())
+            .launch("audit", None, None, "check the config".to_string())
             .await
             .expect("launch succeeds -- the client is built offline");
 
@@ -856,7 +1132,7 @@ mod tests {
     async fn a_second_read_blocks_until_there_is_something_new() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "check the config".to_string())
+            .launch("audit", None, None, "check the config".to_string())
             .await
             .expect("launch succeeds");
         registry.get_result("audit").await.expect("first read");
@@ -873,7 +1149,7 @@ mod tests {
         let (registry, _log_dir) = test_registry();
         for name in ["audit-a", "audit-b"] {
             registry
-                .launch(name, None, "work".to_string())
+                .launch(name, None, None, "work".to_string())
                 .await
                 .expect("launch succeeds");
         }
@@ -895,7 +1171,7 @@ mod tests {
     async fn wait_results_does_not_consume_the_result() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("launch succeeds");
 
@@ -913,13 +1189,13 @@ mod tests {
         registry.ctx.resolved.subagent_width_max = 1;
 
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("first launch");
         registry.get_result("audit").await.expect("collect result");
 
         let err = registry
-            .launch("second", None, "more work".to_string())
+            .launch("second", None, None, "more work".to_string())
             .await
             .expect_err("an idle but unreleased handle still consumes the slot");
         assert!(err.contains("width limit of 1"), "got: {err}");
@@ -927,7 +1203,7 @@ mod tests {
 
         registry.release(&["audit".to_string()]).expect("release");
         registry
-            .launch("second", None, "more work".to_string())
+            .launch("second", None, None, "more work".to_string())
             .await
             .expect("release must free a width slot");
     }
@@ -936,12 +1212,12 @@ mod tests {
     async fn a_live_name_cannot_be_reused() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("first launch");
 
         let err = registry
-            .launch("audit", None, "other work".to_string())
+            .launch("audit", None, None, "other work".to_string())
             .await
             .expect_err("second launch on a live name");
         assert!(err.contains("already live"), "got: {err}");
@@ -953,7 +1229,7 @@ mod tests {
     async fn release_frees_the_name_and_resets_the_inbox() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("launch");
         registry.get_result("audit").await.expect("collect");
@@ -962,7 +1238,7 @@ mod tests {
             .expect("release succeeds");
 
         registry
-            .launch("audit", None, "work again".to_string())
+            .launch("audit", None, None, "work again".to_string())
             .await
             .expect("relaunch under the freed name");
         registry
@@ -975,7 +1251,7 @@ mod tests {
     async fn failed_release_leaves_the_valid_subagent_live_and_collectable() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit-a", None, "work".to_string())
+            .launch("audit-a", None, None, "work".to_string())
             .await
             .expect("launch");
 
@@ -1001,7 +1277,7 @@ mod tests {
     async fn a_duplicate_release_name_is_rejected_without_releasing_it() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("launch");
 
@@ -1019,7 +1295,7 @@ mod tests {
     async fn unknown_names_name_the_live_ones() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("launch");
 
@@ -1037,7 +1313,7 @@ mod tests {
         let (registry, _log_dir) = test_registry();
         for name in ["audit-a", "audit-b"] {
             registry
-                .launch(name, None, "work".to_string())
+                .launch(name, None, None, "work".to_string())
                 .await
                 .expect("launch");
         }
@@ -1061,7 +1337,7 @@ mod tests {
         registry.ctx.mcp_tools = tools;
 
         registry
-            .launch("audit", None, "work".to_string())
+            .launch("audit", None, None, "work".to_string())
             .await
             .expect("launch");
         registry.shutdown().await;
@@ -1083,7 +1359,7 @@ mod tests {
         registry.ctx.resolved.subagent_width_max = 1;
 
         registry
-            .launch("mid", None, "work".to_string())
+            .launch("mid", None, None, "work".to_string())
             .await
             .expect("the root registry's only slot");
         let child = registry
@@ -1097,7 +1373,7 @@ mod tests {
         // The root is at its cap, but the child registry starts empty and has
         // its own cap, so it can launch independently.
         child
-            .launch("deep", None, "work".to_string())
+            .launch("deep", None, None, "work".to_string())
             .await
             .expect("the child registry has an independent width slot");
 
@@ -1111,7 +1387,7 @@ mod tests {
         // depth 2 with max 3: 2 < 3, so the subagent may launch its own.
         let (below, _log_a) = test_registry_at(2, 3);
         below
-            .launch("mid", None, "work".to_string())
+            .launch("mid", None, None, "work".to_string())
             .await
             .expect("launch");
         assert!(
@@ -1122,7 +1398,7 @@ mod tests {
         // depth 3 with max 3: 3 == 3, so the subagent is a leaf.
         let (at_limit, _log_b) = test_registry_at(3, 3);
         at_limit
-            .launch("leaf", None, "work".to_string())
+            .launch("leaf", None, None, "work".to_string())
             .await
             .expect("launch");
         assert!(
@@ -1250,7 +1526,7 @@ mod tests {
     async fn the_ledger_is_swept_of_reaped_tasks() {
         let (registry, _log_dir) = test_registry();
         registry
-            .launch("audit-a", None, "work".to_string())
+            .launch("audit-a", None, None, "work".to_string())
             .await
             .expect("launch");
         registry.release(&["audit-a".to_string()]).expect("release");
@@ -1269,13 +1545,292 @@ mod tests {
         );
 
         registry
-            .launch("audit-b", None, "work".to_string())
+            .launch("audit-b", None, None, "work".to_string())
             .await
             .expect("relaunch");
         assert_eq!(
             registry.spawned_lock().len(),
             1,
             "launching should sweep records whose tasks are already reaped"
+        );
+    }
+
+    /// The default path: no model named means the context's resolution is used
+    /// as-is, with no second resolve to introduce a difference.
+    #[tokio::test(start_paused = true)]
+    async fn launch_without_model_inherits_parent_resolution() {
+        let (registry, _log_dir) = test_registry();
+        let resolved = resolve_launch_model(&registry.ctx, None).expect("inherits");
+        assert_eq!(resolved, registry.ctx.resolved);
+    }
+
+    /// The left column of the field-split table: the model-derived fields come
+    /// from the named model, and the agent identity does not.
+    #[tokio::test(start_paused = true)]
+    async fn launch_with_model_reresolves_model_fields() {
+        let (registry, _log_dir) = test_registry();
+        let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
+
+        assert_eq!(resolved.model_name, "fast");
+        assert_eq!(resolved.model_identifier, "gpt-4o-mini");
+        assert_eq!(resolved.provider_name, "openai");
+        assert_eq!(
+            resolved.agent_name, registry.ctx.resolved.agent_name,
+            "the agent is still the parent's -- SetResultTool's trace prefix \
+             depends on it"
+        );
+        assert_eq!(resolved.preamble, registry.ctx.resolved.preamble);
+        assert_eq!(
+            registry.ctx.resolved.model_name, "smart",
+            "the session's own resolution must be untouched -- the parent keeps \
+             taking its turns on its own model"
+        );
+    }
+
+    /// The named regression: `--max-tool-calls` / `--max-tool-result-bytes` are
+    /// applied to the session's `ResolvedAgent` *after* resolution, so a launch
+    /// that took its limits from a fresh resolve would silently drop them.
+    #[tokio::test(start_paused = true)]
+    async fn launch_with_model_preserves_cli_overrides() {
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.resolved.tool_call_max = 7;
+        registry.ctx.resolved.tool_result_max_bytes = 1234;
+
+        let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
+        assert_eq!(
+            (resolved.tool_call_max, resolved.tool_result_max_bytes),
+            (7, 1234),
+            "the session's CLI overrides must survive a re-resolution; a fresh \
+             resolve would hand back config defaults here"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn launch_with_model_inherits_sampling() {
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.resolved.temperature = Some(0.25);
+        registry.ctx.resolved.max_tokens = Some(4321);
+
+        let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
+        assert_eq!(resolved.temperature, Some(0.25));
+        assert_eq!(resolved.max_tokens, Some(4321));
+    }
+
+    /// Depth and image are the parent's too, and naming a model does not buy a
+    /// launch past the depth ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn launch_with_model_inherits_depth_and_image() {
+        let (mut registry, _log_dir) = registry_with(test_config(), 3, 3);
+        registry.ctx.resolved.image = Some("parent-image".to_string());
+
+        let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
+        assert_eq!(resolved.subagent_depth_max, 3);
+        assert_eq!(resolved.image.as_deref(), Some("parent-image"));
+
+        // depth 3 with max 3: at the ceiling, so the subagent is still a leaf.
+        registry
+            .launch("leaf", Some("fast"), None, "work".to_string())
+            .await
+            .expect("launch");
+        assert!(
+            registry.lock().get("leaf").expect("live").child.is_none(),
+            "naming a model must not exempt a launch from the depth limit"
+        );
+    }
+
+    /// Refusal, enumeration, no half-registration, and a corrected retry -- the
+    /// four things the acceptance bullet asks of a bad name.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_model_refuses_launch_and_leaves_handle_free() {
+        let (registry, _log_dir) = test_registry();
+
+        let err = registry
+            .launch("audit", Some("gpt-4o-mini"), None, "work".to_string())
+            .await
+            .expect_err("a wire identifier is not a model name");
+        assert_eq!(
+            err,
+            "no usable model named \"gpt-4o-mini\"; available: fast, smart"
+        );
+        assert!(
+            registry.lock().is_empty(),
+            "a refused launch must register nothing"
+        );
+        assert!(
+            registry.spawned_lock().is_empty(),
+            "a refused launch must spawn no task"
+        );
+
+        registry
+            .launch("audit", Some("fast"), None, "work".to_string())
+            .await
+            .expect("the handle is still free for a corrected retry");
+    }
+
+    /// Attribution, transcript half: the header names the model a launch asked
+    /// for, and an inherited launch adds no bytes at all. The trace and tool
+    /// result are the other half, pinned in `builtin_tool`.
+    #[tokio::test(start_paused = true)]
+    async fn the_transcript_header_names_the_model() {
+        let (registry, log_dir) = test_registry();
+        registry
+            .launch("audit", Some("fast"), None, "work".to_string())
+            .await
+            .expect("launch");
+        registry.get_result("audit").await.expect("round fails");
+
+        let text = tokio::fs::read_to_string(log_dir.path().join("subagent-audit.log"))
+            .await
+            .expect("transcript exists");
+        assert!(
+            text.starts_with(
+                "=== subagent audit (model: fast / provider: openai / gpt-4o-mini) ===\n"
+            ),
+            "got: {text}"
+        );
+
+        let (inherited, inherited_log) = test_registry();
+        inherited
+            .launch("plain", None, None, "work".to_string())
+            .await
+            .expect("launch");
+        inherited.get_result("plain").await.expect("round fails");
+
+        let text = tokio::fs::read_to_string(inherited_log.path().join("subagent-plain.log"))
+            .await
+            .expect("transcript exists");
+        assert!(
+            !text.contains("model:"),
+            "an inherited launch must add no header bytes: {text}"
+        );
+    }
+
+    /// A local model in a default build must fail with the feature-disabled
+    /// error, not "unknown model" -- the remedy is a rebuild, and collapsing the
+    /// two would hide that. The schema omits the name; the error path does not.
+    #[cfg(not(feature = "local-llm"))]
+    #[tokio::test(start_paused = true)]
+    async fn local_model_in_default_build_fails_feature_disabled() {
+        let (registry, _log_dir) = registry_with(
+            local_model_config(),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+
+        assert!(
+            !usable_model_names(registry.config()).contains(&"onprem".to_string()),
+            "a name that cannot resolve must not be advertised"
+        );
+        let err = registry
+            .launch("audit", Some("onprem"), None, "work".to_string())
+            .await
+            .expect_err("no local-llm feature");
+        assert!(err.contains("local-llm"), "got: {err}");
+        assert!(
+            !err.contains("no usable model named"),
+            "the feature-disabled cause must not be collapsed into unknown: {err}"
+        );
+    }
+
+    /// Crossing provider *styles* needs no new dispatch: `RigAgent` is already
+    /// a runtime-dispatched enum, so a hosted parent naming an in-process model
+    /// just resolves to the mistralrs arm.
+    ///
+    /// Stops at resolution deliberately. Going on to `build_agent` would load
+    /// multi-gigabyte weights (or try to fetch them), which no unit test can
+    /// afford; what this pins down is that the resolution reaches the
+    /// `Mistralrs` provider with weights attached, which is the only input the
+    /// dispatch reads.
+    #[cfg(feature = "local-llm")]
+    #[tokio::test(start_paused = true)]
+    async fn subagent_may_cross_provider_style() {
+        let (registry, _log_dir) = registry_with(
+            local_model_config(),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+        assert!(
+            matches!(
+                registry.ctx.resolved.provider,
+                crate::llm::ResolvedProvider::OpenAi { .. }
+            ),
+            "the parent is hosted"
+        );
+
+        let resolved = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
+        assert!(matches!(
+            resolved.provider,
+            crate::llm::ResolvedProvider::Mistralrs
+        ));
+        assert!(
+            resolved.model_weights.is_some(),
+            "the mistralrs arm carries the weight spec build_agent loads from"
+        );
+        assert!(
+            usable_model_names(registry.config()).contains(&"onprem".to_string()),
+            "a local model is advertised in a local-llm build"
+        );
+    }
+
+    /// Two subagents naming the same in-process model share one loaded engine:
+    /// `LlmRegistry` lives on the context and is keyed by model name, so both
+    /// launches reach one slot and only the first pays for the load.
+    ///
+    /// The engine is a local stub rather than a real `MistralrsModel`, which
+    /// wraps a multi-gigabyte `MistralRs`: the sharing is a property of the
+    /// registry's keying, and the key is what the two resolutions agree on. The
+    /// context's own registry is asked for `is_loaded` too, since that is the
+    /// guard on the cold-load announcement.
+    #[cfg(feature = "local-llm")]
+    #[tokio::test(start_paused = true)]
+    async fn two_subagents_on_one_local_model_share_one_engine() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Stub;
+
+        let (registry, _log_dir) = registry_with(
+            local_model_config(),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+        let first = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
+        let second = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
+        assert_eq!(
+            first.model_name, second.model_name,
+            "both launches must reach the registry under one key"
+        );
+        assert!(
+            !registry.ctx.registry.is_loaded(&first.model_name),
+            "nothing is loaded yet, so the first launch announces a cold load"
+        );
+
+        let engines: crate::llm::LlmRegistry<Stub> = crate::llm::LlmRegistry::new();
+        let loads = AtomicUsize::new(0);
+        let one = engines
+            .get_or_init(&first.model_name, || async {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Stub)
+            })
+            .await
+            .expect("first load");
+        let two = engines
+            .get_or_init(&second.model_name, || async {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(Stub)
+            })
+            .await
+            .expect("the second launch finds the slot");
+
+        assert!(Arc::ptr_eq(&one, &two), "one engine, shared");
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "two subagents on one model must not load the weights twice"
+        );
+        assert!(
+            engines.is_loaded(&first.model_name),
+            "a loaded model must not be announced as cold again"
         );
     }
 

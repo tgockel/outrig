@@ -13,12 +13,18 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
+use super::ModelLabel;
+
 pub struct Transcript {
     file: Option<File>,
 }
 
 impl Transcript {
-    pub async fn open(log_dir: &Path, name: &str) -> Self {
+    /// Open the append log, writing the model header when the launch named a
+    /// model. The header goes here rather than in a method of its own so it
+    /// cannot be skipped or written out of order; the file is opened in append
+    /// mode, so it lands once per open rather than once per file.
+    pub async fn open(log_dir: &Path, name: &str, label: Option<&ModelLabel>) -> Self {
         if tokio::fs::create_dir_all(log_dir).await.is_err() {
             return Self { file: None };
         }
@@ -29,7 +35,14 @@ impl Transcript {
             .open(&path)
             .await
             .ok();
-        Self { file }
+        let mut this = Self { file };
+        if let Some(label) = label {
+            // The trailing newline keeps the next `=== prompt ===` block's
+            // leading blank line, so the header does not run into it.
+            this.write(&format!("=== subagent {name} ({}) ===\n", label.detail()))
+                .await;
+        }
+        this
     }
 
     pub async fn record_prompt(&mut self, prompt: &str) {
@@ -74,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn records_the_round_under_a_name_matching_the_log_convention() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = Transcript::open(dir.path(), "audit").await;
+        let mut log = Transcript::open(dir.path(), "audit", None).await;
         log.record_prompt("check the config").await;
         log.record_reply("looking now").await;
         log.record_outcome("result", "two issues").await;
@@ -88,7 +101,7 @@ mod tests {
     #[tokio::test]
     async fn rounds_append_rather_than_truncate() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = Transcript::open(dir.path(), "audit").await;
+        let mut log = Transcript::open(dir.path(), "audit", None).await;
         log.record_prompt("first").await;
         log.record_prompt("second").await;
 
@@ -102,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_reply_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = Transcript::open(dir.path(), "audit").await;
+        let mut log = Transcript::open(dir.path(), "audit", None).await;
         log.record_reply("").await;
 
         assert!(
@@ -119,7 +132,7 @@ mod tests {
         let blocker = dir.path().join("not-a-dir");
         tokio::fs::write(&blocker, b"x").await.expect("write file");
 
-        let mut log = Transcript::open(&blocker, "audit").await;
+        let mut log = Transcript::open(&blocker, "audit", None).await;
         log.record_prompt("check the config").await;
         log.record_outcome("result", "found things").await;
     }

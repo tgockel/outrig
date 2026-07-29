@@ -20,12 +20,13 @@ across them. That is the whole idea -- the rest is bookkeeping.
 
 What it inherits, and what it does not:
 
-| Inherited                                | Not inherited                             |
-|------------------------------------------|-------------------------------------------|
-| The container, and everything in it      | Your conversation and context             |
-| The MCP tools, over the same connections | The session preamble -- the parent sets it |
-| The model, provider, and limits          | The `outrig__` launch tools past the limit |
-| `/workspace`, at the same paths          | --                                        |
+| Inherited                                 | Not inherited                              |
+|-------------------------------------------|--------------------------------------------|
+| The container, and everything in it       | Your conversation and context              |
+| The MCP tools, over the same connections  | The session preamble -- the parent sets it |
+| The limits, and the sampling settings     | The `outrig__` launch tools past the limit |
+| The model and provider, unless overridden | --                                         |
+| `/workspace`, at the same paths           | --                                         |
 
 Because it borrows the parent's MCP connections, launching one starts no container and connects no
 server. That keeps the [MCP trust model](mcp-trust-model.md) invariant intact: a subagent can only
@@ -50,6 +51,28 @@ outrig__set_result({"status": "error",  "body": "..."})    // could not finish
 
 `name` is a short kebab-case handle the parent picks, and is how it refers to that subagent
 everywhere afterward.
+
+### Choosing the subagent's model
+
+`outrig__subagent` takes an optional `model`. Omit it and the subagent runs under the model the
+launching agent is running under, which is what every call above does.
+
+```
+outrig__subagent({"name": "grep-callers", "prompt": "...", "model": "fast"})
+```
+
+The value is a **model name** -- a key under `[models.<name>]`, like `fast` or `smart` -- not a
+provider and not a wire identifier like `gpt-4o-mini`. The names configured for the running build
+are listed in the argument's schema, so an agent never has to guess one.
+
+This is for delegating mechanical work. Grepping a tree, summarizing logs, or checking whether a
+symbol is still used does not need the parent's expensive reasoning model, and moving it to a cheap
+one keeps the parent's context free for synthesis.
+
+Sampling and limits still come from the launching agent -- `temperature`, `max-tokens`,
+`tool-call-max`, and `tool-result-max` are unaffected by the model named. And a subagent's model is
+fixed for its lifetime: `outrig__subagent_send` cannot re-point a live one, since its history was
+accumulated under the model it started on. Launch a second subagent instead.
 
 ### Launching is not waiting
 
