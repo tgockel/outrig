@@ -32,7 +32,7 @@ pub mod injection;
 pub mod state;
 mod transcript;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -342,11 +342,30 @@ impl SubagentRegistry {
     /// put them out of its reach.
     pub fn release(&self, names: &[String]) -> Result<Vec<String>, String> {
         let mut entries = self.lock();
-        let mut released = Vec::new();
+
+        // Resolve the whole request before changing the registry. Returning an
+        // error after releasing an earlier name would tell the caller a state
+        // that no longer exists, making the failed call unsafe to recover from.
+        let mut seen = BTreeSet::new();
         for name in names {
+            if !seen.insert(name) {
+                return Err(format!(
+                    "subagent {name:?} was named more than once in this release request"
+                ));
+            }
+            entries
+                .get(name)
+                .ok_or_else(|| unknown_name(name, &entries))?;
+        }
+
+        let mut released = Vec::with_capacity(names.len());
+        for name in names {
+            // The preflight above proves the name is live. A repeated name is
+            // invalid after its first removal, so reject duplicates before
+            // this loop rather than panic or partially release below.
             let entry = entries
                 .remove(name)
-                .ok_or_else(|| unknown_name(name, &entries))?;
+                .expect("release names were resolved before mutation");
             entry.abort_tree();
             released.push(name.clone());
         }
@@ -904,6 +923,50 @@ mod tests {
             .get_result("audit")
             .await
             .expect("fresh inbox is readable again from version 0");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_release_leaves_the_valid_subagent_live_and_collectable() {
+        let (registry, _log_dir) = test_registry();
+        registry
+            .launch("audit-a", None, "work".to_string())
+            .await
+            .expect("launch");
+
+        let err = registry
+            .release(&["audit-a".to_string(), "typo".to_string()])
+            .expect_err("an unknown name rejects the whole release");
+        assert!(err.contains("typo"), "got: {err}");
+        assert!(
+            err.contains("audit-a"),
+            "the diagnostic must still list the live valid name: {err}"
+        );
+
+        registry
+            .send("audit-a", "more".to_string())
+            .expect("the valid name remains addressable after rejection");
+        registry
+            .get_result("audit-a")
+            .await
+            .expect("the valid name remains live and collectable after rejection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_duplicate_release_name_is_rejected_without_releasing_it() {
+        let (registry, _log_dir) = test_registry();
+        registry
+            .launch("audit", None, "work".to_string())
+            .await
+            .expect("launch");
+
+        let err = registry
+            .release(&["audit".to_string(), "audit".to_string()])
+            .expect_err("duplicate names must not make release partially succeed");
+        assert!(err.contains("more than once"), "got: {err}");
+        registry
+            .get_result("audit")
+            .await
+            .expect("the duplicate request must leave the subagent live");
     }
 
     #[tokio::test(start_paused = true)]

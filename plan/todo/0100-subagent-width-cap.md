@@ -158,9 +158,8 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **0099.** Both edit `crates/outrig-cli/src/subagent/mod.rs`; that task makes `release`
-  resolve-before-mutate, this one adds a check to `launch`'s two lock sites. Landing the small
-  one first keeps the two locking changes reviewable apart.
+- None. **0099** landed, so `release` already resolves before it mutates; this task adds a check
+  to `launch`'s two lock sites, in the same file but not the same function.
 
 Model selection (see also) is queued immediately after this task, deliberately: it makes wide
 fan-out more expensive rather than merely slower, so the containment half belongs first.

@@ -55,6 +55,33 @@ Atomic-reject is the right default over report-what-happened. Release is cheap t
 agent fixes the name, whereas a partial release is unrecoverable -- the subagent and its history
 are gone. The asymmetry favors doing nothing on a bad list.
 
+## Decisions
+
+1. **A duplicate name rejects the call rather than releasing once.** Resolving names against
+   `entries` before mutating is not on its own enough: `["audit", "audit"]` passes a preflight
+   that only checks membership, and then the second `remove` finds nothing. Deduplicating
+   silently would have worked, but a list naming the same handle twice is a mistake in the
+   caller's bookkeeping, and release is exactly the operation where acting on a list the caller
+   did not mean is unrecoverable. Rejecting also preserves the old behavior in kind -- a repeat
+   was already an error, just a partial one -- so the only thing that changed is that it no
+   longer takes the subagent down on the way out.
+
+   That is what lets the removal loop `expect` instead of propagating: with duplicates rejected,
+   the preflight is a real proof that every `remove` finds its entry, so the second loop has no
+   error path to report and no half-applied state to describe.
+
+2. **The unknown-name error still names only the first miss.** Deliverable 3 asked whether it
+   should collect them all. It reuses the shared `unknown_name` helper, so a bad handle reads
+   the same whether it came from `release`, `get_result`, or `send` -- one diagnostic shape to
+   learn instead of three. The cost the task worried about is now much smaller than when it was
+   written: because release is atomic, retrying after fixing one name is free, where before the
+   retry was against a registry that had already lost a subagent.
+
+3. **The acceptance test sends before it collects.** Acceptance asks that a valid name in a
+   rejected list stay addressable, and `get_result` alone does not show that -- a result can be
+   collectable from a subagent whose prompt channel is gone. `send` exercises the half that
+   `abort_tree` would have taken.
+
 ## Dependencies
 
 - **0092**, for the e2e suite to compile, so the acceptance test can actually be run.

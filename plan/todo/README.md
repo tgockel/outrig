@@ -27,8 +27,7 @@ provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
 | Task | Title                                                     | Dependencies     |
 |------|-----------------------------------------------------------|------------------|
-| 0099 | Make subagent release atomic rather than partial          | 0092             |
-| 0100 | Cap how many subagents run at once                        | 0099             |
+| 0100 | Cap how many subagents run at once                        | --               |
 | 0101 | Launch a subagent under a different model                 | 0093, 0098, 0100 |
 
 0102-0104 were one arc, and the last of them is why the first two were pre-freeze work rather
