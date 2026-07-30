@@ -250,6 +250,26 @@ Type `continue`, or any more specific instruction, to let the next turn pick up 
 tool calls with a fresh max. If the skipped tool call is still needed, the model can ask for it
 again. Use `/reset` first when you want to drop that history.
 
+A rate-limited or briefly unreachable provider does not end the session either. outrig retries
+the call, honoring the server's own `Retry-After` when it sends one, and prints its progress:
+
+```
+[outrig] LLM call failed (HTTP 429 Too Many Requests); retry in 21.0s (Retry-After; 63s/600s spent)
+```
+
+If the endpoint is still failing when the budget runs out, the turn ends and you are back at
+`>`, with the containers still up and the conversation unchanged:
+
+```
+[outrig] LLM endpoint failed and did not recover (HTTP 429 Too Many Requests); ending turn
+[outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
+```
+
+Note the difference from the tool-call max above: nothing was appended, so there is no partial
+turn to `continue`. Resend the prompt itself once the window clears. The budget is
+`retry-budget-secs`; see [config reference](../reference/config.md) to change it, and
+[LLM providers](../concepts/llm-providers.md) for which failures count as transient.
+
 The REPL is line-buffered. Multi-line input is not supported in v0.
 
 > **TODO: Incomplete** -- multi-line / paste-mode input is deferred.

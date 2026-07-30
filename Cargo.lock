@@ -3822,6 +3822,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "bytes",
  "candle-core",
  "clap",
  "dialoguer",

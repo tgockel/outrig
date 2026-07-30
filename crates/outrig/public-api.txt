@@ -138,6 +138,10 @@ pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: 
 pub outrig::config::ConfigValidationError::ReservedMcpServerName
 pub outrig::config::ConfigValidationError::ReservedMcpServerName::image: alloc::string::String
 pub outrig::config::ConfigValidationError::ReservedMcpServerName::server: alloc::string::String
+pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge
+pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge::max: u64
+pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge::path: alloc::string::String
+pub outrig::config::ConfigValidationError::RetryBudgetSecsTooLarge::value: u64
 pub outrig::config::ConfigValidationError::SessionRootNotAbsolute
 pub outrig::config::ConfigValidationError::SessionRootNotAbsolute::path: std::path::PathBuf
 pub outrig::config::ConfigValidationError::SidecarArgsWithoutEntrypoint
@@ -246,15 +250,18 @@ pub outrig::config::ImageSourceRef::Image::image_name: &'a str
 pub outrig::config::LlmProvider::Anthropic::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::Anthropic::base_url: alloc::string::String
 pub outrig::config::LlmProvider::Anthropic::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::Anthropic::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::Mistralrs
 #[non_exhaustive] pub outrig::config::LlmProvider::OpenAi
 pub outrig::config::LlmProvider::OpenAi::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::OpenAi::base_url: alloc::string::String
 pub outrig::config::LlmProvider::OpenAi::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::LlmProvider::OpenAi::retry_budget_secs: core::option::Option<u64>
 impl outrig::config::LlmProvider
 pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
 pub fn outrig::config::LlmProvider::openai(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
 pub fn outrig::config::LlmProvider::style(&self) -> &'static str
+pub fn outrig::config::LlmProvider::with_retry_budget_secs(self, secs: core::option::Option<u64>) -> Self
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
 pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
@@ -367,6 +374,7 @@ pub outrig::config::Config::model_cache_root: core::option::Option<std::path::Pa
 pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
 pub outrig::config::Config::network: outrig::config::NetworkConfig
 pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::LlmProvider>
+pub outrig::config::Config::retry_budget_secs: core::option::Option<u64>
 pub outrig::config::Config::session_root: core::option::Option<std::path::PathBuf>
 pub outrig::config::Config::sidecars: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::SidecarConfig>
 pub outrig::config::Config::subagent_depth_max: core::option::Option<u32>
@@ -488,10 +496,12 @@ pub fn outrig::config::Workspace::new(impl core::convert::Into<std::path::PathBu
 pub fn outrig::config::Workspace::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
 impl core::default::Default for outrig::config::Workspace
 pub fn outrig::config::Workspace::default() -> Self
+pub const outrig::config::DEFAULT_RETRY_BUDGET_SECS: u64
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES: u32
+pub const outrig::config::RETRY_BUDGET_SECS_CEILING: u64
 pub const outrig::config::SUBAGENT_DEPTH_MAX_CEILING: u32
 pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32
 pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32

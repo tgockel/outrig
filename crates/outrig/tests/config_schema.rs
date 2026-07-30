@@ -138,11 +138,13 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.tool_result_max, Some(524288));
         assert_eq!(cfg.subagent_depth_max, Some(4));
         assert_eq!(cfg.subagent_width_max, Some(6));
+        assert_eq!(cfg.retry_budget_secs, Some(300));
 
         let LlmProvider::OpenAi {
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
             ..
         } = &cfg.providers["openai"]
         else {
@@ -151,10 +153,16 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(base_url, "https://api.openai.com/v1");
         assert_eq!(api_key.var_name(), "OPENAI_API_KEY");
         assert_eq!(*request_timeout_secs, Some(90));
+        assert_eq!(
+            *retry_budget_secs,
+            Some(120),
+            "a provider's own budget overrides the top-level 300",
+        );
         let LlmProvider::Anthropic {
             base_url: anthropic_base_url,
             api_key: anthropic_key,
             request_timeout_secs: anthropic_timeout,
+            retry_budget_secs: anthropic_retry_budget,
             ..
         } = &cfg.providers["anthropic"]
         else {
@@ -164,6 +172,9 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(anthropic_base_url, "https://api.anthropic.com");
         assert_eq!(anthropic_key.var_name(), "ANTHROPIC_API_KEY");
         assert_eq!(*anthropic_timeout, None);
+        // Left unset on purpose, so the fixture covers the fall-through to the
+        // top-level value as well as the override above.
+        assert_eq!(*anthropic_retry_budget, None);
 
         assert_eq!(cfg.models["fast"].provider, "openai");
         assert_eq!(

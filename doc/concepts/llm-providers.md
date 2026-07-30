@@ -195,9 +195,34 @@ sends it automatically, but for any other identifier -- an older model, a proxy'
 model (covering every agent that uses it) or on the agent. outrig does not invent a ceiling
 of its own, because a wrong one truncates replies silently.
 
-Everything else is shared with the other remote styles: `request-timeout-secs`, transient
-retries, tool-call limits, tool-result truncation, conversation history, and subagents all
-behave identically. Turns are non-streaming, as for `openai`.
+Everything else is shared with the other remote styles: `request-timeout-secs`,
+`retry-budget-secs`, tool-call limits, tool-result truncation, conversation history, and
+subagents all behave identically. Turns are non-streaming, as for `openai`.
+
+## Transient failures
+
+A rate limit is not a bug, and neither is a gateway that briefly falls over. Both are
+routine on a shared endpoint, so outrig treats them as a wait rather than a failure.
+
+An LLM call that comes back `408`, `425`, `429`, or a `5xx` -- or that never comes back at
+all, timing out or losing its connection -- is retried until it succeeds or the retry budget
+runs out. The budget is `retry-budget-secs` on the provider, falling back to the top-level
+value and then to ten minutes. Everything else, including the rest of the `4xx` family, is
+final on the first try: a `401` will not become a `200` on the second attempt.
+
+When the server says how long to wait, outrig waits that long. This is the reason the retry
+lives in outrig's own HTTP client rather than around the model call: a `Retry-After` header
+is gone by the time a failure has become a provider error, and a rate limiter's own number is
+better than any curve we could guess. Absent one, the wait is exponential backoff from a
+second, doubling to a 30-second ceiling and jittered so that several agents sharing an
+endpoint do not all come back at the same instant.
+
+The retry happens beneath a single model call, which is what keeps it safe. A turn is a
+model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that
+already happened. Retrying one HTTP request replays one HTTP request.
+
+If the budget does run out, the turn ends and the REPL prompts again with the conversation
+untouched -- see [`outrig run`](../usage/run.md). The session, and its containers, stay up.
 
 ## Other Rig provider styles
 

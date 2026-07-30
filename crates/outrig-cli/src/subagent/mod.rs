@@ -41,7 +41,7 @@ use outrig::config::{Config, LlmProvider};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::llm::ResolvedAgent;
+use crate::llm::{ResolvedAgent, TurnStop};
 use crate::session_tool::SessionTool;
 use state::{Outcome, SubagentShared};
 
@@ -807,22 +807,28 @@ async fn run_rounds(
         match outcome {
             Ok(end) => {
                 log.record_reply(&end.reply).await;
-                // Recorded before `end_round` so that a round which published
-                // nothing can tell the parent *why* it stopped instead of only
-                // that it did. Does not displace a truncated report: running
-                // out of tool calls is what follows from a report that would
-                // not fit.
-                if let Some(reason) = end.stopped_early {
-                    shared.note_ended_early(reason);
+                match end.stopped {
+                    // A broken endpoint is a failed round, not a model that
+                    // declined to report, and a parent needs to tell them apart
+                    // to decide whether retrying is worth anything. Publishing
+                    // also keeps reads edge-triggered: `note_ended_early`
+                    // records a cause without bumping the version, so a parent
+                    // polling a subagent whose endpoint is down would otherwise
+                    // be handed the same answer forever instead of blocking for
+                    // something new.
+                    Some(TurnStop::EndpointFailed(reason)) => {
+                        publish_round_failure(&shared, &name, &reason);
+                    }
+                    // Recorded before `end_round` so that a round which
+                    // published nothing can tell the parent *why* it stopped
+                    // instead of only that it did. Does not displace a
+                    // truncated report: running out of tool calls is what
+                    // follows from a report that would not fit.
+                    Some(TurnStop::Interrupted(reason)) => shared.note_ended_early(reason),
+                    None => {}
                 }
             }
-            Err(e) => {
-                // Publish only; the transcript entry comes from the outcome
-                // block below, which would otherwise record this twice.
-                let message = format!("round failed: {e}");
-                eprintln!("[outrig]   [{name}] {message}");
-                shared.publish(Outcome::Error(message));
-            }
+            Err(e) => publish_round_failure(&shared, &name, &e.to_string()),
         }
         shared.end_round();
 
@@ -841,6 +847,15 @@ async fn run_rounds(
             }
         }
     }
+}
+
+/// Publish a round failure to the parent. Publish only -- the transcript entry
+/// comes from the outcome block at the end of the round, which would otherwise
+/// record it twice.
+fn publish_round_failure(shared: &SubagentShared, name: &str, reason: &str) {
+    let message = format!("round failed: {reason}");
+    eprintln!("[outrig]   [{name}] {message}");
+    shared.publish(Outcome::Error(message));
 }
 
 fn width_limit_error(limit: u32) -> String {
@@ -974,6 +989,10 @@ pub(crate) mod fixtures {
                 base_url: "http://127.0.0.1:9".to_string(),
                 api_key: "test-key".to_string(),
                 request_timeout_secs: Some(1),
+                // And retries off, so "immediately" stays true: a refused
+                // connection is transient, so a live budget would spend itself
+                // on backoff before the round could fail.
+                retry_budget_secs: Some(0),
             },
             model_weights: None,
             preamble: "session preamble".to_string(),
@@ -1018,10 +1037,11 @@ mod tests {
     /// fast and deterministically. That is enough to exercise the bookkeeping
     /// -- launch, the inbox, watermarks, release -- without a live model.
     ///
-    /// The tests below run with `start_paused`, because a connection error is
-    /// retried with exponential backoff (`retry::MAX_RETRIES`); real time would
-    /// make each round take seconds. Paused time auto-advances while the
-    /// subagent sleeps, so the failure surfaces immediately.
+    /// "Fast" is why the fixture sets `retry_budget_secs: Some(0)`: a refused
+    /// connection is transient, so a live budget would spend itself on backoff
+    /// before the round could fail. The tests below still run with
+    /// `start_paused`, which keeps them immune to any wait the rest of the
+    /// round picks up.
     fn test_registry() -> (SubagentRegistry, tempfile::TempDir) {
         test_registry_at(2, outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX)
     }
@@ -1110,6 +1130,14 @@ mod tests {
 
     /// Exercises the whole path: launch spawns a round, the round fails, the
     /// driver publishes the failure, and the parent collects it.
+    ///
+    /// The fixture's provider points at the discard port with retries off, so
+    /// this travels the `endpoint_failed` arm -- a connection refused is
+    /// transient, so it now ends the turn cleanly rather than erroring out of
+    /// `run_turn_captured`. That it still reaches the parent as an `Error`, and
+    /// that the next read blocks (see the test below), is the whole point of
+    /// that arm: `note_ended_early` would record the cause without bumping the
+    /// version, leaving the parent re-reading the same answer forever.
     #[tokio::test(start_paused = true)]
     async fn a_failed_round_reaches_the_parent_as_an_error() {
         let (registry, _log_dir) = test_registry();

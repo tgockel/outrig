@@ -491,6 +491,63 @@ async fn slash_help_composes_caller_entries() {
     }
 }
 
+/// A prompt callback that returns `Err` still ends the loop, and no further
+/// line is read.
+///
+/// This is the invariant that survives the transient-failure recovery: a turn
+/// killed by a rate limit is now handled *below* `on_prompt` and comes back as
+/// `Ok`, but `SessionMonitorStopped` -- the primary container dying -- has to
+/// keep escaping, because the caller hard-exits on it rather than prompting
+/// into a dead session. Pinned here because a refactor that made the loop
+/// forgiving would silently swallow it.
+#[tokio::test]
+async fn prompt_callback_error_ends_the_loop() {
+    let (mut stdin_w, stdin_r) = duplex(BUF);
+    let (stdout_w, _stdout_r) = duplex(BUF);
+    let (stderr_w, _stderr_r) = duplex(BUF);
+
+    // Two lines: the second must never be read.
+    stdin_w.write_all(b"boom\nagain\n").await.unwrap();
+    drop(stdin_w);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_cb = calls.clone();
+    let on_prompt = move |_: String| {
+        let c = calls_cb.clone();
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            OutrigResult::Err(outrig_cli::error::CliError::SessionMonitorStopped(
+                "primary died".to_string(),
+            ))
+        }
+    };
+
+    let run = Repl::run_with(
+        BufReader::new(stdin_r),
+        stdout_w,
+        stderr_w,
+        never_interrupt(),
+        "",
+        &[],
+        on_prompt,
+        no_commands(),
+    );
+
+    let err = timeout(TEST_TIMEOUT, run)
+        .await
+        .expect("test must not hang")
+        .expect_err("a fatal prompt error must escape the loop");
+    assert!(
+        matches!(err, outrig_cli::error::CliError::SessionMonitorStopped(_)),
+        "the error must arrive intact, got: {err:?}",
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the loop must stop at the first error, not read the next line",
+    );
+}
+
 async fn read_until_contains(stream: &mut DuplexStream, sink: &mut Vec<u8>, needle: &str) {
     let mut chunk = [0u8; 256];
     loop {

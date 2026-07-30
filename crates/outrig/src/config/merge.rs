@@ -13,7 +13,8 @@ use super::Config;
 /// - For top-level scalars (`default-image`, `default-agent`,
 ///   `default-model`, `session-root`, `model-cache-root`,
 ///   `tool-call-max`, `tool-result-max`, `subagent-depth-max`,
-///   `subagent-width-max`): repo's value wins if set, else global's.
+///   `subagent-width-max`, `retry-budget-secs`): repo's value wins if set,
+///   else global's.
 /// - `[network].mode` follows repo precedence when the repo file declares the
 ///   table. Policy keys (`default`, `allow`, `deny`) are global-only and are
 ///   always taken from the global config.
@@ -62,6 +63,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         tool_result_max: repo.tool_result_max.or(global.tool_result_max),
         subagent_depth_max: repo.subagent_depth_max.or(global.subagent_depth_max),
         subagent_width_max: repo.subagent_width_max.or(global.subagent_width_max),
+        retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
         network,
         providers,
         models,

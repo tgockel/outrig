@@ -30,6 +30,7 @@ tool-call-max      = 100                              # optional; defaults to 50
 tool-result-max    = 262144                           # optional; defaults to 256 KiB
 subagent-depth-max = 3                                # optional; defaults to 3
 subagent-width-max = 8                                # optional; defaults to 8
+retry-budget-secs  = 600                              # optional; defaults to 600
 
 [network]
 mode = "default"                                      # optional: default, audit, or filter
@@ -49,6 +50,7 @@ deny  = ["*:22"]                                      # optional; global only
 | `tool-result-max`    | integer | no                     | global | Per-tool-result byte max. |
 | `subagent-depth-max` | integer | no                     | global | Max subagent nesting.     |
 | `subagent-width-max` | integer | no                     | global | Max live subagents/agent. |
+| `retry-budget-secs`  | integer | no                     | global | LLM retry budget (secs).  |
 | `network.mode`       | string  | no                     | either | Network mode.             |
 | `network.default`    | string  | no                     | global | Filter fallback action.   |
 | `network.allow`      | array   | no                     | global | Filter allow entries.     |
@@ -58,6 +60,9 @@ deny  = ["*:22"]                                      # optional; global only
 project-scoped. `default-model`, `session-root`, `model-cache-root`, `tool-call-max`, and the
 subagent limits belong in the global config since they're user/machine-level. `tool-result-max`
 usually belongs there too, although repo or agent config can tighten it for a noisy project.
+`retry-budget-secs` is a default for every remote provider; a `[providers.<name>]` row that
+sets its own overrides it, which is usually the better place since rate limits are a property
+of the endpoint.
 `[network].mode` can live in either file; when both set it, the repo value wins for that repo.
 Network policy keys (`default`, `allow`, and `deny`) are global-only because they describe the
 machine's egress policy, not a project preference. Each may also appear in the other file; repo
@@ -178,11 +183,24 @@ api-key  = "${OLLAMA_API_KEY}"
 | `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider. |
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.    |
 | `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.      |
+| `retry-budget-secs`    | integer      | no       | `600`   | Transient-retry budget, seconds. |
 
-Each LLM request that fails with a transient error -- a timeout, a dropped connection, or an
-HTTP `408`/`429`/`5xx` -- is retried a few times with exponential backoff before the turn
-gives up. `request-timeout-secs` bounds each individual attempt, and defaults high enough not
-to cut off long reasoning completions.
+`request-timeout-secs` bounds each individual attempt, and defaults high enough not to cut
+off long reasoning completions. `retry-budget-secs` bounds *all* the attempts together: an
+LLM request that fails transiently is retried until it succeeds or the budget runs out, then
+ends the turn without ending the session. Which failures count as transient, how the wait is
+chosen, and how `Retry-After` is honored are described in
+[Concepts -> LLM providers](../concepts/llm-providers.md#transient-failures); this page is
+the reference for the keys themselves.
+
+Two things about the budget that belong here, because they are about the keys:
+
+- It is **wall clock from the first attempt**, including time each attempt spends in flight,
+  not only time spent sleeping. That matters when it is set near `request-timeout-secs`: one
+  attempt that runs the timeout out spends the whole budget and buys no retries. It does not
+  matter for a rate limit, which comes back in milliseconds.
+- `0` disables retries -- the first failure is final. Useful for scripted runs that would
+  rather fail fast than wait.
 
 ### `style = "anthropic"`
 
@@ -204,6 +222,7 @@ api-key  = "${ANTHROPIC_API_KEY}"
 | `base-url`             | string (URL) | yes      | --      | HTTPS endpoint for the provider.    |
 | `api-key`              | string       | yes      | --      | Env-var reference, see below.       |
 | `request-timeout-secs` | integer      | no       | `600`   | HTTP timeout for LLM calls.         |
+| `retry-budget-secs`    | integer      | no       | `600`   | Transient-retry budget, seconds.    |
 
 `base-url` is the API root, without the `/v1/messages` path -- outrig appends that. A
 trailing `/v1`, `/messages`, or `/v1/messages` is trimmed if you write one anyway, so
@@ -805,6 +824,7 @@ tool-call-max      = 100                         # optional; default = 50
 tool-result-max    = 262144                      # optional; default = 256 KiB
 subagent-depth-max = 3                           # optional; default = 3
 subagent-width-max = 8                           # optional; default = 8
+retry-budget-secs  = 600                         # optional; default = 600
 
 [network]
 mode = "default"                                 # optional; default, audit, or filter
@@ -931,6 +951,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `subagent-depth-max`, if set at the top level or on an agent, must be between `1` and `16`
   (`1` disables subagents).
 - `subagent-width-max`, if set at the top level or on an agent, must be between `1` and `16`.
+- `retry-budget-secs`, if set at the top level or on a remote provider, must be at most `3600`
+  seconds. `0` is legal and disables retries.
 - `[network].mode`, if set, must be `default` or `audit`.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.

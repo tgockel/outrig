@@ -148,11 +148,13 @@ pub enum ResolvedProvider {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
+        retry_budget_secs: Option<u64>,
     },
     Anthropic {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
+        retry_budget_secs: Option<u64>,
     },
     Mistralrs,
 }
@@ -288,12 +290,14 @@ pub fn resolve_agent_with_overrides(
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
             ..
         } => (
             ResolvedProvider::OpenAi {
                 base_url: base_url.clone(),
                 api_key: api_key.resolve()?,
                 request_timeout_secs: *request_timeout_secs,
+                retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
             },
             None,
             remote_identifier(),
@@ -302,12 +306,14 @@ pub fn resolve_agent_with_overrides(
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
             ..
         } => (
             ResolvedProvider::Anthropic {
                 base_url: base_url.clone(),
                 api_key: api_key.resolve()?,
                 request_timeout_secs: *request_timeout_secs,
+                retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
             },
             None,
             remote_identifier(),
@@ -448,12 +454,14 @@ fn validate_mistralrs_device(
 /// loop) match on the variant.
 pub enum RigAgent {
     OpenAi {
-        agent: rig::agent::Agent<retry::RetryingModel<rig::providers::openai::CompletionModel>>,
+        agent: rig::agent::Agent<
+            rig::providers::openai::CompletionModel<retry::RetryingHttpClient>,
+        >,
         tool_call_max: usize,
     },
     Anthropic {
         agent: rig::agent::Agent<
-            retry::RetryingModel<rig::providers::anthropic::completion::CompletionModel>,
+            rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
         >,
         tool_call_max: usize,
     },
@@ -474,15 +482,29 @@ pub enum RigAgent {
 /// first use, download) a multi-gigabyte model. The remote arms do no I/O:
 /// they build an HTTP client and hand it to Rig.
 /// The HTTP client every remote provider gets: one per-request timeout, from
-/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`].
-/// Shared so the default cannot drift between the styles.
-fn remote_http_client(request_timeout_secs: Option<u64>) -> Result<reqwest::Client> {
+/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`],
+/// wrapped in the transient-retry loop bounded by `retry-budget-secs` or
+/// [`DEFAULT_RETRY_BUDGET_SECS`]. Shared so neither default can drift between
+/// the styles.
+///
+/// [`DEFAULT_RETRY_BUDGET_SECS`]: outrig::config::DEFAULT_RETRY_BUDGET_SECS
+fn remote_http_client(
+    request_timeout_secs: Option<u64>,
+    retry_budget_secs: Option<u64>,
+) -> Result<retry::RetryingHttpClient> {
     let timeout =
         std::time::Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
-    reqwest::Client::builder()
+    let inner = reqwest::Client::builder()
         .timeout(timeout)
         .build()
-        .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
+        .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
+    let policy = retry::RetryPolicy {
+        budget: std::time::Duration::from_secs(
+            retry_budget_secs.unwrap_or(outrig::config::DEFAULT_RETRY_BUDGET_SECS),
+        ),
+        ..retry::RetryPolicy::default()
+    };
+    Ok(retry::RetryingHttpClient::new(inner, policy))
 }
 
 pub async fn build_agent(
@@ -498,19 +520,19 @@ pub async fn build_agent(
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
         } => {
             use rig::client::CompletionClient;
             use rig::providers::openai::CompletionsClient;
 
-            let http = remote_http_client(*request_timeout_secs)?;
+            let http = remote_http_client(*request_timeout_secs, *retry_budget_secs)?;
             let client = CompletionsClient::builder()
                 .api_key(api_key.clone())
                 .base_url(base_url)
                 .http_client(http)
                 .build()
                 .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
-            let model =
-                retry::RetryingModel::new(client.completion_model(&resolved.model_identifier));
+            let model = client.completion_model(&resolved.model_identifier);
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(model, resolved, tools),
                 tool_call_max: resolved.tool_call_max,
@@ -520,11 +542,12 @@ pub async fn build_agent(
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
         } => {
             use rig::client::CompletionClient;
             use rig::providers::anthropic;
 
-            let http = remote_http_client(*request_timeout_secs)?;
+            let http = remote_http_client(*request_timeout_secs, *retry_budget_secs)?;
             // Rig's client owns the protocol: `x-api-key`, the
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and
             // the native content blocks. It also normalizes a trailing `/v1`
@@ -542,8 +565,7 @@ pub async fn build_agent(
             // Anthropic". `with_model` would instead cap every reply at 2048
             // tokens silently, which looks like a bad model rather than a
             // config gap. `tests/anthropic_mock.rs` pins the difference.
-            let model =
-                retry::RetryingModel::new(client.completion_model(&resolved.model_identifier));
+            let model = client.completion_model(&resolved.model_identifier);
             Ok(RigAgent::Anthropic {
                 agent: finish_agent(model, resolved, tools),
                 tool_call_max: resolved.tool_call_max,
@@ -656,8 +678,8 @@ impl RigAgent {
     ///
     /// Subagent outcomes come from `outrig__set_result`, not from this return
     /// value -- the text is for the transcript log, and
-    /// [`TurnEnd::stopped_early`] is the cause the round driver passes on to
-    /// the parent when nothing was published.
+    /// [`TurnEnd::stopped`] is the cause the round driver passes on to the
+    /// parent when nothing was published.
     pub async fn run_turn_captured(
         &self,
         prompt: &str,
@@ -790,9 +812,37 @@ impl RebuildingAgent {
 pub struct TurnEnd {
     /// The assistant's closing text.
     pub reply: String,
-    /// Set when the loop was cut short rather than finishing on its own --
-    /// the tool-call budget, or a hook that stopped it. Carries the reason.
-    pub stopped_early: Option<String>,
+    /// Why the loop was cut short, when it was. `None` means the model
+    /// finished on its own.
+    pub stopped: Option<TurnStop>,
+}
+
+/// Why a turn stopped short of the model finishing.
+///
+/// Both variants are recoverable and the REPL treats them alike -- end the
+/// turn, keep the session. They part ways at a subagent round, which is why
+/// this is an enum rather than a reason string plus a flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStop {
+    /// The tool-call budget ran out, or a hook stopped the loop. Whatever the
+    /// turn managed is spliced into the history, so it can be continued.
+    Interrupted(String),
+    /// The LLM endpoint stayed transiently broken -- rate-limited, or
+    /// unreachable -- for as long as the retry budget allowed. Nothing was
+    /// spliced, so the prompt itself is what wants resending. A subagent round
+    /// publishes this as a *failed* round rather than a quiet stop: an
+    /// unreachable endpoint is infrastructure for the parent to act on, not a
+    /// report the model declined to write.
+    EndpointFailed(String),
+}
+
+impl TurnStop {
+    /// The reason, for display.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Interrupted(reason) | Self::EndpointFailed(reason) => reason,
+        }
+    }
 }
 
 async fn run_turn_inner<M: CompletionModel + 'static>(
@@ -824,7 +874,7 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
                 // A hook stop normally surfaces as an error, but reading the
                 // reason back unconditionally means a stop can never be lost to
                 // a path that ends the run cleanly instead.
-                stopped_early: observer.stop_reason(),
+                stopped: observer.stop_reason().map(TurnStop::Interrupted),
             })
         }
         Err(other) => handle_prompt_error(other, history, &observer),
@@ -935,7 +985,7 @@ where
     // would notice.
     Ok(TurnEnd {
         reply: streamed_reply,
-        stopped_early: observer.stop_reason(),
+        stopped: observer.stop_reason().map(TurnStop::Interrupted),
     })
 }
 
@@ -947,11 +997,44 @@ where
 /// without this an internal fault -- a driver protocol violation, say -- would
 /// be reported to a subagent's parent as an ordinary "stopped before
 /// reporting", which reads like the model's doing and hides a bug.
+///
+/// The third recoverable case is an endpoint that stayed transiently broken --
+/// rate-limited, or unreachable -- for the whole retry budget. That used to
+/// end the process: the error reached `repl.rs`'s `res?` and unwound past the
+/// REPL loop, tearing down the containers and dropping the conversation. It
+/// ends the *turn* instead, so the user can wait out the window and send the
+/// prompt again in the same session.
 fn handle_prompt_error(
     err: rig::completion::PromptError,
     history: &mut Vec<Message>,
     hook: &OutrigPromptHook,
 ) -> Result<TurnEnd> {
+    // Handled ahead of the match because it shares almost nothing with the
+    // other two: no history to splice, no reply to print, and different advice.
+    if let Some(label) = retry::exhausted_transient_label(&err) {
+        // `PromptError::CompletionError` carries no `chat_history`, so a turn
+        // that died on a *later* model call loses the tool calls it already
+        // ran. Filed as
+        // `plan/next/partial-turn-history-on-failed-model-call.md`.
+        let reason = format!("LLM endpoint failed and did not recover ({label})");
+        eprintln!("[outrig] {reason}; ending turn");
+        // Deliberately not the "continue" advice below: nothing was appended,
+        // so there is no partial turn to continue -- the prompt itself is what
+        // wants resending. The budget is not named, because with
+        // `retry-budget-secs = 0` there was none; the retry progress lines
+        // above name it whenever there was one.
+        eprintln!(
+            "[outrig] history unchanged -- send the prompt again to retry, \
+             or \"/quit\" to stop."
+        );
+        return Ok(TurnEnd {
+            // The model never spoke, so nothing belongs on stdout. `repl.rs`'s
+            // `if !reply.is_empty()` guard handles it.
+            reply: String::new(),
+            stopped: Some(TurnStop::EndpointFailed(reason)),
+        });
+    }
+
     let (reason, chat_history) = match err {
         rig::completion::PromptError::PromptCancelled {
             reason,
@@ -987,7 +1070,7 @@ fn handle_prompt_error(
     extend_history_with_new_suffix(history, chat_history);
     Ok(TurnEnd {
         reply: format!("(turn ended: {reason})"),
-        stopped_early: Some(reason),
+        stopped: Some(TurnStop::Interrupted(reason)),
     })
 }
 
@@ -1381,7 +1464,7 @@ mod tests {
         .expect("a cut-short turn is not an error to the caller");
 
         assert_eq!(
-            end.stopped_early.as_deref(),
+            end.stopped.as_ref().map(TurnStop::reason),
             Some("outrig__set_result failed 4 times in a row")
         );
         assert!(end.reply.contains("failed 4 times"), "got: {}", end.reply);
@@ -1430,11 +1513,15 @@ mod tests {
         )
         .expect("exhaustion is not an error to the caller");
 
-        let reason = end.stopped_early.expect("the budget is a reason");
-        assert!(reason.contains("(52)"), "got: {reason}");
+        let stopped = end.stopped.expect("the budget is a reason");
+        assert!(
+            matches!(stopped, TurnStop::Interrupted(_)),
+            "a spent tool-call budget is a continuable stop, got: {stopped:?}",
+        );
+        assert!(stopped.reason().contains("(52)"), "got: {stopped:?}");
     }
 
-    /// Both turn paths read `stopped_early` straight off the hook, so a hook
+    /// Both turn paths read the stop cause straight off the hook, so a hook
     /// that stopped nothing is what makes an ordinary turn report no cause.
     /// Were it to report one, every normal round would hand its parent a
     /// spurious reason.
@@ -1571,7 +1658,7 @@ mod tests {
         // pinned by `primary_streaming_path_suppresses_the_reprint` below.
         assert_eq!(end.reply, "hello world");
         assert_eq!(
-            end.stopped_early, None,
+            end.stopped, None,
             "a turn the model finished must not look cut short"
         );
         assert_eq!(

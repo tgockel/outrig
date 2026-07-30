@@ -33,7 +33,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `https://api.anthropic.com` and `ANTHROPIC_API_KEY` -- and prompts for `max-tokens`
   alongside the model identifier, so a generated config carries an explicit ceiling.
 
+- **`retry-budget-secs`**, at the top level and on any remote provider, bounds how long a
+  transiently-failing LLM call keeps retrying. Defaults to `600`; `0` disables retries; the
+  ceiling is `3600`. A provider's own value wins over the top-level one, which wins over the
+  default -- rate limits belong to the endpoint, so per-provider is usually the right place.
+
 ### Changed
+
+- **Transient LLM failures are retried against a time budget, and honor `Retry-After`.**
+  Retrying used to mean two attempts roughly a second apart with the server's own guidance
+  ignored, which is not enough for a rate limit measured in minutes. outrig now retries until
+  `retry-budget-secs` runs out, waiting exactly as long as a `Retry-After` header asks (both
+  delta-seconds and HTTP-date forms, clamped at 300s) and falling back to jittered exponential
+  backoff otherwise. Each retry prints the wait and the budget spent so far. The retried set is
+  unchanged: `408`, `425`, `429`, `5xx`, timeouts, and connection errors.
+
+  Reading the header meant moving the retry into outrig's own `http_client` implementation:
+  rig's error type keeps a status and a body and drops every header, so nothing above that
+  layer can see it. Retries still replay exactly one HTTP request, so no already-executed
+  container tool call is repeated.
+
+  A side effect worth having: the old wrapper cloned the whole `CompletionRequest` -- chat
+  history, every tool definition and its JSON schema -- on *every* model call, including the
+  overwhelmingly common one that succeeds first try. Replaying at the HTTP layer clones a
+  header map and bumps a refcount on the serialized body instead.
+
+### Fixed
+
+- **A rate-limited or unreachable provider ends the turn, not the session.** A transient
+  failure that outlived the retries used to escape the REPL loop, tear down the containers,
+  and exit `1` with the conversation lost -- so a two-second rate limit cost the whole session.
+  It now prints what happened and returns you to the `>` prompt with history unchanged, to
+  resend when the window clears. Genuine faults -- a bad API key, a malformed config -- still
+  exit `1`. A subagent round that hits this still reaches its parent as a failed round.
 
 - **Breaking (config):** sidecars are declared at the top level as `[sidecars.<sc>]`, not
   `[images.<name>.sidecars.<sc>]`. Move the blocks up a level; the keys are unchanged. The old

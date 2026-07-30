@@ -209,18 +209,39 @@ impl RecordedRequest {
 }
 
 /// One canned response. Status is separate from body so a script can put a
-/// transient failure ahead of a success.
+/// transient failure ahead of a success, and `headers` carries the response
+/// headers that drive client behavior -- `Retry-After`, most usefully.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct CannedResponse {
     pub status: u16,
     pub body: serde_json::Value,
+    /// Extra response headers, emitted verbatim. `Content-Type`,
+    /// `Content-Length`, and `Connection` are always sent and are not listed
+    /// here.
+    pub headers: Vec<(String, String)>,
 }
 
 impl CannedResponse {
     #[allow(dead_code)]
     pub fn ok(body: serde_json::Value) -> Self {
-        Self { status: 200, body }
+        Self::status(200, body)
+    }
+
+    #[allow(dead_code)]
+    pub fn status(status: u16, body: serde_json::Value) -> Self {
+        Self {
+            status,
+            body,
+            headers: Vec::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 }
 
@@ -268,10 +289,16 @@ async fn serve_mock_http(
         served += 1;
 
         let body = serde_json::to_string(&canned.body).expect("canned body serializes");
+        let extra: String = canned
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let response = format!(
-            "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
+            "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n{}\
              Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             canned.status,
+            extra,
             body.len(),
             body,
         );

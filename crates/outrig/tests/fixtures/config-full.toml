@@ -10,12 +10,14 @@ tool-call-max      = 100
 tool-result-max    = 524288
 subagent-depth-max = 4
 subagent-width-max = 6
+retry-budget-secs  = 300
 
 [providers.openai]
 style                = "openai"
 base-url             = "https://api.openai.com/v1"
 api-key              = "${OPENAI_API_KEY}"
 request-timeout-secs = 90
+retry-budget-secs    = 120
 
 [providers.anthropic]
 style    = "anthropic"

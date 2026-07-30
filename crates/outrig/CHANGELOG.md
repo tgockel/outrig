@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the enum and its variants have been `#[non_exhaustive]` since 0.2.0-rc.1, so a match with
   a catch-all arm keeps compiling.
 
+- **`retry-budget-secs`,** as `Config::retry_budget_secs` and a field on the `OpenAi` and
+  `Anthropic` variants of `LlmProvider`, bounding how long a transiently-failing LLM call
+  keeps retrying. `DEFAULT_RETRY_BUDGET_SECS` is `600` and `RETRY_BUDGET_SECS_CEILING` is
+  `3600`; `0` disables retries. A provider's own value wins over the top-level one, which
+  wins over the default. Over-ceiling values are rejected with the new
+  `ConfigValidationError::RetryBudgetSecsTooLarge`.
+
+  Set it with `LlmProvider::with_retry_budget_secs(..)` rather than a fourth argument to
+  `LlmProvider::openai(..)` / `::anthropic(..)`, which would have been a breaking change to
+  a settled surface. All of this is additive: the enum and its variants are
+  `#[non_exhaustive]`, and so is `Config`.
+
 - **`LlmProvider::style()`,** the `style` tag a provider serializes as. It lives next to the
   serde attributes that define those tags, so a diagnostic or a label can name a style
   without retyping the string somewhere it can drift out of agreement with what the config

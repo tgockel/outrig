@@ -78,6 +78,22 @@ pub const DEFAULT_SUBAGENT_WIDTH_MAX: u32 = 8;
 /// Upper bound accepted for `subagent-width-max`, keeping fan-out finite.
 pub const SUBAGENT_WIDTH_MAX_CEILING: u32 = 16;
 
+/// How long one LLM HTTP call may keep retrying transient failures before the
+/// turn gives up. Ten minutes: long enough to ride out a provider-side
+/// rate-limit window -- a shared endpoint's `Retry-After` runs to minutes --
+/// and short enough that a genuinely dead endpoint is reported inside the
+/// session that hit it. A value of `0` disables retries: the first failure is
+/// final.
+///
+/// The budget is wall clock from the first attempt, so it includes time spent
+/// in flight and not only time spent sleeping. `doc/reference/config.md` has
+/// what that means when it and `request-timeout-secs` are set close together;
+/// `doc/concepts/llm-providers.md` has which failures are retried at all.
+pub const DEFAULT_RETRY_BUDGET_SECS: u64 = 600;
+/// Upper bound accepted for `retry-budget-secs`, so a fat-fingered value cannot
+/// wedge an interactive turn for hours.
+pub const RETRY_BUDGET_SECS_CEILING: u64 = 3600;
+
 /// Which config file an entry was declared in. Recorded per entry at load time
 /// -- before [`merge`], which is where origin would otherwise be lost -- so a
 /// relative path can resolve against the directory that gives it meaning
@@ -158,6 +174,11 @@ pub struct Config {
     /// [`DEFAULT_SUBAGENT_WIDTH_MAX`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_width_max: Option<u32>,
+    /// Default transient-retry budget for every remote provider, in seconds.
+    /// A `[providers.<name>]` row of its own overrides this. See
+    /// [`DEFAULT_RETRY_BUDGET_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_budget_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
 
@@ -373,6 +394,8 @@ pub enum LlmProvider {
         api_key: ApiKeyRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_budget_secs: Option<u64>,
     },
     /// Anthropic's native Messages API: `POST {base-url}/v1/messages` with
     /// `x-api-key` auth. Distinct from reaching Claude through an
@@ -384,6 +407,8 @@ pub enum LlmProvider {
         api_key: ApiKeyRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_timeout_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_budget_secs: Option<u64>,
     },
     Mistralrs,
 }
@@ -412,6 +437,7 @@ impl LlmProvider {
             base_url: base_url.into(),
             api_key,
             request_timeout_secs,
+            retry_budget_secs: None,
         }
     }
 
@@ -428,7 +454,34 @@ impl LlmProvider {
             base_url: base_url.into(),
             api_key,
             request_timeout_secs,
+            retry_budget_secs: None,
         }
+    }
+
+    /// Set the transient-retry budget, in seconds. `None` falls back to the
+    /// top-level `retry-budget-secs`, then to [`DEFAULT_RETRY_BUDGET_SECS`].
+    ///
+    /// A builder step rather than a fourth parameter on [`Self::openai`] /
+    /// [`Self::anthropic`]: those are positional, so widening them would break
+    /// every caller, and the public surface is settled as of 0.2.0. The cost is
+    /// that provider construction now speaks two idioms -- three required
+    /// fields positionally, the optional fourth by method -- and that this is a
+    /// no-op on [`Self::Mistralrs`], which has no HTTP layer to retry. Folding
+    /// both into one options struct is the right end state and wants the next
+    /// breaking window; see
+    /// `plan/next/provider-construction-options-struct.md`.
+    #[must_use]
+    pub fn with_retry_budget_secs(mut self, secs: Option<u64>) -> Self {
+        match &mut self {
+            Self::OpenAi {
+                retry_budget_secs, ..
+            }
+            | Self::Anthropic {
+                retry_budget_secs, ..
+            } => *retry_budget_secs = secs,
+            Self::Mistralrs => {}
+        }
+        self
     }
 }
 

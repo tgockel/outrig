@@ -16,7 +16,9 @@
 //!   does not -- the difference between `completion_model` (what `build_agent`
 //!   uses) and `CompletionModel::with_model` (which would silently cap replies
 //!   at 2048 tokens);
-//! * the shared retry wrapper covers this provider too.
+//! * the shared retry client covers this provider too -- including that a
+//!   `Retry-After` sets the wait, and that a spent budget ends the turn
+//!   without taking the session with it.
 
 mod common;
 
@@ -117,9 +119,19 @@ fn text_reply(text: &str) -> CannedResponse {
 
 // ---- harness --------------------------------------------------------------
 
-/// A config pointing an `anthropic` provider at the mock.
-fn mock_config(addr: SocketAddr, var: &str, identifier: &str, max_tokens: Option<u32>) -> Config {
+/// A config pointing an `anthropic` provider at the mock. `retry_budget_secs`
+/// bounds -- or with `0`, switches off -- the transient-retry loop; `None`
+/// leaves the shipped default, which is what a test not about retries wants.
+fn mock_config(
+    addr: SocketAddr,
+    var: &str,
+    identifier: &str,
+    max_tokens: Option<u32>,
+    retry_budget_secs: Option<u64>,
+) -> Config {
     let max_tokens = max_tokens.map_or(String::new(), |n| format!("max-tokens = {n}"));
+    let retry_budget =
+        retry_budget_secs.map_or(String::new(), |n| format!("retry-budget-secs    = {n}"));
     let cfg = format!(
         r#"
 default-model = "sonnet"
@@ -129,6 +141,7 @@ style                = "anthropic"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 10
+{retry_budget}
 
 [models.sonnet]
 provider   = "claude"
@@ -155,14 +168,30 @@ async fn run_one_turn(
     max_tokens: Option<u32>,
     tools: Vec<EchoTool>,
 ) -> anyhow::Result<String> {
+    let cfg = mock_config(addr, var, identifier, max_tokens, None);
+    let agent = build_mock_agent(&cfg, var, tools).await;
+    let mut history = Vec::new();
+    agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// Build an agent from `cfg` through the real resolve -> build path. Split out
+/// of [`run_one_turn`] so a test can drive more than one turn through the same
+/// agent, which is what "the session survived" means.
+async fn build_mock_agent(
+    cfg: &Config,
+    var: &str,
+    tools: Vec<EchoTool>,
+) -> outrig_cli::llm::RigAgent {
     set_test_env(var, KEY);
-    let cfg = mock_config(addr, var, identifier, max_tokens);
-    let resolved = resolve_agent(&cfg, "coding").expect("resolves");
+    let resolved = resolve_agent(cfg, "coding").expect("resolves");
     unset_test_env(var);
 
     #[cfg(feature = "local-llm")]
     let registry = outrig_cli::llm::LlmRegistry::new();
-    let agent = build_agent(
+    build_agent(
         &resolved,
         session_tool::erase(tools),
         Path::new("."),
@@ -170,13 +199,7 @@ async fn run_one_turn(
         &registry,
     )
     .await
-    .expect("agent builds");
-
-    let mut history = Vec::new();
-    agent
-        .run_turn("echo ping for me", &mut history)
-        .await
-        .map_err(anyhow::Error::from)
+    .expect("agent builds")
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -358,23 +381,23 @@ async fn tool_call_cap_applies_to_the_anthropic_path() {
     );
 }
 
-/// A retry-worthy status is retried by the shared wrapper, one model call at
+/// A retry-worthy status is retried by the shared HTTP client, one request at
 /// a time, without replaying the turn.
 ///
 /// Deliberately not `start_paused`: with paused time, tokio auto-advances the
 /// clock whenever every task is parked -- including while the mock waits on a
 /// socket read -- which can fire the request timeout before the response
-/// lands. The real wait here is one jittered `BASE_DELAY`, at most a second.
+/// lands. The real wait here is one jittered base delay, at most a second.
 #[tokio::test]
-async fn transient_status_is_retried_by_the_shared_wrapper() {
+async fn transient_status_is_retried_at_the_http_layer() {
     let (addr, mut requests) = start_mock_http(vec![
-        CannedResponse {
-            status: 503,
-            body: json!({
+        CannedResponse::status(
+            503,
+            json!({
                 "type": "error",
                 "error": { "type": "overloaded_error", "message": "overloaded" },
             }),
-        },
+        ),
         text_reply("Recovered."),
     ])
     .await;
@@ -401,6 +424,112 @@ async fn transient_status_is_retried_by_the_shared_wrapper() {
         recorded[0].body, recorded[1].body,
         "a retry replays the same model call, not a rebuilt turn",
     );
+}
+
+/// A `Retry-After` header sets the wait, in place of the backoff curve. This
+/// is the whole reason the retry moved below rig: `rig::http_client::Error`
+/// keeps a status and a body and drops every header, so nothing above this
+/// layer can see what the server asked for.
+///
+/// The assertion is the elapsed time, because that is the only observable
+/// difference. Backoff at attempt 0 is jittered into `[0.5s, 1.0s]`, so a wait
+/// past 1.8s cannot have come from the curve.
+#[tokio::test]
+async fn retry_after_header_is_honored() {
+    let (addr, mut requests) = start_mock_http(vec![
+        CannedResponse::status(
+            429,
+            json!({
+                "type": "error",
+                "error": { "type": "rate_limit_error", "message": "slow down" },
+            }),
+        )
+        .with_header("Retry-After", "2"),
+        text_reply("Recovered."),
+    ])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_RETRY_AFTER";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(30));
+    let agent = build_mock_agent(&cfg, var, vec![]).await;
+
+    let started = std::time::Instant::now();
+    let mut history = Vec::new();
+    let reply = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("the retry should carry the turn through the 429");
+    let elapsed = started.elapsed();
+
+    assert_eq!(reply, "Recovered.");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1800),
+        "waited {elapsed:?}, which is the backoff curve rather than the header",
+    );
+
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the rate-limited call is retried once: {recorded:#?}",
+    );
+    assert_eq!(
+        recorded[0].body, recorded[1].body,
+        "a retry replays the same model call, not a rebuilt turn",
+    );
+}
+
+/// An endpoint that stays broken through the whole retry budget ends the
+/// *turn*, not the process -- and the same agent takes the next turn.
+///
+/// Before this, the `CompletionError` reached `repl.rs`'s `res?`, unwound past
+/// the REPL loop, tore the containers down, and exited 1 with the conversation
+/// lost. `retry-budget-secs = 0` makes the giving-up immediate, so the test
+/// pins the recovery rather than the waiting.
+#[tokio::test]
+async fn exhausted_budget_ends_the_turn_without_killing_the_agent() {
+    let (addr, mut requests) = start_mock_http(vec![
+        CannedResponse::status(
+            429,
+            json!({
+                "type": "error",
+                "error": { "type": "rate_limit_error", "message": "slow down" },
+            }),
+        ),
+        text_reply("Second turn."),
+    ])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_BUDGET_SPENT";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let agent = build_mock_agent(&cfg, var, vec![]).await;
+
+    let mut history = Vec::new();
+    let reply = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("a spent budget ends the turn, it does not fail the session");
+    assert_eq!(
+        reply, "",
+        "the model never spoke, so nothing belongs on stdout",
+    );
+    assert!(
+        history.is_empty(),
+        "nothing was appended, which is what the advice to resend rests on: {history:#?}",
+    );
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        1,
+        "a zero budget makes the first failure final",
+    );
+
+    // The agent is still usable, which is the point.
+    let reply = agent
+        .run_turn("try again", &mut history)
+        .await
+        .expect("the next turn runs on the same agent");
+    assert_eq!(reply, "Second turn.");
+    assert_eq!(drain_recorded(&mut requests).len(), 1);
 }
 
 /// Anthropic requires `max_tokens` on every request, and rig only knows a

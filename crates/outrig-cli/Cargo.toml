@@ -41,6 +41,7 @@ outrig = { path = "../outrig", version = "0.2.0-rc.1" }
 anyhow             = { workspace = true, default-features = true }
 async-stream       = { workspace = true, default-features = true }
 axum               = { workspace = true, features = ["http1", "tokio"] }
+bytes              = { workspace = true, default-features = true }
 candle-core        = { workspace = true, optional = true }
 clap               = { workspace = true, default-features = true, features = ["derive"] }
 dialoguer          = { workspace = true, default-features = true, features = ["fuzzy-select"] }

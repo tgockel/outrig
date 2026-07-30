@@ -8,7 +8,7 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use outrig::config::{Config, ConfigValidationError, LlmProvider};
+use outrig::config::{ApiKeyRef, Config, ConfigValidationError, LlmProvider};
 use outrig::error::OutrigError;
 
 fn parse(s: &str) -> Config {
@@ -35,6 +35,7 @@ style                = "anthropic"
 base-url             = "https://api.anthropic.com"
 api-key              = "${ANTHROPIC_API_KEY}"
 request-timeout-secs = 120
+retry-budget-secs    = 300
 
 [models.sonnet]
 provider   = "claude"
@@ -48,6 +49,7 @@ max-tokens = 16384
         base_url,
         api_key,
         request_timeout_secs,
+        retry_budget_secs,
         ..
     } = &cfg.providers["claude"]
     else {
@@ -56,6 +58,7 @@ max-tokens = 16384
     assert_eq!(base_url, "https://api.anthropic.com");
     assert_eq!(api_key.var_name(), "ANTHROPIC_API_KEY");
     assert_eq!(*request_timeout_secs, Some(120));
+    assert_eq!(*retry_budget_secs, Some(300));
     assert_eq!(cfg.models["sonnet"].max_tokens, Some(16384));
 
     let serialized = toml::to_string(&cfg).expect("serializes");
@@ -67,8 +70,9 @@ max-tokens = 16384
     assert_eq!(cfg, again);
 }
 
-/// `request-timeout-secs` is the only optional connection field, and unknown
-/// keys are rejected by the tagged enum rather than silently ignored.
+/// `request-timeout-secs` and `retry-budget-secs` are the optional connection
+/// fields, and unknown keys are rejected by the tagged enum rather than
+/// silently ignored.
 #[test]
 fn anthropic_provider_field_rules() {
     let cfg = parse(
@@ -81,12 +85,14 @@ api-key  = "${ANTHROPIC_API_KEY}"
     );
     let LlmProvider::Anthropic {
         request_timeout_secs,
+        retry_budget_secs,
         ..
     } = &cfg.providers["claude"]
     else {
         panic!("expected the Anthropic variant");
     };
     assert_eq!(*request_timeout_secs, None);
+    assert_eq!(*retry_budget_secs, None);
 
     for (missing, toml) in [
         (
@@ -583,5 +589,53 @@ model-path = "models/missing.gguf"
                 if model == "local"
         ),
         "got: {err:?}",
+    );
+}
+
+/// `with_retry_budget_secs` is the additive counterpart to the positional
+/// constructors, so it has to hold for every variant -- including the
+/// in-process one, where it is a documented no-op. Nothing in the config path
+/// calls it (serde populates the field directly), so this is the only thing
+/// pinning the public API's behavior.
+#[test]
+fn with_retry_budget_secs_sets_remote_variants_and_skips_mistralrs() {
+    let key = ApiKeyRef::parse("${OPENAI_API_KEY}").expect("api-key ref parses");
+    let openai = LlmProvider::openai("https://api.openai.com/v1", key, Some(90))
+        .with_retry_budget_secs(Some(120));
+    let LlmProvider::OpenAi {
+        request_timeout_secs,
+        retry_budget_secs,
+        ..
+    } = &openai
+    else {
+        panic!("expected the OpenAi variant, got: {openai:?}");
+    };
+    assert_eq!(*retry_budget_secs, Some(120));
+    assert_eq!(
+        *request_timeout_secs,
+        Some(90),
+        "the builder must not disturb the fields the constructor set",
+    );
+
+    let key = ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses");
+    let anthropic =
+        LlmProvider::anthropic("https://api.anthropic.com", key, None).with_retry_budget_secs(None);
+    assert!(
+        matches!(
+            anthropic,
+            LlmProvider::Anthropic {
+                retry_budget_secs: None,
+                ..
+            }
+        ),
+        "got: {anthropic:?}",
+    );
+
+    // No HTTP layer, so nothing to retry and nowhere to record it. The TOML
+    // path cannot express this at all -- `deny_unknown_fields` on the tagged
+    // enum rejects `retry-budget-secs` under `style = "mistralrs"`.
+    assert_eq!(
+        LlmProvider::Mistralrs.with_retry_budget_secs(Some(300)),
+        LlmProvider::Mistralrs,
     );
 }

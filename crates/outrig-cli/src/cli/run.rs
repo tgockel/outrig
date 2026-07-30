@@ -912,6 +912,11 @@ mod tests {
                         base_url: "http://127.0.0.1:9".to_string(),
                         api_key: "test-key".to_string(),
                         request_timeout_secs: None,
+                        // Retries off: the discard port refuses connections,
+                        // which is transient by the retry loop's reckoning, and
+                        // this test wants the failure now rather than after a
+                        // budget's worth of backoff.
+                        retry_budget_secs: Some(0),
                     },
                     tool_result_max_bytes: 1024,
                     ..test_resolved_agent()

@@ -737,6 +737,7 @@ preamble = "you are a careful coder"
         base_url,
         api_key,
         request_timeout_secs,
+        retry_budget_secs,
     } = &r.provider
     else {
         panic!("expected Anthropic resolved-provider, got {:?}", r.provider);
@@ -744,6 +745,10 @@ preamble = "you are a careful coder"
     assert_eq!(base_url, "https://api.anthropic.com");
     assert_eq!(api_key, "sk-ant-test");
     assert_eq!(*request_timeout_secs, Some(45));
+    assert_eq!(
+        *retry_budget_secs, None,
+        "an unset budget resolves to None, and the client default applies",
+    );
     assert!(
         r.model_weights.is_none(),
         "a remote model carries no weight spec"

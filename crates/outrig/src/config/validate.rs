@@ -14,8 +14,9 @@ use thiserror::Error;
 
 use super::{
     Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
-    NetworkMode, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
-    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
+    NetworkMode, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
+    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
+    normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -200,6 +201,9 @@ pub enum ConfigValidationError {
 
     #[error("{path} must be at most {max} bytes; got {value}")]
     ToolResultMaxTooLarge { path: String, value: u32, max: u32 },
+
+    #[error("{path} must be at most {max} seconds (0 disables retries); got {value}")]
+    RetryBudgetSecsTooLarge { path: String, value: u64, max: u64 },
 
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
@@ -551,9 +555,33 @@ pub(super) fn validate_with_options(
     if let Some(value) = cfg.subagent_width_max {
         validate_subagent_width_max("top-level subagent-width-max", value)?;
     }
+    if let Some(value) = cfg.retry_budget_secs {
+        validate_retry_budget_secs("top-level retry-budget-secs", value)?;
+    }
     validate_network_policy(cfg)?;
 
     if options.validate_llm {
+        for (provider_name, provider) in &cfg.providers {
+            // Deliberately without a `_` arm, matching the model loop below: a
+            // new provider style has to stop here and say whether it retries.
+            let retry_budget_secs = match provider {
+                LlmProvider::OpenAi {
+                    retry_budget_secs, ..
+                }
+                | LlmProvider::Anthropic {
+                    retry_budget_secs, ..
+                } => *retry_budget_secs,
+                // In-process: no HTTP layer, so nothing to retry.
+                LlmProvider::Mistralrs => None,
+            };
+            if let Some(value) = retry_budget_secs {
+                validate_retry_budget_secs(
+                    &format!("providers.{provider_name}.retry-budget-secs"),
+                    value,
+                )?;
+            }
+        }
+
         for (agent_name, agent) in &cfg.agents {
             if let Some(value) = agent.tool_call_max {
                 validate_tool_call_max(&format!("agents.{agent_name}.tool-call-max"), value)?;
@@ -1110,6 +1138,20 @@ fn validate_subagent_width_max(path: &str, value: u32) -> Result<(), ConfigValid
             path: path.to_string(),
             value,
             max: SUBAGENT_WIDTH_MAX_CEILING,
+        });
+    }
+    Ok(())
+}
+
+/// One-sided, unlike its siblings: `0` is a meaningful value (retries off), so
+/// there is no floor to enforce -- only a ceiling, because an absurd budget
+/// wedges an interactive turn for as long as it names.
+fn validate_retry_budget_secs(path: &str, value: u64) -> Result<(), ConfigValidationError> {
+    if value > RETRY_BUDGET_SECS_CEILING {
+        return Err(ConfigValidationError::RetryBudgetSecsTooLarge {
+            path: path.to_string(),
+            value,
+            max: RETRY_BUDGET_SECS_CEILING,
         });
     }
     Ok(())

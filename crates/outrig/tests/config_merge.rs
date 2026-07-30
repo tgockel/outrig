@@ -1014,6 +1014,104 @@ subagent-width-max = 4
     }
 
     #[test]
+    fn top_level_retry_budget_secs_too_large_errors() {
+        let cfg = parse(
+            r#"
+retry-budget-secs = 7200
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::RetryBudgetSecsTooLarge { path, value, max } => {
+                assert_eq!(path, "top-level retry-budget-secs");
+                assert_eq!(value, 7200);
+                assert_eq!(max, 3600);
+            }
+            other => panic!("expected RetryBudgetSecsTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_retry_budget_secs_too_large_errors() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+
+[providers.openai]
+style             = "openai"
+base-url          = "https://api.openai.com/v1"
+api-key           = "${OPENAI_API_KEY}"
+retry-budget-secs = 99999
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::RetryBudgetSecsTooLarge { path, value, max } => {
+                assert_eq!(path, "providers.openai.retry-budget-secs");
+                assert_eq!(value, 99999);
+                assert_eq!(max, 3600);
+            }
+            other => panic!("expected RetryBudgetSecsTooLarge, got: {other:?}"),
+        }
+    }
+
+    /// Zero is a value, not an omission: it turns retries off. The ceiling is
+    /// one-sided precisely so this stays legal.
+    #[test]
+    fn zero_retry_budget_secs_is_accepted() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+retry-budget-secs = 0
+
+[providers.openai]
+style             = "openai"
+base-url          = "https://api.openai.com/v1"
+api-key           = "${OPENAI_API_KEY}"
+retry-budget-secs = 0
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+"#,
+        );
+        cfg.validate(None)
+            .expect("0 disables retries; it is not a range error");
+        assert_eq!(cfg.retry_budget_secs, Some(0));
+    }
+
+    #[test]
+    fn retry_budget_secs_repo_overrides_global() {
+        let global = parse(
+            r#"
+retry-budget-secs = 60
+"#,
+        );
+        let repo = parse(
+            r#"
+retry-budget-secs = 900
+"#,
+        );
+        let merged = merge(global, repo);
+        assert_eq!(merged.retry_budget_secs, Some(900));
+    }
+
+    #[test]
+    fn retry_budget_secs_falls_back_to_global() {
+        let global = parse(
+            r#"
+retry-budget-secs = 60
+"#,
+        );
+        let merged = merge(global, parse(""));
+        assert_eq!(merged.retry_budget_secs, Some(60));
+    }
+
+    #[test]
     fn top_level_tool_result_max_too_small_errors() {
         let cfg = parse(
             r#"
