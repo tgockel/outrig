@@ -838,6 +838,13 @@ pub enum TurnStop {
 
 impl TurnStop {
     /// The reason, for display.
+    ///
+    /// Exercised only by this module's own tests today -- callers so far have
+    /// matched the variant directly to get an owned `String` -- but it stays a
+    /// real inherent method (not a test helper) because it is the read-only
+    /// counterpart callers that only need the text, not the variant, should
+    /// reach for.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn reason(&self) -> &str {
         match self {
             Self::Interrupted(reason) | Self::EndpointFailed(reason) => reason,
