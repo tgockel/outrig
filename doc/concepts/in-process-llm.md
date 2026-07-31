@@ -135,9 +135,13 @@ without `local-llm` emits a build warning and has no effect. outrig does not sil
 fall back to CPU, because that would hide the performance and policy properties the
 user asked for.
 
-Metal is only usable on macOS targets. Non-macOS builds can compile with the `metal`
-feature for feature-matrix coverage, but trying to instantiate a Metal device fails with
-a platform error.
+Metal is only usable on macOS targets, and outrig does not build for one today: its
+container plumbing calls `setns(2)` and `CLONE_NEW*` unconditionally, so
+`crates/outrig/src/lib.rs` rejects a non-Linux target outright. That makes `metal`
+unreachable in practice until `plan/next/macos-host-support.md` lands. It stays declared so
+the feature matrix and the macOS-only dependency block in `crates/outrig-cli/Cargo.toml` do
+not rot: non-macOS builds can compile with it for that coverage, but instantiating a Metal
+device fails with a platform error.
 
 For one-off runs, `outrig run --device cuda`, `--device cuda:1`, `--device metal`, or
 `--device cpu` overrides the model's configured `device` without editing the config file.
@@ -157,6 +161,9 @@ cargo build --features local-llm
 cargo build --features "local-llm cuda"
 cargo build --features "local-llm metal"
 ```
+
+The `metal` line is listed for completeness. It compiles anywhere, but the device it selects
+needs a macOS target that outrig does not build for yet -- see above.
 
 A build *without* `--features local-llm` still **recognizes** `style = "mistralrs"` in
 config files. Parsing succeeds, cross-reference validation succeeds, `outrig` will load and

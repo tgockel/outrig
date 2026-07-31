@@ -8,6 +8,25 @@
 //! and downstream crates do. Both tiers are a SemVer commitment; every other
 //! module is private, reaching this root only through the re-exports below.
 
+// `network` and `nsfork` below are declared unconditionally and call `setns`
+// and `CLONE_NEW*`, which libc declares only under `linux_like` -- so an Apple
+// or Windows target fails at name resolution, deep in a module a caller never
+// asked for, dozens of errors at a time. This says it once instead. It is not
+// a statement about `outrig-enter`: `build.rs` selects that helper's triple by
+// architecture, never by OS, because it runs inside the container.
+//
+// One gate covers both crates: `outrig` is a hard dependency of `outrig-cli`,
+// so cargo stops here before the binary is touched. Deleting this is part of
+// the acceptance criteria in `plan/next/macos-host-support.md`.
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "outrig does not build for this platform. Its container plumbing calls \
+     setns(2) and CLONE_NEW* unconditionally, through the `network` and \
+     `nsfork` modules. On Windows use WSL2, which is an ordinary Linux build; \
+     on macOS run inside podman machine's VM. Host-native support for either \
+     is tracked in plan/next/{macos,windows}-host-support.md."
+);
+
 use std::path::{Path, PathBuf};
 
 pub mod config;
