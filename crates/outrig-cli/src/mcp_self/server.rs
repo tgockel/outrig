@@ -3,8 +3,9 @@ use std::sync::Arc;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use schemars::JsonSchema;
@@ -188,19 +189,15 @@ impl ServerHandler for SelfServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            next_cursor: None,
-            meta: None,
-            tools: Self::tools(),
-        })
+        Ok(ListToolsResult::with_all_items(Self::tools()))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        self.dispatch(request)
+    ) -> std::result::Result<CallToolResponse, McpError> {
+        self.dispatch(request).map(Into::into)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

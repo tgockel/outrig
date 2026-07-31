@@ -5,7 +5,7 @@ members  = ["crates/outrig", "crates/outrig-cli"]
 [workspace.package]
 version       = "0.2.0-rc.1"
 edition       = "2024"
-rust-version  = "1.87"
+rust-version  = "1.88"
 license       = "Apache-2.0"
 authors       = ["Travis Gockel <travis@gockelhut.com>"]
 homepage      = "https://tgockel.github.io/outrig/"
@@ -36,7 +36,7 @@ rand               = { version = "0.10.2",  default-features = false }
 regex              = { version = "1.12.4",  default-features = false }
 reqwest            = { version = "0.13.4",  default-features = false }
 rig                = { version = "0.40.0",  default-features = false, package = "rig-core" }
-rmcp               = { version = "2.2.0",   default-features = false }
+rmcp               = { version = "3.1.0",   default-features = false }
 schemars           = { version = "1.2.2",   default-features = false }
 serde              = { version = "1.0.229", default-features = false }
 serde_json         = { version = "1.0.151", default-features = false }

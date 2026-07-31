@@ -810,7 +810,7 @@ pub fn outrig::mcp_proxy::ProxyServer<C>::iter_public_names(&self) -> impl core:
 pub fn outrig::mcp_proxy::ProxyServer<C>::list_tools_inner(&self) -> rmcp::model::ListToolsResult
 pub fn outrig::mcp_proxy::ProxyServer<C>::per_server_counts(&self) -> alloc::vec::Vec<(&str, usize)>
 impl<C: outrig::mcp_proxy::BackingClient> rmcp::handler::server::ServerHandler for outrig::mcp_proxy::ProxyServer<C>
-pub async fn outrig::mcp_proxy::ProxyServer<C>::call_tool(&self, rmcp::model::CallToolRequestParams, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>
+pub async fn outrig::mcp_proxy::ProxyServer<C>::call_tool(&self, rmcp::model::CallToolRequestParams, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::mrtr::CallToolResponse, rmcp::model::ErrorData>
 pub fn outrig::mcp_proxy::ProxyServer<C>::get_info(&self) -> rmcp::model::ServerInfo
 pub async fn outrig::mcp_proxy::ProxyServer<C>::list_tools(&self, core::option::Option<rmcp::model::PaginatedRequestParams>, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData>
 impl<C> core::clone::Clone for outrig::mcp_proxy::ProxyServer<C>

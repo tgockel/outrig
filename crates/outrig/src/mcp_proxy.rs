@@ -19,8 +19,8 @@ use std::sync::Arc;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
@@ -269,11 +269,7 @@ impl<C: BackingClient> ProxyServer<C> {
                 )
             })
             .collect();
-        ListToolsResult {
-            next_cursor: None,
-            meta: None,
-            tools,
-        }
+        ListToolsResult::with_all_items(tools)
     }
 
     /// Dispatch a `tools/call` to the appropriate backing client. Returns a
@@ -330,8 +326,8 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
         &self,
         request: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, McpError> {
-        Ok(self.dispatch_call(request).await)
+    ) -> std::result::Result<CallToolResponse, McpError> {
+        Ok(self.dispatch_call(request).await.into())
     }
 }
 
