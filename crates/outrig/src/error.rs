@@ -8,6 +8,17 @@ use thiserror::Error;
 use crate::config::{ApiKeyError, ConfigValidationError, EnvValueError};
 use crate::container::embedded::EmbeddedImageConfigError;
 
+/// Why `build.rs` could not embed the `outrig-enter` helper. It sets
+/// `OUTRIG_ENTER_UNAVAILABLE_REASON` only when it degrades, so `None` is the
+/// build that succeeded -- in which case this error is unreachable and the
+/// fallback is what a mismatched build would be told.
+fn filesystem_helper_unavailable_reason() -> &'static str {
+    option_env!("OUTRIG_ENTER_UNAVAILABLE_REASON").unwrap_or(
+        "install the matching `x86_64-unknown-linux-musl` or \
+         `aarch64-unknown-linux-musl` target and rebuild",
+    )
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum OutrigError {
@@ -16,8 +27,8 @@ pub enum OutrigError {
 
     #[error(
         "this outrig was built without the filesystem-view helper\n\
-         help: install the musl target (`rustup target add x86_64-unknown-linux-musl`, or the \
-         aarch64 equivalent) and rebuild"
+         build detail: {}",
+        filesystem_helper_unavailable_reason()
     )]
     FilesystemHelperUnavailable,
 
@@ -255,6 +266,31 @@ mod tests {
             program: "buildah",
             command: "buildah images --quiet outrig-standard:ab12cd34".to_string(),
             source: std::io::Error::new(kind, "boom"),
+        }
+    }
+
+    /// Which of the two arms runs depends on how *this* build went, so the
+    /// assertions have to differ: asserting the union of both would pass on
+    /// the fallback alone and never notice `build.rs` going quiet.
+    #[test]
+    fn missing_filesystem_helper_error_carries_the_build_reason() {
+        let rendered = OutrigError::FilesystemHelperUnavailable.to_string();
+        assert!(rendered.contains("filesystem-view helper"), "{rendered}");
+        if crate::container::enter::is_available() {
+            // Nothing degraded, so there is no build-time reason to report and
+            // the message falls back to naming both musl targets.
+            assert!(rendered.contains("x86_64-unknown-linux-musl"), "{rendered}");
+            assert!(
+                rendered.contains("aarch64-unknown-linux-musl"),
+                "{rendered}"
+            );
+        } else {
+            // `build.rs` degraded, so it emitted a reason -- which must have
+            // displaced the fallback rather than sitting unread beside it.
+            assert!(
+                !rendered.contains("install the matching"),
+                "expected build.rs's reason, got the fallback: {rendered}"
+            );
         }
     }
 

@@ -27,6 +27,16 @@ $ cargo install outrig-cli
 
 For library use, depend on the `outrig` crate from your Rust package.
 
+## Platform support
+
+OutRig runs on Linux, x86-64 or AArch64. Install the matching musl target
+(`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) to enable `view = "primary"`
+sidecars: those need the `outrig-enter` helper, which is always a Linux binary because it runs
+inside the container rather than in the host process. A build without that target still works
+-- the sidecar mode reports why the helper is unavailable, before creating a container.
+
+macOS and native Windows are not supported. WSL2 works: it is an ordinary Linux build.
+
 ## At a glance
 
 ```sh

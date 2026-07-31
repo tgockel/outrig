@@ -3,8 +3,15 @@
 //!
 //! A direct `rustc` invocation on the single launcher file -- no `cargo`, no
 //! dependencies -- so it needs only `rustup target add <arch>-unknown-linux-musl`
-//! (Rust's musl targets are self-contained and link with `rust-lld`), no C
-//! toolchain, and it cannot deadlock on cargo's package-cache/workspace locks.
+//! (musl targets ship their own crt objects and `libc.a`), no C toolchain, and
+//! it cannot deadlock on cargo's package-cache/workspace locks.
+//!
+//! The output is always a Linux binary: the helper runs inside the container,
+//! not in the host process. Selection is therefore by target architecture, not
+//! target OS. OutRig itself is Linux-only today -- `nsfork` and `network` call
+//! `setns` unconditionally -- so the two coincide; the arch-shaped rule is what
+//! would keep this correct if that ever changed.
+//!
 //! When the target is absent the build still succeeds with an empty artifact;
 //! the feature degrades to a runtime error whose hint resolves it, because the
 //! launcher source ships inside this (published) crate.
@@ -19,10 +26,21 @@ const LAUNCHER: &str = "src/container/enter/launcher.rs";
 /// here. Listing files one by one would put a silent failure mode in the way --
 /// forget one and a stale binary stays embedded with nothing to say so.
 const LAUNCHER_DIR: &str = "src/container/enter";
+/// Set to make the graceful degradation below a hard build error instead. CI
+/// sets it: every degradation path is a warning plus an empty artifact, and the
+/// test for the embedded launcher has a matching early-return, so a launcher
+/// that stopped compiling would otherwise be a green build.
+const REQUIRE_ENTER: &str = "OUTRIG_REQUIRE_ENTER";
+/// Carries the degradation reason to `error.rs`, which reads it with
+/// `option_env!` under this same name -- emitted only when degrading, so
+/// "absent" is the success case rather than a sentinel value. Keep the two
+/// spellings in step.
+const REASON_ENV: &str = "OUTRIG_ENTER_UNAVAILABLE_REASON";
 
 fn main() {
     println!("cargo:rerun-if-changed={LAUNCHER_DIR}");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed={REQUIRE_ENTER}");
 
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");
     let dest = Path::new(&out_dir).join("outrig-enter");
@@ -34,10 +52,7 @@ fn main() {
         other => {
             unavailable(
                 &dest,
-                &format!(
-                    "filesystem-view helper is unsupported on arch {other:?}; \
-                     view=\"primary\" sidecars will be unavailable"
-                ),
+                &format!("filesystem-view helper is unsupported on arch {other:?}"),
             );
             return;
         }
@@ -59,8 +74,8 @@ fn main() {
         unavailable(
             &dest,
             &format!(
-                "target `{triple}` is not installed; view=\"primary\" sidecars will be \
-                 unavailable -- run `rustup target add {triple}` and rebuild"
+                "target `{triple}` is not installed -- run `rustup target add {triple}` \
+                 and rebuild"
             ),
         );
         return;
@@ -68,6 +83,14 @@ fn main() {
 
     let status = Command::new(&rustc)
         .args(["--edition", "2024", "--target", triple])
+        // `rust-lld` rather than the default `cc`. What a musl target ships is
+        // the crt objects and `libc.a`; the linker *driver* is still the host's,
+        // so an x86-64 host building the AArch64 helper hands foreign-arch
+        // objects to the host `ld` and gets "Relocations in generic ELF (EM:
+        // 183)". Native builds link either way -- only the cross does not, so
+        // `.github/workflows/ci.yml` cross-compiles the launcher to keep this
+        // honest on an x86-64-only runner.
+        .args(["-C", "linker=rust-lld"])
         .args([
             "-C",
             "opt-level=2",
@@ -85,17 +108,11 @@ fn main() {
         Ok(s) if s.success() => {}
         Ok(s) => unavailable(
             &dest,
-            &format!(
-                "compiling the filesystem-view helper failed ({s}); \
-                 view=\"primary\" sidecars will be unavailable"
-            ),
+            &format!("compiling the filesystem-view helper failed ({s})"),
         ),
         Err(e) => unavailable(
             &dest,
-            &format!(
-                "could not run rustc for the filesystem-view helper: {e}; \
-                 view=\"primary\" sidecars will be unavailable"
-            ),
+            &format!("could not run rustc for the filesystem-view helper: {e}"),
         ),
     }
 }
@@ -115,7 +132,17 @@ fn target_libdir(rustc: &OsStr, triple: &str) -> Option<String> {
 
 /// Emit the "helper unavailable" warning and leave an empty artifact so the
 /// build still succeeds; `is_available()` then reports false at runtime.
+///
+/// `msg` is cause and remedy only, on one line (cargo directives are
+/// line-oriented). The consequence -- which sidecars stop working -- belongs on
+/// the cargo warning, where there is no context to infer it from, and not in
+/// what `error.rs` renders: a caller reading that has just been told it by the
+/// error's first line.
 fn unavailable(dest: &Path, msg: &str) {
-    println!("cargo:warning=outrig: {msg}");
+    if std::env::var_os(REQUIRE_ENTER).is_some() {
+        panic!("outrig: {msg} ({REQUIRE_ENTER} is set)");
+    }
+    println!("cargo:warning=outrig: {msg}; view=\"primary\" sidecars will be unavailable");
+    println!("cargo:rustc-env={REASON_ENV}={msg}");
     std::fs::write(dest, []).expect("write empty helper artifact");
 }

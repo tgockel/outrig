@@ -210,9 +210,12 @@ matches, startup fails with a message naming the program and the `PATH` that was
 `view = "primary"` is a real posture change: the container starts with `CAP_SYS_ADMIN` and
 `CAP_SYS_PTRACE` in the primary's user namespace, and the server can read the primary's whole
 filesystem. See [MCP Trust Model](mcp-trust-model.md) and `SECURITY.md`. It needs the
-`outrig-enter` helper, compiled when the `<arch>-unknown-linux-musl` Rust target is installed;
-without it a `view = "primary"` session fails at start with a message naming the missing
-artifact.
+`outrig-enter` helper. The helper is supported on Linux x86-64 and AArch64 and is compiled
+when the matching `<arch>-unknown-linux-musl` Rust target is installed; without it a
+`view = "primary"` session fails at start with a message naming the missing artifact and the
+specific build-time reason. The helper is always a Linux binary because it runs inside the
+container, not in the host process. macOS and native Windows are unsupported; WSL2 is Linux and
+uses the normal path.
 
 **The capabilities belong to the launcher, not to the server.** `outrig-enter` needs them for
 the namespace join and the graft, and gives them up the moment that work is done: it becomes the

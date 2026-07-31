@@ -2,7 +2,7 @@
 
 ## Local checks
 
-Install the musl target once before building:
+Install the musl target matching your architecture once before building:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
@@ -11,7 +11,8 @@ rustup target add x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 `crates/outrig/build.rs` compiles the `outrig-enter` launcher for it. Without the target the
 build still succeeds -- it emits a warning and embeds an empty artifact -- but every
 `view = "primary"` sidecar fails at session start, including the three this repo's own
-`.agents/outrig/config.toml` declares.
+`.agents/outrig/config.toml` declares. Development happens on Linux: macOS and native Windows
+are not supported, and WSL2 is an ordinary Linux build.
 
 CI runs the unit suite and `mdbook build` on every push and PR. Run the same checks locally
 before opening a PR:

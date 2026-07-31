@@ -19,6 +19,14 @@ jobs:
   cargo:
     name: cargo (${{ matrix.name }})
     runs-on: ubuntu-latest
+    env:
+      # `crates/outrig/build.rs` degrades *every* launcher failure -- a missing
+      # target, a launcher that stopped compiling, an unrunnable rustc -- to a
+      # cargo warning plus an empty artifact, and `tests/enter_embedded.rs` has
+      # a matching early-return, so none of it turns CI red on its own. This
+      # makes the degradation a hard build error. Both musl targets are
+      # installed below, so every row can satisfy it.
+      OUTRIG_REQUIRE_ENTER: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -37,11 +45,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          # `crates/outrig/build.rs` compiles the `outrig-enter` launcher for this
-          # target and degrades to a warning plus an empty artifact when it is
-          # absent -- so without it here, a launcher that does not compile is a
-          # green build.
-          targets: x86_64-unknown-linux-musl
+          # `crates/outrig/build.rs` compiles the `outrig-enter` launcher for
+          # the runner's own arch; AArch64 is for the cross-compile step below.
+          # `OUTRIG_REQUIRE_ENTER` above is what makes a launcher that will not
+          # compile fail the build rather than warn.
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - uses: mozilla-actions/sccache-action@v0.0.3
       - uses: Swatinem/rust-cache@v2
         with:
@@ -63,6 +71,21 @@ jobs:
       # not the feature set.
       - if: matrix.name == 'default'
         run: cargo check -p outrig --target x86_64-unknown-linux-musl
+      # Cross-compile the standalone launcher as AArch64: a cargo build on this
+      # runner only ever exercises the x86-64 branch in build.rs, and the cross
+      # is the leg that breaks -- the host `cc` cannot link foreign-arch
+      # objects, which is why build.rs passes `-C linker=rust-lld`. These flags
+      # mirror that invocation exactly; a divergence here would validate a
+      # command the build never issues. `file -b` drops the path from the
+      # output, without which `aarch64` matches the filename and the check
+      # passes for any architecture.
+      - if: matrix.name == 'default'
+        run: |
+          rustc --edition 2024 --target aarch64-unknown-linux-musl \
+            -C linker=rust-lld -C opt-level=2 -C panic=abort -C strip=symbols \
+            -o "$RUNNER_TEMP/outrig-enter-aarch64" \
+            crates/outrig/src/container/enter/launcher.rs
+          file -b "$RUNNER_TEMP/outrig-enter-aarch64" | grep -q 'ARM aarch64'
       - run: cargo test ${{ matrix.cargo_args }} ${{ matrix.test_args }}
 
   doc-style:

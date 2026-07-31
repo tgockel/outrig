@@ -10,6 +10,7 @@ crates publish from this repository.
 
 ## Prerequisites
 
+- Linux on x86-64 or AArch64. WSL2 counts; macOS and native Windows are not supported.
 - Rust toolchain (you'll need it to install outrig itself).
 - [podman](https://podman.io) installed and working in rootless mode. Verify with `podman info`
   -- it should print without errors.
