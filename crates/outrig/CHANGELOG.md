@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-08-02
+
+A release candidate. This is the first cycle to break the public surface, so it goes out for
+integration testing ahead of 0.2.0 final. Everything here is measured against **0.1.0**, the
+last published release.
+
+The three things a 0.1.0 consumer hits first: the crate now links **rmcp 3.x** (0.1.0 was on
+1.x), the **minimum supported Rust version is 1.88** (was 1.87), and every public struct and
+enum is `#[non_exhaustive]`, so struct literals and exhaustive `match`es on them no longer
+compile. Each is detailed under **Changed**.
+
 ### Added
 
 - **Anthropic's native Messages API is a provider style.** `style = "anthropic"` on a
@@ -19,9 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trimmed if present. Reaching Claude through a bridge is still an `openai` provider pointed
   at that bridge, and both remain supported.
 
-  `LlmProvider::Anthropic` and its `LlmProvider::anthropic(..)` constructor are additive:
-  the enum and its variants have been `#[non_exhaustive]` since 0.2.0-rc.1, so a match with
-  a catch-all arm keeps compiling.
+  `LlmProvider::Anthropic` and its `LlmProvider::anthropic(..)` constructor arrive together
+  with the `#[non_exhaustive]` sweep below, so a match with a catch-all arm keeps compiling.
 
 - **`retry-budget-secs`,** as `Config::retry_budget_secs` and a field on the `OpenAi` and
   `Anthropic` variants of `LlmProvider`, bounding how long a transiently-failing LLM call
@@ -32,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Set it with `LlmProvider::with_retry_budget_secs(..)` rather than a fourth argument to
   `LlmProvider::openai(..)` / `::anthropic(..)`, which would have been a breaking change to
-  a settled surface. All of this is additive: the enum and its variants are
+  a surface this release otherwise settles. The enum and its variants are
   `#[non_exhaustive]`, and so is `Config`.
 
 - **`LlmProvider::style()`,** the `style` tag a provider serializes as. It lives next to the
@@ -105,6 +115,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as the session's runtime user -- the first streaming, the second returning a
   `std::process::Output` with a non-zero exit reported as data rather than an error. The
   primary `Container` stays private, so an embedder cannot stop a container the session owns.
+- **MCP sidecar containers** -- an MCP server can run in its own container alongside the
+  primary. `LaunchSpec::with_sidecar` declares sidecars at launch (abort-only: any failure
+  tears down everything already started), and `Outrig::add_sidecar` starts one mid-session,
+  returning the new tool handles so callers need not diff `tools()`. `SidecarSpec` and
+  `SidecarServerSpec` are the builder types -- a raw podman image ref used verbatim, plus
+  workspace access, mounts, security, and servers.
+- **Config-driven sidecar placement** -- `LaunchSpec::from_config(&Config, image_name,
+  repo_root, log_dir)` translates an image config's `[mcp]` map into the primary MCP map plus
+  resolved `SidecarSpec`s, resolving a sidecar's image against sibling `[images.<name>]`
+  blocks. It replaces `LaunchSpec::from_image_config`; see **Removed**.
+- **Entrypoint-stdio MCP servers** -- an image whose `ENTRYPOINT` is itself the server (an
+  inline image with no command) is supported, so off-the-shelf MCP images work with no
+  repo-side command knowledge. Launch splits into `podman create` + `podman init` +
+  `podman start`, which lets the network interceptor attach to the held process before the
+  server's first packet.
+- **Sidecars that share the primary's filesystem view** -- `view = "primary"` runs a sidecar's
+  server against the primary container's own tree, via the embedded `outrig-enter` launcher,
+  so a server needs no bind mount and cannot disagree with the primary about paths. It is
+  entrypoint-stdio only, requires the `<arch>-unknown-linux-musl` helper at build time, and
+  costs `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` in the primary's user namespace.
+  `OutrigError::FilesystemHelperUnavailable` names the missing artifact, and the build-time
+  reason it was not produced, when the helper is absent.
+
+  The launcher holds those capabilities only until the graft is in place: it clears its
+  supplementary groups and becomes the session's uid/gid immediately before exec'ing the
+  payload, which drops the permitted, effective and ambient sets with the uid transition. So a
+  server placed this way is indistinguishable from an exec-stdio one in what it may do and what
+  it may own -- in particular, what it writes into the workspace comes back owned by the
+  invoking user. A server needing root over the primary's filesystem is not supported.
+- **Device passthrough and a no-new-privileges opt-out** -- `[image.security]` carries
+  `devices` and `no-new-privileges`, surfaced as `ContainerSecurity`. `no_new_privileges`
+  defaults to `true`, so the default posture is unchanged from 0.1.0.
+- **The container's runtime user is written from the host** -- the session user is grafted
+  into the container's `/etc/passwd` and `/etc/group` without executing anything inside it,
+  so a bootstrap no longer depends on the image shipping `useradd`.
+- **`subagent-depth-max` and `subagent-width-max`** bound how deeply subagents nest and how
+  many one agent may hold at once. Both are top-level `Config` keys with an
+  `[agents.<name>]` override; the defaults are 3 and 8.
+- **Every podman/buildah command line is logged at debug level**, so a session can be
+  reconstructed from a trace without reproducing it.
 - **Arguments for entrypoint-stdio MCP servers** -- an `args` key on `[images.<name>.mcp]`
   entries and on `[sidecars.<sc>]` blocks supplies the container's trailing argv,
   so images that take their configuration positionally (`docker.io/mcp/filesystem` and most of
@@ -114,29 +164,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one MCP entry omits `command` runs that image's `ENTRYPOINT` as the server, which is how an
   entrypoint-stdio server gets a workspace view, mounts, or its own security policy. Such a
   block hosts exactly one server and must be `start = "auto"`.
+- `SidecarSpec`, `SidecarServerSpec`, `SidecarWorkspaceAccess`, `SidecarView`, and
+  `resolve_mcp_env` are exported from the crate root.
 
 ### Changed
 
-- **A `view = "primary"` sidecar's server now runs as the session user**, not as the sidecar
-  image's `USER`. That placement is entrypoint-stdio, so the container process *is* the server
-  and there is no `podman exec` window for the user bootstrap -- and because `outrig-enter` needs
-  `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` to join the primary's namespace, the image's `USER` was
-  effectively forced to root. Under `--userns=container:<primary>` that root is a host subuid, so
-  everything such a server wrote into the workspace came back owned by an id the invoking user
-  does not have, and every process it spawned inherited `CAP_SYS_ADMIN`.
+- **Breaking:** the `rmcp` MCP SDK moved from 1.x to **3.1**, so consumers of this library
+  link against rmcp 3.x. Two migrations are folded into this one step. rmcp 2.x replaced the
+  `Annotated<RawContent>` content model with a flat `ContentBlock`, which the proxy and client
+  now build on; rmcp 3.x then changed `ServerHandler::call_tool` to return `CallToolResponse`
+  (the `Complete` / `InputRequired` / `Task` enum) rather than `CallToolResult`, and gave
+  `ListToolsResult` three further fields that block struct-literal construction.
 
-  The launcher now gives the privileges up as soon as the graft is in place: it clears its
-  supplementary groups and becomes the session's uid/gid immediately before exec'ing the payload,
-  which clears the permitted, effective and ambient capability sets with the uid transition. A
-  server placed this way is therefore indistinguishable from an exec-stdio one in what it may do
-  and what it may own. Servers that relied on writing to root-owned paths in the primary -- or to
-  the image's `HOME`, typically `/root` -- will now be refused.
-- **Breaking:** `container::sidecar::build_primary_view_argv` and
-  `container::sidecar::entrypoint_create_args` take a trailing `ids: Option<(u32, u32)>`, the
-  `(uid, gid)` the payload drops to, emitted as the launcher's `--uid`/`--gid`. `None` reproduces
-  the previous argv exactly and leaves the payload as whatever the image's `USER` says; every
-  OutRig-launched sidecar passes the session's ids. The flags are optional on the launcher too,
-  which is a standalone binary with a documented argv contract.
+  `ProxyServer::dispatch_call` still hands back a `CallToolResult`, so a caller driving the
+  dispatch path directly is unaffected by the second change. Peers negotiating a protocol
+  version older than `2026-07-28` see the same bytes as before.
+- **Breaking:** the minimum supported Rust version is **1.88**, up from 1.87, matching rmcp
+  3.1.0's own declared MSRV.
+- **Breaking:** the crate builds on Linux only, and a non-Linux target now fails with an
+  explicit `compile_error!` naming the reason. `network`, `nsfork`, and
+  `container::namespace` call `setns` and `CLONE_NEW*` with nothing between them and the
+  crate root, so an Apple or Windows target never resolved; it previously surfaced as an
+  avalanche of unresolved-import errors instead of one message. Supported architectures are
+  x86-64 and AArch64.
+- The network interceptor spans N containers rather than one: a single policy and audit log
+  covers the primary and every sidecar, with traffic attributed to the container that produced
+  it.
+- The session watcher is a single `podman events` stream per session, replacing one
+  `podman wait` child per container.
+- Sidecar bring-up fans out -- distinct images are ensured and label-inspected concurrently and
+  only once each, then containers start concurrently. Label-collision errors stay deterministic.
+- **A `view = "primary"` sidecar's server runs as the session user**, not as the sidecar
+  image's `USER`; see the placement's entry under **Added**. Servers that expect to write to
+  root-owned paths in the primary -- or to the image's `HOME`, typically `/root` -- are
+  refused.
 - **Breaking:** the three provider-specific `ConfigValidationError` variants are now named
   for what they check rather than for one style, and the two remote ones carry the style
   they are reporting on: `OpenAiModelMissingIdentifier { model }` becomes
@@ -147,27 +208,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The rendered messages for `openai` models are unchanged; an `anthropic` model now reports
   `(provider style=anthropic)` instead of claiming to be an openai one.
-- **Breaking:** `SidecarServerSpec` is now a two-variant enum rather than a struct, since a
-  sidecar server is either exec-stdio (a `command`) or entrypoint-stdio (`args`, no command).
-  `SidecarServerSpec::new(command)` becomes `SidecarServerSpec::exec(command)`, mirroring
-  `McpServerSpec::exec`, and its sibling is `SidecarServerSpec::entrypoint(args)`. Both
-  variants are sealed, so `env` is attached with `with_env` instead of by field assignment, and
-  read back through the `command()` / `args()` / `env()` / `is_entrypoint()` accessors.
-  `SidecarSpec::with_server` and `with_server_env` are unchanged.
-
-  `SidecarSpec` also gained a `view` field. Because the type is `#[non_exhaustive]`, callers
-  that build it through `from_image` plus `with_*` need no change.
-- **Breaking:** `LaunchSpec::from_config` no longer errors on an entrypoint-stdio placement.
-  It lowers one into a `SidecarSpec` like any other placement, carrying `view` and resolving
-  `args` from whichever of the entry or the sidecar block declared them. Code matching on that
-  error to fall back to the CLI can drop the fallback.
-
-  Two config keys still have no library counterpart, and a repo config that uses them behaves
-  differently under `Outrig::launch` than under `outrig run`: `start = "manual"` sidecars are
-  skipped rather than carried, and `on-failure = "warn"` is not honored -- launch-time sidecars
-  are abort-only, so a config that degrades gracefully in the CLI fails the whole launch here.
-  Both were already true; they are called out now that entrypoint hosts (which cannot be
-  `start = "manual"` at all) make the surface worth stating.
 - **Breaking:** every public struct and enum that stays public is now `#[non_exhaustive]`, so
   adding a field or a variant stops being a breaking change. Downstream crates can no longer
   build these types with a struct literal -- including with `..Default::default()`, which the
@@ -179,7 +219,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `let mut cfg = Config::default(); cfg.default_image = Some(name);`. Types with a required
   field gained a constructor naming exactly that field -- `ImageConfig::from_dockerfile` /
   `from_image_name`, `SidecarConfig::new`, `Model::new`, `Workspace::new`, `MountConfig::new`,
-  `MountSpec::new`, `WorkspaceSpec::new`, `CapabilitySpec::new`, `SidecarServerSpec::new`,
+  `MountSpec::new`, `WorkspaceSpec::new`, `CapabilitySpec::new`,
   `ContainerWorkspace::new`, `ContainerMount::new`, `ContainerCapabilities::new`,
   `PrimaryView::new`, `McpTool::new`, and `McpToolResult::ok` / `error`. Types that only ever
   come back out of the library -- `ToolHandle`, `ContainerInspect`, `ImageBuildOutcome`,
@@ -202,28 +242,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SidecarView::as_str` gives the wire name. `From<&ContainerSecurity> for ContainerCapabilities`
   is also new: that mapping now has to live here, because a future security knob can only be
   wired through inside this crate.
-- **Breaking:** sidecars moved from `[images.<name>.sidecars.<sc>]` to a top-level
-  `[sidecars.<sc>]` map, matching every other cross-referenced entity in the config
-  (`[models.<n>]`, `[providers.<n>]`, `[images.<n>]`). One block can now be shared by any
-  number of image-configs, and the global config can declare sidecars a repo references,
-  because top-level maps merge global-then-repo by name. `ImageConfig::sidecars` is gone;
-  `Config::sidecars` replaces it, and `sidecar::plan_from_config` takes the `Config` too.
-  A config using the old nested form fails to parse with an unknown-field error.
-- **Breaking:** a sidecar starts only when some `[images.<name>.mcp]` entry names it.
-  Previously every declared block started. With blocks now shared and global, declaring one
-  can no longer mean "run it" -- a personal toolbox in the user config would otherwise start
-  in every repo. A block hosting no MCP servers, and one whose servers came only from its
-  image's `org.outrig.mcp` label, are no longer reachable.
-- **Breaking:** `McpServerSpec::Full` gained an `args` field and `SidecarConfig` an `args`
-  field; struct-literal constructions of either need it. The entrypoint argv reaches
-  `Container::create_initialized` through the new options struct described below.
-- **Breaking:** `Container::create_initialized` takes a single `ContainerCreateOptions` instead
-  of seven positional parameters. That list had already grown once this release (the entrypoint
-  argv), and a `#[non_exhaustive]` options struct means the next knob is an addition rather than
-  another break. Build it with `ContainerCreateOptions::new(image, launch, name)` plus
-  `with_transcript` / `with_env` / `with_intercept_dns` / `with_args`; the four omitted default
-  to none, empty, and off. `Container::start_named` is unchanged -- `podman run` takes none of
-  the create-only knobs, so one shared struct would have meant silently ignored fields.
 - **Breaking:** `mcp_proxy::BackingClient` is sealed and can no longer be implemented outside
   this crate. Nothing about *using* `ProxyServer` changes; only an external `impl BackingClient`
   is affected, and the only known one was this repo's own test fake, now a crate-internal
@@ -236,95 +254,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `into_string` takes it by value, replacing `.0` reads and moves respectively. `Display` is
   unchanged and still covers the common read path. The field was the last thing freezing the
   tag's representation into the contract -- `ApiKeyRef` has always been opaque this way.
-- `ConfigValidationError`'s `SidecarNameInvalid`, `SidecarImageEmpty`, `SidecarMount`, and
-  `SidecarArgsWithoutEntrypoint` lost their `image` field -- a sidecar block no longer belongs
-  to one image-config -- and their messages are scoped `sidecars.<sc>` rather than
-  `<image>.sidecars.<sc>`.
-- `sidecar = "<sc>"` without a `command` is no longer a config error -- it is the named
-  entrypoint-host form. `ConfigValidationError::McpSidecarRequiresCommand` is removed.
-- `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
-  placement keys.
+- `McpServerSpec::Full` gained `sidecar`, `image`, `args`, and `view` fields alongside its
+  existing `command` and `env`, carrying the placement of a server that runs in a sidecar.
+  The variant is sealed by the sweep above, so it is built through `McpServerSpec::exec` /
+  `entrypoint` plus the `with_*` methods rather than as a literal.
 
 ### Removed
 
-- **Breaking:** four label-plumbing helpers left `container::embedded` --
-  `mcp_config_to_labels`, `merged_mcp_config_to_labels`, `primary_scoped_mcp`, and `merge_mcp` --
-  along with `container::sidecar::bootstrap_needed`. They served the crate's own build and launch
-  paths, never a caller: each takes the internal shape of a half-resolved MCP table, and none had
-  a consumer outside this crate. `standalone_config_to_labels` and `parse_standalone_image_labels`
-  remain for building and reading a standalone image's labels.
+- **Breaking:** three label-plumbing helpers left `container::embedded` --
+  `mcp_config_to_labels`, `merged_mcp_config_to_labels`, and `merge_mcp`. They served the
+  crate's own build and launch paths, never a caller: each takes the internal shape of a
+  half-resolved MCP table, and none had a consumer outside this crate.
+  `standalone_config_to_labels` and `parse_standalone_image_labels` remain for building and
+  reading a standalone image's labels.
+- **Breaking:** `LaunchSpec::from_image_config`, which copied an image config's `[mcp]` map
+  verbatim and left placement-bearing entries to fail at launch. Use `LaunchSpec::from_config`,
+  which performs the translation faithfully.
 
-  This is the only reachability `0.2.0` removes. The rest of the surface is now settled
+  These are the only reachability `0.2.0` removes. The rest of the surface is now settled
   deliberately: `config`, `container`, `error`, `image`, `mcp_proxy`, and `network` are all
   supported API, so a caller can drive containers, images, and egress policy directly rather than
   only through the `Outrig` facade.
 
 ### Fixed
 
-- A `view = "primary"` sidecar whose image declares an **absolute** `ENTRYPOINT` no longer
-  fails to start. `build_primary_view_argv` graft-prefixed the payload's program, but
-  `outrig-enter` opens that program before joining the primary's namespace -- while the
-  sidecar's own rootfs is still at `/` -- and applies the graft itself when handing the path to
-  the loader, so the program was being looked for under the graft twice. The program is now
-  passed bare and every other image-declared element keeps its prefix.
-
-  An image whose `ENTRYPOINT` is a *relative* program name (`["node", "/app/dist/index.js"]`,
-  which is `docker.io/mcp/filesystem:latest`) still fails: the launcher does no `PATH` search.
-  That is tracked separately.
-
-## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-07-24
-
-A release candidate. This is the first cycle to break the public surface, so it goes out for
-integration testing ahead of 0.2.0 final. The two items consumers hit first are the rmcp 2.x
-content model under **Changed** and the removed constructor under **Removed**.
-
-### Added
-
-- **MCP sidecar containers** -- an MCP server can run in its own container alongside the
-  primary. `LaunchSpec::with_sidecar` declares sidecars at launch (abort-only: any failure
-  tears down everything already started), and `Outrig::add_sidecar` starts one mid-session,
-  returning the new tool handles so callers need not diff `tools()`. `SidecarSpec` and
-  `SidecarServerSpec` are the builder types -- a raw podman image ref used verbatim, plus
-  workspace access, mounts, security, and exec-stdio servers.
-- **Entrypoint-stdio MCP servers** -- an image whose `ENTRYPOINT` is itself the server (an
-  inline image with no command) is now supported, so off-the-shelf MCP images work with no
-  repo-side command knowledge. Launch splits into `podman create` + `podman init` +
-  `podman start`, which lets the network interceptor attach to the held process before the
-  server's first packet.
-- **Config-driven sidecar placement** -- `LaunchSpec::from_config(&Config, image_name,
-  repo_root, log_dir)` translates an image config's `[mcp]` map into the primary MCP map plus
-  resolved `SidecarSpec`s, resolving a sidecar's image against sibling `[images.<name>]`
-  blocks. `start = "manual"` sidecars are skipped, and entrypoint-stdio placements are
-  rejected with an error naming the server.
-- `SidecarSpec`, `SidecarServerSpec`, `SidecarWorkspaceAccess`, and `resolve_mcp_env` are
-  exported from the crate root.
-
-### Changed
-
-- **Breaking:** upgraded the `rmcp` MCP SDK from 1.x to 2.x. The proxy and client now build on
-  rmcp 2.2's flat `ContentBlock` content model (replacing `RawContent`), so consumers of this
-  library link against rmcp 2.x.
-- The network interceptor spans N containers rather than one: a single policy and audit log
-  covers the primary and every sidecar, with traffic attributed to the container that
-  produced it.
-- The session watcher is a single `podman events` stream per session, replacing one
-  `podman wait` child per container.
-- Sidecar bring-up fans out -- distinct images are ensured and label-inspected concurrently
-  and only once each, then containers start concurrently. Label-collision errors stay
-  deterministic.
-
-### Removed
-
-- **Breaking:** `LaunchSpec::from_image_config`, which copied an image config's `[mcp]` map
-  verbatim and left placement-bearing entries to fail at launch. Use
-  `LaunchSpec::from_config`, which performs the translation faithfully.
-
-### Fixed
-
-- `Container::stop` passes `--ignore`, so an entrypoint sidecar that has already self-reaped
-  no longer fails session teardown.
-- A malformed `org.outrig.mcp` label on a repo-built image fails during the build rather than
-  at session start.
+- A `view = "primary"` sidecar whose image declares an `ENTRYPOINT` no longer fails to start,
+  in either of the two ways it used to. An **absolute** program was looked for under the graft
+  twice: `build_primary_view_argv` prefixed it, and `outrig-enter` applies the graft itself when
+  handing the path to the loader, having opened the program before joining the primary's
+  namespace while the sidecar's own rootfs is still at `/`. The program is now passed bare and
+  every other image-declared element keeps its prefix. A **relative** program
+  (`["node", "/app/dist/index.js"]`, which is `docker.io/mcp/filesystem:latest`) was never
+  resolved at all, because the launcher did a literal `open` rather than an `execvp`-style
+  search; it is now searched along the launcher's own `PATH`, and a failed search reports where
+  it looked.
+- A `view = "primary"` payload gets a `HOME` it can write (`/home/<name>`, the same path every
+  exec-stdio server gets) rather than inheriting the image's, typically a root-owned `/root`.
+  The visible symptom was tooling that reads per-user config through `HOME` failing oddly --
+  libgit2 treats an unstattable `core.excludesFile` as a hard error, so `cargo` subcommands
+  failed while others succeeded.
+- A `view = "primary"` payload sees its own `/proc`. `outrig-enter` joins the primary's mount
+  namespace only, so the inherited procfs was an instance of the primary's PID namespace with
+  no entry for the payload: `/proc/self` resolved to nothing and every rustup shim failed with
+  "no /proc/self/exe available". The launcher now unshares its mount namespace unconditionally
+  and mounts a fresh `proc` over the inherited one, which also stops the payload from seeing
+  the primary's process list.
+- The library builds for `*-unknown-linux-musl`. `nsfork` assigned `usize` into
+  `msghdr.msg_controllen` and `cmsghdr.cmsg_len`, which musl types as `socklen_t` and glibc as
+  `size_t`; the fields are now written and read through inference so both libcs work.
+- `Container::stop` passes `--ignore`, so an entrypoint sidecar that has already self-reaped no
+  longer fails session teardown.
+- A malformed `org.outrig.mcp` label on a repo-built image fails during the build rather than at
+  session start.
 
 ## [0.1.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.1.0) - 2026-06-26
 
