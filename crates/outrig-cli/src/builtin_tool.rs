@@ -545,7 +545,9 @@ pub struct SetResultTool {
     /// The agent whose turns hit the ceiling, and the ceiling in effect for
     /// it -- which may have come from the agent or from its model. Carried
     /// only to name the fix in the one operator-facing warning below.
-    agent_name: Arc<str>,
+    /// `None` for an agentless session, which has no `[agents.<name>]` table
+    /// to point the operator at.
+    agent_name: Option<Arc<str>>,
     max_tokens: Option<u32>,
 }
 
@@ -553,13 +555,13 @@ impl SetResultTool {
     pub fn new(
         shared: Arc<SubagentShared>,
         label: &str,
-        agent_name: &str,
+        agent_name: Option<&str>,
         max_tokens: Option<u32>,
     ) -> Self {
         Self {
             shared,
             label: Arc::from(label),
-            agent_name: Arc::from(agent_name),
+            agent_name: agent_name.map(Arc::from),
             max_tokens,
         }
     }
@@ -573,18 +575,26 @@ impl SetResultTool {
     fn warn_about_the_ceiling(&self) {
         // The effective ceiling can come from the agent or from the model it
         // uses, so name the knob without claiming which file set it.
+        let scope = match &self.agent_name {
+            Some(agent) => format!("agent {agent}"),
+            None => "this session".to_string(),
+        };
         let remedy = match self.max_tokens {
-            Some(limit) => format!(
-                "the max-tokens in effect for agent {} is {limit} -- raise it",
-                self.agent_name
-            ),
+            Some(limit) => {
+                format!("the max-tokens in effect for {scope} is {limit} -- raise it")
+            }
             // Nothing set it anywhere, so there is no ambiguity about which
-            // table to name.
-            None => format!(
-                "[agents.{}].max-tokens is unset, so the provider's default \
-                 applies -- set it explicitly",
-                self.agent_name
-            ),
+            // table to name -- except that an agentless session has no
+            // `[agents.<name>]` table, and its only knob is the model's.
+            None => match &self.agent_name {
+                Some(agent) => format!(
+                    "[agents.{agent}].max-tokens is unset, so the provider's default \
+                     applies -- set it explicitly"
+                ),
+                None => "max-tokens is unset, so the provider's default applies -- set \
+                         [models.<name>].max-tokens explicitly"
+                    .to_string(),
+            },
         };
         eprintln!(
             "[outrig]   [{}] set_result was cut off before `body`: the model's \
@@ -859,7 +869,7 @@ mod tests {
         let shared = Arc::new(SubagentShared::new());
         shared.begin_round();
         (
-            SetResultTool::new(shared.clone(), "audit", "primary", None),
+            SetResultTool::new(shared.clone(), "audit", Some("primary"), None),
             shared,
         )
     }

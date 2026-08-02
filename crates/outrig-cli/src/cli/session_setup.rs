@@ -101,20 +101,22 @@ pub struct SessionSetupArgs<'a> {
     /// Existing session id or podman container name to attach to instead of
     /// starting a fresh container. Used by `outrig mcp --attach`.
     pub attach_target: Option<&'a str>,
-    /// Raw `--agent` flag. Read only when `require_agent = true`; ignored
+    /// Raw `--agent` flag. Read only when `llm_session = true`; ignored
     /// otherwise (and `outrig mcp` always passes `None`).
     pub agent_flag: Option<&'a str>,
-    /// Raw `--model` flag. Read only when `require_agent = true`; ignored
+    /// Raw `--model` flag. Read only when `llm_session = true`; ignored
     /// otherwise (and `outrig mcp` always passes `None`).
     pub model_override: Option<&'a str>,
-    /// `true` for `outrig run`: [`setup`] resolves an agent from
-    /// `agent_flag.or(cfg.default_agent)` (errors if neither) and lets
-    /// `agent.image` participate in the container fallback.
-    /// `false` for `outrig mcp`: no agent at all -- `llm::resolve_agent` is
-    /// not called, `cfg.default_agent` is not consulted, the resulting
-    /// [`Session::agent_name`] is `None`, and the container cascade is
-    /// `image_flag -> default_image` only.
-    pub require_agent: bool,
+    /// `true` for `outrig run`, the one command that drives an LLM loop:
+    /// [`setup`] resolves the model wiring from
+    /// `agent_flag.or(cfg.default_agent)` and lets `agent.image` participate
+    /// in the container fallback. Naming no agent is fine -- the session then
+    /// runs with no preamble and [`Session::agent_name`] stays `None` -- but
+    /// a model must still resolve from `--model` or `default-model`.
+    /// `false` for `outrig mcp`: no LLM at all -- `llm::resolve_agent` is
+    /// not called, `cfg.default_agent` is not consulted, and the container
+    /// cascade is `image_flag -> default_image` only.
+    pub llm_session: bool,
     pub explicit_session_dir: Option<&'a Path>,
     pub network_mode_override: Option<NetworkMode>,
     pub device_override: Option<MistralrsDeviceSpec>,
@@ -241,7 +243,7 @@ struct AttachResolution {
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let repo_root = repo_root_from_config_path(args.repo_cfg_path);
     let span = ProgressSpan::start("loading config");
-    let mut cfg = if args.require_agent {
+    let mut cfg = if args.llm_session {
         Config::load_for_run(
             &repo_root,
             Some(args.global_cfg_path),
@@ -263,7 +265,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         session::resolve_session_root(args.session_root_flag, &cfg, &default_session_root());
     let store = SessionStore::new(session_root);
     let attach = match args.attach_target {
-        Some(target) if args.require_agent => {
+        Some(target) if args.llm_session => {
             return Err(OutrigError::Configuration(format!(
                 "--attach {target:?} is only supported by `outrig mcp`"
             ))
@@ -311,28 +313,23 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         cfg.validate_workspace_mounts(Some(&repo_root))?;
     }
 
-    // Agent presence is checked before any container work so the failure
-    // mode is identical for `outrig run` regardless of which container
-    // would have been picked. `outrig mcp` opts out via `require_agent =
-    // false` -- it has no agent concept, so `agent_flag` and
-    // `cfg.default_agent` are not consulted at all.
+    // Model wiring is resolved before any container work so the failure mode
+    // is identical for `outrig run` regardless of which container would have
+    // been picked. Naming no agent is not a failure: the resolution just runs
+    // against an empty agent, and only a missing *model* stops it. `outrig
+    // mcp` opts out via `llm_session = false` -- it has no LLM at all, so
+    // `agent_flag` and `cfg.default_agent` are not consulted.
     let span = ProgressSpan::start("resolving agent and container");
     let (session_agent_name, agent_image) = if attach.is_some() {
         (None, None)
-    } else if args.require_agent {
-        let agent_name = args
-            .agent_flag
-            .or(cfg.default_agent.as_deref())
-            .ok_or_else(|| {
-                OutrigError::Configuration("no --agent and no default-agent configured".to_string())
-            })?;
+    } else if args.llm_session {
         let resolved = llm::resolve_agent_with_overrides(
             &cfg,
-            agent_name,
+            args.agent_flag.or(cfg.default_agent.as_deref()),
             args.model_override,
             args.device_override,
         )?;
-        (Some(resolved.agent_name.clone()), resolved.image.clone())
+        (resolved.agent_name.clone(), resolved.image.clone())
     } else {
         (None, None)
     };
@@ -346,7 +343,10 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
                     .as_deref()
                     .or(cfg.default_image.as_deref())
                     .ok_or_else(|| {
-                        let msg = if args.require_agent {
+                        // Keyed on whether an agent actually resolved, not on
+                        // the command: an agentless `outrig run` has no
+                        // `agent.image` rung to offer either.
+                        let msg = if session_agent_name.is_some() {
                             "no --image, agent.image, or default-image configured"
                         } else {
                             "no --image or default-image configured"

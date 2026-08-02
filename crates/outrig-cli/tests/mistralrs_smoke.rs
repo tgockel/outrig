@@ -93,7 +93,7 @@ async fn offline_path_smoke() {
     };
 
     let cfg = Config::load_from_str(&cfg_with_model_path(&model_path)).expect("config parses");
-    let resolved = resolve_agent(&cfg, "smoke").expect("agent resolves");
+    let resolved = resolve_agent(&cfg, Some("smoke")).expect("agent resolves");
 
     let cache = TempDir::new().expect("tempdir");
     let registry = LlmRegistry::new();
@@ -124,7 +124,7 @@ async fn download_path_smoke() {
         Config::load_from_str(&cfg_with_model_id(&model_id, &model_file)).expect("config parses");
 
     // First load: downloads.
-    let resolved = resolve_agent(&cfg, "smoke").expect("agent resolves");
+    let resolved = resolve_agent(&cfg, Some("smoke")).expect("agent resolves");
     let registry = LlmRegistry::new();
     let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await

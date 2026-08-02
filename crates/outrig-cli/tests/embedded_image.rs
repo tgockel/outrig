@@ -75,6 +75,21 @@ model = "fast"
 preamble = "test"
 "#;
 
+/// The same wiring with no agent surface: `outrig run` resolves against
+/// `default-model` and starts with no preamble.
+const AGENTLESS_CONFIG_TOML: &str = r#"
+default-model = "fast"
+
+[providers.openai]
+style = "openai"
+base-url = "http://127.0.0.1:1/v1"
+api-key = "${OUTRIG_TEST_KEY}"
+
+[models.fast]
+provider = "openai"
+identifier = "gpt-4o-mini"
+"#;
+
 fn write_agent_only_config(repo: &std::path::Path) {
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
@@ -393,6 +408,115 @@ async fn run_without_repo_config_uses_global_config() {
     assert!(
         stderr.contains(":/extra"),
         "stderr did not show the --volume mount in the podman transcript: {stderr}",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_without_an_agent_reaches_the_repl() {
+    common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
+    // No agent anywhere -- not in the repo (there is none), not in the global
+    // config. `--image` plus `default-model` is the whole of what `outrig run`
+    // needs, and the banner leads with the model rather than an agent name.
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let image_ctx = tempfile::tempdir().expect("tempdir image context");
+    let global_dir = tempfile::tempdir().expect("tempdir global config");
+
+    let global_config = global_dir.path().join("config.toml");
+    std::fs::write(&global_config, AGENTLESS_CONFIG_TOML).expect("write global config");
+
+    let image_ref = unique_image_tag("agentless-run");
+    std::fs::write(
+        image_ctx.path().join("Dockerfile"),
+        "FROM docker.io/library/alpine:latest\nRUN apk add --no-cache shadow\n",
+    )
+    .expect("write Dockerfile");
+    build_local_image(&image_ref, image_ctx.path()).await;
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--global-config",
+                global_config.to_str().expect("global config utf-8"),
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "run",
+                "--image",
+                &image_ref,
+            ])
+            .current_dir(repo_dir.path())
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("run mode timed out")
+    .expect("run outrig run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "agentless run exited {:?}; stderr:\n{stderr}",
+        output.status,
+    );
+    assert!(
+        stderr.contains("[outrig] entering REPL"),
+        "agentless run did not reach the REPL: {stderr}",
+    );
+    assert!(
+        stderr.contains("[outrig] model:") && !stderr.contains("[outrig] agent:"),
+        "banner should name the model, not an agent line: {stderr}",
+    );
+}
+
+/// The agentless image cascade is `--image -> default-image`, and its error
+/// says exactly that -- offering `agent.image` would name a rung that does
+/// not exist for this session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_without_an_agent_or_image_names_only_the_rungs_it_has() {
+    common::init_tracing();
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let global_dir = tempfile::tempdir().expect("tempdir global config");
+
+    let global_config = global_dir.path().join("config.toml");
+    std::fs::write(&global_config, AGENTLESS_CONFIG_TOML).expect("write global config");
+
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(bin)
+            .args([
+                "--global-config",
+                global_config.to_str().expect("global config utf-8"),
+                "--session-root",
+                sessions.path().to_str().expect("sessions path utf-8"),
+                "run",
+            ])
+            .current_dir(repo_dir.path())
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("run mode timed out")
+    .expect("run outrig run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "run with no image unexpectedly succeeded; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("no --image or default-image configured"),
+        "stderr lacked the agentless image error: {stderr}",
+    );
+    assert!(
+        !stderr.contains("agent.image"),
+        "an agentless session has no agent.image rung to offer: {stderr}",
     );
 }
 

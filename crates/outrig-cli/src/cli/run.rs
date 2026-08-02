@@ -47,7 +47,9 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
 pub struct RunArgs {
-    /// Pick an `[agents.<name>]` block. Defaults to `default-agent` from config.
+    /// Pick an `[agents.<name>]` block. Defaults to `default-agent` from
+    /// config; with neither, the session runs with no agent -- no preamble,
+    /// and the image comes from `--image` or `default-image`.
     #[arg(long, value_name = "NAME")]
     pub agent: Option<String>,
 
@@ -113,7 +115,7 @@ pub async fn execute(
         attach_target: None,
         agent_flag: args.agent.as_deref(),
         model_override: args.model.as_deref(),
-        require_agent: true,
+        llm_session: true,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
         device_override: args.device,
@@ -124,11 +126,9 @@ pub async fn execute(
     })
     .await?;
 
-    let agent_name = setup
-        .session
-        .agent_name
-        .clone()
-        .expect("outrig run always resolves an agent in setup");
+    // `None` when neither `--agent` nor `default-agent` named one: the session
+    // runs with no preamble and no agent-level knobs.
+    let agent_name = setup.session.agent_name.clone();
     let SessionSetup {
         cfg,
         image_cfg_name,
@@ -165,7 +165,7 @@ pub async fn execute(
 
     let outcome: Result<i32> = run_inner(RunInnerArgs {
         cfg: Arc::clone(&cfg),
-        agent_name: &agent_name,
+        agent_name: agent_name.as_deref(),
         image_cfg_name: &image_cfg_name,
         image_tag: &image_tag,
         log_dir: &log_dir,
@@ -204,7 +204,8 @@ struct RunInnerArgs<'a> {
     /// Shared rather than borrowed: the subagent registry keeps a handle so a
     /// launch can re-resolve the agent against another `[models.<name>]`.
     cfg: Arc<Config>,
-    agent_name: &'a str,
+    /// `None` for an agentless session; see [`SessionSetupArgs::llm_session`].
+    agent_name: Option<&'a str>,
     image_cfg_name: &'a str,
     image_tag: &'a ImageTag,
     log_dir: &'a Path,
@@ -300,9 +301,8 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     // The primary gets the launch tools when its agent opts in *and* the depth
     // limit leaves room for a first layer (root depth 1 < max). A
     // `subagent-depth-max` of 1 disables subagents for everyone.
-    let subagents_enabled = cfg
-        .agents
-        .get(agent_name)
+    let subagents_enabled = agent_name
+        .and_then(|name| cfg.agents.get(name))
         .is_none_or(outrig::config::Agent::subagents_enabled);
     if subagents_enabled && resolved.subagent_depth_max > 1 {
         agent_tools.extend(builtin_tool::parent_tools(
@@ -729,11 +729,20 @@ fn print_banner(
         llm::ResolvedProvider::Mistralrs => "mistralrs",
     };
     let mut buf = String::new();
-    let _ = writeln!(
-        buf,
-        "[outrig] agent:             {} (model: {} / provider: {} / {})",
-        resolved.agent_name, resolved.model_name, provider_label, resolved.model_identifier
-    );
+    // An agentless session has no agent name to print, so the banner leads
+    // with the model.
+    let _ = match &resolved.agent_name {
+        Some(agent) => writeln!(
+            buf,
+            "[outrig] agent:             {} (model: {} / provider: {} / {})",
+            agent, resolved.model_name, provider_label, resolved.model_identifier
+        ),
+        None => writeln!(
+            buf,
+            "[outrig] model:             {} (provider: {} / {})",
+            resolved.model_name, provider_label, resolved.model_identifier
+        ),
+    };
     let _ = writeln!(
         buf,
         "[outrig] tool-call max:     {}",
@@ -842,13 +851,13 @@ mod tests {
     /// they exercise via struct-update syntax.
     fn test_resolved_agent() -> llm::ResolvedAgent {
         llm::ResolvedAgent {
-            agent_name: "coding".to_string(),
+            agent_name: Some("coding".to_string()),
             model_name: "fast".to_string(),
             model_identifier: "gpt-4o-mini".to_string(),
             provider_name: "local".to_string(),
             provider: llm::ResolvedProvider::Mistralrs,
             model_weights: None,
-            preamble: "test".to_string(),
+            preamble: Some("test".to_string()),
             temperature: None,
             max_tokens: None,
             tool_call_max: 100,

@@ -26,7 +26,9 @@ outrig run [--agent <name>]
            [--verbose]
 ```
 
-- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
+- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block. With
+  neither, the session runs with no agent: no preamble, and the image comes from `--image` or
+  `default-image`.
 - `--image <name-or-local-ref>` (default: agent's `image`, else `default-image`):
   pick an image-config by name; if an explicit `--image` value does not match
   config, treat it as a local Podman image ref and run it without pulling.
@@ -105,8 +107,8 @@ With no repo config found and no `--config`, outrig uses the current directory a
 root (mounted at `/workspace`) and reads the agent, model, and provider from the global config
 (`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). Because there is no
 `default-image`, you must pass `--image`; an unknown ref is used as a local Podman image and is
-never pulled. If the global config has no resolvable agent, startup fails with the usual
-`no --agent and no default-agent configured` error.
+never pulled. The global config need not name an agent -- without one the session runs with no
+preamble -- but it must resolve a model, from `--model` or `default-model`.
 
 ## What happens, in order
 
@@ -138,7 +140,8 @@ never pulled. If the global config has no resolvable agent, startup fails with t
 7. **Connect MCP servers.** For each entry in `[images.<name>.mcp]`,
    `podman exec -i --user=$(id -u):$(id -g)` the configured command, run the MCP `initialize`
    handshake, and discover tools via `tools/list`.
-8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`), pick the
+8. **Resolve agent -> model -> provider.** From `--agent` (or `default-agent`, or neither --
+   an agentless session resolves as though the agent had no keys set), pick the
    model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
    must name an existing `[models.<name>]` entry; it is not a raw provider model identifier. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call max from
@@ -148,7 +151,8 @@ never pulled. If the global config has no resolvable agent, startup fails with t
    the provider's `api-key`. Build the Rig provider client.
 9. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
-   `AgentBuilder`.
+   `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
+   system prompt at all.
 10. **Open the REPL.** Banner on stderr, `> ` prompt, ready for input.
 
 If anything before step 10 fails, `outrig run` reports the error on stderr and exits non-zero

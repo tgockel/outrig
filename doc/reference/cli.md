@@ -195,7 +195,9 @@ outrig run [--agent <name>]
            [--verbose]
 ```
 
-- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block.
+- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block. With
+  neither, the session runs with no agent -- no preamble, and no `agent.image` rung in the
+  image cascade.
 - `--image <name-or-local-ref>` (default: from agent or `default-image`):
   image-config to launch. If an explicit value does not match config, it is
   treated as a local Podman image ref and is not pulled.

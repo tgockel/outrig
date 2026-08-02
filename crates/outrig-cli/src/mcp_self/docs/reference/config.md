@@ -20,7 +20,7 @@ their as-written form. Unknown keys are an error -- outrig validates with `deny_
 ```toml
 # repo config (.agents/outrig/config.toml):
 default-image = "coding"
-default-agent     = "coding"
+default-agent = "coding"
 
 # global config (~/.outrig/config.toml):
 default-model      = "fast"
@@ -42,7 +42,7 @@ deny  = ["*:22"]                                      # optional; global only
 | Key                  | Type    | Required               | Where  | Description               |
 |----------------------|---------|------------------------|--------|---------------------------|
 | `default-image`      | string  | for `outrig run`       | repo   | Default `--image`.        |
-| `default-agent`      | string  | for `outrig run`       | repo   | Default `--agent`.        |
+| `default-agent`      | string  | no                     | repo   | Default `--agent`.        |
 | `default-model`      | string  | if agent omits `model` | global | Fallback model name.      |
 | `session-root`       | path    | no                     | global | Sessions root dir.        |
 | `model-cache-root`   | path    | no                     | global | GGUF download cache dir.  |
@@ -55,6 +55,11 @@ deny  = ["*:22"]                                      # optional; global only
 | `network.default`    | string  | no                     | global | Filter fallback action.   |
 | `network.allow`      | array   | no                     | global | Filter allow entries.     |
 | `network.deny`       | array   | no                     | global | Filter deny entries.      |
+
+`default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
+with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
+is `--image` then `default-image`. A model must still resolve from `--model` or `default-model`
+-- that is the one thing an agentless session cannot do without.
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, `tool-call-max`, and the
@@ -425,6 +430,10 @@ a platform error.
 An agent is the runnable unit: a model plus a system prompt, optionally bound to an image-config
 so `outrig run --agent <name>` knows which sandbox to use.
 
+The whole table is optional. A run that names no agent behaves as an entry with no keys set:
+no preamble, no image hint, every limit from the top level. Declare agents when you want a
+preamble or a per-agent knob; skip them to run a model against a sandbox and nothing more.
+
 ```toml
 [agents.coding]
 # model omitted -> falls back to top-level default-model
@@ -442,7 +451,8 @@ preamble = "You are a meticulous code reviewer..."
 
 - `model` (string, optional, default: `default-model`): name of an entry in
   `[models.<name>]`.
-- `preamble` (string, optional, default: minimal default): system prompt for this agent.
+- `preamble` (string, optional, default: none): system prompt for this agent. If it is
+  omitted, requests carry no system prompt.
 - `image` (string, optional, default: `default-image`): default image-config
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
@@ -463,7 +473,8 @@ preamble = "You are a meticulous code reviewer..."
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
 `outrig run --agent <a>` runs, the chosen image-config is `--image` if given, otherwise
-`agents.<a>.image` if set, otherwise `default-image`.
+`agents.<a>.image` if set, otherwise `default-image`. A run with no agent drops the middle rung:
+`--image` if given, otherwise `default-image`.
 `tool-call-max` is per turn, not per session; follow-up prompts start a fresh count.
 `tool-result-max` is per result and applies equally to successful MCP results and MCP error
 messages. It also caps what `outrig__get_result` hands back from a subagent.
@@ -888,7 +899,7 @@ device     = "cpu"
 
 ```toml
 default-image = "coding"
-default-agent     = "coding"
+default-agent = "coding"
 
 [workspace]
 host-path      = "."
@@ -937,7 +948,8 @@ build-args = { NODE_VERSION = "20" }
 image-config in the merged config but does not require agent/model/provider wiring to resolve.
 
 - `default-image` must name an existing `[images.<name>]` block.
-- `default-agent` must name an existing `[agents.<name>]` block.
+- `default-agent` must name an existing `[agents.<name>]` block. Absence is fine; a name that
+  matches nothing is not.
 - Every `agents.<name>.model` (if set) must name an existing `[models.<name>]`. If `model` is
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.

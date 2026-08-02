@@ -643,7 +643,7 @@ fn resolve_launch_model(
     // `None` for the device override: a subagent names a model, not hardware.
     match crate::llm::resolve_agent_with_overrides(
         &ctx.cfg,
-        &ctx.resolved.agent_name,
+        ctx.resolved.agent_name.as_deref(),
         Some(model),
         None,
     ) {
@@ -693,13 +693,15 @@ async fn build_subagent_agent(
     preamble: Option<String>,
 ) -> Result<(crate::llm::RigAgent, Option<Arc<SubagentRegistry>>), String> {
     let mut resolved = resolved.clone();
-    resolved.preamble = compose_preamble(preamble.as_deref());
+    // A subagent always carries the `set_result` protocol fragment, so its
+    // preamble is `Some` even when the session that launched it has none.
+    resolved.preamble = Some(compose_preamble(preamble.as_deref()));
 
     let mut tools = ctx.mcp_tools.clone();
     tools.push(SessionTool::new(crate::builtin_tool::SetResultTool::new(
         shared.clone(),
         name,
-        &ctx.resolved.agent_name,
+        ctx.resolved.agent_name.as_deref(),
         ctx.resolved.max_tokens,
     )));
 
@@ -980,7 +982,7 @@ pub(crate) mod fixtures {
     /// model the fixture agent is configured on, against the discard port.
     pub(crate) fn test_resolved(subagent_depth_max: u32) -> ResolvedAgent {
         ResolvedAgent {
-            agent_name: "primary".to_string(),
+            agent_name: Some("primary".to_string()),
             model_name: "smart".to_string(),
             model_identifier: "gpt-4o".to_string(),
             provider_name: "openai".to_string(),
@@ -995,7 +997,7 @@ pub(crate) mod fixtures {
                 retry_budget_secs: Some(0),
             },
             model_weights: None,
-            preamble: "session preamble".to_string(),
+            preamble: Some("session preamble".to_string()),
             temperature: None,
             max_tokens: None,
             tool_call_max: 4,

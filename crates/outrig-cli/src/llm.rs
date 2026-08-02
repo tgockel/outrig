@@ -67,11 +67,6 @@ pub mod registry;
 #[cfg(feature = "local-llm")]
 pub use registry::LlmRegistry;
 
-/// Default preamble used when an agent leaves the field unset. Deliberately
-/// generic; agents that need anything specific spell it out themselves.
-const DEFAULT_PREAMBLE: &str =
-    "You are a careful assistant whose tools run inside a sandboxed container.";
-
 /// Failures that surface while walking `agents -> models -> providers` or
 /// constructing the Rig client. Wrapped into [`crate::error::OutrigError`]
 /// at the top level via `#[from]`.
@@ -85,6 +80,9 @@ pub enum LlmResolveError {
 
     #[error("agent {agent:?} omits 'model' and no default-model is set")]
     AgentMissingModel { agent: String },
+
+    #[error("no model selected; pass --model <name> or set default-model in config")]
+    MissingModel,
 
     #[error("model {name:?} is not defined under [models.<name>]")]
     UnknownModel { name: String },
@@ -193,7 +191,11 @@ pub struct MistralrsWeights {
 /// metadata, so it should never get serialized.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAgent {
-    pub agent_name: String,
+    /// `None` for a session that named no agent: `outrig run` with neither
+    /// `--agent` nor `default-agent`. Every knob below then comes from the
+    /// top-level config and the built-in defaults, exactly as it would for an
+    /// `[agents.<name>]` block with no keys set.
+    pub agent_name: Option<String>,
     pub model_name: String,
     pub model_identifier: String,
     pub provider_name: String,
@@ -201,7 +203,9 @@ pub struct ResolvedAgent {
     /// `Some` for mistralrs-style models, `None` for remote ones. Carries
     /// the per-model weight spec that used to live on the provider config.
     pub model_weights: Option<MistralrsWeights>,
-    pub preamble: String,
+    /// `None` sends no system prompt at all. That is what an agent which omits
+    /// `preamble` resolves to, and what every agentless session resolves to.
+    pub preamble: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub tool_call_max: usize,
@@ -218,18 +222,24 @@ pub struct ResolvedAgent {
 /// loop needs. Bails with a descriptive error if a reference is dangling or
 /// the api-key env var is unset.
 ///
+/// `agent_name` is optional: `None` resolves the *agentless* session that
+/// `outrig run` starts when neither `--agent` nor `default-agent` names one.
+/// That case behaves as an `[agents.<name>]` block with no keys set -- no
+/// preamble, no image hint, every limit from the top-level config -- so the
+/// only thing it still needs from somewhere is a model.
+///
 /// Each lookup is re-checked here -- the function does not assume
 /// `cfg.validate()` was called -- so errors carry the resolution context
 /// (which agent, which model) regardless.
 #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
-pub fn resolve_agent(cfg: &Config, agent_name: &str) -> Result<ResolvedAgent> {
+pub fn resolve_agent(cfg: &Config, agent_name: Option<&str>) -> Result<ResolvedAgent> {
     resolve_agent_with_overrides(cfg, agent_name, None, None)
 }
 
 #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub fn resolve_agent_with_device_override(
     cfg: &Config,
-    agent_name: &str,
+    agent_name: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
 ) -> Result<ResolvedAgent> {
     resolve_agent_with_overrides(cfg, agent_name, None, device_override)
@@ -237,31 +247,44 @@ pub fn resolve_agent_with_device_override(
 
 pub fn resolve_agent_with_overrides(
     cfg: &Config,
-    agent_name: &str,
+    agent_name: Option<&str>,
     model_override: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
 ) -> Result<ResolvedAgent> {
-    let agent = cfg.agents.get(agent_name).ok_or_else(|| {
-        let known = if cfg.agents.is_empty() {
-            "(none)".to_string()
-        } else {
-            cfg.agents
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        LlmResolveError::UnknownAgent {
-            name: agent_name.to_string(),
-            known,
+    // The agentless session resolves against an empty agent rather than a
+    // parallel code path, so every fallback below is written once and cannot
+    // drift between the two cases.
+    let empty;
+    let agent = match agent_name {
+        Some(name) => cfg.agents.get(name).ok_or_else(|| {
+            let known = if cfg.agents.is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.agents
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            LlmResolveError::UnknownAgent {
+                name: name.to_string(),
+                known,
+            }
+        })?,
+        None => {
+            empty = outrig::config::Agent::default();
+            &empty
         }
-    })?;
+    };
 
     let model_name = model_override
         .or(agent.model.as_deref())
         .or(cfg.default_model.as_deref())
-        .ok_or_else(|| LlmResolveError::AgentMissingModel {
-            agent: agent_name.to_string(),
+        .ok_or_else(|| match agent_name {
+            Some(agent) => LlmResolveError::AgentMissingModel {
+                agent: agent.to_string(),
+            },
+            None => LlmResolveError::MissingModel,
         })?;
 
     let model = cfg
@@ -375,16 +398,13 @@ pub fn resolve_agent_with_overrides(
     };
 
     Ok(ResolvedAgent {
-        agent_name: agent_name.to_string(),
+        agent_name: agent_name.map(str::to_string),
         model_name: model_name.to_string(),
         model_identifier,
         provider_name: model.provider.clone(),
         provider: resolved_provider,
         model_weights,
-        preamble: agent
-            .preamble
-            .clone()
-            .unwrap_or_else(|| DEFAULT_PREAMBLE.to_string()),
+        preamble: agent.preamble.clone(),
         temperature: agent.temperature,
         // The agent's ceiling wins; the model's is the fallback. A model that
         // carries one covers every agent pointed at it, which is what an
@@ -651,11 +671,17 @@ pub async fn build_agent(
 fn warn_fallback_ceiling(resolved: &ResolvedAgent) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        // An agentless session has no `[agents.<name>]` table to point at, so
+        // offer only the knob that exists for it.
+        let also = match &resolved.agent_name {
+            Some(agent) => format!(" (or [agents.{agent}].max-tokens)"),
+            None => String::new(),
+        };
         eprintln!(
             "[outrig] {} has no published output-token ceiling in this build, so turns \
-             are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens \
-             (or [agents.{}].max-tokens) to choose your own.",
-            resolved.model_identifier, resolved.model_name, resolved.agent_name,
+             are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens{also} \
+             to choose your own.",
+            resolved.model_identifier, resolved.model_name,
         );
     });
 }
@@ -1382,7 +1408,12 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
 ) -> rig::agent::Agent<M> {
     use rig::agent::AgentBuilder;
 
-    let mut builder = AgentBuilder::new(model).preamble(&resolved.preamble);
+    let mut builder = AgentBuilder::new(model);
+    // Skipped rather than passed as "": a builder that never saw a preamble
+    // sends no system prompt, which is what an unset `preamble` now means.
+    if let Some(preamble) = &resolved.preamble {
+        builder = builder.preamble(preamble);
+    }
     if let Some(temperature) = resolved.temperature {
         builder = builder.temperature(temperature as f64);
     }

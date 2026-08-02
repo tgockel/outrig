@@ -101,8 +101,8 @@ max-tokens  = 4096
 "#,
     ));
 
-    let r = resolve_agent(&cfg, "coding").expect("resolves");
-    assert_eq!(r.agent_name, "coding");
+    let r = resolve_agent(&cfg, Some("coding")).expect("resolves");
+    assert_eq!(r.agent_name.as_deref(), Some("coding"));
     assert_eq!(r.model_name, "fast");
     assert_eq!(r.model_identifier, "gpt-4o-mini");
     assert_eq!(r.provider_name, "openai");
@@ -114,7 +114,7 @@ max-tokens  = 4096
     };
     assert_eq!(base_url, "https://api.openai.com/v1");
     assert_eq!(api_key, "test-key");
-    assert_eq!(r.preamble, "you are a careful coder");
+    assert_eq!(r.preamble.as_deref(), Some("you are a careful coder"));
     assert_eq!(r.temperature, Some(0.2));
     assert_eq!(r.max_tokens, Some(4096));
     assert_eq!(r.tool_call_max, MAX_TOOL_CALLS);
@@ -141,7 +141,7 @@ preamble = "be meticulous"
 "#,
     ));
 
-    let r = resolve_agent(&cfg, "review").expect("resolves");
+    let r = resolve_agent(&cfg, Some("review")).expect("resolves");
     assert_eq!(r.model_name, "smart");
     assert_eq!(r.model_identifier, "gpt-4o");
 
@@ -162,10 +162,11 @@ preamble = "be meticulous"
 "#,
     ));
 
-    let r = resolve_agent_with_overrides(&cfg, "review", Some("smart"), None).expect("resolves");
+    let r =
+        resolve_agent_with_overrides(&cfg, Some("review"), Some("smart"), None).expect("resolves");
     assert_eq!(r.model_name, "smart");
     assert_eq!(r.model_identifier, "gpt-4o");
-    assert_eq!(r.preamble, "be meticulous");
+    assert_eq!(r.preamble.as_deref(), Some("be meticulous"));
 
     unset_env(var);
 }
@@ -183,7 +184,8 @@ preamble = "code"
 "#,
     ));
 
-    let r = resolve_agent_with_overrides(&cfg, "coding", Some("smart"), None).expect("resolves");
+    let r =
+        resolve_agent_with_overrides(&cfg, Some("coding"), Some("smart"), None).expect("resolves");
     assert_eq!(r.model_name, "smart");
     assert_eq!(r.model_identifier, "gpt-4o");
 
@@ -203,7 +205,8 @@ preamble = "code"
 "#,
     ));
 
-    let r = resolve_agent_with_overrides(&cfg, "coding", Some("fast"), None).expect("resolves");
+    let r =
+        resolve_agent_with_overrides(&cfg, Some("coding"), Some("fast"), None).expect("resolves");
     assert_eq!(r.model_name, "fast");
     assert_eq!(r.model_identifier, "gpt-4o-mini");
 
@@ -222,7 +225,7 @@ preamble = "code"
 "#,
     ));
 
-    let err = resolve_agent_with_overrides(&cfg, "coding", Some("ghost"), None).unwrap_err();
+    let err = resolve_agent_with_overrides(&cfg, Some("coding"), Some("ghost"), None).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -252,10 +255,10 @@ tool-call-max = 300
 "#,
     ));
 
-    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    let coding = resolve_agent(&cfg, Some("coding")).expect("coding resolves");
     assert_eq!(coding.tool_call_max, 100);
 
-    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    let review = resolve_agent(&cfg, Some("review")).expect("review resolves");
     assert_eq!(review.tool_call_max, 300);
 
     unset_env(var);
@@ -281,10 +284,10 @@ tool-result-max = 1048576
 "#,
     ));
 
-    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    let coding = resolve_agent(&cfg, Some("coding")).expect("coding resolves");
     assert_eq!(coding.tool_result_max_bytes, 524288);
 
-    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    let review = resolve_agent(&cfg, Some("review")).expect("review resolves");
     assert_eq!(review.tool_result_max_bytes, 1048576);
 
     unset_env(var);
@@ -311,9 +314,9 @@ subagent-depth-max = 2
     ));
 
     // Agent unset -> top-level; agent set -> agent wins.
-    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    let coding = resolve_agent(&cfg, Some("coding")).expect("coding resolves");
     assert_eq!(coding.subagent_depth_max, 4);
-    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    let review = resolve_agent(&cfg, Some("review")).expect("review resolves");
     assert_eq!(review.subagent_depth_max, 2);
 
     unset_env(var);
@@ -334,7 +337,7 @@ preamble = "code"
 "#,
     ));
 
-    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    let coding = resolve_agent(&cfg, Some("coding")).expect("coding resolves");
     assert_eq!(
         coding.subagent_depth_max,
         outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX
@@ -363,9 +366,9 @@ subagent-width-max = 3
 "#,
     ));
 
-    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    let coding = resolve_agent(&cfg, Some("coding")).expect("coding resolves");
     assert_eq!(coding.subagent_width_max, 6);
-    let review = resolve_agent(&cfg, "review").expect("review resolves");
+    let review = resolve_agent(&cfg, Some("review")).expect("review resolves");
     assert_eq!(review.subagent_width_max, 3);
 
     unset_env(var);
@@ -384,7 +387,7 @@ preamble = "code"
 "#,
     ));
 
-    let coding = resolve_agent(&cfg, "coding").expect("coding resolves");
+    let coding = resolve_agent(&cfg, Some("coding")).expect("coding resolves");
     assert_eq!(
         coding.subagent_width_max,
         outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX
@@ -393,8 +396,9 @@ preamble = "code"
     unset_env(var);
 }
 
+/// An agent that declares no `preamble` sends no system prompt.
 #[test]
-fn missing_preamble_falls_back_to_default() {
+fn missing_preamble_sends_none() {
     let var = "OUTRIG_TEST_LLM_RESOLVE_PREAMBLE";
     set_env(var, "k");
     let cfg = parse(&cfg_with_key_var(
@@ -405,11 +409,98 @@ fn missing_preamble_falls_back_to_default() {
 "#,
     ));
 
-    let r = resolve_agent(&cfg, "coding").expect("resolves");
+    let r = resolve_agent(&cfg, Some("coding")).expect("resolves");
+    assert_eq!(r.preamble, None, "an unset preamble must stay unset");
+
+    unset_env(var);
+}
+
+/// The agentless session `outrig run` starts when neither `--agent` nor
+/// `default-agent` names one. It resolves against an empty agent: no
+/// preamble, no image hint, no sampling overrides, and every limit from the
+/// top-level config.
+#[test]
+fn no_agent_resolves_against_the_defaults() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_NO_AGENT";
+    set_env(var, "test-key");
+    let cfg = parse(&cfg_with_key_var(var, r#"default-model = "fast""#, ""));
+
+    let r = resolve_agent(&cfg, None).expect("resolves without an agent");
+    assert_eq!(r.agent_name, None);
+    assert_eq!(r.preamble, None);
+    assert_eq!(r.image, None);
+    assert_eq!(r.temperature, None);
+    assert_eq!(r.max_tokens, None);
+    assert_eq!(r.model_name, "fast");
+    assert_eq!(r.model_identifier, "gpt-4o-mini");
+    assert_eq!(r.tool_call_max, MAX_TOOL_CALLS);
+    assert_eq!(r.tool_result_max_bytes, DEFAULT_TOOL_RESULT_MAX_BYTES);
+
+    unset_env(var);
+}
+
+/// Declaring agents does not make one *apply*: an agentless session ignores
+/// the `[agents]` table entirely rather than picking an arbitrary entry.
+#[test]
+fn no_agent_ignores_declared_agents() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_NO_AGENT_IGNORES";
+    set_env(var, "test-key");
+    let cfg = parse(&cfg_with_key_var(
+        var,
+        r#"default-model = "fast""#,
+        r#"
+[agents.coding]
+model    = "smart"
+preamble = "you are a careful coder"
+image    = "coding"
+"#,
+    ));
+
+    let r = resolve_agent(&cfg, None).expect("resolves without an agent");
+    assert_eq!(r.agent_name, None);
+    assert_eq!(r.preamble, None);
+    assert_eq!(r.image, None);
+    assert_eq!(r.model_name, "fast", "default-model, not the agent's model");
+
+    unset_env(var);
+}
+
+/// `--model` is the other way an agentless session names its model.
+#[test]
+fn no_agent_takes_the_model_override() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_NO_AGENT_MODEL";
+    set_env(var, "test-key");
+    let cfg = parse(&cfg_with_key_var(var, "", ""));
+
+    let r = resolve_agent_with_overrides(&cfg, None, Some("smart"), None)
+        .expect("resolves without an agent");
+    assert_eq!(r.model_name, "smart");
+    assert_eq!(r.model_identifier, "gpt-4o");
+
+    unset_env(var);
+}
+
+/// A model is the one thing an agentless session cannot do without, and the
+/// error has no agent name to quote -- so it names the two knobs instead.
+#[test]
+fn no_agent_and_no_model_errors() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_NO_AGENT_NO_MODEL";
+    set_env(var, "test-key");
+    let cfg = parse(&cfg_with_key_var(var, "", ""));
+
+    let err = resolve_agent(&cfg, None).unwrap_err();
+    let msg = err.to_string();
     assert!(
-        r.preamble.contains("sandboxed container"),
-        "default preamble should mention the sandbox; got: {}",
-        r.preamble,
+        matches!(err, CliError::LlmResolve(LlmResolveError::MissingModel)),
+        "got: {err:?}",
+    );
+    assert!(
+        msg.contains("--model"),
+        "error should name --model; got: {msg}"
+    );
+    assert!(
+        msg.contains("default-model"),
+        "error should name default-model; got: {msg}",
     );
 
     unset_env(var);
@@ -418,7 +509,7 @@ fn missing_preamble_falls_back_to_default() {
 #[test]
 fn mistralrs_device_defaults_to_cpu() {
     let cfg = local_mistralrs_cfg(None);
-    let r = resolve_agent(&cfg, "smoke").expect("resolves");
+    let r = resolve_agent(&cfg, Some("smoke")).expect("resolves");
     let weights = r.model_weights.as_ref().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }
@@ -426,7 +517,7 @@ fn mistralrs_device_defaults_to_cpu() {
 #[test]
 fn mistralrs_cpu_device_resolves_to_weights() {
     let cfg = local_mistralrs_cfg(Some("cpu"));
-    let r = resolve_agent(&cfg, "smoke").expect("resolves");
+    let r = resolve_agent(&cfg, Some("smoke")).expect("resolves");
     let weights = r.model_weights.as_ref().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }
@@ -434,7 +525,7 @@ fn mistralrs_cpu_device_resolves_to_weights() {
 #[test]
 fn mistralrs_invalid_device_errors_during_resolve() {
     let cfg = local_mistralrs_cfg(Some("cuda:"));
-    let err = resolve_agent(&cfg, "smoke").unwrap_err();
+    let err = resolve_agent(&cfg, Some("smoke")).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -450,7 +541,7 @@ fn mistralrs_invalid_device_errors_during_resolve() {
 #[test]
 fn mistralrs_device_override_replaces_model_device() {
     let cfg = local_mistralrs_cfg(Some("cuda"));
-    let r = resolve_agent_with_device_override(&cfg, "smoke", Some(MistralrsDeviceSpec::Cpu))
+    let r = resolve_agent_with_device_override(&cfg, Some("smoke"), Some(MistralrsDeviceSpec::Cpu))
         .expect("resolves");
     let weights = r.model_weights.as_ref().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
@@ -471,7 +562,7 @@ preamble = "hi"
 
     let r = resolve_agent_with_overrides(
         &cfg,
-        "coding",
+        Some("coding"),
         Some("claude"),
         Some(MistralrsDeviceSpec::Cpu),
     )
@@ -494,8 +585,9 @@ preamble = "hi"
 "#,
     ));
 
-    let err = resolve_agent_with_device_override(&cfg, "coding", Some(MistralrsDeviceSpec::Cpu))
-        .unwrap_err();
+    let err =
+        resolve_agent_with_device_override(&cfg, Some("coding"), Some(MistralrsDeviceSpec::Cpu))
+            .unwrap_err();
     unset_env(var);
     assert!(
         matches!(
@@ -518,7 +610,7 @@ preamble = "hi"
 #[test]
 fn mistralrs_cuda_device_feature_off_explains_clearly() {
     let cfg = local_mistralrs_cfg(Some("cuda:2"));
-    let err = resolve_agent(&cfg, "smoke").unwrap_err();
+    let err = resolve_agent(&cfg, Some("smoke")).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -542,7 +634,7 @@ fn mistralrs_cuda_device_feature_off_explains_clearly() {
 #[test]
 fn mistralrs_metal_device_feature_off_explains_clearly() {
     let cfg = local_mistralrs_cfg(Some("metal"));
-    let err = resolve_agent(&cfg, "smoke").unwrap_err();
+    let err = resolve_agent(&cfg, Some("smoke")).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -574,7 +666,7 @@ preamble = "hi"
 "#,
     ));
 
-    let err = resolve_agent(&cfg, "ghost").unwrap_err();
+    let err = resolve_agent(&cfg, Some("ghost")).unwrap_err();
     let msg = err.to_string();
     assert!(
         matches!(
@@ -615,7 +707,7 @@ preamble = "hi"
 "#,
     );
 
-    let err = resolve_agent(&cfg, "coding").unwrap_err();
+    let err = resolve_agent(&cfg, Some("coding")).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -639,7 +731,7 @@ preamble = "hi"
 "#,
     );
 
-    let err = resolve_agent(&cfg, "coding").unwrap_err();
+    let err = resolve_agent(&cfg, Some("coding")).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -667,7 +759,7 @@ async fn mistralrs_provider_feature_off_explains_clearly() {
 preamble = "hi"
 "#,
     ));
-    let resolved = resolve_agent(&cfg, "review").expect("resolves");
+    let resolved = resolve_agent(&cfg, Some("review")).expect("resolves");
     assert!(
         matches!(resolved.provider, ResolvedProvider::Mistralrs),
         "expected Mistralrs resolved-provider, got {:?}",
@@ -730,7 +822,7 @@ preamble = "you are a careful coder"
 "#,
     );
 
-    let r = resolve_agent(&cfg, "coding").expect("resolves");
+    let r = resolve_agent(&cfg, Some("coding")).expect("resolves");
     assert_eq!(r.model_identifier, "claude-sonnet-4-6");
     assert_eq!(r.provider_name, "claude");
     let ResolvedProvider::Anthropic {
@@ -777,13 +869,13 @@ max-tokens = 4096
 "#,
     );
     assert_eq!(
-        resolve_agent(&cfg, "inherits")
+        resolve_agent(&cfg, Some("inherits"))
             .expect("resolves")
             .max_tokens,
         Some(16384),
     );
     assert_eq!(
-        resolve_agent(&cfg, "overrides")
+        resolve_agent(&cfg, Some("overrides"))
             .expect("resolves")
             .max_tokens,
         Some(4096),
@@ -801,7 +893,7 @@ preamble = "hi"
 "#,
     );
     assert_eq!(
-        resolve_agent(&cfg, "inherits")
+        resolve_agent(&cfg, Some("inherits"))
             .expect("resolves")
             .max_tokens,
         None,
@@ -825,8 +917,9 @@ preamble = "hi"
 "#,
     );
 
-    let err = resolve_agent_with_device_override(&cfg, "coding", Some(MistralrsDeviceSpec::Cpu))
-        .expect_err("device override should be rejected");
+    let err =
+        resolve_agent_with_device_override(&cfg, Some("coding"), Some(MistralrsDeviceSpec::Cpu))
+            .expect_err("device override should be rejected");
     unset_env(var);
     assert!(
         matches!(
@@ -853,7 +946,7 @@ preamble = "hi"
 "#,
     );
 
-    let err = resolve_agent(&cfg, "coding").expect_err("unset key should fail");
+    let err = resolve_agent(&cfg, Some("coding")).expect_err("unset key should fail");
     assert!(
         matches!(err, CliError::Outrig(outrig::error::OutrigError::ApiKey(_))),
         "got: {err:?}"
@@ -886,7 +979,7 @@ preamble = "hi"
 "#,
     ));
 
-    let err = resolve_agent(&cfg, "coding").unwrap_err();
+    let err = resolve_agent(&cfg, Some("coding")).unwrap_err();
     let msg = err.to_string();
     assert!(
         matches!(err, CliError::Outrig(outrig::error::OutrigError::ApiKey(_))),

@@ -137,7 +137,7 @@ pub async fn execute(
         attach_target: args.attach.as_deref(),
         agent_flag: None,
         model_override: None,
-        require_agent: false,
+        llm_session: false,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
         device_override: None,

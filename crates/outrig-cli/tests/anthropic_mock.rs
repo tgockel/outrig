@@ -191,7 +191,7 @@ async fn build_mock_agent(
     tools: Vec<EchoTool>,
 ) -> outrig_cli::llm::RigAgent {
     set_test_env(var, KEY);
-    let resolved = resolve_agent(cfg, "coding").expect("resolves");
+    let resolved = resolve_agent(cfg, Some("coding")).expect("resolves");
     unset_test_env(var);
 
     #[cfg(feature = "local-llm")]

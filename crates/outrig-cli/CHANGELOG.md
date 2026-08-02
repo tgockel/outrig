@@ -48,6 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`outrig run` no longer needs an agent.** With neither `--agent` nor `default-agent`, the
+  session starts against `--model` (or `default-model`) and `--image` (or `default-image`) and
+  sends no preamble -- the same shape `outrig mcp` has always had, now with an LLM attached.
+  Every agent-level knob falls through to its top-level default, subagents stay enabled, and
+  the banner leads with `model:` in place of the usual `agent:` line. Declaring
+  `[agents.<name>]` is still how you attach a preamble or per-agent limits; it is just no
+  longer the price of admission. A `default-agent` that names nothing remains an error.
+
+- **Breaking (config): an agent that omits `preamble` now sends no system prompt.** outrig used
+  to fill the gap with a fixed sentence ("You are a careful assistant whose tools run inside a
+  sandboxed container."), which appeared nowhere in config and could not be turned off. Unset
+  now means unset, so an agent that was relying on that text needs to spell it out. Agents that set
+  `preamble` are unaffected. Subagents are unaffected too -- their preamble is composed from the
+  `set_result` protocol fragment plus whatever the parent passes.
+
 - **Transient LLM failures are retried against a time budget, and honor `Retry-After`.**
   Retrying used to mean two attempts roughly a second apart with the server's own guidance
   ignored, which is not enough for a rate limit measured in minutes. outrig now retries until

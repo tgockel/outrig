@@ -34,6 +34,36 @@ fn fixture_mcp_fs_dir() -> PathBuf {
 }
 
 fn write_smoke_config(repo: &Path, mock_addr: &str) {
+    write_config(
+        repo,
+        mock_addr,
+        r#"
+default-agent = "smoke"
+"#,
+        r#"
+[agents.smoke]
+model = "fast"
+preamble = "test"
+"#,
+    );
+}
+
+/// The same fixture with no agent surface at all: no `default-agent`, no
+/// `[agents]` table. `default-model` is what the session resolves against.
+fn write_agentless_config(repo: &Path, mock_addr: &str) {
+    write_config(
+        repo,
+        mock_addr,
+        r#"
+default-model = "fast"
+"#,
+        "",
+    );
+}
+
+/// `top` lands with the other scalar keys, above every table; `agents` lands
+/// at the bottom, after the provider/model registry.
+fn write_config(repo: &Path, mock_addr: &str, top: &str, agents: &str) {
     let agents_dir = repo.join(".agents/outrig");
     std::fs::create_dir_all(&agents_dir).expect("mkdir .agents/outrig");
 
@@ -41,8 +71,8 @@ fn write_smoke_config(repo: &Path, mock_addr: &str) {
     let context = fixture_mcp_fs_dir();
     let config_toml = format!(
         r#"
-default-agent = "smoke"
 default-image = "smoke"
+{top}
 
 [providers.openai]
 style = "openai"
@@ -54,16 +84,13 @@ request-timeout-secs = 10
 provider = "openai"
 identifier = "gpt-4o-mini"
 
-[agents.smoke]
-model = "fast"
-preamble = "test"
-
 [images.smoke]
 dockerfile = "{dockerfile}"
 context = "{context}"
 
   [images.smoke.mcp]
   fs = ["mcp-server-filesystem", "/workspace"]
+{agents}
 "#,
         addr = mock_addr,
         dockerfile = dockerfile.display(),
@@ -192,6 +219,82 @@ async fn run_drives_one_tool_call_and_prints_reply() {
     assert!(
         leftovers.trim().is_empty(),
         "this run's container `{our_container}` is still alive: {leftovers}"
+    );
+}
+
+/// `outrig run` with no agent anywhere in config: it starts, the banner leads
+/// with the model instead of an agent name, and the request carries no
+/// `system` message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_without_an_agent_sends_no_preamble() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = listener.local_addr().expect("mock addr");
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let server_handle = tokio::spawn(run_mock_openai_capturing(listener, Some(request_tx)));
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_agentless_config(repo_dir.path(), &mock_addr.to_string());
+
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
+
+    let captured = run_child(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+        ],
+        repo_dir.path(),
+    )
+    .await;
+    server_handle.abort();
+
+    assert!(
+        captured.status.success(),
+        "agentless run exited with {:?}; stderr was: {}",
+        captured.status,
+        captured.stderr,
+    );
+    assert!(
+        captured.stderr.contains("[outrig] model:"),
+        "banner should lead with the model when no agent is configured: {}",
+        captured.stderr,
+    );
+    assert!(
+        !captured.stderr.contains("[outrig] agent:"),
+        "banner should not print an agent line when none is configured: {}",
+        captured.stderr,
+    );
+    assert!(
+        captured.stdout.contains("listed the workspace"),
+        "stdout lacked canned reply: {}",
+        captured.stdout,
+    );
+
+    let request = timeout(Duration::from_secs(5), request_rx.recv())
+        .await
+        .expect("mock server did not capture the first request")
+        .expect("mock server request channel closed");
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("first request has messages array");
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.get("role").and_then(Value::as_str) == Some("system")),
+        "an agentless session must send no system message; got: {}",
+        serde_json::to_string(messages).expect("messages serialize"),
     );
 }
 
@@ -508,10 +611,20 @@ async fn run_child_with_input(args: &[&str], repo: &Path, input: &[u8]) -> Captu
     }
 }
 
+async fn run_mock_openai(listener: TcpListener) {
+    run_mock_openai_capturing(listener, None).await
+}
+
 /// Hand-rolled mock OpenAI server. Reads HTTP/1.1 requests, parses
 /// Content-Length, and returns canned chat-completions responses. The first
 /// request is answered with a tool-call; the second with a final text reply.
-async fn run_mock_openai(listener: TcpListener) {
+///
+/// `request_tx`, when given, forwards each parsed request body so a test can
+/// assert on what outrig put on the wire.
+async fn run_mock_openai_capturing(
+    listener: TcpListener,
+    request_tx: Option<mpsc::UnboundedSender<Value>>,
+) {
     let mut request_count = 0u32;
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
@@ -559,7 +672,10 @@ async fn run_mock_openai(listener: TcpListener) {
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
             })
         };
-        let _ = drain_request(&mut sock).await;
+        let request = drain_request(&mut sock).await.unwrap_or(Value::Null);
+        if let Some(tx) = &request_tx {
+            let _ = tx.send(request);
+        }
         let body_str = serde_json::to_string(&body).unwrap_or_default();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

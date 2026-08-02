@@ -80,7 +80,9 @@ identifier; every agent using that name picks up the change.
 
 ## `[agents.<name>]`
 
-An agent ties a model to a system preamble and (optionally) a default image.
+An agent ties a model to a system preamble and (optionally) a default image. Agents are
+optional: `outrig run` with neither `--agent` nor `default-agent` runs the model directly,
+with no preamble and no agent-level knobs.
 
 ```toml
 [agents.coding]
@@ -100,7 +102,8 @@ preamble = "You are a meticulous code reviewer. Be specific about line numbers."
 `[models.<name>]`; if omitted, the agent inherits the top-level `default-model` (typically
 declared in `~/.outrig/config.toml`). `image` is optional too: if set, `outrig run --agent
 <name>` defaults to that image-config. `preamble` is the system prompt the agent operates
-under -- the place to encode role, scope, voice.
+under -- the place to encode role, scope, voice. It is optional as well: an agent with no
+`preamble` runs with no system prompt.
 
 `temperature` and `max-tokens` live on the agent because the same underlying model is often used
 with different sampling for different tasks (e.g. low temperature for code, higher for
@@ -318,10 +321,10 @@ api-key  = "${OPENAI_API_KEY}"
 | `[models.<name>]`     | typical home (reused names)      | allowed for repo-specific models    |
 | `[agents.<name>]`     | rare                             | typical home                        |
 | `[workspace]`         | --                               | repo only                           |
-| `[images.<name>]` | --                               | repo only                           |
+| `[images.<name>]`     | --                               | repo only                           |
 | `default-model`       | typical home                     | optional override                   |
-| `default-agent`       | rare                             | required for `outrig run`           |
-| `default-image`   | rare                             | required for `outrig run`           |
+| `default-agent`       | rare                             | optional                            |
+| `default-image`       | rare                             | required for `outrig run`           |
 
 If a name is defined in both, the repo wins -- override by redefining.
 
