@@ -12,10 +12,11 @@
 //!
 //! * the wire shape is Anthropic's, not an OpenAI-compatible one (path,
 //!   `x-api-key`, `anthropic-version`, `input_schema`, content blocks);
-//! * `max_tokens` behavior for a model identifier rig recognizes and one it
-//!   does not -- the difference between `completion_model` (what `build_agent`
-//!   uses) and `CompletionModel::with_model` (which would silently cap replies
-//!   at 2048 tokens);
+//! * which of the three `max_tokens` tiers -- config, rig's published ceiling,
+//!   OutRig's fallback -- reaches the wire for a model identifier rig
+//!   recognizes and one it does not, including the difference between
+//!   `completion_model` (what `build_agent` uses) and
+//!   `CompletionModel::with_model` (which would silently cap replies at 2048);
 //! * the shared retry client covers this provider too -- including that a
 //!   `Retry-After` sets the wait, and that a spent budget ends the turn
 //!   without taking the session with it.
@@ -92,6 +93,10 @@ const PREAMBLE: &str = "You are a careful coding assistant.";
 /// Low enough that a test can drive the agent into the cap in one turn.
 const TOOL_CALL_MAX: usize = 1;
 const MODEL: &str = "claude-sonnet-4-6";
+/// A recognized identifier whose published ceiling differs from both `MODEL`'s
+/// and outrig's fallback, so a test can tell the three apart by the number
+/// alone.
+const HIGHER_CEILING_MODEL: &str = "claude-opus-4-7";
 /// An identifier outrig has no published ceiling for -- which is the case a
 /// user picking anything but a current model hits on their first run.
 const UNRECOGNIZED_MODEL: &str = "claude-3-5-sonnet-20241022";
@@ -533,11 +538,12 @@ async fn exhausted_budget_ends_the_turn_without_killing_the_agent() {
 }
 
 /// Anthropic requires `max_tokens` on every request, and rig only knows a
-/// default for the identifiers it recognizes. This pins what OutRig does in
-/// each case -- most importantly that an unrecognized identifier *fails*
-/// rather than quietly acquiring a ceiling nobody chose.
+/// default for the identifiers it recognizes. This pins all three tiers of the
+/// precedence OutRig applies -- config, rig's published ceiling, OutRig's
+/// fallback -- including, in both directions, that the fallback fills only the
+/// gap and never overrides a ceiling rig or the user already chose.
 #[tokio::test]
-async fn max_tokens_comes_from_rig_for_known_models_and_config_otherwise() {
+async fn max_tokens_comes_from_config_then_rig_then_the_fallback() {
     // 1. Recognized identifier, nothing configured: rig's own default for the
     //    Claude 4 family travels on the request.
     let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
@@ -548,15 +554,33 @@ async fn max_tokens_comes_from_rig_for_known_models_and_config_otherwise() {
     assert_eq!(recorded.len(), 1);
     assert_eq!(
         recorded[0].body["max_tokens"], 64_000,
-        "rig's published ceiling for the Claude 4 family",
+        "rig's published ceiling for the Claude 4 family, not OutRig's fallback",
     );
 
-    // 2. Unrecognized identifier, nothing configured: the turn fails, and it
-    //    fails *before* any request goes out. A silent 2048-token ceiling here
-    //    -- what `CompletionModel::with_model` would produce -- would show up
-    //    as one recorded request instead.
+    // 2. Another recognized identifier, whose published ceiling is higher than
+    //    the fallback. Together with case 1 this is what would catch a fallback
+    //    that stopped checking whether rig already had an answer: it would show
+    //    up here as a ceiling *lowered* to 32768.
     let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
-    let err = run_one_turn(
+    run_one_turn(
+        addr,
+        "OUTRIG_TEST_ANTHROPIC_HIGHER",
+        HIGHER_CEILING_MODEL,
+        None,
+        vec![],
+    )
+    .await
+    .expect("a recognized identifier needs no configured ceiling");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].body["max_tokens"], 128_000);
+
+    // 3. Unrecognized identifier, nothing configured: rig has no ceiling to
+    //    offer, so OutRig's fallback fills the gap and the turn runs. It is
+    //    deliberately not rig's silent 2048 -- see
+    //    `rig_max_tokens_defaults_differ_between_constructors` below.
+    let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
+    run_one_turn(
         addr,
         "OUTRIG_TEST_ANTHROPIC_UNKNOWN",
         UNRECOGNIZED_MODEL,
@@ -564,19 +588,16 @@ async fn max_tokens_comes_from_rig_for_known_models_and_config_otherwise() {
         vec![],
     )
     .await
-    .expect_err("an unrecognized identifier has no ceiling to fall back on");
-    assert!(
-        err.to_string()
-            .contains("`max_tokens` must be set for Anthropic"),
-        "the error should say which knob is missing, got: {err}",
-    );
-    assert!(
-        drain_recorded(&mut requests).is_empty(),
-        "no request should be sent without a ceiling",
+    .expect("the fallback ceiling covers an identifier rig does not recognize");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].body["max_tokens"],
+        outrig_cli::llm::ANTHROPIC_FALLBACK_MAX_TOKENS,
     );
 
-    // 3. Unrecognized identifier with a configured ceiling: that value is
-    //    what travels, and the turn works.
+    // 4. Unrecognized identifier with a configured ceiling: that value is
+    //    what travels, over the fallback.
     let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
     run_one_turn(
         addr,
@@ -597,9 +618,10 @@ async fn max_tokens_comes_from_rig_for_known_models_and_config_otherwise() {
 /// than in a truncated reply months later.
 ///
 /// `build_agent` must keep using `CompletionClient::completion_model`: it
-/// leaves the default unset for an identifier rig does not recognize, which is
-/// what turns a missing ceiling into the loud error above.
-/// `CompletionModel::with_model` invents 2048 instead.
+/// leaves the default unset for an identifier rig does not recognize, and that
+/// `None` is the signal the fallback ceiling keys off. `CompletionModel::with_model`
+/// invents 2048 first, which would both hide the gap and cap replies at a
+/// quarter of what the fallback chooses.
 #[test]
 fn rig_max_tokens_defaults_differ_between_constructors() {
     use rig::client::CompletionClient;
@@ -627,8 +649,8 @@ fn rig_max_tokens_defaults_differ_between_constructors() {
             .completion_model("claude-3-5-sonnet-20241022")
             .default_max_tokens,
         None,
-        "an unrecognized identifier must reach the request with no ceiling, \
-         so rig raises its explicit error",
+        "an unrecognized identifier must arrive with no ceiling, so build_agent \
+         can tell that gap from a ceiling rig chose",
     );
 
     assert_eq!(

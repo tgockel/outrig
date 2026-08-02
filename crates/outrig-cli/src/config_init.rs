@@ -201,10 +201,10 @@ const MODEL_IDENTIFIER_FIELD: Field = Field {
 const MODEL_MAX_TOKENS_FIELD: Field = Field {
     name: "max-tokens for this model",
     description: "Output-token ceiling per turn. Anthropic requires one on \
-                  every request, and outrig knows a default only for current \
-                  Claude identifiers -- any other one fails its first turn \
-                  without this. An agent's own max-tokens still wins. Blank \
-                  to omit.",
+                  every request, and outrig knows the published ceiling only \
+                  for current Claude identifiers -- any other one falls back \
+                  to a conservative default without this. An agent's own \
+                  max-tokens still wins. Blank to omit.",
     options: &[],
     doc_link: "doc/reference/config.md",
 };
@@ -433,8 +433,9 @@ pub(crate) async fn prompt_models_loop(
 /// An Anthropic model: the identifier, plus the output-token ceiling its API
 /// requires on every request. The default matches the published ceiling for
 /// the Claude 4 family, so accepting it never lowers one outrig would have
-/// sent anyway -- and an identifier outrig has no default for still gets a
-/// config that works on its first turn.
+/// sent anyway -- and an identifier outrig has no published ceiling for gets a
+/// number chosen for it here rather than the conservative fallback
+/// `build_agent` would otherwise apply.
 async fn prompt_anthropic_model(
     prompt: &mut impl PromptSource,
     provider_name: String,

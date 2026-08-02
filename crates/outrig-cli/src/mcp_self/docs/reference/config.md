@@ -317,6 +317,10 @@ identifier = "gpt-4o"
 decide -- which is fine for OpenAI-compatible endpoints, and is what the next section is
 about for Anthropic.
 
+Note the spelling. In config it is `max-tokens`, like every other key; `max_tokens` is
+rejected as an unknown field. The underscored form is what the provider API calls it, so it
+is what appears in a raw error coming back from one.
+
 #### anthropic models
 
 ```toml
@@ -330,18 +334,32 @@ identifier = "claude-3-5-sonnet-20241022"
 max-tokens = 8192
 ```
 
-The Messages API rejects a request with no `max_tokens`, so outrig has to send one. It
-knows the published ceiling for current Claude model identifiers -- the `claude-opus-4-6`
-and later families, and the `claude-sonnet-4` / `claude-haiku-4-5` families -- and uses it
-when neither the model nor the agent sets one. For any other identifier there is no such
-default, and a turn fails with `` `max_tokens` must be set for Anthropic ``. Set
-`max-tokens` on the model (as `[models.older]` does above) or on the agent.
+The Messages API rejects a request with no `max_tokens`, so outrig has to send one. Three
+tiers decide which, highest priority first:
 
-outrig deliberately has no fallback ceiling of its own. A number invented here would apply
-to models it was never chosen for, and the failure -- replies cut short mid-sentence, with
-nothing logged -- is far harder to recognize than an error naming the missing setting.
+1. `[agents.<name>].max-tokens`, then `[models.<name>].max-tokens`.
+2. The published ceiling for a Claude identifier outrig recognizes -- 128000 for the
+   `claude-opus-4-6` and later families, 64000 for the `claude-opus-4`, `claude-sonnet-4`,
+   and `claude-haiku-4-5` families.
+3. Otherwise a fallback of **32768**, announced once on stderr:
+
+   ```text
+   [outrig] claude-3-5-sonnet-20241022 has no published output-token ceiling in this
+            build, so turns are capped at 32768. Set [models.older].max-tokens (or
+            [agents.coding].max-tokens) to choose your own.
+   ```
+
+Tier 3 is a floor under the failure, not a recommendation -- prefer setting the ceiling
+yourself, as `[models.older]` does above. The recognized set in tier 2 is whatever the
+pinned rig release knows, so an identifier newer than that release lands in tier 3 even
+though it is current.
+
+32768 is chosen to fail in the direction you can see. A model whose real limit is *lower*
+-- the 3.x families cap at 8192 or 4096 -- rejects the request outright, naming its own
+limit, and one config line fixes it. A ceiling set too low instead cuts replies off
+mid-sentence with nothing logged, which is much harder to recognize as a config problem.
 `outrig config init` prompts for `max-tokens` when it writes an Anthropic model, so a
-generated config carries an explicit one.
+generated config carries an explicit one either way.
 
 ### mistralrs models
 
@@ -429,9 +447,9 @@ preamble = "You are a meticulous code reviewer..."
   to launch.
 - `temperature` (float, optional, default: provider default): sampling temperature.
 - `max-tokens` (integer, optional, default: the model's `max-tokens`, else the provider
-  default): output token max per turn. Required in one place or the other for an Anthropic
-  model whose identifier outrig does not recognize -- see
-  [anthropic models](#anthropic-models).
+  default): output token max per turn. Worth setting in one place or the other for an
+  Anthropic model whose identifier outrig does not recognize, which otherwise runs on a
+  fallback ceiling -- see [anthropic models](#anthropic-models).
 - `tool-call-max` (integer, optional, default: top-level value or `50`): tool calls per turn.
 - `tool-result-max` (integer, optional, default: top-level value or `262144`): bytes per result.
 - `subagents` (bool, optional, default: `true`): whether this agent may launch subagents. When

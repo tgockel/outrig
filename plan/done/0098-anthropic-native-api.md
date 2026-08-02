@@ -303,6 +303,9 @@ container environments.
    that changes either value fails) and the OutRig-level behavior (an unrecognized identifier
    with no ceiling sends *zero* requests -- `with_model` would send one carrying 2048).
 
+   **Superseded in part, still unreleased.** The constructor choice stands, but "no ceiling
+   anywhere is an error" did not. See decision 9.
+
 4. **The three provider-specific validation errors were renamed and now carry the style.**
    `OpenAiModelMissingIdentifier`/`OpenAiModelHasMistralrsField` became
    `RemoteModelMissingIdentifier { model, style }` / `RemoteModelHasMistralrsField { model, style,
@@ -335,6 +338,32 @@ container environments.
    `anthropic-beta` remain rig's defaults; prompt caching, citations, and reasoning display have
    no config surface yet. The `doc/concepts/llm-providers.md` TODO now names those rather than
    claiming native Anthropic is unwired.
+
+9. **Revisited after the fact: "do not invent a second OutRig-wide token default" (above, under
+   *Token limit behavior*) was wrong, and `build_agent` now falls back to 32768.** The argument
+   against a default assumed the alternative was a *global* ceiling that would apply to models it
+   was never chosen for. What shipped is narrower: it applies only where `resolved.max_tokens` is
+   `None` *and* rig's own `default_max_tokens` is `None`, so an explicit `max-tokens` and every
+   published per-model ceiling still win, and it announces itself once on stderr.
+
+   What the original reasoning underweighted is how large the unrecognized set is and which way
+   it grows. It is not just older models and proxy naming -- it is every Claude released after
+   the pinned rig. So "fails on its first turn" was the default experience for a user picking a
+   current model, and it got worse with time rather than better, which is not a defensible
+   resting state for the recommended provider style.
+
+   The silent-truncation concern is answered by the number rather than by refusing to pick one.
+   32768 sits under every current-generation ceiling and above any reply a turn realistically
+   produces; where it *is* wrong -- a 3.x identifier capped at 8192 or 4096 -- Anthropic rejects
+   the request and names the real limit, which is the loud failure the original decision wanted.
+   Reversing this was cheap because none of it had shipped: `[models.<name>].max-tokens` and the
+   Anthropic style were both still under `## [Unreleased]`.
+
+   The same change reworded the error a missing ceiling produces. Rig's text names `max_tokens`,
+   which is the wire field and not a key any outrig table accepts (`rename_all = "kebab-case"`
+   plus `deny_unknown_fields`), so `CliError::PromptMissingMaxTokens` says `max-tokens` and names
+   `[models.<name>]` / `[agents.<name>]`. With the fallback in place it is unreachable on the
+   native path; it stays for the streaming path and for a rig upgrade that moves the default.
 
 ## Dependencies
 

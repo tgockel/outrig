@@ -189,11 +189,16 @@ translates to and from chat-completions on someone else's server, while this one
 native protocol end to end. Prefer the native style when you hold an Anthropic key.
 
 The one thing it asks of you is `max-tokens`. The Messages API requires an output-token
-ceiling on every request; outrig knows the published one for current Claude identifiers and
-sends it automatically, but for any other identifier -- an older model, a proxy's own naming
--- there is nothing to fall back on and the turn fails saying so. Set `max-tokens` on the
-model (covering every agent that uses it) or on the agent. outrig does not invent a ceiling
-of its own, because a wrong one truncates replies silently.
+ceiling on every request, so outrig always sends one: yours if you set it on the model
+(covering every agent that uses it) or on the agent, otherwise the published ceiling for a
+Claude identifier it recognizes, otherwise a fallback of 32768. That last case -- an older
+model, a proxy's own naming, or simply a model newer than the pinned rig release -- says so
+once on stderr rather than picking a number quietly.
+
+Prefer setting the ceiling yourself. The fallback keeps a first run working; it does not
+know your model. It errs high deliberately, because a model whose real limit is lower
+rejects the request and names that limit, whereas a ceiling set too low truncates replies
+mid-sentence with nothing logged.
 
 Everything else is shared with the other remote styles: `request-timeout-secs`,
 `retry-budget-secs`, tool-call limits, tool-result truncation, conversation history, and

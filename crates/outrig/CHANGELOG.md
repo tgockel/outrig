@@ -48,9 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It exists because Anthropic requires `max_tokens` on every request and the ceiling is a
   property of the model, not of the role using it. outrig sends the published ceiling for
   the Claude identifiers it recognizes; any other identifier now has somewhere to declare
-  one other than every agent that names it. outrig does not fall back to a ceiling of its
-  own -- a wrong one truncates replies with nothing logged, which is much harder to
-  diagnose than the error naming the missing setting.
+  one other than every agent that names it. Setting neither is no longer an error: an
+  Anthropic model outrig has no published ceiling for falls back to 32768 and says so once
+  on stderr, naming the tables the ceiling belongs in. The fallback errs high on purpose --
+  a model whose real limit is lower rejects the request and names that limit, whereas a
+  ceiling set too low truncates replies with nothing logged.
 
 - **Relative config paths resolve against the file that declared them.** A path in
   `~/.outrig/config.toml` (or a `--global-config` file) is now relative to that file's own

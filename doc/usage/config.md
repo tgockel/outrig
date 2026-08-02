@@ -62,7 +62,7 @@ The prompts that follow depend on the style you pick.
 
 Anthropic's API requires an output-token ceiling on every request, so the generated config
 carries one explicitly rather than leaving a model whose identifier outrig does not
-recognize to fail on its first turn. See
+recognize to run on the conservative fallback outrig would otherwise apply. See
 [Concepts -> LLM Providers](../concepts/llm-providers.md#native-anthropic-style--anthropic).
 
 If you pick `mistralrs` as the provider style, the provider itself has no follow-up

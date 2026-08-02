@@ -45,6 +45,18 @@ pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize =
 /// request.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 
+/// Output-token ceiling for a Claude identifier this build of rig has no
+/// published ceiling for -- typically a model newer than the pinned rig, or a
+/// proxy's own naming. Anthropic rejects a request that carries no ceiling at
+/// all, so *something* has to fill the gap; see `build_agent`'s Anthropic arm
+/// for when this one does.
+///
+/// High enough that a real reply is not clipped, and below every
+/// current-generation ceiling. An identifier whose true limit is *lower* (the
+/// 3.x families) draws a 400 from Anthropic naming that limit -- loud, and
+/// fixable with one config line, which is the trade this number is chosen for.
+pub const ANTHROPIC_FALLBACK_MAX_TOKENS: u64 = 32_768;
+
 pub mod retry;
 
 #[cfg(feature = "local-llm")]
@@ -560,12 +572,21 @@ pub async fn build_agent(
                 .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
             // `completion_model`, never `CompletionModel::with_model`: the two
             // disagree about a model identifier rig does not recognize. This
-            // one leaves the default unset, so a turn with no `max-tokens`
-            // anywhere fails with rig's explicit "`max_tokens` must be set for
-            // Anthropic". `with_model` would instead cap every reply at 2048
-            // tokens silently, which looks like a bad model rather than a
-            // config gap. `tests/anthropic_mock.rs` pins the difference.
-            let model = client.completion_model(&resolved.model_identifier);
+            // one leaves the default unset, which is the signal the fallback
+            // below keys off. `with_model` would have already capped every
+            // reply at 2048 tokens, silently and without outrig ever seeing
+            // that it happened. `tests/anthropic_mock.rs` pins the difference.
+            let mut model = client.completion_model(&resolved.model_identifier);
+            // Precedence, highest first: the agent's or model's `max-tokens`
+            // (already merged into `resolved.max_tokens` by `resolve_agent`),
+            // then rig's published ceiling for an identifier it recognizes,
+            // then ours. Anthropic rejects a request carrying no ceiling at
+            // all, so the last tier has to exist; filling it *silently* is the
+            // failure mode the warning exists to prevent.
+            if resolved.max_tokens.is_none() && model.default_max_tokens.is_none() {
+                warn_fallback_ceiling(resolved);
+                model.default_max_tokens = Some(ANTHROPIC_FALLBACK_MAX_TOKENS);
+            }
             Ok(RigAgent::Anthropic {
                 agent: finish_agent(model, resolved, tools),
                 tool_call_max: resolved.tool_call_max,
@@ -618,6 +639,25 @@ pub async fn build_agent(
             }
         }
     }
+}
+
+/// Say, once, that outrig picked an output-token ceiling nobody asked for.
+///
+/// The whole hazard of a fallback ceiling is that a reply cut off at it looks
+/// like a bad model rather than a config gap, so the operator hears about it
+/// before the first turn. Once per process, not once per build: `build_agent`
+/// runs again on `/sidecar add` and once more per subagent launch, and a fan-out
+/// of subagents repeating an identical line would bury the traces around it.
+fn warn_fallback_ceiling(resolved: &ResolvedAgent) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[outrig] {} has no published output-token ceiling in this build, so turns \
+             are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens \
+             (or [agents.{}].max-tokens) to choose your own.",
+            resolved.model_identifier, resolved.model_name, resolved.agent_name,
+        );
+    });
 }
 
 impl RigAgent {

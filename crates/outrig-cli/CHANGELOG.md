@@ -26,12 +26,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sidecar-added tools, and subagents all unchanged; only the wire format differs. The banner
   reports `provider: anthropic`.
 
-  Anthropic requires an output-token ceiling on every request. outrig sends the published one
-  for the Claude identifiers it recognizes; for any other identifier the turn fails with
-  `` `max_tokens` must be set for Anthropic `` unless `max-tokens` is set on the model or the
-  agent. `outrig config init` offers `anthropic` as a provider style -- defaulting to
+  Anthropic requires an output-token ceiling on every request, and outrig always sends one:
+  `max-tokens` from the agent or the model if set, otherwise the published ceiling for a
+  Claude identifier it recognizes, otherwise a fallback of `32768` announced once on stderr.
+  That last tier covers an older model, a proxy's own naming, and any Claude newer than the
+  pinned rig release; it errs high on purpose, since a model whose real limit is lower rejects
+  the request and names that limit, whereas too low a ceiling truncates replies with nothing
+  logged. `outrig config init` offers `anthropic` as a provider style -- defaulting to
   `https://api.anthropic.com` and `ANTHROPIC_API_KEY` -- and prompts for `max-tokens`
-  alongside the model identifier, so a generated config carries an explicit ceiling.
+  alongside the model identifier, so a generated config carries an explicit ceiling anyway.
+
+  Where a missing ceiling does still surface as an error, outrig words it itself rather than
+  passing through the provider's `` `max_tokens` must be set for Anthropic ``: the key in
+  config is `max-tokens`, under `[models.<name>]` or `[agents.<name>]`, and the message says
+  so.
 
 - **`retry-budget-secs`**, at the top level and on any remote provider, bounds how long a
   transiently-failing LLM call keeps retrying. Defaults to `600`; `0` disables retries; the
