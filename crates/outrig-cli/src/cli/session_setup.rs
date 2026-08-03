@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::builtin_image;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::SessionWatcher;
@@ -222,6 +223,10 @@ pub struct SessionSetup {
     /// starts resolve mount paths against it.
     pub repo_root: PathBuf,
     pub attached: bool,
+    /// The session fell through to outrig's built-in default image-config.
+    /// Drives the banner's `(built-in default)` marker and, for `outrig run`,
+    /// whether the `outrig__*` self-documentation tools are offered.
+    pub used_builtin_default: bool,
     pub network: Option<NetworkInterceptor>,
     /// Full placement plan (config + label merges), including servers in
     /// skipped sidecars. `show-merged` renders from this;
@@ -334,27 +339,63 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         (None, None)
     };
 
+    // Injection is lazy throughout: a repo that names its own image pays none
+    // of it, and the notes only exist on the paths that can act on them.
+    let mut used_builtin_default = false;
+    let mut fall_back_to_builtin = |cfg: &mut Config, announce: bool| {
+        let injection = builtin_image::inject(cfg);
+        used_builtin_default = injection.applied;
+        if injection.applied && announce {
+            eprintln!(
+                "[outrig] no --image, agent image, or default-image configured; \
+                 using outrig's built-in default"
+            );
+        }
+        for note in &injection.notes {
+            eprintln!("[outrig] {note}");
+        }
+        injection.resolved
+    };
+
     let (image_cfg_name, allow_raw_image) = match &attach {
         Some(attach) => (attach.image_cfg_name.clone(), true),
         None => match args.image_flag {
-            Some(image) => (image.to_string(), true),
-            None => {
-                let image = agent_image
-                    .as_deref()
-                    .or(cfg.default_image.as_deref())
-                    .ok_or_else(|| {
-                        // Keyed on whether an agent actually resolved, not on
-                        // the command: an agentless `outrig run` has no
-                        // `agent.image` rung to offer either.
-                        let msg = if session_agent_name.is_some() {
-                            "no --image, agent.image, or default-image configured"
-                        } else {
-                            "no --image or default-image configured"
-                        };
-                        OutrigError::Configuration(msg.to_string())
-                    })?;
+            // An explicit name that is one of the built-in's own resolves to
+            // the built-in, so `--image outrig-default` means here what it
+            // means to `outrig build`. Without this it would fall through to
+            // the raw-local-ref rule and fail at podman instead.
+            Some(image)
+                if builtin_image::is_reserved(image) && !cfg.images.contains_key(image) =>
+            {
+                fall_back_to_builtin(&mut cfg, false);
                 (image.to_string(), false)
             }
+            Some(image) => (image.to_string(), true),
+            // Computed here rather than hoisted so the immutable borrow of
+            // `cfg` ends before the fall-through arm needs it mutably.
+            None => match agent_image
+                .as_deref()
+                .or(cfg.default_image.as_deref())
+                .map(str::to_string)
+            {
+                Some(image) => (image, false),
+                None => match fall_back_to_builtin(&mut cfg, true) {
+                    Some(name) => (name.to_string(), false),
+                    // A reserved *sidecar* name is declared but the matching
+                    // image-config is not, so injection was vetoed and there is
+                    // nothing to fall back to. Say what the session lacks
+                    // rather than naming a block the user never wrote.
+                    None => {
+                        return Err(OutrigError::Configuration(
+                            "no --image or default-image configured, and outrig's built-in \
+                             default is shadowed by a [sidecars.<name>] block using one of \
+                             its reserved names"
+                                .to_string(),
+                        )
+                        .into());
+                    }
+                },
+            },
         },
     };
     let (image_cfg, raw_local_image) =
@@ -616,6 +657,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         store,
         repo_root,
         attached: attach.is_some(),
+        used_builtin_default,
         network,
         mcp_plan,
         watcher,

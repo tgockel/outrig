@@ -30,7 +30,7 @@ use crate::subagent::state::{Outcome, SubagentShared, TRUNCATED_REPORT};
 #[error("{0}")]
 struct BuiltinError(String);
 
-fn fail<T>(message: impl Into<String>) -> Result<T, ToolError> {
+pub(crate) fn fail<T>(message: impl Into<String>) -> Result<T, ToolError> {
     Err(ToolError::ToolCallError(Box::new(BuiltinError(
         message.into(),
     ))))
@@ -40,7 +40,7 @@ fn fail<T>(message: impl Into<String>) -> Result<T, ToolError> {
 /// arg struct carries `deny_unknown_fields` to match. Letting the decoder be
 /// laxer than the advertised contract is the same class of drift that made
 /// `set_result` accept `{}` while its prose said otherwise.
-fn parse_args<T: for<'de> Deserialize<'de>>(args: &str) -> Result<T, ToolError> {
+pub(crate) fn parse_args<T: for<'de> Deserialize<'de>>(args: &str) -> Result<T, ToolError> {
     let value: Value = if args.trim().is_empty() {
         json!({})
     } else {
@@ -49,7 +49,7 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: &str) -> Result<T, ToolError> 
     serde_json::from_value(value).map_err(ToolError::JsonError)
 }
 
-fn name_of(tool: &str) -> String {
+pub(crate) fn name_of(tool: &str) -> String {
     outrig::sanitize_tool_name(outrig::RESERVED_SERVER, tool)
 }
 

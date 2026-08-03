@@ -41,7 +41,7 @@ deny  = ["*:22"]                                      # optional; global only
 
 | Key                  | Type    | Required               | Where  | Description               |
 |----------------------|---------|------------------------|--------|---------------------------|
-| `default-image`      | string  | for `outrig run`       | repo   | Default `--image`.        |
+| `default-image`      | string  | no                     | repo   | Default `--image`.        |
 | `default-agent`      | string  | no                     | repo   | Default `--agent`.        |
 | `default-model`      | string  | if agent omits `model` | global | Fallback model name.      |
 | `session-root`       | path    | no                     | global | Sessions root dir.        |
@@ -58,8 +58,9 @@ deny  = ["*:22"]                                      # optional; global only
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
-is `--image` then `default-image`. A model must still resolve from `--model` or `default-model`
--- that is the one thing an agentless session cannot do without.
+is `--image`, then `default-image`, then outrig's
+[built-in default](#the-built-in-default-image-config). A model must still resolve from
+`--model` or `default-model` -- that is the one thing an agentless session cannot do without.
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
 project-scoped. `default-model`, `session-root`, `model-cache-root`, `tool-call-max`, and the
@@ -473,8 +474,9 @@ preamble = "You are a meticulous code reviewer..."
 If `model` is omitted, outrig falls back to the top-level `default-model`; an error if neither is
 set, except `outrig run --model <name>` may supply the selected agent's model for that run. When
 `outrig run --agent <a>` runs, the chosen image-config is `--image` if given, otherwise
-`agents.<a>.image` if set, otherwise `default-image`. A run with no agent drops the middle rung:
-`--image` if given, otherwise `default-image`.
+`agents.<a>.image` if set, otherwise `default-image`, otherwise outrig's
+[built-in default](#the-built-in-default-image-config). A run with no agent drops the middle
+rung: `--image` if given, otherwise `default-image`, otherwise the built-in.
 `tool-call-max` is per turn, not per session; follow-up prompts start a fresh count.
 `tool-result-max` is per result and applies equally to successful MCP results and MCP error
 messages. It also caps what `outrig__get_result` hands back from a subagent.
@@ -565,6 +567,72 @@ image-name = "docker.io/library/ubuntu:24.04"
 
 \* Exactly one of the two shapes must be set. Setting `image-name` alongside `dockerfile`,
 `context`, or `build-args` is an error. Setting neither is also an error.
+
+### The built-in default image-config
+
+When nothing names an image -- no `--image`, no `agents.<n>.image`, no `default-image` --
+outrig supplies one of its own rather than failing. This is what makes `outrig run` work in a
+repo with no `.agents/outrig/config.toml` at all. It is ordinary config, injected into the
+merged result at the bottom of the precedence order:
+
+```toml
+[images.outrig-default]
+image-name = "docker.io/library/buildpack-deps:bookworm-scm"
+
+  [images.outrig-default.mcp]
+  fs    = { sidecar = "outrig-default-fs" }
+  shell = { sidecar = "outrig-default-shell" }
+
+[images.outrig-default-fs]
+image-name = "docker.io/mcp/filesystem:latest"
+
+[images.outrig-default-shell]
+# Built from a Dockerfile outrig writes into your user cache directory
+# (`~/.cache/outrig/builtin-images/`), never into your repo.
+
+[sidecars.outrig-default-fs]
+image = "outrig-default-fs"
+view  = "primary"
+args  = ["/workspace"]
+
+[sidecars.outrig-default-shell]
+image = "outrig-default-shell"
+view  = "primary"
+```
+
+`buildpack-deps:bookworm-scm` is the smallest official image that carries `git`, `curl`, and
+`ca-certificates` while setting no `ENTRYPOINT` and baking in no user -- both of which outrig
+needs, since it appends `sleep infinity` itself and writes the runtime user's `/etc/passwd`
+entry at start. Because both servers run with `view = "primary"`, the commands they spawn
+resolve in *this* container's filesystem, which is why the primary is the one that needs `git`.
+
+The first run pulls two images and builds one. Each is reachable by name from `outrig build`
+and from `--image`, so that cost can be paid deliberately -- one command per part:
+
+```sh
+$ outrig build --image outrig-default          # pulls buildpack-deps
+$ outrig build --image outrig-default-fs       # pulls the filesystem server
+$ outrig build --image outrig-default-shell    # builds the shell server
+```
+
+**Reserved names.** `outrig-default`, `outrig-default-fs`, and `outrig-default-shell` are
+reserved as `[images.<name>]`; the latter two are also reserved as `[sidecars.<name>]`. Your
+config wins: declare any one of them and outrig injects *none* of the built-in and says so.
+Injection is all-or-nothing because a half-injected set is a broken config -- your
+`[images.outrig-default]` beside outrig's `[sidecars.outrig-default-fs]` would leave that
+block's `args` unreachable, which is a hard error for every command in the repo.
+
+**Without the `outrig-enter` launcher.** `view = "primary"` needs the launcher, which is only
+embedded when outrig was built with the `<arch>-unknown-linux-musl` target. Without it the
+built-in degrades rather than failing: `fs` switches to `workspace = "rw"`, giving the same
+file tools over a bind mount, and `shell` is dropped. A shell has no honest degraded form --
+a bind-mounted sidecar sees none of the primary's toolchain, so it would report a different
+environment than the one you have.
+
+**`default-image` cannot name it.** `default-image = "outrig-default"` is still an error: that
+key is validated when the config is loaded, before the built-in is injected. You never need to
+write it -- the built-in is the rung that fires when the key is absent. To pin it explicitly,
+declare `[images.outrig-default]` yourself, which shadows the built-in entirely.
 
 Notes:
 

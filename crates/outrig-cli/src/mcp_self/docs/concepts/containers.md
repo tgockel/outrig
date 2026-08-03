@@ -87,6 +87,11 @@ build-args = { NODE_VERSION = "20" }                     # extra Dockerfile ARGs
   shell = ["bash", "-lc", "exec shell-mcp-command"]
 ```
 
+An image-config can come from three places, lowest precedence first: outrig's
+[built-in default](../reference/config.md#the-built-in-default-image-config), the global
+config, and the repo config. The built-in only appears when nothing else names an image at
+all, and any block you declare under one of its reserved names shadows it entirely.
+
 `dockerfile` and `context` are relative to the directory of the config file that declared the
 block. For this repo config that is the repo root (the directory containing `.agents/outrig/`).
 Declare the same block in `~/.outrig/config.toml` and the paths are relative to `~/.outrig/`

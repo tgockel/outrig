@@ -32,6 +32,7 @@ use crate::paths::model_cache_root;
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
+use crate::self_tool;
 use crate::session_tool::{self, SessionTool};
 use crate::subagent::{SubagentContext, SubagentRegistry};
 use outrig::McpClient;
@@ -141,6 +142,7 @@ pub async fn execute(
         network,
         mcp_plan,
         watcher,
+        used_builtin_default,
         attached: _,
         session: _,
     } = setup;
@@ -167,6 +169,7 @@ pub async fn execute(
         cfg: Arc::clone(&cfg),
         agent_name: agent_name.as_deref(),
         image_cfg_name: &image_cfg_name,
+        used_builtin_default,
         image_tag: &image_tag,
         log_dir: &log_dir,
         sid: &sid,
@@ -207,6 +210,9 @@ struct RunInnerArgs<'a> {
     /// `None` for an agentless session; see [`SessionSetupArgs::llm_session`].
     agent_name: Option<&'a str>,
     image_cfg_name: &'a str,
+    /// The session fell through to outrig's built-in default image-config:
+    /// marks the banner and gates the `outrig__*` self-documentation tools.
+    used_builtin_default: bool,
     image_tag: &'a ImageTag,
     log_dir: &'a Path,
     sid: &'a SessionId,
@@ -227,6 +233,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         cfg,
         agent_name,
         image_cfg_name,
+        used_builtin_default,
         image_tag,
         log_dir,
         sid,
@@ -310,6 +317,12 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
             resolved.tool_result_max_bytes,
         ));
     }
+    // A session running on the built-in default is by definition one the user
+    // has not configured, so outrig's own docs are the thing most likely to be
+    // asked for. A configured repo pays none of this prompt budget.
+    if used_builtin_default {
+        agent_tools.extend(self_tool::self_tools());
+    }
 
     let span = ProgressSpan::start("building agent");
     let agent = llm::build_agent(
@@ -322,15 +335,16 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     .await?;
     span.done("agent ready");
 
-    print_banner(
-        &resolved,
-        image_cfg_name,
+    print_banner(StartupBanner {
+        resolved: &resolved,
+        container_name: image_cfg_name,
+        builtin_default: used_builtin_default,
         image_tag,
-        runtime.containers.primary.name(),
-        &per_server_counts,
-        &agent_tools,
-        sid.as_str(),
-    );
+        container_pod_name: runtime.containers.primary.name(),
+        per_server_counts: &per_server_counts,
+        all_tools: &agent_tools,
+        session_id: sid.as_str(),
+    });
 
     let primary_name = runtime.containers.primary.name().to_string();
     let agent = llm::RebuildingAgent::new(
@@ -714,15 +728,32 @@ async fn sidecar_list(state: &ReplSession<'_>) -> String {
     buf
 }
 
-fn print_banner(
-    resolved: &llm::ResolvedAgent,
-    container_name: &str,
-    image_tag: &ImageTag,
-    container_pod_name: &str,
-    per_server_counts: &[(String, usize)],
-    all_tools: &[SessionTool],
-    session_id: &str,
-) {
+/// Grouped rather than passed positionally, mirroring `mcp`'s
+/// `StartupBanner`: the banner grew past the point where seven bare arguments
+/// at a call site say what they are.
+struct StartupBanner<'a> {
+    resolved: &'a llm::ResolvedAgent,
+    container_name: &'a str,
+    /// The session fell through to outrig's built-in default image-config.
+    builtin_default: bool,
+    image_tag: &'a ImageTag,
+    container_pod_name: &'a str,
+    per_server_counts: &'a [(String, usize)],
+    all_tools: &'a [SessionTool],
+    session_id: &'a str,
+}
+
+fn print_banner(banner: StartupBanner<'_>) {
+    let StartupBanner {
+        resolved,
+        container_name,
+        builtin_default,
+        image_tag,
+        container_pod_name,
+        per_server_counts,
+        all_tools,
+        session_id,
+    } = banner;
     let provider_label = match &resolved.provider {
         llm::ResolvedProvider::OpenAi { .. } => "openai",
         llm::ResolvedProvider::Anthropic { .. } => "anthropic",
@@ -756,7 +787,8 @@ fn print_banner(
     if let Some(weights) = &resolved.model_weights {
         let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
     }
-    let _ = writeln!(buf, "[outrig] image-config:  {container_name}");
+    let origin = crate::builtin_image::banner_suffix(builtin_default);
+    let _ = writeln!(buf, "[outrig] image-config:  {container_name}{origin}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
     for (name, count) in per_server_counts {

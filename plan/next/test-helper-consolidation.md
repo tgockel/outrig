@@ -47,6 +47,14 @@ Helpers duplicated across files but **not** yet in `common`, i.e. candidates to 
 - **`stream_lines`** -- `outrig-cli/tests/e2e_quickstart.rs:365` is a ~20-line near-duplicate of
   `common::stream_lines`, differing only by an extra `kind: &'static str` label parameter.
   Unifiable by formatting the label at the call site.
+- **Spawning the `outrig` binary** -- roughly ten `outrig-cli` test binaries each roll their own
+  `env!("CARGO_BIN_EXE_outrig")` + `Command::new(bin).args(..).current_dir(..).stdin(null)` +
+  `timeout(..)` + `String::from_utf8_lossy(&output.stderr)` block, with only the argv and the
+  timeout constant differing: `embedded_image.rs`, `builtin_default.rs`, `run_smoke.rs`,
+  `session_cli.rs`, `build_cli.rs`, `image_build.rs`, and others. A
+  `run_outrig(cwd, args) -> (bool, String)` in `outrig-cli/tests/common/mod.rs` absorbs all of
+  them. Note this one is *not* a shadowed helper -- `common` has no binary-spawn helper today,
+  so every copy is following the entrenched convention rather than ignoring an available one.
 
 ## Also worth doing
 

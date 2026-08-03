@@ -47,6 +47,18 @@ Whether the recipes should offer both shapes (in-image for users who want one co
 sidecar otherwise) or switch outright. The in-image form is still the only one that works
 when the launcher is unavailable.
 
+The built-in default image-config answered that question *for itself*, and the reasoning may
+transfer. Its primary is stock Debian on purpose, so it has no in-image form to fall back to;
+when the launcher is missing it degrades `fs` to `workspace = "rw"` and **drops** `shell`
+rather than substituting a different execution environment. The argument was that a
+bind-mounted shell sees none of the user's toolchain, so an agent told it has a shell that
+then reports `cargo: not found` burns turns repairing a container that is discarded at
+session end -- an absent tool is legible, a wrong one is not. A generated image-config does
+have an in-image form available, so this is not automatically the same call; but if these
+recipes switch outright, that is the precedent for what "unavailable launcher" should do.
+See `crates/outrig-cli/src/builtin_image/` and
+`crates/outrig-cli/src/mcp_self/docs/reference/config.md`.
+
 Whether the wrapper image for `git` should exist at all. `elf.rs` refuses a `#!` payload on
 the grounds that its interpreter line would resolve inside the target namespace -- but the
 dynamic path already solves that exact problem for `PT_INTERP` by naming the loader as

@@ -17,8 +17,15 @@ outrig build [--image <name>]
 ```
 
 - `--image <name>` (default: `default-image`): build a specific named
-  image-config.
-- `--all` (default: off): build every image-config defined in the config file.
+  image-config. This also reaches outrig's
+  [built-in default](../reference/config.md#the-built-in-default-image-config) by name. It has
+  three parts and one invocation warms one of them, so warming the set is three commands:
+  `outrig build --image outrig-default` (pulls the primary), then `--image outrig-default-fs`
+  (pulls the filesystem server), then `--image outrig-default-shell` (builds the shell server,
+  the only part that is built rather than pulled).
+- `--all` (default: off): build every image-config defined in the config file. The built-in
+  default is deliberately not among them -- `--all` means the image-configs *you* declared,
+  and pulling and building outrig's fallback in every repo would be a surprise.
 - `--config <path>` (default: walks up from cwd): use a non-default config path.
 - `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
   to `buildah`.

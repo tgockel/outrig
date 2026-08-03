@@ -105,10 +105,52 @@ $ outrig run --image my-tool:latest --volume "$PWD/data:/data:rw"
 
 With no repo config found and no `--config`, outrig uses the current directory as the workspace
 root (mounted at `/workspace`) and reads the agent, model, and provider from the global config
-(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). Because there is no
-`default-image`, you must pass `--image`; an unknown ref is used as a local Podman image and is
-never pulled. The global config need not name an agent -- without one the session runs with no
-preamble -- but it must resolve a model, from `--model` or `default-model`.
+(`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). You need not pass
+`--image`: with nothing else naming one, the session falls through to
+[the built-in default image-config](#the-built-in-default-image). If you do pass `--image`, an
+unknown ref is used as a local Podman image and is never pulled.
+
+What the global config must still supply is a **model**. The session does not need an agent --
+without one it runs with no preamble -- but `--model` alone is not enough on its own: the name
+is looked up in `[models.<name>]`, and that entry's provider in `[providers.<name>]`. So the
+supported shape is *global config, no repo config*, which is exactly where
+[`outrig config init`](../quickstart.md) leaves you:
+
+```sh
+$ outrig config init     # once per machine: provider, model, API key
+$ cd ~/some/other/repo   # no .agents/outrig/ here
+$ outrig run
+```
+
+### The built-in default image
+
+The image-config outrig falls back to is `outrig-default`: a
+`docker.io/library/buildpack-deps:bookworm-scm` container (Debian with `git`, `curl`, and
+`ca-certificates`) with two MCP servers attached as `view = "primary"` sidecars -- `fs` for
+reading and writing files, and `shell` for running commands. Both run against the primary
+container's filesystem, so the shell sees the same tree `fs` edits. The banner marks it:
+
+```
+[outrig] no --image, agent image, or default-image configured; using outrig's built-in default
+[outrig] image-config:  outrig-default (built-in default)
+```
+
+A session on the built-in default also gets outrig's own documentation tools
+(`outrig__list_docs`, `outrig__get_doc`, `outrig__validate_config`, and others), so you can ask
+the agent how to configure outrig and it will answer from the shipped docs for your build. A
+repo with its own image-config does not get them, and its tool list is unchanged.
+
+`outrig-default` is also usable as an explicit `--image`, so you can opt into it from a repo
+that has its own `default-image`. The first such run pulls two images and builds a third; to
+pay that up front rather than inside your first session, see
+[`outrig build`](build.md#synopsis).
+
+Two caveats. `outrig-default`, `outrig-default-fs`, and `outrig-default-shell` are reserved
+names -- declare any of them yourself and outrig steps aside entirely, with a note saying so.
+And if outrig was built without the `<arch>-unknown-linux-musl` target, the `outrig-enter`
+launcher is missing: `fs` then falls back to a read-write bind mount of the workspace (same
+tools) and `shell` is unavailable. Full details in
+[Reference -> Config](../reference/config.md#the-built-in-default-image-config).
 
 ## What happens, in order
 
@@ -119,7 +161,9 @@ preamble -- but it must resolve a model, from `--model` or `default-model`.
 2. **Resolve image.** Uses explicit `--image` first. If that value matches
    `[images.<name>]`, OutRig uses the config block; otherwise it must already
    exist in local Podman images. Without explicit `--image`, agent `image` and
-   `default-image` still name config blocks only.
+   `default-image` still name config blocks only. With none of the three set,
+   the session falls through to
+   [the built-in default](#the-built-in-default-image).
 3. **Build/cache/probe the image.** Config build images run `buildah build` or
    cache-hit. Config `image-name` images may be pulled. Raw `--image` refs are
    local-only and are checked with `podman image exists`.

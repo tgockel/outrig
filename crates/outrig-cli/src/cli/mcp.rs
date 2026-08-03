@@ -173,6 +173,7 @@ async fn serve(
         network,
         mcp_plan,
         watcher,
+        used_builtin_default,
         cfg: _,
         session: _,
         repo_root: _,
@@ -194,6 +195,7 @@ async fn serve(
     let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(
         &image_cfg_name,
+        used_builtin_default,
         &image_tag,
         &mut runtime.containers,
         &log_dir,
@@ -228,6 +230,7 @@ async fn show_merged(setup: SessionSetup) -> Result<i32> {
         session: _,
         log_dir: _,
         repo_root: _,
+        used_builtin_default: _,
     } = setup;
 
     let outcome = write_merged_mcp(&mcp_plan).map(|()| 0);
@@ -262,6 +265,7 @@ fn parse_listen_addr(s: &str) -> std::result::Result<ListenAddr, String> {
 #[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     image_cfg_name: &str,
+    used_builtin_default: bool,
     image_tag: &ImageTag,
     containers: &mut SessionContainers,
     log_dir: &Path,
@@ -298,6 +302,7 @@ async fn serve_inner(
 
     print_banner(StartupBanner {
         container_name: image_cfg_name,
+        builtin_default: used_builtin_default,
         image_tag,
         container_pod_name: containers.primary.name(),
         per_server_counts: &per_server_counts,
@@ -772,6 +777,8 @@ fn log_waiter_result(
 
 struct StartupBanner<'a> {
     container_name: &'a str,
+    /// The session fell through to outrig's built-in default image-config.
+    builtin_default: bool,
     image_tag: &'a ImageTag,
     container_pod_name: &'a str,
     per_server_counts: &'a [(String, usize)],
@@ -783,7 +790,12 @@ struct StartupBanner<'a> {
 
 fn print_banner(banner: StartupBanner<'_>) {
     let mut buf = String::new();
-    let _ = writeln!(buf, "[outrig] image-config:  {}", banner.container_name);
+    let origin = crate::builtin_image::banner_suffix(banner.builtin_default);
+    let _ = writeln!(
+        buf,
+        "[outrig] image-config:  {}{origin}",
+        banner.container_name
+    );
     let _ = writeln!(buf, "[outrig] image:             {}", banner.image_tag);
     let container_action = if banner.attached {
         "attached"

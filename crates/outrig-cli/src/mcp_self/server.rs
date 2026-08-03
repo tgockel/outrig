@@ -14,16 +14,12 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{OutrigError, Result};
+use crate::mcp_self::args::{
+    EmptyArgs, GET_CONFIG_SCHEMA, GET_DOC, GetDocArgs, LIST_BASE_IMAGES, LIST_DOCS,
+    LIST_MCP_SERVER_SUGGESTIONS, VALIDATE_CONFIG, VALIDATE_DOCKERFILE, VALIDATE_IMAGE_TOML,
+    ValidateConfigArgs, ValidateDockerfileArgs,
+};
 use crate::mcp_self::{docs, schema, suggestions, validate};
-
-const LIST_DOCS: &str = "list_docs";
-const GET_DOC: &str = "get_doc";
-const GET_CONFIG_SCHEMA: &str = "get_config_schema";
-const LIST_BASE_IMAGES: &str = "list_base_images";
-const LIST_MCP_SERVER_SUGGESTIONS: &str = "list_mcp_server_suggestions";
-const VALIDATE_DOCKERFILE: &str = "validate_dockerfile";
-const VALIDATE_CONFIG: &str = "validate_config";
-const VALIDATE_IMAGE_TOML: &str = "validate_image_toml";
 
 #[derive(Debug, Clone, Default)]
 pub struct SelfServer {
@@ -31,24 +27,6 @@ pub struct SelfServer {
     /// server start: it costs a `podman info`, and no tool call should pay
     /// for advice only `validate_dockerfile` gives.
     bootstrap: validate::UserBootstrap,
-}
-
-#[derive(Debug, serde::Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct GetDocArgs {
-    page: String,
-}
-
-#[derive(Debug, serde::Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ValidateDockerfileArgs {
-    dockerfile: String,
-}
-
-#[derive(Debug, serde::Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ValidateConfigArgs {
-    toml: String,
 }
 
 pub async fn serve_stdio() -> Result<i32> {
@@ -70,7 +48,7 @@ pub async fn serve_stdio() -> Result<i32> {
 }
 
 impl SelfServer {
-    fn tools() -> Vec<Tool> {
+    pub(crate) fn tools() -> Vec<Tool> {
         vec![
             tool::<EmptyArgs>(
                 LIST_DOCS,
@@ -206,10 +184,6 @@ impl ServerHandler for SelfServer {
             .find(|tool| tool.name.as_ref() == name)
     }
 }
-
-#[derive(Debug, serde::Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct EmptyArgs {}
 
 fn tool<T: JsonSchema>(name: &'static str, title: &'static str, description: &'static str) -> Tool {
     Tool::new(name, description, input_schema::<T>())

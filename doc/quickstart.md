@@ -36,6 +36,28 @@ $ outrig --version
 outrig 0.1.0
 ```
 
+## Try it before configuring anything
+
+You need a provider and a model, and nothing else. `outrig config init` writes the global
+config -- once per machine, not per repo:
+
+```sh
+$ outrig config init
+$ cd any-repo-you-like
+$ OPENAI_API_KEY=sk-... outrig run
+```
+
+With no `.agents/outrig/config.toml` anywhere, outrig uses the current directory as the
+workspace and falls back to its
+[built-in default image-config](usage/run.md#the-built-in-default-image): a Debian container
+with `git` and `curl`, plus `fs` and `shell` MCP servers. That session also
+carries outrig's own documentation tools, so you can ask the agent things like "how do I pin a
+Rust toolchain in my image?" and it will answer from the docs shipped with your build.
+
+The first run pulls a couple of images, so give it a minute. This is a real session, not a demo
+mode -- but the built-in default is a starting point, not a destination. When you want a
+container with your project's toolchain in it, configure one:
+
 ## Initialize the configs
 
 In a fresh git repo, run `outrig init`:

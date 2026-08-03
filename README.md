@@ -33,7 +33,10 @@ OutRig runs on Linux, x86-64 or AArch64. Install the matching musl target
 (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) to enable `view = "primary"`
 sidecars: those need the `outrig-enter` helper, which is always a Linux binary because it runs
 inside the container rather than in the host process. A build without that target still works
--- the sidecar mode reports why the helper is unavailable, before creating a container.
+-- the sidecar mode reports why the helper is unavailable, before creating a container, and
+the [built-in default image-config](doc/reference/config.md#the-built-in-default-image-config)
+degrades rather than failing: its `fs` server switches to a read-write bind mount of the
+workspace, and its `shell` server is dropped.
 
 macOS and native Windows are not supported. WSL2 works: it is an ordinary Linux build.
 

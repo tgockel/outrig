@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use clap::{ArgGroup, Parser};
 
+use crate::builtin_image;
 use crate::error::{OutrigError, Result};
 use crate::paths::repo_root_from_config_path;
 use outrig::config::{Config, ImageConfig, ImageSourceRef};
@@ -42,40 +43,47 @@ pub async fn execute(
     args: &BuildArgs,
 ) -> Result<i32> {
     let repo_root = repo_root_from_config_path(repo_cfg_path);
-    let cfg = Config::load_for_build(&repo_root, Some(global_cfg_path))?;
+    let mut cfg = Config::load_for_build(&repo_root, Some(global_cfg_path))?;
 
-    let targets: Vec<&str> = if args.all {
+    // `--all` means "every image-config *you* declared". outrig's built-in
+    // default is not that, and pulling and building it in every repo that runs
+    // `outrig build --all` would be a surprise -- so this returns before the
+    // injection below, and `--all` never sees it. The built-in stays reachable
+    // by name, which is the deliberate way to pre-warm it.
+    if args.all {
         if cfg.images.is_empty() {
             return Err(OutrigError::Configuration(
                 "--all requires at least one [images.<name>] block".to_string(),
             )
             .into());
         }
-        cfg.images.keys().map(String::as_str).collect()
-    } else {
-        let name = args
-            .image
-            .as_deref()
-            .or(cfg.default_image.as_deref())
-            .ok_or_else(|| {
-                OutrigError::Configuration(
-                    "no --image, --all, or default-image configured".to_string(),
-                )
-            })?;
-        vec![name]
-    };
-
-    if args.all {
-        build_all(&cfg, &repo_root, &targets, args.no_cache).await
-    } else {
-        let name = targets[0];
-        let cc = cfg.images.get(name).ok_or_else(|| {
-            OutrigError::Configuration(format!(
-                "image-config {name:?} does not match any [images.<name>]"
-            ))
-        })?;
-        build_single(name, cc, &repo_root, args.no_cache).await
+        return build_all(&cfg, &repo_root, args.no_cache).await;
     }
+
+    let name = args
+        .image
+        .as_deref()
+        .or(cfg.default_image.as_deref())
+        .ok_or_else(|| {
+            OutrigError::Configuration(
+                "no --image, --all, or default-image configured (pass \
+                 --image outrig-default to pre-warm outrig's built-in default)"
+                    .to_string(),
+            )
+        })?
+        .to_string();
+    if builtin_image::is_reserved(&name) {
+        for note in &builtin_image::inject(&mut cfg).notes {
+            eprintln!("[outrig] {note}");
+        }
+    }
+
+    let cc = cfg.images.get(&name).ok_or_else(|| {
+        OutrigError::Configuration(format!(
+            "image-config {name:?} does not match any [images.<name>]"
+        ))
+    })?;
+    build_single(&name, cc, &repo_root, args.no_cache).await
 }
 
 async fn build_single(
@@ -122,19 +130,9 @@ fn unsupported_image_source(name: &str) -> OutrigError {
     ))
 }
 
-async fn build_all(
-    cfg: &Config,
-    repo_root: &Path,
-    targets: &[&str],
-    no_cache: bool,
-) -> Result<i32> {
-    let pad = targets.iter().map(|n| n.len()).max().unwrap_or(0);
-    for name in targets {
-        let cc = cfg.images.get(*name).ok_or_else(|| {
-            OutrigError::Configuration(format!(
-                "image-config {name:?} does not match any [images.<name>]"
-            ))
-        })?;
+async fn build_all(cfg: &Config, repo_root: &Path, no_cache: bool) -> Result<i32> {
+    let pad = cfg.images.keys().map(String::len).max().unwrap_or(0);
+    for (name, cc) in &cfg.images {
         match cc.source() {
             ImageSourceRef::Image { image_name, .. } => {
                 let tag = image::ImageTag::new(image_name);

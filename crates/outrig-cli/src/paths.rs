@@ -97,6 +97,18 @@ pub(crate) fn resolve_repo_config_optional(override_path: Option<&Path>, cwd: &P
     }
 }
 
+/// Build context for one of outrig's built-in images, under the user cache
+/// directory. A subdirectory per image: the content hash covers the whole
+/// context, so two built-ins sharing a directory would bust each other's tag.
+pub(crate) fn builtin_image_dir(name: &str) -> PathBuf {
+    if let Some(dirs) = ProjectDirs::from("", "", "outrig") {
+        return dirs.cache_dir().join("builtin-images").join(name);
+    }
+    std::env::temp_dir()
+        .join("outrig-builtin-images")
+        .join(name)
+}
+
 pub(crate) fn model_cache_root(from_config: Option<&Path>) -> PathBuf {
     if let Some(p) = from_config {
         return p.to_path_buf();

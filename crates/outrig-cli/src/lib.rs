@@ -30,9 +30,11 @@ internal_modules! {
 }
 
 // Reached only from inside the crate, so these stay private either way.
+pub(crate) mod builtin_image;
 pub(crate) mod builtin_tool;
 pub(crate) mod mcp_self;
 pub(crate) mod paths;
+pub(crate) mod self_tool;
 pub(crate) mod subagent;
 
 /// Run the `outrig` command-line tool, returning the process exit code.

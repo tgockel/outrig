@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A built-in default image-config**, so a session that names no image no longer fails.
+  `--image`, `agents.<n>.image`, and `default-image` gain a fourth rung below them, which
+  makes `outrig run` work in a repo with no `.agents/outrig/config.toml` at all -- a global
+  config that resolves a model is all it needs. The two errors it replaces
+  (`no --image or default-image configured` and its three-rung sibling) are gone. What gets
+  injected is ordinary config, at the bottom of the precedence order:
+
+      [images.outrig-default]
+      image-name = "docker.io/library/buildpack-deps:bookworm-scm"
+
+        [images.outrig-default.mcp]
+        fs    = { sidecar = "outrig-default-fs" }
+        shell = { sidecar = "outrig-default-shell" }
+
+  `buildpack-deps:bookworm-scm` is the smallest `docker.io/library` image with `git`, `curl`,
+  and `ca-certificates` that sets no `ENTRYPOINT` and bakes in no user. Both servers run as
+  `view = "primary"` sidecars, so the commands `shell` spawns resolve in the primary's
+  filesystem -- which is why the primary is the container that needs `git`. `fs` is pulled
+  from `docker.io/mcp/filesystem:latest`; `shell` is built from a Dockerfile outrig writes
+  into the user cache directory, never into your repo. All three are reachable by name from
+  both `--image` and `outrig build`, so the first-run cost can be paid deliberately:
+  `outrig build --image outrig-default`, then `--image outrig-default-fs`, then
+  `--image outrig-default-shell`.
+
+  `outrig-default`, `outrig-default-fs`, and `outrig-default-shell` are reserved names.
+  Declaring any one of them shadows the built-in entirely -- injection is all-or-nothing,
+  since a half-injected set is a broken config -- and outrig says which file took the name.
+  `outrig build --all` skips the built-in: it means the image-configs you declared.
+  `default-image = "outrig-default"` remains an error, because that key is validated before
+  the built-in is injected; you never need to write it.
+
+  Without the `outrig-enter` launcher (a build with no `<arch>-unknown-linux-musl` target)
+  the built-in degrades instead of failing: `fs` switches to `workspace = "rw"`, giving the
+  same file tools over a bind mount, and `shell` is dropped. A bind-mounted shell would see
+  none of the primary's toolchain, so reporting a different environment than the one you have
+  is worse than reporting none.
+
+- **outrig's own documentation tools in a built-in-default session.** The eight tools
+  `outrig mcp self` serves -- `outrig__list_docs`, `outrig__get_doc`,
+  `outrig__get_config_schema`, `outrig__list_base_images`,
+  `outrig__list_mcp_server_suggestions`, `outrig__validate_dockerfile`,
+  `outrig__validate_config`, `outrig__validate_image_toml` -- are offered to the agent
+  directly, beside `outrig__subagent`. They are pure host-side functions over embedded data,
+  so there is nothing to install in an image. They appear **only** when the session fell
+  through to the built-in default, which is exactly the user who has not written a config
+  yet; a configured repo's tool list is unchanged. `outrig mcp self` is untouched and remains
+  the surface for external authoring tools.
+
 - **`args` for entrypoint-stdio MCP servers**, on an `[images.<name>.mcp]` entry or on the
   sidecar block it names, so an off-the-shelf image that takes its configuration positionally
   (`docker.io/mcp/filesystem` and most of the MCP catalog) runs from config alone:

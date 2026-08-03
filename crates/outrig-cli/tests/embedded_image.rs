@@ -472,12 +472,14 @@ async fn run_without_an_agent_reaches_the_repl() {
     );
 }
 
-/// The agentless image cascade is `--image -> default-image`, and its error
-/// says exactly that -- offering `agent.image` would name a rung that does
-/// not exist for this session.
+/// The agentless image cascade is `--image -> default-image -> built-in`, and
+/// naming nothing is no longer an error: the session falls through to outrig's
+/// built-in default image-config, which is what makes a repo with no
+/// `.agents/outrig/config.toml` runnable at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_without_an_agent_or_image_names_only_the_rungs_it_has() {
+async fn run_without_an_agent_or_image_falls_back_to_the_built_in() {
     common::init_tracing();
+    let _guard = E2E_LOCK.lock().await;
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
     let global_dir = tempfile::tempdir().expect("tempdir global config");
@@ -507,16 +509,26 @@ async fn run_without_an_agent_or_image_names_only_the_rungs_it_has() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "run with no image unexpectedly succeeded; stderr:\n{stderr}",
+        output.status.success(),
+        "run with no image should fall back to the built-in; stderr:\n{stderr}",
     );
     assert!(
-        stderr.contains("no --image or default-image configured"),
-        "stderr lacked the agentless image error: {stderr}",
+        stderr.contains("using outrig's built-in default"),
+        "stderr did not announce the fall-through: {stderr}",
     );
     assert!(
-        !stderr.contains("agent.image"),
-        "an agentless session has no agent.image rung to offer: {stderr}",
+        stderr.contains("image-config:  outrig-default (built-in default)"),
+        "the banner should mark the image-config as built-in: {stderr}",
+    );
+    assert!(
+        stderr.contains("[outrig] entering REPL"),
+        "built-in default run did not reach the REPL: {stderr}",
+    );
+    // The un-configured user is the one who most needs outrig to explain
+    // itself, so this is the session that carries the self-doc tools.
+    assert!(
+        stderr.contains("outrig__list_docs"),
+        "a built-in-default session should offer the self-documentation tools: {stderr}",
     );
 }
 
