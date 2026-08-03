@@ -468,8 +468,8 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
     assert!(
         captured
             .stdout
-            .contains("(turn ended; tool-call max reached)"),
-        "stdout lacked canned max reply: {}",
+            .contains("(turn ended: tool-call iteration max (1) reached)"),
+        "stdout lacked the ended-turn reply: {}",
         captured.stdout
     );
     assert!(
