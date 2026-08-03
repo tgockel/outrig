@@ -19,10 +19,10 @@ Nothing checks for this. `src/outrig_.rs:897` gates the whole feature on
 installed therefore reports the feature as available and proceeds to create a container whose
 entrypoint bind names a path the engine cannot see.
 
-The condition is already detected elsewhere: `container::podman_service_is_remote()`
-(`src/container/mod.rs:90`) probes `{{.Host.ServiceIsRemote}}`, and
-`direct_bootstrap_supported()` (`:81`) uses it to turn off the host-side user bootstrap. The
-`view = "primary"` path simply never asks.
+Nothing detects the condition any more. `container::podman_service_is_remote()` used to probe
+`{{.Host.ServiceIsRemote}}` for `direct_bootstrap_supported()`, but both went away with the
+`podman exec` user-bootstrap fallback, which was the only caller. This task now has to
+introduce the probe rather than reuse it.
 
 ## Why it might matter
 
@@ -39,10 +39,15 @@ uses -- before a container is created.
 
 ## Deliverables
 
+- **A `podman info --format {{.Host.ServiceIsRemote}}` probe**, memoized in a `OnceCell`. A
+  probe that *fails* means podman is not working; that is its own error, distinct from a
+  probe that succeeds and reports a remote service. Do not collapse the two into one `bool` --
+  the deleted `direct_bootstrap_supported()` did, and told anyone with a broken podman that
+  their engine was remote.
 - **A second input to `validate_sidecar_spec`.** `add_sidecar` (`src/outrig_.rs:896`) is already
-  `async`, so it can `.await podman_service_is_remote()` and pass the result alongside
-  `enter::is_available()`. Keeping the function sync and boolean-driven preserves its unit
-  tests, which construct specs directly.
+  `async`, so it can `.await` the probe and pass the result alongside `enter::is_available()`.
+  Keeping the function sync and boolean-driven preserves its unit tests, which construct specs
+  directly.
 - **A distinct error variant.** "Built without the helper" and "the engine is not on this
   machine" have different remedies and should not share a message. The new one names the
   remote service and points at running OutRig where the engine is.
@@ -58,10 +63,9 @@ uses -- before a container is created.
 
 - With `CONTAINER_HOST` set to a remote engine, declaring a `view = "primary"` sidecar fails
   before `podman create` runs, naming the remote service.
-- Local podman is unchanged: `podman_service_is_remote()` is memoized in a `OnceCell`
-  (`src/container/mod.rs:82-88`), so the probe costs one `podman info` per process.
-- A probe that cannot answer counts as remote, matching the conservative default
-  `direct_bootstrap_supported()`'s doc comment already sets out for the same probe.
+- Local podman is unchanged, and the probe costs one `podman info` per process.
+- A `podman info` that fails reports *that*, naming the failed probe -- not "the service is
+  remote", which would be a guess dressed as a diagnosis.
 
 ## Design forks
 

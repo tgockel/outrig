@@ -37,81 +37,6 @@ use crate::process::{self, Cmd, Transcript};
 /// Maximum `_`-suffix retries before bootstrap gives up.
 const BOOTSTRAP_RETRIES: usize = 10;
 
-/// Selects how [`Container::bootstrap_user`] materializes the runtime user.
-/// Documented in `doc/reference/cli.md`; an escape hatch rather than config,
-/// so it is read from the environment rather than plumbed through
-/// [`ContainerLaunchSpec`].
-const BOOTSTRAP_ENV: &str = "OUTRIG_BOOTSTRAP";
-
-/// How the runtime user gets into the container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BootstrapMode {
-    /// Write `/etc/passwd` and `/etc/group` from the host, falling back to
-    /// `podman exec` when the container's namespaces can't be entered.
-    Auto,
-    /// Write from the host or fail -- never fall back. Useful for proving a
-    /// setup isn't silently degrading.
-    Direct,
-    /// Always use the `podman exec` chain, which needs `useradd`/`groupadd`
-    /// in the image.
-    Exec,
-}
-
-/// [`BOOTSTRAP_ENV`]'s value, read once. An unrecognized value is
-/// [`BootstrapMode::Auto`]: this is an escape hatch, not a place to fail a
-/// session start over a typo.
-fn bootstrap_mode() -> BootstrapMode {
-    static MODE: OnceLock<BootstrapMode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var(BOOTSTRAP_ENV).as_deref() {
-        Ok("direct") => BootstrapMode::Direct,
-        Ok("exec") => BootstrapMode::Exec,
-        _ => BootstrapMode::Auto,
-    })
-}
-
-/// Whether this host can bootstrap the runtime user without the image's
-/// `useradd`/`groupadd`. False when [`BOOTSTRAP_ENV`] selects the fallback
-/// outright, and when podman's service is remote -- `/proc/<pid>/ns/*` then
-/// names namespaces on another machine.
-///
-/// Probed once per process, and a probe that cannot answer counts as
-/// unsupported: this drives advice about what an image should install, where
-/// over-advising is cheaper than a broken session. The runtime path does not
-/// consult it -- it just tries, and falls back on what actually happens.
-pub async fn direct_bootstrap_supported() -> bool {
-    static SUPPORTED: OnceCell<bool> = OnceCell::const_new();
-    *SUPPORTED
-        .get_or_init(|| async {
-            bootstrap_mode() != BootstrapMode::Exec && !podman_service_is_remote().await
-        })
-        .await
-}
-
-async fn podman_service_is_remote() -> bool {
-    let probe = process::try_capture(Cmd::new("podman").args([
-        "info",
-        "--format",
-        "{{.Host.ServiceIsRemote}}",
-    ]))
-    .await;
-    match probe {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim() != "false"
-        }
-        _ => true,
-    }
-}
-
-/// How the direct bootstrap can fail.
-enum BootstrapFailure {
-    /// The container's namespaces could not be entered, and nothing inside it
-    /// was touched -- the `podman exec` chain can still run.
-    NoNamespace(String),
-    /// Everything else, including any failure after the container was
-    /// modified.
-    Fatal(OutrigError),
-}
-
 static TRACKED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 #[derive(Debug)]
@@ -668,11 +593,12 @@ impl Container {
     /// reusing existing entries when present and appending `_` to candidate
     /// names on collision.
     ///
-    /// Normally this writes `/etc/passwd` and `/etc/group` from the host,
-    /// through descriptors a forked child opened inside the container's
-    /// namespaces (see [`namespace`]), so the image needs no `useradd`,
-    /// `groupadd`, or `getent`. When namespace entry is unavailable it falls
-    /// back to [`Container::bootstrap_via_exec`], which does need them.
+    /// Writes `/etc/passwd` and `/etc/group` from the host, through
+    /// descriptors a forked child opened inside the container's namespaces
+    /// (see [`namespace`]), so the image needs no `useradd`, `groupadd`, or
+    /// `getent`. Probes first: on podman 5.x, `--userns=keep-id` auto-injects
+    /// the host UID/GID into both files, so there is frequently nothing to
+    /// write.
     ///
     /// Records the resolved names on the struct for
     /// [`Container::exec_stdio`] to reference. Must be called once, after
@@ -695,73 +621,26 @@ impl Container {
             &format!("g{}", self.gid),
         );
 
-        let mode = bootstrap_mode();
-        let (user_name, group_name) = if mode == BootstrapMode::Exec {
-            // Asked for, not fallen back to: no warning belongs here.
-            self.bootstrap_via_exec(&host_user, &host_group).await?
-        } else {
-            match self.bootstrap_direct(&host_user, &host_group).await {
-                Ok(names) => names,
-                Err(BootstrapFailure::Fatal(e)) => return Err(e),
-                Err(BootstrapFailure::NoNamespace(reason)) if mode == BootstrapMode::Direct => {
-                    return Err(OutrigError::Configuration(format!(
-                        "container {:?}: {BOOTSTRAP_ENV}=direct forbids the `podman exec` \
-                         bootstrap, but the host could not enter the container's namespaces \
-                         ({reason})",
-                        self.name
-                    )));
-                }
-                Err(BootstrapFailure::NoNamespace(reason)) => {
-                    self.log_bootstrap(&format!(
-                        "namespace entry unavailable ({reason}); bootstrapping via `podman exec`, \
-                         which needs useradd/groupadd in the image"
-                    ))
-                    .await;
-                    tracing::warn!(
-                        target: "outrig::container",
-                        container = %self.name,
-                        reason = %reason,
-                        "host-side user bootstrap unavailable; falling back to podman exec"
-                    );
-                    self.bootstrap_via_exec(&host_user, &host_group).await?
-                }
-            }
-        };
+        let pid = self.pid().await?;
+        let db = namespace::open_user_db(pid)
+            .map_err(|e| self.bootstrap_failed(e.step.label(), e.io()))?;
 
-        self.user_name = Some(user_name);
-        self.group_name = Some(group_name);
-        Ok(())
-    }
-
-    /// Write the user and group entries straight into the container's
-    /// `/etc`, from the host. Probes first: on podman 5.x, `--userns=keep-id`
-    /// auto-injects the host UID/GID into both files, so there is frequently
-    /// nothing to write.
-    async fn bootstrap_direct(
-        &self,
-        host_user: &str,
-        host_group: &str,
-    ) -> std::result::Result<(String, String), BootstrapFailure> {
-        // A container with no init pid has no namespaces to join, and no
-        // `podman exec` would work either: that is a hard error, not a
-        // fallback.
-        let pid = self.pid().await.map_err(BootstrapFailure::Fatal)?;
-
-        let db = namespace::open_user_db(pid).map_err(|e| self.classify_ns_error(e))?;
-
-        let group_name = self.resolve_or_append(&db, namespace::Db::Group, host_group)?;
-        let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, host_user)?;
+        let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
+        let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
 
         let home = userdb::home_dir(&user_name);
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
-            .map_err(|e| self.classify_ns_error(e))?;
+            .map_err(|e| self.bootstrap_failed(e.step.label(), e.io()))?;
 
         self.log_bootstrap(&format!(
             "user {user_name} and group {group_name} ready in {}, written from the host",
             self.name
         ))
         .await;
-        Ok((user_name, group_name))
+
+        self.user_name = Some(user_name);
+        self.group_name = Some(group_name);
+        Ok(())
     }
 
     /// The name at the host's uid (or gid) in one of the container's
@@ -772,10 +651,10 @@ impl Container {
         db: &namespace::UserDb,
         which: namespace::Db,
         candidate: &str,
-    ) -> std::result::Result<String, BootstrapFailure> {
+    ) -> Result<String> {
         let text = db
             .read(which)
-            .map_err(|e| self.ns_io_fatal(which, "read", &e))?;
+            .map_err(|e| self.bootstrap_failed(format!("read {}", which.path()), e))?;
         let id = match which {
             namespace::Db::Group => self.gid,
             namespace::Db::Passwd => self.uid,
@@ -788,9 +667,8 @@ impl Container {
             namespace::Db::Group => "group",
             namespace::Db::Passwd => "user",
         };
-        let name = userdb::free_name(&text, candidate, BOOTSTRAP_RETRIES).ok_or(
-            BootstrapFailure::Fatal(OutrigError::BootstrapExhausted { kind }),
-        )?;
+        let name = userdb::free_name(&text, candidate, BOOTSTRAP_RETRIES)
+            .ok_or(OutrigError::BootstrapExhausted { kind })?;
         let line = match which {
             namespace::Db::Group => userdb::group_line(&name, id),
             namespace::Db::Passwd => {
@@ -798,173 +676,25 @@ impl Container {
             }
         };
         db.append(which, &userdb::append_blob(&text, &line))
-            .map_err(|e| self.ns_io_fatal(which, "append to", &e))?;
+            .map_err(|e| self.bootstrap_failed(format!("append to {}", which.path()), e))?;
         Ok(name)
     }
 
-    /// A namespace failure on the way *into* the container leaves it
-    /// untouched, so the `podman exec` chain can still run; anything past
-    /// that point would leave a half-written bootstrap behind.
-    fn classify_ns_error(&self, err: namespace::NsError) -> BootstrapFailure {
-        if err.step.is_entry() {
-            BootstrapFailure::NoNamespace(err.to_string())
-        } else {
-            BootstrapFailure::Fatal(OutrigError::BootstrapNamespace {
-                container: self.name.clone(),
-                step: err.step.label().to_string(),
-                source: err.io(),
-            })
-        }
-    }
-
-    /// A failed read or append through a descriptor the child handed back.
-    /// Always fatal: the databases were reachable, so nothing else is going to
-    /// do better.
-    fn ns_io_fatal(
-        &self,
-        which: namespace::Db,
-        op: &'static str,
-        err: &std::io::Error,
-    ) -> BootstrapFailure {
-        BootstrapFailure::Fatal(OutrigError::BootstrapNamespace {
+    /// A bootstrap failure, labeled with `step` -- how far the chain into the
+    /// container's namespaces got. There is nothing to fall back to, so every
+    /// one of them is fatal, and how far it got is the whole diagnostic.
+    fn bootstrap_failed(&self, step: impl Into<String>, source: std::io::Error) -> OutrigError {
+        OutrigError::BootstrapNamespace {
             container: self.name.clone(),
-            step: format!("{op} {}", which.path()),
-            source: std::io::Error::new(err.kind(), err.to_string()),
-        })
+            step: step.into(),
+            source,
+        }
     }
 
     async fn log_bootstrap(&self, line: &str) {
         if let Some(transcript) = &self.transcript {
             let _ = transcript.line("bootstrap", line).await;
         }
-    }
-
-    /// The original bootstrap: `getent` / `groupadd` / `useradd` / `mkdir` /
-    /// `chown` over `podman exec`. Retained for podman setups where the host
-    /// cannot enter the container's namespaces; it needs `useradd` and
-    /// `groupadd` present in the image, which the direct path does not.
-    ///
-    /// All `podman exec` calls here go through `--user=0:0` to land at
-    /// in-container UID 0; under `--userns=keep-id` an unscoped exec would
-    /// default to the host user, which can't `useradd` / `groupadd` / write
-    /// to `/home`.
-    async fn bootstrap_via_exec(
-        &self,
-        host_user: &str,
-        host_group: &str,
-    ) -> Result<(String, String)> {
-        let group_name = self.resolve_or_create_group(host_group).await?;
-        let user_name = self.resolve_or_create_user(host_user, &group_name).await?;
-
-        let home = userdb::home_dir(&user_name);
-        process::run_capture_logged(
-            podman_exec_root(&self.name)
-                .arg("mkdir")
-                .arg("-p")
-                .arg(&home),
-            "podman",
-            self.transcript.as_ref(),
-        )
-        .await?;
-        process::run_capture_logged(
-            podman_exec_root(&self.name)
-                .arg("chown")
-                .arg(format!("{user_name}:{group_name}"))
-                .arg(&home),
-            "podman",
-            self.transcript.as_ref(),
-        )
-        .await?;
-
-        Ok((user_name, group_name))
-    }
-
-    async fn resolve_or_create_group(&self, candidate: &str) -> Result<String> {
-        if let Some(name) = self.probe_entry("group", self.gid).await? {
-            return Ok(name);
-        }
-        self.create_with_retry(candidate, "group", |name| {
-            podman_exec_root(&self.name)
-                .arg("groupadd")
-                .arg("--gid")
-                .arg(self.gid.to_string())
-                .arg(name)
-        })
-        .await
-    }
-
-    async fn resolve_or_create_user(&self, candidate: &str, group: &str) -> Result<String> {
-        if let Some(name) = self.probe_entry("passwd", self.uid).await? {
-            return Ok(name);
-        }
-        self.create_with_retry(candidate, "user", |name| {
-            podman_exec_root(&self.name)
-                .arg("useradd")
-                .arg("-u")
-                .arg(self.uid.to_string())
-                .arg("-g")
-                .arg(group)
-                .arg(name)
-        })
-        .await
-    }
-
-    /// Look up an existing entry in the in-container `getent` database
-    /// (`group` or `passwd`) by id. Returns the first `:`-field of the first
-    /// matching line, or `None` if `getent` exited non-zero (no match, or no
-    /// `getent` in the image). Part of [`Container::bootstrap_via_exec`].
-    async fn probe_entry(&self, db: &str, id: u32) -> Result<Option<String>> {
-        let probe = process::try_capture_logged(
-            podman_exec_root(&self.name)
-                .arg("getent")
-                .arg(db)
-                .arg(id.to_string()),
-            "podman",
-            self.transcript.as_ref(),
-        )
-        .await?;
-        if !probe.status.success() {
-            return Ok(None);
-        }
-        Ok(first_colon_field(&probe.stdout))
-    }
-
-    /// Try `build(candidate)`; on non-zero exit, append `_` and retry up to
-    /// [`BOOTSTRAP_RETRIES`] times. `kind` labels the entity in the
-    /// exhausted-error message (e.g. `"group"`, `"user"`). Part of
-    /// [`Container::bootstrap_via_exec`].
-    ///
-    /// Exit code 127 is the exception: the tool isn't in the image at all, so
-    /// retrying a different name changes nothing. Say what's missing instead
-    /// of spending ten round-trips to reach a misleading error.
-    async fn create_with_retry<F>(
-        &self,
-        candidate: &str,
-        kind: &'static str,
-        mut build: F,
-    ) -> Result<String>
-    where
-        F: FnMut(&str) -> Cmd,
-    {
-        let mut name = candidate.to_string();
-        for _ in 0..BOOTSTRAP_RETRIES {
-            let attempt =
-                process::try_capture_logged(build(&name), "podman", self.transcript.as_ref())
-                    .await?;
-            if attempt.status.success() {
-                return Ok(name);
-            }
-            if attempt.status.code() == Some(127) {
-                return Err(OutrigError::Configuration(format!(
-                    "container {:?}: the `podman exec` bootstrap needs `useradd`/`groupadd` to \
-                     create the runtime {kind}, and the image has neither -- install the `passwd` \
-                     package (Debian family) or `shadow` (Alpine)",
-                    self.name
-                )));
-            }
-            name.push('_');
-        }
-        Err(OutrigError::BootstrapExhausted { kind })
     }
 
     /// Build the argv for a `podman exec -i --user --env HOME ...` invocation
@@ -1074,32 +804,6 @@ impl Drop for Container {
         }
         spawn_detached_rm(&self.name);
         untrack(&self.name);
-    }
-}
-
-/// `podman exec --user=0:0 <name> ...`, i.e. running as the container's
-/// root regardless of how the container was started. Used by
-/// [`Container::bootstrap_via_exec`] -- under `--userns=keep-id`, an unscoped
-/// `podman exec` defaults to the *host* user, which can't `useradd` /
-/// `groupadd` / write to `/home`. Forcing `--user=0:0` explicitly puts us
-/// at in-container UID 0, which is what we need before any host user
-/// exists inside the container.
-pub(super) fn podman_exec_root(name: &str) -> Cmd {
-    Cmd::new("podman").args(["exec", "--user=0:0"]).arg(name)
-}
-
-/// Parse the first `:`-separated field of the first line of `getent`-style
-/// output. `tgockel:x:1000:` -> `Some("tgockel")`. Returns `None` for empty
-/// or malformed input. Stdout is lossy-decoded; this is fine for entries
-/// in `/etc/passwd` and `/etc/group`, which are ASCII in practice.
-fn first_colon_field(stdout: &[u8]) -> Option<String> {
-    let line = String::from_utf8_lossy(stdout);
-    let line = line.lines().next()?;
-    let name = line.split(':').next()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
     }
 }
 

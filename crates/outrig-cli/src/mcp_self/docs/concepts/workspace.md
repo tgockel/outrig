@@ -81,12 +81,6 @@ After bootstrap, every `podman exec` outrig issues -- to start MCP servers, to r
 therefore appear with your UID/GID on the host. The image itself needs no user setup and no user
 tooling: any base image works, including one with no `useradd`, `groupadd`, or `getent` at all.
 
-On a host that cannot enter container namespaces -- a remote podman service, most likely -- outrig
-falls back to the older path, which runs `getent`/`groupadd`/`useradd` over `podman exec` and does
-need those tools in the image. The fallback announces itself in the session transcript. Set
-`OUTRIG_BOOTSTRAP=exec` to select it by hand, or `OUTRIG_BOOTSTRAP=direct` to make an unavailable
-namespace a hard error instead of a silent downgrade.
-
 The collision dance handles the case where the image already has a group or user at your UID/GID
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,
 outrig reuses the existing entry rather than creating a duplicate.
@@ -146,8 +140,8 @@ shape and validation as `[[workspace.mounts]]`, including path resolution: a rel
 Sidecars run with `--userns=keep-id` like the primary. The in-container user bootstrap runs
 only where identity matters: the sidecar hosts at least one exec-stdio server, sees the
 workspace, or declares mounts. A mount-less sidecar keeps the image's own `USER` untouched --
-as does an entrypoint host, mounts or not, since the bootstrap runs over `podman exec` and the
-container's first process is already the server.
+as does an entrypoint host, mounts or not, since the bootstrap needs a running container and
+that container's first process is already the server.
 
 ## Network is *not* part of the workspace
 

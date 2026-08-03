@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The `podman exec` user-bootstrap fallback, and the `OUTRIG_BOOTSTRAP` environment
+  variable.** Since 0.2.0-rc.1 the runtime user has been written into the container from the
+  host, through the container's own namespaces; the older `getent` / `groupadd` / `useradd`
+  chain remained only for hosts that cannot enter those namespaces, which means a podman
+  service on another machine. OutRig does not support that topology -- the built-in default
+  image-config alone declares two `view = "primary"` sidecars, which cannot work against a
+  remote engine -- so the fallback kept one subsystem limping where nothing else would run.
+
+  **Breaking:** `container::direct_bootstrap_supported` was public and is gone. It answered
+  "will this host need `useradd`/`groupadd` in the image", a question that no longer has a
+  yes case. `Container::bootstrap_user` is unchanged, and its failures are unchanged in
+  kind -- only in that a namespace-entry failure is now reported rather than absorbed.
+
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-08-02
 
 A release candidate. This is the first cycle to break the public surface, so it goes out for

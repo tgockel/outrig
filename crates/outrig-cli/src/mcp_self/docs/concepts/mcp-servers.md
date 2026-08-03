@@ -115,12 +115,12 @@ exec-form `ENTRYPOINT`, so `["node", "/app/dist/index.js"]` plus `args = ["/work
 in `CMD` instead loses it, and nothing starts.
 
 Because the container process is the server, an entrypoint host serves exactly one server and
-cannot be `start = "manual"`. It also skips the in-container user bootstrap: that runs over
-`podman exec`, and there is no window for it between the container's creation and the attach
-that runs the entrypoint. The image's own `USER` therefore applies to any `workspace` or
-`mounts` the block declares. `view = "primary"` is the exception -- see below: its payload runs
-as the session user whatever the image says, because OutRig's own launcher is the process that
-starts it.
+cannot be `start = "manual"`. It also skips the in-container user bootstrap: that needs a
+running container, and an entrypoint host runs its server as the first process, so there is no
+window for it between the container's creation and the attach that runs the entrypoint. The
+image's own `USER` therefore applies to any `workspace` or `mounts` the block declares.
+`view = "primary"` is the exception -- see below: its payload runs as the session user whatever
+the image says, because OutRig's own launcher is the process that starts it.
 
 Entrypoint sidecars never race session network policy: the container is created and initialized
 with its entrypoint held un-executed, audit/filter interception attaches to its network

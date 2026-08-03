@@ -99,10 +99,10 @@ pub enum OutrigError {
     #[non_exhaustive]
     BootstrapExhausted { kind: &'static str },
 
-    /// The user bootstrap entered the container's namespaces and then failed
-    /// inside them. Distinct from a failure on the way *in*, which is not an
-    /// error at all: that falls back to the `podman exec` bootstrap, because
-    /// nothing in the container has been touched yet.
+    /// The user bootstrap failed somewhere in the chain into the container's
+    /// namespaces, or inside them. `step` names how far it got, which is the
+    /// whole diagnostic: an early step means the container was never entered,
+    /// a late one means it was.
     #[error("container {container}: bootstrapping the runtime user failed at {step}: {source}")]
     #[non_exhaustive]
     BootstrapNamespace {

@@ -77,8 +77,8 @@ pub fn root_stdout(name: &str, argv: &[&str]) -> String {
 }
 
 /// Add the `shadow` package, which supplies `useradd`/`groupadd`. Needed only
-/// by tests that plant an entry themselves or exercise the `podman exec`
-/// bootstrap -- never by the bootstrap under test.
+/// by tests that plant an entry themselves -- never by the bootstrap under
+/// test.
 pub fn install_shadow(name: &str) {
     run_capture(root_cmd(name).args(["apk", "add", "--no-cache", "shadow"]));
 }

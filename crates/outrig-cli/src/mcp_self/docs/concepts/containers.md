@@ -51,10 +51,7 @@ without rebuilding.
 The image needs no user tooling for this. outrig writes the matching `/etc/passwd` and
 `/etc/group` entries into the container itself, from the host, so an image with no `useradd`,
 `groupadd`, or `getent` -- an unadorned `FROM docker.io/library/alpine`, or a distroless base --
-works unchanged. On the unusual hosts where that isn't possible (a remote podman service, say),
-outrig falls back to running `useradd`/`groupadd` inside the image and says so in the session
-transcript; only then does the image need the `passwd` package (Debian/Ubuntu) or `shadow`
-(Alpine).
+works unchanged.
 
 ### Install MCP servers
 

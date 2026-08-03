@@ -205,13 +205,7 @@ impl ToolDyn for SelfTool {
                 Kind::ListMcpServers => encode(&suggestions::list_mcp_server_suggestions()),
                 Kind::ValidateDockerfile => {
                     let args: ValidateDockerfileArgs = parse_args(&args)?;
-                    // Probed here rather than at registration: it costs a
-                    // ~1.4s `podman info`, this is the one tool of the eight
-                    // that reads it, and a session that only reads docs should
-                    // not pay for advice it never asks for. The probe caches in
-                    // a `OnceCell`, so at most one call pays it.
-                    let bootstrap = validate::UserBootstrap::for_this_host().await;
-                    encode(&validate::validate_dockerfile(&args.dockerfile, bootstrap))
+                    encode(&validate::validate_dockerfile(&args.dockerfile))
                 }
                 Kind::ValidateConfig => {
                     let args: ValidateConfigArgs = parse_args(&args)?;

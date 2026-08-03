@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The `OUTRIG_BOOTSTRAP` environment variable**, along with the `podman exec` user-bootstrap
+  fallback it selected. The runtime user is written into the container from the host, and that
+  is now the only path.
+- **The `user_bootstrap_package_missing` warning** from `validate_dockerfile` (`mcp self` and
+  the `rig` self tool). It advised installing `passwd`/`shadow` on hosts that would fall back
+  to `useradd`/`groupadd`; with no fallback there is no such host. The tool no longer runs a
+  `podman info` probe to decide, so it answers without touching podman at all.
+
 ### Added
 
 - **A built-in default image-config**, so a session that names no image no longer fails.

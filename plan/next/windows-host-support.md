@@ -29,13 +29,16 @@ plainly: **the axis is local versus remote podman, not OS.**
 ## The shared half
 
 podman on Windows runs the engine in a WSL2 VM with a native client, exactly as podman machine
-does on macOS. The code already models that. `container/mod.rs:90`'s
-`podman_service_is_remote()` probes `{{.Host.ServiceIsRemote}}`, and
-`direct_bootstrap_supported()` (`:81`) turns the host-side bootstrap off when it is true. So the
-machinery a Windows host could not run in any case -- `nsfork`'s `fork`/`setns`/`SCM_RIGHTS`,
-`container::namespace`'s join of `/proc/<pid>/ns/*`, `network`'s `nsenter`/`nft` interceptor --
-is *already inert at runtime* there, with the `podman exec` bootstrap carrying the session. The
-defect is only that it is compiled unconditionally.
+does on macOS. The machinery a Windows host could not run in any case -- `nsfork`'s
+`fork`/`setns`/`SCM_RIGHTS`, `container::namespace`'s join of `/proc/<pid>/ns/*`, `network`'s
+`nsenter`/`nft` interceptor -- is both compiled unconditionally and, now, load-bearing.
+
+This entry used to say the user bootstrap was already inert on such a host, because
+`direct_bootstrap_supported()` turned it off and the `podman exec` bootstrap carried the
+session. That fallback is gone: the host-side write is the only bootstrap, so a Windows host
+has no working path to a runtime user rather than a slower one. Whatever this task does about
+namespaces has to answer for the bootstrap too -- see
+`plan/next/primary-view-remote-podman.md`, which shares the `podman cp` route.
 
 `plan/next/macos-host-support.md` owns that `cfg(target_os = "linux")` boundary and should land
 first; this entry is the smaller half that sits on top of it.

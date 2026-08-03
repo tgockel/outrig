@@ -36,9 +36,15 @@ absent by construction rather than broken at runtime.
 ## Deliverables
 
 - **A Linux-only boundary.** `nsfork`, `network`'s namespace-entering half, and
-  `container::namespace` behind `cfg(target_os = "linux")`, with the callers either gated to
-  match or falling back to the `podman exec` bootstrap that already exists for the
-  namespace-join failure path (`OutrigError::BootstrapNamespace`'s doc comment describes it).
+  `container::namespace` behind `cfg(target_os = "linux")`, with the callers gated to match.
+- **A runtime user for a non-Linux host.** This entry used to point at the `podman exec`
+  bootstrap as the fallback for a namespace-join failure. That fallback is gone: the host-side
+  write through `container::namespace` is the only bootstrap, and every failure in it is now
+  fatal. So a macOS host currently has *no* path to a runtime user, not a slower one, and this
+  task has to supply one -- most likely the `podman cp` route that
+  `plan/next/primary-view-remote-podman.md` fork 1 sketches for the helper binary, which
+  streams over the remote API and does not care where the client's filesystem is.
+  `plan/next/windows-host-support.md` needs the same answer.
 - **A decision on the network interceptor.** It is the one subsystem with no non-namespace
   implementation. Either it is a Linux-only capability that a macOS build reports as
   unavailable the way `view = "primary"` does today, or it needs a podman-machine-side design.

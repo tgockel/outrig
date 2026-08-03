@@ -261,7 +261,7 @@ impl outrig::config::LlmProvider
 pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
 pub fn outrig::config::LlmProvider::openai(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
 pub fn outrig::config::LlmProvider::style(&self) -> &'static str
-pub fn outrig::config::LlmProvider::with_retry_budget_secs(self, secs: core::option::Option<u64>) -> Self
+pub fn outrig::config::LlmProvider::with_retry_budget_secs(self, core::option::Option<u64>) -> Self
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
 pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
@@ -627,6 +627,7 @@ pub async fn outrig::container::Container::exec_capture(&self, &[alloc::string::
 pub async fn outrig::container::Container::exec_stdio(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<tokio::process::Child>
 pub fn outrig::container::Container::gid(&self) -> u32
 pub fn outrig::container::Container::group_name(&self) -> core::option::Option<&str>
+pub fn outrig::container::Container::home_dir(&self) -> core::option::Option<alloc::string::String>
 pub fn outrig::container::Container::host_workspace(&self) -> &std::path::Path
 pub fn outrig::container::Container::image_tag(&self) -> &outrig::image::ImageTag
 pub async fn outrig::container::Container::inspect_existing(&str, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<outrig::container::ContainerInspect>
@@ -695,17 +696,17 @@ impl outrig::container::ContainerWorkspace
 pub fn outrig::container::ContainerWorkspace::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
 #[non_exhaustive] pub struct outrig::container::PrimaryView
 pub outrig::container::PrimaryView::helper_host: std::path::PathBuf
+pub outrig::container::PrimaryView::payload_home: alloc::string::String
 pub outrig::container::PrimaryView::primary_container: alloc::string::String
 pub outrig::container::PrimaryView::primary_pid: u32
 impl outrig::container::PrimaryView
-pub fn outrig::container::PrimaryView::new(impl core::convert::Into<alloc::string::String>, u32, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn outrig::container::PrimaryView::new(impl core::convert::Into<alloc::string::String>, u32, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>) -> Self
 pub const outrig::container::LABEL_SESSION: &str
 pub const outrig::container::LABEL_SIDECAR: &str
 pub const outrig::container::PRIMARY_VIEW_GRAFT: &str
 pub const outrig::container::PRIMARY_VIEW_HELPER_MOUNT: &str
 pub const outrig::container::PRIMARY_VIEW_NS_FILE: &str
 pub const outrig::container::PRIMARY_VIEW_NS_MOUNT: &str
-pub async fn outrig::container::direct_bootstrap_supported() -> bool
 pub fn outrig::container::force_remove_detached(&str)
 pub fn outrig::container::install_panic_hook()
 pub fn outrig::container::sidecar_container_name(&str, &str) -> alloc::string::String

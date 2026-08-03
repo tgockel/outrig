@@ -173,8 +173,7 @@ tools) and `shell` is unavailable. Full details in
 5. **Bootstrap the user.** From the host, inside the container's namespaces: ensure a group with
    `$(id -g)` and a user with `$(id -u)` exist -- appending the entries to `/etc/group` and
    `/etc/passwd` if not -- and that `/home/<user>` exists and is owned by them. The image needs
-   no `useradd`/`groupadd` for this; `OUTRIG_BOOTSTRAP` selects the older `podman exec` path if
-   ever needed. See
+   no `useradd`/`groupadd` for this. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
 6. **Start network interception, if enabled.** `--network audit`, `--network filter`, or

@@ -22,18 +22,11 @@ use crate::mcp_self::args::{
 use crate::mcp_self::{docs, schema, suggestions, validate};
 
 #[derive(Debug, Clone, Default)]
-pub struct SelfServer {
-    /// How this host bootstraps a container's runtime user, resolved once at
-    /// server start: it costs a `podman info`, and no tool call should pay
-    /// for advice only `validate_dockerfile` gives.
-    bootstrap: validate::UserBootstrap,
-}
+pub struct SelfServer;
 
 pub async fn serve_stdio() -> Result<i32> {
     let ct = CancellationToken::new();
-    let server = SelfServer {
-        bootstrap: validate::UserBootstrap::for_this_host().await,
-    };
+    let server = SelfServer;
     let service = rmcp::service::serve_server_with_ct(server, rmcp::transport::stdio(), ct).await?;
     eprintln!("[outrig] mcp self server ready");
     match service.waiting().await {
@@ -120,10 +113,7 @@ impl SelfServer {
                     Ok(args) => args,
                     Err(result) => return Ok(result),
                 };
-                json_result(validate::validate_dockerfile(
-                    &args.dockerfile,
-                    self.bootstrap,
-                ))
+                json_result(validate::validate_dockerfile(&args.dockerfile))
             }
             VALIDATE_CONFIG => {
                 let args: ValidateConfigArgs = match parse_args(request.arguments) {
@@ -238,7 +228,7 @@ mod tests {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        SelfServer::default().dispatch(request).expect("dispatch")
+        SelfServer.dispatch(request).expect("dispatch")
     }
 
     fn text(result: &CallToolResult) -> &str {

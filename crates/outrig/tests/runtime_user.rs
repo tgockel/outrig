@@ -12,8 +12,7 @@
 //! bootstrap writes `/etc/passwd` and `/etc/group` from the host and needs
 //! neither. The tests that still install the `shadow` package do so because
 //! they plant a conflicting entry with `useradd` before bootstrapping, not
-//! because bootstrap needs it. The `podman exec` fallback has its own binary,
-//! `runtime_user_fallback.rs`, since it is selected by a process-wide env var.
+//! because bootstrap needs it.
 
 #![cfg(feature = "e2e")]
 

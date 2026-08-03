@@ -71,7 +71,7 @@ impl NsStep {
         NsStep::ALL.get(index).copied()
     }
 
-    /// Human-readable step name, used in transcript lines and error messages.
+    /// Human-readable step name, used in error messages.
     pub(super) fn label(self) -> &'static str {
         match self {
             NsStep::OpenUserNsFile => "open /proc/<pid>/ns/user",
@@ -85,30 +85,6 @@ impl NsStep {
             NsStep::Reply => "hand back the opened files",
             NsStep::Mkdir => "mkdir the home directory",
             NsStep::Chown => "chown the home directory",
-        }
-    }
-
-    /// Whether the failure happened on the way *into* the container, before
-    /// anything inside it was touched. Those are the failures the `podman
-    /// exec` fallback can still safely handle; a failure past this point may
-    /// leave a half-applied bootstrap, so it is fatal.
-    ///
-    /// Matched exhaustively on purpose: this is the one decision that must
-    /// not be gotten wrong, so a new step has to be classified by hand rather
-    /// than defaulting into "safe to retry".
-    pub(super) fn is_entry(self) -> bool {
-        match self {
-            NsStep::OpenUserNsFile
-            | NsStep::OpenMountNsFile
-            | NsStep::Fork
-            | NsStep::SetnsUser
-            | NsStep::SetIds
-            | NsStep::SetnsMount
-            | NsStep::Reply => true,
-            // An unopenable database is a broken image, not an unusable host:
-            // `podman exec` would fail the same way, so say so rather than
-            // retrying and reporting the second failure.
-            NsStep::OpenPasswd | NsStep::OpenGroup | NsStep::Mkdir | NsStep::Chown => false,
         }
     }
 }
@@ -368,14 +344,6 @@ mod tests {
         assert!(NsStep::from_code(99).is_none());
     }
 
-    #[test]
-    fn only_post_entry_steps_are_fatal() {
-        assert!(NsStep::SetnsUser.is_entry());
-        assert!(NsStep::SetnsMount.is_entry());
-        assert!(!NsStep::OpenPasswd.is_entry());
-        assert!(!NsStep::Chown.is_entry());
-    }
-
     /// Entering our *own* namespaces exercises the whole round trip without a
     /// container: the user-namespace join returns EINVAL (already there, not a
     /// failure), and the mount-namespace join then needs CAP_SYS_ADMIN in the
@@ -387,7 +355,6 @@ mod tests {
         }
         let err = open_user_db(std::process::id()).expect_err("own mount namespace");
         assert_eq!(err.step, NsStep::SetnsMount, "unexpected step: {err}");
-        assert!(err.step.is_entry());
         assert_eq!(err.io().raw_os_error(), Some(libc::EPERM), "{err}");
     }
 
@@ -396,6 +363,5 @@ mod tests {
         // pid 0 never has /proc entries, so this stops at the parent's open.
         let err = open_user_db(0).expect_err("no such process");
         assert_eq!(err.step, NsStep::OpenUserNsFile);
-        assert!(err.step.is_entry());
     }
 }

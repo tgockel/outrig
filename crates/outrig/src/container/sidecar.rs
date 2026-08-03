@@ -131,7 +131,7 @@ impl SessionMcpPlan {
 
     /// Whether the sidecar needs the in-container user bootstrap: it hosts an
     /// exec-stdio server, takes a workspace view, or carries mounts. An
-    /// entrypoint host never does -- bootstrap runs over `podman exec`, and
+    /// entrypoint host never does -- bootstrap needs a running container, and
     /// there is no window for it between `podman create` and the `podman start
     /// --attach` that *is* the server. Such a container keeps the image's own
     /// `USER`, mounts or not -- except under [`SidecarView::Primary`], where
@@ -328,8 +328,8 @@ pub fn entrypoint_create_args(
 /// one exec-stdio server (exec needs `--user` and `HOME`), sees the workspace,
 /// or declares mounts.
 ///
-/// An entrypoint host never does, whatever else it declares -- bootstrap runs
-/// over `podman exec`, and there is no window for it between `podman create`
+/// An entrypoint host never does, whatever else it declares -- bootstrap needs
+/// a running container, and there is no window for it between `podman create`
 /// and the `podman start --attach` that *is* the server, so such a container
 /// keeps the image's own `USER`. That short-circuit lives here rather than in
 /// each caller: the config-plan path and `Outrig::add_sidecar`'s `SidecarSpec`

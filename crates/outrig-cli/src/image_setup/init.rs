@@ -161,7 +161,7 @@ mod tests {
     use outrig::config::Config;
     use outrig::container::embedded::parse_standalone_image_toml;
 
-    use crate::mcp_self::validate::{UserBootstrap, validate_dockerfile, validate_image_toml};
+    use crate::mcp_self::validate::{validate_dockerfile, validate_image_toml};
 
     fn read(path: &Path) -> String {
         std::fs::read_to_string(path).unwrap()
@@ -234,7 +234,7 @@ mod tests {
         let dockerfile = read(&tmp.path().join("rust-dev/Dockerfile"));
 
         assert_eq!(
-            validate_dockerfile(&dockerfile, UserBootstrap::HostSide).warnings,
+            validate_dockerfile(&dockerfile).warnings,
             Vec::new()
         );
         assert!(dockerfile.starts_with("FROM docker.io/library/debian:bookworm-slim"));
