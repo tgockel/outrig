@@ -185,6 +185,26 @@ async fn run_one_turn(
         .map_err(anyhow::Error::from)
 }
 
+/// Run one turn and hand back the `max_tokens` that reached the wire.
+///
+/// Every ceiling case is the same four steps -- stand up a mock, run a turn,
+/// drain, assert exactly one request -- differing only in the identifier and the
+/// configured ceiling, so the steps live here and each case is left as the two
+/// numbers it is actually about.
+async fn recorded_max_tokens(
+    var: &str,
+    identifier: &str,
+    max_tokens: Option<u32>,
+) -> serde_json::Value {
+    let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
+    run_one_turn(addr, var, identifier, max_tokens, vec![])
+        .await
+        .expect("the turn must reach the provider for its ceiling to be observable");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 1, "one turn is one request");
+    recorded[0].body["max_tokens"].clone()
+}
+
 /// Build an agent from `cfg` through the real resolve -> build path. Split out
 /// of [`run_one_turn`] so a test can drive more than one turn through the same
 /// agent, which is what "the session survived" means.
@@ -726,14 +746,9 @@ async fn a_rejected_api_key_stays_fatal() {
 async fn max_tokens_comes_from_config_then_rig_then_the_fallback() {
     // 1. Recognized identifier, nothing configured: rig's own default for the
     //    Claude 4 family travels on the request.
-    let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
-    run_one_turn(addr, "OUTRIG_TEST_ANTHROPIC_KNOWN", MODEL, None, vec![])
-        .await
-        .expect("a recognized identifier needs no configured ceiling");
-    let recorded = drain_recorded(&mut requests);
-    assert_eq!(recorded.len(), 1);
     assert_eq!(
-        recorded[0].body["max_tokens"], 64_000,
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_KNOWN", MODEL, None).await,
+        64_000,
         "rig's published ceiling for the Claude 4 family, not OutRig's fallback",
     );
 
@@ -741,56 +756,76 @@ async fn max_tokens_comes_from_config_then_rig_then_the_fallback() {
     //    the fallback. Together with case 1 this is what would catch a fallback
     //    that stopped checking whether rig already had an answer: it would show
     //    up here as a ceiling *lowered* to 32768.
-    let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
-    run_one_turn(
-        addr,
-        "OUTRIG_TEST_ANTHROPIC_HIGHER",
-        HIGHER_CEILING_MODEL,
-        None,
-        vec![],
-    )
-    .await
-    .expect("a recognized identifier needs no configured ceiling");
-    let recorded = drain_recorded(&mut requests);
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].body["max_tokens"], 128_000);
+    assert_eq!(
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_HIGHER", HIGHER_CEILING_MODEL, None).await,
+        128_000,
+    );
 
     // 3. Unrecognized identifier, nothing configured: rig has no ceiling to
     //    offer, so OutRig's fallback fills the gap and the turn runs. It is
     //    deliberately not rig's silent 2048 -- see
     //    `rig_max_tokens_defaults_differ_between_constructors` below.
-    let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
-    run_one_turn(
-        addr,
-        "OUTRIG_TEST_ANTHROPIC_UNKNOWN",
-        UNRECOGNIZED_MODEL,
-        None,
-        vec![],
-    )
-    .await
-    .expect("the fallback ceiling covers an identifier rig does not recognize");
-    let recorded = drain_recorded(&mut requests);
-    assert_eq!(recorded.len(), 1);
     assert_eq!(
-        recorded[0].body["max_tokens"],
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_UNKNOWN", UNRECOGNIZED_MODEL, None).await,
         outrig_cli::llm::ANTHROPIC_FALLBACK_MAX_TOKENS,
     );
 
     // 4. Unrecognized identifier with a configured ceiling: that value is
     //    what travels, over the fallback.
-    let (addr, mut requests) = start_mock_http(vec![text_reply("ok")]).await;
-    run_one_turn(
-        addr,
-        "OUTRIG_TEST_ANTHROPIC_CONFIGURED",
-        UNRECOGNIZED_MODEL,
-        Some(8192),
-        vec![],
-    )
-    .await
-    .expect("a configured ceiling covers an unrecognized identifier");
-    let recorded = drain_recorded(&mut requests);
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].body["max_tokens"], 8192);
+    assert_eq!(
+        recorded_max_tokens(
+            "OUTRIG_TEST_ANTHROPIC_CONFIGURED",
+            UNRECOGNIZED_MODEL,
+            Some(8192),
+        )
+        .await,
+        8192,
+    );
+}
+
+/// A configured ceiling above what the identifier can actually serve is lowered
+/// to the published one rather than sent and refused.
+///
+/// The Messages API rejects an over-ceiling `max_tokens` outright, so the whole
+/// turn fails rather than being cut short -- lowering is the only outcome that
+/// runs at all. This is distinct from the fallback in
+/// `max_tokens_comes_from_config_then_rig_then_the_fallback`, whose cases 1 and 2
+/// pin that a ceiling is never lowered to OutRig's 32768: here the value asserted
+/// is the identifier's own published ceiling, so a fallback that started
+/// overriding rig would fail this test with 32768 rather than pass it.
+#[tokio::test]
+async fn a_configured_ceiling_is_capped_at_the_published_one() {
+    // Recognized identifier, configured above its published 64000. The number
+    // that travels is the model's, not the config's.
+    assert_eq!(
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_OVER_CEILING", MODEL, Some(128_000)).await,
+        64_000,
+        "the identifier's published ceiling, not the configured 128000 the API \
+         would refuse -- and not the fallback",
+    );
+
+    // Under the ceiling, nothing to cap: the configured value is what the user
+    // asked for and travels untouched.
+    assert_eq!(
+        recorded_max_tokens("OUTRIG_TEST_ANTHROPIC_UNDER_CEILING", MODEL, Some(16_384)).await,
+        16_384,
+    );
+
+    // No published ceiling to cap against: OutRig invents none, so a large
+    // configured value travels whole. Capping here would mean guessing, and the
+    // guess would be wrong for exactly the identifiers rig has not caught up to.
+    // Deliberately larger than the fallback, unlike case 4 of the test above: a
+    // cap mistakenly applied against 32768 rather than rig's ceiling passes
+    // there and fails here.
+    assert_eq!(
+        recorded_max_tokens(
+            "OUTRIG_TEST_ANTHROPIC_UNCAPPED",
+            UNRECOGNIZED_MODEL,
+            Some(128_000),
+        )
+        .await,
+        128_000,
+    );
 }
 
 /// The constructor contract this integration depends on, asserted directly

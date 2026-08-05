@@ -633,6 +633,15 @@ fn unusable_model_message(cfg: &Config, model: &str) -> String {
 /// carried-forward side, which is the safe default. It is also what preserves
 /// `run_inner`'s post-resolution `--max-tool-calls` / `--max-tool-result-bytes`
 /// overrides, which a fresh resolution would replace with config defaults.
+///
+/// `max_tokens` is the one exception, and is left on the re-resolved side. An
+/// output-token ceiling belongs to the model rather than to the agent: a cheap
+/// model serves fewer output tokens than an expensive one, so carrying the
+/// parent's ceiling forward sends a number the named model rejects -- and it does
+/// so in exactly the case the `model` argument exists for, an expensive parent
+/// delegating down. The re-resolution already computed
+/// `agent.max-tokens.or(named_model.max-tokens)`, which keeps a deliberate
+/// per-agent ceiling winning over the model's default.
 fn resolve_launch_model(
     ctx: &SubagentContext,
     model: Option<&str>,
@@ -651,7 +660,6 @@ fn resolve_launch_model(
             let parent = &ctx.resolved;
             resolved.preamble = parent.preamble.clone();
             resolved.temperature = parent.temperature;
-            resolved.max_tokens = parent.max_tokens;
             resolved.tool_call_max = parent.tool_call_max;
             resolved.tool_result_max_bytes = parent.tool_result_max_bytes;
             resolved.subagent_depth_max = parent.subagent_depth_max;
@@ -698,11 +706,15 @@ async fn build_subagent_agent(
     resolved.preamble = Some(compose_preamble(preamble.as_deref()));
 
     let mut tools = ctx.mcp_tools.clone();
+    // The agent name is the parent's -- a subagent has no `[agents.<name>]` table
+    // of its own -- but the ceiling has to be *this* subagent's, which a launch
+    // that named a model resolved from that model. Reporting the parent's would
+    // name a number that was never in effect for the report being truncated.
     tools.push(SessionTool::new(crate::builtin_tool::SetResultTool::new(
         shared.clone(),
         name,
         ctx.resolved.agent_name.as_deref(),
-        ctx.resolved.max_tokens,
+        resolved.max_tokens,
     )));
 
     // This subagent lives at `ctx.depth`. If that is under the max, hand it its
@@ -938,20 +950,27 @@ pub(crate) mod fixtures {
         cfg
     }
 
-    fn hosted_model(identifier: &str) -> Model {
+    fn hosted_model(identifier: &str, max_tokens: Option<u32>) -> Model {
         let mut model = Model::new("openai");
         model.identifier = Some(identifier.to_string());
+        model.max_tokens = max_tokens;
         model
     }
 
     /// Two usable models, so the schema advertises a choice and a launch has
     /// something other than the parent's model to name.
+    ///
+    /// The two carry different ceilings on purpose: a cheap model serves fewer
+    /// output tokens than an expensive one, and that asymmetry runs the same
+    /// direction as the delegation the `model` argument exists for.
     pub(crate) fn test_config() -> Config {
         let mut cfg = base_config();
+        cfg.models.insert(
+            "fast".to_string(),
+            hosted_model("gpt-4o-mini", Some(16_000)),
+        );
         cfg.models
-            .insert("fast".to_string(), hosted_model("gpt-4o-mini"));
-        cfg.models
-            .insert("smart".to_string(), hosted_model("gpt-4o"));
+            .insert("smart".to_string(), hosted_model("gpt-4o", Some(64_000)));
         cfg
     }
 
@@ -960,7 +979,7 @@ pub(crate) mod fixtures {
     pub(crate) fn test_config_single() -> Config {
         let mut cfg = base_config();
         cfg.models
-            .insert("smart".to_string(), hosted_model("gpt-4o"));
+            .insert("smart".to_string(), hosted_model("gpt-4o", None));
         cfg
     }
 
@@ -1635,15 +1654,54 @@ mod tests {
         );
     }
 
+    /// Sampling is an agent knob, so it still crosses a re-resolution untouched.
     #[tokio::test(start_paused = true)]
     async fn launch_with_model_inherits_sampling() {
         let (mut registry, _log_dir) = test_registry();
         registry.ctx.resolved.temperature = Some(0.25);
-        registry.ctx.resolved.max_tokens = Some(4321);
 
         let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
         assert_eq!(resolved.temperature, Some(0.25));
-        assert_eq!(resolved.max_tokens, Some(4321));
+    }
+
+    /// The ceiling is a model knob, and is the one field that does *not* carry
+    /// forward: the parent's belongs to the parent's model, and sending it at a
+    /// cheaper one is a request that model refuses outright.
+    #[tokio::test(start_paused = true)]
+    async fn launch_with_model_takes_the_ceiling_from_that_model() {
+        let (mut registry, _log_dir) = test_registry();
+        // What the session resolved for itself, from `[models.smart]`.
+        registry.ctx.resolved.max_tokens = Some(64_000);
+
+        let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
+        assert_eq!(
+            resolved.max_tokens,
+            Some(16_000),
+            "the ceiling must follow the model named, not the launching agent"
+        );
+    }
+
+    /// `agent.or(model)` has to survive the re-resolution: an operator who set a
+    /// ceiling on the agent meant it for every model that agent runs.
+    #[tokio::test(start_paused = true)]
+    async fn launch_with_model_keeps_the_agent_ceiling_over_the_models() {
+        let mut cfg = test_config();
+        cfg.agents
+            .get_mut("primary")
+            .expect("fixture agent")
+            .max_tokens = Some(8_000);
+        // The parent's own ceiling is left unset, so 8000 can only have come
+        // from the re-resolution. Pinning it to 8000 too would let a restored
+        // carry-forward pass this test.
+        let (registry, _log_dir) = registry_with(cfg, 0, 2);
+
+        let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
+        assert_eq!(
+            resolved.max_tokens,
+            Some(8_000),
+            "an agent that set a ceiling meant it for every model it runs, so \
+             it still beats the named model's own"
+        );
     }
 
     /// Depth and image are the parent's too, and naming a model does not buy a

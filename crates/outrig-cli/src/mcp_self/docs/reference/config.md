@@ -361,10 +361,16 @@ tiers decide which, highest priority first:
             [agents.coding].max-tokens) to choose your own.
    ```
 
+Tier 2 is also a cap, not only a default: a tier-1 value *above* the published ceiling is
+lowered to it. The API refuses an over-ceiling request outright, so the whole turn fails
+rather than being cut short, and the published number is the only one that runs. This
+applies where outrig recognizes the identifier; for one it does not, there is no ceiling to
+cap against and the configured value travels whole.
+
 Tier 3 is a floor under the failure, not a recommendation -- prefer setting the ceiling
 yourself, as `[models.older]` does above. The recognized set in tier 2 is whatever the
 pinned rig release knows, so an identifier newer than that release lands in tier 3 even
-though it is current.
+though it is current -- and, for the same reason, is not capped.
 
 32768 is chosen to fail in the direction you can see. A model whose real limit is *lower*
 -- the 3.x families cap at 8192 or 4096 -- rejects the request outright, naming its own

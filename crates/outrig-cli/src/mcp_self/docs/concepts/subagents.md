@@ -24,8 +24,8 @@ What it inherits, and what it does not:
 |-------------------------------------------|--------------------------------------------|
 | The container, and everything in it       | Your conversation and context              |
 | The MCP tools, over the same connections  | The session preamble -- the parent sets it |
-| The limits, and the sampling settings     | The `outrig__` launch tools past the limit |
-| The model and provider, unless overridden | --                                         |
+| The tool limits and sampling settings     | The `outrig__` launch tools past the limit |
+| The model and provider, unless overridden | `max-tokens`, when a model is named        |
 | `/workspace`, at the same paths           | --                                         |
 
 Because it borrows the parent's MCP connections, launching one starts no container and connects no
@@ -69,10 +69,16 @@ This is for delegating mechanical work. Grepping a tree, summarizing logs, or ch
 symbol is still used does not need the parent's expensive reasoning model, and moving it to a cheap
 one keeps the parent's context free for synthesis.
 
-Sampling and limits still come from the launching agent -- `temperature`, `max-tokens`,
-`tool-call-max`, and `tool-result-max` are unaffected by the model named. And a subagent's model is
-fixed for its lifetime: `outrig__subagent_send` cannot re-point a live one, since its history was
-accumulated under the model it started on. Launch a second subagent instead.
+Sampling and the tool limits still come from the launching agent -- `temperature`, `tool-call-max`,
+and `tool-result-max` are unaffected by the model named. `max-tokens` is not: an output-token
+ceiling belongs to the model, and a cheap model generally serves fewer output tokens than an
+expensive one, so a subagent takes the ceiling that applies to the model it actually runs on. That
+is `[agents.<name>].max-tokens` where the launching agent sets one, otherwise the named model's
+`[models.<name>].max-tokens`, capped at the model's published ceiling where outrig knows one --
+the same order [config](../reference/config.md#anthropic-models) applies to any other turn.
+
+A subagent's model is fixed for its lifetime: `outrig__subagent_send` cannot re-point a live one,
+since its history was accumulated under the model it started on. Launch a second subagent instead.
 
 ### Launching is not waiting
 
@@ -137,9 +143,10 @@ not take the hint.
 
 The durable fix is a bigger ceiling. `max-tokens` is unset by default, which leaves the limit to
 the provider, and that default can be much lower than expected behind a gateway. The first
-truncated attempt prints one line to stderr naming the agent and whether its `max-tokens` is set,
-because that is the part a human -- not the model -- has to act on. Set
-`[agents.<name>].max-tokens` explicitly if subagents produce long reports.
+truncated attempt prints one line to stderr naming the agent and the ceiling that was in effect for
+that subagent, because that is the part a human -- not the model -- has to act on. Set
+`[agents.<name>].max-tokens` explicitly if subagents produce long reports, or, for one launched
+under a named model, `[models.<name>].max-tokens` on the model it runs.
 
 ### Repeating a failing call does not pay
 

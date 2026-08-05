@@ -576,7 +576,12 @@ pub async fn build_agent(
                 .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
             let model = client.completion_model(&resolved.model_identifier);
             Ok(RigAgent::OpenAi {
-                agent: finish_agent(retry::RetryingModel::new(model, policy), resolved, tools),
+                agent: finish_agent(
+                    retry::RetryingModel::new(model, policy),
+                    resolved,
+                    resolved.max_tokens,
+                    tools,
+                ),
                 tool_call_max: resolved.tool_call_max,
             })
         }
@@ -618,8 +623,24 @@ pub async fn build_agent(
                 warn_fallback_ceiling(resolved);
                 model.default_max_tokens = Some(ANTHROPIC_FALLBACK_MAX_TOKENS);
             }
+            // Tier 2 is also a cap, not only a default. A configured ceiling
+            // above what this identifier can serve is a request the API refuses
+            // outright, so the whole turn fails rather than being cut short --
+            // lowering it is the only outcome that runs at all, and the number
+            // is not invented, it is what the model publishes. Only reachable
+            // for an identifier rig recognizes; for one it does not there is no
+            // ceiling to compare against, and outrig guesses none.
+            let max_tokens = match (resolved.max_tokens, model.default_max_tokens) {
+                (Some(want), Some(ceiling)) => Some(u64::from(want).min(ceiling) as u32),
+                _ => resolved.max_tokens,
+            };
             Ok(RigAgent::Anthropic {
-                agent: finish_agent(retry::RetryingModel::new(model, policy), resolved, tools),
+                agent: finish_agent(
+                    retry::RetryingModel::new(model, policy),
+                    resolved,
+                    max_tokens,
+                    tools,
+                ),
                 tool_call_max: resolved.tool_call_max,
             })
         }
@@ -664,7 +685,7 @@ pub async fn build_agent(
                     })
                     .await?;
                 Ok(RigAgent::Mistralrs {
-                    agent: finish_agent((*model).clone(), resolved, tools),
+                    agent: finish_agent((*model).clone(), resolved, resolved.max_tokens, tools),
                     tool_call_max: resolved.tool_call_max,
                 })
             }
@@ -1429,9 +1450,14 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
     }
 }
 
+/// `max_tokens` is passed rather than read off `resolved` because the ceiling
+/// that travels is not always the one that was configured: the Anthropic arm
+/// caps it at what the identifier publishes. Every other field is the resolved
+/// agent's as-is.
 fn finish_agent<M: rig::completion::CompletionModel + 'static>(
     model: M,
     resolved: &ResolvedAgent,
+    max_tokens: Option<u32>,
     tools: Vec<SessionTool>,
 ) -> rig::agent::Agent<M> {
     use rig::agent::AgentBuilder;
@@ -1445,7 +1471,7 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
     if let Some(temperature) = resolved.temperature {
         builder = builder.temperature(temperature as f64);
     }
-    if let Some(max_tokens) = resolved.max_tokens {
+    if let Some(max_tokens) = max_tokens {
         builder = builder.max_tokens(max_tokens as u64);
     }
     builder.tools(session_tool::boxed(&tools)).build()

@@ -196,7 +196,11 @@ ceiling on every request, so outrig always sends one: yours if you set it on the
 (covering every agent that uses it) or on the agent, otherwise the published ceiling for a
 Claude identifier it recognizes, otherwise a fallback of 32768. That last case -- an older
 model, a proxy's own naming, or simply a model newer than the pinned rig release -- says so
-once on stderr rather than picking a number quietly.
+once on stderr rather than picking a number quietly. Where outrig knows the published
+ceiling, it is a cap as well as a default: a larger value of your own is lowered to it,
+because the API refuses an over-ceiling request outright. See
+[`max-tokens` in the config reference](../reference/config.md#anthropic-models) for the
+tiers in full.
 
 Prefer setting the ceiling yourself. The fallback keeps a first run working; it does not
 know your model. It errs high deliberately, because a model whose real limit is lower

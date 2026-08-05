@@ -141,6 +141,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent launched under another model takes that model's `max-tokens`.** The launching
+  agent's ceiling used to be copied onto the subagent whatever model it named, so an expensive
+  parent delegating to a cheap one sent a ceiling the cheap model refuses -- and every turn of
+  that subagent failed, not merely long ones. That is precisely the case the `model` argument
+  exists for: cheap models generally serve fewer output tokens than expensive ones. The ceiling
+  now follows the model, resolved the way any other turn resolves it
+  (`[agents.<name>].max-tokens`, else the named model's `[models.<name>].max-tokens`).
+  `temperature`, `tool-call-max`, and `tool-result-max` still come from the launching agent --
+  those are agent knobs, where an output-token ceiling is a model one. A launch that names no
+  model is unchanged.
+
+  Relatedly, the stderr line that names the ceiling when `set_result` is cut off used to print
+  the *parent's* number for such a subagent, which was never the one in effect.
+
+- **A configured `max-tokens` above an Anthropic model's published ceiling is lowered to it**
+  rather than sent and refused. The Messages API rejects an over-ceiling request outright, so the
+  whole turn failed where a capped one runs. Only applies to identifiers outrig recognizes a
+  ceiling for; for the rest the configured value still travels whole, since there is nothing to
+  cap against and guessing would be wrong for exactly the newest models.
+
 - **A rate-limited or unreachable provider ends the turn, not the session.** A transient
   failure that outlived the retries used to escape the REPL loop, tear down the containers,
   and exit `1` with the conversation lost -- so a two-second rate limit cost the whole session.
