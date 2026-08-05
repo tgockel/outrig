@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: a mount validation error names the config file that declared the mount**, the way
+  an image path error has since 0.2.0-rc.1. Global and repo `[[workspace.mounts]]` lists are
+  *concatenated*, so a bare relative path in a diagnostic is ambiguous between two files:
+  `workspace mount host-path "shared" does not exist` reads as a repo problem even when
+  `shared` was only ever meant to be found beside `~/.outrig/config.toml`. The message now ends
+  with `(declared in "/home/you/.outrig/config.toml")`, and an entry with no recorded source --
+  every hand-built `MountConfig` -- renders no clause at all rather than an empty one.
+
+  Every variant of `MountRuleViolation` changed shape to carry it. The five were tuple variants
+  and are now struct variants: `HostMissing { path, declared_in }`,
+  `HostNotDirectory { path, declared_in }`, `ContainerNotAbsolute { path, declared_in }`,
+  `ContainerDuplicate { path, declared_in }`, and `ContainerRoot { declared_in }`, which was a
+  unit variant. The five `ConfigValidationError::WorkspaceMount*` variants gained the same
+  field, `WorkspaceMountContainerRoot` likewise ceasing to be a unit variant.
+  `ConfigValidationError::SidecarMount` is unchanged and needed no change -- it wraps the
+  violation whole, so the clause arrives through the violation's own rendering.
+
+  The container-path rules carry it too, though they judge the value rather than look for a
+  directory on disk: the clause answers which file to go edit, which is the same question for
+  every rule, and `ContainerRoot`'s message carries no path at all, so the declaring file is
+  the only handle it offers. On a duplicate, the named file is the one that declared the
+  *rejected* entry -- the later of the two, and the one to edit -- rather than both sides of
+  the collision.
+
+  All ten reshaped variants are now `#[non_exhaustive]`, so the next field they take is
+  additive. That makes the pattern in a `match` need a trailing `..`; these are return-only
+  error variants, so sealing them removes no construction path.
+
 ### Removed
 
 - **The `podman exec` user-bootstrap fallback, and the `OUTRIG_BOOTSTRAP` environment

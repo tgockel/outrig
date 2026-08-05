@@ -541,7 +541,7 @@ container-path = "/resources/docs"
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::WorkspaceMountHostMissing { path } => {
+            ConfigValidationError::WorkspaceMountHostMissing { path, .. } => {
                 assert_eq!(path, std::path::PathBuf::from("missing-docs"));
             }
             other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
@@ -561,7 +561,7 @@ container-path = "/resources/docs"
         );
         let err = expect_validation_err(&cfg, Some(tmp.path()));
         match err {
-            ConfigValidationError::WorkspaceMountHostNotDirectory { path } => {
+            ConfigValidationError::WorkspaceMountHostNotDirectory { path, .. } => {
                 assert_eq!(path, std::path::PathBuf::from("docs.txt"));
             }
             other => panic!("expected WorkspaceMountHostNotDirectory, got: {other:?}"),
@@ -579,7 +579,7 @@ container-path = "resources/docs"
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::WorkspaceMountContainerNotAbsolute { path } => {
+            ConfigValidationError::WorkspaceMountContainerNotAbsolute { path, .. } => {
                 assert_eq!(path, std::path::PathBuf::from("resources/docs"));
             }
             other => panic!("expected WorkspaceMountContainerNotAbsolute, got: {other:?}"),
@@ -597,7 +597,10 @@ container-path = "/"
         );
         let err = expect_validation_err(&cfg, None);
         assert!(
-            matches!(err, ConfigValidationError::WorkspaceMountContainerRoot),
+            matches!(
+                err,
+                ConfigValidationError::WorkspaceMountContainerRoot { .. }
+            ),
             "expected WorkspaceMountContainerRoot, got: {err:?}",
         );
     }
@@ -617,7 +620,7 @@ container-path = "/resources/docs"
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::WorkspaceMountContainerDuplicate { path } => {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path, .. } => {
                 assert_eq!(path, std::path::PathBuf::from("/resources/docs"));
             }
             other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
@@ -639,7 +642,7 @@ container-path = "/workspace"
         );
         let err = expect_validation_err(&cfg, None);
         match err {
-            ConfigValidationError::WorkspaceMountContainerDuplicate { path } => {
+            ConfigValidationError::WorkspaceMountContainerDuplicate { path, .. } => {
                 assert_eq!(path, std::path::PathBuf::from("/workspace"));
             }
             other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
@@ -2313,7 +2316,7 @@ context    = "ctx"
             matches!(
                 err,
                 ConfigValidationError::SidecarMount {
-                    violation: MountRuleViolation::ContainerDuplicate(_),
+                    violation: MountRuleViolation::ContainerDuplicate { .. },
                     ..
                 }
             ),
@@ -2339,7 +2342,7 @@ context    = "ctx"
             matches!(
                 err,
                 ConfigValidationError::SidecarMount {
-                    violation: MountRuleViolation::ContainerDuplicate(_),
+                    violation: MountRuleViolation::ContainerDuplicate { .. },
                     ..
                 }
             ),
@@ -2821,6 +2824,10 @@ container-path = "/local"
 
     /// The negative twin: satisfying a global mount's path under the *repo*
     /// root must not make it validate. Before this change it would have.
+    ///
+    /// It is also the case whose message was misleading: `host-path "shared"
+    /// does not exist` is true and useless when `shared` was never meant to be
+    /// found under the repo in the first place.
     #[test]
     fn global_mount_is_not_satisfied_by_a_repo_path() {
         let (repo, _global, global_cfg) = repo_and_global(
@@ -2836,13 +2843,224 @@ container-path = "/shared"
         let err =
             expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
         assert!(
-            matches!(
-                err,
-                ConfigValidationError::WorkspaceMountHostMissing { ref path }
-                    if path == Path::new("shared")
-            ),
-            "expected WorkspaceMountHostMissing, got: {err:?}",
+            err.to_string().contains("declared in"),
+            "the rendered message must carry the clause: {err}",
         );
+        match err {
+            ConfigValidationError::WorkspaceMountHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(
+                    path,
+                    std::path::PathBuf::from("shared"),
+                    "the reported path stays the raw config value",
+                );
+                assert_eq!(
+                    declared_in,
+                    Some(global_cfg),
+                    "a bare relative path reads as a repo problem without this",
+                );
+            }
+            other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
+        }
+    }
+
+    /// The concatenated list is the case one base directory provably cannot
+    /// cover, so attribution has to be per entry. One load reports one failure
+    /// -- `check_mount_list` returns on the first -- so this breaks each side in
+    /// turn: whichever entry is bad names *its own* file, not whichever config
+    /// was loaded last.
+    #[test]
+    fn concatenated_mount_failures_name_their_own_files() {
+        const GLOBAL_BODY: &str = r#"
+[[workspace.mounts]]
+host-path      = "shared"
+container-path = "/shared"
+"#;
+        const REPO_BODY: &str = r#"
+[[workspace.mounts]]
+host-path      = "local"
+container-path = "/local"
+"#;
+
+        // Only the repo entry is satisfied, so the global one is what fails.
+        let repo = tempdir().unwrap();
+        let global = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("local")).unwrap();
+        write_repo_cfg(repo.path(), REPO_BODY);
+        let global_cfg = write_global_cfg(global.path(), GLOBAL_BODY);
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::WorkspaceMountHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("shared"));
+                assert_eq!(declared_in, Some(global_cfg));
+            }
+            other => panic!("expected the global entry to fail, got: {other:?}"),
+        }
+
+        // The mirror, which is what rules out "whichever file loaded last":
+        // only the global entry is satisfied now.
+        let repo = tempdir().unwrap();
+        let global = tempdir().unwrap();
+        fs::create_dir_all(global.path().join("shared")).unwrap();
+        write_repo_cfg(repo.path(), REPO_BODY);
+        let global_cfg = write_global_cfg(global.path(), GLOBAL_BODY);
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::WorkspaceMountHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("local"));
+                assert_eq!(
+                    declared_in,
+                    Some(repo.path().join(".agents/outrig/config.toml")),
+                );
+            }
+            other => panic!("expected the repo entry to fail, got: {other:?}"),
+        }
+    }
+
+    /// A config that never went through `Config::load` records no source, and
+    /// must render no clause at all -- not an empty one, not a `None`. Asserted
+    /// once, on the whole rendered string, because `declared_in_clause` is
+    /// shared by every variant that carries the field.
+    #[test]
+    fn a_config_without_a_source_renders_no_clause() {
+        let tmp = tempdir().unwrap();
+        let cfg = parse(
+            r#"
+[[workspace.mounts]]
+host-path      = "missing-docs"
+container-path = "/resources/docs"
+"#,
+        );
+
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        assert_eq!(
+            err.to_string(),
+            r#"workspace mount host-path "missing-docs" does not exist"#,
+        );
+        assert!(matches!(
+            err,
+            ConfigValidationError::WorkspaceMountHostMissing {
+                declared_in: None,
+                ..
+            }
+        ));
+    }
+
+    /// The wrapping boundary: `validate_sidecar` maps the violation whole into
+    /// `SidecarMount`, so the clause has to survive as part of the violation's
+    /// own rendering rather than being restated by the wrapper.
+    #[test]
+    fn global_sidecar_mount_failure_names_the_global_config() {
+        let (repo, _global, global_cfg) = repo_and_global(
+            r#"
+[sidecars.tools]
+image = "docker.io/library/alpine:3"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "gh-config"
+  container-path = "/gh"
+"#,
+        );
+        // Only the repo has it, so resolving against the global dir must fail.
+        fs::create_dir_all(repo.path().join("gh-config")).unwrap();
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&format!("{global_cfg:?}")),
+            "the clause must reach the wrapped rendering: {rendered}",
+        );
+        match err {
+            ConfigValidationError::SidecarMount {
+                sidecar,
+                violation: MountRuleViolation::HostMissing { declared_in, .. },
+            } => {
+                assert_eq!(sidecar, "tools");
+                assert_eq!(declared_in, Some(global_cfg));
+            }
+            other => panic!("expected a host-missing SidecarMount, got: {other:?}"),
+        }
+    }
+
+    /// A container-path rule is about the value, not about where a host
+    /// directory was looked for -- but the question the clause answers ("which
+    /// file do I go edit") is the same, and the concatenated list is what makes
+    /// the bare path ambiguous.
+    #[test]
+    fn global_mount_container_path_violation_names_the_global_config() {
+        let (repo, _global, global_cfg) = repo_and_global(
+            r#"
+[[workspace.mounts]]
+host-path      = "shared"
+container-path = "relative/path"
+"#,
+        );
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::WorkspaceMountContainerNotAbsolute {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("relative/path"));
+                assert_eq!(declared_in, Some(global_cfg));
+            }
+            other => panic!("expected WorkspaceMountContainerNotAbsolute, got: {other:?}"),
+        }
+    }
+
+    /// A duplicate spans two files by construction. The clause names the
+    /// *rejected* entry -- the repo one, since global mounts are concatenated
+    /// first -- rather than claiming to name both sides of the collision.
+    #[test]
+    fn duplicate_container_path_names_the_rejected_entry() {
+        let repo = tempdir().unwrap();
+        let global = tempdir().unwrap();
+        fs::create_dir_all(global.path().join("shared")).unwrap();
+        fs::create_dir_all(repo.path().join("also-shared")).unwrap();
+
+        let global_cfg = write_global_cfg(
+            global.path(),
+            r#"
+[[workspace.mounts]]
+host-path      = "shared"
+container-path = "/shared"
+"#,
+        );
+        write_repo_cfg(
+            repo.path(),
+            r#"
+[[workspace.mounts]]
+host-path      = "also-shared"
+container-path = "/shared"
+"#,
+        );
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::WorkspaceMountContainerDuplicate {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("/shared"));
+                assert_eq!(
+                    declared_in,
+                    Some(repo.path().join(".agents/outrig/config.toml")),
+                    "the second entry is the one refused, so it is the one to edit",
+                );
+            }
+            other => panic!("expected WorkspaceMountContainerDuplicate, got: {other:?}"),
+        }
     }
 
     /// A sidecar block is replaced whole by `merge`, so its mount list is always

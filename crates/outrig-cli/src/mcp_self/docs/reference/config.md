@@ -913,6 +913,19 @@ and context live beside `~/.outrig/config.toml` and are found from any repo on t
 exception remains repo-relative: `[models.<name>].model-path`, which is documented under
 [Validation rules](#validation-rules).
 
+Because provenance is recorded per entry, a diagnostic about a config-declared path names the
+file that declared it, as a trailing `(declared in "<path>")`. Every image and mount rule
+carries it -- including the mount rules that judge the value rather than look for a directory,
+since the question it answers is which file to go edit. The reported path stays the raw config
+value rather than the resolved one:
+
+```
+workspace mount host-path "shared" does not exist (declared in "/home/you/.outrig/config.toml")
+```
+
+An entry built through the library API rather than loaded from a file records no source, and
+its diagnostics carry no clause.
+
 ## Full examples
 
 ### Global `~/.outrig/config.toml`

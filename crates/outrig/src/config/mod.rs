@@ -728,6 +728,15 @@ impl MountConfig {
             .map_or(repo_root, ConfigSource::base_dir);
         resolve_against(base, &self.host_path)
     }
+
+    /// The file to name in a diagnostic about this mount, or `None` for a
+    /// hand-built entry. Deliberately not defaulted to the repo config, for the
+    /// reason [`ImageConfig::declared_in`] gives: unlike a base directory, a
+    /// filename in an error message is a *claim*, and naming a file that never
+    /// mentioned this mount would be a fabrication.
+    pub(crate) fn declared_in(&self) -> Option<PathBuf> {
+        self.source.as_ref().map(ConfigSource::config_path)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

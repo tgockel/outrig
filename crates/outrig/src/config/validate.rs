@@ -137,20 +137,54 @@ pub enum ConfigValidationError {
     #[error("model-cache-root {path:?} must be an absolute path")]
     ModelCacheRootNotAbsolute { path: PathBuf },
 
-    #[error("workspace mount host-path {path:?} does not exist")]
-    WorkspaceMountHostMissing { path: PathBuf },
+    // The five below restate `MountRuleViolation` in workspace terms, so their
+    // `declared_in` means exactly what the variant it is mapped from means.
+    #[error(
+        "workspace mount host-path {path:?} does not exist{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceMountHostMissing {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
 
-    #[error("workspace mount host-path {path:?} is not a directory")]
-    WorkspaceMountHostNotDirectory { path: PathBuf },
+    #[error(
+        "workspace mount host-path {path:?} is not a directory{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceMountHostNotDirectory {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
 
-    #[error("workspace mount container-path {path:?} must be absolute")]
-    WorkspaceMountContainerNotAbsolute { path: PathBuf },
+    #[error(
+        "workspace mount container-path {path:?} must be absolute{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceMountContainerNotAbsolute {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
 
-    #[error("workspace mount container-path must not be /")]
-    WorkspaceMountContainerRoot,
+    #[error(
+        "workspace mount container-path must not be /{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceMountContainerRoot { declared_in: Option<PathBuf> },
 
-    #[error("workspace mount container-path {path:?} is declared more than once")]
-    WorkspaceMountContainerDuplicate { path: PathBuf },
+    #[error(
+        "workspace mount container-path {path:?} is declared more than once{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceMountContainerDuplicate {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
 
     #[error("image {image:?}: `{field}` capability name must not be empty")]
     CapabilityNameEmpty { image: String, field: &'static str },
@@ -1012,18 +1046,20 @@ pub(super) fn validate_workspace_mounts(
 
     check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
         |violation| match violation {
-            MountRuleViolation::ContainerNotAbsolute(path) => {
-                ConfigValidationError::WorkspaceMountContainerNotAbsolute { path }
+            MountRuleViolation::ContainerNotAbsolute { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountContainerNotAbsolute { path, declared_in }
             }
-            MountRuleViolation::ContainerRoot => ConfigValidationError::WorkspaceMountContainerRoot,
-            MountRuleViolation::ContainerDuplicate(path) => {
-                ConfigValidationError::WorkspaceMountContainerDuplicate { path }
+            MountRuleViolation::ContainerRoot { declared_in } => {
+                ConfigValidationError::WorkspaceMountContainerRoot { declared_in }
             }
-            MountRuleViolation::HostMissing(path) => {
-                ConfigValidationError::WorkspaceMountHostMissing { path }
+            MountRuleViolation::ContainerDuplicate { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountContainerDuplicate { path, declared_in }
             }
-            MountRuleViolation::HostNotDirectory(path) => {
-                ConfigValidationError::WorkspaceMountHostNotDirectory { path }
+            MountRuleViolation::HostMissing { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountHostMissing { path, declared_in }
+            }
+            MountRuleViolation::HostNotDirectory { path, declared_in } => {
+                ConfigValidationError::WorkspaceMountHostNotDirectory { path, declared_in }
             }
         },
     )
@@ -1032,19 +1068,69 @@ pub(super) fn validate_workspace_mounts(
 /// Scope-agnostic mount-list rule violation. The workspace caller maps it
 /// onto its pre-existing per-rule variants; sidecar (and future) callers
 /// wrap it whole and render via `Display`.
+///
+/// Every variant names the file that declared the offending entry, because
+/// [`merge`] *concatenates* the global and repo mount lists: a bare path in the
+/// message is ambiguous between two files even when the rule broken has nothing
+/// to do with path resolution.
+///
+/// [`merge`]: super::merge
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MountRuleViolation {
-    #[error("container-path {0:?} must be absolute")]
-    ContainerNotAbsolute(PathBuf),
-    #[error("container-path must not be /")]
-    ContainerRoot,
-    #[error("container-path {0:?} is declared more than once")]
-    ContainerDuplicate(PathBuf),
-    #[error("host-path {0:?} does not exist")]
-    HostMissing(PathBuf),
-    #[error("host-path {0:?} is not a directory")]
-    HostNotDirectory(PathBuf),
+    #[error(
+        "container-path {path:?} must be absolute{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    ContainerNotAbsolute {
+        path: PathBuf,
+        /// The config file that declared this mount, or `None` for a
+        /// hand-built entry -- see [`MountConfig::config_source`], the public
+        /// accessor for the same provenance. Every variant below carries this
+        /// field with the same meaning.
+        ///
+        /// [`MountConfig::config_source`]: super::MountConfig::config_source
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error("container-path must not be /{}", declared_in_clause(declared_in))]
+    #[non_exhaustive]
+    ContainerRoot {
+        /// The one handle this rule offers: the message carries no path at all.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "container-path {path:?} is declared more than once{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    ContainerDuplicate {
+        path: PathBuf,
+        /// The file that declared the *rejected* entry -- the later of the two,
+        /// which is the one to edit. The path it collides with may have come
+        /// from the other file, or from the block's own reserved set; neither is
+        /// tracked, so this deliberately does not claim to name both sides.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error("host-path {path:?} does not exist{}", declared_in_clause(declared_in))]
+    #[non_exhaustive]
+    HostMissing {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "host-path {path:?} is not a directory{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    HostNotDirectory {
+        path: PathBuf,
+        declared_in: Option<PathBuf>,
+    },
 }
 
 /// Shared rules for any bind-mount list: absolute container paths, never `/`,
@@ -1057,29 +1143,38 @@ fn check_mount_list(
     repo_root: Option<&Path>,
 ) -> Result<(), MountRuleViolation> {
     for mount in mounts {
+        // Per entry, not per list: the list may be a concatenation of two files.
+        let declared_in = mount.declared_in();
+
         if !mount.container_path.is_absolute() {
-            return Err(MountRuleViolation::ContainerNotAbsolute(
-                mount.container_path.clone(),
-            ));
+            return Err(MountRuleViolation::ContainerNotAbsolute {
+                path: mount.container_path.clone(),
+                declared_in,
+            });
         }
         if mount.container_path == Path::new("/") {
-            return Err(MountRuleViolation::ContainerRoot);
+            return Err(MountRuleViolation::ContainerRoot { declared_in });
         }
         if !reserved.insert(mount.container_path.clone()) {
-            return Err(MountRuleViolation::ContainerDuplicate(
-                mount.container_path.clone(),
-            ));
+            return Err(MountRuleViolation::ContainerDuplicate {
+                path: mount.container_path.clone(),
+                declared_in,
+            });
         }
 
         if let Some(root) = repo_root {
             let resolved = mount.resolved_host_path(root);
             if !resolved.exists() {
-                return Err(MountRuleViolation::HostMissing(mount.host_path.clone()));
+                return Err(MountRuleViolation::HostMissing {
+                    path: mount.host_path.clone(),
+                    declared_in,
+                });
             }
             if !resolved.is_dir() {
-                return Err(MountRuleViolation::HostNotDirectory(
-                    mount.host_path.clone(),
-                ));
+                return Err(MountRuleViolation::HostNotDirectory {
+                    path: mount.host_path.clone(),
+                    declared_in,
+                });
             }
         }
     }

@@ -92,6 +92,72 @@ more bullet in a `### Changed` section rather than a `0.3.0` item.
 0097 was additive because *it* was required to be, not because the enum was frozen. The real
 cost of deferring past `0.2.0` is that the window closes and this waits for the next one.
 
+## Decisions
+
+1. **Fork 1 -- struct variants, as recommended.** All five `MountRuleViolation` variants took
+   named fields. The alternative, `HostMissing(PathBuf, PathBuf)`, is unreadable at the match
+   site and worse in the `Display` impl, where thiserror's positional `{0:?}` / `{1:?}` gives
+   the reader nothing to go on. The variants changed shape either way.
+
+2. **Fork 2 -- sealed, as recommended.** Every reshaped variant carries `#[non_exhaustive]`.
+   0094 Decision 6's warning does not apply: these are return-only error variants, so sealing
+   removes no construction path that anyone had.
+
+3. **Fork 3 -- resolved *yes*: every mount rule gets `declared_in`, not just the two host-path
+   ones.** `ContainerRoot` therefore stops being a unit variant, which is the single largest
+   break in the set. The reasoning is that the clause does not answer "what did this relative
+   path resolve against" -- it answers "which file do I go edit", and that question is identical
+   for all five rules. `ContainerRoot` is the strongest case rather than the weakest: its
+   message carries no path *at all*, so the declaring file is the only handle it offers. Half a
+   sealed enum able to name its file is the asymmetry this task exists to remove, and repeating
+   it one level down would have been the same mistake in miniature.
+
+4. **A duplicate names the rejected entry, not both sides of the collision.** `check_mount_list`
+   detects duplicates against a `BTreeSet<PathBuf>` of already-claimed paths that carries no
+   provenance -- the claim may have come from the other config file *or* from the block's own
+   reserved set (the primary workspace mount). Teaching `reserved` to carry sources so the
+   message could name both is a larger change for marginal benefit, and the entry being refused
+   is the one the user edits. The narrower claim is written into the field's doc comment so a
+   later reader does not assume the wider one.
+
+5. **`ConfigValidationError::SidecarMount` is unchanged and deliberately still unsealed.** It
+   wraps the violation whole, so the clause arrives through the violation's own `Display` with
+   no code change at the wrapping boundary -- which is why that path needed a test rather than
+   an edit. Sealing it too would have been a gratuitous break: 0094 Decision 5 seals a variant
+   only where a field addition is proven, and none is proven here.
+
+6. **The `WorkspaceMount*` variants were not collapsed into a single wrapping variant.** The
+   temptation is real: `SidecarMount` already wraps `MountRuleViolation`, so five flat variants
+   plus a five-arm map restate the same five rules twice, and `#[error("workspace mount
+   {violation}")]` would have rendered byte-identically while deleting ~40 lines. Rejected on
+   three grounds -- it *deletes* public variants rather than reshaping them, which is a strictly
+   larger break for a crate with downstream integration consumers; the task's acceptance names
+   these variants as reshaped-and-sealed; and 0094 Decision 5's principle that the enum *is* the
+   validation documentation favors a flat list that reads as one line per rule.
+
+7. **`declared_in` has no repo-config fallback**, matching `ImageConfig::declared_in` rather
+   than `MountConfig::resolved_host_path`. The two look similar and are not: a base directory
+   may sensibly default to the repo root, but a filename in an error message is a *claim*, and
+   naming a config that never mentioned this mount would be a fabrication. A hand-built
+   `MountConfig` reports `None` and renders no clause -- asserted directly, in six
+   `mod config_validate` tests that build their configs with `parse`.
+
+8. **Verification that the tests test something,** per 0097 Decision 12. With
+   `MountConfig::declared_in` stubbed to return `None`, all five new/extended provenance tests
+   fail and the other 132 pass. Run before trusting a green suite.
+
+9. **An independent implementation converged on the same shape, which is why fork 3 can be
+   considered settled rather than merely chosen.** A second pass written without sight of the
+   first produced a structurally identical `src/` half -- same accessor, same struct variants,
+   same sealing, same per-entry stamping, `validate_sidecar` untouched -- and resolved fork 3
+   the same way. Two of its test choices were better and were adopted: the concatenated-list
+   test is written as two flat scenarios rather than behind a local helper struct and enum, and
+   the no-source contract is asserted **once** on the whole rendered string
+   (`a_config_without_a_source_renders_no_clause`) instead of as a repeated
+   `assert_eq!(declared_in, None)` in six rule tests that are not about provenance. The single
+   exact-string assertion is the stronger claim anyway, and it is sufficient because
+   `declared_in_clause` is shared by all ten variants.
+
 ## See also
 
 - `crates/outrig/src/config/validate.rs` -- `MountRuleViolation`, `check_mount_list`,

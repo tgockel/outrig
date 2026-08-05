@@ -25,16 +25,13 @@ longer public at all. 0098 cashed the sweep in a second time, adding an `LlmProv
 variant and a `Model::max_tokens` field additively; the one break it did take -- renaming three
 provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
-Everything through 0104 landed, emptying the queue, and 0105-0111 refill it from `plan/next/`
+Everything through 0105 landed; 0105-0111 refilled the queue from `plan/next/`
 against one gate: **does deferring this force a breaking change later, or freeze a contract a
 point release cannot fix?** The 0094 sweep is what makes that question narrow -- `#[non_exhaustive]`
 makes field and variant *additions* free, so what is left are field *type* changes, variants the
 sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
 qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
 
-- **0105 [mount-errors-lack-provenance](0105-mount-errors-lack-provenance.md)** -- four
-  `WorkspaceMount*` variants and every `MountRuleViolation` variant are unsealed, so giving a
-  mount error the `declared_in` an image error already has reshapes them.
 - **0106 [validate-request-timeout-secs](0106-validate-request-timeout-secs.md)** -- a range
   check added after the release rejects configs the release accepted.
 - **0107 [exec-workdir](0107-exec-workdir.md)** -- four published methods take
@@ -51,10 +48,16 @@ qualified. The rest are additive by construction, internal, or explicitly post-v
 - **0111 [provider-construction-options-struct](0111-provider-construction-options-struct.md)** --
   `LlmProvider::openai` / `::anthropic` take their fields positionally, and Rust cannot overload.
 
-0105 is the cheapest and highest-value of them: 0097 already built the machinery -- `ConfigSource`,
-per-mount stamping, `resolved_host_path()` -- and gave `declared_in` to the two image variants it
-could reach additively. The mount variants were skipped because they were not sealed, so threading
-provenance through them is mostly wiring, and it is a break now or a break forever.
+0105 landed, and was the cheapest and highest-value of them: 0097 had already built the machinery
+-- `ConfigSource`, per-mount stamping, `resolved_host_path()` -- and given `declared_in` to the two
+image variants it could reach additively, so threading provenance through the mount variants was
+mostly wiring. A mount diagnostic now ends with `(declared in "<file>")`, which is what the
+concatenated global+repo mount list makes necessary: a bare relative path is ambiguous between two
+files. All five `MountRuleViolation` variants and all five `WorkspaceMount*` variants took it and
+are now `#[non_exhaustive]`, so the next field is additive. Its one open fork was resolved *yes*:
+the container-path rules carry it too, `ContainerRoot` ceasing to be a unit variant, because the
+clause answers which file to go edit rather than what a path resolved against -- and that rule's
+message carries no path at all, so the declaring file is the only handle it has.
 
 0111 is last deliberately. It is the only one of the seven that is API *shape* rather than API
 *correctness*: rc.1 shipped `with_retry_budget_secs` as the non-breaking workaround, and

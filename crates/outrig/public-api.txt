@@ -208,14 +208,19 @@ pub outrig::config::ConfigValidationError::UnknownDefaultModel::name: alloc::str
 pub outrig::config::ConfigValidationError::UnknownModelProvider
 pub outrig::config::ConfigValidationError::UnknownModelProvider::model: alloc::string::String
 pub outrig::config::ConfigValidationError::UnknownModelProvider::provider: alloc::string::String
-pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::path: std::path::PathBuf
-pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerNotAbsolute::path: std::path::PathBuf
-pub outrig::config::ConfigValidationError::WorkspaceMountContainerRoot
-pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerRoot
+pub outrig::config::ConfigValidationError::WorkspaceMountContainerRoot::declared_in: core::option::Option<std::path::PathBuf>
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing
+pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountHostMissing::path: std::path::PathBuf
-pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory
+pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountHostNotDirectory::path: std::path::PathBuf
 #[non_exhaustive] pub enum outrig::config::EnvValue
 pub outrig::config::EnvValue::EnvRef(alloc::string::String)
@@ -303,11 +308,20 @@ pub fn outrig::config::MistralrsDeviceSpec::from_str(&str) -> core::result::Resu
 pub outrig::config::MountAccess::ReadOnly
 pub outrig::config::MountAccess::ReadWrite
 #[non_exhaustive] pub enum outrig::config::MountRuleViolation
-pub outrig::config::MountRuleViolation::ContainerDuplicate(std::path::PathBuf)
-pub outrig::config::MountRuleViolation::ContainerNotAbsolute(std::path::PathBuf)
-pub outrig::config::MountRuleViolation::ContainerRoot
-pub outrig::config::MountRuleViolation::HostMissing(std::path::PathBuf)
-pub outrig::config::MountRuleViolation::HostNotDirectory(std::path::PathBuf)
+#[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerDuplicate
+pub outrig::config::MountRuleViolation::ContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::MountRuleViolation::ContainerDuplicate::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerNotAbsolute
+pub outrig::config::MountRuleViolation::ContainerNotAbsolute::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::MountRuleViolation::ContainerNotAbsolute::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::MountRuleViolation::ContainerRoot
+pub outrig::config::MountRuleViolation::ContainerRoot::declared_in: core::option::Option<std::path::PathBuf>
+#[non_exhaustive] pub outrig::config::MountRuleViolation::HostMissing
+pub outrig::config::MountRuleViolation::HostMissing::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::MountRuleViolation::HostMissing::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::MountRuleViolation::HostNotDirectory
+pub outrig::config::MountRuleViolation::HostNotDirectory::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::MountRuleViolation::HostNotDirectory::path: std::path::PathBuf
 #[non_exhaustive] pub enum outrig::config::NetworkAction
 pub outrig::config::NetworkAction::Allow
 pub outrig::config::NetworkAction::Deny
