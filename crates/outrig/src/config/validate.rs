@@ -14,9 +14,9 @@ use thiserror::Error;
 
 use super::{
     Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
-    NetworkMode, RETRY_BUDGET_SECS_CEILING, SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING,
-    TOOL_CALL_MAX_LIMIT, TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
-    normalize_capability_name,
+    NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
+    SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
+    TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
 
 /// Renders the trailing `(declared in <file>)` note, or nothing when the entry
@@ -239,6 +239,16 @@ pub enum ConfigValidationError {
     #[error("{path} must be at most {max} seconds (0 disables retries); got {value}")]
     RetryBudgetSecsTooLarge { path: String, value: u64, max: u64 },
 
+    #[error("{path} must be between 1 and {max} seconds; got {value}")]
+    RequestTimeoutSecsTooLarge { path: String, value: u64, max: u64 },
+
+    #[error(
+        "{path} must be between 1 and {max} seconds; got 0, which is an immediate \
+         timeout rather than a disabled one -- every request would fail before \
+         it could be answered"
+    )]
+    RequestTimeoutSecsZero { path: String, max: u64 },
+
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
 
@@ -430,6 +440,15 @@ pub enum ConfigValidationError {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ValidationOptions<'a> {
     pub agent_model_override: Option<&'a str>,
+    /// Whether to check the `[providers]` / `[models]` / `[agents]` blocks.
+    /// `outrig build` sets this false: it resolves images and never opens an
+    /// HTTP connection, so a config whose LLM half is broken still builds.
+    ///
+    /// The provider range checks -- `retry-budget-secs`,
+    /// `request-timeout-secs` -- ride along inside this gate, so `outrig build`
+    /// accepts values `outrig run` rejects. That is deliberate: the bounds
+    /// exist to keep an interactive turn from wedging, and a build has no turn
+    /// to wedge.
     pub validate_llm: bool,
 }
 
@@ -597,20 +616,32 @@ pub(super) fn validate_with_options(
     if options.validate_llm {
         for (provider_name, provider) in &cfg.providers {
             // Deliberately without a `_` arm, matching the model loop below: a
-            // new provider style has to stop here and say whether it retries.
-            let retry_budget_secs = match provider {
+            // new provider style has to stop here and say whether it retries
+            // and whether it speaks HTTP at all.
+            let (retry_budget_secs, request_timeout_secs) = match provider {
                 LlmProvider::OpenAi {
-                    retry_budget_secs, ..
+                    retry_budget_secs,
+                    request_timeout_secs,
+                    ..
                 }
                 | LlmProvider::Anthropic {
-                    retry_budget_secs, ..
-                } => *retry_budget_secs,
-                // In-process: no HTTP layer, so nothing to retry.
-                LlmProvider::Mistralrs => None,
+                    retry_budget_secs,
+                    request_timeout_secs,
+                    ..
+                } => (*retry_budget_secs, *request_timeout_secs),
+                // In-process: no HTTP layer, so nothing to retry and no
+                // request to time out.
+                LlmProvider::Mistralrs => (None, None),
             };
             if let Some(value) = retry_budget_secs {
                 validate_retry_budget_secs(
                     &format!("providers.{provider_name}.retry-budget-secs"),
+                    value,
+                )?;
+            }
+            if let Some(value) = request_timeout_secs {
+                validate_request_timeout_secs(
+                    &format!("providers.{provider_name}.request-timeout-secs"),
                     value,
                 )?;
             }
@@ -1247,6 +1278,28 @@ fn validate_retry_budget_secs(path: &str, value: u64) -> Result<(), ConfigValida
             path: path.to_string(),
             value,
             max: RETRY_BUDGET_SECS_CEILING,
+        });
+    }
+    Ok(())
+}
+
+/// Two-sided, unlike the budget above: this bounds one attempt rather than
+/// counting them, so `0` is not "no wait" but an immediate timeout -- reqwest
+/// treats `Duration::ZERO` as a deadline already past, failing every request
+/// before it can be answered. Both ends reject a config that parses and then
+/// cannot work.
+fn validate_request_timeout_secs(path: &str, value: u64) -> Result<(), ConfigValidationError> {
+    if value == 0 {
+        return Err(ConfigValidationError::RequestTimeoutSecsZero {
+            path: path.to_string(),
+            max: REQUEST_TIMEOUT_SECS_CEILING,
+        });
+    }
+    if value > REQUEST_TIMEOUT_SECS_CEILING {
+        return Err(ConfigValidationError::RequestTimeoutSecsTooLarge {
+            path: path.to_string(),
+            value,
+            max: REQUEST_TIMEOUT_SECS_CEILING,
         });
     }
     Ok(())

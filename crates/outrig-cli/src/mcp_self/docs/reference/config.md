@@ -192,7 +192,9 @@ api-key  = "${OLLAMA_API_KEY}"
 | `retry-budget-secs`    | integer      | no       | `600`   | Transient-retry budget, seconds. |
 
 `request-timeout-secs` bounds each individual attempt, and defaults high enough not to cut
-off long reasoning completions. `retry-budget-secs` bounds *all* the attempts together: an
+off long reasoning completions. It must be between `1` and `3600` seconds; `0` is rejected,
+because it is an *immediate* timeout rather than a disabled one and every request would fail
+before it could be answered. `retry-budget-secs` bounds *all* the attempts together: an
 LLM request that fails transiently is retried until it succeeds or the budget runs out, then
 ends the turn without ending the session. Which failures count as transient, how the wait is
 chosen, and how `Retry-After` is honored are described in
@@ -1068,6 +1070,9 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `subagent-width-max`, if set at the top level or on an agent, must be between `1` and `16`.
 - `retry-budget-secs`, if set at the top level or on a remote provider, must be at most `3600`
   seconds. `0` is legal and disables retries.
+- `request-timeout-secs`, if set on a remote provider, must be between `1` and `3600` seconds.
+  Unlike `retry-budget-secs`, `0` is **not** legal: it is an immediate timeout rather than a
+  disabled one, so every request would fail before it could be answered.
 - `[network].mode`, if set, must be `default` or `audit`.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.

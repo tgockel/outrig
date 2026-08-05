@@ -135,6 +135,13 @@ pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::style: 
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::max: u64
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::path: alloc::string::String
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::value: u64
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsZero
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsZero::max: u64
+pub outrig::config::ConfigValidationError::RequestTimeoutSecsZero::path: alloc::string::String
 pub outrig::config::ConfigValidationError::ReservedMcpServerName
 pub outrig::config::ConfigValidationError::ReservedMcpServerName::image: alloc::string::String
 pub outrig::config::ConfigValidationError::ReservedMcpServerName::server: alloc::string::String
@@ -515,6 +522,7 @@ pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES: u32
+pub const outrig::config::REQUEST_TIMEOUT_SECS_CEILING: u64
 pub const outrig::config::RETRY_BUDGET_SECS_CEILING: u64
 pub const outrig::config::SUBAGENT_DEPTH_MAX_CEILING: u32
 pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32

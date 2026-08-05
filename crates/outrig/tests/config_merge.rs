@@ -1087,6 +1087,129 @@ identifier = "gpt-4o-mini"
         assert_eq!(cfg.retry_budget_secs, Some(0));
     }
 
+    /// The per-provider path, on both remote styles: the message names the
+    /// provider so a multi-provider config says which row to edit.
+    #[test]
+    fn provider_request_timeout_secs_too_large_errors() {
+        for style in ["openai", "anthropic"] {
+            let cfg = parse(&format!(
+                r#"
+default-model = "fast"
+
+[providers.remote]
+style                = "{style}"
+base-url             = "https://api.example.com"
+api-key              = "${{REMOTE_API_KEY}}"
+request-timeout-secs = 86400
+
+[models.fast]
+provider   = "remote"
+identifier = "some-model"
+"#
+            ));
+            let err = expect_validation_err(&cfg, None);
+            match err {
+                ConfigValidationError::RequestTimeoutSecsTooLarge { path, value, max } => {
+                    assert_eq!(path, "providers.remote.request-timeout-secs");
+                    assert_eq!(value, 86400);
+                    assert_eq!(max, 3600);
+                }
+                other => panic!("expected RequestTimeoutSecsTooLarge for {style}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// `0` parses and would then fail every request before it could be
+    /// answered -- `Duration::ZERO` is an immediate timeout in reqwest, not a
+    /// disabled one. The message has to say so, since the sibling key's `0`
+    /// means "off" and the reader is entitled to expect the same here.
+    #[test]
+    fn provider_request_timeout_secs_zero_errors() {
+        let cfg = parse(
+            r#"
+default-model = "fast"
+
+[providers.openai]
+style                = "openai"
+base-url             = "https://api.openai.com/v1"
+api-key              = "${OPENAI_API_KEY}"
+request-timeout-secs = 0
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        let rendered = err.to_string();
+        match err {
+            ConfigValidationError::RequestTimeoutSecsZero { path, max } => {
+                assert_eq!(path, "providers.openai.request-timeout-secs");
+                assert_eq!(max, 3600);
+                assert!(
+                    rendered.contains("immediate timeout"),
+                    "message should say what 0 would do, got: {rendered}"
+                );
+                assert!(
+                    rendered.contains("between 1 and 3600"),
+                    "message should state the legal range, got: {rendered}"
+                );
+            }
+            other => panic!("expected RequestTimeoutSecsZero, got: {other:?}"),
+        }
+    }
+
+    /// The bound is inclusive at both ends: exactly the ceiling, and the
+    /// smallest legal value, both validate.
+    #[test]
+    fn provider_request_timeout_secs_bounds_are_inclusive() {
+        for secs in [1, 3600] {
+            let cfg = parse(&format!(
+                r#"
+default-model = "fast"
+
+[providers.openai]
+style                = "openai"
+base-url             = "https://api.openai.com/v1"
+api-key              = "${{OPENAI_API_KEY}}"
+request-timeout-secs = {secs}
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+"#
+            ));
+            cfg.validate(None)
+                .unwrap_or_else(|e| panic!("{secs}s is inside the bound, got: {e:?}"));
+        }
+    }
+
+    /// A `mistralrs` provider has no HTTP layer, so the `(None, None)` arm of
+    /// the validation match is what it takes -- there is no timeout to check.
+    ///
+    /// It reaches that arm by *parsing*, not by rejection: `Mistralrs` is a
+    /// unit variant, and `deny_unknown_fields` cannot reject unknown keys for a
+    /// variant that has no fields, so the key is silently swallowed rather than
+    /// refused. That is a pre-existing serde-shape bug affecting every key on
+    /// this variant, filed as `plan/next/mistralrs-provider-swallows-keys.md`;
+    /// this test pins today's behavior so the fix has a failing assertion to
+    /// flip rather than a silent one to discover.
+    #[test]
+    fn mistralrs_provider_ignores_request_timeout_secs() {
+        let cfg = parse(
+            r#"
+[providers.local]
+style                = "mistralrs"
+request-timeout-secs = 0
+"#,
+        );
+        assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs);
+        // Even a `0`, which is a hard error on any remote style, validates
+        // here: the key never made it into the parsed provider at all.
+        cfg.validate(None)
+            .expect("mistralrs carries no timeout to validate");
+    }
+
     #[test]
     fn retry_budget_secs_repo_overrides_global() {
         let global = parse(

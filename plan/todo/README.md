@@ -25,15 +25,13 @@ longer public at all. 0098 cashed the sweep in a second time, adding an `LlmProv
 variant and a `Model::max_tokens` field additively; the one break it did take -- renaming three
 provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
-Everything through 0105 landed; 0105-0111 refilled the queue from `plan/next/`
+Everything through 0106 landed; 0105-0111 refilled the queue from `plan/next/`
 against one gate: **does deferring this force a breaking change later, or freeze a contract a
 point release cannot fix?** The 0094 sweep is what makes that question narrow -- `#[non_exhaustive]`
 makes field and variant *additions* free, so what is left are field *type* changes, variants the
 sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
 qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
 
-- **0106 [validate-request-timeout-secs](0106-validate-request-timeout-secs.md)** -- a range
-  check added after the release rejects configs the release accepted.
 - **0107 [exec-workdir](0107-exec-workdir.md)** -- four published methods take
   `(&[String], &BTreeMap)` today: `exec_stdio` and `exec_capture`, on both `Outrig` and
   `Container`.
@@ -103,3 +101,17 @@ against the sidecar image's `PATH` before the namespace join, and that e2e now p
 the stock image), and the payload inherited the primary's procfs, in which `/proc/self` names
 nothing, so every rustup shim failed (0104, landed -- the launcher mounts a fresh `proc`). The
 arc is closed; all three servers now run as `view = "primary"` sidecars every session.
+
+0106 landed: `request-timeout-secs` is bounded to `1..=3600`, the hour its sibling
+`retry-budget-secs` already used. Two things it turned up are worth recording, because both were
+assumptions the queue carried rather than facts. The key has **no top-level form** -- it lives
+only on the two remote provider variants, so the task's "top level and per provider" wording
+described a path that does not exist; the criteria were corrected to the one that does, and the
+missing default is filed as `plan/next/top-level-request-timeout-secs.md`, additive and so not
+window-bound. And `0` is an *immediate* timeout in reqwest rather than a disabled one, the
+opposite of what the `plan/next/` entry it was groomed from claimed -- verified against the
+pinned 0.13.4 source, not inferred. That makes `0` mean opposite things on the two keys, which
+is correct: the budget counts attempts, the timeout bounds one. A third finding was incidental --
+`style = "mistralrs"` is a unit variant, so `deny_unknown_fields` silently swallows *every*
+unknown key on it, filed as `plan/next/mistralrs-provider-swallows-keys.md` and pinned by a test
+written against today's behavior.

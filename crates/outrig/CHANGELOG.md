@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `request-timeout-secs` is now range-checked**, closing an asymmetry with its
+  sibling `retry-budget-secs`, which has validated against `RETRY_BUDGET_SECS_CEILING` since it
+  landed. A remote provider's `request-timeout-secs` must be between `1` and the new
+  `REQUEST_TIMEOUT_SECS_CEILING` (`3600`, the same hour as the budget's ceiling); both bounds
+  are inclusive. Breaking because a config 0.2.0-rc.1 accepted -- any `u64` at all -- can now be
+  rejected at load; the two new error variants are themselves additive.
+
+  `0` is rejected rather than treated as "no timeout". Checked against the pinned reqwest
+  0.13.4, `Duration::ZERO` is an *immediate* timeout: the builder stores it, it becomes a
+  `tokio::time::sleep` that is ready on first poll, and the request fails before it can be
+  answered. So `request-timeout-secs = 0` was a config that parsed, validated, and then could
+  not work. Note this differs from `retry-budget-secs = 0`, which means "do not retry" and
+  remains legal -- one key counts attempts, the other bounds a single one.
+
+  Two `ConfigValidationError` variants carry it: `RequestTimeoutSecsTooLarge { path, value,
+  max }` and `RequestTimeoutSecsZero { path, max }`. The enum is `#[non_exhaustive]`, so both
+  are additive.
+
+  The bound applies per provider, which is the only place the key exists -- unlike
+  `retry-budget-secs` there is no top-level default to check. Adding one is additive and is
+  filed as follow-up work rather than folded in here. It is also checked only on the paths that
+  can reach an HTTP client: `outrig build` skips the `[providers]` block wholesale, as it does
+  for every LLM-side rule, so a build still succeeds against a config `outrig run` would reject.
+
 - **Breaking: a mount validation error names the config file that declared the mount**, the way
   an image path error has since 0.2.0-rc.1. Global and repo `[[workspace.mounts]]` lists are
   *concatenated*, so a bare relative path in a diagnostic is ambiguous between two files:

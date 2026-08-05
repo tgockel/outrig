@@ -94,6 +94,19 @@ pub const DEFAULT_RETRY_BUDGET_SECS: u64 = 600;
 /// wedge an interactive turn for hours.
 pub const RETRY_BUDGET_SECS_CEILING: u64 = 3600;
 
+/// Upper bound accepted for `request-timeout-secs`. The same hour as
+/// [`RETRY_BUDGET_SECS_CEILING`], and for the same reason: an endpoint that has
+/// not answered inside a minute is not going to, so an hour is already the
+/// degenerate case rather than a tuning range. Inclusive -- exactly `3600` is
+/// accepted.
+///
+/// Unlike the budget this key also has a floor, enforced as a rejection of `0`
+/// rather than as a constant: `Duration::ZERO` is an *immediate* timeout in
+/// reqwest, not a disabled one, so a `0` here fails every request before it can
+/// be answered. A `0` on the budget means "do not retry" and stays legal; the
+/// keys differ because one counts attempts and the other bounds a single one.
+pub const REQUEST_TIMEOUT_SECS_CEILING: u64 = 3600;
+
 /// Which config file an entry was declared in. Recorded per entry at load time
 /// -- before [`merge`], which is where origin would otherwise be lost -- so a
 /// relative path can resolve against the directory that gives it meaning
