@@ -5,6 +5,9 @@ history, because `rig::completion::PromptError::CompletionError` carries no
 `chat_history` (rig 0.40, `src/completion/request.rs:148-189`) -- unlike
 `PromptCancelled` and `MaxTurnsError`, which both do.
 
+The unusable-response arm beside it has the same shape and the same loss; both
+want whatever fix this gets.
+
 For a turn that dies on its *first* model call that is exactly right: nothing
 happened, and "history unchanged -- send the prompt again" is true. But a turn
 that dies on a *later* model call has already executed container tool calls,

@@ -317,6 +317,20 @@ turn to `continue`. Resend the prompt itself once the window clears. The budget 
 `retry-budget-secs`; see [config reference](../reference/config.md) to change it, and
 [LLM providers](../concepts/llm-providers.md) for which failures count as transient.
 
+A provider that answers with nothing usable is handled the same way. The call is retried
+twice before outrig gives up:
+
+```
+[outrig] model returned an unusable response (Response contained no message or tool call
+        (empty)); retry in 1.4s (attempt 2/3)
+```
+
+```
+[outrig] the model returned a response outrig could not use (Response contained no message
+        or tool call (empty)); ending turn
+[outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
+```
+
 The REPL is line-buffered. Multi-line input is not supported in v0.
 
 > **TODO: Incomplete** -- multi-line / paste-mode input is deferred.

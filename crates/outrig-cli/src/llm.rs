@@ -487,13 +487,17 @@ fn validate_mistralrs_device(
 pub enum RigAgent {
     OpenAi {
         agent: rig::agent::Agent<
-            rig::providers::openai::CompletionModel<retry::RetryingHttpClient>,
+            retry::RetryingModel<
+                rig::providers::openai::CompletionModel<retry::RetryingHttpClient>,
+            >,
         >,
         tool_call_max: usize,
     },
     Anthropic {
         agent: rig::agent::Agent<
-            rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
+            retry::RetryingModel<
+                rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
+            >,
         >,
         tool_call_max: usize,
     },
@@ -513,16 +517,27 @@ pub enum RigAgent {
 /// The function is async because the mistralrs arm has to load (and on
 /// first use, download) a multi-gigabyte model. The remote arms do no I/O:
 /// they build an HTTP client and hand it to Rig.
-/// The HTTP client every remote provider gets: one per-request timeout, from
-/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`],
-/// wrapped in the transient-retry loop bounded by `retry-budget-secs` or
-/// [`DEFAULT_RETRY_BUDGET_SECS`]. Shared so neither default can drift between
-/// the styles.
+/// The retry policy every remote provider gets, from the provider's
+/// `retry-budget-secs` or [`DEFAULT_RETRY_BUDGET_SECS`]. Both retry layers take
+/// the same one, so `retry-budget-secs = 0` switches off both.
 ///
 /// [`DEFAULT_RETRY_BUDGET_SECS`]: outrig::config::DEFAULT_RETRY_BUDGET_SECS
+fn retry_policy(retry_budget_secs: Option<u64>) -> retry::RetryPolicy {
+    retry::RetryPolicy {
+        budget: std::time::Duration::from_secs(
+            retry_budget_secs.unwrap_or(outrig::config::DEFAULT_RETRY_BUDGET_SECS),
+        ),
+        ..retry::RetryPolicy::default()
+    }
+}
+
+/// The HTTP client every remote provider gets: one per-request timeout, from
+/// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`],
+/// wrapped in the transient-retry loop `policy` bounds. Shared so neither
+/// default can drift between the styles.
 fn remote_http_client(
     request_timeout_secs: Option<u64>,
-    retry_budget_secs: Option<u64>,
+    policy: retry::RetryPolicy,
 ) -> Result<retry::RetryingHttpClient> {
     let timeout =
         std::time::Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
@@ -530,12 +545,6 @@ fn remote_http_client(
         .timeout(timeout)
         .build()
         .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
-    let policy = retry::RetryPolicy {
-        budget: std::time::Duration::from_secs(
-            retry_budget_secs.unwrap_or(outrig::config::DEFAULT_RETRY_BUDGET_SECS),
-        ),
-        ..retry::RetryPolicy::default()
-    };
     Ok(retry::RetryingHttpClient::new(inner, policy))
 }
 
@@ -557,7 +566,8 @@ pub async fn build_agent(
             use rig::client::CompletionClient;
             use rig::providers::openai::CompletionsClient;
 
-            let http = remote_http_client(*request_timeout_secs, *retry_budget_secs)?;
+            let policy = retry_policy(*retry_budget_secs);
+            let http = remote_http_client(*request_timeout_secs, policy)?;
             let client = CompletionsClient::builder()
                 .api_key(api_key.clone())
                 .base_url(base_url)
@@ -566,7 +576,7 @@ pub async fn build_agent(
                 .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
             let model = client.completion_model(&resolved.model_identifier);
             Ok(RigAgent::OpenAi {
-                agent: finish_agent(model, resolved, tools),
+                agent: finish_agent(retry::RetryingModel::new(model, policy), resolved, tools),
                 tool_call_max: resolved.tool_call_max,
             })
         }
@@ -579,7 +589,8 @@ pub async fn build_agent(
             use rig::client::CompletionClient;
             use rig::providers::anthropic;
 
-            let http = remote_http_client(*request_timeout_secs, *retry_budget_secs)?;
+            let policy = retry_policy(*retry_budget_secs);
+            let http = remote_http_client(*request_timeout_secs, policy)?;
             // Rig's client owns the protocol: `x-api-key`, the
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and
             // the native content blocks. It also normalizes a trailing `/v1`
@@ -608,7 +619,7 @@ pub async fn build_agent(
                 model.default_max_tokens = Some(ANTHROPIC_FALLBACK_MAX_TOKENS);
             }
             Ok(RigAgent::Anthropic {
-                agent: finish_agent(model, resolved, tools),
+                agent: finish_agent(retry::RetryingModel::new(model, policy), resolved, tools),
                 tool_call_max: resolved.tool_call_max,
             })
         }
@@ -1071,12 +1082,13 @@ where
 /// be reported to a subagent's parent as an ordinary "stopped before
 /// reporting", which reads like the model's doing and hides a bug.
 ///
-/// The third recoverable case is an endpoint that stayed transiently broken --
-/// rate-limited, or unreachable -- for the whole retry budget. That used to
-/// end the process: the error reached `repl.rs`'s `res?` and unwound past the
-/// REPL loop, tearing down the containers and dropping the conversation. It
-/// ends the *turn* instead, so the user can wait out the window and send the
-/// prompt again in the same session.
+/// The remaining two recoverable cases are both the endpoint's doing: one that
+/// stayed transiently broken -- rate-limited, or unreachable -- for the whole
+/// retry budget, and one that answered with a body rig could not turn into a
+/// completion. Either used to end the process: the error reached `repl.rs`'s
+/// `res?` and unwound past the REPL loop, tearing down the containers and
+/// dropping the conversation. They end the *turn* instead, so the user can wait
+/// out the window and send the prompt again in the same session.
 fn handle_prompt_error(
     err: rig::completion::PromptError,
     history: &mut Vec<Message>,
@@ -1103,6 +1115,22 @@ fn handle_prompt_error(
         return Ok(TurnEnd {
             // The model never spoke, so nothing belongs on stdout. `repl.rs`'s
             // `if !reply.is_empty()` guard handles it.
+            reply: String::new(),
+            stopped: Some(TurnStop::EndpointFailed(reason)),
+        });
+    }
+
+    // A response rig could not use, still unusable after `RetryingModel` spent
+    // its attempts. Handled the same way and for the same reasons: nothing was
+    // appended, and the prompt is what wants resending.
+    if let Some(detail) = retry::unusable_response_label(&err) {
+        let reason = format!("the model returned a response outrig could not use ({detail})");
+        eprintln!("[outrig] {reason}; ending turn");
+        eprintln!(
+            "[outrig] history unchanged -- send the prompt again to retry, \
+             or \"/quit\" to stop."
+        );
+        return Ok(TurnEnd {
             reply: String::new(),
             stopped: Some(TurnStop::EndpointFailed(reason)),
         });

@@ -19,7 +19,10 @@
 //!   `CompletionModel::with_model` (which would silently cap replies at 2048);
 //! * the shared retry client covers this provider too -- including that a
 //!   `Retry-After` sets the wait, and that a spent budget ends the turn
-//!   without taking the session with it.
+//!   without taking the session with it;
+//! * a `200` carrying no usable content is retried above the HTTP client,
+//!   which is the only place it is visible at all, and ends the turn rather
+//!   than the session when it persists.
 
 mod common;
 
@@ -535,6 +538,183 @@ async fn exhausted_budget_ends_the_turn_without_killing_the_agent() {
         .expect("the next turn runs on the same agent");
     assert_eq!(reply, "Second turn.");
     assert_eq!(drain_recorded(&mut requests).len(), 1);
+}
+
+/// A `200 OK` carrying no usable content is retried at the model layer, which
+/// is the only layer that can see it -- to the HTTP client it is a success.
+///
+/// `stop_reason` is deliberately not `end_turn`: rig normalizes *that* empty
+/// response into empty assistant text, and every other one into the
+/// `ResponseError` this retries.
+///
+/// Not `start_paused`, for the reason
+/// [`transient_status_is_retried_at_the_http_layer`] gives: the real wait here
+/// is one jittered base delay, at most a second.
+#[tokio::test]
+async fn an_unusable_response_is_retried_at_the_model_layer() {
+    let (addr, mut requests) = start_mock_http(vec![
+        message(json!([]), "max_tokens"),
+        text_reply("Recovered."),
+    ])
+    .await;
+
+    let reply = run_one_turn(
+        addr,
+        "OUTRIG_TEST_ANTHROPIC_UNUSABLE",
+        MODEL,
+        Some(1024),
+        vec![],
+    )
+    .await
+    .expect("the retry should carry the turn through the unusable response");
+
+    assert_eq!(reply, "Recovered.");
+
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the unusable response is retried once: {recorded:#?}",
+    );
+    assert_eq!(
+        recorded[0].body, recorded[1].body,
+        "a retry replays the same model call, not a rebuilt turn",
+    );
+}
+
+/// The property the whole design rests on: a retry replays one *model call*,
+/// not the turn around it. The unusable response lands on the second model
+/// call, after a tool has already run, and the tool does not run again.
+///
+/// Retrying `agent.prompt(..)` instead would re-execute the tool -- harmless
+/// for this echo, a repeat for a container tool call that wrote something.
+#[tokio::test]
+async fn a_retry_mid_turn_does_not_re_run_the_tool_calls_before_it() {
+    let (addr, mut requests) = start_mock_http(vec![
+        message(
+            json!([{
+                "type": "tool_use",
+                "id": "toolu_mock_1",
+                "name": "outrig_test_echo",
+                "input": { "value": "ping" }
+            }]),
+            "tool_use",
+        ),
+        message(json!([]), "max_tokens"),
+        text_reply("The echo said pong:ping."),
+    ])
+    .await;
+
+    let tool = EchoTool::default();
+    let reply = run_one_turn(
+        addr,
+        "OUTRIG_TEST_ANTHROPIC_UNUSABLE_MID_TURN",
+        MODEL,
+        Some(4096),
+        vec![tool.clone()],
+    )
+    .await
+    .expect("the retry should carry the turn through the unusable response");
+
+    assert_eq!(reply, "The echo said pong:ping.");
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "the retry replays the model call, not the turn, so the tool runs once",
+    );
+
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 3, "tool_use, the retry, the reply");
+    assert_eq!(
+        recorded[1].body, recorded[2].body,
+        "the retried call carries the same history the unusable one did -- \
+         including the tool_result, which is what was at risk",
+    );
+}
+
+/// A response that stays unusable ends the *turn*, not the process -- and the
+/// same agent takes the next turn.
+///
+/// This is the failure that prompted the change: an `outrig run` six turns into
+/// a conversation exited 1 with `agent prompt failed: CompletionError:
+/// ResponseError: Response contained no message or tool call (empty)`, tearing
+/// down its containers and losing the lot. `retry-budget-secs = 0` makes the
+/// giving-up immediate, so the test pins the recovery rather than the waiting.
+#[tokio::test]
+async fn a_persistently_unusable_response_ends_the_turn_not_the_session() {
+    let (addr, mut requests) = start_mock_http(vec![
+        message(json!([]), "max_tokens"),
+        text_reply("Second turn."),
+    ])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_UNUSABLE_PERSISTS";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let agent = build_mock_agent(&cfg, var, vec![]).await;
+
+    let mut history = Vec::new();
+    let reply = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("an unusable response ends the turn, it does not fail the session");
+    assert_eq!(
+        reply, "",
+        "the model never said anything usable, so nothing belongs on stdout",
+    );
+    assert!(
+        history.is_empty(),
+        "nothing was appended, which is what the advice to resend rests on: {history:#?}",
+    );
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        1,
+        "a zero budget makes the first unusable response final",
+    );
+
+    // The agent is still usable, which is the point.
+    let reply = agent
+        .run_turn("try again", &mut history)
+        .await
+        .expect("the next turn runs on the same agent");
+    assert_eq!(reply, "Second turn.");
+    assert_eq!(drain_recorded(&mut requests).len(), 1);
+}
+
+/// The other side of the two recoverable classes: a rejected key still ends
+/// the session. Both of the arms above return `Ok` for a failing model call, so
+/// this pins that the *terminal* class did not get swept in with them -- a
+/// misconfiguration the user must fix has to exit, not invite a resend that can
+/// never work.
+#[tokio::test]
+async fn a_rejected_api_key_stays_fatal() {
+    let (addr, mut requests) = start_mock_http(vec![CannedResponse::status(
+        401,
+        json!({
+            "type": "error",
+            "error": { "type": "authentication_error", "message": "invalid x-api-key" },
+        }),
+    )])
+    .await;
+
+    let err = run_one_turn(
+        addr,
+        "OUTRIG_TEST_ANTHROPIC_BAD_KEY",
+        MODEL,
+        Some(1024),
+        vec![],
+    )
+    .await
+    .expect_err("a rejected key is the user's to fix, so it must not end up an Ok turn");
+
+    assert!(
+        err.to_string().contains("401"),
+        "the error should name the status: {err}",
+    );
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        1,
+        "a 401 is terminal at both retry layers",
+    );
 }
 
 /// Anthropic requires `max_tokens` on every request, and rig only knows a

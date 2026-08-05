@@ -207,6 +207,10 @@ Two things about the budget that belong here, because they are about the keys:
   matter for a rate limit, which comes back in milliseconds.
 - `0` disables retries -- the first failure is final. Useful for scripted runs that would
   rather fail fast than wait.
+- It is not the only bound on the second retry layer. A provider that answers with a body
+  outrig cannot use gets at most two retries whatever the budget says, because such a
+  response comes back immediately and the budget alone would spend itself on dozens of them.
+  `0` still switches that layer off along with everything else.
 
 ### `style = "anthropic"`
 

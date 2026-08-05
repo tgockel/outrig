@@ -225,12 +225,22 @@ better than any curve we could guess. Absent one, the wait is exponential backof
 second, doubling to a 30-second ceiling and jittered so that several agents sharing an
 endpoint do not all come back at the same instant.
 
-The retry happens beneath a single model call, which is what keeps it safe. A turn is a
-model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that
-already happened. Retrying one HTTP request replays one HTTP request.
+A provider can also fail while appearing to succeed: a `200 OK` whose body carries no usable
+content. There is nothing for outrig to say and nothing to act on, so that response is
+retried too -- twice, then given up on. This retry cannot live in the HTTP client, which sees
+a `200` and calls it a success; it wraps the model call instead. It shares the budget, so
+`retry-budget-secs = 0` switches off both layers, but it is capped by that count as well: an
+unusable response comes back in milliseconds, so the budget alone would spend ten minutes on
+dozens of tries where a hiccup wants two.
 
-If the budget does run out, the turn ends and the REPL prompts again with the conversation
-untouched -- see [`outrig run`](../usage/run.md). The session, and its containers, stay up.
+Both retries happen beneath a single model call, which is what keeps them safe. A turn is a
+model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that
+already happened. Tools run between model calls, never inside one, so replaying either an
+HTTP request or a model call replays exactly that and nothing observable.
+
+If the budget or the attempts do run out, the turn ends and the REPL prompts again with the
+conversation untouched -- see [`outrig run`](../usage/run.md). The session, and its
+containers, stay up.
 
 ## Other Rig provider styles
 
