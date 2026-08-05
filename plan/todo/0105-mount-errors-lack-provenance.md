@@ -1,4 +1,4 @@
-# Mount validation errors cannot name the file that declared the path
+# 0105 -- Mount validation errors cannot name the file that declared the path
 
 ## Context
 
@@ -48,6 +48,19 @@ Let a mount diagnostic name its declaring file, the way an image diagnostic alre
   currently misleading.
 - Regenerate `crates/outrig/public-api.txt` and add a `### Changed` CHANGELOG entry; this is a
   breaking change to a public enum, unlike 0097.
+
+## Acceptance
+
+- A global `[[workspace.mounts]]` with a missing `host-path` reports the path *and* the file that
+  declared it, so `global_mount_is_not_satisfied_by_a_repo_path` in
+  `crates/outrig/tests/config_merge.rs` no longer produces a misleading message.
+- A concatenated list holding one global entry and one repo entry reports each failure against its
+  own declaring file, not against whichever config was loaded last.
+- The sidecar path carries it too: a failing `[[sidecars.<name>.mounts]]` surfaces `declared_in`
+  through `ConfigValidationError::SidecarMount` rather than losing it at the wrapping boundary.
+- Every reshaped variant carries `#[non_exhaustive]` afterwards, so the next field is additive.
+- `crates/outrig/public-api.txt` is regenerated and `crates/outrig/CHANGELOG.md` records the enum
+  reshape under `### Changed` in the existing `[Unreleased]` section.
 
 ## Design forks
 

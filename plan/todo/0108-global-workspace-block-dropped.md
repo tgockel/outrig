@@ -1,4 +1,4 @@
-# Global `[workspace]` primary fields are silently discarded
+# 0108 -- Global `[workspace]` primary fields are silently discarded
 
 ## Context
 
@@ -48,6 +48,19 @@ Make the global `[workspace]` block either work or fail loudly, and make the doc
   a global `host-path` would then be relative to `~/.outrig/` -- the 0097 rule applied to a key
   0097 could correctly skip. `Workspace::resolved_host_path`
   (`crates/outrig/src/config/mod.rs`) is the one call site to change.
+
+## Acceptance
+
+- A global `[workspace]` with no repo `[workspace]` at all behaves the way the chosen rule says,
+  and a test in `mod config_merge` pins it -- today this case silently yields
+  `Workspace::default()`.
+- A both-declare case pins repo precedence, so whatever changes for the silent case, the
+  documented block-wins behavior is unchanged where both files speak.
+- `doc/reference/config.md`'s "Resolution: which file wins" states the rule in terms of the repo
+  config being *silent*, not only in terms of both declaring.
+- `mounts` still concatenates global-then-repo, unchanged.
+- If the rule is "reject", the error names the global file; a config carrying a global
+  `[workspace]` today fails loudly rather than being quietly ineffective.
 
 ## Design forks
 

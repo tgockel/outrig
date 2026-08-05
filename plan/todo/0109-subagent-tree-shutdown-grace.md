@@ -1,4 +1,4 @@
-# The subagent shutdown grace was never measured against a full tree
+# 0109 -- The subagent shutdown grace was never measured against a full tree
 
 ## Symptom
 
@@ -16,7 +16,14 @@ those is below the depth limit so it gets its own registry and its own 8, and th
 leaves. 0100's own Risks section asked for that worst case to be timed before committing to the
 default. It was not; the number is arithmetic, not a measurement.
 
-## What to measure
+## Goal
+
+Find out whether the five-second teardown budget fits the tree `subagent-width-max` permits, and
+settle `DEFAULT_SUBAGENT_WIDTH_MAX` before 0.2.0 publishes it as working behavior. The grace is a
+private constant and stays changeable; the default width is a `pub const` and lowering it after
+the release breaks setups that were running fine.
+
+## Deliverables
 
 Stand up a tree at the permitted worst case and time `shutdown()` end to end:
 
@@ -35,6 +42,24 @@ test to grow from; it already builds a grandchild and asserts the tool clones ar
 raise the grace.** The grace exists to bound a wedged subagent, not to absorb a large healthy one --
 stretching it to fit 72 tasks would make a genuinely hung subagent take proportionally longer to
 give up on, which is the case the timeout was written for.
+
+## Acceptance
+
+- The worst-case tree (width 8, depth 3, 72 live subagents) tears down inside `SHUTDOWN_GRACE` in
+  both shapes -- all idle, and all mid-round with a tool call in flight -- or the default width is
+  lowered until it does.
+- The measured join time is *reported*, not just asserted against, so the margin is a number
+  someone can reason about later rather than a boolean that passed once.
+- Whatever the outcome, `shutdown_releases_the_tool_clones_subagents_hold` and
+  `shutdown_reaps_nested_subagents_and_releases_their_tool_clones` still pass -- no tool clone
+  outlives the shutdown.
+- If the default width moves, `DEFAULT_SUBAGENT_WIDTH_MAX`, the config docs, and the range check
+  move together, and the CHANGELOG records the new default.
+
+## Dependencies
+
+- **Landed: `plan/done/0100-subagent-width-cap.md`.** It set the width cap and its decision 5
+  deferred exactly this measurement; fork 2 there records why the default is `8`.
 
 ## See also
 

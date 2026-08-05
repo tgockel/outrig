@@ -25,9 +25,48 @@ longer public at all. 0098 cashed the sweep in a second time, adding an `LlmProv
 variant and a `Model::max_tokens` field additively; the one break it did take -- renaming three
 provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
-**The queue is empty.** Every numbered task through 0104 has landed; `plan/todo/` holds nothing
-but this file. The pre-freeze work for `0.2.0` is done, and the next entries come from
-`plan/next/` via `/groom-plan` rather than from an existing backlog.
+Everything through 0104 landed, emptying the queue, and 0105-0111 refill it from `plan/next/`
+against one gate: **does deferring this force a breaking change later, or freeze a contract a
+point release cannot fix?** The 0094 sweep is what makes that question narrow -- `#[non_exhaustive]`
+makes field and variant *additions* free, so what is left are field *type* changes, variants the
+sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
+qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
+
+- **0105 [mount-errors-lack-provenance](0105-mount-errors-lack-provenance.md)** -- four
+  `WorkspaceMount*` variants and every `MountRuleViolation` variant are unsealed, so giving a
+  mount error the `declared_in` an image error already has reshapes them.
+- **0106 [validate-request-timeout-secs](0106-validate-request-timeout-secs.md)** -- a range
+  check added after the release rejects configs the release accepted.
+- **0107 [exec-workdir](0107-exec-workdir.md)** -- four published methods take
+  `(&[String], &BTreeMap)` today: `exec_stdio` and `exec_capture`, on both `Outrig` and
+  `Container`.
+- **0108 [global-workspace-block-dropped](0108-global-workspace-block-dropped.md)** -- a global
+  `[workspace]` block is parsed, validated, merged, and discarded; honoring it and rejecting it
+  both change what a config `0.2.0` accepts does.
+- **0109 [subagent-tree-shutdown-grace](0109-subagent-tree-shutdown-grace.md)** -- the five-second
+  teardown budget was never measured against the 72-subagent tree the width cap permits, and
+  `DEFAULT_SUBAGENT_WIDTH_MAX` is a `pub const`.
+- **0110 [model-aliases](0110-model-aliases.md)** -- `Model::provider` becomes `Option<String>`,
+  a field *type* change the sweep does not cover.
+- **0111 [provider-construction-options-struct](0111-provider-construction-options-struct.md)** --
+  `LlmProvider::openai` / `::anthropic` take their fields positionally, and Rust cannot overload.
+
+0105 is the cheapest and highest-value of them: 0097 already built the machinery -- `ConfigSource`,
+per-mount stamping, `resolved_host_path()` -- and gave `declared_in` to the two image variants it
+could reach additively. The mount variants were skipped because they were not sealed, so threading
+provenance through them is mostly wiring, and it is a break now or a break forever.
+
+0111 is last deliberately. It is the only one of the seven that is API *shape* rather than API
+*correctness*: rc.1 shipped `with_retry_budget_secs` as the non-breaking workaround, and
+`#[non_exhaustive]` means downstream cannot construct the variants anyway. It is the first entry to
+cut if the window tightens.
+
+Two things are **not** queued and are worth stating so they are not re-litigated. Regenerating
+`crates/outrig/public-api.txt` is each task's own deliverable rather than a task of its own -- four
+of the seven rewrite it, and a queued step would only be a second place to forget.
+`plan/next/public-api-snapshot-gate.md` (an opt-in check so the snapshot cannot silently rot) stays
+in the buffer as post-release process hygiene; a check against `cargo-public-api` 0.52.0 found no
+semantic drift in the current file, only `std::io` -> `core::io` renderings.
 
 0100 landed: `subagent-width-max` (default `8`, range `1..=16`) bounds how many live subagents one
 launching agent may hold, refusing past the limit rather than queueing. It was sequenced before

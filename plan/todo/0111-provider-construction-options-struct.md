@@ -1,4 +1,4 @@
-# `LlmProvider` construction now speaks two idioms
+# 0111 -- `LlmProvider` construction now speaks two idioms
 
 `LlmProvider::openai(base_url, api_key, request_timeout_secs)` and
 `::anthropic(..)` take their three fields positionally. `retry-budget-secs`
@@ -17,7 +17,14 @@ two problems:
 
 The next optional connection field makes this worse, not better.
 
-## Sketch
+## Goal
+
+Give `LlmProvider` one construction idiom instead of two, while the breaking window is open.
+Rust cannot overload `openai`, so the reshape is a break whenever it happens; taking it before
+0.2.0 final is the difference between one more line in an existing `### Changed` section and
+waiting for the next major.
+
+## Deliverables
 
 An options struct, matching the shape 0095 used for the session options:
 
@@ -44,3 +51,12 @@ point release.
 - `crates/outrig/public-api.txt` regenerated.
 - `crates/outrig/CHANGELOG.md` records it under `### Changed` as breaking, with
   the one-line migration.
+
+## Dependencies
+
+None hard. Queued last on purpose: rc.1 already shipped `with_retry_budget_secs`
+as the non-breaking workaround and the variants are `#[non_exhaustive]`, so
+downstream cannot construct them anyway. That makes this the one pre-final entry
+that is API shape rather than API correctness, and the first to cut if the
+window tightens. 0106 also touches `request-timeout-secs`; if both land, this one
+moves the field into the options struct rather than reasoning about it twice.
