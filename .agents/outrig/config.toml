@@ -29,9 +29,14 @@ context    = ".agents/outrig/images/mcp-git"
 dockerfile = ".agents/outrig/images/mcp-shell/Dockerfile"
 context    = ".agents/outrig/images/mcp-shell"
 
+[images.mcp-web]
+dockerfile = ".agents/outrig/images/mcp-web/Dockerfile"
+context    = ".agents/outrig/images/mcp-web"
+
   [images.outrig-standard.mcp]
   fs  = { image = "mcp-filesystem", view = "primary", args = ["/workspace"] }
   git = { image = "mcp-git", view = "primary", args = ["--repository", "/workspace"] }
+  web = { image = "mcp-web" }
 
   [images.outrig-standard.mcp.shell]
   image = "mcp-shell"
