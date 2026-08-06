@@ -493,8 +493,8 @@ fn is_transient(err: &HttpError) -> bool {
 /// which is transient by this predicate, so an unreachable endpoint ends the
 /// turn rather than the session. That is right for a REPL -- the message names
 /// the connection failure and the user can fix the config or `/quit` -- but it
-/// does mean a typo no longer exits non-zero. Narrowing it is filed as
-/// `plan/next/connect-failures-are-not-really-transient.md`.
+/// does mean a typo no longer exits non-zero. Narrowing it is queued as
+/// `plan/todo/0112-connect-failures-are-not-really-transient.md`.
 ///
 /// Returning the label rather than a `bool` keeps the classification and the
 /// thing to print together: a caller cannot decide this is recoverable without

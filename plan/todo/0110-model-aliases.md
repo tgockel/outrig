@@ -85,6 +85,9 @@ between.
   deliberately.
 - **Not in the first pass**: the runtime half. Specified under Runtime behavior because the config
   surface has to be designed for it, but it is separable and much larger -- see Design forks §2.
+  It is now queued as `plan/todo/0113-model-alias-failover.md`, which executes that specification;
+  this entry stays its authority on the config surface and on the two loose ends it hands over
+  (Design forks §4 and the `warn_fallback_ceiling` risk).
 
 ## Config surface
 
@@ -248,8 +251,9 @@ no usable model for alias "smart"; tried:
 
 ### Selecting a candidate: the runtime half
 
-Not in the first pass. Specified here because it constrains the config surface above and because
-the layer it belongs at is not the obvious one.
+Not in the first pass; queued as `plan/todo/0113-model-alias-failover.md`. Specified here because
+it constrains the config surface above and because the layer it belongs at is not the obvious one.
+Where 0113 and this section disagree, 0113 is newer and says why.
 
 The obvious placement -- try the whole turn against candidate 1, retry the turn against
 candidate 2 -- is wrong, and `crates/outrig-cli/src/llm/retry.rs`'s module doc already says why:
@@ -293,7 +297,7 @@ Two further constraints:
 - **The retry budget must be shared across the chain, not per candidate.** Three candidates at
   the default `retry-budget-secs = 600` is a thirty-minute turn against a total outage. Worse,
   most of that is spent retrying endpoints already known to be down. This is why the dependency on
-  `plan/next/connect-failures-are-not-really-transient.md` is close to hard: that entry's
+  `plan/todo/0112-connect-failures-are-not-really-transient.md` is close to hard: that entry's
   pre-first-byte budget is exactly the signal "move to the next candidate now" as opposed to "keep
   waiting on this one", and without it failover's worst case is worse than no failover at all.
 
@@ -405,7 +409,8 @@ should confirm), or **Open** (deferred).
    runtime half needs an object-safe shim, a shared retry budget, and the connect-failure split
    before it is a net improvement. The config surface is identical for both, so the second half is
    additive to the first -- which is the property that makes splitting them safe rather than merely
-   convenient.
+   convenient. The second half is `plan/todo/0113-model-alias-failover.md`, which resolves the
+   shared-budget question as a chain-scoped deadline and takes 0112 as a hard dependency.
 
 3. **The key name -- Resolved: `alias`.** It reads correctly for the case that motivated the
    feature (`alias = "opus-5"`) and acceptably for the list, where the entry is a set of
@@ -502,11 +507,12 @@ should confirm), or **Open** (deferred).
 
 - **Scheduling: before 0.2.0 final**, or the `Model::provider` change waits for the next major.
   See the first Risks item. Nothing else in this entry is order-sensitive.
-- **Soft, but close to hard for the runtime half:
-  `plan/next/connect-failures-are-not-really-transient.md`.** Failover across three candidates
+- **Not a dependency of this entry, but of its second half:
+  `plan/todo/0112-connect-failures-are-not-really-transient.md`.** Failover across three candidates
   multiplies the retry budget by three unless connect failures are separated from transient ones.
   That entry's short pre-first-byte budget is the signal failover needs to move on quickly; without
-  it, a total outage takes thirty minutes to report instead of ten.
+  it, a total outage takes thirty minutes to report instead of ten. 0113 takes it as a hard
+  dependency; the static half here needs nothing from it.
 - **Soft: `plan/next/subagent-model-allowlist.md`.** Design forks §8 -- the two compose cleanly but
   the second to land owns the pre- vs post-resolution matching rule.
 - **Soft: `plan/next/public-api-snapshot-gate.md`.** This change edits the public surface, and the

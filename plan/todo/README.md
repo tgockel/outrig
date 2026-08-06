@@ -43,6 +43,26 @@ qualified. The rest are additive by construction, internal, or explicitly post-v
 - **0111 [provider-construction-options-struct](0111-provider-construction-options-struct.md)** --
   `LlmProvider::openai` / `::anthropic` take their fields positionally, and Rust cannot overload.
 
+0112-0113 are the queue's first **post-freeze** tail, and are here despite failing the gate above
+rather than because they pass it. Both are additive: they live entirely in `outrig-cli`, whose
+internals 0093 made private, so neither regenerates `public-api.txt` nor writes a CHANGELOG line.
+They are numbered rather than left in `plan/next/` because 0113 has a hard dependency on 0112, and
+the buffer cannot express ordering -- a dependency between two buffer entries is a note, while a
+dependency between two numbered tasks is an invariant this file maintains. They sit after 0111 so
+nothing pre-final is displaced.
+
+- **0112
+  [connect-failures-are-not-really-transient](0112-connect-failures-are-not-really-transient.md)**
+  -- every `reqwest` transport error is retry-worthy today, so a typo'd `base-url` spends the full
+  `retry-budget-secs` before the turn ends. Splits the budget: a short pre-first-byte bound for
+  "never reached the endpoint", the full one for "the endpoint answered badly". Pulled out of
+  `plan/next/` because 0113 needs it.
+- **0113 [model-alias-failover](0113-model-alias-failover.md)** -- the runtime half 0110 defers:
+  moving to the next alias candidate when one fails *inside* a `completion()` call, which is the
+  only layer that can do it without re-running container tool calls. Resolves 0110's design fork §4
+  (the ceiling must move with the identifier) and its shared-budget blocker (a chain-scoped
+  deadline, at the cost of `RetryPolicy: Copy`). Depends on 0110 and 0112.
+
 0105 landed, and was the cheapest and highest-value of them: 0097 had already built the machinery
 -- `ConfigSource`, per-mount stamping, `resolved_host_path()` -- and given `declared_in` to the two
 image variants it could reach additively, so threading provenance through the mount variants was
