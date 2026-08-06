@@ -121,12 +121,12 @@ async fn write_repo_config(
         .await?;
     let ws_default = Workspace::default();
     let host_path = prompt
-        .ask_string(&HOST_PATH_FIELD, &ws_default.host_path.to_string_lossy())
+        .ask_string(&HOST_PATH_FIELD, &ws_default.host_path().to_string_lossy())
         .await?;
     let container_path = prompt
         .ask_string(
             &CONTAINER_PATH_FIELD,
-            &ws_default.container_path.to_string_lossy(),
+            &ws_default.container_path().to_string_lossy(),
         )
         .await?;
 

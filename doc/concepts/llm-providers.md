@@ -334,13 +334,19 @@ api-key  = "${OPENAI_API_KEY}"
 | `[providers.<name>]`  | typical home                     | allowed for repo-only providers     |
 | `[models.<name>]`     | typical home (reused names)      | allowed for repo-specific models    |
 | `[agents.<name>]`     | rare                             | typical home                        |
-| `[workspace]`         | --                               | repo only                           |
-| `[images.<name>]`     | --                               | repo only                           |
+| `[workspace]`         | rare (machine-wide paths)        | typical home                        |
+| `[images.<name>]`     | rare (reused across repos)       | typical home                        |
 | `default-model`       | typical home                     | optional override                   |
 | `default-agent`       | rare                             | optional                            |
 | `default-image`       | rare                             | required for `outrig run`           |
 
 If a name is defined in both, the repo wins -- override by redefining.
+
+`[workspace]` is the one block that does not merge by name. Its `host-path` and `container-path`
+merge per key, so a global `container-path` stays in effect until a repo declares its own, and
+`workspace.mounts` from both files are appended rather than replaced -- global entries first. A
+relative path in either file resolves against the directory of the file that declared it. See
+[Reference -> Config](../reference/config.md#resolution-which-file-wins).
 
 ## See also
 

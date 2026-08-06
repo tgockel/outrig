@@ -453,7 +453,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 
     let sid = SessionId::new();
     let host_workspace = cfg.workspace.resolved_host_path(&repo_root);
-    let container_workspace = cfg.workspace.container_path.clone();
+    let container_workspace = cfg.workspace.container_path().to_path_buf();
     let mut launch =
         ContainerLaunchSpec::workspace(host_workspace.clone(), container_workspace.clone());
     launch.mounts = container_mounts(&repo_root, &cfg.workspace.mounts);

@@ -510,7 +510,7 @@ impl LaunchSpec {
 
         let ws = WorkspaceSpec::new(
             config.workspace.resolved_host_path(repo_root),
-            config.workspace.container_path.clone(),
+            config.workspace.container_path().to_path_buf(),
         );
         let mounts = config
             .workspace

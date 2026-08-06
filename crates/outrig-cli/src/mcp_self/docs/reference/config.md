@@ -517,9 +517,9 @@ container-path = "/resources/cache"
 access         = "read-write"
 ```
 
-- `host-path` (path, optional, default: `"."`): primary workspace host path,
-  relative to the repo root. Always the repo root -- the primary `[workspace]`
-  fields are repo-owned as a block.
+- `host-path` (path, optional, default: `"."`): primary workspace host path. A
+  relative value resolves against the directory of the file that declared it --
+  see [path resolution](#path-resolution).
 - `container-path` (path, optional, default: `"/workspace"`): where the primary
   workspace is mounted in the container.
 - `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
@@ -887,10 +887,11 @@ used in full (no per-key merging).
 -> resolved api-key from env. Anything that fails to resolve is an error printed to stderr
 before the REPL starts.
 
-`[workspace]` primary fields are repo-owned: the repo config's `host-path` and
-`container-path` win as a block. Extra `workspace.mounts` are combined instead of replaced:
-global mounts are kept first, followed by repo mounts. Duplicate final `container-path` values
-are rejected during validation.
+`[workspace]` primary fields merge per key. A repo `host-path` or `container-path` overrides
+the corresponding global value; when the repo is silent, the global value remains in effect.
+If neither file declares a key, its built-in default (`.` or `/workspace`) applies. Extra
+`workspace.mounts` are combined instead of replaced: global mounts are kept first, followed by
+repo mounts. Duplicate final `container-path` values are rejected during validation.
 
 `[sidecars.<sc>]` merges by name like the other top-level maps, so a repo image-config can
 reference a sidecar the user declared globally.
@@ -913,9 +914,16 @@ concatenated `workspace.mounts` list can hold entries with different base direct
 | `--global-config <path>`     | `<path>`'s parent directory            |
 
 Absolute paths are used as-is and ignore the rule entirely. This applies to
-`[images.<name>].dockerfile` and `.context`, and to `host-path` in both `[[workspace.mounts]]`
-and `[sidecars.<sc>.mounts]`. `[workspace].host-path` is always repo-relative, because the
-primary `[workspace]` fields are repo-owned as a block.
+`[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, and to `host-path` in
+both `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`. Because `[workspace]` merges per key,
+a `host-path` inherited from the global file resolves beside that file, not from the repo root.
+
+Provenance is recorded, not written back. A merged config is a flattened snapshot: re-serializing
+one emits each inherited path as the literal text its source file used, without the base
+directory that text was resolved against. Writing that snapshot out and loading it as a repo
+config therefore re-reads relative inherited paths against the repo root. Outrig never does
+this -- the merge result is used in memory and discarded -- but a tool that round-trips a loaded
+config through disk should resolve paths first, or keep the two files separate.
 
 The practical effect is that a global `[images.<name>]` can use the build shape: its Dockerfile
 and context live beside `~/.outrig/config.toml` and are found from any repo on the machine. One

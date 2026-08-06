@@ -1024,7 +1024,7 @@ fn validate_sidecar(
     // so extra mounts must not collide with it.
     let mut reserved = BTreeSet::new();
     if sidecar.workspace != super::SidecarWorkspaceAccess::None {
-        reserved.insert(cfg.workspace.container_path.clone());
+        reserved.insert(cfg.workspace.container_path().to_path_buf());
     }
     check_mount_list(&sidecar.mounts, reserved, repo_root).map_err(|violation| {
         ConfigValidationError::SidecarMount {
@@ -1073,7 +1073,7 @@ pub(super) fn validate_workspace_mounts(
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
     let mut reserved = BTreeSet::new();
-    reserved.insert(cfg.workspace.container_path.clone());
+    reserved.insert(cfg.workspace.container_path().to_path_buf());
 
     check_mount_list(&cfg.workspace.mounts, reserved, repo_root).map_err(
         |violation| match violation {

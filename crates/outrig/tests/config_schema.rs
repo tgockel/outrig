@@ -2,7 +2,7 @@
 //! rejection, and MCP shape parity.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use outrig::config::{
     CapabilityProfile, Config, EnvValue, LlmProvider, McpServerSpec, MountAccess,
@@ -224,8 +224,8 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding.subagent_width_max, Some(3));
         assert_eq!(cfg.agents["review"].model.as_deref(), Some("smart"));
 
-        assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
-        assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+        assert_eq!(cfg.workspace.host_path(), Path::new("."));
+        assert_eq!(cfg.workspace.container_path(), Path::new("/workspace"));
         assert_eq!(cfg.workspace.mounts.len(), 2);
         assert_eq!(
             cfg.workspace.mounts[0].host_path,
@@ -290,9 +290,52 @@ srv = { command = ["bin", "arg1"] }
     #[test]
     fn workspace_table_absent_yields_documented_defaults() {
         let cfg = Config::load_from_str("").expect("empty config parses");
-        assert_eq!(cfg.workspace.host_path, PathBuf::from("."));
-        assert_eq!(cfg.workspace.container_path, PathBuf::from("/workspace"));
+        assert_eq!(cfg.workspace.host_path(), Path::new("."));
+        assert_eq!(cfg.workspace.container_path(), Path::new("/workspace"));
         assert!(cfg.workspace.mounts.is_empty());
+        // The defaults come from the accessors, not from the fields -- an
+        // absent key stays absent so `merge` can fill it from the global file.
+        assert_eq!(cfg.workspace.declared_host_path(), None);
+        assert_eq!(cfg.workspace.declared_container_path(), None);
+    }
+
+    #[test]
+    fn partial_workspace_round_trip_preserves_omitted_primary_key() {
+        let cfg = Config::load_from_str(
+            r#"
+[workspace]
+container-path = "/src"
+"#,
+        )
+        .expect("config parses");
+        let encoded = toml::to_string(&cfg).expect("config serializes");
+        assert!(encoded.contains("container-path = \"/src\""));
+        assert!(!encoded.contains("host-path"));
+
+        // The omitted key must come back omitted, not defaulted -- a
+        // round-tripped config that declares `host-path = "."` would stop
+        // inheriting one from the global file. `merge` acting on that is
+        // pinned in `config_merge.rs`; here the declaration state itself is
+        // the assertion.
+        let round_tripped = Config::load_from_str(&encoded).expect("serialized config parses");
+        assert_eq!(round_tripped.workspace.declared_host_path(), None);
+        assert_eq!(
+            round_tripped.workspace.declared_container_path(),
+            Some(Path::new("/src")),
+        );
+    }
+
+    /// A config that declares no workspace at all must not grow one on the way
+    /// out. Round-tripping such a config through a global that *does* declare
+    /// one would otherwise stop inheriting.
+    #[test]
+    fn undeclared_workspace_serializes_no_table() {
+        let cfg = Config::load_from_str("default-agent = \"coding\"\n").expect("config parses");
+        let encoded = toml::to_string(&cfg).expect("config serializes");
+        assert!(
+            !encoded.contains("[workspace]"),
+            "expected no workspace table, got: {encoded}",
+        );
     }
 
     /// The key is absent from nearly every real config, so the default is what

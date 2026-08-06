@@ -18,12 +18,18 @@ use super::Config;
 /// - `[network].mode` follows repo precedence when the repo file declares the
 ///   table. Policy keys (`default`, `allow`, `deny`) are global-only and are
 ///   always taken from the global config.
-/// - `[workspace]` primary fields are repo-owned. Since `Workspace` has serde
-///   defaults, an absent block in the repo file deserializes to those defaults
-///   -- so taking repo `host-path`/`container-path` unconditionally matches
-///   the documented "rare to set globally; repo still wins block-level" rule.
-///   Extra `workspace.mounts` are concatenated so user-level resource mounts
-///   and repo-level resource mounts both participate.
+/// - `[workspace]` primary fields merge per key, like the scalars above: a
+///   repo declaration wins, otherwise a global one is inherited, otherwise the
+///   key stays `None` and [`Workspace`](super::Workspace)'s accessors apply
+///   the built-in default. Extra `workspace.mounts` are concatenated so
+///   user-level resource mounts and repo-level resource mounts both
+///   participate.
+///
+/// The result is a flattened snapshot, not a config file: provenance rides
+/// along in memory but is `#[serde(skip)]`, so re-serializing a merged config
+/// emits each inherited path as the text its source file used and loses the
+/// base directory that text meant. Nothing in outrig writes a merged config
+/// back to disk.
 pub fn merge(global: Config, repo: Config) -> Config {
     let mut providers = global.providers;
     providers.extend(repo.providers);
@@ -41,6 +47,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
     sidecars.extend(repo.sidecars);
 
     let mut workspace = repo.workspace;
+    workspace.inherit_missing_primary_fields(&global.workspace);
     let mut mounts = global.workspace.mounts;
     mounts.extend(workspace.mounts);
     workspace.mounts = mounts;

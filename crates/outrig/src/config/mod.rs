@@ -152,6 +152,15 @@ impl ConfigSource {
     }
 }
 
+/// Base directory a config-declared relative path resolves against: the
+/// directory of the file that declared it, or `repo_root` for an entry that
+/// never went through [`Config::load`]. The other half of [`resolve_against`]'s
+/// rule, stated once so the fallback cannot drift between the types that carry
+/// a [`ConfigSource`].
+fn source_base_dir<'a>(source: Option<&'a ConfigSource>, repo_root: &'a Path) -> &'a Path {
+    source.map_or(repo_root, ConfigSource::base_dir)
+}
+
 /// Resolve `path` against `base`, leaving absolute paths alone. The one rule,
 /// shared by every config-declared host path.
 pub(crate) fn resolve_against(base: &Path, path: &Path) -> PathBuf {
@@ -202,7 +211,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, Agent>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Workspace::is_default")]
     pub workspace: Workspace,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -275,17 +284,31 @@ impl Config {
         });
 
         let global_cfg = match global_path {
-            Some(g) => match fs::read_to_string(g) {
-                Ok(text) => {
-                    let mut cfg = Self::load_from_str(&text)?;
-                    cfg.stamp_source(&ConfigSource::Global {
-                        path: g.to_path_buf(),
-                    });
-                    cfg
+            Some(g) => {
+                // Resolve before reading, and read through the resolved path.
+                // `--global-config` takes any path, and a relative one would
+                // otherwise consult the working directory twice -- once to
+                // find the file, once to record where its relative paths point
+                // -- so a directory change in between could load one file and
+                // stamp another's origin. Every path inherited from this file
+                // rides on that origin, the read-write primary bind mount
+                // included. Lexical: no I/O, no symlink resolution.
+                //
+                // A failure here means the working directory is unreadable or
+                // the path is empty, in which case no relative path in the file
+                // can be given a meaning; that is an error rather than grounds
+                // to keep the relative origin.
+                let g = std::path::absolute(g).path_ctx("resolve", g)?;
+                match fs::read_to_string(&g) {
+                    Ok(text) => {
+                        let mut cfg = Self::load_from_str(&text)?;
+                        cfg.stamp_source(&ConfigSource::Global { path: g });
+                        cfg
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+                    Err(e) => return Err(e).path_ctx("read", &g),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-                Err(e) => return Err(e).path_ctx("read", g),
-            },
+            }
             None => Self::default(),
         };
 
@@ -297,7 +320,9 @@ impl Config {
     /// before the merge: `extend` and the mount concatenation move whole
     /// entries, and nothing afterwards can tell the two files apart.
     ///
-    /// Only images and mounts are stamped. Providers and agents have no path
+    /// Only images, mounts, and `[workspace].host-path` are stamped -- the
+    /// last of those only when the file declared it, since the built-in `.`
+    /// belongs to no file. Providers and agents have no path
     /// fields, so a base directory would buy them nothing. `models.<n>`
     /// does have one -- `model-path` -- and is left out on purpose: it is
     /// validated against a base the loader does not use, so giving it a
@@ -307,6 +332,7 @@ impl Config {
         for image in self.images.values_mut() {
             image.set_config_source(src.clone());
         }
+        self.workspace.set_config_source(src.clone());
         // Every mount, wherever it lives -- one expression, so a future
         // mount-bearing block extends here and nowhere else.
         let mounts = self.workspace.mounts.iter_mut().chain(
@@ -649,42 +675,136 @@ impl Agent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `[workspace].host-path` when the config declares none. Read it through
+/// [`Workspace::host_path`].
+const DEFAULT_WORKSPACE_HOST_PATH: &str = ".";
+/// `[workspace].container-path` when the config declares none. Read it through
+/// [`Workspace::container_path`].
+const DEFAULT_WORKSPACE_CONTAINER_PATH: &str = "/workspace";
+
+/// `None` on a primary field means the config file did not declare the key,
+/// which is what lets [`merge`] fill it from the global config instead of
+/// overwriting it with a default.
+///
+/// The two primary fields are private because `host_path` is paired with the
+/// [`ConfigSource`] it is resolved against: a value replaced without clearing
+/// that pairing would be resolved against the directory of a file it never
+/// came from, and the primary mount is read-write. Read them with
+/// [`host_path`](Self::host_path) / [`container_path`](Self::container_path),
+/// which apply the documented defaults, or with
+/// [`declared_host_path`](Self::declared_host_path) /
+/// [`declared_container_path`](Self::declared_container_path) to see
+/// declaration state. Write them with the setters, which keep the pairing
+/// honest.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct Workspace {
-    pub host_path: PathBuf,
-    pub container_path: PathBuf,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    container_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountConfig>,
-}
-
-impl Default for Workspace {
-    fn default() -> Self {
-        Self {
-            host_path: PathBuf::from("."),
-            container_path: PathBuf::from("/workspace"),
-            mounts: Vec::new(),
-        }
-    }
+    /// Source of `host_path` alone, set at load time, never deserialized. The
+    /// two primary fields are selected independently. See [`ConfigSource`].
+    #[serde(skip)]
+    source: Option<ConfigSource>,
 }
 
 impl Workspace {
     /// A workspace mapping `host_path` to `container_path`, with no extra
-    /// mounts. [`Workspace::default`] is the `.` -> `/workspace` case.
+    /// mounts. Both are declared, so neither is inherited by [`merge`];
+    /// [`Workspace::default`] declares nothing and inherits both.
     pub fn new(host_path: impl Into<PathBuf>, container_path: impl Into<PathBuf>) -> Self {
         Self {
-            host_path: host_path.into(),
-            container_path: container_path.into(),
-            mounts: Vec::new(),
+            host_path: Some(host_path.into()),
+            container_path: Some(container_path.into()),
+            ..Self::default()
         }
     }
 
-    /// `host_path` made absolute. Always resolves against `repo_root`: [`merge`]
-    /// takes the repo's `[workspace]` block whole, so this key can only ever
-    /// have come from the repo config (or its serde default).
+    /// The declared `host-path`, or `.`. Relative values are resolved by
+    /// [`resolved_host_path`](Self::resolved_host_path).
+    pub fn host_path(&self) -> &Path {
+        self.host_path
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_WORKSPACE_HOST_PATH))
+    }
+
+    /// The declared `container-path`, or `/workspace`.
+    pub fn container_path(&self) -> &Path {
+        self.container_path
+            .as_deref()
+            .unwrap_or(Path::new(DEFAULT_WORKSPACE_CONTAINER_PATH))
+    }
+
+    /// `host-path` exactly as declared, or `None` when the config was silent --
+    /// the state [`merge`] acts on, as opposed to the value it resolves to.
+    pub fn declared_host_path(&self) -> Option<&Path> {
+        self.host_path.as_deref()
+    }
+
+    /// `container-path` exactly as declared, or `None` when the config was
+    /// silent. See [`declared_host_path`](Self::declared_host_path).
+    pub fn declared_container_path(&self) -> Option<&Path> {
+        self.container_path.as_deref()
+    }
+
+    /// Declare `host-path`, dropping any recorded [`ConfigSource`]: the new
+    /// value did not come from a config file, so it resolves against the
+    /// `repo_root` passed to
+    /// [`resolved_host_path`](Self::resolved_host_path) like any other
+    /// hand-built path.
+    pub fn set_host_path(&mut self, host_path: impl Into<PathBuf>) {
+        self.host_path = Some(host_path.into());
+        self.source = None;
+    }
+
+    /// Declare `container-path`. Carries no provenance -- a container path is
+    /// absolute and resolves against nothing.
+    pub fn set_container_path(&mut self, container_path: impl Into<PathBuf>) {
+        self.container_path = Some(container_path.into());
+    }
+
+    /// Nothing here came from a config file, so serializing would emit an empty
+    /// `[workspace]` table. Lets [`Config`] skip the block the way it skips
+    /// every other one with nothing to say.
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Only a *declared* `host_path` gets a source: the built-in `.` is not the
+    /// global file's `.`, and stamping it would move an undeclared workspace
+    /// off the repo root.
+    fn set_config_source(&mut self, source: ConfigSource) {
+        if self.host_path.is_some() {
+            self.source = Some(source);
+        }
+    }
+
+    /// Take each primary field the repo file left undeclared from `global`.
+    /// `host_path` travels with its provenance, so an inherited value keeps
+    /// resolving against the file that declared it.
+    fn inherit_missing_primary_fields(&mut self, global: &Self) {
+        if self.host_path.is_none() {
+            self.host_path.clone_from(&global.host_path);
+            self.source.clone_from(&global.source);
+        }
+        if self.container_path.is_none() {
+            self.container_path.clone_from(&global.container_path);
+        }
+    }
+
+    /// [`host_path`](Self::host_path) made absolute against the directory of
+    /// the config file that declared it. A hand-built or default workspace
+    /// falls back to `repo_root`, preserving the library API's existing
+    /// behavior.
     pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
-        resolve_against(repo_root, &self.host_path)
+        resolve_against(
+            source_base_dir(self.source.as_ref(), repo_root),
+            self.host_path(),
+        )
     }
 }
 
@@ -735,11 +855,10 @@ impl MountConfig {
     /// directory provably cannot be right for every element of the result --
     /// this is per-entry for that reason.
     pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
-        let base = self
-            .source
-            .as_ref()
-            .map_or(repo_root, ConfigSource::base_dir);
-        resolve_against(base, &self.host_path)
+        resolve_against(
+            source_base_dir(self.source.as_ref(), repo_root),
+            &self.host_path,
+        )
     }
 
     /// The file to name in a diagnostic about this mount, or `None` for a
@@ -1457,9 +1576,7 @@ impl ImageConfig {
     /// is the fallback for an entry with no recorded source, which keeps every
     /// hand-built [`ImageConfig`] resolving exactly as it did before.
     pub fn base_dir<'a>(&'a self, repo_root: &'a Path) -> &'a Path {
-        self.source
-            .as_ref()
-            .map_or(repo_root, ConfigSource::base_dir)
+        source_base_dir(self.source.as_ref(), repo_root)
     }
 
     /// `dockerfile` and `context` made absolute against

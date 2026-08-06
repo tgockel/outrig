@@ -10,7 +10,7 @@ use tempfile::tempdir;
 use outrig::config::{
     Config, ConfigSource, ConfigValidationError, ImageConfig, LlmProvider, McpServerSpec,
     MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode,
-    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, merge,
+    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace, merge,
 };
 use outrig::error::OutrigError;
 
@@ -1509,6 +1509,71 @@ tool-result-max = 262144
     }
 
     #[test]
+    fn workspace_global_primary_fields_are_used_when_repo_is_silent() {
+        let global = parse(
+            r#"
+[workspace]
+host-path      = "global-workspace"
+container-path = "/src"
+"#,
+        );
+        let repo = parse("");
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.workspace.host_path(), Path::new("global-workspace"));
+        assert_eq!(merged.workspace.container_path(), Path::new("/src"));
+    }
+
+    #[test]
+    fn workspace_primary_fields_merge_per_key_with_repo_precedence() {
+        let global = parse(
+            r#"
+[workspace]
+host-path      = "global-workspace"
+container-path = "/global"
+"#,
+        );
+        let repo = parse(
+            r#"
+[workspace]
+container-path = "/repo"
+"#,
+        );
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.workspace.host_path(), Path::new("global-workspace"));
+        assert_eq!(merged.workspace.container_path(), Path::new("/repo"));
+    }
+
+    #[test]
+    fn workspace_explicit_repo_defaults_still_override_global() {
+        let global = parse(
+            r#"
+[workspace]
+host-path      = "/global"
+container-path = "/global"
+"#,
+        );
+        let repo = parse(
+            r#"
+[workspace]
+host-path      = "."
+container-path = "/workspace"
+"#,
+        );
+
+        // The repo's values happen to equal the built-in defaults, which is
+        // exactly the case a `PathBuf` field could not express: `Some` here is
+        // the whole point, since `None` would inherit `/global` instead.
+        let merged = merge(global, repo);
+        assert_eq!(merged.workspace.declared_host_path(), Some(Path::new(".")));
+        assert_eq!(
+            merged.workspace.declared_container_path(),
+            Some(Path::new("/workspace")),
+        );
+    }
+
+    #[test]
     fn workspace_mounts_concatenate_global_then_repo() {
         let global = parse(
             r#"
@@ -1535,11 +1600,8 @@ access         = "read-write"
         );
 
         let merged = merge(global, repo);
-        assert_eq!(merged.workspace.host_path, std::path::PathBuf::from("."));
-        assert_eq!(
-            merged.workspace.container_path,
-            std::path::PathBuf::from("/workspace"),
-        );
+        assert_eq!(merged.workspace.host_path(), Path::new("."));
+        assert_eq!(merged.workspace.container_path(), Path::new("/workspace"));
         assert_eq!(merged.workspace.mounts.len(), 2);
         assert_eq!(
             merged.workspace.mounts[0].container_path,
@@ -1627,6 +1689,132 @@ mod config_load {
         write_repo_cfg(tmp.path(), "");
         let absent = tmp.path().join("does-not-exist.toml");
         Config::load(tmp.path(), Some(&absent)).expect("absent global is treated as empty");
+    }
+
+    /// A *missing* global file is fine; an unresolvable one is not. Silently
+    /// treating it as absent would discard an explicit `--global-config`,
+    /// which is the failure mode this whole block exists to remove.
+    #[test]
+    fn unresolvable_global_path_is_an_error_not_an_empty_config() {
+        let tmp = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), "");
+        let err = Config::load(tmp.path(), Some(Path::new("")))
+            .expect_err("an empty global path cannot be given a meaning");
+        assert!(
+            err.to_string().contains("resolve"),
+            "error should name the failed step, got: {err}",
+        );
+    }
+
+    #[test]
+    fn inherited_global_workspace_host_path_resolves_from_global_file() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "[workspace]\ncontainer-path = \"/repo\"\n");
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            "[workspace]\nhost-path = \"global-workspace\"\n",
+        );
+        fs::create_dir(global.path().join("global-workspace")).unwrap();
+
+        let cfg = Config::load(repo.path(), Some(&global_path)).expect("config loads");
+        assert_eq!(
+            cfg.workspace.resolved_host_path(repo.path()),
+            global.path().join("global-workspace"),
+        );
+        assert_eq!(cfg.workspace.container_path(), Path::new("/repo"));
+    }
+
+    /// The mirror of the case above: inheriting `container-path` must not drag
+    /// the global file's base directory along with it, so a repo `host-path`
+    /// still resolves from the repo root when both files declare a workspace.
+    #[test]
+    fn repo_workspace_host_path_keeps_repo_base_when_global_also_declares() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "[workspace]\nhost-path = \"sub\"\n");
+        fs::create_dir(repo.path().join("sub")).unwrap();
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            "[workspace]\nhost-path = \"global-workspace\"\ncontainer-path = \"/src\"\n",
+        );
+
+        let cfg = Config::load(repo.path(), Some(&global_path)).expect("config loads");
+        assert_eq!(
+            cfg.workspace.resolved_host_path(repo.path()),
+            repo.path().join("sub"),
+        );
+        assert_eq!(cfg.workspace.container_path(), Path::new("/src"));
+    }
+
+    /// A workspace that never went through `Config::load` has no recorded
+    /// source, and `repo_root` is what `resolved_host_path` promises the
+    /// library API in that case.
+    #[test]
+    fn hand_built_workspace_host_path_resolves_from_repo_root() {
+        let workspace = Workspace::new("sub", "/w");
+        let repo_root = Path::new("/tmp/some-repo");
+        assert_eq!(
+            workspace.resolved_host_path(repo_root),
+            repo_root.join("sub"),
+        );
+    }
+
+    /// Replacing an inherited global `host-path` must drop the global file's
+    /// base directory with it. The primary mount is read-write, so resolving a
+    /// caller's value against a directory it never named would bind the wrong
+    /// tree.
+    #[test]
+    fn set_host_path_clears_inherited_global_provenance() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global = tempdir().unwrap();
+        let global_path = write_global_cfg(
+            global.path(),
+            "[workspace]\nhost-path = \"global-workspace\"\n",
+        );
+
+        let mut cfg = Config::load(repo.path(), Some(&global_path)).expect("config loads");
+        assert_eq!(
+            cfg.workspace.resolved_host_path(repo.path()),
+            global.path().join("global-workspace"),
+            "inherited value resolves beside the global file",
+        );
+
+        cfg.workspace.set_host_path("mine");
+        assert_eq!(
+            cfg.workspace.resolved_host_path(repo.path()),
+            repo.path().join("mine"),
+            "a caller-supplied value belongs to no config file",
+        );
+    }
+
+    /// `--global-config` accepts any path. A relative one must be pinned at
+    /// load time, or an inherited `host-path` would name a different directory
+    /// after the process changes working directory.
+    #[test]
+    fn relative_global_config_path_resolves_independently_of_cwd() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "");
+        let global = tempdir().unwrap();
+        let global_dir = global.path().canonicalize().unwrap();
+        write_global_cfg(
+            &global_dir,
+            "[workspace]\nhost-path = \"global-workspace\"\n",
+        );
+
+        // Name the global config relatively, from its own parent directory.
+        let restore = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&global_dir).unwrap();
+        let cfg = Config::load(repo.path(), Some(Path::new("config.toml")));
+        std::env::set_current_dir(&restore).unwrap();
+
+        let cfg = cfg.expect("config loads");
+        assert_eq!(
+            cfg.workspace.resolved_host_path(repo.path()),
+            global_dir.join("global-workspace"),
+            "the base directory is frozen at load, not read at resolve time",
+        );
     }
 
     #[test]

@@ -509,14 +509,16 @@ pub outrig::config::SidecarConfig::workspace: outrig::config::SidecarWorkspaceAc
 impl outrig::config::SidecarConfig
 pub fn outrig::config::SidecarConfig::new(impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub struct outrig::config::Workspace
-pub outrig::config::Workspace::container_path: std::path::PathBuf
-pub outrig::config::Workspace::host_path: std::path::PathBuf
 pub outrig::config::Workspace::mounts: alloc::vec::Vec<outrig::config::MountConfig>
 impl outrig::config::Workspace
+pub fn outrig::config::Workspace::container_path(&self) -> &std::path::Path
+pub fn outrig::config::Workspace::declared_container_path(&self) -> core::option::Option<&std::path::Path>
+pub fn outrig::config::Workspace::declared_host_path(&self) -> core::option::Option<&std::path::Path>
+pub fn outrig::config::Workspace::host_path(&self) -> &std::path::Path
 pub fn outrig::config::Workspace::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::config::Workspace::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
-impl core::default::Default for outrig::config::Workspace
-pub fn outrig::config::Workspace::default() -> Self
+pub fn outrig::config::Workspace::set_container_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
+pub fn outrig::config::Workspace::set_host_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
 pub const outrig::config::DEFAULT_RETRY_BUDGET_SECS: u64
 pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
