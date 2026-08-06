@@ -269,6 +269,53 @@ impl ContainerCreateOptions {
     }
 }
 
+/// Everything an exec takes besides its argv -- the counterpart of
+/// [`ContainerCreateOptions`] on the `podman exec` path, and a struct for the
+/// same reason: the environment was the only knob until the working directory
+/// joined it, and each further one would otherwise be another parameter on
+/// four published methods.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ExecOptions {
+    /// Added to the environment podman already sets up (`HOME` plus the
+    /// mapped user and group). `BTreeMap` order makes the argv deterministic.
+    pub env: BTreeMap<String, String>,
+    /// Becomes `--workdir <path>`. `None` emits no flag, leaving the
+    /// container's configured working directory -- which is the image's
+    /// `WORKDIR` only when the launch did not override it. A workspace-backed
+    /// launch does override it: the run sets `-w` to the workspace's container
+    /// path, so an unset exec runs in the *workspace*, on the host-mounted
+    /// checkout. This is what every exec did before the
+    /// knob existed; set it explicitly if a relative or destructive command
+    /// must not land there.
+    pub workdir: Option<PathBuf>,
+}
+
+impl ExecOptions {
+    /// An exec that adds nothing to podman's own environment and runs in the
+    /// container's configured working directory; `with_*` sets each knob. See
+    /// [`ExecOptions::workdir`] for what that directory actually is -- with a
+    /// workspace mounted it is the workspace, not the image's `WORKDIR`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the environment added to the exec.
+    pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Run the command in `workdir` rather than the container's configured
+    /// working directory. The path is the container's, not the host's, and
+    /// outrig does not check that it exists -- a missing directory is podman's
+    /// to report, and probing for it would cost an extra exec on every call.
+    pub fn with_workdir(mut self, workdir: impl Into<PathBuf>) -> Self {
+        self.workdir = Some(workdir.into());
+        self
+    }
+}
+
 /// Primary workspace mount. When present, this also sets `-w`. The session's
 /// own container mounts it read-write; sidecars may take a read-only view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,13 +746,17 @@ impl Container {
 
     /// Build the argv for a `podman exec -i --user --env HOME ...` invocation
     /// without spawning. `HOME` is always set to the in-container home
-    /// directory; entries in `env` are forwarded via `--env K=V` (BTreeMap
-    /// order makes the resulting argv deterministic).
+    /// directory; entries in `options.env` are forwarded via `--env K=V`
+    /// (BTreeMap order makes the resulting argv deterministic), and
+    /// `options.workdir` becomes `--workdir <path>` when set. An unset
+    /// working directory emits no flag at all, leaving whatever the container
+    /// was configured with -- the workspace when the run set `-w`, the image's
+    /// `WORKDIR` otherwise.
     ///
     /// Panics if [`Container::bootstrap_user`] has not yet been called --
     /// the user/group don't exist inside the container, so a `--user`-scoped
     /// exec would fail at the podman layer with a less useful message.
-    pub(crate) fn build_exec_argv(&self, cmd: &[String], env: &BTreeMap<String, String>) -> Cmd {
+    pub(crate) fn build_exec_argv(&self, cmd: &[String], options: &ExecOptions) -> Cmd {
         let user_name = self
             .user_name
             .as_deref()
@@ -716,8 +767,11 @@ impl Container {
             .arg(format!("--user={}:{}", self.uid, self.gid))
             .arg("--env")
             .arg(format!("HOME={}", userdb::home_dir(user_name)));
-        for (k, v) in env {
+        for (k, v) in &options.env {
             c = c.arg("--env").arg(format!("{k}={v}"));
+        }
+        if let Some(workdir) = &options.workdir {
+            c = c.arg("--workdir").arg(workdir);
         }
         c = c.arg(&self.name);
         for arg in cmd {
@@ -734,25 +788,20 @@ impl Container {
     }
 
     /// Spawn a command inside the container as the host user, with all three
-    /// stdio streams piped back to the caller.
-    pub async fn exec_stdio(
-        &self,
-        cmd: &[String],
-        env: &BTreeMap<String, String>,
-    ) -> Result<Child> {
-        process::spawn_stdio(self.build_exec_argv(cmd, env)).await
+    /// stdio streams piped back to the caller. See [`ExecOptions`] for the
+    /// environment and working directory the exec runs under.
+    pub async fn exec_stdio(&self, cmd: &[String], options: &ExecOptions) -> Result<Child> {
+        process::spawn_stdio(self.build_exec_argv(cmd, options)).await
     }
 
     /// [`Self::exec_stdio`], driven to completion: stdout and stderr are
     /// drained concurrently and returned with the exit status. A non-zero
     /// exit is reported in [`Output::status`], not as an error -- the command
-    /// ran, and what it made of its arguments is the caller's to judge.
-    pub async fn exec_capture(
-        &self,
-        cmd: &[String],
-        env: &BTreeMap<String, String>,
-    ) -> Result<Output> {
-        process::try_capture(self.build_exec_argv(cmd, env)).await
+    /// ran, and what it made of its arguments is the caller's to judge. A
+    /// working directory the container does not have lands here too: podman
+    /// exits non-zero and names the path on stderr.
+    pub async fn exec_capture(&self, cmd: &[String], options: &ExecOptions) -> Result<Output> {
+        process::try_capture(self.build_exec_argv(cmd, options)).await
     }
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
@@ -1758,6 +1807,80 @@ mod tests {
             args.last().expect("argv is non-empty"),
             "/workspace",
             "entrypoint args come last: {args:?}"
+        );
+    }
+
+    /// A post-bootstrap handle with fixed ids, so an exec argv is the same on
+    /// every machine. `attach` rather than a struct literal: it is the public
+    /// path to an un-owned handle, so `Drop` fires no `podman rm -f` for a
+    /// container that was never created. Only the bootstrap-set fields are
+    /// touched afterward, because nothing public sets them without podman.
+    fn bootstrapped_container() -> Container {
+        let mut container =
+            Container::attach("outrig-test-exec", ImageTag::new("local:test"), None, None);
+        container.user_name = Some("dev".to_string());
+        container.group_name = Some("dev".to_string());
+        container.uid = 1000;
+        container.gid = 1000;
+        container
+    }
+
+    #[test]
+    fn podman_exec_args_without_workdir_are_byte_identical() {
+        let args = argv(
+            bootstrapped_container()
+                .build_exec_argv(&["id".to_string(), "-un".to_string()], &ExecOptions::new()),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "exec",
+                "-i",
+                "--user=1000:1000",
+                "--env",
+                "HOME=/home/dev",
+                "outrig-test-exec",
+                "id",
+                "-un",
+            ]
+        );
+    }
+
+    /// Same reasoning as `every_create_option_setter_reaches_the_podman_command`,
+    /// plus it pins where `--workdir` sits: after the `--env` block and before
+    /// the container name, so the no-workdir argv above stays a strict prefix
+    /// of this one.
+    #[test]
+    fn every_exec_option_setter_reaches_the_podman_command() {
+        let options = ExecOptions::new()
+            .with_env(BTreeMap::from([
+                ("ZONE".to_string(), "utc".to_string()),
+                ("TOKEN".to_string(), "secret".to_string()),
+            ]))
+            .with_workdir("/workspace/sub");
+
+        let args = argv(bootstrapped_container().build_exec_argv(&["pwd".to_string()], &options));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "exec",
+                "-i",
+                "--user=1000:1000",
+                "--env",
+                "HOME=/home/dev",
+                // BTreeMap order, not insertion order.
+                "--env",
+                "TOKEN=secret",
+                "--env",
+                "ZONE=utc",
+                "--workdir",
+                "/workspace/sub",
+                "outrig-test-exec",
+                "pwd",
+            ]
         );
     }
 }

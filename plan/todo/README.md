@@ -32,9 +32,6 @@ makes field and variant *additions* free, so what is left are field *type* chang
 sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
 qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
 
-- **0107 [exec-workdir](0107-exec-workdir.md)** -- four published methods take
-  `(&[String], &BTreeMap)` today: `exec_stdio` and `exec_capture`, on both `Outrig` and
-  `Container`.
 - **0108 [global-workspace-block-dropped](0108-global-workspace-block-dropped.md)** -- a global
   `[workspace]` block is parsed, validated, merged, and discarded; honoring it and rejecting it
   both change what a config `0.2.0` accepts does.
@@ -56,6 +53,19 @@ are now `#[non_exhaustive]`, so the next field is additive. Its one open fork wa
 the container-path rules carry it too, `ContainerRoot` ceasing to be a unit variant, because the
 clause answers which file to go edit rather than what a path resolved against -- and that rule's
 message carries no path at all, so the declaring file is the only handle it has.
+
+0107 landed: `ExecOptions` replaces the bare `&BTreeMap` on all four published exec methods, and
+`with_workdir` becomes `--workdir` on the `podman exec`. Absorbing the environment into the struct
+rather than leaving it a third parameter was the call worth recording -- Rust has no default
+arguments, so the "add a parameter" shape breaks every call site anyway without buying source
+compatibility, and `ContainerCreateOptions` already holds its `env` the same way. Two findings came
+out of building it. A missing directory is *not* an `Err`: `process::try_capture` fails only when
+the spawn does, so podman's own non-zero exit arrives as `Ok(Output)` with the path named on
+stderr -- which is what the existing "a non-zero exit is data, not an error" contract requires, and
+what the acceptance criterion had to be read against. And the first draft of the e2e test asked for
+`/workspace`, which the run path already sets with `-w`, so every positive assertion passed with the
+flag deleted; it now uses `/workspace/sub`, verified by removing the flag and watching it go red.
+The suite gained its first shell-less image, which is the case the argv form exists to serve.
 
 0111 is last deliberately. It is the only one of the seven that is API *shape* rather than API
 *correctness*: rc.1 shipped `with_retry_budget_secs` as the non-breaking workaround, and

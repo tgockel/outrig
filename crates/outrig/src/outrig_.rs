@@ -20,7 +20,7 @@ use crate::config::{
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount,
-    ContainerWorkspace, LABEL_SESSION, LABEL_SIDECAR, PrimaryView,
+    ContainerWorkspace, ExecOptions, LABEL_SESSION, LABEL_SIDECAR, PrimaryView,
     embedded::{self, McpDeclarationSource},
     enter,
     sidecar::{self, Placement, SessionMcpPlan},
@@ -1069,31 +1069,23 @@ impl Outrig {
     }
 
     /// Run `argv` in the **primary** container as the session's runtime user,
-    /// with all three stdio streams piped back to the caller. `env` is added
-    /// to the environment podman already sets up (`HOME` and the mapped
-    /// user/group).
+    /// with all three stdio streams piped back to the caller. See
+    /// [`ExecOptions`] for the environment and working directory it runs
+    /// under.
     ///
     /// This is the supported way to reach the primary: the `Container` itself
     /// stays private, because the session owns it and will stop it at
     /// [`Outrig::shutdown`]. For a command you just want the output of, use
     /// [`Outrig::exec_capture`].
-    pub async fn exec_stdio(
-        &self,
-        argv: &[String],
-        env: &BTreeMap<String, String>,
-    ) -> Result<Child> {
-        self.container.exec_stdio(argv, env).await
+    pub async fn exec_stdio(&self, argv: &[String], options: &ExecOptions) -> Result<Child> {
+        self.container.exec_stdio(argv, options).await
     }
 
     /// [`Outrig::exec_stdio`], driven to completion: stdout and stderr are
     /// drained concurrently and returned with the exit status. A non-zero
     /// exit is data on the returned [`Output`], not an error.
-    pub async fn exec_capture(
-        &self,
-        argv: &[String],
-        env: &BTreeMap<String, String>,
-    ) -> Result<Output> {
-        self.container.exec_capture(argv, env).await
+    pub async fn exec_capture(&self, argv: &[String], options: &ExecOptions) -> Result<Output> {
+        self.container.exec_capture(argv, options).await
     }
 
     /// Dispatch an MCP `tools/call` to the named server. `server` must

@@ -18,12 +18,11 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
-use outrig::Transcript;
+use outrig::{ExecOptions, Transcript};
 
 use common::{
     entry_for_id, init_tracing, install_shadow, pull_alpine, read_stdout, root_cmd, root_stdout,
@@ -43,7 +42,7 @@ async fn bootstrap_then_id_matches_host() {
     assert!(container.group_name().is_some());
 
     let mut child = container
-        .exec_stdio(&["id".to_string()], &BTreeMap::new())
+        .exec_stdio(&["id".to_string()], &ExecOptions::new())
         .await
         .expect("exec_stdio id");
     let out = read_stdout(&mut child).await;
@@ -78,7 +77,7 @@ async fn workspace_writes_have_host_ownership() {
                 "-c".to_string(),
                 "echo hello > /workspace/test.txt".to_string(),
             ],
-            &BTreeMap::new(),
+            &ExecOptions::new(),
         )
         .await
         .expect("exec_stdio sh");
@@ -205,7 +204,7 @@ async fn bootstrap_on_unadorned_alpine() {
                 "-c".to_string(),
                 "touch \"$HOME/probe\" && echo \"$HOME\"".to_string(),
             ],
-            &BTreeMap::new(),
+            &ExecOptions::new(),
         )
         .await
         .expect("exec_stdio home probe");
@@ -273,7 +272,7 @@ async fn bootstrap_writes_canonical_entries_when_absent() {
 
     // The written entry has to be usable, not just well-formed.
     let mut child = container
-        .exec_stdio(&["id".to_string(), "-un".to_string()], &BTreeMap::new())
+        .exec_stdio(&["id".to_string(), "-un".to_string()], &ExecOptions::new())
         .await
         .expect("exec_stdio id -un");
     assert_eq!(read_stdout(&mut child).await.trim(), user);

@@ -353,6 +353,42 @@ filesystems, or network egress policy in this container launch path. Network aud
 is a separate session-level interceptor; see
 [Workspace](workspace.md#network-is-not-part-of-the-workspace).
 
+## What outrig sets in an exec
+
+Most real processes -- an exec-hosted MCP server, a command a library caller runs -- reach the
+container through `podman exec`, and that invocation is assembled separately from the run. For
+those, outrig always passes `-i` so stdin stays open for a stdio-speaking server,
+`--user=<uid>:<gid>` with the session's ids, and `--env HOME=/home/<user>` naming the home
+directory the runtime user bootstrap created. Each entry a caller supplies becomes one further
+`--env K=V`, emitted in sorted key order so the same inputs always produce the same command line.
+
+**An entrypoint-stdio server is the exception, and gets none of that.** It is the image's own
+`ENTRYPOINT`, started by `podman create` plus `podman start --attach --interactive` rather than
+exec'd, so there is no `--user` and no `HOME` from this path -- it runs as whatever user its
+image expects, and its environment has to be baked in at create time. Such a container also
+skips the runtime user bootstrap unless something else about it needs identity (a workspace, a
+mount, or a co-hosted exec server). Do not assume the mapped ids for one. The single exception
+to the exception is a `view = "primary"` sidecar, whose launcher is handed the session's ids
+explicitly and drops to them before the payload runs.
+
+The working directory is the one exec flag that is conditional. Supply one and outrig emits
+`--workdir <path>`; leave it unset and no flag is emitted at all, so the exec lands wherever the
+container already is. That is the image's `WORKDIR` only when nothing overrode it -- a
+workspace-backed session sets `-w` to the workspace's container path on the run, so an unset
+exec runs in the workspace, on your mounted checkout. Set the directory explicitly when a
+relative or destructive command must not land there. The path is the container's, not the
+host's, and outrig does not check that it exists before running: podman reports a missing
+directory itself, naming the path, and probing for it in advance would cost an extra exec on
+every call. That failure arrives the way any failing command does -- a non-zero exit status with
+the message on stderr -- rather than as a distinct kind of error.
+
+Setting the directory this way is what lets the argv form stay usable on an image with no shell.
+The alternative, wrapping the command in `sh -c 'cd ... && ...'`, needs a shell in the image and
+correct quoting from the caller; setting `PWD` instead changes the variable without moving the
+process, so anything calling `getcwd` never notices. A library caller sets it with
+`ExecOptions::with_workdir`; see the crate docs for `Outrig::exec_stdio` and
+`Outrig::exec_capture`.
+
 ## See also
 
 - [outrig image add](../usage/image.md#outrig-image-add) -- the easiest way to

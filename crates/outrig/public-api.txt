@@ -645,8 +645,8 @@ pub fn outrig::container::Container::attach(impl core::convert::Into<alloc::stri
 pub async fn outrig::container::Container::bootstrap_user(&mut self) -> outrig::error::Result<()>
 pub fn outrig::container::Container::container_workspace(&self) -> &std::path::Path
 pub async fn outrig::container::Container::create_initialized(outrig::container::ContainerCreateOptions) -> outrig::error::Result<Self>
-pub async fn outrig::container::Container::exec_capture(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<std::process::Output>
-pub async fn outrig::container::Container::exec_stdio(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<tokio::process::Child>
+pub async fn outrig::container::Container::exec_capture(&self, &[alloc::string::String], &outrig::container::ExecOptions) -> outrig::error::Result<std::process::Output>
+pub async fn outrig::container::Container::exec_stdio(&self, &[alloc::string::String], &outrig::container::ExecOptions) -> outrig::error::Result<tokio::process::Child>
 pub fn outrig::container::Container::gid(&self) -> u32
 pub fn outrig::container::Container::group_name(&self) -> core::option::Option<&str>
 pub fn outrig::container::Container::home_dir(&self) -> core::option::Option<alloc::string::String>
@@ -716,6 +716,13 @@ pub outrig::container::ContainerWorkspace::container: std::path::PathBuf
 pub outrig::container::ContainerWorkspace::host: std::path::PathBuf
 impl outrig::container::ContainerWorkspace
 pub fn outrig::container::ContainerWorkspace::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
+#[non_exhaustive] pub struct outrig::container::ExecOptions
+pub outrig::container::ExecOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::container::ExecOptions::workdir: core::option::Option<std::path::PathBuf>
+impl outrig::container::ExecOptions
+pub fn outrig::container::ExecOptions::new() -> Self
+pub fn outrig::container::ExecOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 #[non_exhaustive] pub struct outrig::container::PrimaryView
 pub outrig::container::PrimaryView::helper_host: std::path::PathBuf
 pub outrig::container::PrimaryView::payload_home: alloc::string::String
@@ -922,6 +929,13 @@ impl outrig::CapabilitySpec
 pub fn outrig::CapabilitySpec::new(outrig::config::CapabilityProfile) -> Self
 impl core::convert::From<&outrig::CapabilitySpec> for outrig::container::ContainerCapabilities
 pub fn outrig::container::ContainerCapabilities::from(&outrig::CapabilitySpec) -> Self
+#[non_exhaustive] pub struct outrig::ExecOptions
+pub outrig::ExecOptions::env: alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>
+pub outrig::ExecOptions::workdir: core::option::Option<std::path::PathBuf>
+impl outrig::container::ExecOptions
+pub fn outrig::container::ExecOptions::new() -> Self
+pub fn outrig::container::ExecOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
 #[non_exhaustive] pub struct outrig::LaunchSpec
 pub outrig::LaunchSpec::embedded_mcp_policy: outrig::EmbeddedMcpPolicy
 pub outrig::LaunchSpec::log_dir: std::path::PathBuf
@@ -1007,8 +1021,8 @@ pub struct outrig::Outrig
 impl outrig::Outrig
 pub async fn outrig::Outrig::add_sidecar(&mut self, outrig::SidecarSpec) -> outrig::error::Result<alloc::vec::Vec<outrig::ToolHandle>>
 pub async fn outrig::Outrig::call_tool(&self, &str, &str, serde_json::value::Value) -> outrig::error::Result<outrig::McpToolResult>
-pub async fn outrig::Outrig::exec_capture(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<std::process::Output>
-pub async fn outrig::Outrig::exec_stdio(&self, &[alloc::string::String], &alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> outrig::error::Result<tokio::process::Child>
+pub async fn outrig::Outrig::exec_capture(&self, &[alloc::string::String], &outrig::container::ExecOptions) -> outrig::error::Result<std::process::Output>
+pub async fn outrig::Outrig::exec_stdio(&self, &[alloc::string::String], &outrig::container::ExecOptions) -> outrig::error::Result<tokio::process::Child>
 pub async fn outrig::Outrig::launch(&outrig::LaunchSpec) -> outrig::error::Result<Self>
 pub async fn outrig::Outrig::shutdown(self) -> outrig::error::Result<()>
 pub fn outrig::Outrig::tools(&self) -> &[outrig::ToolHandle]

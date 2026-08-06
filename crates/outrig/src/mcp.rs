@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::process::Child;
 
 use crate::config::{EnvValue, McpServerSpec};
-use crate::container::{Container, embedded::McpDeclarationSource};
+use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{Cmd, Transcript};
 
@@ -138,7 +138,9 @@ impl McpClient {
     ) -> Result<Self> {
         let (command, env_spec) = server_cfg.normalize();
         let env = resolve_mcp_env(name, env_spec, extra_env)?;
-        let exec_cmd = container.build_exec_argv(&command, &env);
+        // Sidecar servers run wherever their image puts them; no exec-side
+        // working directory has come up for one yet.
+        let exec_cmd = container.build_exec_argv(&command, &ExecOptions::new().with_env(env));
         Self::connect_stdio_cmd(
             exec_cmd,
             name,

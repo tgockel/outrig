@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: an exec can name the directory it runs in, and the four exec methods now take an
+  `ExecOptions` instead of a bare environment map.** `Outrig::exec_stdio`, `Outrig::exec_capture`,
+  and the two `Container` methods behind them previously took `(&[String], &BTreeMap<String,
+  String>)` and had no way to say where the command should run. They now take `(&[String],
+  &ExecOptions)`, where `ExecOptions::with_workdir` becomes `--workdir <path>` on the
+  `podman exec` and `ExecOptions::with_env` carries what the map used to. Omitting the directory
+  emits no flag, so an exec that does not ask for one is byte-identical to what 0.2.0-rc.1 ran.
+
+  Note what "no flag" actually means, because the docs got this wrong at first and it is
+  load-bearing: the exec inherits the container's configured working directory, which is the
+  image's `WORKDIR` only when nothing overrode it. A workspace-backed session sets `-w` to the
+  workspace's container path on the run, so an unset exec runs *in the workspace*, on the
+  mounted checkout. Set the directory explicitly if a relative or destructive command must not
+  land there.
+
+  Without this a caller wanting a build to run in the checkout had three bad options: wrap the
+  command in `sh -c 'cd ... && ...'`, which defeats the argv form that exists so a shell-less
+  image stays usable and pushes quoting onto the caller; set `PWD`, which changes the variable
+  without moving the process, so `getcwd` never notices; or require every path to be absolute,
+  which does not help a tool that resolves relative paths itself.
+
+  The environment moved inside the struct rather than staying a third parameter.
+  `ContainerCreateOptions` already holds its `env` that way, so keeping it out here would have
+  meant env is in the bag on create and beside it on exec; a timeout and a tty flag are the
+  foreseeable next knobs and would all land inside. Rust has no default arguments, so leaving
+  `env` in place would have broken every call site anyway without buying source compatibility.
+  `ExecOptions` is `#[non_exhaustive]`, so those later fields are additive. It lives in
+  `outrig::container` next to `ContainerCreateOptions` and is re-exported at the crate root,
+  since `Outrig`'s methods name it.
+
+  A directory the container does not have stays podman's error to report. It surfaces the way
+  any failing exec does -- a non-zero `Output::status` with podman's message, which names the
+  path, on stderr -- not as an `Err`. Validating existence up front would cost an extra exec on
+  every call to pre-empt a case podman already handles.
+
 - **Breaking: `request-timeout-secs` is now range-checked**, closing an asymmetry with its
   sibling `retry-budget-secs`, which has validated against `RETRY_BUDGET_SECS_CEILING` since it
   landed. A remote provider's `request-timeout-secs` must be between `1` and the new

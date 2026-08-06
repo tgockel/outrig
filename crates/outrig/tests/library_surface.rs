@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use outrig::config::{Config, McpServerSpec};
 use outrig::{
-    CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountAccess, MountSpec,
-    NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
+    CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
+    MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
     SidecarWorkspaceAccess,
 };
 
@@ -77,18 +77,36 @@ fn ensure_mcp_fs_image() {
 /// `outrig-enter`, which decides how to open it before anything in the image
 /// runs.
 fn build_image_with_entrypoint(tag: &str, base: &str, entrypoint: &[&str]) {
-    let ctx = tempfile::tempdir().expect("tempdir image context");
     let entrypoint = entrypoint
         .iter()
         .map(|e| format!("\"{}\"", dockerfile_escape(e)))
         .collect::<Vec<_>>()
         .join(", ");
-    std::fs::write(
-        ctx.path().join("Dockerfile"),
-        format!("FROM {base}\nENTRYPOINT [{entrypoint}]\n"),
-    )
-    .expect("write Dockerfile");
+    build_image_from_dockerfile(tag, &format!("FROM {base}\nENTRYPOINT [{entrypoint}]\n"));
+}
+
+/// Build `dockerfile` as `tag` in a throwaway context. The tempdir has to
+/// outlive `podman build`, which is why every caller goes through here rather
+/// than handing a path around.
+fn build_image_from_dockerfile(tag: &str, dockerfile: &str) {
+    let ctx = tempfile::tempdir().expect("tempdir image context");
+    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
     podman_build(tag, ctx.path());
+}
+
+/// An image with no shell anywhere on `PATH`. alpine -- the base every other
+/// e2e fixture uses -- is busybox underneath, with `sh`, `cat`, and `pwd` all
+/// symlinks to one static binary, so deleting the shell's names leaves the
+/// rest working. The argv exec form exists precisely so an image like this
+/// stays usable, and nothing else in the suite has one. No `CMD` is needed:
+/// `build_podman_run_cmd` appends `sleep infinity` after the image ref.
+fn build_shell_less_image(tag: &str) {
+    build_image_from_dockerfile(
+        tag,
+        "FROM docker.io/library/alpine:latest\n\
+         RUN [\"/bin/busybox\", \"rm\", \"-f\", \
+         \"/bin/sh\", \"/bin/ash\", \"/bin/bash\", \"/usr/bin/sh\", \"/usr/bin/ash\"]\n",
+    );
 }
 
 fn dockerfile_escape(value: &str) -> String {
@@ -100,7 +118,6 @@ fn label_line(key: &str, value: &str) -> String {
 }
 
 fn build_fixture_image_with_mcp_label(tag: &str, mcp: &BTreeMap<String, McpServerSpec>) {
-    let ctx = tempfile::tempdir().expect("tempdir image context");
     let dockerfile = format!(
         "FROM docker.io/library/alpine:latest\n\
          RUN apk add --no-cache nodejs npm shadow\n\
@@ -111,8 +128,7 @@ fn build_fixture_image_with_mcp_label(tag: &str, mcp: &BTreeMap<String, McpServe
             &serde_json::to_string(mcp).expect("serialize mcp label json"),
         ),
     );
-    std::fs::write(ctx.path().join("Dockerfile"), dockerfile).expect("write Dockerfile");
-    podman_build(tag, ctx.path());
+    build_image_from_dockerfile(tag, &dockerfile);
 }
 
 fn fs_spec(path: &str) -> McpServerSpec {
@@ -481,7 +497,7 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
                 "-lc".into(),
                 "echo hi > /tmp/IN-PRIMARY.txt".into(),
             ],
-            &BTreeMap::new(),
+            &ExecOptions::new(),
         )
         .await
         .expect("exec_capture in the primary");
@@ -657,7 +673,10 @@ async fn exec_capture_runs_a_command_in_the_primary() {
     let out = outrig
         .exec_capture(
             &["sh".into(), "-lc".into(), "printf %s \"$GREETING\"".into()],
-            &BTreeMap::from([("GREETING".to_string(), "hello".to_string())]),
+            &ExecOptions::new().with_env(BTreeMap::from([(
+                "GREETING".to_string(),
+                "hello".to_string(),
+            )])),
         )
         .await
         .expect("exec_capture");
@@ -668,7 +687,7 @@ async fn exec_capture_runs_a_command_in_the_primary() {
     let failed = outrig
         .exec_capture(
             &["sh".into(), "-lc".into(), "exit 3".into()],
-            &BTreeMap::new(),
+            &ExecOptions::new(),
         )
         .await
         .expect("a failing command still ran");
@@ -676,7 +695,10 @@ async fn exec_capture_runs_a_command_in_the_primary() {
 
     // The streaming form hands back the child with all three pipes open.
     let mut child = outrig
-        .exec_stdio(&["sh".into(), "-lc".into(), "cat".into()], &BTreeMap::new())
+        .exec_stdio(
+            &["sh".into(), "-lc".into(), "cat".into()],
+            &ExecOptions::new(),
+        )
         .await
         .expect("exec_stdio");
     {
@@ -695,6 +717,115 @@ async fn exec_capture_runs_a_command_in_the_primary() {
         assert_eq!(out, "ping\n");
     }
     assert!(child.wait().await.expect("wait").success());
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// `ExecOptions::with_workdir` against an image with no shell -- the case the
+/// knob exists for. Without it a caller would have to wrap the command in
+/// `sh -c 'cd ... && ...'`, which this image cannot run at all.
+#[tokio::test]
+async fn exec_honors_a_working_directory_without_a_shell() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-noshell-{}:latest",
+        std::process::id(),
+    );
+    build_shell_less_image(&tag);
+
+    // The marker goes in a *subdirectory*. The run path already sets
+    // `-w /workspace`, so a test that asked for `/workspace` would pass with
+    // `--workdir` deleted entirely -- it has to name a directory the container
+    // would not otherwise be in.
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    std::fs::create_dir(host_ws.path().join("sub")).expect("mkdir sub");
+    std::fs::write(host_ws.path().join("sub/MARKER.txt"), "in-the-subdir\n")
+        .expect("write MARKER.txt");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(tag, BTreeMap::new(), session_dir.path().join("logs"))
+        .with_workspace(outrig::WorkspaceSpec::new(host_ws.path(), "/workspace"));
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // The image really has no shell, which is what makes the rest meaningful.
+    let no_shell = outrig
+        .exec_capture(
+            &["sh".into(), "-c".into(), "pwd".into()],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("podman ran; the command inside it is what fails");
+    assert!(
+        !no_shell.status.success(),
+        "this image is supposed to have no shell, but `sh -c pwd` succeeded: {}",
+        String::from_utf8_lossy(&no_shell.stdout),
+    );
+
+    // Omitting it leaves the container where it already was -- the workspace,
+    // which the run path set with `-w`. This is the baseline the next two
+    // assertions have to differ from.
+    let default_dir = outrig
+        .exec_capture(&["pwd".into()], &ExecOptions::new())
+        .await
+        .expect("exec_capture pwd with no workdir");
+    assert_eq!(
+        String::from_utf8_lossy(&default_dir.stdout).trim(),
+        "/workspace",
+    );
+
+    // The working directory takes effect: `pwd` reports the subdirectory, not
+    // the `-w` the container was started with.
+    let pwd = outrig
+        .exec_capture(
+            &["pwd".into()],
+            &ExecOptions::new().with_workdir("/workspace/sub"),
+        )
+        .await
+        .expect("exec_capture pwd");
+    assert!(pwd.status.success(), "exit: {:?}", pwd.status);
+    assert_eq!(
+        String::from_utf8_lossy(&pwd.stdout).trim(),
+        "/workspace/sub"
+    );
+
+    // ...and a relative path in the argv resolves against it, with no shell in
+    // the picture to have expanded it. `MARKER.txt` exists only in the
+    // subdirectory, so this fails outright if the working directory did not
+    // apply.
+    let marker = outrig
+        .exec_capture(
+            &["cat".into(), "MARKER.txt".into()],
+            &ExecOptions::new().with_workdir("/workspace/sub"),
+        )
+        .await
+        .expect("exec_capture cat");
+    assert!(
+        marker.status.success(),
+        "reading a relative path failed: {}",
+        String::from_utf8_lossy(&marker.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&marker.stdout), "in-the-subdir\n");
+
+    // A directory the container does not have is podman's error to report,
+    // and it arrives the way every other failing exec does: a non-zero status
+    // with the message on stderr, not an `Err`.
+    let missing = outrig
+        .exec_capture(
+            &["pwd".into()],
+            &ExecOptions::new().with_workdir("/no/such/dir"),
+        )
+        .await
+        .expect("podman itself ran");
+    assert!(
+        !missing.status.success(),
+        "a nonexistent working directory should fail the exec"
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("/no/such/dir"),
+        "the failure should name the directory, got: {stderr}"
+    );
 
     outrig.shutdown().await.expect("shutdown");
 }

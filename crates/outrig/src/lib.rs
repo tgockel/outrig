@@ -46,6 +46,13 @@ pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
     NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,
 };
+// Doubled at the root the way `config`'s types are, because it is the one
+// `container` type a root-level *signature* names -- `Outrig::exec_stdio` and
+// `exec_capture` take it. `ContainerCreateOptions` is used from `outrig_` but
+// appears in no root signature, so it stays a single path. This is a
+// convenience, not a rule: `Container` itself is named by
+// `McpClient::connect_via_podman_exec` and stays put.
+pub use container::ExecOptions;
 pub use mcp::{McpClient, McpTool, McpToolResult, resolve_mcp_env};
 pub use outrig_::{
     CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec,
