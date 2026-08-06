@@ -78,7 +78,12 @@ pub(crate) fn render_prompt() -> String {
          Produce a Dockerfile and a matching `.agents/outrig/config.toml` \
          `[images.<name>]` block. Respect these rules:\n\
          \n\
-         - Keep the container alive with `CMD [\"sleep\", \"infinity\"]`.\n\
+         - End with `CMD [\"sleep\", \"infinity\"]` by convention. OutRig appends that \
+         same command itself and overrides the image's `CMD`, so the `CMD` is not what \
+         keeps the container alive.\n\
+         - Do not set an `ENTRYPOINT`. podman appends trailing arguments to an exec-form \
+         `ENTRYPOINT` rather than replacing it, so OutRig's `sleep infinity` would arrive \
+         as arguments to it.\n\
          - Do not add a Dockerfile `USER`; OutRig maps the host UID/GID at runtime.\n\
          - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
          - Prefer `/workspace` as the mounted repo path unless the request says otherwise.\n\
@@ -119,7 +124,12 @@ pub(crate) fn render_standalone_prompt() -> String {
          - `[image].description`, `[image].version`, and `[image].tags` are optional.\n\
          - `[build]` is optional. When present, it must set both `dockerfile` and `context`.\n\
          - Without `[build]`, `outrig image build` uses sibling `Dockerfile` and context `.`.\n\
-         - Keep the container alive with `CMD [\"sleep\", \"infinity\"]`.\n\
+         - End with `CMD [\"sleep\", \"infinity\"]` by convention. OutRig appends that \
+         same command itself and overrides the image's `CMD`, so the `CMD` is not what \
+         keeps the container alive.\n\
+         - Do not set an `ENTRYPOINT`. podman appends trailing arguments to an exec-form \
+         `ENTRYPOINT` rather than replacing it, so OutRig's `sleep infinity` would arrive \
+         as arguments to it.\n\
          - Do not add a Dockerfile `USER`; OutRig maps the host UID/GID at runtime.\n\
          - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
          - `outrig image build` validates `image.toml` and stamps the config into OCI labels.\n\

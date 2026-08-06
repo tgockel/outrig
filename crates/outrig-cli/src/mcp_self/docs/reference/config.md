@@ -614,9 +614,10 @@ view  = "primary"
 
 `buildpack-deps:bookworm-scm` is the smallest official image that carries `git`, `curl`, and
 `ca-certificates` while setting no `ENTRYPOINT` and baking in no user -- both of which outrig
-needs, since it appends `sleep infinity` itself and writes the runtime user's `/etc/passwd`
-entry at start. Because both servers run with `view = "primary"`, the commands they spawn
-resolve in *this* container's filesystem, which is why the primary is the one that needs `git`.
+needs, since it appends `sleep infinity` after the image ref (which an `ENTRYPOINT` would
+swallow as arguments) and writes the runtime user's `/etc/passwd` entry at start. Because both
+servers run with `view = "primary"`, the commands they spawn resolve in *this* container's
+filesystem, which is why the primary is the one that needs `git`.
 
 The first run pulls two images and builds one. Each is reachable by name from `outrig build`
 and from `--image`, so that cost can be paid deliberately -- one command per part:

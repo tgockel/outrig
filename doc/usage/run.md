@@ -169,7 +169,10 @@ tools) and `shell` is unavailable. Full details in
    local-only and are checked with `podman image exists`.
 4. **Start the container.** `podman run -d --rm --name outrig-<sid> -v <repo>:/workspace:rw
    --userns=keep-id ... <image> sleep infinity`. Any `[workspace.mounts]` and `--volume` entries
-   become additional `-v` binds.
+   become additional `-v` binds. The trailing `sleep infinity` is the container's command and
+   overrides the image's `CMD`; an image that sets an `ENTRYPOINT` gets it appended instead, so
+   a primary image should not set one (see
+   [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)).
 5. **Bootstrap the user.** From the host, inside the container's namespaces: ensure a group with
    `$(id -g)` and a user with `$(id -u)` exist -- appending the entries to `/etc/group` and
    `/etc/passwd` if not -- and that `/home/<user>` exists and is owned by them. The image needs

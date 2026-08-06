@@ -192,7 +192,7 @@ place (preserving surrounding TOML).
 build output is a reusable container image. Unlike `image add`, it writes no repo config --
 it creates three files and nothing else:
 
-- `Dockerfile` -- a Debian-slim image with the filesystem MCP server, ending in the standard
+- `Dockerfile` -- a Debian-slim image with the filesystem MCP server, ending in the customary
   `CMD ["sleep", "infinity"]`. It installs the tool binaries; it does not copy OutRig config.
 - `image.toml` -- the standalone image authoring config: `[image].ref` plus a `[mcp]` table.
   `outrig image build` validates this file and stamps the `[mcp]` table into the image's OCI

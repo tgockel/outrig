@@ -28,18 +28,37 @@ absolutely anywhere, with an absolute path.
 
 outrig expects a few things from your Dockerfile.
 
-### `CMD ["sleep", "infinity"]`
+### Don't set an `ENTRYPOINT`
 
 The container's job is to stay running while the agent works. Every real process -- MCP servers,
-shell commands the agent runs -- is launched via `podman exec` from outrig on the host. So your
-`Dockerfile` ends with:
+shell commands the agent runs -- is launched via `podman exec` from outrig on the host, so the
+container's own process only has to stay alive.
 
-```Dockerfile
-CMD ["sleep", "infinity"]
-```
+outrig arranges that itself: it appends `sleep infinity` after the image reference on the
+`podman run`, and trailing arguments there *are* the container's command. **Your `CMD` is
+overridden and does not matter.** Setting one is harmless -- outrig's own templates still end
+with `CMD ["sleep", "infinity"]`, which keeps the image behaving the same way under a plain
+`podman run <image>` -- but nothing depends on it.
 
-If you set a different `CMD` or `ENTRYPOINT`, the container will exit before outrig can attach
-an MCP server to it. outrig doesn't override your `CMD`; it relies on this convention.
+`ENTRYPOINT` is the one that matters, because podman *appends* trailing arguments to an
+exec-form `ENTRYPOINT` rather than replacing it. An image that sets one therefore runs
+`<entrypoint> sleep infinity`, which is rarely what either side intended. Leave `ENTRYPOINT`
+unset on an image you mean to use as a primary.
+
+The same goes for a sidecar image whose servers are `podman exec`'d into it -- those containers
+start exactly the way the primary does. An *entrypoint-stdio* sidecar is the opposite case:
+there the image's `ENTRYPOINT` is the server, outrig appends no command of its own, and `args`
+supply its arguments. See [MCP Servers](mcp-servers.md#sidecar-placement) for which entries are
+which.
+
+The one thing the image has to supply is a `sleep` that accepts `infinity`. GNU coreutils has
+always understood it, and busybox has since 1.30 -- Alpine 3.10, June 2019 -- so any current
+base is fine. An older busybox exits immediately with `sleep: invalid number 'infinity'`, and
+an image with no `sleep` at all (`FROM scratch`, some distroless bases) has nothing to run.
+
+When either of these bites, the container exits moments after starting and the failure surfaces
+one step later, as a bootstrap error reporting that the container `has no running namespaces`.
+`podman logs outrig-<sid>` has the real cause.
 
 ### Don't set up a user in the Dockerfile
 
@@ -51,7 +70,9 @@ without rebuilding.
 The image needs no user tooling for this. outrig writes the matching `/etc/passwd` and
 `/etc/group` entries into the container itself, from the host, so an image with no `useradd`,
 `groupadd`, or `getent` -- an unadorned `FROM docker.io/library/alpine`, or a distroless base --
-works unchanged.
+works unchanged. What it does need is the two files to already exist and a writable `/etc`; a
+base so minimal that it ships neither cannot be bootstrapped, and neither can one without the
+`sleep` the section above describes.
 
 ### Install MCP servers
 
@@ -204,6 +225,14 @@ $ outrig build --image scratch
 
 `outrig run --image scratch` starts the container directly -- no buildah invocation.
 
+A stock distribution image works here precisely because outrig supplies the command itself: it
+needs no `CMD`, and `ubuntu`, `debian`, `fedora`, and `alpine` all set no `ENTRYPOINT` and bake
+in no user. What it does *not* have is any MCP server, and outrig installs nothing at run time,
+so an off-the-shelf base is useful only with servers placed in sidecars -- see
+[MCP Servers -> Sidecar placement](mcp-servers.md#sidecar-placement). That is exactly how
+outrig's own [built-in default](../reference/config.md#the-built-in-default-image-config) is
+put together.
+
 ## Named image-configs
 
 You can declare multiple image-configs for the same repo and switch between them with
@@ -328,11 +357,13 @@ sidecar the same way it attaches to the primary, before any MCP server connects.
 ## What outrig sets in the run
 
 outrig adds `--userns=keep-id`, the primary workspace bind-mount, any configured extra
-workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). The
-bootstrap runs from the host: a forked child joins the container's user namespace, becomes its
-root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group` entries
-before creating `/home/<user>`. No `podman exec` is involved, and nothing is written when podman's
-`keep-id` mapping already planted the entries. A
+workspace mounts, and the runtime user-mapping bootstrap (see [Workspace](workspace.md)). It
+also supplies the container's command: `sleep infinity`, appended after the image reference,
+which overrides the image's `CMD` (see [Don't set an `ENTRYPOINT`](#dont-set-an-entrypoint)).
+The bootstrap runs from the host: a forked child joins the container's user namespace, becomes
+its root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group`
+entries before creating `/home/<user>`. No `podman exec` is involved, and nothing is written
+when podman's `keep-id` mapping already planted the entries. A
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see

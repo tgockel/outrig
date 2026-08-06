@@ -39,6 +39,12 @@ pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
                 message: "OutRig bootstraps and runs containers as the host UID/GID, so Dockerfile USER directives are not respected.".to_string(),
                 line: Some(line_no),
             });
+        } else if starts_with_instruction(line, "ENTRYPOINT") {
+            warnings.push(ValidationMessage {
+                code: "entrypoint_takes_args",
+                message: "OutRig appends `sleep infinity` after the image reference to keep the container alive. podman appends trailing arguments to an exec-form ENTRYPOINT rather than replacing it, so this image would run `<entrypoint> sleep infinity`. Leave ENTRYPOINT unset on any image OutRig starts this way -- the primary, and any sidecar whose servers are exec'd into it. An entrypoint-stdio sidecar image, whose ENTRYPOINT is the server itself, is a separate case and is fine.".to_string(),
+                line: Some(line_no),
+            });
         } else if starts_with_instruction(line, "CMD") {
             last_cmd = Some((line_no, line.to_string()));
         }
@@ -47,16 +53,11 @@ pub fn validate_dockerfile(dockerfile: &str) -> DockerfileValidation {
     match last_cmd {
         Some((line, cmd)) if !is_sleep_infinity_cmd(&cmd) => {
             warnings.push(ValidationMessage {
-                code: "cmd_may_exit",
-                message: "A CMD that does not run forever can let the container exit before the agent has finished using it; OutRig templates use CMD [\"sleep\", \"infinity\"].".to_string(),
+                code: "cmd_ignored",
+                message: "OutRig appends `sleep infinity` after the image reference, which overrides this CMD -- it has no effect on an OutRig session. OutRig templates still use CMD [\"sleep\", \"infinity\"] so the image behaves the same under a plain `podman run`.".to_string(),
                 line: Some(line),
             });
         }
-        None => warnings.push(ValidationMessage {
-            code: "cmd_missing",
-            message: "Without a long-running CMD, the container may exit before the agent has finished using it; OutRig templates use CMD [\"sleep\", \"infinity\"].".to_string(),
-            line: None,
-        }),
         _ => {}
     }
 
@@ -152,7 +153,39 @@ RUN apt-get install -y curl
 CMD ["bash"]
 "#,
         );
-        assert!(out.warnings.iter().any(|w| w.code == "cmd_may_exit"));
+        assert!(out.warnings.iter().any(|w| w.code == "cmd_ignored"));
+    }
+
+    /// A missing `CMD` is not a problem: OutRig supplies the command itself,
+    /// and the e2e suite's shell-less fixture is an image with no `CMD` at all.
+    #[test]
+    fn absent_cmd_is_not_a_warning() {
+        let out = validate_dockerfile(
+            r#"
+FROM debian:bookworm-slim
+RUN apt-get install -y curl
+"#,
+        );
+        assert_eq!(out.warnings, Vec::new());
+    }
+
+    /// The instruction that actually breaks a primary image: podman appends
+    /// the `sleep infinity` OutRig supplies to it rather than replacing it.
+    #[test]
+    fn entrypoint_is_warning() {
+        let out = validate_dockerfile(
+            r#"
+FROM debian:bookworm-slim
+ENTRYPOINT ["/usr/bin/myserver"]
+CMD ["sleep", "infinity"]
+"#,
+        );
+        let warning = out
+            .warnings
+            .iter()
+            .find(|w| w.code == "entrypoint_takes_args")
+            .expect("an ENTRYPOINT warning");
+        assert_eq!(warning.line, Some(3));
     }
 
     #[test]

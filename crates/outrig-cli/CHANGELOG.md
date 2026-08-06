@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`validate_dockerfile` now flags `ENTRYPOINT` rather than a missing `CMD`** (`outrig mcp
+  self` and the `rig` self tool). OutRig appends `sleep infinity` after the image reference, so
+  the container's command comes from OutRig and the image's `CMD` is overridden -- a Dockerfile
+  that sets a different one, or none at all, was never the problem the old warnings described.
+  The `cmd_missing` warning is gone, `cmd_may_exit` becomes `cmd_ignored` and says the `CMD` has
+  no effect rather than that the container may exit, and a new `entrypoint_takes_args` warning
+  covers the instruction that does break a primary image: podman appends trailing arguments to
+  an exec-form `ENTRYPOINT` instead of replacing it, so such an image runs
+  `<entrypoint> sleep infinity`. The documentation and `outrig design prompt` carried the same
+  mistake and are corrected to match.
+
 - **`outrig run` no longer needs an agent.** With neither `--agent` nor `default-agent`, the
   session starts against `--model` (or `default-model`) and `--image` (or `default-image`) and
   sends no preamble -- the same shape `outrig mcp` has always had, now with an LLM attached.
