@@ -2,7 +2,7 @@
 
 ## Context
 
-`plan/todo/0110-model-aliases.md` divides aliases into a **static half** -- select one candidate at
+`plan/done/0110-model-aliases.md` divides aliases into a **static half** -- select one candidate at
 resolve time from what this build is credentialed for -- and a **runtime half**, which moves to the
 next candidate when one fails mid-session. 0110 ships only the static half, and says so twice:
 under Deliverables ("**Not in the first pass**: the runtime half") and under Design forks §2, whose
@@ -284,9 +284,15 @@ from eating it.
 
 ## Dependencies
 
-- **Hard: `plan/todo/0110-model-aliases.md`.** The config surface, the flattening walk, and the
+- **Landed: `plan/done/0110-model-aliases.md`.** The config surface, the flattening walk, and the
   static half's selectability rule. This entry is 0110's deferred second half and nothing here is
-  meaningful without it.
+  meaningful without it. Three things it left on the table, all in its `## Decisions`:
+  `selectability` (`llm.rs`) predicts `build_agent`'s `local-llm` check without being linked to
+  it, so a precondition added to either goes stale silently -- this entry reshapes `build_agent`
+  and is the natural place to unify them; a single-target alias deliberately bypasses candidate
+  selection, so a chain of one must keep doing so; and `Unselectable` carries `LlmResolveError`
+  values rather than restating their text, which is the shape `FailoverModel`'s per-candidate
+  exhaustion report should reuse.
 - **Hard: `plan/todo/0112-connect-failures-are-not-really-transient.md`.** 0110 calls this
   dependency "close to hard"; with the chain deadline resolved it is hard. The deadline bounds the
   chain's worst case at one budget, but only the short pre-first-byte bound stops each dead
@@ -303,7 +309,7 @@ from eating it.
 
 ## See also
 
-- `plan/todo/0110-model-aliases.md` -- the static half. Its Runtime behavior section
+- `plan/done/0110-model-aliases.md` -- the static half. Its Runtime behavior section
   ("Selecting a candidate: the runtime half") is the specification this entry executes; its Design
   forks §2 and §4 and its `warn_fallback_ceiling` risk are the loose ends it inherits.
 - `crates/outrig-cli/src/llm/retry.rs` -- the module doc (8-13) that places this layer,

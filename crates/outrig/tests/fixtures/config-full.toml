@@ -51,6 +51,16 @@ provider       = "local"
 model-path     = ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
 context-length = 4096
 
+# One name for one model: repoint this line and every agent naming `opus`
+# follows, with no other edit.
+[models.opus]
+alias = "claude"
+
+# One name for a set of equivalents, in preference order. The first candidate
+# this build is credentialed for wins.
+[models.any-fast]
+alias = ["fast", "phi3-fast"]
+
 [agents.coding]
 image              = "coding"
 preamble           = "You are a careful coding assistant. Repo is at /workspace."

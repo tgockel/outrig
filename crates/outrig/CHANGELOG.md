@@ -7,7 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A `[models.<name>]` entry can name other models instead of a provider.** The new `alias`
+  key takes one model name (`alias = "opus-5"`) or an ordered list of them
+  (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`), and both spellings deserialize through
+  the same helper `model-file` already uses. `Model::alias` joins `Model::new` as a
+  constructor, `Model::source` returns the new `ModelSourceRef` discriminating the two shapes,
+  and `Config::model_candidates` flattens an alias graph to the ordered list of concrete model
+  names it stands for.
+
+  An alias *is* a model: it lives in the same table, under one namespace and one lookup, so
+  everything that already accepts a model name accepts it unchanged. A separate
+  `[model-aliases]` table would have needed a documented precedence rule for a name declared
+  in both; inside one table that collision cannot be expressed, so the rule does not need to
+  exist.
+
+  Six `ConfigValidationError` variants come with it -- `ModelSourceMissing`,
+  `ModelSourceConflict`, `ModelAliasEmpty`, `UnknownModelAliasTarget`, `ModelAliasCycle`, and
+  `ModelAliasTooDeep`, the last bounding traversal depth at `MODEL_ALIAS_DEPTH_MAX` (32) so a
+  long chain reports a bad config instead of exhausting the stack. The enum is
+  `#[non_exhaustive]`, so all six are additive. Unlike the other model rules,
+  these are checked on every validation path including `outrig build`'s: they establish an
+  entry's *shape* rather than resolve a cross-reference, and until `provider` became optional
+  serde's own "missing field" enforced half of it everywhere.
+
+  `Config::model_candidates` is the first method on `Config` that is neither `load*` nor
+  `validate*`. It is public because both crates walk this graph -- validation checks it, and
+  the binary's resolver selects from it -- and two traversals that had to agree on ordering
+  and on cycle handling would be two chances to disagree.
+
 ### Changed
+
+- **Breaking: `Model::provider` is now `Option<String>`.** A model entry has two mutually
+  exclusive shapes -- a provider that serves it, or an `alias` naming other models -- so the
+  field that identifies the first cannot be required. This follows `ImageConfig` exactly,
+  which has carried `image-name` XOR `dockerfile`+`context` in one table since 0.1: every
+  field `Option`, exactly-one-shape enforced by validation, and a discriminated accessor
+  (`ImageConfig::source`, now joined by `Model::source`) as the way readers ask which shape
+  they got.
+
+  `Model::new(provider)` is unchanged and still the way to build a provider-shape model, so
+  the common construction path does not move. Readers of the field take a one-line migration:
+  `model.provider` becomes `model.provider.as_deref()` compared against `Some("...")`, or a
+  `match model.source()` where the shape matters.
+
+  Taken now rather than deferred because it is a field *type* change, which the
+  `#[non_exhaustive]` sweep does not make additive the way it does field and variant
+  additions. It rides the breaking changes already in this section rather than forcing a new
+  one; after 0.2.0 it would have had to wait for the next major.
+
+  One consequence worth stating: `Model` carries `deny_unknown_fields`, so a config using
+  `alias` is rejected outright by an older outrig rather than degrading. That is the correct
+  behavior, and it makes a shared repo config with an alias in it a breaking change for
+  collaborators who have not upgraded.
 
 - **Breaking: an exec can name the directory it runs in, and the four exec methods now take an
   `ExecOptions` instead of a bare environment map.** `Outrig::exec_stdio`, `Outrig::exec_capture`,

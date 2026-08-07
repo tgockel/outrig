@@ -65,6 +65,13 @@ The value is a **model name** -- a key under `[models.<name>]`, like `fast` or `
 provider and not a wire identifier like `gpt-4o-mini`. The names configured for the running build
 are listed in the argument's schema, so an agent never has to guess one.
 
+That includes [aliases](../reference/config.md), since an alias is a model like any other. An
+alias is offered when **at least one** of its candidates is reachable in this build, which is what
+lets `alias = ["opus-local", "opus-anthropic"]` stay launchable without `--features local-llm`
+where naming `opus-local` directly would not be. A launch under an alias reports the hop it took --
+`(model: cheap -> fast)` -- in the launch trace, the tool result, and the transcript header, so
+the answer to "which model actually ran" is never inferred.
+
 This is for delegating mechanical work. Grepping a tree, summarizing logs, or checking whether a
 symbol is still used does not need the parent's expensive reasoning model, and moving it to a cheap
 one keeps the parent's context free for synthesis.

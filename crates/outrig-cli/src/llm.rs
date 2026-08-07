@@ -18,7 +18,7 @@ use thiserror::Error;
 #[cfg(feature = "local-llm")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::error::Result;
+use crate::error::{CliError, Result};
 use crate::session_tool::{self, SessionTool};
 use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
 
@@ -126,6 +126,30 @@ pub enum LlmResolveError {
     )]
     MistralrsDeviceOverrideUnsupported { model: String, provider: String },
 
+    /// The multi-candidate counterpart of the variant above. Deliberately not
+    /// that one: `--device` selects hardware for one in-process model, and an
+    /// alias spanning several candidates has no single provider to name, so
+    /// that message's "uses provider X" clause would be a lie.
+    #[error(
+        "--device selects hardware for one in-process model, but model \
+         {model:?} is an alias over several candidates ({candidates}); pass \
+         --model naming one of them directly"
+    )]
+    MistralrsDeviceOverrideAlias { model: String, candidates: String },
+
+    /// A `[models.<name>]` row that is neither shape. Validation rejects it and
+    /// `Model::source` panics on it, so this is reachable only through a
+    /// `ModelSourceRef` variant added after this match was written.
+    #[error("model {model:?} names neither a provider nor an alias")]
+    ModelHasNoProvider { model: String },
+
+    /// Every candidate of an alias was rejected before the session started.
+    /// `tried` is pre-rendered one candidate per line: a list of three that
+    /// fail for three different reasons is exactly the case a single-line
+    /// error wastes an afternoon on.
+    #[error("no usable model for alias {alias:?}; tried:\n{tried}")]
+    NoUsableAliasCandidate { alias: String, tried: String },
+
     #[cfg(feature = "local-llm")]
     #[error(
         "mistralrs model {model:?}: requested context-length \
@@ -196,7 +220,15 @@ pub struct ResolvedAgent {
     /// top-level config and the built-in defaults, exactly as it would for an
     /// `[agents.<name>]` block with no keys set.
     pub agent_name: Option<String>,
+    /// The *concrete* `[models.<name>]` row this session runs against, which is
+    /// also the `LlmRegistry` cache key -- so two names for one in-process
+    /// model share one loaded engine.
     pub model_name: String,
+    /// The name the caller asked for, when it was an alias standing for
+    /// `model_name`; `None` when no alias was involved. Kept beside
+    /// `model_name` rather than replacing it so attribution can show the hop
+    /// without the alias reaching the registry.
+    pub alias_name: Option<String>,
     pub model_identifier: String,
     pub provider_name: String,
     pub provider: ResolvedProvider,
@@ -216,6 +248,199 @@ pub struct ResolvedAgent {
     /// Maximum number of live subagents this agent may launch at once.
     pub subagent_width_max: u32,
     pub image: Option<String>,
+}
+
+impl ResolvedAgent {
+    /// The model as it should be *shown*: `alias -> concrete` when an alias was
+    /// involved, and the bare name otherwise.
+    ///
+    /// One function behind every surface that prints a model name -- the
+    /// banner, the subagent launch trace, and the transcript header -- because
+    /// static selection is otherwise invisible by construction. Picking a
+    /// candidate from a list because of an environment variable is exactly the
+    /// kind of decision that stays hidden until it is wrong.
+    ///
+    /// The arrow appears only when an alias was actually involved, so a direct
+    /// model name prints exactly what it printed before aliases existed.
+    pub(crate) fn model_display(&self) -> String {
+        match &self.alias_name {
+            Some(alias) => format!("{alias} -> {}", self.model_name),
+            None => self.model_name.clone(),
+        }
+    }
+}
+
+/// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
+/// loop needs. Bails with a descriptive error if a reference is dangling or
+/// the api-key env var is unset.
+///
+/// `agent_name` is optional: `None` resolves the *agentless* session that
+/// `outrig run` starts when neither `--agent` nor `default-agent` names one.
+/// That case behaves as an `[agents.<name>]` block with no keys set -- no
+/// preamble, no image hint, every limit from the top-level config -- so the
+/// only thing it still needs from somewhere is a model.
+///
+/// Why a concrete model is not a candidate this build could pick.
+///
+/// Every arm that has a canonical error elsewhere *is* that error rather than a
+/// second wording of it, so the same misconfiguration reads identically whether
+/// the user named the model directly or reached it through an alias -- the
+/// drift this predicate exists to prevent.
+#[derive(Debug)]
+pub(crate) enum Unselectable {
+    /// No `[models.<name>]` row, or one naming no provider. Unreachable through
+    /// either caller today, since both feed names that came out of
+    /// `Config::model_candidates`; kept so the predicate stays total on a
+    /// hand-built config.
+    NotConcrete,
+    /// Carries the resolver's own error for the three cases it also reports.
+    AsResolved(LlmResolveError),
+    /// The rendered `ApiKeyError` -- unset, or not valid UTF-8. Held as text
+    /// because `ApiKeyRef::resolve` returns the library crate's `OutrigError`.
+    ApiKey(String),
+    /// `ApiKeyError` has no "set but empty" variant, so this one is ours.
+    ApiKeyEmpty(String),
+}
+
+impl std::fmt::Display for Unselectable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConcrete => write!(f, "names neither a provider nor an alias"),
+            Self::AsResolved(e) => write!(f, "{e}"),
+            Self::ApiKey(message) => write!(f, "{message}"),
+            Self::ApiKeyEmpty(var) => write!(f, "api-key env var {var} is set but empty"),
+        }
+    }
+}
+
+/// Whether this build could actually reach `model_name`, which must be a
+/// concrete (provider-shape) row.
+///
+/// The one predicate behind two callers -- [`first_selectable`] below and
+/// `subagent::usable_model_names`, which advertises a name when any of its
+/// candidates passes. They were separate filters that agreed by coincidence.
+///
+/// The bar is "not a guaranteed failure" rather than "works". A wrong key, a
+/// down endpoint, and a missing GGUF are all invisible from here and stay so --
+/// no network I/O, no weight load, no client construction, so the synchronous
+/// schema-building path can call it.
+///
+/// It predicts two later stages: the api-key resolution in
+/// `resolve_agent_with_overrides` and the `local-llm` check in `build_agent`.
+/// A precondition added to either without being added here goes stale silently
+/// -- aliases would pick a candidate that then dies, and the subagent schema
+/// would over-advertise.
+///
+/// One divergence is deliberate: an *empty* api-key variable counts as unset,
+/// where `ApiKeyRef::resolve` accepts it (`std::env::var` returns `Ok("")` for
+/// `FOO=`) and the request then fails at the endpoint with a provider-side auth
+/// error. Making `resolve` reject empty values would move an existing error
+/// path for direct model names, which is a separate decision -- so the two
+/// differ on purpose, in the safe direction: under-advertise, never
+/// over-advertise.
+///
+/// Reads `provider` directly rather than through `Model::source()`, which
+/// panics on an unvalidated row. This must stay total.
+pub(crate) fn selectability(
+    cfg: &Config,
+    model_name: &str,
+) -> std::result::Result<(), Unselectable> {
+    let model = cfg.models.get(model_name).ok_or(Unselectable::NotConcrete)?;
+    let provider_name = model.provider.as_deref().ok_or(Unselectable::NotConcrete)?;
+    let provider = cfg.providers.get(provider_name).ok_or_else(|| {
+        Unselectable::AsResolved(LlmResolveError::UnknownProvider {
+            name: provider_name.to_string(),
+        })
+    })?;
+    match provider {
+        LlmProvider::OpenAi { api_key, .. } | LlmProvider::Anthropic { api_key, .. } => {
+            // Through `resolve` rather than `env::var` so "not set" and "not
+            // valid UTF-8" read exactly as they will when the session resolves.
+            match api_key.resolve() {
+                Ok(value) if !value.is_empty() => Ok(()),
+                Ok(_) => Err(Unselectable::ApiKeyEmpty(api_key.var_name().to_string())),
+                Err(e) => Err(Unselectable::ApiKey(e.to_string())),
+            }
+        }
+        // Two compile-time decisions, not runtime ones. `cfg!` keeps one body
+        // compiling in every build, so they cannot drift apart.
+        LlmProvider::Mistralrs => {
+            if !cfg!(feature = "local-llm") {
+                return Err(Unselectable::AsResolved(
+                    LlmResolveError::MistralrsFeatureDisabled {
+                        name: provider_name.to_string(),
+                    },
+                ));
+            }
+            // The *backend* is a second gate: a row asking for `cuda` in a
+            // build without `--features cuda` is as unreachable as a mistralrs
+            // row without `local-llm`, and resolution rejects it a moment
+            // later. Selecting it anyway would strand a multi-candidate alias
+            // on a model that cannot run while a hosted candidate sat behind
+            // it. Delegated to the resolver's own parser so the device rules
+            // are stated once.
+            parse_mistralrs_device(model_name, model.device.as_deref())
+                .map(|_| ())
+                .map_err(Unselectable::AsResolved)
+        }
+        // `LlmProvider` is `#[non_exhaustive]`: a style this function has not
+        // been taught about is not selectable.
+        _ => Err(Unselectable::AsResolved(
+            LlmResolveError::UnsupportedProvider {
+                name: provider_name.to_string(),
+            },
+        )),
+    }
+}
+
+/// The first candidate this build could reach, or every candidate paired with
+/// why it was skipped.
+///
+/// Shared by the alias selector and `subagent::usable_model_names` so the
+/// *traversal* is common, not just the per-candidate predicate: a future
+/// selection rule cannot land in one and not the other.
+///
+/// Selection is deliberately blind to whether an endpoint is *up* -- building a
+/// remote client does no I/O, so this answers "am I configured for this" and
+/// not "is this working". Moving to another candidate when one fails mid-turn
+/// is a separate mechanism.
+pub(crate) fn first_selectable<'a>(
+    cfg: &Config,
+    candidates: &[&'a str],
+) -> std::result::Result<&'a str, Vec<(&'a str, Unselectable)>> {
+    // Deliberately not `with_capacity`: the common case returns on the first
+    // candidate, and this vector exists only to build a failure message.
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        match selectability(cfg, candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(reason) => tried.push((*candidate, reason)),
+        }
+    }
+    Err(tried)
+}
+
+/// [`first_selectable`] with the alias's name attached, rendering the failure
+/// as one line per candidate.
+///
+/// Only reached when there is a genuine choice to make -- a single-target alias
+/// resolves its one target directly, so this never turns a legible single-model
+/// error into a list of one. The per-candidate shape is for the case worth
+/// serving: three candidates failing for three different reasons, where one
+/// line costs the user an afternoon.
+fn select_candidate<'a>(cfg: &Config, alias: &str, candidates: &[&'a str]) -> Result<&'a str> {
+    first_selectable(cfg, candidates).map_err(|tried| {
+        let width = tried.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+        LlmResolveError::NoUsableAliasCandidate {
+            alias: alias.to_string(),
+            tried: tried
+                .iter()
+                .map(|(name, reason)| format!("  {name:width$} -- {reason}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+        .into()
+    })
 }
 
 /// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
@@ -287,18 +512,80 @@ pub fn resolve_agent_with_overrides(
             None => LlmResolveError::MissingModel,
         })?;
 
-    let model = cfg
+    let mut model_name = model_name;
+    let mut model = cfg
         .models
         .get(model_name)
         .ok_or_else(|| LlmResolveError::UnknownModel {
             name: model_name.to_string(),
         })?;
+    let mut alias_name = None;
+
+    // A model names either a provider that serves it or other models it stands
+    // for. Branching on the shape rather than on how many candidates an alias
+    // happens to flatten to is what keeps the no-alias path *textually* the
+    // code it has always been, rather than merely arguably equivalent to it.
+    //
+    // Read from the raw field rather than through `Model::source()`, which
+    // panics on a row that is both shapes or neither. This function promises
+    // above that it does not assume `cfg.validate()` ran, and a hand-built or
+    // mutated `Config` can reach it through the library API -- a promise of a
+    // `Result` has to be kept with a `Result`.
+    if model.alias.is_some() {
+        let candidates = cfg
+            .model_candidates(model_name)
+            .map_err(|e| CliError::Outrig(e.into()))?;
+
+        // `--device` selects hardware for one in-process model, and an alias
+        // may span several styles. Picking a device for whichever candidate
+        // happened to win is a silent surprise on a multi-GPU host. A
+        // single-target alias names exactly one model, so it is free to take
+        // the flag.
+        if candidates.len() > 1 && device_override.is_some() {
+            return Err(LlmResolveError::MistralrsDeviceOverrideAlias {
+                model: model_name.to_string(),
+                candidates: candidates.join(", "),
+            }
+            .into());
+        }
+
+        let concrete = match candidates.as_slice() {
+            // One candidate is renaming, not choosing. Resolve it exactly as if
+            // the user had typed it, rather than filtering it: that keeps every
+            // existing error with its own text *and its own remedy* -- an unset
+            // api key names the variable, and a mistralrs model in a default
+            // build still reports `MistralrsFeatureDisabled`, the one that says
+            // "rebuild with --features local-llm".
+            [only] => *only,
+            _ => select_candidate(cfg, model_name, &candidates)?,
+        };
+
+        alias_name = Some(model_name);
+        model_name = concrete;
+        // Infallible: every candidate is a key of `cfg.models` by construction
+        // -- `model_candidates` only ever yields names it found in the table.
+        model = &cfg.models[concrete];
+    }
+
+    // From here down the resolution is of one concrete row, exactly as it was
+    // before aliases existed.
+    let Some(provider_name) = model.provider.as_deref() else {
+        // A row that is neither shape. Validation rejects it on every load
+        // path, so this is reachable only through a `Config` built or mutated
+        // in code -- which is exactly the case the check above exists for. Say
+        // what is wrong rather than looking up the empty string and blaming a
+        // provider named "".
+        return Err(LlmResolveError::ModelHasNoProvider {
+            model: model_name.to_string(),
+        }
+        .into());
+    };
 
     let provider =
         cfg.providers
-            .get(&model.provider)
+            .get(provider_name)
             .ok_or_else(|| LlmResolveError::UnknownProvider {
-                name: model.provider.clone(),
+                name: provider_name.to_string(),
             })?;
 
     // `--device` selects hardware for an in-process model, so it is a
@@ -307,7 +594,7 @@ pub fn resolve_agent_with_overrides(
     if device_override.is_some() && !matches!(provider, LlmProvider::Mistralrs) {
         return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
             model: model_name.to_string(),
-            provider: model.provider.clone(),
+            provider: provider_name.to_string(),
         }
         .into());
     }
@@ -391,7 +678,7 @@ pub fn resolve_agent_with_overrides(
         // than guess at one.
         _ => {
             return Err(LlmResolveError::UnsupportedProvider {
-                name: model.provider.clone(),
+                name: provider_name.to_string(),
             }
             .into());
         }
@@ -399,9 +686,14 @@ pub fn resolve_agent_with_overrides(
 
     Ok(ResolvedAgent {
         agent_name: agent_name.map(str::to_string),
+        // The *concrete* row, never the alias. `LlmRegistry` is keyed on this
+        // (`llm/registry.rs`), so an alias name reaching it loads the same
+        // multi-gigabyte GGUF twice in one process. The name the caller asked
+        // for rides in `alias_name` instead.
         model_name: model_name.to_string(),
+        alias_name: alias_name.map(str::to_string),
         model_identifier,
-        provider_name: model.provider.clone(),
+        provider_name: provider_name.to_string(),
         provider: resolved_provider,
         model_weights,
         preamble: agent.preamble.clone(),
@@ -1844,5 +2136,35 @@ mod tests {
             "hello world\n",
             "the reply should still have been streamed exactly once"
         );
+    }
+
+    /// A model name resolved through an alias shows the hop it took. Static
+    /// selection is otherwise invisible: picking a candidate because of an
+    /// environment variable is exactly the kind of decision that stays hidden
+    /// until it is wrong, so every surface that prints a model prints this.
+    #[test]
+    fn model_display_shows_the_alias_hop() {
+        let resolved = ResolvedAgent {
+            alias_name: Some("opus".to_string()),
+            ..test_resolved_for_display()
+        };
+        assert_eq!(resolved.model_display(), "opus -> opus-5");
+    }
+
+    /// No alias, no arrow -- so the banner, the launch trace and the transcript
+    /// header all read exactly as they did before aliases existed.
+    #[test]
+    fn model_display_is_the_bare_name_for_a_direct_model() {
+        assert_eq!(test_resolved_for_display().model_display(), "opus-5");
+    }
+
+    /// The display helper only reads `model_name` and `alias_name`, so this
+    /// borrows the session fixture rather than spelling a fifth full
+    /// `ResolvedAgent` literal.
+    fn test_resolved_for_display() -> ResolvedAgent {
+        ResolvedAgent {
+            model_name: "opus-5".to_string(),
+            ..crate::subagent::fixtures::test_resolved(1)
+        }
     }
 }

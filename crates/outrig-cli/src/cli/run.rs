@@ -760,18 +760,24 @@ fn print_banner(banner: StartupBanner<'_>) {
         llm::ResolvedProvider::Mistralrs => "mistralrs",
     };
     let mut buf = String::new();
+    // Shows the `alias -> concrete` hop when the session resolved through one,
+    // and the bare name otherwise. Static selection is invisible by
+    // construction -- a user with two keys set gets the first-listed vendor and
+    // no other signal -- so printing the hop every time is the mitigation, not
+    // a decoration.
+    let model_label = resolved.model_display();
     // An agentless session has no agent name to print, so the banner leads
     // with the model.
     let _ = match &resolved.agent_name {
         Some(agent) => writeln!(
             buf,
             "[outrig] agent:             {} (model: {} / provider: {} / {})",
-            agent, resolved.model_name, provider_label, resolved.model_identifier
+            agent, model_label, provider_label, resolved.model_identifier
         ),
         None => writeln!(
             buf,
             "[outrig] model:             {} (provider: {} / {})",
-            resolved.model_name, provider_label, resolved.model_identifier
+            model_label, provider_label, resolved.model_identifier
         ),
     };
     let _ = writeln!(
@@ -885,6 +891,7 @@ mod tests {
         llm::ResolvedAgent {
             agent_name: Some("coding".to_string()),
             model_name: "fast".to_string(),
+            alias_name: None,
             model_identifier: "gpt-4o-mini".to_string(),
             provider_name: "local".to_string(),
             provider: llm::ResolvedProvider::Mistralrs,

@@ -176,7 +176,7 @@ srv = { command = ["bin", "arg1"] }
         // top-level value as well as the override above.
         assert_eq!(*anthropic_retry_budget, None);
 
-        assert_eq!(cfg.models["fast"].provider, "openai");
+        assert_eq!(cfg.models["fast"].provider.as_deref(), Some("openai"));
         assert_eq!(
             cfg.models["fast"].identifier.as_deref(),
             Some("gpt-4o-mini")
@@ -184,13 +184,13 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.models["fast"].max_tokens, None);
 
         let claude = &cfg.models["claude"];
-        assert_eq!(claude.provider, "anthropic");
+        assert_eq!(claude.provider.as_deref(), Some("anthropic"));
         assert_eq!(claude.identifier.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(claude.max_tokens, Some(16384));
 
         // mistralrs-side models carry weight fields and no identifier.
         let phi3 = &cfg.models["phi3-fast"];
-        assert_eq!(phi3.provider, "local");
+        assert_eq!(phi3.provider.as_deref(), Some("local"));
         assert_eq!(phi3.identifier, None);
         assert_eq!(
             phi3.model_id.as_deref(),
@@ -202,7 +202,7 @@ srv = { command = ["bin", "arg1"] }
         );
         assert_eq!(phi3.device.as_deref(), Some("cpu"));
         let llama = &cfg.models["llama-local"];
-        assert_eq!(llama.provider, "local");
+        assert_eq!(llama.provider.as_deref(), Some("local"));
         assert_eq!(llama.identifier, None);
         assert_eq!(
             llama.model_path.as_deref(),
@@ -212,6 +212,17 @@ srv = { command = ["bin", "arg1"] }
         );
         assert_eq!(llama.context_length, Some(4096));
         assert!(matches!(cfg.providers["local"], LlmProvider::Mistralrs));
+
+        // Alias rows carry no provider at all, and both spellings -- a bare
+        // string and an array -- normalize to the same `Vec`.
+        let opus = &cfg.models["opus"];
+        assert_eq!(opus.provider, None);
+        assert_eq!(opus.alias.as_deref(), Some(&["claude".to_string()][..]));
+        assert_eq!(
+            cfg.models["any-fast"].alias.as_deref(),
+            Some(&["fast".to_string(), "phi3-fast".to_string()][..])
+        );
+        assert_eq!(cfg.model_candidates("opus").expect("walks"), vec!["claude"]);
 
         let coding = &cfg.agents["coding"];
         assert_eq!(coding.model, None);

@@ -546,3 +546,233 @@ should confirm), or **Open** (deferred).
   sweep that makes field *additions* free.
 - `doc/concepts/llm-providers.md` -- the provider/model/agent layering and the mermaid diagram,
   both of which assume one provider edge per model.
+
+## Decisions
+
+1. **The resolver branches on the model's *shape*, not on how many candidates an alias
+   flattens to.** `resolve_agent_with_overrides` matches `model.source()`; the provider arm is
+   textually the code that was there before. This makes the acceptance criterion "a config
+   with no `alias` key behaves identically to today" true by construction rather than by an
+   argument about list length -- and the 34 pre-existing `llm_resolve.rs` tests passing
+   untouched is the evidence.
+
+2. **A single-target alias skips candidate selection entirely.** Discovered by a failing test,
+   not by design: selection had rejected `alias = "local"` in a build without `local-llm`,
+   replacing `MistralrsFeatureDisabled` -- the message that says *rebuild with --features
+   local-llm* -- with a "no usable candidate" list of one. An alias over one target is
+   renaming, not choosing, so it resolves its target exactly as if the user had typed it and
+   keeps that target's own error *and remedy*. Selection filters only where there is a real
+   choice. This is narrower than 0110's original rule and is what the acceptance criterion
+   "`--device` ... with a single-target mistralrs alias it applies" requires.
+
+3. **`ModelSourceRef` carries only the discriminant** -- `Provider { provider }` and
+   `Alias { targets }`, not the weight fields the task sketched. Every reader already holds
+   the `&Model` and reads those fields directly, so restating them would be published surface
+   with no consumer. Per-variant `#[non_exhaustive]`, as `ImageSourceRef` has, keeps adding
+   one additive.
+
+4. **The flattening walk is `Config::model_candidates`, public, returning
+   `ConfigValidationError`.** Public because both crates walk the graph and the task forbids
+   two implementations; returning the existing validation error rather than a new public type
+   because the three failures it reports (empty, dangling, cycle) *are* config-validity
+   statements. `From` does not chain, so the CLI call site spells
+   `.map_err(|e| CliError::Outrig(e.into()))` rather than widening `CliError`.
+
+5. **The shape and graph rules validate ungated**, outside the `validate_llm` block that
+   `outrig build` turns off, for two different reasons worth separating. `validate_model_source`
+   is a shape rule that establishes the invariant `Model::source` panics on -- and until
+   `provider` became optional, serde's own "missing field" enforced half of it on every path,
+   builds included. `model_candidates` is a cross-reference check, but one resolving entirely
+   within `[models]`: an alias target is another row, not a provider or a credential, so it
+   says nothing about whether this build can reach an LLM. A build therefore still accepts a
+   typo'd `provider` while rejecting a typo'd alias target. That looks inconsistent and is not.
+
+6. **`--device` over a multi-candidate alias gets its own error variant.** The task said to
+   reuse `MistralrsDeviceOverrideUnsupported`, but its message names the provider the model
+   uses, and an alias spanning candidates has no single provider -- the sentence would be
+   false. `LlmResolveError` is crate-private, so a variant is free. A *single-target* alias
+   still reuses the existing variant, where the message is true.
+
+7. **`usable_model_names` and the alias selector share both the predicate and the traversal.**
+   `selectability` answers "could this build reach this row", `first_selectable` walks a
+   candidate list with it. Sharing only the predicate would have let a future selection rule
+   land in one and not the other. The user-visible consequence is that a model whose api-key
+   variable is unset is no longer advertised in the subagent tool schema -- a behavior change
+   beyond aliases, and the right one: the function's own doc set the bar at "not a guaranteed
+   failure", and an absent key is on the guaranteed side.
+
+8. **`Unselectable` carries the resolver's own errors rather than restating them.** The first
+   draft re-authored four messages that already existed as `LlmResolveError` /`ApiKeyError`
+   variants, so the same misconfiguration would have read differently depending on whether the
+   user named the model directly or reached it through an alias -- precisely the drift the
+   shared predicate exists to prevent. Only "set but empty" is new text, because `ApiKeyError`
+   has no variant for it.
+
+9. **An empty api-key variable counts as unset for selection, and only for selection.**
+   `std::env::var` returns `Ok("")` for `FOO=`, so `ApiKeyRef::resolve` accepts it and the
+   request fails later at the endpoint. Making `resolve` reject empty values would move an
+   existing error path for direct model names, which is a separate decision. The two differ on
+   purpose, in the safe direction: under-advertise, never over-advertise.
+
+10. **`Model::alias` takes an `IntoIterator`.** `Model::alias(["opus-5"])` is marginally
+    noisier than the `alias = "opus-5"` it mirrors; a second constructor for the singular case
+    would be a second published method meaning the same thing.
+
+11. **`public-api.txt` took only this feature's lines.** A full regeneration also renders
+    `std::io::Error` as `core::io::Error` in six places -- a toolchain shift `plan/todo/README.md`
+    already identified as non-semantic and deliberately did not take. Folding it into a feature
+    commit would be unrelated churn.
+
+12. **`crates/outrig-cli/CHANGELOG.md` got an entry too.** The banner hop, the new resolve
+    errors, and the narrowed subagent schema are all user-visible from the binary, and only the
+    library changelog was in the task's deliverables.
+
+### Not done, and why
+
+- **The `local-llm`-gated end-to-end "one alias, one loaded engine" test** the plan sketched for
+  `llm_registry.rs`. The criterion is covered by composition instead:
+  `an_alias_and_its_target_resolve_to_the_same_registry_key` proves an alias and its target
+  produce the same `LlmRegistry` key (the one-line mistake with a several-gigabyte symptom),
+  and the pre-existing `two_subagents_on_one_local_model_share_one_engine` proves one key
+  yields one engine.
+- **Unifying `selectability` with `build_agent`'s own preconditions.** Design review's deepest
+  finding: `selectability` predicts two later stages (the api-key resolution here, the
+  `local-llm` check in `build_agent`) and nothing links them, so a precondition added to either
+  goes stale silently. The fix reshapes `build_agent`, which `plan/todo/0113` also rewrites.
+  Documented at the definition instead; worth folding into 0113.
+
+### Review follow-ups
+
+Seven defects found in review, all fixed on the same branch.
+
+13. **`SubagentContext` must not derive `Debug`.** A blanket `sed` over `#[derive(Clone)]`
+    intended for `ModelLabel` also hit `SubagentContext`, whose `local-llm`-only
+    `Arc<LlmRegistry>` field is not `Debug` -- so the default build compiled and the feature
+    build did not. The lesson is the editing method, not the type: a pattern-substitution
+    across a file cannot see which struct it lands on. The `local-llm` lane is now part of
+    verification, and reproducing the derive under it reproduces the exact `E0277`.
+
+14. **Selection has to check the device backend, not just the feature.** `selectability`
+    accepted any mistralrs row whenever `local-llm` was on, but a row asking for `cuda` in a
+    build without `--features cuda` is rejected by `parse_mistralrs_device` a moment later. A
+    multi-candidate alias therefore stranded itself on a model that could not run while a
+    hosted candidate sat behind it unused, and the subagent schema advertised it. Now
+    delegates to the resolver's own parser, so the device rules are stated once.
+
+15. **The traversal was exponential.** Deduplicating leaves is not enough -- a diamond
+    re-enters the shared *alias* node once per path reaching it, so `aN = [aN-1, aN-1]` costs
+    2^N visits: 26 rows is ~134 million calls on a valid config, walked on every load. An
+    `expanded` set makes it linear and changes no output, since re-expanding could only
+    re-emit names `flattened` already holds. Note the original plan specified this set and the
+    first implementation silently dropped it while keeping the comment that described it.
+    Guarded by a wall-clock test that hangs past 60s without the fix.
+
+16. **Recursion depth was config-controlled.** `on_path` bounds depth at `models.len()`, which
+    is not a bound -- a long enough chain aborts the process instead of reporting a bad
+    config. `MODEL_ALIAS_DEPTH_MAX` (32) plus a `ModelAliasTooDeep` variant makes it legible;
+    tests pin both sides of the boundary.
+
+17. **`alias_with_no_selectable_candidate_names_every_reason` was written for one build.** Its
+    third candidate is in-process, so under `local-llm` the alias resolves rather than
+    exhausting, and the unconditional `unwrap_err` would have failed that lane. Split by
+    feature: the exhaustion assertions where nothing is reachable, selection of the local
+    candidate where it is. The split is worth more than the fix -- the exhaustion message is
+    only interesting because the selector demonstrably would have taken a reachable candidate.
+
+18. **`init`'s global summary offered shapeless models.** Moving the missing-source check from
+    deserialization to validation meant `load_global_summary` (which parses without
+    validating) could surface a row with neither `provider` nor `alias`, and choosing it wrote
+    a repo `default-model` that the next validated load rejects. Filtered at the source.
+
+19. **The resolver called `Model::source()`, which panics.** Its own doc promises it does not
+    assume `validate()` ran, and a hand-built or mutated `Config` reaches it through the
+    library API -- so the defensive `ModelHasNoProvider` branch below was unreachable, because
+    the panic fired first. It now classifies from the raw fields. `Model::source()` keeps its
+    panic, which Design fork §7 chose deliberately; the rule is that callers promising
+    totality do not call it.
+
+### Second review round
+
+Six more findings, all fixed. Two were structural; four were contract gaps.
+
+20. **The walk was cubic across roots, and quadratic within one.** Two separate
+    costs. Within a root, `flattened.contains` is a linear scan per leaf, so `N` leaves
+    cost `N^2` comparisons -- the `emitted` set removed in a simplification pass was
+    load-bearing after all, and is back beside the output vector rather than instead of
+    it. Across roots, validation called `model_candidates` per row, re-flattening a
+    shared subtree once per name pointing at it. `Config::validate_model_alias_graph`
+    now walks the whole table once with `expanded` carried across roots, which is sound
+    because a node is recorded only after completing without error. Measured: 800 rows
+    over one shared alias went from ~1.1s to ~0.01s.
+
+21. **The depth bound depended on sibling order.** The `expanded` short-circuit ran
+    before the depth check, so a shared node already expanded via a short branch was
+    returned early without its depth being counted -- the same structure passed or
+    failed depending on the order its targets were written in. The check moved above the
+    short-circuit.
+
+    Worth recording how close this came to shipping unverified. The first test written
+    for it passed under mutation, because the chain was long enough to trip the bound on
+    its own in *both* orders; the second mutation attempt was a silent no-op, because the
+    patch asserted two code blocks existed individually and then replaced their
+    concatenation, which a comment between them prevented from matching. Only a probe
+    printing the actual error per ordering located the true boundary (a chain of exactly
+    `MODEL_ALIAS_DEPTH_MAX - 2`). **A mutation test that does not fail is not evidence
+    until the mutation is confirmed to have applied.**
+
+22. **The depth limit bounds recursion, not path length.** With memoization a subtree
+    reached through a shorter route is not re-entered, so a graph whose notional longest
+    path exceeds the limit can be accepted -- having never recursed that deep. That is
+    exactly the property that protects the stack, so the rustdoc now says this rather
+    than claiming something stronger.
+
+23. **A row that is both shapes resolved silently.** The resolver treated any row with
+    `alias` set as an alias, discarding a `provider` its author meant. The check went
+    into the walk rather than the resolver, which catches it for nested rows too, and
+    reuses `ModelSourceConflict` rather than adding a variant.
+
+24. **`init` still advertised broken alias rows.** The first fix filtered only shapeless
+    rows; empty, dangling, cyclic, over-deep, and both-shapes rows survived. Now filters
+    on the full contract -- exactly one shape, and a graph that flattens.
+
+25. **Two rustdoc contract errors.** `model_candidates` documented three errors and
+    returns five; the `provider` field's link to `alias` resolved to `Model::alias` the
+    constructor rather than the field (`field@` disambiguates).
+
+### Third review round
+
+Three findings. One was a real inconsistency the previous round's own note had
+waved through.
+
+26. **Cross-root memoization let an over-deep chain load and then fail at
+    resolve.** Round two documented "the depth limit bounds recursion, not path
+    length" as a benign consequence of memoizing. It was not benign. With
+    bottom-up lexical names (`a00 -> leaf`, `a01 -> a00`, ...) every suffix is
+    already expanded when its parent is walked, so validation never recursed
+    deep enough to notice a 33-hop chain -- `Config::validate` returned `Ok`
+    while `model_candidates("a32")` returned `ModelAliasTooDeep` on the *same
+    config*. A config that loads and then dies at resolve time is worse than one
+    that fails at load.
+
+    The fix is to memoize each node's subtree *height* rather than a bare
+    "seen", and check `depth + height` when re-entering. That makes the bound
+    exact and order-independent, so the two entry points agree. The lesson is
+    the first-round note, not the code: documenting a known divergence is not
+    the same as establishing it is harmless, and "bounds recursion, not path
+    length" quietly conceded a load-time/runtime split that nobody would want.
+
+27. **`init`'s filter was still weaker than validation.** The round-two fix
+    checked shape XOR plus a flattening graph, which still admitted an alias
+    carrying `identifier` / `max-tokens` / `device`, an alias onto a shapeless
+    leaf, and a `default-model` naming a row that had itself been filtered out.
+    Rather than re-deriving the rules a third time, the walk now enforces the
+    *whole* model contract -- shapeless leaves included -- so
+    `model_candidates(name).is_ok()` is the single question init asks, and a
+    default that does not survive it is dropped instead of inherited. This is
+    the third attempt at this filter; each earlier one re-stated a subset of the
+    rules instead of calling the one that owns them.
+
+28. **The nested conflict named two fields out of nine.** The walk hard-coded
+    `["alias", "provider"]` while the error contract promises every offending
+    key. Both sites now share `Model::provider_shape_fields`, which also
+    subsumes the `mistralrs_weight_fields` helper the first round extracted.

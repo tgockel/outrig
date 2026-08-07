@@ -168,10 +168,30 @@ fn load_global_summary(global_path: &Path) -> Result<GlobalSummary> {
         Err(e) => return Err(e).path_ctx("read", global_path).map_err(Into::into),
     };
     let cfg = Config::load_from_str(&text)?;
+    // Only rows a validated load would accept. `load_from_str` parses without
+    // validating, and since `provider` became optional a broken row survives
+    // parsing -- offering one as a choice would write a repo `default-model`
+    // that the next load rejects outright. `model_candidates` enforces the
+    // whole model contract, shape included: a row that is neither shape or
+    // that carries a provider-shape field alongside `alias` fails it, as does
+    // an empty, dangling, cyclic, or over-deep graph, and so does an alias
+    // whose target is itself malformed.
+    let models: Vec<String> = cfg
+        .models
+        .keys()
+        .filter(|name| cfg.model_candidates(name).is_ok())
+        .cloned()
+        .collect();
+    // A default naming a row that did not survive is worse than no default: it
+    // would be inherited silently and fail at the next load. Dropping it makes
+    // the prompt ask, which is the honest outcome.
+    let default_model = cfg
+        .default_model
+        .filter(|name| models.iter().any(|kept| kept == name));
     Ok(GlobalSummary {
         providers: cfg.providers,
-        models: cfg.models.keys().cloned().collect(),
-        default_model: cfg.default_model,
+        models,
+        default_model,
     })
 }
 
@@ -465,3 +485,98 @@ pub const DOC_SYNC_FIELDS: &[&Field] = &[
     &AGENT_MODEL_FIELD,
     &PREAMBLE_FIELD,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary_of(body: &str) -> GlobalSummary {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("write");
+        load_global_summary(&path).expect("parses")
+    }
+
+    /// `load_global_summary` parses without validating, so every model rule has
+    /// to be re-applied here or init offers a choice that writes a repo config
+    /// the next load rejects. The filter delegates to `model_candidates`, which
+    /// carries the whole contract -- shape included.
+    #[test]
+    fn only_models_a_validated_load_would_accept_are_offered() {
+        let summary = summary_of(
+            r#"
+[providers.p]
+style    = "openai"
+base-url = "https://example.invalid/v1"
+api-key  = "${OUTRIG_TEST_INIT_KEY}"
+
+[models.good]
+provider   = "p"
+identifier = "gpt-4o"
+
+[models.good-alias]
+alias = "good"
+
+# Every one of these parses and none of them loads.
+[models.shapeless]
+identifier = "gpt-4o"
+
+[models.alias-with-identifier]
+alias      = "good"
+identifier = "gpt-4o"
+
+[models.alias-with-max-tokens]
+alias      = "good"
+max-tokens = 4096
+
+[models.empty-alias]
+alias = []
+
+[models.dangling]
+alias = "ghost"
+
+[models.cycle-a]
+alias = "cycle-b"
+
+[models.cycle-b]
+alias = "cycle-a"
+
+[models.onto-shapeless]
+alias = "shapeless"
+"#,
+        );
+        assert_eq!(summary.models, vec!["good", "good-alias"]);
+    }
+
+    /// A default naming a row that did not survive would be inherited silently
+    /// and fail at the next load, so it is dropped rather than carried.
+    #[test]
+    fn a_default_model_that_did_not_survive_is_dropped() {
+        let kept = summary_of(
+            r#"
+default-model = "good"
+
+[providers.p]
+style    = "openai"
+base-url = "https://example.invalid/v1"
+api-key  = "${OUTRIG_TEST_INIT_KEY}"
+
+[models.good]
+provider   = "p"
+identifier = "gpt-4o"
+"#,
+        );
+        assert_eq!(kept.default_model.as_deref(), Some("good"));
+
+        let dropped = summary_of(
+            r#"
+default-model = "broken"
+
+[models.broken]
+alias = "ghost"
+"#,
+        );
+        assert_eq!(dropped.default_model, None);
+        assert!(dropped.models.is_empty());
+    }
+}

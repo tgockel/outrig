@@ -32,10 +32,20 @@ makes field and variant *additions* free, so what is left are field *type* chang
 sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
 qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
 
-- **0110 [model-aliases](0110-model-aliases.md)** -- `Model::provider` becomes `Option<String>`,
-  a field *type* change the sweep does not cover.
 - **0111 [provider-construction-options-struct](0111-provider-construction-options-struct.md)** --
   `LlmProvider::openai` / `::anthropic` take their fields positionally, and Rust cannot overload.
+
+0110 landed, taking the last of the seven field *type* changes: `Model::provider` is now
+`Option<String>`, because a model entry names either a provider or an `alias` over other models.
+`Model` follows `ImageConfig`'s two-shapes-one-table pattern exactly -- every field `Option`,
+exactly-one-shape enforced by validation, and a discriminated `Model::source()` as the way readers
+ask which shape they got. Two calls are worth carrying forward. Its shape and alias-graph rules
+validate *ungated*, unlike every other model rule, because they establish an invariant rather than
+resolve a cross-reference -- so `outrig build` now rejects a typo'd alias target while still
+accepting a typo'd `provider`, which reads as inconsistent and is not. And a single-target alias
+skips candidate selection entirely: filtering it replaced `MistralrsFeatureDisabled`, the message
+carrying the *rebuild with `--features local-llm`* remedy, with a "no usable candidate" list of
+one. Selection filters only where there is a genuine choice.
 
 0112-0113 are the queue's first **post-freeze** tail, and are here despite failing the gate above
 rather than because they pass it. Both are additive: they live entirely in `outrig-cli`, whose

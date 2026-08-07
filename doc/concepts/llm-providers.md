@@ -5,7 +5,8 @@ the LLM stack in three layers so the same providers and models can be reused acr
 without copy-pasting:
 
 - **Provider** -- where to talk to (`base-url`, `api-key`, wire format).
-- **Model** -- a named identifier living on one provider (e.g. `gpt-4o-mini` on `openai`).
+- **Model** -- either a named identifier living on one provider (e.g. `gpt-4o-mini` on
+  `openai`), or an **alias** naming one or more other models.
 - **Agent** -- a runnable unit: model + system preamble (+ optional default image).
 
 Most users keep providers and models in the **global** config (`~/.outrig/config.toml`) since
@@ -19,6 +20,7 @@ flowchart LR
         prov["[providers.openai]<br/>base-url<br/>api-key"]
         m1["[models.fast]<br/>identifier=gpt-4o-mini"]
         m2["[models.smart]<br/>identifier=gpt-4o"]
+        al["[models.cheap]<br/>alias=[fast, smart]"]
     end
     subgraph repo[".agents/outrig/config.toml"]
         a1["[agents.coding]<br/>preamble"]
@@ -28,6 +30,8 @@ flowchart LR
     user --> prov
     m1 --> prov
     m2 --> prov
+    al -. "1st" .-> m1
+    al -. "2nd" .-> m2
     a1 --> m1
     a2 --> m2
     a1 -. "image" .-> cont
@@ -59,7 +63,8 @@ one per OpenAI-compatible aggregator. Names you pick (e.g. `openai`, `local-olla
 
 ## `[models.<name>]`
 
-A model picks a specific identifier on a specific provider.
+A model entry does one of two things: it picks a specific identifier on a specific provider, or
+it aliases one or more other models.
 
 ```toml
 [models.fast]
@@ -77,6 +82,51 @@ whatever string the provider expects in its API request's `model` field.
 The model layer exists so that agents can refer to a stable name (`fast`, `smart`) and swap the
 underlying API model without touching every agent. If OpenAI renames a model, you edit one
 identifier; every agent using that name picks up the change.
+
+### Aliases
+
+That hop is spent on the wire identifier, which leaves two things it cannot express: a name for a
+*name*, and a name for a *set of equivalents*. An `alias` entry covers both.
+
+```toml
+# A name for a name. `opus-5` stays pinned for reproducing a result while
+# `opus` floats to whatever you consider current.
+[models.opus]
+alias = "opus-5"
+
+# A name for a set of equivalents: the same weights sold by three vendors,
+# in preference order.
+[models.smart]
+alias = ["opus-5-bedrock", "opus-5-anthropic", "opus-5-azure"]
+```
+
+An alias is a model. It sits in the same table, and anything that takes a model name takes it:
+`--model`, `default-model`, `[agents.<name>].model`, and a subagent's `model` argument. Aliases
+may name aliases; the graph flattens depth-first in config order, keeping the first occurrence of
+a repeated name. A cycle is rejected when the config loads.
+
+An entry sets `alias` **or** the provider-shape fields, never both. See
+[Reference -> config](../reference/config.md) for the full rules.
+
+#### Which candidate gets picked
+
+When an alias names several models, outrig picks the first one **this build can actually reach**:
+its provider is defined, its style is one the binary has a client for, and its `api-key` variable
+is set and non-empty. The choice is made once, when the session starts, and the banner prints the
+hop it took:
+
+```text
+[outrig] agent:             coding (model: smart -> opus-5-anthropic / provider: anthropic / ...)
+```
+
+That is what lets one committed config serve a laptop with `ANTHROPIC_API_KEY` set and a CI runner
+holding a Bedrock role, without editing `default-model` per machine or keeping divergent configs.
+
+Be clear about what this does *not* do. Building a remote client performs no network I/O, so
+selection answers **"am I configured for this"** and not **"is this endpoint up"**. An alias does
+not move to another vendor when the first one rate-limits or goes down mid-session -- that turn
+still ends the way [Transient failures](#transient-failures) describes. If every candidate is
+unreachable, the session fails at startup naming each one and why it was skipped.
 
 ## `[agents.<name>]`
 

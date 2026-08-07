@@ -6,7 +6,7 @@ mod env_value;
 mod merge;
 mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -77,6 +77,43 @@ pub const SUBAGENT_DEPTH_MAX_CEILING: u32 = 16;
 pub const DEFAULT_SUBAGENT_WIDTH_MAX: u32 = 8;
 /// Upper bound accepted for `subagent-width-max`, keeping fan-out finite.
 pub const SUBAGENT_WIDTH_MAX_CEILING: u32 = 16;
+
+/// Scratch state for [`Config::model_candidates`]' depth-first walk.
+///
+/// Four collections rather than one, because they answer four different
+/// questions and two of them are load-bearing for complexity:
+///
+/// - `flattened` is the ordered result.
+/// - `emitted` is its membership index. `flattened.contains` would be a linear
+///   scan per leaf, so `N` leaves cost `N^2` comparisons -- and validation
+///   walks once per root, making an ordinary "many names, one shared alias"
+///   config cubic.
+/// - `expanded` maps an alias node already fully walked to its subtree height.
+///   Without it a diamond re-enters a shared node once per path reaching it, so
+///   `aN = [aN-1, aN-1]` costs `2^N` visits -- around 134 million for 26 rows,
+///   on a valid config walked at every load. Skipping one changes no output:
+///   re-expanding could only re-emit names `emitted` already holds. The height
+///   is kept so the depth bound survives the skip -- see `walk_model_alias`.
+/// - `on_path` is the current path, for cycle detection and the depth bound.
+///   Distinct from `expanded`: `alias = ["b", "b"]` is a repeat, while
+///   `a -> b -> a` is a cycle, and only the path distinguishes them.
+#[derive(Default)]
+struct AliasWalk<'a> {
+    flattened: Vec<&'a str>,
+    emitted: BTreeSet<&'a str>,
+    expanded: BTreeMap<&'a str, usize>,
+    on_path: Vec<&'a str>,
+}
+
+/// How many `[models.<name>].alias` hops one name may take before
+/// [`Config::model_candidates`] gives up.
+///
+/// Bounds the traversal's recursion against the config rather than against the
+/// stack: without it, depth is limited only by the number of model entries, and
+/// a long enough chain aborts the process instead of reporting a bad config.
+/// Well above anything an alias graph plausibly needs -- a chain this deep is a
+/// mistake, and saying so beats crashing.
+pub const MODEL_ALIAS_DEPTH_MAX: usize = 32;
 
 /// How long one LLM HTTP call may keep retrying transient failures before the
 /// turn gives up. Ten minutes: long enough to ride out a provider-side
@@ -353,6 +390,202 @@ impl Config {
         Ok(())
     }
 
+    /// Flatten `name`'s alias graph to the ordered list of provider-shape model
+    /// names it stands for.
+    ///
+    /// A name that is not an alias flattens to itself, so every caller can walk
+    /// unconditionally. A name that is not in `[models.<name>]` at all flattens
+    /// to nothing: reporting an undefined *root* belongs to the caller, which
+    /// has better words for it than this function does, and both in-tree
+    /// callers look the name up before walking it.
+    ///
+    /// The walk is depth-first in config order, splicing a nested alias's
+    /// targets in at its position and keeping the first occurrence of a
+    /// repeated name. Order is the config's, so the result is stable across
+    /// runs -- which matters because it reaches the subagent tool schema, and
+    /// an unstable schema churns the parent agent's context for nothing.
+    ///
+    /// Public because both crates walk this graph: `validate` checks it, and
+    /// the CLI's resolver selects from it. Two implementations that had to
+    /// agree on ordering and on cycle handling would be two chances to
+    /// disagree.
+    ///
+    /// This is the whole `[models.<name>]` contract, not just the graph half,
+    /// so `model_candidates(name).is_ok()` is a complete answer to "would a
+    /// validated load accept this row". Six errors: [`ModelSourceMissing`] for
+    /// a row that is neither shape (including a leaf reached through an alias),
+    /// [`ModelSourceConflict`] naming every provider-shape field set alongside
+    /// `alias`, [`ModelAliasEmpty`], an [`UnknownModelAliasTarget`], a
+    /// [`ModelAliasCycle`], and [`ModelAliasTooDeep`] once a path reaches
+    /// [`MODEL_ALIAS_DEPTH_MAX`] hops.
+    ///
+    /// Validation surfaces all six from the file that has them, and reaches the
+    /// same verdict this does on the same config -- but the walk detects them
+    /// itself regardless: it must not hang, overflow, or panic on a `Config`
+    /// built by hand in a test or by a library embedder, neither of which goes
+    /// through [`validate`](Self::validate).
+    ///
+    /// [`ModelSourceMissing`]: crate::config::ConfigValidationError::ModelSourceMissing
+    /// [`ModelSourceConflict`]: crate::config::ConfigValidationError::ModelSourceConflict
+    /// [`ModelAliasTooDeep`]: crate::config::ConfigValidationError::ModelAliasTooDeep
+    ///
+    /// [`ModelAliasEmpty`]: crate::config::ConfigValidationError::ModelAliasEmpty
+    /// [`UnknownModelAliasTarget`]: crate::config::ConfigValidationError::UnknownModelAliasTarget
+    /// [`ModelAliasCycle`]: crate::config::ConfigValidationError::ModelAliasCycle
+    pub fn model_candidates<'a>(
+        &'a self,
+        name: &str,
+    ) -> std::result::Result<Vec<&'a str>, ConfigValidationError> {
+        let mut walk = AliasWalk::default();
+        self.walk_model_alias(name, &mut walk)?;
+        Ok(walk.flattened)
+    }
+
+    /// Check every `[models.<name>]` alias graph rule across the whole table.
+    ///
+    /// One pass rather than one [`model_candidates`](Self::model_candidates)
+    /// call per row: `expanded` carries across roots, so a subtree shared by
+    /// many names is walked once. Sound because every rule the walk enforces is
+    /// a property of the subtree alone -- a node lands in `expanded` only after
+    /// completing without error, so nothing reachable from it can still fail.
+    /// Re-flattening per root instead is cubic on a shape as ordinary as `N`
+    /// names pointing at one shared alias over `N` leaves.
+    pub(crate) fn validate_model_alias_graph(
+        &self,
+    ) -> std::result::Result<(), ConfigValidationError> {
+        let mut walk = AliasWalk::default();
+        for name in self.models.keys() {
+            // Per-root state; `expanded` is deliberately the one thing kept.
+            walk.flattened.clear();
+            walk.emitted.clear();
+            walk.on_path.clear();
+            self.walk_model_alias(name, &mut walk)?;
+        }
+        Ok(())
+    }
+
+    /// One node of [`model_candidates`](Self::model_candidates)' depth-first
+    /// walk.
+    ///
+    /// Reads the shape fields directly rather than going through
+    /// [`Model::source`], which panics on a row that sets both shapes or
+    /// neither. This walk has to stay total on exactly that input, so it
+    /// enforces the same shape contract `validate` does and returns an error
+    /// where `source` would abort.
+    ///
+    /// Returns `Some(height)` for an alias row -- how much deeper than itself
+    /// its subtree reaches, in alias hops -- and `None` for a leaf. The height
+    /// is what makes the depth bound independent of walk order: a memoized node
+    /// re-entered from a longer path is checked against `depth + height`, so
+    /// `validate` (which shares `expanded` across roots) and a fresh
+    /// [`model_candidates`](Self::model_candidates) reach the same verdict on
+    /// the same config. Without it, a bottom-up name ordering expands every
+    /// suffix before its parent, and a chain past the limit validates cleanly
+    /// only to fail later at resolve time.
+    fn walk_model_alias<'a>(
+        &'a self,
+        name: &str,
+        walk: &mut AliasWalk<'a>,
+    ) -> std::result::Result<Option<usize>, ConfigValidationError> {
+        // Borrow the key rather than the caller's `name`, so everything the
+        // walk accumulates lives as long as `self`. Only the root can be
+        // absent -- every target is checked against the table before it is
+        // recursed into -- and an absent root contributes nothing.
+        let Some((key, model)) = self.models.get_key_value(name) else {
+            return Ok(None);
+        };
+        let key: &'a str = key.as_str();
+
+        let Some(targets) = model.alias.as_deref() else {
+            // A leaf still has to name a provider; a row that is neither shape
+            // is what `Model::source` panics on, and callers that filter on
+            // this walk are entitled to have it rejected rather than emitted.
+            if model.provider.is_none() {
+                return Err(ConfigValidationError::ModelSourceMissing {
+                    model: key.to_string(),
+                });
+            }
+            if walk.emitted.insert(key) {
+                walk.flattened.push(key);
+            }
+            return Ok(None);
+        };
+
+        // An alias carrying any provider-shape field. Validation rejects it
+        // before the resolver ever walks, so this is the hand-built case --
+        // and silently treating it as an alias would discard fields the author
+        // meant. The list is the shared collector, so the message names every
+        // offender rather than the first two.
+        let conflicts = model.provider_shape_fields();
+        if !conflicts.is_empty() {
+            let mut fields = vec!["alias"];
+            fields.extend(conflicts);
+            return Err(ConfigValidationError::ModelSourceConflict {
+                model: key.to_string(),
+                fields,
+            });
+        }
+
+        if targets.is_empty() {
+            return Err(ConfigValidationError::ModelAliasEmpty {
+                model: key.to_string(),
+            });
+        }
+
+        let depth = walk.on_path.len();
+        let too_deep = || ConfigValidationError::ModelAliasTooDeep {
+            model: key.to_string(),
+            max: MODEL_ALIAS_DEPTH_MAX,
+        };
+        if depth >= MODEL_ALIAS_DEPTH_MAX {
+            return Err(too_deep());
+        }
+
+        // Already walked to completion through some other path, so its leaves
+        // are in `flattened` already and in the right places. Its *height* is
+        // still checked against this path: arriving somewhere shallow first
+        // must not license a longer route to the same subtree.
+        if let Some(&height) = walk.expanded.get(&key) {
+            if depth + height >= MODEL_ALIAS_DEPTH_MAX {
+                return Err(too_deep());
+            }
+            return Ok(Some(height));
+        }
+
+        let mut height = 0;
+        walk.on_path.push(key);
+        for target in targets {
+            if !self.models.contains_key(target.as_str()) {
+                return Err(ConfigValidationError::UnknownModelAliasTarget {
+                    model: key.to_string(),
+                    target: target.clone(),
+                });
+            }
+            // A cycle is a name already *on the current path*, not one already
+            // emitted: `alias = ["b", "b"]` is a repeat, which the `emitted`
+            // set collapses, while `a -> b -> a` is a cycle. Using `emitted`
+            // for both would call the first one an error.
+            if let Some(start) = walk
+                .on_path
+                .iter()
+                .position(|seen| *seen == target.as_str())
+            {
+                let mut cycle: Vec<&str> = walk.on_path[start..].to_vec();
+                cycle.push(walk.on_path[start]);
+                return Err(ConfigValidationError::ModelAliasCycle {
+                    cycle: cycle.join(" -> "),
+                });
+            }
+            // Only an alias target adds a hop; a leaf ends the path here.
+            if let Some(child) = self.walk_model_alias(target, walk)? {
+                height = height.max(child + 1);
+            }
+        }
+        walk.on_path.pop();
+        walk.expanded.insert(key, height);
+        Ok(Some(height))
+    }
+
     /// Validate `[workspace.mounts]` -- including any appended at runtime, e.g.
     /// from `--volume` -- without re-running LLM/image checks: container paths
     /// absolute, not `/`, unique (against each other and the primary workspace
@@ -528,7 +761,24 @@ impl LlmProvider {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct Model {
-    pub provider: String,
+    /// The `[providers.<name>]` entry serving this model. Mutually exclusive
+    /// with [`alias`](field@Self::alias): a row names a provider *or* other models,
+    /// never both. `Option` for that reason rather than because a model may
+    /// legitimately have neither -- validation rejects a row with neither, and
+    /// [`source`](Self::source) panics on one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Other models this name stands for, in preference order. One name for one
+    /// model (`alias = "opus-5"`) or one name for a set of provider-equivalent
+    /// rows (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`); both spellings
+    /// deserialize here. Mutually exclusive with every provider-shape field
+    /// above and below, including `max-tokens`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string_or_vec_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub alias: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -558,10 +808,41 @@ pub struct Model {
 impl Model {
     /// A model served by the `[providers.<provider>]` entry of that name.
     /// Every other field is optional and stays unset; assign the ones the
-    /// provider needs.
+    /// provider needs. The counterpart of [`ModelSourceRef::Provider`].
     pub fn new(provider: impl Into<String>) -> Self {
         Self {
-            provider: provider.into(),
+            provider: Some(provider.into()),
+            ..Self::sourceless()
+        }
+    }
+
+    /// A name standing for one or more other models, in preference order. The
+    /// counterpart of [`ModelSourceRef::Alias`].
+    ///
+    /// Takes an iterator rather than offering a second single-target
+    /// constructor: `Model::alias(["opus-5"])` is marginally noisier than the
+    /// `alias = "opus-5"` it mirrors, which is cheaper than a second published
+    /// method meaning the same thing.
+    pub fn alias<I, S>(targets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            alias: Some(targets.into_iter().map(Into::into).collect()),
+            ..Self::sourceless()
+        }
+    }
+
+    /// Every field at its serde default, which means *neither* source shape is
+    /// set. Deliberately private, and deliberately not a `Default` impl, for
+    /// the reason [`ImageConfig::sourceless`] gives: it is the state
+    /// [`source`](Self::source) panics on, so it is a base for the two
+    /// constructors above rather than a value worth handing out.
+    fn sourceless() -> Self {
+        Self {
+            provider: None,
+            alias: None,
             identifier: None,
             model_id: None,
             model_path: None,
@@ -572,6 +853,77 @@ impl Model {
             max_tokens: None,
         }
     }
+
+    /// Every field that only a `style = "mistralrs"` model may carry, paired
+    /// with whether this row sets it.
+    ///
+    /// One list, three readers: a remote model rejects all of them, an alias
+    /// rejects them along with the rest of the provider shape, and the alias
+    /// walk reports them. Adding a weight field to only one of the three would
+    /// leave the others silently permitting it.
+    pub(crate) fn mistralrs_weight_fields(&self) -> [(bool, &'static str); 6] {
+        [
+            (self.model_id.is_some(), "model-id"),
+            (self.model_path.is_some(), "model-path"),
+            (self.model_file.is_some(), "model-file"),
+            (self.revision.is_some(), "revision"),
+            (self.context_length.is_some(), "context-length"),
+            (self.device.is_some(), "device"),
+        ]
+    }
+
+    /// Every provider-shape field this row actually sets, in declaration order.
+    ///
+    /// Empty for a well-formed alias, which is what makes it the conflict list:
+    /// anything here alongside `alias` is a contradiction, `max-tokens`
+    /// included.
+    pub(crate) fn provider_shape_fields(&self) -> Vec<&'static str> {
+        [
+            (self.provider.is_some(), "provider"),
+            (self.identifier.is_some(), "identifier"),
+        ]
+        .into_iter()
+        .chain(self.mistralrs_weight_fields())
+        .chain([(self.max_tokens.is_some(), "max-tokens")])
+        .filter(|(present, _)| *present)
+        .map(|(_, field)| field)
+        .collect()
+    }
+
+    /// Return the discriminated source variant. Panics if validation has not
+    /// run (i.e. both or neither shape is set). Every real call path goes
+    /// through [`Config::load`], which validates -- and unlike the rest of the
+    /// model rules, the shape check is not gated on `validate-llm`, so
+    /// `outrig build` establishes this invariant too.
+    ///
+    /// Callers that must stay total on a hand-built `Config` -- the alias walk
+    /// and the resolver's selectability check -- read the fields directly
+    /// instead.
+    pub fn source(&self) -> ModelSourceRef<'_> {
+        match (&self.provider, &self.alias) {
+            (Some(provider), None) => ModelSourceRef::Provider { provider },
+            (None, Some(targets)) => ModelSourceRef::Alias { targets },
+            _ => panic!(
+                "Model::source() called on an unvalidated config; \
+                 call Config::validate() first"
+            ),
+        }
+    }
+}
+
+/// Discriminated view of what a `[models.<name>]` row names -- a provider that
+/// serves it, or other models it stands for. Returned by [`Model::source`].
+///
+/// Deliberately carries only the discriminant: every reader already holds the
+/// `&Model` and reads the weight fields (`identifier`, `model-id`, `device`,
+/// ...) off it directly, so restating them here would be surface with no
+/// consumer. The per-variant `#[non_exhaustive]` keeps adding one additive.
+#[non_exhaustive]
+pub enum ModelSourceRef<'a> {
+    #[non_exhaustive]
+    Provider { provider: &'a str },
+    #[non_exhaustive]
+    Alias { targets: &'a [String] },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1838,11 +2190,18 @@ impl McpServerSpec {
     }
 }
 
-/// Accepts `model-file = "x.gguf"` *or* `model-file = ["a.gguf", "b.gguf"]`
-/// during deserialization, normalizing to `Vec<String>`. The single-string
-/// form keeps configs from before this field went multi (split-quantization
-/// shards) parsing without a hand edit; the array form is what the init
-/// flow writes today.
+/// Accepts a bare string *or* an array of them during deserialization,
+/// normalizing to `Vec<String>`. Two fields use it:
+///
+/// - `model-file`, where the single-string form keeps configs from before the
+///   field went multi (split-quantization shards) parsing without a hand edit,
+///   and the array form is what the init flow writes today.
+/// - `alias`, where the two forms are the two cases the feature exists for:
+///   one name for one model, and one name for a set of equivalents.
+///
+/// Both re-serialize as an array, so a round-trip rewrites `alias = "opus-5"`
+/// as `alias = ["opus-5"]`. The parsed configs compare equal, which is what
+/// the round-trip tests assert.
 fn deserialize_string_or_vec_string<'de, D>(
     d: D,
 ) -> std::result::Result<Option<Vec<String>>, D::Error>

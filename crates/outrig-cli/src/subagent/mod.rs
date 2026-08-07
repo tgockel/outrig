@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures_util::future::select_all;
-use outrig::config::{Config, LlmProvider};
+use outrig::config::Config;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -55,6 +55,11 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything needed to build a subagent's agent loop, cloned from the
 /// session. Held by the registry so a launch needs only a name and a prompt.
+///
+/// Deliberately not `Debug`: under `local-llm` this carries an
+/// `Arc<LlmRegistry>` holding loaded mistralrs engines, which are not `Debug`
+/// themselves, so a derive here compiles in a default build and breaks the
+/// feature build.
 #[derive(Clone)]
 pub struct SubagentContext {
     /// The session's resolved agent. A subagent reuses its limits and sampling;
@@ -163,13 +168,19 @@ impl SubagentRegistry {
     /// Launch a subagent under `name`, running `prompt` as its first round.
     /// `model` names a `[models.<name>]` to run it under; `None` inherits the
     /// launching agent's.
+    ///
+    /// Returns the [`ModelLabel`] the launch resolved to, `Some` on exactly the
+    /// condition the transcript header is written -- the caller named a model.
+    /// Handing the label back rather than letting the tool re-derive it from
+    /// its own argument is what lets an alias show the hop it took, and is what
+    /// makes `ModelLabel`'s claim to carry all three surfaces true.
     pub async fn launch(
         &self,
         name: &str,
         model: Option<&str>,
         preamble: Option<String>,
         prompt: String,
-    ) -> Result<(), String> {
+    ) -> Result<Option<ModelLabel>, String> {
         validate_name(name)?;
         // Resolved before the entries lock, and before anything is registered:
         // a bad model name costs one tool call and leaves the handle free for a
@@ -181,6 +192,10 @@ impl SubagentRegistry {
         // parent's: an inherited launch must read exactly as it did before, and
         // an agent that names its own model asked and wants confirmation.
         let label = model.map(|_| ModelLabel::of(&resolved));
+        // The same value the transcript header is written from, so the trace
+        // and the header cannot disagree about which model ran. Cloned because
+        // `label` moves into the round loop below.
+        let launched_as = label.clone();
         {
             let entries = self.lock();
             if entries.contains_key(name) {
@@ -260,7 +275,7 @@ impl SubagentRegistry {
                 child,
             },
         );
-        Ok(())
+        Ok(launched_as)
     }
 
     /// Deliver a prompt whether the subagent is idle or running. Idle starts a
@@ -545,33 +560,36 @@ impl Spawned {
 /// `BTreeMap` order -- so both the tool schema's `enum` and the unknown-model
 /// message are sorted and byte-stable across launches.
 ///
-/// A name is kept only when resolution would not reject it out of hand: the
-/// three exclusions mirror the resolver's own `UnknownProvider`,
-/// `UnsupportedProvider` and `MistralrsFeatureDisabled` failures. Membership
-/// does not prove a model *works* -- credentials may be wrong, an endpoint may
-/// be down, a GGUF path may not exist -- only that it is not a guaranteed
-/// failure, which is the right bar for something advertised to the model.
+/// A name is kept only when resolution would not reject it out of hand, which
+/// is [`crate::llm::selectability`]'s question -- the same predicate the
+/// resolver selects alias candidates with, so the set advertised here and the
+/// set a launch can actually reach cannot drift.
 ///
-/// Pure inspection of `Config`: no registry touch, no weight load, no client
-/// construction, so the synchronous schema-building path can call it.
+/// An **alias** is usable when *any* of its candidates is. That falls out well:
+/// `alias = ["opus-local", "opus-anthropic"]` stays offerable in a build
+/// without `local-llm`, where naming `opus-local` directly would not be.
+///
+/// Membership still does not prove a model *works* -- a key may be wrong, an
+/// endpoint may be down, a GGUF path may not exist -- only that it is not a
+/// guaranteed failure, which is the right bar for something advertised to the
+/// model. An *unset* api-key variable is on the guaranteed side of that line,
+/// since the resolver fails the session on it eagerly, so it excludes a name
+/// here too.
+///
+/// Pure inspection of `Config` plus the environment: no registry touch, no
+/// weight load, no client construction, so the synchronous schema-building
+/// path can call it.
 pub(crate) fn usable_model_names(cfg: &Config) -> Vec<String> {
     cfg.models
-        .iter()
-        .filter(|(_, model)| {
-            cfg.providers
-                .get(&model.provider)
-                .is_some_and(|provider| match provider {
-                    LlmProvider::OpenAi { .. } | LlmProvider::Anthropic { .. } => true,
-                    // A compile-time decision, not a runtime one. `cfg!` keeps
-                    // one body compiling in both builds, so the two cannot
-                    // drift apart.
-                    LlmProvider::Mistralrs => cfg!(feature = "local-llm"),
-                    // `LlmProvider` is `#[non_exhaustive]`: a style this
-                    // function has not been taught about is not advertised.
-                    _ => false,
-                })
+        .keys()
+        .filter(|name| {
+            // A walk error means the alias graph is malformed, which is not
+            // something to advertise. `usable_model_names` is infallible by
+            // contract, so an uncheckable name is simply not offered.
+            cfg.model_candidates(name)
+                .is_ok_and(|candidates| crate::llm::first_selectable(cfg, &candidates).is_ok())
         })
-        .map(|(name, _)| name.clone())
+        .cloned()
         .collect()
 }
 
@@ -582,6 +600,10 @@ pub(crate) fn usable_model_names(cfg: &Config) -> Vec<String> {
 /// `None` wherever the launch inherited the parent's model, which is what keeps
 /// the default path byte-for-byte -- and byte-free in the transcript -- as it
 /// was before this argument existed.
+///
+/// Display-only. `name` holds the rendered `alias -> concrete` hop when one was
+/// taken, so it is not a key anything can be looked up by.
+#[derive(Clone, Debug)]
 pub(crate) struct ModelLabel {
     name: String,
     provider: String,
@@ -591,10 +613,20 @@ pub(crate) struct ModelLabel {
 impl ModelLabel {
     fn of(resolved: &ResolvedAgent) -> Self {
         Self {
-            name: resolved.model_name.clone(),
+            // `model_display`, not `model_name`: a launch under an alias shows
+            // the hop it took. Identical to `model_name` for a direct name, so
+            // the pre-alias output is unchanged byte for byte.
+            name: resolved.model_display(),
             provider: resolved.provider_name.clone(),
             identifier: resolved.model_identifier.clone(),
         }
+    }
+
+    /// The model as the launch trace and the tool result name it -- the first
+    /// slot of [`detail`](Self::detail), without the provider and identifier
+    /// those two surfaces have never carried.
+    pub(crate) fn display_name(&self) -> &str {
+        &self.name
     }
 
     /// The transcript header's parenthesized detail: the name the agent asked
@@ -983,6 +1015,29 @@ pub(crate) mod fixtures {
         cfg
     }
 
+    /// [`test_config`] plus `cheap`, an alias onto `fast`.
+    ///
+    /// A separate fixture rather than a third model on `test_config`, because
+    /// the schema-enum test pins that config's `enum` positionally -- adding a
+    /// name there would break the byte-stability assertion it exists to make.
+    pub(crate) fn alias_config() -> Config {
+        let mut cfg = test_config();
+        cfg.models
+            .insert("cheap".to_string(), Model::alias(["fast"]));
+        cfg
+    }
+
+    /// An alias spanning an in-process candidate and a hosted one, in that
+    /// order. Usable in *both* builds: with `local-llm` the first candidate
+    /// wins, and without it the alias falls through to the hosted one -- which
+    /// is the case naming `onprem` directly cannot express.
+    pub(crate) fn mixed_alias_config() -> Config {
+        let mut cfg = local_model_config();
+        cfg.models
+            .insert("either".to_string(), Model::alias(["onprem", "fast"]));
+        cfg
+    }
+
     /// [`test_config`] plus an in-process model, `onprem`. Usable only in a
     /// `local-llm` build, which is exactly what makes it useful in both: one
     /// build resolves it, the other must refuse it with the feature-disabled
@@ -1010,6 +1065,7 @@ pub(crate) mod fixtures {
         ResolvedAgent {
             agent_name: Some("primary".to_string()),
             model_name: "smart".to_string(),
+            alias_name: None,
             model_identifier: "gpt-4o".to_string(),
             provider_name: "openai".to_string(),
             provider: ResolvedProvider::OpenAi {
@@ -2158,6 +2214,85 @@ mod tests {
         assert!(
             !text.contains("model:"),
             "an inherited launch must add no header bytes: {text}"
+        );
+    }
+
+    /// The same header, launched under an alias: the first slot shows the hop,
+    /// while the provider and identifier still describe the row that ran.
+    #[tokio::test(start_paused = true)]
+    async fn the_transcript_header_shows_the_alias_hop() {
+        let (registry, log_dir) = registry_with(
+            fixtures::alias_config(),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+        registry
+            .launch("audit", Some("cheap"), None, "work".to_string())
+            .await
+            .expect("launch");
+        registry.get_result("audit").await.expect("round fails");
+
+        let text = tokio::fs::read_to_string(log_dir.path().join("subagent-audit.log"))
+            .await
+            .expect("transcript exists");
+        assert!(
+            text.starts_with(
+                "=== subagent audit (model: cheap -> fast / provider: openai / gpt-4o-mini) ===\n"
+            ),
+            "got: {text}"
+        );
+    }
+
+    /// An alias is usable when *any* candidate is, which is what lets one name
+    /// span an in-process model and a hosted one. Naming `onprem` directly is
+    /// refused in this build; naming the alias that lists it is not.
+    #[cfg(not(feature = "local-llm"))]
+    #[test]
+    fn an_alias_over_a_local_and_a_remote_candidate_is_usable_without_local_llm() {
+        let cfg = fixtures::mixed_alias_config();
+        let usable = usable_model_names(&cfg);
+        assert!(
+            usable.contains(&"either".to_string()),
+            "the alias falls through to its hosted candidate: {usable:?}"
+        );
+        assert!(
+            !usable.contains(&"onprem".to_string()),
+            "naming the in-process model directly is still not offered: {usable:?}"
+        );
+    }
+
+    /// With the feature on, the same alias prefers its first candidate.
+    #[cfg(feature = "local-llm")]
+    #[test]
+    fn an_alias_over_a_local_and_a_remote_candidate_prefers_the_local_one() {
+        let cfg = fixtures::mixed_alias_config();
+        assert!(usable_model_names(&cfg).contains(&"either".to_string()));
+    }
+
+    /// An unset api-key variable is a guaranteed failure, so a model behind one
+    /// is not advertised. This is the same predicate the resolver selects alias
+    /// candidates with, which is why the two cannot drift.
+    #[test]
+    fn a_model_whose_key_is_unset_is_not_advertised() {
+        let mut cfg = fixtures::test_config();
+        cfg.providers.insert(
+            "keyless".to_string(),
+            outrig::config::LlmProvider::openai(
+                "http://127.0.0.1:9",
+                outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_SUBAGENT_NEVER_SET_KEY}")
+                    .expect("api-key ref parses"),
+                Some(1),
+            ),
+        );
+        let mut model = outrig::config::Model::new("keyless");
+        model.identifier = Some("gpt-4o".to_string());
+        cfg.models.insert("unreachable".to_string(), model);
+
+        let usable = usable_model_names(&cfg);
+        assert_eq!(
+            usable,
+            vec!["fast".to_string(), "smart".to_string()],
+            "a model behind an unset key is not offered"
         );
     }
 

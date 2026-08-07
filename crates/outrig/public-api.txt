@@ -124,8 +124,20 @@ pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model_id
 pub outrig::config::ConfigValidationError::MistralrsModelPathMissing
 pub outrig::config::ConfigValidationError::MistralrsModelPathMissing::model: alloc::string::String
 pub outrig::config::ConfigValidationError::MistralrsModelPathMissing::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::ModelAliasCycle
+pub outrig::config::ConfigValidationError::ModelAliasCycle::cycle: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::ModelAliasEmpty
+pub outrig::config::ConfigValidationError::ModelAliasEmpty::model: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::ModelAliasTooDeep
+pub outrig::config::ConfigValidationError::ModelAliasTooDeep::max: usize
+pub outrig::config::ConfigValidationError::ModelAliasTooDeep::model: alloc::string::String
 pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute
 pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::ModelSourceConflict
+pub outrig::config::ConfigValidationError::ModelSourceConflict::fields: alloc::vec::Vec<&'static str>
+pub outrig::config::ConfigValidationError::ModelSourceConflict::model: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::ModelSourceMissing
+pub outrig::config::ConfigValidationError::ModelSourceMissing::model: alloc::string::String
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid::message: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField
@@ -212,6 +224,9 @@ pub outrig::config::ConfigValidationError::UnknownDefaultImage
 pub outrig::config::ConfigValidationError::UnknownDefaultImage::name: alloc::string::String
 pub outrig::config::ConfigValidationError::UnknownDefaultModel
 pub outrig::config::ConfigValidationError::UnknownDefaultModel::name: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::UnknownModelAliasTarget
+pub outrig::config::ConfigValidationError::UnknownModelAliasTarget::model: alloc::string::String
+pub outrig::config::ConfigValidationError::UnknownModelAliasTarget::target: alloc::string::String
 pub outrig::config::ConfigValidationError::UnknownModelProvider
 pub outrig::config::ConfigValidationError::UnknownModelProvider::model: alloc::string::String
 pub outrig::config::ConfigValidationError::UnknownModelProvider::provider: alloc::string::String
@@ -311,6 +326,11 @@ pub fn outrig::config::MistralrsDeviceSpec::fmt(&self, &mut core::fmt::Formatter
 impl core::str::traits::FromStr for outrig::config::MistralrsDeviceSpec
 pub type outrig::config::MistralrsDeviceSpec::Err = outrig::config::MistralrsDeviceParseError
 pub fn outrig::config::MistralrsDeviceSpec::from_str(&str) -> core::result::Result<Self, Self::Err>
+#[non_exhaustive] pub enum outrig::config::ModelSourceRef<'a>
+#[non_exhaustive] pub outrig::config::ModelSourceRef::Alias
+pub outrig::config::ModelSourceRef::Alias::targets: &'a [alloc::string::String]
+#[non_exhaustive] pub outrig::config::ModelSourceRef::Provider
+pub outrig::config::ModelSourceRef::Provider::provider: &'a str
 #[non_exhaustive] pub enum outrig::config::MountAccess
 pub outrig::config::MountAccess::ReadOnly
 pub outrig::config::MountAccess::ReadWrite
@@ -408,6 +428,7 @@ pub fn outrig::config::Config::load(&std::path::Path, core::option::Option<&std:
 pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_workspace_mounts(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 #[non_exhaustive] pub struct outrig::config::ContainerSecurity
@@ -441,6 +462,7 @@ impl core::error::Error for outrig::config::MistralrsDeviceParseError
 impl core::fmt::Display for outrig::config::MistralrsDeviceParseError
 pub fn outrig::config::MistralrsDeviceParseError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::config::Model
+pub outrig::config::Model::alias: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub outrig::config::Model::context_length: core::option::Option<u32>
 pub outrig::config::Model::device: core::option::Option<alloc::string::String>
 pub outrig::config::Model::identifier: core::option::Option<alloc::string::String>
@@ -448,10 +470,12 @@ pub outrig::config::Model::max_tokens: core::option::Option<u32>
 pub outrig::config::Model::model_file: core::option::Option<alloc::vec::Vec<alloc::string::String>>
 pub outrig::config::Model::model_id: core::option::Option<alloc::string::String>
 pub outrig::config::Model::model_path: core::option::Option<std::path::PathBuf>
-pub outrig::config::Model::provider: alloc::string::String
+pub outrig::config::Model::provider: core::option::Option<alloc::string::String>
 pub outrig::config::Model::revision: core::option::Option<alloc::string::String>
 impl outrig::config::Model
+pub fn outrig::config::Model::alias<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn outrig::config::Model::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::Model::source(&self) -> outrig::config::ModelSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MountConfig
 pub outrig::config::MountConfig::access: outrig::config::MountAccess
 pub outrig::config::MountConfig::container_path: std::path::PathBuf
@@ -524,6 +548,7 @@ pub const outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX: u32
 pub const outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_CALL_MAX: u32
 pub const outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES: u32
+pub const outrig::config::MODEL_ALIAS_DEPTH_MAX: usize
 pub const outrig::config::REQUEST_TIMEOUT_SECS_CEILING: u64
 pub const outrig::config::RETRY_BUDGET_SECS_CEILING: u64
 pub const outrig::config::SUBAGENT_DEPTH_MAX_CEILING: u32

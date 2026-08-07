@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use super::{
     Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
-    NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
+    ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
     SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
     TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
@@ -104,6 +104,42 @@ pub enum ConfigValidationError {
 
     #[error("image {image:?}: `build-args` cannot be used with `image-name`")]
     ImageNameWithBuildArgs { image: String },
+
+    #[error("model {model:?}: neither `provider` nor `alias` is set")]
+    #[non_exhaustive]
+    ModelSourceMissing { model: String },
+
+    #[error(
+        "model {model:?}: conflicting fields {fields:?} -- set either `alias` \
+         or `provider`, not both"
+    )]
+    #[non_exhaustive]
+    ModelSourceConflict {
+        model: String,
+        fields: Vec<&'static str>,
+    },
+
+    #[error("model {model:?}: `alias` must name at least one model")]
+    #[non_exhaustive]
+    ModelAliasEmpty { model: String },
+
+    #[error(
+        "model {model:?} has alias target {target:?} which does not match any \
+         [models.<name>]"
+    )]
+    #[non_exhaustive]
+    UnknownModelAliasTarget { model: String, target: String },
+
+    #[error("model alias cycle: {cycle}")]
+    #[non_exhaustive]
+    ModelAliasCycle { cycle: String },
+
+    #[error(
+        "model {model:?}: `alias` chain is more than {max} hops deep; an alias \
+         graph this deep is a mistake rather than a configuration"
+    )]
+    #[non_exhaustive]
+    ModelAliasTooDeep { model: String, max: usize },
 
     #[error(
         "image {image:?} dockerfile path {path:?} does not exist{}",
@@ -613,6 +649,31 @@ pub(super) fn validate_with_options(
     }
     validate_network_policy(cfg)?;
 
+    // Deliberately outside the `validate_llm` gate below, which `outrig build`
+    // turns off, for two different reasons.
+    //
+    // `validate_model_source` is a shape rule rather than a cross-reference
+    // one: it establishes the invariant `Model::source` panics on, and until
+    // `provider` became optional serde's own "missing field" enforced half of
+    // it on every path, `outrig build` included. Gating it would quietly let a
+    // build accept `[models.x]` with nothing in it. The images loop above
+    // treats `validate_image_source` exactly this way.
+    //
+    // `model_candidates` *is* a cross-reference check, but one that resolves
+    // entirely within `[models]` -- an alias target is another row in this same
+    // table, not a provider, an endpoint, or a credential. So it says nothing
+    // about whether this build can reach an LLM, which is the only thing the
+    // gate exists to skip. A build therefore still accepts a typo'd `provider`
+    // while rejecting a typo'd alias target, which looks inconsistent and is
+    // not: one is reachability, the other is internal consistency.
+    for (model_name, model) in &cfg.models {
+        validate_model_source(model_name, model)?;
+    }
+    // One pass for the whole table rather than a flatten per row: a subtree
+    // shared by many names is walked once, which keeps an ordinary "many names,
+    // one shared alias" config from costing cubic work at every load.
+    cfg.validate_model_alias_graph()?;
+
     if options.validate_llm {
         for (provider_name, provider) in &cfg.providers {
             // Deliberately without a `_` arm, matching the model loop below: a
@@ -669,10 +730,19 @@ pub(super) fn validate_with_options(
         }
 
         for (model_name, model) in &cfg.models {
-            let provider = cfg.providers.get(&model.provider).ok_or_else(|| {
+            // An alias has no provider of its own; its targets are rows in this
+            // same loop and are checked on their own account. The shape pass
+            // above ran ungated, so `source()` cannot panic here.
+            let ModelSourceRef::Provider {
+                provider: provider_name,
+            } = model.source()
+            else {
+                continue;
+            };
+            let provider = cfg.providers.get(provider_name).ok_or_else(|| {
                 ConfigValidationError::UnknownModelProvider {
                     model: model_name.clone(),
-                    provider: model.provider.clone(),
+                    provider: provider_name.to_string(),
                 }
             })?;
             // Deliberately without a `_` arm: this crate can match the enum
@@ -1323,6 +1393,41 @@ fn validate_tool_result_max(path: &str, value: u32) -> Result<(), ConfigValidati
     Ok(())
 }
 
+/// Validate the XOR constraint on model source fields: a row names either a
+/// `provider` that serves it or an `alias` naming other models, never both and
+/// never neither. The counterpart of [`validate_image_source`], and the check
+/// that makes [`Model::source`] safe to call.
+///
+/// Every provider-shape field counts as a conflict, `max-tokens` included. An
+/// alias carrying a ceiling for whichever candidate wins is coherent and may be
+/// allowed later; "an alias has no provider-shape fields" is a rule with one
+/// clause, while the same rule with an exception in it is two. Relaxing later
+/// is additive; tightening later is not.
+fn validate_model_source(model_name: &str, model: &Model) -> Result<(), ConfigValidationError> {
+    if model.alias.is_some() {
+        // The same collector the alias walk reports from, so a row rejected
+        // here names exactly the fields it would name there.
+        let mut conflicts: Vec<&'static str> = vec!["alias"];
+        conflicts.extend(model.provider_shape_fields());
+        if conflicts.len() > 1 {
+            return Err(ConfigValidationError::ModelSourceConflict {
+                model: model_name.to_string(),
+                fields: conflicts,
+            });
+        }
+        // Emptiness, dangling targets, and cycles are graph properties rather
+        // than per-row ones, so `Config::model_candidates` owns them.
+        return Ok(());
+    }
+
+    if model.provider.is_none() {
+        return Err(ConfigValidationError::ModelSourceMissing {
+            model: model_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// The field rules every remote (HTTP) provider style shares: an `identifier`
 /// is required, and every mistralrs weight field is rejected. `style` names the
 /// style in diagnostics, so the message points at the row the user wrote rather
@@ -1338,15 +1443,7 @@ fn validate_remote_model(
             style,
         });
     }
-    let weight_fields: [(bool, &'static str); 6] = [
-        (model.model_id.is_some(), "model-id"),
-        (model.model_path.is_some(), "model-path"),
-        (model.model_file.is_some(), "model-file"),
-        (model.revision.is_some(), "revision"),
-        (model.context_length.is_some(), "context-length"),
-        (model.device.is_some(), "device"),
-    ];
-    for (present, field) in weight_fields {
+    for (present, field) in model.mistralrs_weight_fields() {
         if present {
             return Err(ConfigValidationError::RemoteModelHasMistralrsField {
                 model: model_name.to_string(),

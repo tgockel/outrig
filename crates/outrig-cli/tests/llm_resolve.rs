@@ -990,3 +990,521 @@ preamble = "hi"
         "error should name the missing var; got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Model aliases (task 0110): one name for a model, or for an ordered set of
+// provider-equivalent rows. The config-layer half -- flattening order and the
+// five validation rules -- lives in `outrig/tests/config_model_alias.rs`.
+// ---------------------------------------------------------------------------
+
+/// Three provider-equivalent rows on three providers, each keyed by its own
+/// env var, plus a `smart` alias listing them in preference order.
+fn three_vendor_alias_cfg(vars: [&str; 3]) -> Config {
+    let [a, b, c] = vars;
+    parse(&format!(
+        r#"
+default-model = "smart"
+
+[providers.bedrock]
+style    = "openai"
+base-url = "https://bedrock.example.invalid/v1"
+api-key  = "${{{a}}}"
+
+[providers.anthropic]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${{{b}}}"
+
+[providers.azure]
+style    = "openai"
+base-url = "https://azure.example.invalid/v1"
+api-key  = "${{{c}}}"
+
+[models.smart]
+alias = ["opus-5-bedrock", "opus-5-anthropic", "opus-5-azure"]
+
+[models.opus-5-bedrock]
+provider   = "bedrock"
+identifier = "anthropic.claude-opus-5-v1:0"
+
+[models.opus-5-anthropic]
+provider   = "anthropic"
+identifier = "claude-opus-5"
+
+[models.opus-5-azure]
+provider   = "azure"
+identifier = "claude-opus-5-azure"
+
+[agents.coding]
+preamble = "hi"
+"#,
+    ))
+}
+
+/// The headline case: one name for one model, reachable through every surface
+/// that already takes a model name.
+#[test]
+fn single_target_alias_resolves_through_model_flag_default_and_agent() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_SINGLE";
+    set_env(var, "sk-test");
+    let alias = "\n[models.opus]\nalias = \"fast\"\n";
+
+    // via --model
+    let cfg = parse(&format!(
+        "{}{alias}",
+        cfg_with_key_var(var, "", "[agents.coding]\npreamble = \"hi\"")
+    ));
+    let r = resolve_agent_with_overrides(&cfg, Some("coding"), Some("opus"), None).unwrap();
+    assert_eq!(r.model_name, "fast", "the concrete row wins the name");
+    assert_eq!(r.alias_name.as_deref(), Some("opus"));
+    assert_eq!(r.model_identifier, "gpt-4o-mini");
+
+    // via default-model
+    let cfg = parse(&format!(
+        "{}{alias}",
+        cfg_with_key_var(
+            var,
+            "default-model = \"opus\"",
+            "[agents.coding]\npreamble = \"hi\""
+        )
+    ));
+    let r = resolve_agent(&cfg, Some("coding")).unwrap();
+    assert_eq!(r.model_name, "fast");
+    assert_eq!(r.alias_name.as_deref(), Some("opus"));
+
+    // via [agents.<n>].model
+    let cfg = parse(&format!(
+        "{}{alias}",
+        cfg_with_key_var(
+            var,
+            "",
+            "[agents.coding]\npreamble = \"hi\"\nmodel = \"opus\""
+        )
+    ));
+    let r = resolve_agent(&cfg, Some("coding")).unwrap();
+    assert_eq!(r.model_name, "fast");
+    assert_eq!(r.alias_name.as_deref(), Some("opus"));
+}
+
+/// The point of the indirection: repointing one line moves every agent naming
+/// it, with no other edit.
+#[test]
+fn repointing_an_alias_moves_every_agent_naming_it() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_REPOINT";
+    set_env(var, "sk-test");
+    let agents = "[agents.one]\npreamble = \"a\"\nmodel = \"opus\"\n\n\
+                  [agents.two]\npreamble = \"b\"\nmodel = \"opus\"";
+    let mut cfg = parse(&format!(
+        "{}\n[models.opus]\nalias = \"fast\"\n",
+        cfg_with_key_var(var, "", agents)
+    ));
+
+    for agent in ["one", "two"] {
+        assert_eq!(resolve_agent(&cfg, Some(agent)).unwrap().model_name, "fast");
+    }
+
+    // The single edit.
+    cfg.models
+        .insert("opus".to_string(), outrig::config::Model::alias(["smart"]));
+
+    for agent in ["one", "two"] {
+        let r = resolve_agent(&cfg, Some(agent)).unwrap();
+        assert_eq!(r.model_name, "smart");
+        assert_eq!(r.model_identifier, "gpt-4o");
+        assert_eq!(r.alias_name.as_deref(), Some("opus"));
+    }
+}
+
+/// The credential case the static half exists for: one committed config, and
+/// each machine picks the row it is actually credentialed for.
+#[test]
+fn alias_selects_the_first_candidate_whose_key_is_set() {
+    let vars = [
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_SEL_A",
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_SEL_B",
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_SEL_C",
+    ];
+    let cfg = three_vendor_alias_cfg(vars);
+
+    // Only the second vendor's key is set, so the second candidate wins even
+    // though it is not first in the list.
+    unset_env(vars[0]);
+    set_env(vars[1], "sk-test");
+    unset_env(vars[2]);
+
+    let r = resolve_agent(&cfg, Some("coding")).unwrap();
+    assert_eq!(r.model_name, "opus-5-anthropic");
+    assert_eq!(r.alias_name.as_deref(), Some("smart"));
+    assert_eq!(r.model_identifier, "claude-opus-5");
+    assert!(matches!(r.provider, ResolvedProvider::Anthropic { .. }));
+
+    // With the first also set, preference order decides.
+    set_env(vars[0], "sk-test");
+    let r = resolve_agent(&cfg, Some("coding")).unwrap();
+    assert_eq!(r.model_name, "opus-5-bedrock");
+}
+
+/// An empty variable is not a set one: `std::env::var` returns `Ok("")` for
+/// `FOO=`, which would otherwise be selected and then fail at the endpoint
+/// with a provider-side auth error.
+#[test]
+fn an_empty_api_key_variable_does_not_select_a_candidate() {
+    let vars = [
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_EMPTY_A",
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_EMPTY_B",
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_EMPTY_C",
+    ];
+    let cfg = three_vendor_alias_cfg(vars);
+    set_env(vars[0], "");
+    set_env(vars[1], "sk-test");
+    unset_env(vars[2]);
+
+    let r = resolve_agent(&cfg, Some("coding")).unwrap();
+    assert_eq!(r.model_name, "opus-5-anthropic");
+}
+
+/// A list of three failing for three different reasons is exactly the case a
+/// single-line error wastes an afternoon on.
+///
+/// The third candidate is an in-process model, so what this config *means*
+/// depends on the build: without `local-llm` every candidate is unreachable and
+/// the alias is exhausted, and with it the third one is the answer. Both halves
+/// are asserted, because the exhaustion message is only interesting if the
+/// selector really would have taken a reachable candidate.
+#[test]
+fn alias_with_no_selectable_candidate_names_every_reason() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_NONE";
+    unset_env(var);
+    let cfg = parse(&format!(
+        r#"
+default-model = "smart"
+
+[providers.bedrock]
+style    = "openai"
+base-url = "https://bedrock.example.invalid/v1"
+api-key  = "${{{var}}}"
+
+[providers.local]
+style = "mistralrs"
+
+[models.smart]
+alias = ["opus-5-bedrock", "opus-5-orphan", "opus-5-local"]
+
+[models.opus-5-bedrock]
+provider   = "bedrock"
+identifier = "anthropic.claude-opus-5-v1:0"
+
+[models.opus-5-orphan]
+provider   = "nowhere"
+identifier = "claude-opus-5"
+
+[models.opus-5-local]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+
+[agents.coding]
+preamble = "hi"
+"#,
+    ));
+
+    let resolved = resolve_agent(&cfg, Some("coding"));
+
+    #[cfg(feature = "local-llm")]
+    {
+        // The first two are unreachable, so selection walks past them to the
+        // in-process candidate this build *can* run.
+        let r = resolved.expect("the mistralrs candidate is reachable in this build");
+        assert_eq!(r.model_name, "opus-5-local");
+        assert_eq!(r.alias_name.as_deref(), Some("smart"));
+    }
+
+    #[cfg(not(feature = "local-llm"))]
+    {
+        let err = resolved.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(
+                err,
+                CliError::LlmResolve(LlmResolveError::NoUsableAliasCandidate { .. })
+            ),
+            "got: {err:?}"
+        );
+        assert!(msg.contains("no usable model for alias \"smart\""), "{msg}");
+        // Every candidate, each with its own distinct reason.
+        assert!(
+            msg.contains("opus-5-bedrock")
+                && msg.contains(&format!("api-key env var {var} is not set")),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("opus-5-orphan")
+                && msg.contains("provider \"nowhere\" is not defined under [providers.<name>]"),
+            "{msg}"
+        );
+        // The reasons are the resolver's own errors, not a second wording of
+        // them, so a candidate reads the same here as it would if named
+        // directly -- including the remedy.
+        assert!(
+            msg.contains("opus-5-local") && msg.contains("rebuild with --features local-llm"),
+            "{msg}"
+        );
+    }
+}
+
+/// A configured device this build has no backend for makes a candidate as
+/// unreachable as a missing feature: resolution rejects it a moment later with
+/// `MistralrsDeviceUnavailable`. Selection has to agree, or a multi-candidate
+/// alias strands itself on a model that cannot run while a hosted candidate
+/// sits behind it unused.
+#[cfg(all(feature = "local-llm", not(feature = "cuda")))]
+#[test]
+fn alias_skips_a_candidate_whose_device_backend_is_missing() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_DEVICE_FALLBACK";
+    set_env(var, "sk-test");
+    let cfg = parse(&format!(
+        r#"
+default-model = "smart"
+
+[providers.hosted]
+style    = "openai"
+base-url = "https://hosted.example.invalid/v1"
+api-key  = "${{{var}}}"
+
+[providers.local]
+style = "mistralrs"
+
+[models.smart]
+alias = ["gpu-only", "hosted-fallback"]
+
+[models.gpu-only]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
+device     = "cuda"
+
+[models.hosted-fallback]
+provider   = "hosted"
+identifier = "gpt-4o"
+
+[agents.coding]
+preamble = "hi"
+"#,
+    ));
+
+    let r = resolve_agent(&cfg, Some("coding")).expect("falls through to the hosted candidate");
+    assert_eq!(r.model_name, "hosted-fallback");
+    assert_eq!(r.alias_name.as_deref(), Some("smart"));
+}
+
+/// `LlmRegistry` is keyed by the resolved model name, so an alias and its
+/// target must produce the *same* key -- otherwise two names for one GGUF load
+/// the same multi-gigabyte weights twice in one process.
+#[test]
+fn an_alias_and_its_target_resolve_to_the_same_registry_key() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_REGISTRY";
+    set_env(var, "sk-test");
+    let cfg = parse(&format!(
+        "{}\n[models.opus]\nalias = \"fast\"\n",
+        cfg_with_key_var(var, "", "[agents.coding]\npreamble = \"hi\"")
+    ));
+
+    let via_alias = resolve_agent_with_overrides(&cfg, Some("coding"), Some("opus"), None).unwrap();
+    let direct = resolve_agent_with_overrides(&cfg, Some("coding"), Some("fast"), None).unwrap();
+
+    assert_eq!(
+        via_alias.model_name, direct.model_name,
+        "the registry key must not depend on which name was typed"
+    );
+    // ... while attribution still distinguishes them. The rendering itself is
+    // `model_display`, unit-tested in `llm.rs`.
+    assert_eq!(via_alias.alias_name.as_deref(), Some("opus"));
+    assert_eq!(direct.alias_name, None);
+}
+
+/// `--device` selects hardware for one in-process model, so an alias that
+/// could land on any of several is refused rather than silently picking one.
+#[test]
+fn device_override_is_refused_for_a_multi_candidate_alias() {
+    let vars = [
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_DEV_A",
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_DEV_B",
+        "OUTRIG_TEST_LLM_RESOLVE_ALIAS_DEV_C",
+    ];
+    let cfg = three_vendor_alias_cfg(vars);
+    for var in vars {
+        set_env(var, "sk-test");
+    }
+
+    let err =
+        resolve_agent_with_device_override(&cfg, Some("coding"), Some(MistralrsDeviceSpec::Cpu))
+            .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(
+            err,
+            CliError::LlmResolve(LlmResolveError::MistralrsDeviceOverrideAlias { .. })
+        ),
+        "got: {err:?}"
+    );
+    assert!(
+        msg.contains("opus-5-bedrock, opus-5-anthropic, opus-5-azure"),
+        "{msg}"
+    );
+}
+
+/// A single-target alias names exactly one model, so there is no ambiguity and
+/// the flag applies just as it would to the target's own name.
+#[test]
+fn device_override_applies_through_a_single_target_mistralrs_alias() {
+    let mut cfg = local_mistralrs_cfg(None);
+    cfg.models.insert(
+        "onprem".to_string(),
+        outrig::config::Model::alias(["local"]),
+    );
+    cfg.default_model = Some("onprem".to_string());
+
+    let r = resolve_agent_with_device_override(&cfg, Some("smoke"), Some(MistralrsDeviceSpec::Cpu))
+        .unwrap();
+    assert_eq!(r.model_name, "local");
+    assert_eq!(r.alias_name.as_deref(), Some("onprem"));
+    assert_eq!(
+        r.model_weights.expect("mistralrs weights").device,
+        MistralrsDeviceSpec::Cpu
+    );
+}
+
+/// A single-target alias onto a remote model still refuses `--device`, and
+/// does so through the same message a direct name gets: there is one provider
+/// to name, and it is not mistralrs.
+#[test]
+fn device_override_is_still_refused_through_a_single_target_remote_alias() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_DEV_REMOTE";
+    set_env(var, "sk-test");
+    let cfg = parse(&format!(
+        "{}\n[models.opus]\nalias = \"fast\"\n",
+        cfg_with_key_var(var, "", "[agents.coding]\npreamble = \"hi\"")
+    ));
+
+    let err = resolve_agent_with_overrides(
+        &cfg,
+        Some("coding"),
+        Some("opus"),
+        Some(MistralrsDeviceSpec::Cpu),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CliError::LlmResolve(LlmResolveError::MistralrsDeviceOverrideUnsupported { .. })
+        ),
+        "got: {err:?}"
+    );
+}
+
+/// A single-target alias is renaming, not choosing, so it must not be filtered
+/// by selectability -- an unset key has to keep naming the variable, which is
+/// the actionable part, rather than collapsing into a list of one.
+#[test]
+fn a_single_target_alias_keeps_its_targets_own_error() {
+    let var = "OUTRIG_TEST_LLM_RESOLVE_ALIAS_ONE_ERR";
+    unset_env(var);
+    let cfg = parse(&format!(
+        "{}\n[models.opus]\nalias = \"fast\"\n",
+        cfg_with_key_var(var, "", "[agents.coding]\npreamble = \"hi\"")
+    ));
+
+    let err = resolve_agent_with_overrides(&cfg, Some("coding"), Some("opus"), None).unwrap_err();
+    assert!(
+        matches!(err, CliError::Outrig(outrig::error::OutrigError::ApiKey(_))),
+        "expected the target's own api-key error, got: {err:?}"
+    );
+    assert!(err.to_string().contains(var), "got: {err}");
+}
+
+/// The same rule seen from the other side: a single-target alias onto an
+/// in-process model in a build without `local-llm` still reports the feature,
+/// because that message carries the remedy (a rebuild).
+#[cfg(not(feature = "local-llm"))]
+#[tokio::test]
+async fn a_single_target_local_alias_still_reports_the_missing_feature() {
+    let mut cfg = local_mistralrs_cfg(None);
+    cfg.models.insert(
+        "onprem".to_string(),
+        outrig::config::Model::alias(["local"]),
+    );
+    cfg.default_model = Some("onprem".to_string());
+
+    let resolved = resolve_agent(&cfg, Some("smoke")).expect("resolution succeeds");
+    assert_eq!(resolved.model_name, "local");
+
+    let err = match build_agent(&resolved, vec![], Path::new("/tmp/outrig-test-cache")).await {
+        Ok(_) => panic!("expected build_agent to error on feature-off mistralrs"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            &err,
+            CliError::LlmResolve(LlmResolveError::MistralrsFeatureDisabled { name }) if name == "local"
+        ),
+        "got: {err:?}"
+    );
+    assert!(err.to_string().contains("local-llm"), "got: {err}");
+}
+
+/// The walk must be total on a `Config` that never went through `validate` --
+/// built by hand in a test, or by a library embedder -- rather than recursing
+/// until the stack runs out.
+#[test]
+fn hand_built_cycle_fails_resolution_without_hanging() {
+    let mut cfg = Config::default();
+    cfg.default_model = Some("a".to_string());
+    cfg.models
+        .insert("a".to_string(), outrig::config::Model::alias(["b"]));
+    cfg.models
+        .insert("b".to_string(), outrig::config::Model::alias(["a"]));
+
+    let err = resolve_agent(&cfg, None).unwrap_err();
+    assert!(
+        err.to_string().contains("model alias cycle: a -> b -> a"),
+        "got: {err}"
+    );
+}
+
+/// An alias naming a name that is not in the table is a config error, not a
+/// silent empty candidate list.
+#[test]
+fn hand_built_dangling_alias_target_fails_resolution() {
+    let mut cfg = Config::default();
+    cfg.default_model = Some("a".to_string());
+    cfg.models
+        .insert("a".to_string(), outrig::config::Model::alias(["ghost"]));
+
+    let err = resolve_agent(&cfg, None).unwrap_err();
+    assert!(
+        err.to_string().contains("alias target \"ghost\""),
+        "got: {err}"
+    );
+}
+
+/// `resolve_agent_with_overrides` promises a `Result` and documents that it does
+/// not assume `cfg.validate()` ran, so a row that is neither shape has to come
+/// back as an error. `Model::source()` panics on exactly that input, which is
+/// why the resolver classifies from the raw fields instead of calling it.
+#[test]
+fn a_shapeless_model_fails_resolution_rather_than_panicking() {
+    let mut cfg = Config::default();
+    cfg.default_model = Some("broken".to_string());
+    // Neither `provider` nor `alias`: unreachable through `Config::load`, which
+    // validates, but reachable for a config built in code.
+    let mut broken = outrig::config::Model::new("p");
+    broken.provider = None;
+    cfg.models.insert("broken".to_string(), broken);
+
+    let err = resolve_agent(&cfg, None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("names neither a provider nor an alias"),
+        "got: {err}"
+    );
+}

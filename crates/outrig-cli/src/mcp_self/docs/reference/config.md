@@ -300,8 +300,63 @@ See [Concepts -> LLM Providers](../concepts/llm-providers.md).
 
 ## `[models.<name>]`
 
-A model points at a provider and supplies whatever that provider needs to identify the
-weights or wire-format model name. The required fields depend on the provider's `style`.
+A model entry has two shapes, and sets exactly one of them:
+
+- **A provider shape** -- `provider` plus whatever that provider needs to identify the
+  weights or wire-format model name. The required fields depend on the provider's `style`.
+- **An alias shape** -- `alias`, naming one or more other models. No provider-shape field
+  is allowed alongside it.
+
+### Alias models
+
+An `alias` gives one name to another model, or to an ordered set of provider-equivalent
+ones.
+
+```toml
+# One name for one model. Repoint this line and every agent naming `opus`
+# follows, with no other edit.
+[models.opus]
+alias = "opus-5"
+
+# One name for a set of equivalents, in preference order.
+[models.smart]
+alias = ["opus-5-bedrock", "opus-5-anthropic", "opus-5-azure"]
+
+# Aliases may name aliases. This flattens to opus-5-bedrock,
+# opus-5-anthropic, opus-5-azure, haiku-5.
+[models.default]
+alias = ["smart", "haiku-5"]
+```
+
+| Key     | Type    | Required | Default | Description                                     |
+|---------|---------|----------|---------|-------------------------------------------------|
+| `alias` | str/arr | yes      | --      | Other model names, in preference order.         |
+
+An alias **is** a model. It lives in the same table, and every place that accepts a model
+name accepts it unchanged: `--model`, `default-model`, `[agents.<name>].model`, and the
+`outrig__subagent` tool's `model` argument.
+
+An alias resolves by flattening depth-first in config order, keeping the first occurrence
+of a repeated name. OutRig then picks the **first candidate this build could actually
+reach**: its provider exists, its style is one this build has a client for, and its
+`api-key` variable is set and non-empty. That is what lets one committed config serve a
+laptop with `ANTHROPIC_API_KEY` and a CI runner with a Bedrock role.
+
+Selection happens once, when the session starts, and answers *"am I configured for
+this"* -- **not** *"is this endpoint up"*. Building a remote client does no network I/O, so
+an alias does not fail over when a vendor rate-limits or goes down mid-session; a turn that
+loses its endpoint still ends the turn. An alias with no reachable candidate fails the
+session, naming each candidate and why it was skipped.
+
+A single-target alias is pure renaming, so it keeps its target's own errors -- an unset key
+still names the variable, and an in-process model in a build without `local-llm` still says
+to rebuild.
+
+Two spelling notes. `alias = "opus-5"` and `alias = ["opus-5"]` are the same config; a
+round-trip through OutRig rewrites the first as the second, the same way `model-file`
+behaves. And because `[models.<name>]` rejects unknown fields, a config using `alias` is
+rejected outright by an OutRig older than this feature rather than degrading -- worth
+knowing before putting one in a shared repo config.
 
 ### Remote-provider models
 
@@ -318,11 +373,14 @@ provider   = "openai"
 identifier = "gpt-4o"
 ```
 
-| Key          | Type    | Required | Default | Description                                |
-|--------------|---------|----------|---------|--------------------------------------------|
-| `provider`   | string  | yes      | --      | Name of an entry in `[providers.<name>]`.  |
-| `identifier` | string  | yes      | --      | Model id passed to the provider API.       |
-| `max-tokens` | integer | no       | --      | Output-token ceiling per turn, see below.  |
+| Key          | Type    | Required   | Default | Description                              |
+|--------------|---------|------------|---------|------------------------------------------|
+| `provider`   | string  | yes\*      | --      | Name of an entry in `[providers.<name>]`.|
+| `identifier` | string  | yes        | --      | Model id passed to the provider API.     |
+| `max-tokens` | integer | no         | --      | Output-token ceiling per turn, see below.|
+
+\* Required unless the entry sets `alias` instead, which forbids every field in this table
+-- `max-tokens` included.
 
 `max-tokens` on a model is the fallback for every agent that uses it;
 `[agents.<name>].max-tokens` wins where it is set. Leaving both unset lets the provider
@@ -414,7 +472,7 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 
 | Key              | Type    | Required | Default  | Description                                  |
 |------------------|---------|----------|----------|----------------------------------------------|
-| `provider`       | string  | yes      | --       | Name of a `style = "mistralrs"` provider.    |
+| `provider`       | string  | yes\*\*  | --       | Name of a `style = "mistralrs"` provider.    |
 | `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
 | `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
 | `model-file`     | str/arr | with `id`| --       | GGUF filename(s) inside the HF repo.         |
@@ -424,6 +482,9 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 
 \* Exactly one of `model-id` / `model-path` must be set; setting both, or neither,
 is an error.
+
+\*\* Required unless the entry sets `alias` instead, which forbids every field in this
+table.
 
 `device = "cuda"` and `device = "cuda:N"` require a binary built with
 `--features "local-llm cuda"`; `device = "metal"` requires
@@ -1055,6 +1116,16 @@ image-config in the merged config but does not require agent/model/provider wiri
 - Every `agents.<name>.model` (if set) must name an existing `[models.<name>]`. If `model` is
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.
+- Every `[models.<name>]` must set exactly one of `provider` or `alias`. Setting neither, or
+  setting `alias` alongside any provider-shape field (including `max-tokens`), is an error
+  naming every offending key. Unlike the other model rules, this one and the three below are
+  checked on **every** path, `outrig build` included -- they establish the entry's shape
+  rather than resolve a cross-reference.
+- Every `alias` must name at least one model; `alias = []` is an error.
+- Every name in an `alias` must name an existing `[models.<name>]`.
+- Alias entries must not form a cycle. The error names the cycle, e.g. `a -> b -> a`.
+- An `alias` chain may be at most 32 hops deep. A graph that deep is a mistake rather than a
+  configuration, and the limit is what makes it report as one.
 - Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
 - Every `providers.<name>.style` must be one of `{"openai", "anthropic", "mistralrs"}`. Other
   styles are reserved for future Rig adapters and listed as TODO in the providers concept

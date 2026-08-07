@@ -2021,6 +2021,46 @@ preamble = "hi"
         assert!(cfg.models.contains_key("fast"));
     }
 
+    /// Alias targets are resolved against the *merged* table, so a repo config
+    /// may name a model the global one declares. Validation only ever sees the
+    /// merged config, which is what makes this work without a second rule.
+    #[test]
+    fn repo_alias_may_target_a_global_model() {
+        let tmp = tempdir().unwrap();
+        let global_cfg = tmp.path().join("global.toml");
+        fs::write(
+            &global_cfg,
+            r#"
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+"#,
+        )
+        .unwrap();
+
+        write_repo_cfg(
+            tmp.path(),
+            r#"
+default-model = "cheap"
+
+[models.cheap]
+alias = "fast"
+
+[agents.coding]
+preamble = "hi"
+"#,
+        );
+
+        let cfg = Config::load(tmp.path(), Some(&global_cfg))
+            .expect("a repo alias resolves against the merged model table");
+        assert_eq!(cfg.model_candidates("cheap").expect("walks"), vec!["fast"]);
+    }
+
     #[test]
     fn global_network_mode_loads() {
         let tmp = tempdir().unwrap();

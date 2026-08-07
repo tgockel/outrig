@@ -207,13 +207,16 @@ outrig run [--agent <name>]
   [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax). Within a scope, last wins
   on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`): override
-  the in-process mistralrs model device for this run. Rejected for OpenAI-style models.
+  the in-process mistralrs model device for this run. Rejected for OpenAI-style models, and
+  for an alias spanning more than one candidate -- it selects hardware for one in-process
+  model, and an alias may span several styles. A single-target alias is accepted.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): per-turn tool-call
   max.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):
   per-tool-result byte max.
 - `--model <name>` (default: agent's `model`, else `default-model`): configured
   `[models.<name>]` entry to use for this run. This is not a raw provider model identifier.
+  An alias entry is accepted like any other name; the banner prints the hop it resolved to.
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.

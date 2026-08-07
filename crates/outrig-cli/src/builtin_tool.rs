@@ -171,12 +171,14 @@ impl ToolDyn for SubagentTool {
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(launched_as) => {
                     // Empty unless the launch named a model, so an inherited one
-                    // reads exactly as it always has.
-                    let suffix = args
-                        .model
-                        .map_or(String::new(), |model| format!(" (model: {model})"));
+                    // reads exactly as it always has. The name comes back from
+                    // the launch rather than from `args.model`, so an alias
+                    // shows the row it resolved to.
+                    let suffix = launched_as.map_or(String::new(), |label| {
+                        format!(" (model: {})", label.display_name())
+                    });
                     eprintln!("[outrig] subagent {} started{suffix}", args.name);
                     Ok(format!(
                         "subagent {:?} started{suffix}; collect it with outrig__get_result",
@@ -833,6 +835,41 @@ mod tests {
         assert_eq!(
             result,
             "subagent \"audit\" started (model: fast); collect it with outrig__get_result"
+        );
+    }
+
+    /// Launched under an alias, the result names the hop rather than echoing
+    /// the argument back. The parent asked for `cheap` and needs to know which
+    /// row that turned out to be -- the alias could be repointed tomorrow.
+    #[tokio::test(start_paused = true)]
+    async fn a_launch_under_an_alias_names_the_hop_in_its_result() {
+        let (registry, _log_dir) = crate::subagent::fixtures::registry_with(
+            crate::subagent::fixtures::alias_config(),
+            2,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
+        let tool = SubagentTool::new(Arc::new(registry));
+
+        let result = tool
+            .call(r#"{"name":"audit","prompt":"check the config","model":"cheap"}"#.to_string())
+            .await
+            .expect("launch succeeds -- the client is built offline");
+        assert_eq!(
+            result,
+            "subagent \"audit\" started (model: cheap -> fast); collect it with outrig__get_result"
+        );
+    }
+
+    /// An alias is a model name, so it is offered like any other -- which is
+    /// what lets a user have intent-named models without duplicating a row to
+    /// get them.
+    #[test]
+    fn subagent_schema_enum_lists_alias_names() {
+        let schema = subagent_schema(crate::subagent::fixtures::alias_config());
+        assert_eq!(
+            schema["properties"]["model"]["enum"],
+            json!(["cheap", "fast", "smart"]),
+            "got: {schema}"
         );
     }
 

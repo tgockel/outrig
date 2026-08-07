@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[models.<name>]` entries can be aliases**, so `--model`, `default-model`,
+  `[agents.<name>].model`, and a subagent's `model` argument all accept a name that stands
+  for one other model or for an ordered set of provider-equivalent ones. The session picks
+  the first candidate this build can reach -- provider defined, style compiled in, `api-key`
+  variable set and non-empty -- which is what lets one committed config serve a laptop with
+  `ANTHROPIC_API_KEY` and a CI runner holding a Bedrock role.
+
+  Selection happens once, at startup, and answers "am I configured for this" rather than "is
+  this endpoint up": building a remote client does no network I/O, so an alias does **not**
+  fail over when a vendor rate-limits mid-session. An alias with no reachable candidate ends
+  the session listing every candidate and the distinct reason each was skipped.
+
+  Attribution follows the name: the banner, the subagent launch trace, the subagent tool
+  result, and the transcript header all render `alias -> concrete` when a hop was taken. A
+  direct model name prints byte-for-byte what it printed before.
+
+  `--device` is refused for an alias spanning more than one candidate -- it selects hardware
+  for one in-process model, and an alias may span styles. A single-target alias takes it.
+
+### Changed
+
+- **The `outrig__subagent` tool no longer advertises a model whose `api-key` variable is
+  unset or empty.** The schema's `enum` and the alias selector are now one predicate, so a
+  name is offered exactly when a launch could reach it. Previously an unset key was
+  advertised and failed at launch. An alias is offered when *any* of its candidates is
+  reachable, which is what lets `alias = ["opus-local", "opus-anthropic"]` stay launchable
+  in a build without `--features local-llm` where naming `opus-local` directly would not be.
+
 ### Removed
 
 - **The `OUTRIG_BOOTSTRAP` environment variable**, along with the `podman exec` user-bootstrap
