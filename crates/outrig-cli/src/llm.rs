@@ -541,8 +541,19 @@ fn remote_http_client(
 ) -> Result<retry::RetryingHttpClient> {
     let timeout =
         std::time::Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
-    let inner = reqwest::Client::builder()
-        .timeout(timeout)
+    let builder = reqwest::Client::builder().timeout(timeout);
+
+    // Unit tests point providers at loopback fixtures. reqwest picks up
+    // `HTTP_PROXY` / `ALL_PROXY` automatically and has no loopback exemption of
+    // its own, so on a machine behind a proxy every fixture request would be
+    // sent to that proxy instead of the fixture -- leaking the request and
+    // hanging the test rather than failing it usefully. Real runs keep
+    // automatic proxy detection, which is how a user reaches a hosted provider
+    // from behind one.
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+
+    let inner = builder
         .build()
         .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
     Ok(retry::RetryingHttpClient::new(inner, policy))

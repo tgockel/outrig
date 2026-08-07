@@ -32,9 +32,6 @@ makes field and variant *additions* free, so what is left are field *type* chang
 sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
 qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
 
-- **0109 [subagent-tree-shutdown-grace](0109-subagent-tree-shutdown-grace.md)** -- the five-second
-  teardown budget was never measured against the 72-subagent tree the width cap permits, and
-  `DEFAULT_SUBAGENT_WIDTH_MAX` is a `pub const`.
 - **0110 [model-aliases](0110-model-aliases.md)** -- `Model::provider` becomes `Option<String>`,
   a field *type* change the sweep does not cover.
 - **0111 [provider-construction-options-struct](0111-provider-construction-options-struct.md)** --

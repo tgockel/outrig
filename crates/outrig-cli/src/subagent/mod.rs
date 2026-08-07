@@ -1000,14 +1000,20 @@ pub(crate) mod fixtures {
     /// The session's resolved agent as the context carries it: `smart`, the
     /// model the fixture agent is configured on, against the discard port.
     pub(crate) fn test_resolved(subagent_depth_max: u32) -> ResolvedAgent {
+        // Discard port: connects are refused immediately.
+        test_resolved_at("http://127.0.0.1:9", subagent_depth_max)
+    }
+
+    /// [`test_resolved`] against a caller-supplied endpoint, for the tests that
+    /// need the round to reach a model rather than fail connecting.
+    pub(crate) fn test_resolved_at(base_url: &str, subagent_depth_max: u32) -> ResolvedAgent {
         ResolvedAgent {
             agent_name: Some("primary".to_string()),
             model_name: "smart".to_string(),
             model_identifier: "gpt-4o".to_string(),
             provider_name: "openai".to_string(),
             provider: ResolvedProvider::OpenAi {
-                // Discard port: connects are refused immediately.
-                base_url: "http://127.0.0.1:9".to_string(),
+                base_url: base_url.to_string(),
                 api_key: "test-key".to_string(),
                 request_timeout_secs: Some(1),
                 // And retries off, so "immediately" stays true: a refused
@@ -1052,7 +1058,9 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
 
     /// A registry whose subagents talk to a closed port, so every round fails
     /// fast and deterministically. That is enough to exercise the bookkeeping
@@ -1084,43 +1092,367 @@ mod tests {
     ///
     /// Returns the counter seeded at 1 for the copy the caller installs on the
     /// registry; a test reaches 0 only after dropping the registry too.
-    fn counted_tools() -> (Arc<std::sync::atomic::AtomicUsize>, Vec<SessionTool>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CountedTool(Arc<AtomicUsize>);
-        impl Drop for CountedTool {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        impl rig::tool::ToolDyn for CountedTool {
-            fn name(&self) -> String {
-                "counted".to_string()
-            }
-            fn description(&self) -> String {
-                String::new()
-            }
-            fn parameters(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object"})
-            }
-            fn call<'a>(
-                &'a self,
-                _args: String,
-            ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>>
-            {
-                Box::pin(async { Ok(String::new()) })
-            }
-        }
-
+    fn counted_tools() -> (Arc<AtomicUsize>, Vec<SessionTool>) {
         let live = Arc::new(AtomicUsize::new(1));
-        let tools = vec![SessionTool::new(CountedTool(live.clone()))];
+        let tools = vec![SessionTool::new(CountedTool {
+            name: "counted",
+            live: live.clone(),
+            blocking: None,
+        })];
         (live, tools)
     }
 
-    /// How many copies of a [`counted_tools`] tool are still alive. Zero means
-    /// every clone has been dropped.
-    fn alive(counter: &std::sync::atomic::AtomicUsize) -> usize {
-        counter.load(std::sync::atomic::Ordering::SeqCst)
+    /// How many copies of a [`CountedTool`] are still alive. Zero means every
+    /// clone has been dropped.
+    fn alive(counter: &AtomicUsize) -> usize {
+        counter.load(Ordering::SeqCst)
+    }
+
+    /// The session-tool stand-in behind both [`counted_tools`] and
+    /// [`BlockingTools`]. `blocking` is what separates them: `None` returns
+    /// immediately, `Some` announces that the call was entered and then never
+    /// returns, so the round is still inside the tool when shutdown starts.
+    struct CountedTool {
+        name: &'static str,
+        live: Arc<AtomicUsize>,
+        blocking: Option<Entered>,
+    }
+
+    /// The readiness half of a blocking [`CountedTool`].
+    struct Entered {
+        count: Arc<AtomicUsize>,
+        ready: Arc<Notify>,
+    }
+
+    impl Drop for CountedTool {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl rig::tool::ToolDyn for CountedTool {
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn call<'a>(
+            &'a self,
+            _args: String,
+        ) -> rig::wasm_compat::WasmBoxedFuture<'a, Result<String, rig::tool::ToolError>> {
+            Box::pin(async move {
+                let Some(entered) = &self.blocking else {
+                    return Ok(String::new());
+                };
+                entered.count.fetch_add(1, Ordering::SeqCst);
+                // There is one readiness waiter. notify_one retains a permit if
+                // the increment lands between its predicate check and await,
+                // unlike notify_waiters.
+                entered.ready.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    /// A session tool that proves every round reached a tool call and then
+    /// remains in flight until shutdown cancels its owning subagent task.
+    struct BlockingTools {
+        /// Live clones, seeded at 1 for the copy installed on the registry --
+        /// same convention as [`counted_tools`].
+        live: Arc<AtomicUsize>,
+        entered: Arc<AtomicUsize>,
+        ready: Arc<Notify>,
+        tools: Vec<SessionTool>,
+    }
+
+    impl BlockingTools {
+        fn new() -> Self {
+            let live = Arc::new(AtomicUsize::new(1));
+            let entered = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(Notify::new());
+            let tools = vec![SessionTool::new(CountedTool {
+                // `mock_tool_call` names this tool in the call it returns.
+                name: "blocking",
+                live: live.clone(),
+                blocking: Some(Entered {
+                    count: entered.clone(),
+                    ready: ready.clone(),
+                }),
+            })];
+            Self {
+                live,
+                entered,
+                ready,
+                tools,
+            }
+        }
+
+        /// Hand the tools to the registry under test.
+        ///
+        /// They are moved out rather than cloned: the probe outlives the
+        /// registry so a test can read `live` after teardown, and a clone
+        /// parked here would be a clone teardown could never release.
+        fn take_tools(&mut self) -> Vec<SessionTool> {
+            std::mem::take(&mut self.tools)
+        }
+
+        /// Block until `expected` rounds are suspended inside the tool.
+        async fn wait_for_calls(&self, expected: usize) {
+            tokio::time::timeout(SETUP_TIMEOUT, async {
+                while self.entered.load(Ordering::SeqCst) < expected {
+                    self.ready.notified().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of {expected} subagents entered their tool call",
+                    self.entered.load(Ordering::SeqCst)
+                )
+            });
+        }
+    }
+
+    /// How long a full-tree test waits for setup to settle before it gives up.
+    /// Generous on purpose: it is a stuck-test backstop, not a measurement --
+    /// the number under test is the shutdown join, timed separately.
+    const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// One depth-2 subagent, the private registry it was given, and the
+    /// depth-3 leaves launched through that registry.
+    struct Branch {
+        root: String,
+        registry: Arc<SubagentRegistry>,
+        leaves: Vec<String>,
+    }
+
+    /// A full tree at the shipped defaults: the session registry's eight
+    /// children, and eight grandchildren in each child's private registry.
+    /// Names are globally unique because transcripts share one directory.
+    struct FullTree {
+        branches: Vec<Branch>,
+    }
+
+    impl FullTree {
+        fn live_count(&self) -> usize {
+            self.branches.iter().map(|b| 1 + b.leaves.len()).sum()
+        }
+
+        /// Every subagent in the tree, as the registry that owns it and the
+        /// name it is filed under.
+        fn members<'a>(
+            &'a self,
+            root: &'a SubagentRegistry,
+        ) -> impl Iterator<Item = (&'a SubagentRegistry, &'a String)> {
+            self.branches.iter().flat_map(move |b| {
+                std::iter::once((root, &b.root))
+                    .chain(b.leaves.iter().map(|leaf| (&*b.registry, leaf)))
+            })
+        }
+
+        /// Block until every round has published and gone back to its prompt
+        /// loop, so setup cannot leak into the shutdown measurement.
+        ///
+        /// `end_round` transitions through the same `watch` channel the parent
+        /// reads, so waiting on that channel needs no polling -- and `wait_for`
+        /// checks the current value before parking, which is what makes the
+        /// `publish`-then-`end_round` ordering a non-issue. A fresh subagent
+        /// starts `Running` (see `SubagentShared::new`), so no receiver can
+        /// match before its round has run.
+        async fn wait_until_idle(&self, root: &SubagentRegistry) {
+            let mut receivers: Vec<_> = self
+                .members(root)
+                .map(|(registry, name)| {
+                    registry
+                        .lock()
+                        .get(name)
+                        .expect("every launched subagent stays live")
+                        .shared
+                        .subscribe()
+                })
+                .collect();
+
+            let settled =
+                futures_util::future::join_all(receivers.iter_mut().map(|rx| {
+                    rx.wait_for(|snap| matches!(snap.state, state::RunState::Idle { .. }))
+                }));
+            tokio::time::timeout(SETUP_TIMEOUT, settled)
+                .await
+                .expect("every subagent finishes its round")
+                .into_iter()
+                .for_each(|seen| {
+                    seen.expect("a subagent's state channel outlives its round");
+                });
+        }
+    }
+
+    /// The registry a live subagent was handed to launch its own children
+    /// through. Panics if `name` is not live, or is a leaf at the depth limit.
+    fn child_registry(registry: &SubagentRegistry, name: &str) -> Arc<SubagentRegistry> {
+        registry
+            .lock()
+            .get(name)
+            .expect("live")
+            .child
+            .clone()
+            .expect("a subagent below the depth limit gets a registry")
+    }
+
+    /// Launch the widest, deepest tree the shipped defaults admit, through the
+    /// real `launch` path rather than by writing the ledger directly.
+    ///
+    /// `registry` must come from [`test_registry`], which launches at depth 2
+    /// under the shipped depth limit; the width comes from the shipped constant.
+    ///
+    /// Both shipped defaults are pinned against their constants rather than
+    /// against the literals the caller passed, so that moving either one fails
+    /// here instead of quietly measuring a tree that is no longer the worst
+    /// case. At 8 and 3 the tree is 8 + 8 * 8 = 72.
+    async fn launch_full_default_tree(registry: &SubagentRegistry) -> FullTree {
+        let width = outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX as usize;
+        assert_eq!(width, 8, "this measurement pins the shipped default width");
+        assert_eq!(
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+            3,
+            "this measurement pins the shipped default depth: at 3 the depth-2 \
+             children get registries and the depth-3 layer is leaves"
+        );
+
+        let mut branches = Vec::with_capacity(width);
+        for parent_index in 0..width {
+            let root = format!("root-{parent_index}");
+            registry
+                .launch(&root, None, None, "work".to_string())
+                .await
+                .expect("root launch");
+            let child = child_registry(registry, &root);
+
+            let mut leaves = Vec::with_capacity(width);
+            for leaf_index in 0..width {
+                let leaf = format!("leaf-{parent_index}-{leaf_index}");
+                child
+                    .launch(&leaf, None, None, "work".to_string())
+                    .await
+                    .expect("leaf launch");
+                leaves.push(leaf);
+            }
+            branches.push(Branch {
+                root,
+                registry: child,
+                leaves,
+            });
+        }
+
+        FullTree { branches }
+    }
+
+    /// A completion that always asks for the `blocking` tool, so every round
+    /// that reaches the model ends up suspended inside a session tool.
+    ///
+    /// The header is set by hand rather than through `axum::Json`, which would
+    /// mean turning on axum's `json` feature for one test.
+    async fn mock_tool_call() -> ([(&'static str, &'static str); 1], String) {
+        let body = serde_json::json!({
+            "id": "chatcmpl-shutdown",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_shutdown",
+                        "type": "function",
+                        "function": {"name": "blocking", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        ([("content-type", "application/json")], body.to_string())
+    }
+
+    struct ToolCallServer {
+        base_url: String,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for ToolCallServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn start_tool_call_server() -> ToolCallServer {
+        use axum::routing::post;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let app = axum::Router::new().route("/v1/chat/completions", post(mock_tool_call));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider serves");
+        });
+        ToolCallServer {
+            base_url: format!("http://{address}/v1"),
+            task,
+        }
+    }
+
+    /// Tear `tree` down and report what the join cost against the grace.
+    ///
+    /// The subject is `shutdown_tree`, the *unclamped* join, wrapped here in
+    /// the same budget `shutdown` gives it. Timing `shutdown` instead would
+    /// make the assertion nearly self-fulfilling: it swallows its own timeout
+    /// and returns at roughly the grace no matter how wedged the tree is, so a
+    /// clock read afterwards can only fail by timer overshoot. This way the
+    /// bound is the timeout's own verdict, and the elapsed time is reported for
+    /// the margin rather than asked to stand in for the bound.
+    ///
+    /// Takes both by value so drop order is settled here rather than repeated
+    /// per test: `tree` holds the child registries, and each one's context
+    /// carries a clone of the session's tools that teardown needs released.
+    async fn shutdown_within_grace(
+        shape: &str,
+        registry: SubagentRegistry,
+        tree: FullTree,
+        live: &AtomicUsize,
+    ) {
+        let live_count = tree.live_count();
+        let started = Instant::now();
+        let joined = tokio::time::timeout(SHUTDOWN_GRACE, registry.shutdown_tree()).await;
+        let elapsed = started.elapsed();
+
+        // Visible under `--nocapture`; the margin is the point, not the pass.
+        eprintln!(
+            "[outrig] {shape} {live_count}-subagent tree joined in {elapsed:?} \
+             (grace {SHUTDOWN_GRACE:?})"
+        );
+        assert!(
+            joined.is_ok(),
+            "{shape} full-tree shutdown did not join within {SHUTDOWN_GRACE:?}"
+        );
+
+        drop(tree);
+        drop(registry);
+        assert_eq!(
+            alive(live),
+            0,
+            "{shape} full-tree shutdown must release every session tool clone"
+        );
     }
 
     /// Launch `mid`, then reach into the registry it was given and launch a
@@ -1135,13 +1467,7 @@ mod tests {
             .launch("mid", None, None, "work".to_string())
             .await
             .expect("launch");
-        let child = registry
-            .lock()
-            .get("mid")
-            .expect("live")
-            .child
-            .clone()
-            .expect("a subagent below the depth limit gets a registry");
+        let child = child_registry(registry, "mid");
         child
             .launch("deep", None, None, "work".to_string())
             .await
@@ -1476,6 +1802,48 @@ mod tests {
             "shutdown must reap the whole tree; a grandchild left running keeps \
              a tool clone alive and teardown cannot close the MCP children"
         );
+    }
+
+    /// Measure the shipped worst case after every round has published and
+    /// returned to its prompt loop. This is the largest idle handle set the
+    /// default width and depth permit, not a synthetic ledger-only tree.
+    ///
+    /// Run with `--nocapture` to see the join time it measures.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_idle_tree_shuts_down_within_the_grace() {
+        let (live, tools) = counted_tools();
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.mcp_tools = tools;
+
+        let tree = launch_full_default_tree(&registry).await;
+        tree.wait_until_idle(&registry).await;
+
+        shutdown_within_grace("idle", registry, tree, &live).await;
+    }
+
+    /// Measure the same real tree in the harder shape: every round has entered
+    /// a session tool and is suspended inside that call when shutdown begins.
+    /// That is the case the grace exists to bound -- an idle tree has nothing
+    /// to interrupt.
+    ///
+    /// Needs a provider that answers, so this one points at a loopback endpoint
+    /// that always calls the blocking tool, rather than the fixture's discard
+    /// port where the round would fail before reaching a tool at all.
+    ///
+    /// Run with `--nocapture` to see the join time it measures.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_in_flight_tool_tree_shuts_down_within_the_grace() {
+        let server = start_tool_call_server().await;
+        let mut probe = BlockingTools::new();
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.mcp_tools = probe.take_tools();
+        registry.ctx.resolved =
+            test_resolved_at(&server.base_url, outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX);
+
+        let tree = launch_full_default_tree(&registry).await;
+        probe.wait_for_calls(tree.live_count()).await;
+
+        shutdown_within_grace("in-flight-tool", registry, tree, &probe.live).await;
     }
 
     /// Releasing a subagent mid-session aborts the subagents it launched too,
