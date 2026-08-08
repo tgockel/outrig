@@ -285,10 +285,9 @@ pub outrig::config::LlmProvider::OpenAi::base_url: alloc::string::String
 pub outrig::config::LlmProvider::OpenAi::request_timeout_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::OpenAi::retry_budget_secs: core::option::Option<u64>
 impl outrig::config::LlmProvider
-pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
-pub fn outrig::config::LlmProvider::openai(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, core::option::Option<u64>) -> Self
+pub fn outrig::config::LlmProvider::anthropic(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::AnthropicOptions) -> Self
+pub fn outrig::config::LlmProvider::openai(impl core::convert::Into<alloc::string::String>, outrig::config::ApiKeyRef, outrig::config::OpenAiOptions) -> Self
 pub fn outrig::config::LlmProvider::style(&self) -> &'static str
-pub fn outrig::config::LlmProvider::with_retry_budget_secs(self, core::option::Option<u64>) -> Self
 #[non_exhaustive] pub enum outrig::config::McpServerSpec
 #[non_exhaustive] pub outrig::config::McpServerSpec::Full
 pub outrig::config::McpServerSpec::Full::args: alloc::vec::Vec<alloc::string::String>
@@ -396,6 +395,13 @@ pub outrig::config::Agent::tool_call_max: core::option::Option<u32>
 pub outrig::config::Agent::tool_result_max: core::option::Option<u32>
 impl outrig::config::Agent
 pub fn outrig::config::Agent::subagents_enabled(&self) -> bool
+#[non_exhaustive] pub struct outrig::config::AnthropicOptions
+pub outrig::config::AnthropicOptions::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::AnthropicOptions::retry_budget_secs: core::option::Option<u64>
+impl outrig::config::AnthropicOptions
+pub fn outrig::config::AnthropicOptions::new() -> Self
+pub fn outrig::config::AnthropicOptions::with_request_timeout_secs(self, u64) -> Self
+pub fn outrig::config::AnthropicOptions::with_retry_budget_secs(self, u64) -> Self
 pub struct outrig::config::ApiKeyRef(_)
 impl outrig::config::ApiKeyRef
 pub fn outrig::config::ApiKeyRef::parse(&str) -> outrig::error::Result<Self>
@@ -521,6 +527,13 @@ pub fn outrig::config::NetworkPolicyBuilder::build(self) -> outrig::error::Resul
 pub fn outrig::config::NetworkPolicyBuilder::default_action(self, outrig::config::NetworkAction) -> Self
 pub fn outrig::config::NetworkPolicyBuilder::deny_host(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::NetworkPolicyBuilder::deny_host_port(self, impl core::convert::Into<alloc::string::String>, u16) -> Self
+#[non_exhaustive] pub struct outrig::config::OpenAiOptions
+pub outrig::config::OpenAiOptions::request_timeout_secs: core::option::Option<u64>
+pub outrig::config::OpenAiOptions::retry_budget_secs: core::option::Option<u64>
+impl outrig::config::OpenAiOptions
+pub fn outrig::config::OpenAiOptions::new() -> Self
+pub fn outrig::config::OpenAiOptions::with_request_timeout_secs(self, u64) -> Self
+pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
 #[non_exhaustive] pub struct outrig::config::SidecarConfig
 pub outrig::config::SidecarConfig::args: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::SidecarConfig::image: alloc::string::String

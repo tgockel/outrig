@@ -504,7 +504,7 @@ fn many_roots_over_one_shared_alias_validate_quickly() {
         outrig::config::LlmProvider::openai(
             "https://example.invalid/v1",
             outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_ALIAS_KEY}").expect("api-key ref"),
-            None,
+            outrig::config::OpenAiOptions::new(),
         ),
     );
     let leaves: Vec<String> = (0..N).map(|i| format!("leaf{i}")).collect();
@@ -600,7 +600,7 @@ fn validate_and_model_candidates_agree_on_an_over_deep_bottom_up_chain() {
         outrig::config::LlmProvider::openai(
             "https://example.invalid/v1",
             outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_ALIAS_KEY}").expect("api-key ref"),
-            None,
+            outrig::config::OpenAiOptions::new(),
         ),
     );
     let mut leaf = Model::new("p");

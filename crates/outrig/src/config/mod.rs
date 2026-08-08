@@ -648,6 +648,80 @@ fn reject_repo_network_policy(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Optional settings for an OpenAI-compatible provider.
+///
+/// Non-exhaustive, so a future connection setting is an addition rather than a
+/// change to [`LlmProvider::openai`]'s signature -- which also means the fields
+/// alone cannot construct this from outside the crate. Start from
+/// [`new`](Self::new) and set what you need with `with_*`.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct OpenAiOptions {
+    /// Per-request HTTP timeout in seconds. `None` uses the client default.
+    pub request_timeout_secs: Option<u64>,
+    /// Transient-retry budget in seconds. `None` uses the top-level setting,
+    /// then [`DEFAULT_RETRY_BUDGET_SECS`].
+    pub retry_budget_secs: Option<u64>,
+}
+
+impl OpenAiOptions {
+    /// Options that override nothing: every field below stays `None`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bound each HTTP request to this provider at `secs`, rather than the
+    /// client default.
+    pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.request_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Keep retrying a transiently-failing call to this provider for at most
+    /// `secs`, rather than for the top-level budget. `0` disables retries.
+    pub fn with_retry_budget_secs(mut self, secs: u64) -> Self {
+        self.retry_budget_secs = Some(secs);
+        self
+    }
+}
+
+/// Optional settings for an Anthropic provider.
+///
+/// The twin of [`OpenAiOptions`], and deliberately a separate type rather than
+/// one shared with it: either provider is free to grow a setting the other has
+/// no meaning for, which a shared struct could only ignore in silence on one of
+/// the two paths. Construct it the same way: [`new`](Self::new), then `with_*`.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct AnthropicOptions {
+    /// Per-request HTTP timeout in seconds. `None` uses the client default.
+    pub request_timeout_secs: Option<u64>,
+    /// Transient-retry budget in seconds. `None` uses the top-level setting,
+    /// then [`DEFAULT_RETRY_BUDGET_SECS`].
+    pub retry_budget_secs: Option<u64>,
+}
+
+impl AnthropicOptions {
+    /// Options that override nothing: every field below stays `None`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bound each HTTP request to this provider at `secs`, rather than the
+    /// client default.
+    pub fn with_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.request_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Keep retrying a transiently-failing call to this provider for at most
+    /// `secs`, rather than for the top-level budget. `0` disables retries.
+    pub fn with_retry_budget_secs(mut self, secs: u64) -> Self {
+        self.retry_budget_secs = Some(secs);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "style",
@@ -698,62 +772,30 @@ impl LlmProvider {
         }
     }
 
-    /// An OpenAI-compatible provider at `base_url`. `request_timeout_secs`
-    /// falls back to the client default when `None`.
-    pub fn openai(
-        base_url: impl Into<String>,
-        api_key: ApiKeyRef,
-        request_timeout_secs: Option<u64>,
-    ) -> Self {
+    /// An OpenAI-compatible provider at `base_url`.
+    pub fn openai(base_url: impl Into<String>, api_key: ApiKeyRef, options: OpenAiOptions) -> Self {
         Self::OpenAi {
             base_url: base_url.into(),
             api_key,
-            request_timeout_secs,
-            retry_budget_secs: None,
+            request_timeout_secs: options.request_timeout_secs,
+            retry_budget_secs: options.retry_budget_secs,
         }
     }
 
     /// Anthropic's native Messages API at `base_url` -- the official endpoint
     /// is `https://api.anthropic.com`. A trailing `/v1`, `/messages`, or
     /// `/v1/messages` is normalized away by the client, so either form works.
-    /// `request_timeout_secs` falls back to the client default when `None`.
     pub fn anthropic(
         base_url: impl Into<String>,
         api_key: ApiKeyRef,
-        request_timeout_secs: Option<u64>,
+        options: AnthropicOptions,
     ) -> Self {
         Self::Anthropic {
             base_url: base_url.into(),
             api_key,
-            request_timeout_secs,
-            retry_budget_secs: None,
+            request_timeout_secs: options.request_timeout_secs,
+            retry_budget_secs: options.retry_budget_secs,
         }
-    }
-
-    /// Set the transient-retry budget, in seconds. `None` falls back to the
-    /// top-level `retry-budget-secs`, then to [`DEFAULT_RETRY_BUDGET_SECS`].
-    ///
-    /// A builder step rather than a fourth parameter on [`Self::openai`] /
-    /// [`Self::anthropic`]: those are positional, so widening them would break
-    /// every caller, and the public surface is settled as of 0.2.0. The cost is
-    /// that provider construction now speaks two idioms -- three required
-    /// fields positionally, the optional fourth by method -- and that this is a
-    /// no-op on [`Self::Mistralrs`], which has no HTTP layer to retry. Folding
-    /// both into one options struct is the right end state and wants the next
-    /// breaking window; see
-    /// `plan/next/provider-construction-options-struct.md`.
-    #[must_use]
-    pub fn with_retry_budget_secs(mut self, secs: Option<u64>) -> Self {
-        match &mut self {
-            Self::OpenAi {
-                retry_budget_secs, ..
-            }
-            | Self::Anthropic {
-                retry_budget_secs, ..
-            } => *retry_budget_secs = secs,
-            Self::Mistralrs => {}
-        }
-        self
     }
 }
 

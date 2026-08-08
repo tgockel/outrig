@@ -8,7 +8,9 @@ use std::path::Path;
 
 use tempfile::tempdir;
 
-use outrig::config::{ApiKeyRef, Config, ConfigValidationError, LlmProvider};
+use outrig::config::{
+    AnthropicOptions, ApiKeyRef, Config, ConfigValidationError, LlmProvider, OpenAiOptions,
+};
 use outrig::error::OutrigError;
 
 fn parse(s: &str) -> Config {
@@ -592,50 +594,57 @@ model-path = "models/missing.gguf"
     );
 }
 
-/// `with_retry_budget_secs` is the additive counterpart to the positional
-/// constructors, so it has to hold for every variant -- including the
-/// in-process one, where it is a documented no-op. Nothing in the config path
-/// calls it (serde populates the field directly), so this is the only thing
-/// pinning the public API's behavior.
+/// The constructor options carry both remote-only settings in one place, each
+/// `with_*` reaches its own field without disturbing the other, and `new`
+/// leaves both unset. Nothing in the config path constructs a provider this way
+/// -- serde populates the fields directly -- so this is the only thing pinning
+/// the published surface.
 #[test]
-fn with_retry_budget_secs_sets_remote_variants_and_skips_mistralrs() {
+fn remote_provider_options_populate_remote_variants() {
     let key = ApiKeyRef::parse("${OPENAI_API_KEY}").expect("api-key ref parses");
-    let openai = LlmProvider::openai("https://api.openai.com/v1", key, Some(90))
-        .with_retry_budget_secs(Some(120));
-    let LlmProvider::OpenAi {
-        request_timeout_secs,
-        retry_budget_secs,
-        ..
-    } = &openai
-    else {
-        panic!("expected the OpenAi variant, got: {openai:?}");
-    };
-    assert_eq!(*retry_budget_secs, Some(120));
-    assert_eq!(
-        *request_timeout_secs,
-        Some(90),
-        "the builder must not disturb the fields the constructor set",
+    let openai = LlmProvider::openai(
+        "https://api.openai.com/v1",
+        key,
+        OpenAiOptions::new()
+            .with_request_timeout_secs(90)
+            .with_retry_budget_secs(120),
+    );
+    assert!(
+        matches!(
+            openai,
+            LlmProvider::OpenAi {
+                request_timeout_secs: Some(90),
+                retry_budget_secs: Some(120),
+                ..
+            }
+        ),
+        "got: {openai:?}",
     );
 
     let key = ApiKeyRef::parse("${ANTHROPIC_API_KEY}").expect("api-key ref parses");
-    let anthropic =
-        LlmProvider::anthropic("https://api.anthropic.com", key, None).with_retry_budget_secs(None);
+    let anthropic = LlmProvider::anthropic(
+        "https://api.anthropic.com",
+        key,
+        AnthropicOptions::new().with_retry_budget_secs(0),
+    );
     assert!(
         matches!(
             anthropic,
             LlmProvider::Anthropic {
-                retry_budget_secs: None,
+                request_timeout_secs: None,
+                retry_budget_secs: Some(0),
                 ..
             }
         ),
-        "got: {anthropic:?}",
+        "one setter must leave the other field alone, and `0` is retries off \
+         rather than an absent value; got: {anthropic:?}",
     );
 
-    // No HTTP layer, so nothing to retry and nowhere to record it. The TOML
-    // path cannot express this at all -- `deny_unknown_fields` on the tagged
-    // enum rejects `retry-budget-secs` under `style = "mistralrs"`.
-    assert_eq!(
-        LlmProvider::Mistralrs.with_retry_budget_secs(Some(300)),
-        LlmProvider::Mistralrs,
-    );
+    // `new` is the no-override spelling, and the one the docs and the migration
+    // note name -- so it has to keep agreeing with the derived `Default` that
+    // four other call sites reach through. The fields themselves are covered
+    // above: the Anthropic provider was built from a bare `new` plus one setter
+    // and came out with `request_timeout_secs: None`.
+    assert_eq!(OpenAiOptions::new(), OpenAiOptions::default());
+    assert_eq!(AnthropicOptions::new(), AnthropicOptions::default());
 }

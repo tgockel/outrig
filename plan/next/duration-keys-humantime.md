@@ -21,16 +21,20 @@ work is every duration key at once:
 
 - `Config::retry_budget_secs`
 - `LlmProvider::OpenAi` / `::Anthropic` -- `request_timeout_secs`, `retry_budget_secs`
-- `LlmProvider::with_retry_budget_secs`, and the positional `openai` / `anthropic`
-  constructors
+- `OpenAiOptions` / `AnthropicOptions` -- both fields and both `with_*` setters
 - `DEFAULT_RETRY_BUDGET_SECS`, `RETRY_BUDGET_SECS_CEILING`,
   `REQUEST_TIMEOUT_SECS_CEILING`, `DEFAULT_REQUEST_TIMEOUT_SECS`
 - both provider tables and the validation rules in `doc/reference/config.md`
 - `crates/outrig/public-api.txt`
 
-Interacts with `plan/next/provider-construction-options-struct.md` (0111), which
-already reshapes those constructors -- if both are wanted, do them together
-rather than rewriting the same signatures twice.
+0111 already landed the reshape this entry used to have to sequence around: the
+`openai` / `anthropic` constructors are no longer positional and
+`LlmProvider::with_retry_budget_secs` is gone, so the duration values now enter
+through the two options types rather than through four signatures. That shrinks
+this entry -- the setters are where a `humantime` string would be accepted, and
+their arguments are already `u64` rather than `Option<u64>`, so the conversion
+is a type change on two methods per struct plus the fields behind them. See
+`plan/done/0111-provider-construction-options-struct.md`.
 
 ## Notes
 
@@ -53,4 +57,5 @@ bare `"600"`, and whether the error text is good enough to surface raw.
 
 ## Dependencies
 
-None hard. Sequence with or after 0111, which touches the same signatures.
+None hard. 0111 was the sequencing constraint and has landed, so the signatures
+this would rewrite are settled.

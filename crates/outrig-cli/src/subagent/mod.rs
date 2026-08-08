@@ -951,7 +951,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 pub(crate) mod fixtures {
     use super::*;
     use crate::llm::ResolvedProvider;
-    use outrig::config::{Agent, ApiKeyRef, LlmProvider, Model};
+    use outrig::config::{Agent, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
 
     /// The env var the fixture provider's api-key points at. Unique to this
     /// module so concurrent tests cannot race another fixture on the same key.
@@ -972,7 +972,7 @@ pub(crate) mod fixtures {
             LlmProvider::openai(
                 "http://127.0.0.1:9",
                 ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
-                Some(1),
+                OpenAiOptions::new().with_request_timeout_secs(1),
             ),
         );
         let mut agent = Agent::default();
@@ -2281,7 +2281,7 @@ mod tests {
                 "http://127.0.0.1:9",
                 outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_SUBAGENT_NEVER_SET_KEY}")
                     .expect("api-key ref parses"),
-                Some(1),
+                outrig::config::OpenAiOptions::new().with_request_timeout_secs(1),
             ),
         );
         let mut model = outrig::config::Model::new("keyless");

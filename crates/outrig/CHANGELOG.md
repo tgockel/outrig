@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `LlmProvider::openai` and `LlmProvider::anthropic` now take an options
+  struct**, `OpenAiOptions` and `AnthropicOptions` respectively, instead of a positional
+  `request_timeout_secs`. Both structs also carry `retry_budget_secs`, so
+  `LlmProvider::with_retry_budget_secs` is removed -- a retry budget can no longer be handed to
+  the in-process `Mistralrs` variant, which had nowhere to record it and discarded it in
+  silence. Migrate a constructor with no overrides by replacing its third argument with
+  `OpenAiOptions::new()` or `AnthropicOptions::new()`, and one that set a timeout with
+  `OpenAiOptions::new().with_request_timeout_secs(secs)`; `with_retry_budget_secs(secs)` on
+  either options type replaces the removed `LlmProvider` method. The structs are
+  `#[non_exhaustive]`, so later connection settings can be added without changing the
+  constructor signatures again -- which also means the `with_*` setters, not the public fields,
+  are how a downstream crate builds one.
+
 - **Breaking: `Model::provider` is now `Option<String>`.** A model entry has two mutually
   exclusive shapes -- a provider that serves it, or an `alias` naming other models -- so the
   field that identifies the first cannot be required. This follows `ImageConfig` exactly,

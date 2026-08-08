@@ -18,7 +18,7 @@ use crate::error::{OutrigError, Result};
 use crate::hf::{self, HfTreeFetcher};
 use crate::init::prompt::{self, Field, PromptSource};
 use crate::paths::{global_config_path, write_atomic};
-use outrig::config::{ApiKeyRef, LlmProvider, Model};
+use outrig::config::{AnthropicOptions, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
 
 /// Public entry: resolve the path, pick a `PromptSource` via
 /// `prompt::auto()` (dialoguer on a TTY, line-based on piped stdin), and
@@ -326,7 +326,11 @@ async fn prompt_openai_provider(prompt: &mut impl PromptSource) -> Result<LlmPro
         .ask_string(&API_KEY_ENV_FIELD, "OPENAI_API_KEY")
         .await?;
     let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
-    Ok(LlmProvider::openai(base_url, api_key, None))
+    Ok(LlmProvider::openai(
+        base_url,
+        api_key,
+        OpenAiOptions::new(),
+    ))
 }
 
 async fn prompt_anthropic_provider(prompt: &mut impl PromptSource) -> Result<LlmProvider> {
@@ -339,7 +343,11 @@ async fn prompt_anthropic_provider(prompt: &mut impl PromptSource) -> Result<Llm
         .ask_string(&API_KEY_ENV_FIELD, "ANTHROPIC_API_KEY")
         .await?;
     let api_key = ApiKeyRef::parse(&format!("${{{env_name}}}"))?;
-    Ok(LlmProvider::anthropic(base_url, api_key, None))
+    Ok(LlmProvider::anthropic(
+        base_url,
+        api_key,
+        AnthropicOptions::new(),
+    ))
 }
 
 async fn prompt_models(

@@ -25,15 +25,12 @@ longer public at all. 0098 cashed the sweep in a second time, adding an `LlmProv
 variant and a `Model::max_tokens` field additively; the one break it did take -- renaming three
 provider-specific `ConfigValidationError` variants -- was chosen, not forced.
 
-Everything through 0106 landed; 0105-0111 refilled the queue from `plan/next/`
+Everything through 0111 landed; 0105-0111 refilled the queue from `plan/next/`
 against one gate: **does deferring this force a breaking change later, or freeze a contract a
 point release cannot fix?** The 0094 sweep is what makes that question narrow -- `#[non_exhaustive]`
 makes field and variant *additions* free, so what is left are field *type* changes, variants the
 sweep did not seal, and published method signatures. Seven of the 39 entries in `plan/next/`
 qualified. The rest are additive by construction, internal, or explicitly post-v0, and stay there.
-
-- **0111 [provider-construction-options-struct](0111-provider-construction-options-struct.md)** --
-  `LlmProvider::openai` / `::anthropic` take their fields positionally, and Rust cannot overload.
 
 0110 landed, taking the last of the seven field *type* changes: `Model::provider` is now
 `Option<String>`, because a model entry names either a provider or an `alias` over other models.
@@ -91,10 +88,17 @@ what the acceptance criterion had to be read against. And the first draft of the
 flag deleted; it now uses `/workspace/sub`, verified by removing the flag and watching it go red.
 The suite gained its first shell-less image, which is the case the argv form exists to serve.
 
-0111 is last deliberately. It is the only one of the seven that is API *shape* rather than API
-*correctness*: rc.1 shipped `with_retry_budget_secs` as the non-breaking workaround, and
-`#[non_exhaustive]` means downstream cannot construct the variants anyway. It is the first entry to
-cut if the window tightens.
+0111 landed last, as sequenced: it was the only one of the seven that is API *shape* rather than
+API *correctness*, so it was the entry to cut had the window tightened. `LlmProvider::openai` /
+`::anthropic` now take `OpenAiOptions` / `AnthropicOptions`, and `with_retry_budget_secs` -- rc.1's
+non-breaking workaround, and a silent no-op on the `Mistralrs` variant -- is gone, the no-op
+dissolved by construction rather than replaced by a check. Two things carry forward. An options
+struct that is `#[non_exhaustive]` needs `new` plus `with_*` setters to be usable at all from
+downstream, because the attribute forbids the struct literal that `..Default::default()` would
+need; the draft that shipped bare `pub` fields typechecked in-tree and would have been dead on
+arrival outside it. And no lint catches that -- `field_reassign_with_default` declines to fire
+precisely because its suggested fix is the form the attribute forbids -- so the convention 0095 and
+0107 established is held by review and nothing else.
 
 Two things are **not** queued and are worth stating so they are not re-litigated. Regenerating
 `crates/outrig/public-api.txt` is each task's own deliverable rather than a task of its own -- four
