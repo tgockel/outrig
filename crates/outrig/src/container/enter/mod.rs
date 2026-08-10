@@ -20,10 +20,12 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{IoPathExt, OutrigError, Result};
 
-// The pure ELF parser and `PATH` expansion are unit-tested on the host;
-// `launcher.rs` pulls the same files in with `include!` for the musl build.
-// Neither has a non-test consumer in the library, so both are compiled only
-// under `cfg(test)`.
+// The ELF parser, the `PATH` expansion and the symlink resolution are
+// unit-tested on the host; `launcher.rs` pulls the same files in with
+// `include!` for the musl build. None has a non-test consumer in the library,
+// so all three are compiled only under `cfg(test)`.
+#[cfg(test)]
+mod canon;
 #[cfg(test)]
 mod elf;
 #[cfg(test)]

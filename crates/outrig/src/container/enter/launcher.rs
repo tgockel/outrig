@@ -18,13 +18,20 @@
 //! (to open the target's nsfs file).
 //!
 //! **The argv contract, which the caller depends on:** `PROGRAM` is in *this*
-//! container's coordinates, ungrafted -- it is opened before the setns, while
-//! this image's rootfs is still at `/`, and the graft is applied to it here
-//! when handing the path to the loader. A `PROGRAM` with no `/` in it is
-//! searched along this process's own `PATH` first (see `path_search.rs`), which
-//! is the sidecar image's -- the same environment the image's `ENTRYPOINT`
-//! would have resolved against had podman run it directly. `ARGS...` are in the
-//! *target's* coordinates and are passed through untouched.
+//! container's coordinates, ungrafted -- it is opened *and resolved to a
+//! symlink-free path* before the setns, while this image's rootfs is still at
+//! `/`, and the graft is applied to it here when handing the path to the
+//! loader. Opening it is not enough on its own: the loader is given the path
+//! by name and opens it again, after the setns, when an absolute symlink in it
+//! would mean a file of the primary's (see the ordering contract below). For
+//! the same reason a *dynamic* `PROGRAM` that is not absolute is refused --
+//! there is no working directory left to apply the graft prefix to. A static
+//! one is unaffected, having no path to hand anybody. A `PROGRAM` with no `/`
+//! in it is searched along this process's own `PATH` first (see
+//! `path_search.rs`), which is the sidecar image's -- the same environment the
+//! image's `ENTRYPOINT` would have resolved against had podman run it
+//! directly. `ARGS...` are in the *target's* coordinates and are passed
+//! through untouched.
 //! `container::sidecar`'s `build_primary_view_argv` is the producer that honors
 //! this; changing either side alone silently breaks the other, and the failure
 //! looks like an image that cannot find its own interpreter.
@@ -45,14 +52,25 @@
 //! `0755`. Reordering the drop earlier breaks the graft; reordering it later
 //! is not possible, because the exec is the last thing this process does.
 //!
+//! Every path this file *hands* the dynamic exec -- the program, its
+//! interpreter, and each `--library-path` entry -- is canonicalized in that
+//! same pre-setns phase, and for the same reason rather than as a tidiness
+//! pass: after the setns an absolute symlink resolves in the primary's rootfs
+//! instead of the graft, which `canon.rs` explains in full. That closes the
+//! paths this file names. It does not close the ones ld.so goes on to find for
+//! itself -- a `DT_NEEDED` library that is an absolute symlink escapes by the
+//! identical mechanism, as does musl's `/etc/ld-musl-<arch>.path`; see
+//! `plan/next/enter-musl-loader-reads-the-primarys-path-file.md`.
+//!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
-//! Linux musl target; it is not part of the normal `cargo build`. The pure
-//! logic it relies on lives in `elf.rs` and `path_search.rs`, pulled in below
-//! and unit-tested on the host.
+//! Linux musl target; it is not part of the normal `cargo build`. The logic it
+//! relies on lives in `elf.rs`, `path_search.rs` and `canon.rs`, pulled in
+//! below and unit-tested on the host.
 
 use std::ffi::{CString, OsString, c_char, c_int, c_long, c_ulong, c_void};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
+include!("canon.rs");
 include!("elf.rs");
 include!("path_search.rs");
 
@@ -125,6 +143,46 @@ fn lib_dirs() -> [String; 7] {
     ]
 }
 
+/// Whether `path` is here, in whatever rootfs is currently at `/`. Leaves
+/// errno as the failed `open` set it, so a caller may `die()` straight after.
+fn exists(path: &str) -> bool {
+    let path_c = cstr(path.as_bytes());
+    let fd = unsafe { open(path_c.as_ptr(), O_RDONLY) };
+    if fd < 0 {
+        return false;
+    }
+    unsafe { close(fd) };
+    true
+}
+
+/// The `lib_dirs()` this image actually has, canonicalized and deduplicated --
+/// still graft-relative, and still in the fixed list's order.
+///
+/// Canonicalizing is the same rule the program and its interpreter follow: the
+/// loader opens these by name after the setns, so a distro whose `/lib` were an
+/// *absolute* symlink would silently be offered the primary's libraries. Both
+/// Debian's and Ubuntu's are relative, which is the only reason this one is
+/// latent. Deduplication then falls out for free, since `lib_dirs()` is a fixed
+/// guess covering four distro layouts at once and several of its entries
+/// collapse onto one real directory.
+///
+/// Dropping the absent ones is a separate, deliberate choice -- resolution
+/// keeps a missing component verbatim rather than failing, so this is the
+/// `open` probe's doing, not the walk's. Passing a directory the image does not
+/// have was harmless; not passing it says what was searched.
+///
+/// Must run before the setns, for the reason `canonicalize_under_root` gives.
+fn present_lib_dirs() -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    for dir in lib_dirs() {
+        let canon = canonical_or_die("library path", dir.as_bytes());
+        if exists(&canon) && !dirs.contains(&canon) {
+            dirs.push(canon);
+        }
+    }
+    dirs
+}
+
 /// Report `step` with the current errno (plus an optional capability hint) and
 /// exit. Never unwinds and never touches the target's filesystem.
 fn die(step: &str, hint: &str) -> ! {
@@ -135,6 +193,35 @@ fn die(step: &str, hint: &str) -> ! {
 
 fn cstr(bytes: &[u8]) -> CString {
     CString::new(bytes).unwrap_or_else(|_| die("argument contains an interior NUL", ""))
+}
+
+/// Resolve `path` against this image's rootfs, or report which path could not
+/// be resolved and exit. `role` names it the way the caller thinks of it --
+/// "PROGRAM", "interpreter" -- since the path itself is often one the user
+/// never wrote.
+///
+/// Lossy, like every other path this file renders: the result is headed for a
+/// `format!` either way.
+///
+/// Must run before the setns; see the ordering contract in the module docs.
+fn canonical_or_die(role: &str, path: &[u8]) -> String {
+    // Named here rather than by errno: the "not absolute" rule is the caller's
+    // to explain, and `canon.rs`'s constants are its own.
+    let hint = match path.starts_with(b"/") {
+        true => "",
+        false => " (not an absolute path, so the graft point cannot be applied to it)",
+    };
+    match canonicalize_under_root(b"", path) {
+        Ok(canon) => String::from_utf8_lossy(&canon).into_owned(),
+        Err(errno) => {
+            let err = std::io::Error::from_raw_os_error(errno);
+            eprintln!(
+                "outrig-enter: resolve {role} {}: {err}{hint}",
+                String::from_utf8_lossy(path),
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// A NULL-terminated `argv`/`envp` array borrowing from `items`.
@@ -196,6 +283,22 @@ fn drop_privileges(uid: u32, gid: u32) {
     if unsafe { setresuid(uid, uid, uid) } < 0 {
         die(&format!("setresuid({uid})"), "");
     }
+}
+
+/// What a dynamic payload's exec needs, every path of it resolved while the
+/// sidecar's rootfs is still `/`. A static payload has no equivalent: it execs
+/// from a descriptor and resolves nothing at all after the setns, which is why
+/// it was never exposed to the graft escape `canon.rs` describes.
+struct DynamicLaunch {
+    /// `PROGRAM` as the lookup settled it, canonical -- the loader is handed
+    /// this by name and opens it itself.
+    program: String,
+    /// The payload's `PT_INTERP`, canonical and confirmed present.
+    loader: String,
+    /// [`present_lib_dirs`], for the loader's `--library-path`.
+    lib_dirs: Vec<String>,
+    /// Whether that loader is musl's, which takes no `--inhibit-cache`.
+    musl: bool,
 }
 
 fn main() {
@@ -301,10 +404,40 @@ fn main() {
         }
     };
 
+    // Everything the exec will later name is settled here, against this image's
+    // rootfs; see the ordering contract.
+    let dynamic = match &kind {
+        ElfKind::Static => None,
+        ElfKind::Dynamic(interp) => {
+            let program = canonical_or_die("PROGRAM", resolved.as_os_str().as_bytes());
+            let loader = canonical_or_die("interpreter", interp.as_bytes());
+            // Confirmed present here rather than left to the exec: after the
+            // setns a loader path that reaches one of the primary's files is a
+            // segfault with nothing on stderr, and one that reaches none of
+            // them is an error naming a path the user never wrote.
+            if !exists(&loader) {
+                die(
+                    &format!("open interpreter {loader}"),
+                    " (the payload's PT_INTERP; not in the sidecar image)",
+                );
+            }
+            Some(DynamicLaunch {
+                program,
+                loader,
+                lib_dirs: present_lib_dirs(),
+                // Read from the interpreter as the image wrote it, not as it
+                // resolves: an image is free to route `ld-musl-*.so.1` through
+                // a differently named real file, and which loader this is does
+                // not change when its path does.
+                musl: interp.contains("ld-musl"),
+            })
+        }
+    };
+
     let root = cstr(b"/");
     // A static payload resolves nothing through either rootfs, so it needs no
     // graft -- only the dynamic path snapshots the sidecar's root before setns.
-    let tree_fd = if matches!(kind, ElfKind::Dynamic(_)) {
+    let tree_fd = if dynamic.is_some() {
         let fd = unsafe {
             syscall(SYS_OPEN_TREE, AT_FDCWD, root.as_ptr(), OPEN_TREE_CLONE | AT_RECURSIVE)
         } as c_int;
@@ -406,12 +539,12 @@ fn main() {
         drop_privileges(uid, gid);
     }
 
-    match kind {
-        ElfKind::Static => {
-            // Run straight from the fd: nothing resolves through the target, so
-            // its libc is irrelevant. `argv[0]` stays as the caller wrote it --
-            // a name found on `PATH` reaches the payload as that name, which is
-            // what `execvp` hands it too.
+    match dynamic {
+        None => {
+            // Static: run straight from the fd, so nothing resolves through the
+            // target and its libc is irrelevant. `argv[0]` stays as the caller
+            // wrote it -- a name found on `PATH` reaches the payload as that
+            // name, which is what `execvp` hands it too.
             let argv: Vec<CString> = prog_argv.iter().map(|a| cstr(a.as_bytes())).collect();
             let envp = environ_cstrings();
             let argv_p = arg_ptrs(&argv);
@@ -429,13 +562,16 @@ fn main() {
             }
             die("execveat", "");
         }
-        ElfKind::Dynamic(interp) => {
-            // Run through the sidecar's own loader, now under the graft
-            // point, at the path the lookup settled on.
+        Some(dynamic) => {
+            // Run through the sidecar's own loader, now under the graft point,
+            // at the paths resolved before the setns. Every one of these is
+            // symlink-free already, so prefixing the graft is the last thing
+            // that happens to them.
             let g = graft.to_string_lossy();
-            let loader = format!("{g}{interp}");
-            let progpath = format!("{g}{}", resolved.display());
-            let libpath = lib_dirs()
+            let loader = format!("{g}{}", dynamic.loader);
+            let progpath = format!("{g}{}", dynamic.program);
+            let libpath = dynamic
+                .lib_dirs
                 .iter()
                 .map(|d| format!("{g}{d}"))
                 .collect::<Vec<_>>()
@@ -445,7 +581,7 @@ fn main() {
             launch.push(cstr(loader.as_bytes()));
             // musl's loader takes --library-path but not glibc's --inhibit-cache,
             // and MCP images are very often Alpine-based.
-            if !interp.contains("ld-musl") {
+            if !dynamic.musl {
                 launch.push(cstr(b"--inhibit-cache"));
             }
             launch.push(cstr(b"--library-path"));
