@@ -28,6 +28,11 @@ static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// point of that placement is that an unmodified third-party image works.
 const MCP_FS_IMAGE: &str = "docker.io/mcp/filesystem:latest";
 
+/// A primary whose glibc (2.39) differs from the Debian-based sidecar's (2.36)
+/// in `primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader`. The mismatch
+/// is the test; see there.
+const UBUNTU_IMAGE: &str = "docker.io/library/ubuntu:24.04";
+
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
 }
@@ -55,20 +60,21 @@ fn build_fixture_image(tag: &str) {
     podman_build(tag, &fixture_dir());
 }
 
-/// Ensure the off-the-shelf MCP image is present locally; outrig launches it
-/// `--pull=never`, so the test pulls it on demand.
-fn ensure_mcp_fs_image() {
+/// Ensure an off-the-shelf image is present locally; outrig launches every
+/// image `--pull=never`, so a stock ref has to be pulled on demand before it
+/// can be named directly in a spec.
+fn ensure_image(image: &str) {
     let present = std::process::Command::new("podman")
-        .args(["image", "exists", MCP_FS_IMAGE])
+        .args(["image", "exists", image])
         .status()
         .expect("podman image exists")
         .success();
     if !present {
         let status = std::process::Command::new("podman")
-            .args(["pull", MCP_FS_IMAGE])
+            .args(["pull", image])
             .status()
             .expect("podman pull");
-        assert!(status.success(), "failed to pull {MCP_FS_IMAGE}");
+        assert!(status.success(), "failed to pull {image}");
     }
 }
 
@@ -390,7 +396,7 @@ async fn launch_with_entrypoint_sidecar_serves_tools() {
     let _guard = E2E_LOCK.lock().await;
     init_tracing();
 
-    ensure_mcp_fs_image();
+    ensure_image(MCP_FS_IMAGE);
     let primary_tag = format!(
         "localhost/outrig-library-surface-entrypoint-primary-{}:latest",
         std::process::id(),
@@ -464,7 +470,7 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         "localhost/outrig-library-surface-view-sidecar-{}:latest",
         std::process::id(),
     );
-    ensure_mcp_fs_image();
+    ensure_image(MCP_FS_IMAGE);
     build_image_with_entrypoint(
         &sidecar_tag,
         MCP_FS_IMAGE,
@@ -595,6 +601,118 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
     outrig.shutdown().await.expect("shutdown");
     assert_eq!(
         sidecar_containers_labeled("fs"),
+        Vec::<String>::new(),
+        "shutdown should remove the sidecar container"
+    );
+}
+
+/// `view = "primary"` with a **glibc** sidecar against a primary carrying a
+/// *differently versioned* glibc -- the pairing that caught `outrig-enter`
+/// exec'ing the wrong dynamic loader.
+///
+/// `setns(CLONE_NEWNS)` moves the launcher's root directory, so an absolute
+/// symlink met under the graft afterwards resolves in the *primary's* rootfs.
+/// Debian's `/lib64/ld-linux-x86-64.so.2` is exactly that (Ubuntu's is
+/// relative), so `execv("/mnt/lib64/ld-linux-x86-64.so.2")` ran Ubuntu's
+/// ld.so 2.39 against Debian's libc 2.36 -- one version-locked unit, mismatched
+/// -- and the payload died on SIGSEGV before writing a byte to stderr.
+///
+/// Nothing else in the suite can fail this way. Every other `view = "primary"`
+/// test runs an Alpine sidecar, whose `/lib/ld-musl-x86_64.so.1` is a real file
+/// with no link to escape through, and a Debian sidecar over the existing
+/// `rust:1-slim` primary would pair 2.36 with 2.36 and work by accident. The
+/// two glibcs have to differ, which is why the primary here is `ubuntu:24.04`
+/// rather than a fixture.
+///
+/// The assertion is on the *success*: the server handshakes and serves the
+/// primary's tree. Asserting on exit 139 would pass for the wrong reason.
+///
+/// What the view itself shows is the test above's job, so this one asserts only
+/// the part that used to segfault plus one listing to prove the payload really
+/// is serving the primary.
+#[tokio::test]
+async fn primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-view-glibc-sidecar-{}:latest",
+        std::process::id(),
+    );
+    // The absolute `/lib64` interpreter symlink comes free with the base image.
+    // The `ENTRYPOINT` names `node` absolutely and the server by its real path
+    // rather than the `mcp-server-filesystem` shim, which is a shebang script
+    // and so refused before any of this is reached.
+    build_image_from_dockerfile(
+        &sidecar_tag,
+        "FROM docker.io/library/node:22-slim\n\
+         RUN npm install -g @modelcontextprotocol/server-filesystem\n\
+         ENTRYPOINT [\"/usr/local/bin/node\", \
+         \"/usr/local/lib/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js\"]\n",
+    );
+    // Stock and unmodified: the primary contributes only its glibc version, so
+    // a derived image would be a build that adds no layer.
+    ensure_image(UBUNTU_IMAGE);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        UBUNTU_IMAGE,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+
+    let mut outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // Written into the primary's own rootfs, outside every bind mount.
+    let touched = outrig
+        .exec_capture(
+            &[
+                "sh".into(),
+                "-lc".into(),
+                "echo hi > /tmp/IN-PRIMARY.txt".into(),
+            ],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("exec_capture in the primary");
+    assert!(
+        touched.status.success(),
+        "writing into the primary failed: {}",
+        String::from_utf8_lossy(&touched.stderr),
+    );
+
+    // The add is where the segfault surfaced: the payload died during the MCP
+    // handshake, so `add_sidecar` failed with "connection closed" and exit 139.
+    let tools = outrig
+        .add_sidecar(
+            SidecarSpec::from_image("glibcfs", sidecar_tag.as_str())
+                .with_view(SidecarView::Primary)
+                .with_entrypoint_server("glibcfs", ["/"]),
+        )
+        .await
+        .expect("a glibc sidecar must run its own loader, not the primary's");
+    assert!(
+        !tools.is_empty(),
+        "the glibc sidecar should have served at least one tool",
+    );
+
+    let tmp = outrig
+        .call_tool(
+            "glibcfs",
+            "list_directory",
+            serde_json::json!({ "path": "/tmp" }),
+        )
+        .await
+        .expect("list the primary's own rootfs through the view");
+    assert!(
+        tmp.content_text.contains("IN-PRIMARY.txt"),
+        "the view should show a file only the primary container has, got: {}",
+        tmp.content_text,
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+    assert_eq!(
+        sidecar_containers_labeled("glibcfs"),
         Vec::<String>::new(),
         "shutdown should remove the sidecar container"
     );

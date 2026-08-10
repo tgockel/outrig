@@ -177,6 +177,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yes case. `Container::bootstrap_user` is unchanged, and its failures are unchanged in
   kind -- only in that a namespace-entry failure is now reported rather than absorbed.
 
+### Fixed
+
+- **A `view = "primary"` sidecar on a Debian/glibc base no longer dies on SIGSEGV with an
+  empty stderr.** The visible failure was `mcp server "..." failed to start: connection
+  closed: initialize response` with `exit: code 139` and nothing to read, which is as close to
+  no diagnosis as a failure gets.
+
+  `setns(CLONE_NEWNS)` moves the launcher's *root directory*, not only its mounts, so an
+  absolute symlink met under the graft afterwards resolves in the primary's rootfs rather than
+  the sidecar's. Debian's `/lib64/ld-linux-x86-64.so.2` is such a link where Ubuntu's is
+  relative, so `outrig-enter` exec'd the *primary's* dynamic loader and handed it the
+  *sidecar's* `libc.so.6` off `--library-path`. ld.so and libc.so.6 are one version-locked
+  unit; the mismatched pair corrupts itself during early startup, before either can write to
+  fd 2. Against a musl primary the same escape merely `ENOENT`s -- the identical defect, with
+  a legible message.
+
+  `outrig-enter` now resolves every path the exec will later open *by name* -- the program,
+  its `PT_INTERP` interpreter, and each `--library-path` entry -- while the sidecar's own
+  rootfs is still `/`, so a path that survives to the exec means the same thing on both sides
+  of the namespace join. The interpreter is also confirmed present at that point, since a
+  missing one is legible before the setns and a segfault after it. Two smaller consequences:
+  loader search directories the image does not have are dropped rather than passed dead, and a
+  dynamically linked `PROGRAM` named by a relative path is refused rather than exec'd as the
+  nonsense `/mnt./server`. Statically linked payloads are untouched -- they exec from a
+  descriptor and resolve nothing after the setns, which is why they were never affected.
+
 ## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-08-02
 
 A release candidate. This is the first cycle to break the public surface, so it goes out for
