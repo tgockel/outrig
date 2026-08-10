@@ -1056,12 +1056,32 @@ pub(crate) mod fixtures {
     /// model the fixture agent is configured on, against the discard port.
     pub(crate) fn test_resolved(subagent_depth_max: u32) -> ResolvedAgent {
         // Discard port: connects are refused immediately.
-        test_resolved_at("http://127.0.0.1:9", subagent_depth_max)
+        test_resolved_at("http://127.0.0.1:9", None, subagent_depth_max)
+    }
+
+    /// [`test_resolved`] with retries switched off, for the real-clock tests
+    /// that need a round against the discard port to fail on the first refused
+    /// connect rather than ride the connect budget out.
+    ///
+    /// The default is deliberately *not* this: a fixture that pins retries off
+    /// to stay fast is compensating for the retry classification, which is the
+    /// thing the connect budget fixed. Measuring something other than retry is
+    /// the case that earns the opt-out, and it says so at the call site.
+    pub(crate) fn test_resolved_without_retries(subagent_depth_max: u32) -> ResolvedAgent {
+        test_resolved_at("http://127.0.0.1:9", Some(0), subagent_depth_max)
     }
 
     /// [`test_resolved`] against a caller-supplied endpoint, for the tests that
     /// need the round to reach a model rather than fail connecting.
-    pub(crate) fn test_resolved_at(base_url: &str, subagent_depth_max: u32) -> ResolvedAgent {
+    ///
+    /// `retry_budget_secs` is a parameter rather than something a caller pokes
+    /// afterwards, so "retries off" is a value this one constructor understands
+    /// and cannot be lost by a fixture changing provider variant.
+    pub(crate) fn test_resolved_at(
+        base_url: &str,
+        retry_budget_secs: Option<u64>,
+        subagent_depth_max: u32,
+    ) -> ResolvedAgent {
         ResolvedAgent {
             agent_name: Some("primary".to_string()),
             model_name: "smart".to_string(),
@@ -1072,10 +1092,11 @@ pub(crate) mod fixtures {
                 base_url: base_url.to_string(),
                 api_key: "test-key".to_string(),
                 request_timeout_secs: Some(1),
-                // And retries off, so "immediately" stays true: a refused
-                // connection is transient, so a live budget would spend itself
-                // on backoff before the round could fail.
-                retry_budget_secs: Some(0),
+                // `None` at every call site but one, which keeps
+                // "immediately" true on its own: a refused connection never
+                // reaches the endpoint, so the short connect budget bounds it
+                // rather than the full one.
+                retry_budget_secs,
             },
             model_weights: None,
             preamble: Some("session preamble".to_string()),
@@ -1122,11 +1143,11 @@ mod tests {
     /// fast and deterministically. That is enough to exercise the bookkeeping
     /// -- launch, the inbox, watermarks, release -- without a live model.
     ///
-    /// "Fast" is why the fixture sets `retry_budget_secs: Some(0)`: a refused
-    /// connection is transient, so a live budget would spend itself on backoff
-    /// before the round could fail. The tests below still run with
-    /// `start_paused`, which keeps them immune to any wait the rest of the
-    /// round picks up.
+    /// "Fast" no longer needs a fixture-side `retry_budget_secs: Some(0)`: a
+    /// refused connection never reaches the endpoint, so the retry loop bounds
+    /// it by the short connect budget instead of the full one. The tests below
+    /// still run with `start_paused`, which keeps them immune to any wait the
+    /// rest of the round picks up.
     fn test_registry() -> (SubagentRegistry, tempfile::TempDir) {
         test_registry_at(2, outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX)
     }
@@ -1534,13 +1555,13 @@ mod tests {
     /// Exercises the whole path: launch spawns a round, the round fails, the
     /// driver publishes the failure, and the parent collects it.
     ///
-    /// The fixture's provider points at the discard port with retries off, so
-    /// this travels the `endpoint_failed` arm -- a connection refused is
-    /// transient, so it now ends the turn cleanly rather than erroring out of
-    /// `run_turn_captured`. That it still reaches the parent as an `Error`, and
-    /// that the next read blocks (see the test below), is the whole point of
-    /// that arm: `note_ended_early` would record the cause without bumping the
-    /// version, leaving the parent re-reading the same answer forever.
+    /// The fixture's provider points at the discard port, so this travels the
+    /// `endpoint_failed` arm -- a connection refused is transient, so it ends
+    /// the turn cleanly rather than erroring out of `run_turn_captured`. That
+    /// it still reaches the parent as an `Error`, and that the next read blocks
+    /// (see the test below), is the whole point of that arm: `note_ended_early`
+    /// would record the cause without bumping the version, leaving the parent
+    /// re-reading the same answer forever.
     #[tokio::test(start_paused = true)]
     async fn a_failed_round_reaches_the_parent_as_an_error() {
         let (registry, _log_dir) = test_registry();
@@ -1870,6 +1891,13 @@ mod tests {
         let (live, tools) = counted_tools();
         let (mut registry, _log_dir) = test_registry();
         registry.ctx.mcp_tools = tools;
+        // What this measures is the join, on a real clock, after every round
+        // has gone idle -- so the rounds themselves have to fail at once. The
+        // fixture's default budget is realistic on purpose, which here would
+        // mean spending the whole connect budget on backoff before the tree
+        // could settle, timing the shutdown grace behind 30s of retry.
+        registry.ctx.resolved =
+            test_resolved_without_retries(outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX);
 
         let tree = launch_full_default_tree(&registry).await;
         tree.wait_until_idle(&registry).await;
@@ -1893,8 +1921,11 @@ mod tests {
         let mut probe = BlockingTools::new();
         let (mut registry, _log_dir) = test_registry();
         registry.ctx.mcp_tools = probe.take_tools();
-        registry.ctx.resolved =
-            test_resolved_at(&server.base_url, outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX);
+        registry.ctx.resolved = test_resolved_at(
+            &server.base_url,
+            None,
+            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+        );
 
         let tree = launch_full_default_tree(&registry).await;
         probe.wait_for_calls(tree.live_count()).await;

@@ -813,6 +813,14 @@ pub enum RigAgent {
 /// `retry-budget-secs` or [`DEFAULT_RETRY_BUDGET_SECS`]. Both retry layers take
 /// the same one, so `retry-budget-secs = 0` switches off both.
 ///
+/// `retry-budget-secs` is not the whole policy: the default carries a second,
+/// much shorter bound for a call that never reaches the endpoint, which config
+/// cannot reach. It never widens this one -- the loop applies whichever is
+/// smaller -- so `0` still means no retries anywhere. See
+/// [`RetryPolicy::connect_budget`].
+///
+/// [`RetryPolicy::connect_budget`]: retry::RetryPolicy::connect_budget
+///
 /// [`DEFAULT_RETRY_BUDGET_SECS`]: outrig::config::DEFAULT_RETRY_BUDGET_SECS
 fn retry_policy(retry_budget_secs: Option<u64>) -> retry::RetryPolicy {
     retry::RetryPolicy {
@@ -833,7 +841,16 @@ fn remote_http_client(
 ) -> Result<retry::RetryingHttpClient> {
     let timeout =
         std::time::Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
-    let builder = reqwest::Client::builder().timeout(timeout);
+    // Two ceilings, on two different things. `timeout` bounds the whole
+    // request, and is high because a non-streaming completion answers only
+    // when the model has finished. `connect_timeout` bounds getting connected
+    // at all, which no completion is waiting on -- without it, a host that
+    // silently drops packets would hold an attempt open for the full request
+    // timeout, and the retry loop's much shorter budget for an endpoint that
+    // never answered could not stop it (see [`retry::CONNECT_TIMEOUT`]).
+    let builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(retry::CONNECT_TIMEOUT);
 
     // Unit tests point providers at loopback fixtures. reqwest picks up
     // `HTTP_PROXY` / `ALL_PROXY` automatically and has no loopback exemption of

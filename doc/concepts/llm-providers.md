@@ -266,11 +266,43 @@ subagents all behave identically. Turns are non-streaming, as for `openai`.
 A rate limit is not a bug, and neither is a gateway that briefly falls over. Both are
 routine on a shared endpoint, so outrig treats them as a wait rather than a failure.
 
-An LLM call that comes back `408`, `425`, `429`, or a `5xx` -- or that never comes back at
-all, timing out or losing its connection -- is retried until it succeeds or the retry budget
-runs out. The budget is `retry-budget-secs` on the provider, falling back to the top-level
-value and then to ten minutes. Everything else, including the rest of the `4xx` family, is
-final on the first try: a `401` will not become a `200` on the second attempt.
+An LLM call that comes back `408`, `425`, `429`, or a `5xx` -- or that answers and then
+stops, timing out or losing its connection mid-request -- is retried until it succeeds or
+the retry budget runs out. The budget is `retry-budget-secs` on the provider, falling back
+to the top-level value and then to ten minutes. Everything else, including the rest of the
+`4xx` family, is final on the first try: a `401` will not become a `200` on the second
+attempt.
+
+A call that never reaches the endpoint at all is retried on a much shorter leash. A refused
+connection, an unresolvable host, or a TLS mismatch usually means the address is wrong
+rather than busy, and a wrong address does not come right in ten minutes -- so while no
+attempt has got bytes back, the loop is bounded by 30 seconds instead. That is still long
+enough to ride out a gateway that is restarting, which is the case worth waiting for. The
+short bound is fixed and not configurable, unlike `retry-budget-secs`; it is a property of
+how long a restart takes rather than a preference. Setting `retry-budget-secs` below it, or
+to `0`, still wins: the loop always takes whichever bound is shorter.
+
+Getting connected is bounded on its own, at ten seconds per attempt, which is what makes
+that leash real. A host that answers a connection attempt with silence rather than a refusal
+-- a firewall dropping packets, say -- would otherwise hold one attempt open for the whole
+`request-timeout-secs` and reach the short bound only afterwards. Note what this does *not*
+bound: once connected, waiting for the response is `request-timeout-secs`' business and
+nothing else's, because a non-streaming completion answers only when the model has finished,
+so a long wait for the first byte is what a long reasoning turn looks like from outside.
+
+Both budgets bound the *retrying* and not an attempt already in flight, which is the same
+rule `retry-budget-secs` has always followed. An attempt is never cancelled by the clock
+running out; the loop simply declines to start another. So an address that never answers is
+settled in about 30 seconds and at worst 40 -- the bound, plus one last connection attempt
+that had already begun. A `retry-budget-secs` shorter than ten seconds does not shorten the
+connection cap either; it just buys no retries.
+
+The distinction is per request, not per turn, and it latches: once a call has produced a
+response, the full budget applies for the rest of that request. A call that connects, gets
+a `503`, and then cannot reconnect for its retry is a provider having a bad minute -- not an
+address that was never right -- and it keeps the full budget. The practical effect of the
+split is that a typo in `base-url` ends the turn in seconds, naming the connection failure,
+rather than after ten minutes of retry lines.
 
 When the server says how long to wait, outrig waits that long. This is the reason the retry
 lives in outrig's own HTTP client rather than around the model call: a `Retry-After` header
@@ -282,10 +314,11 @@ endpoint do not all come back at the same instant.
 A provider can also fail while appearing to succeed: a `200 OK` whose body carries no usable
 content. There is nothing for outrig to say and nothing to act on, so that response is
 retried too -- twice, then given up on. This retry cannot live in the HTTP client, which sees
-a `200` and calls it a success; it wraps the model call instead. It shares the budget, so
-`retry-budget-secs = 0` switches off both layers, but it is capped by that count as well: an
-unusable response comes back in milliseconds, so the budget alone would spend ten minutes on
-dozens of tries where a hiccup wants two.
+a `200` and calls it a success; it wraps the model call instead. It shares the full budget,
+so `retry-budget-secs = 0` switches off both layers -- and the short connect bound never
+applies here, since a `200 OK` is by definition an endpoint that answered. It is capped by
+that count as well: an unusable response comes back in milliseconds, so the budget alone
+would spend ten minutes on dozens of tries where a hiccup wants two.
 
 Both retries happen beneath a single model call, which is what keeps them safe. A turn is a
 model -> tool -> model loop, and retrying the *turn* would re-run container tool calls that

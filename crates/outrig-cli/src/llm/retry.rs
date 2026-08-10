@@ -21,6 +21,21 @@
 //! because what a rate limit asks of a client is a *wait*, not a number of
 //! tries.
 //!
+//! That budget is really two, because "the endpoint answered badly" and "the
+//! endpoint never answered at all" are not the same failure. Until some attempt
+//! gets bytes back, the much shorter [`CONNECT_BUDGET`] applies: a host that
+//! refuses every connection is usually a typo'd `base-url` or a dead address,
+//! and neither heals in ten minutes. It is still long enough to ride out a load
+//! balancer that is restarting, which is the case the retry exists for. Once
+//! the endpoint has produced a response, the full budget applies for the rest
+//! of that request -- a `503` followed by a failure to reconnect is a provider
+//! having a bad minute, not an address that was never right. The short bound is
+//! a fixed constant while the full one is `retry-budget-secs`; a zero budget
+//! short-circuits both, so it stays the one "no retries" knob. The loop checks
+//! the clock only between attempts, so [`CONNECT_TIMEOUT`] bounds the
+//! connection itself -- otherwise a host that drops packets rather than
+//! refusing them would sit in one attempt past either budget.
+//!
 //! Retrying transport failures *there* rather than around a
 //! [`CompletionModel`] call is what makes `Retry-After` reachable at all: rig's
 //! `http_client::Error` carries only a status code and a body string, so by the
@@ -64,6 +79,51 @@ const MAX_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 /// Floor on any delay, so a `Retry-After: 0` cannot become a busy loop.
 const MIN_DELAY: Duration = Duration::from_millis(100);
+/// Ceiling on the whole retry loop when the endpoint has never answered --
+/// every attempt so far failed to connect, so nothing has come back from it.
+/// Deliberately not configurable, like the delays above: it describes how long
+/// a restarting load balancer takes to come back, not a preference. A config
+/// key can be added later additively; the reverse is not true.
+///
+/// Thirty seconds is a guess, bounded on one side by that restart and on the
+/// other by a user's patience, and neither is measured. It is long enough for
+/// the backoff curve to spend four or five attempts on a provider that is
+/// briefly down, and nowhere near long enough to sit through a typo'd
+/// `base-url`. Revisit it with a number rather than an intuition.
+const CONNECT_BUDGET: Duration = Duration::from_secs(30);
+/// Ceiling on one attempt's *connection* -- DNS, TCP, TLS -- handed to the
+/// `reqwest` client that [`RetryingHttpClient`] wraps.
+///
+/// [`CONNECT_BUDGET`] alone does not bound a host that drops packets rather
+/// than refusing them: the loop checks the clock between attempts, so a SYN
+/// nobody answers would sit in `send` until `request-timeout-secs` -- ten
+/// minutes by default -- and only then find the budget spent. Capping the
+/// connection is what makes the short budget a real ceiling on an address that
+/// was never right.
+///
+/// Deliberately *not* a cap on the whole request. A non-streaming completion
+/// returns its headers when the model has finished generating, so the wait for
+/// a response is indistinguishable from a model thinking hard, and bounding it
+/// here would cut off exactly the long reasoning turns
+/// `request-timeout-secs` defaults high to protect. This bounds only the phase
+/// before there is anything to wait for.
+///
+/// Small enough that [`CONNECT_BUDGET`] buys more than one try at a gateway
+/// that is restarting -- pinned by a test, since the two constants are only
+/// useful in proportion to each other.
+///
+/// It is one flat cap, not a slice of whatever budget is left, and both are
+/// deliberate. reqwest sets a connect timeout per *client*, not per request, so
+/// a bound that tracked the remaining budget would mean rebuilding the client
+/// mid-request and throwing away its connection pool. The consequences are
+/// worth naming: a budget smaller than this does not shrink it -- the same rule
+/// [`RetryPolicy::budget`] already follows, where an attempt in flight is never
+/// cancelled by the clock running out -- so the loop stops *retrying* at its
+/// bound and the last attempt can run past it by up to this much. It also
+/// applies after `answered` latches, where the full budget is otherwise in
+/// force: a reconnect whose handshake takes longer than this fails, though as a
+/// connect failure it is transient and simply retried.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Extra attempts [`RetryingModel`] spends on an unusable response, on top of
 /// the first, and on top of the budget it shares with the HTTP loop. Small on
 /// purpose: each one resends the whole conversation, and a body that is
@@ -78,16 +138,50 @@ pub struct RetryPolicy {
     /// attempt spends in flight -- not only the time spent sleeping. Zero
     /// disables retries.
     pub budget: Duration,
+    /// The same wall clock, but the ceiling that applies while the endpoint has
+    /// never answered -- see [`CONNECT_BUDGET`]. Much shorter than [`budget`]:
+    /// a host that refuses every connection is usually misconfigured, not busy.
+    ///
+    /// A bound in its own right rather than a mode of [`budget`], so a reader
+    /// -- or a failover chain picking its next candidate -- can consume it
+    /// without knowing which request state produced it. Never exceeds
+    /// [`budget`] in effect: the loop applies whichever is smaller, so a budget
+    /// of zero still means no retries anywhere.
+    ///
+    /// [`budget`]: Self::budget
+    pub connect_budget: Duration,
     /// First backoff delay, doubling each attempt.
     pub base_delay: Duration,
     /// Ceiling on one backoff delay. Does not cap a server's `Retry-After`.
     pub max_delay: Duration,
 }
 
+impl RetryPolicy {
+    /// The ceiling in force for a request in the given state: the full
+    /// [`budget`] once the endpoint has answered, and while it has not, the
+    /// *smaller* of the two bounds rather than [`connect_budget`] outright -- a
+    /// zero `budget` is the documented "no retries" knob, so it has to
+    /// short-circuit this path too rather than acquire an exception.
+    ///
+    /// One method rather than the rule spelled out at each reader, because the
+    /// loop both decides against it and prints it, and the two must agree.
+    ///
+    /// [`budget`]: Self::budget
+    /// [`connect_budget`]: Self::connect_budget
+    fn bound(&self, answered: bool) -> Duration {
+        if answered {
+            self.budget
+        } else {
+            self.budget.min(self.connect_budget)
+        }
+    }
+}
+
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             budget: Duration::from_secs(outrig::config::DEFAULT_RETRY_BUDGET_SECS),
+            connect_budget: CONNECT_BUDGET,
             base_delay: BASE_DELAY,
             max_delay: MAX_DELAY,
         }
@@ -240,8 +334,13 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
             // the provider answered, it just answered with nothing -- so
             // spending ten minutes of budget re-rolling it would only delay
             // telling the user.
+            //
+            // `answered: true` unconditionally: reaching this layer at all
+            // means a `200 OK` came back, so the connect bound cannot apply.
             let delay = (attempt < RESPONSE_RETRY_ATTEMPTS)
-                .then(|| next_delay(&self.policy, attempt, started.elapsed(), None, jitter()))
+                .then(|| {
+                    next_delay(&self.policy, attempt, started.elapsed(), true, None, jitter())
+                })
                 .flatten();
             let Some(delay) = delay else {
                 return Err(CompletionError::ResponseError(message));
@@ -296,6 +395,11 @@ where
     // sleeps below advance the same clock this is measured against.
     let started = tokio::time::Instant::now();
     let mut attempt = 0u32;
+    // Whether any attempt has got bytes back from the endpoint. Latches on and
+    // never clears: once the endpoint has answered, a later failure to
+    // reconnect is a provider having a bad minute rather than an address that
+    // was never right, so the full budget applies for the rest of the request.
+    let mut answered = false;
     loop {
         let sent = client
             .request(method.clone(), url.clone())
@@ -307,6 +411,7 @@ where
         let (err, retry_after) = match sent {
             Ok(response) if response.status().is_success() => return into_lazy_response(response),
             Ok(response) => {
+                answered = true;
                 let status = response.status();
                 // Read before `text()` consumes the response.
                 let retry_after = response
@@ -335,17 +440,25 @@ where
                 }
                 (err, retry_after)
             }
-            // Connection failures, read timeouts, and the like -- all
+            // Read timeouts, connection resets, and the like -- all
             // retry-worthy, and none of them carry a `Retry-After`.
-            Err(error) => (HttpError::Instance(Box::new(error)), None),
+            Err(error) => {
+                // Read here because the box below erases the concrete type, so
+                // this is the only place a connect failure is still knowable.
+                answered |= !error.is_connect();
+                (HttpError::Instance(Box::new(error)), None)
+            }
         };
 
         let elapsed = started.elapsed();
-        let Some(delay) = next_delay(&policy, attempt, elapsed, retry_after, jitter()) else {
+        let Some(delay) = next_delay(&policy, attempt, elapsed, answered, retry_after, jitter())
+        else {
             return Err(err);
         };
         // Kept under 100 columns for a realistic status line and budget, so a
-        // wait does not wrap in a terminal the user is watching.
+        // wait does not wrap in a terminal the user is watching. The budget
+        // shown is the one actually being spent against, so a connect failure
+        // does not count down against a ten-minute bound it will never reach.
         eprintln!(
             "[outrig] LLM call failed ({}); retry in {:.1}s ({}; {}s/{}s spent)",
             failure_label(&err),
@@ -356,7 +469,7 @@ where
                 "backoff"
             },
             elapsed.as_secs(),
-            policy.budget.as_secs(),
+            policy.bound(answered).as_secs(),
         );
         tokio::time::sleep(delay).await;
         attempt += 1;
@@ -433,15 +546,18 @@ fn parse_retry_after(value: &str, now: jiff::Timestamp) -> Option<Duration> {
 /// How long to wait before the next attempt, or `None` to give up.
 ///
 /// `jitter` is injected so the whole decision -- including the budget
-/// arithmetic -- is unit-testable with no RNG and no sleeping.
+/// arithmetic -- is unit-testable with no RNG and no sleeping. `answered` says
+/// whether any attempt has produced a response, which picks the bound:
+/// see [`RetryPolicy::bound`].
 fn next_delay(
     policy: &RetryPolicy,
     attempt: u32,
     elapsed: Duration,
+    answered: bool,
     retry_after: Option<Duration>,
     jitter: f64,
 ) -> Option<Duration> {
-    let remaining = policy.budget.checked_sub(elapsed)?;
+    let remaining = policy.bound(answered).checked_sub(elapsed)?;
     let delay = match retry_after {
         // No jitter on a server-named delay: the server told us when to come
         // back, and jittering *down* means hammering it early.
@@ -492,9 +608,10 @@ fn is_transient(err: &HttpError) -> bool {
 /// Note the deliberate reach: a wrong `base-url` fails with a connection error,
 /// which is transient by this predicate, so an unreachable endpoint ends the
 /// turn rather than the session. That is right for a REPL -- the message names
-/// the connection failure and the user can fix the config or `/quit` -- but it
-/// does mean a typo no longer exits non-zero. Narrowing it is queued as
-/// `plan/todo/0112-connect-failures-are-not-really-transient.md`.
+/// the connection failure and the user can fix the config or `/quit` -- and the
+/// *wait* before it no longer follows the full budget: an endpoint that never
+/// answered is bounded by [`CONNECT_BUDGET`], so a typo costs seconds rather
+/// than minutes. The classification is the decision; the wait was the bug.
 ///
 /// Returning the label rather than a `bool` keeps the classification and the
 /// thing to print together: a caller cannot decide this is recoverable without
@@ -704,7 +821,7 @@ mod tests {
         for attempt in 0..=5 {
             let cap = backoff_secs(&policy, attempt);
             for _ in 0..100 {
-                let d = next_delay(&policy, attempt, Duration::ZERO, None, jitter())
+                let d = next_delay(&policy, attempt, Duration::ZERO, true, None, jitter())
                     .expect("a fresh budget always allows the first backoff")
                     .as_secs_f64();
                 assert!(d >= cap * 0.5 - f64::EPSILON, "{d} < {}", cap * 0.5);
@@ -755,6 +872,7 @@ mod tests {
             &policy,
             0,
             Duration::ZERO,
+            true,
             Some(Duration::from_secs(45)),
             0.5,
         );
@@ -773,6 +891,7 @@ mod tests {
             &policy,
             0,
             Duration::ZERO,
+            true,
             Some(Duration::from_secs(7200)),
             1.0,
         );
@@ -782,7 +901,7 @@ mod tests {
     #[test]
     fn next_delay_floors_a_zero_delay() {
         let policy = RetryPolicy::default();
-        let delay = next_delay(&policy, 0, Duration::ZERO, Some(Duration::ZERO), 1.0);
+        let delay = next_delay(&policy, 0, Duration::ZERO, true, Some(Duration::ZERO), 1.0);
         assert_eq!(delay, Some(MIN_DELAY));
     }
 
@@ -790,12 +909,12 @@ mod tests {
     fn next_delay_stops_once_the_budget_is_spent() {
         let policy = RetryPolicy::default();
         assert_eq!(
-            next_delay(&policy, 0, policy.budget, None, 1.0),
+            next_delay(&policy, 0, policy.budget, true, None, 1.0),
             None,
             "an exactly-spent budget stops",
         );
         assert_eq!(
-            next_delay(&policy, 0, policy.budget + Duration::from_secs(1), None, 1.0),
+            next_delay(&policy, 0, policy.budget + Duration::from_secs(1), true, None, 1.0),
             None,
             "an overspent budget stops",
         );
@@ -808,7 +927,7 @@ mod tests {
         // and retrying into a window that has not reopened.
         let elapsed = policy.budget - Duration::from_secs(9);
         assert_eq!(
-            next_delay(&policy, 0, elapsed, Some(Duration::from_secs(30)), 1.0),
+            next_delay(&policy, 0, elapsed, true, Some(Duration::from_secs(30)), 1.0),
             None,
         );
     }
@@ -819,7 +938,284 @@ mod tests {
             budget: Duration::ZERO,
             ..RetryPolicy::default()
         };
-        assert_eq!(next_delay(&policy, 0, Duration::ZERO, None, 1.0), None);
+        assert_eq!(next_delay(&policy, 0, Duration::ZERO, true, None, 1.0), None);
+    }
+
+    /// The point of the whole task: an endpoint that has never answered is
+    /// bounded by the short budget, so a typo'd `base-url` gives up in seconds.
+    #[test]
+    fn an_unanswered_endpoint_gives_up_on_the_connect_budget() {
+        let policy = RetryPolicy::default();
+        // Comfortably inside the full budget (600s) and past the short one.
+        let elapsed = policy.connect_budget + Duration::from_secs(1);
+        assert!(
+            elapsed < policy.budget,
+            "fixture must sit between the two bounds"
+        );
+        assert_eq!(next_delay(&policy, 0, elapsed, false, None, 1.0), None);
+        // The same elapsed time, once the endpoint has answered, keeps going.
+        assert!(next_delay(&policy, 0, elapsed, true, None, 1.0).is_some());
+    }
+
+    /// A read timeout is not a connect failure: the acceptance criterion that
+    /// distinguishes this from "every transport error is short-bounded".
+    #[test]
+    fn an_answered_endpoint_keeps_the_full_budget() {
+        let policy = RetryPolicy::default();
+        for elapsed in [
+            policy.connect_budget,
+            policy.connect_budget * 2,
+            // Not `budget - 1s`: a wait that does not fit in what is left is
+            // refused rather than truncated, which is the rule
+            // `next_delay_stops_when_the_wait_would_not_fit` pins.
+            policy.budget - policy.max_delay - Duration::from_secs(1),
+        ] {
+            assert!(
+                next_delay(&policy, 0, elapsed, true, None, 1.0).is_some(),
+                "{elapsed:?} is inside the full budget and must still retry"
+            );
+        }
+    }
+
+    /// A connect failure *before* the short bound is spent still retries --
+    /// the restarting-load-balancer case the short bound is sized for.
+    #[test]
+    fn an_unanswered_endpoint_still_retries_inside_the_connect_budget() {
+        let policy = RetryPolicy::default();
+        assert!(next_delay(&policy, 0, Duration::ZERO, false, None, 1.0).is_some());
+    }
+
+    /// `retry-budget-secs = 0` is the one "no retries" knob, so it has to
+    /// short-circuit the connect path too rather than acquire an exception.
+    #[test]
+    fn a_zero_budget_disables_retries_on_the_connect_path_too() {
+        let policy = RetryPolicy {
+            budget: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        assert!(
+            !policy.connect_budget.is_zero(),
+            "the short bound is non-zero, so this proves the budget wins"
+        );
+        assert_eq!(next_delay(&policy, 0, Duration::ZERO, false, None, 1.0), None);
+    }
+
+    /// A budget shorter than the connect bound is not widened by it: the loop
+    /// applies whichever is smaller, in both directions.
+    #[test]
+    fn a_budget_below_the_connect_bound_still_wins() {
+        let policy = RetryPolicy {
+            budget: Duration::from_secs(5),
+            ..RetryPolicy::default()
+        };
+        let elapsed = Duration::from_secs(6);
+        assert!(elapsed < policy.connect_budget);
+        assert_eq!(next_delay(&policy, 0, elapsed, false, None, 1.0), None);
+    }
+
+    /// The two bounds are distinct fields, not one field that means different
+    /// things depending on state -- 0113 reads the short one directly.
+    #[test]
+    fn the_two_bounds_are_separately_named_and_differently_sized() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.connect_budget, CONNECT_BUDGET);
+        assert!(
+            policy.connect_budget < policy.budget,
+            "the connect bound must be the shorter of the two"
+        );
+    }
+
+    /// The two connect constants are only useful in proportion: a connection
+    /// cap at or above the budget would leave a black-holed address one try
+    /// and no retry, and the "ride out a restarting gateway" case is the whole
+    /// reason the budget is not zero.
+    #[test]
+    fn the_connect_timeout_leaves_room_for_more_than_one_try() {
+        assert!(
+            CONNECT_TIMEOUT * 2 <= CONNECT_BUDGET,
+            "{CONNECT_TIMEOUT:?} must fit inside {CONNECT_BUDGET:?} at least twice",
+        );
+    }
+
+    /// The classification the whole split rests on: a failure to get connected
+    /// has to reach the loop as a *connect* failure, or `answered` latches on
+    /// and buys the full budget. reqwest owns that verdict, so it is pinned
+    /// rather than assumed.
+    ///
+    /// Refusal is the half that can be produced locally and deterministically.
+    /// The other half -- a connect that times out -- has no local recipe: a
+    /// stalled handshake needs SYNs to go unanswered, and the usual trick of
+    /// filling a listener's accept queue does not do it, because the kernel
+    /// completes the handshake from the SYN queue and the client sees a
+    /// connection that is established and then silent. That is a different
+    /// failure, and deliberately not this one.
+    #[tokio::test]
+    async fn a_refused_connection_is_a_connect_failure() {
+        let error = test_client()
+            .post(format!("http://127.0.0.1:{REFUSED_PORT}/v1/chat/completions"))
+            .send()
+            .await
+            .expect_err("nothing listens on the discard port");
+        assert!(
+            error.is_connect(),
+            "the loop reads `is_connect()` to mean the endpoint never answered: {error}",
+        );
+    }
+
+    /// The discard port: assigned to a service essentially nothing runs, and
+    /// below the ephemeral range so no test can be handed it. The crate's other
+    /// unreachable-endpoint fixtures already point here.
+    const REFUSED_PORT: u16 = 9;
+
+    /// The client the socket tests drive the loop with.
+    ///
+    /// `no_proxy` for the same reason `remote_http_client` sets it under
+    /// `cfg(test)`: reqwest reads `HTTP_PROXY` / `ALL_PROXY` automatically and
+    /// exempts no address, so on a machine behind a proxy a loopback request
+    /// would go to the proxy instead of being refused -- which is the one thing
+    /// these tests need to happen.
+    ///
+    /// No `connect_timeout`, unlike the shipped client: these tests run on a
+    /// paused clock, and a timer pending during real socket I/O is one the
+    /// runtime may fire by auto-advancing while the connect is still in flight.
+    /// Nothing here needs one -- refusal is immediate.
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a bare client builds")
+    }
+
+    /// A policy sized for the loop tests below: the two bounds far enough apart
+    /// that which one is in force is unmistakable in the elapsed time, and a
+    /// backoff curve that reaches either in a handful of attempts.
+    fn loop_policy() -> RetryPolicy {
+        RetryPolicy {
+            budget: Duration::from_secs(120),
+            connect_budget: Duration::from_secs(4),
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(8),
+        }
+    }
+
+    /// Drive the retry loop against `port` and report how long it spent before
+    /// giving up, and what it gave up on. Time is [`tokio::time::Instant`] as
+    /// the loop measures it, so under `start_paused` this is the sum of the
+    /// backoffs and costs no wall clock.
+    ///
+    /// The label comes back because elapsed time alone cannot tell a refused
+    /// connection from any other prompt failure -- the callers assert on the
+    /// failure *class*, which is what makes them tests of the connect path
+    /// rather than of the clock.
+    async fn spend_the_budget(port: u16) -> (Duration, String) {
+        let started = tokio::time::Instant::now();
+        let result = send_with_retry::<Bytes>(
+            test_client(),
+            loop_policy(),
+            Method::POST,
+            format!("http://127.0.0.1:{port}/v1/chat/completions")
+                .parse()
+                .expect("a loopback URI parses"),
+            HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        let err = result.err().expect("the endpoint never succeeds");
+        (started.elapsed(), failure_label(&err))
+    }
+
+    /// Confirm nothing answers on [`REFUSED_PORT`], so a test that reads a
+    /// failure as "connect refused" is reading the truth.
+    ///
+    /// The first draft of this fixture took a port by binding to `:0` and
+    /// dropping the listener. That hands the port back to the ephemeral pool,
+    /// where any other test in this binary can take it before the request goes
+    /// out -- and a stolen port answering `404` would satisfy a timing
+    /// assertion while exercising nothing. A probe narrows that window without
+    /// closing it. A port *below* the ephemeral range is never handed out by
+    /// the kernel and cannot be bound without privileges, so the race is gone
+    /// rather than made unlikely; the probe is left as the check that this
+    /// machine is not the exception.
+    async fn expect_nothing_listening() {
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", REFUSED_PORT))
+                .await
+                .is_err(),
+            "something answers on 127.0.0.1:{REFUSED_PORT}, which these tests need closed",
+        );
+    }
+
+    /// The visible bug in one test: an endpoint that refuses every connection
+    /// gives up on the short bound, so a typo'd `base-url` costs seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_endpoint_gives_up_on_the_connect_budget() {
+        expect_nothing_listening().await;
+        let policy = loop_policy();
+        let (elapsed, label) = spend_the_budget(REFUSED_PORT).await;
+        assert!(
+            label.starts_with("connection error"),
+            "the loop must have failed connecting, not on {label}",
+        );
+        assert!(
+            elapsed <= policy.connect_budget,
+            "a refused endpoint must give up on the connect budget, not after {elapsed:?}",
+        );
+    }
+
+    /// The latch, which is the half of the split `next_delay` alone cannot
+    /// show: the endpoint answers once with a `503`, then stops accepting, and
+    /// every later attempt is a refused connect. Those attempts must ride the
+    /// *full* budget -- a provider having a bad minute, not an address that was
+    /// never right -- which is only true if `answered` stayed on.
+    ///
+    /// This one cannot use [`REFUSED_PORT`]: it needs a port that answers once
+    /// and then refuses, which means a real listener and so an ephemeral port
+    /// that goes back in the pool when it is dropped. The failure-class
+    /// assertion below is what keeps a stolen port from passing as a refused
+    /// connect.
+    #[tokio::test(start_paused = true)]
+    async fn a_503_then_a_refused_reconnect_keeps_the_full_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a one-shot 503 server");
+        let port = listener.local_addr().expect("loopback address").port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("one connection arrives");
+            // Enough of the request to let the client finish writing; the
+            // answer does not depend on it.
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\n\
+                      content-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("the 503 is written");
+            let _ = socket.shutdown().await;
+            // Dropped before the first retry, so every later connect is
+            // refused rather than queued in the accept backlog.
+            drop(listener);
+        });
+
+        let policy = loop_policy();
+        let (elapsed, label) = spend_the_budget(port).await;
+        // The last attempt is a refused connect, so the loop rode the full
+        // budget on connect failures rather than on the one `503`.
+        assert!(
+            label.starts_with("connection error"),
+            "the retries after the 503 must have failed connecting, not on {label}",
+        );
+        assert!(
+            elapsed > policy.connect_budget,
+            "the 503 must latch the full budget on, but the loop stopped at {elapsed:?}",
+        );
+        assert!(
+            elapsed >= policy.budget - policy.max_delay,
+            "the full budget must be spent, not {elapsed:?} of it",
+        );
     }
 
     #[test]

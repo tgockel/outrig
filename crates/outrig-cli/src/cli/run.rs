@@ -960,11 +960,14 @@ mod tests {
                         base_url: "http://127.0.0.1:9".to_string(),
                         api_key: "test-key".to_string(),
                         request_timeout_secs: None,
-                        // Retries off: the discard port refuses connections,
-                        // which is transient by the retry loop's reckoning, and
-                        // this test wants the failure now rather than after a
-                        // budget's worth of backoff.
-                        retry_budget_secs: Some(0),
+                        // Retries left at their default. Nothing here drives a
+                        // turn -- these tests call `handle_sidecar_command`,
+                        // and the discard port only has to make `build_agent`
+                        // do no I/O -- so pinning the budget off would be
+                        // claiming a promptness this module never measures.
+                        // Were a turn added, the short connect budget bounds a
+                        // refused connection on its own.
+                        retry_budget_secs: None,
                     },
                     tool_result_max_bytes: 1024,
                     ..test_resolved_agent()

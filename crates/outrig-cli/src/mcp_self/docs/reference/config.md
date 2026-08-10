@@ -209,6 +209,18 @@ Two things about the budget that belong here, because they are about the keys:
   matter for a rate limit, which comes back in milliseconds.
 - `0` disables retries -- the first failure is final. Useful for scripted runs that would
   rather fail fast than wait.
+- It is not the only bound on a call that never reaches the endpoint. While no attempt has
+  got bytes back -- a refused connection, an unresolvable host, a TLS mismatch -- the loop
+  stops after 30 seconds instead, on the reasoning that a wrong address does not come right
+  in ten minutes. Getting connected is separately capped at ten seconds per attempt, so a
+  host that drops packets rather than refusing them cannot hold an attempt open for the
+  whole `request-timeout-secs` first. Both are fixed and have no key; the loop takes
+  whichever of the two budgets is shorter, so setting this one below it, or to `0`, still
+  wins -- for the *retrying*. Neither budget cancels an attempt already in flight, so a
+  value below ten seconds does not shorten the connection cap, and an unreachable address
+  is settled in about 30 seconds rather than exactly 30. Neither bounds the wait for a
+  response once connected -- that is `request-timeout-secs`, and it is why that default is
+  high.
 - It is not the only bound on the second retry layer. A provider that answers with a body
   outrig cannot use gets at most two retries whatever the budget says, because such a
   response comes back immediately and the budget alone would spend itself on dozens of them.

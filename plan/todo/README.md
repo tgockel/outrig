@@ -52,17 +52,25 @@ the buffer cannot express ordering -- a dependency between two buffer entries is
 dependency between two numbered tasks is an invariant this file maintains. They sit after 0111 so
 nothing pre-final is displaced.
 
-- **0112
-  [connect-failures-are-not-really-transient](0112-connect-failures-are-not-really-transient.md)**
-  -- every `reqwest` transport error is retry-worthy today, so a typo'd `base-url` spends the full
-  `retry-budget-secs` before the turn ends. Splits the budget: a short pre-first-byte bound for
-  "never reached the endpoint", the full one for "the endpoint answered badly". Pulled out of
-  `plan/next/` because 0113 needs it.
 - **0113 [model-alias-failover](0113-model-alias-failover.md)** -- the runtime half 0110 defers:
   moving to the next alias candidate when one fails *inside* a `completion()` call, which is the
   only layer that can do it without re-running container tool calls. Resolves 0110's design fork §4
   (the ceiling must move with the identifier) and its shared-budget blocker (a chain-scoped
   deadline, at the cost of `RetryPolicy: Copy`). Depends on 0110 and 0112.
+
+0112 landed, and the split is narrower than "a connect failure is terminal". `RetryPolicy` grew a
+second bound, `connect_budget`, that applies only while no attempt has got bytes back, and
+`send_with_retry` latches it off on the first response of any kind. A refused connect is still
+transient -- the classification was never the bug -- but it now gives up in 30 seconds rather than
+the full `retry-budget-secs`, so a typo'd `base-url` ends the turn instead of ten minutes of retry
+lines. Two calls carry forward. The bound in force while unanswered is the *smaller* of the two
+rather than `connect_budget` outright, which keeps `retry-budget-secs = 0` the single "no retries"
+knob instead of a knob with an exception. And `reqwest::Error::is_connect()` has to be read in the
+loop's own `Err` arm: the error is boxed into `HttpError::Instance` immediately after, so no
+downstream reader -- `is_transient` included -- can still tell what it was. Both discard-port
+fixtures dropped their `retry_budget_secs: Some(0)` crutch and stay fast on the new bound, which is
+the end-to-end proof; the one real-clock test that measures shutdown grace rather than retry opts
+out explicitly, and says why.
 
 0105 landed, and was the cheapest and highest-value of them: 0097 had already built the machinery
 -- `ConfigSource`, per-mount stamping, `resolved_host_path()` -- and given `declared_in` to the two
