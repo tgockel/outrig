@@ -122,11 +122,65 @@ hop it took:
 That is what lets one committed config serve a laptop with `ANTHROPIC_API_KEY` set and a CI runner
 holding a Bedrock role, without editing `default-model` per machine or keeping divergent configs.
 
-Be clear about what this does *not* do. Building a remote client performs no network I/O, so
-selection answers **"am I configured for this"** and not **"is this endpoint up"**. An alias does
-not move to another vendor when the first one rate-limits or goes down mid-session -- that turn
-still ends the way [Transient failures](#transient-failures) describes. If every candidate is
-unreachable, the session fails at startup naming each one and why it was skipped.
+Be clear about what this choice is. Building a remote client performs no network I/O, so
+selection answers **"am I configured for this"** and not **"is this endpoint up"**. If every
+candidate is unreachable, the session fails at startup naming each one and why it was skipped.
+
+Which endpoint is *working* is settled at runtime instead, by failover -- see
+[Failover between candidates](#failover-between-candidates).
+
+#### Failover between candidates
+
+Selection picks a candidate before the session starts, which cannot know that a vendor will
+rate-limit an hour later. So when an alias names more than one candidate, the order is also a
+runtime fallback: a model call that fails against candidate one is retried against candidate two,
+and outrig says so as it happens.
+
+```text
+[outrig] model opus-5-bedrock failed (HTTP 429); trying opus-5-anthropic
+```
+
+A move happens when a candidate's own retry loop has given up -- so everything under
+[Transient failures](#transient-failures) is tried against that endpoint *first*, and failover is
+what happens after. It also covers failures no retry would fix: a revoked key answers `401`, which
+is final for that vendor but says nothing about the next one, so the chain tries it rather than
+ending the session.
+
+When every candidate has failed, what happens next depends on *why*. The message names each
+candidate with its own reason either way:
+
+* **At least one failed recoverably** -- a rate limit, an unreachable host, a response that could
+  not be used -- and the **turn** ends. Nothing was appended to the history, so sending the prompt
+  again retries it. One vendor rate-limiting while another's key is revoked lands here too: the
+  rate limit is the reason that can lift on its own, so it is worth waiting out.
+* **Every one was terminal** -- a revoked key answering `401` at all three vendors, say -- and the
+  **session** ends, exactly as that failure ends it for a single model. No resend can satisfy a
+  prompt whose credentials are refused everywhere, and advising one would loop forever.
+
+Two properties worth knowing:
+
+* **The whole chain is bounded by one `retry-budget-secs`, not one per candidate.** Three
+  candidates at the ten-minute default is a half-hour turn against a total outage, most of it spent
+  on endpoints already known to be down, so the budget is shared rather than repeated. The value
+  is the one on the **first selectable remote candidate's** provider; `retry-budget-secs` on any
+  later candidate's provider is not consulted. A chain spanning providers that disagree has no
+  single right answer, and the head of a preference order is the defensible one -- so a `0` there
+  disables retries for every candidate, and reordering the alias can change which budget governs.
+
+  In-process candidates are skipped when finding it, because `style = "mistralrs"` has no
+  `retry-budget-secs` to give -- it does no HTTP, so it has nothing to retry. An alias whose head
+  is a local model takes its budget from the first *remote* candidate after it, which is the one
+  the setting can actually be configured on. A chain of only local candidates has no budget at
+  all, and needs none.
+* **Every model call starts again at the head of the list.** The order is a preference, so one
+  rate-limit window does not demote candidate one for the rest of the session.
+
+A move happens *between* model calls, never around a whole turn, so tool calls the turn already
+ran are not re-executed -- a turn that fails on its fifth model call has already run the tool calls
+from the first four, and those stay done.
+
+The cost is that one reply can be half one model's work. That is why a move prints, and why the
+banner lists the fallbacks a session may reach before it starts.
 
 ## `[agents.<name>]`
 

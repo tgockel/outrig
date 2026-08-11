@@ -162,7 +162,7 @@ impl SubagentRegistry {
     /// The model the *launching* agent runs under -- what "omit to use yours"
     /// in the tool schema names.
     pub(crate) fn parent_model_name(&self) -> &str {
-        &self.ctx.resolved.model_name
+        self.ctx.resolved.model_name()
     }
 
     /// Launch a subagent under `name`, running `prompt` as its first round.
@@ -216,12 +216,22 @@ impl SubagentRegistry {
         // A multi-gigabyte weight load would otherwise stall the parent's tool
         // call with no output at all, which reads as a hang. The parent's own
         // model is loaded by definition, so an inherited launch cannot get here.
+        //
+        // Only for a lone candidate, which is the shape whose load happens
+        // *here*, inside `build_subagent_agent`. A chain defers its local rows
+        // to the moment it reaches them and announces the wait there, so
+        // warning at launch as well would print the same line twice for one
+        // initialization -- and would be predicting a load the chain may never
+        // perform, since a working primary means the fallback is never touched.
         #[cfg(feature = "local-llm")]
-        if resolved.model_weights.is_some() && !self.ctx.registry.is_loaded(&resolved.model_name) {
+        if resolved.candidates.len() == 1
+            && resolved.model_weights().is_some()
+            && !self.ctx.registry.is_loaded(resolved.model_name())
+        {
             eprintln!(
                 "[outrig] subagent {name}: loading in-process model {} (first use; this may take \
                  several minutes)",
-                resolved.model_name
+                resolved.model_name()
             );
         }
         let (agent, child) =
@@ -611,14 +621,21 @@ pub(crate) struct ModelLabel {
 }
 
 impl ModelLabel {
+    /// Built once at launch, from the *first* candidate.
+    ///
+    /// That is the model the subagent starts on, and for a chain it is a
+    /// preference rather than a certainty: a mid-turn move changes which model
+    /// is answering without changing this label. Attribution that has to be
+    /// exact about what served a given reply cannot read it -- see
+    /// `plan/next/chain-attribution-names-the-first-candidate.md`.
     fn of(resolved: &ResolvedAgent) -> Self {
         Self {
             // `model_display`, not `model_name`: a launch under an alias shows
             // the hop it took. Identical to `model_name` for a direct name, so
             // the pre-alias output is unchanged byte for byte.
             name: resolved.model_display(),
-            provider: resolved.provider_name.clone(),
-            identifier: resolved.model_identifier.clone(),
+            provider: resolved.provider_name().to_string(),
+            identifier: resolved.model_identifier().to_string(),
         }
     }
 
@@ -630,7 +647,8 @@ impl ModelLabel {
     }
 
     /// The transcript header's parenthesized detail: the name the agent asked
-    /// for, plus the provider and wire identifier it landed on.
+    /// for, plus the provider and wire identifier it started on. See
+    /// [`of`](Self::of) for why "started" rather than "landed on".
     fn detail(&self) -> String {
         format!(
             "model: {} / provider: {} / {}",
@@ -746,7 +764,7 @@ async fn build_subagent_agent(
         shared.clone(),
         name,
         ctx.resolved.agent_name.as_deref(),
-        resolved.max_tokens,
+        resolved.max_tokens(),
     )));
 
     // This subagent lives at `ctx.depth`. If that is under the max, hand it its
@@ -950,7 +968,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
-    use crate::llm::ResolvedProvider;
+    use crate::llm::{ResolvedCandidate, ResolvedProvider};
     use outrig::config::{Agent, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
 
     /// The env var the fixture provider's api-key points at. Unique to this
@@ -1084,24 +1102,26 @@ pub(crate) mod fixtures {
     ) -> ResolvedAgent {
         ResolvedAgent {
             agent_name: Some("primary".to_string()),
-            model_name: "smart".to_string(),
+            candidates: vec![ResolvedCandidate {
+                model_name: "smart".to_string(),
+                model_identifier: "gpt-4o".to_string(),
+                provider_name: "openai".to_string(),
+                provider: ResolvedProvider::OpenAi {
+                    base_url: base_url.to_string(),
+                    api_key: "test-key".to_string(),
+                    request_timeout_secs: Some(1),
+                    // `None` at every call site but one, which keeps
+                    // "immediately" true on its own: a refused connection never
+                    // reaches the endpoint, so the short connect budget bounds
+                    // it rather than the full one.
+                    retry_budget_secs,
+                },
+                model_weights: None,
+                max_tokens: None,
+            }],
             alias_name: None,
-            model_identifier: "gpt-4o".to_string(),
-            provider_name: "openai".to_string(),
-            provider: ResolvedProvider::OpenAi {
-                base_url: base_url.to_string(),
-                api_key: "test-key".to_string(),
-                request_timeout_secs: Some(1),
-                // `None` at every call site but one, which keeps
-                // "immediately" true on its own: a refused connection never
-                // reaches the endpoint, so the short connect budget bounds it
-                // rather than the full one.
-                retry_budget_secs,
-            },
-            model_weights: None,
             preamble: Some("session preamble".to_string()),
             temperature: None,
-            max_tokens: None,
             tool_call_max: 4,
             tool_result_max_bytes: 4096,
             subagent_depth_max,
@@ -2075,9 +2095,9 @@ mod tests {
         let (registry, _log_dir) = test_registry();
         let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
 
-        assert_eq!(resolved.model_name, "fast");
-        assert_eq!(resolved.model_identifier, "gpt-4o-mini");
-        assert_eq!(resolved.provider_name, "openai");
+        assert_eq!(resolved.model_name(), "fast");
+        assert_eq!(resolved.model_identifier(), "gpt-4o-mini");
+        assert_eq!(resolved.provider_name(), "openai");
         assert_eq!(
             resolved.agent_name, registry.ctx.resolved.agent_name,
             "the agent is still the parent's -- SetResultTool's trace prefix \
@@ -2085,7 +2105,8 @@ mod tests {
         );
         assert_eq!(resolved.preamble, registry.ctx.resolved.preamble);
         assert_eq!(
-            registry.ctx.resolved.model_name, "smart",
+            registry.ctx.resolved.model_name(),
+            "smart",
             "the session's own resolution must be untouched -- the parent keeps \
              taking its turns on its own model"
         );
@@ -2126,11 +2147,11 @@ mod tests {
     async fn launch_with_model_takes_the_ceiling_from_that_model() {
         let (mut registry, _log_dir) = test_registry();
         // What the session resolved for itself, from `[models.smart]`.
-        registry.ctx.resolved.max_tokens = Some(64_000);
+        registry.ctx.resolved.candidates[0].max_tokens = Some(64_000);
 
         let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
         assert_eq!(
-            resolved.max_tokens,
+            resolved.max_tokens(),
             Some(16_000),
             "the ceiling must follow the model named, not the launching agent"
         );
@@ -2152,7 +2173,7 @@ mod tests {
 
         let resolved = resolve_launch_model(&registry.ctx, Some("fast")).expect("resolves");
         assert_eq!(
-            resolved.max_tokens,
+            resolved.max_tokens(),
             Some(8_000),
             "an agent that set a ceiling meant it for every model it runs, so \
              it still beats the named model's own"
@@ -2373,7 +2394,7 @@ mod tests {
         );
         assert!(
             matches!(
-                registry.ctx.resolved.provider,
+                registry.ctx.resolved.provider(),
                 crate::llm::ResolvedProvider::OpenAi { .. }
             ),
             "the parent is hosted"
@@ -2381,11 +2402,11 @@ mod tests {
 
         let resolved = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
         assert!(matches!(
-            resolved.provider,
+            resolved.provider(),
             crate::llm::ResolvedProvider::Mistralrs
         ));
         assert!(
-            resolved.model_weights.is_some(),
+            resolved.model_weights().is_some(),
             "the mistralrs arm carries the weight spec build_agent loads from"
         );
         assert!(
@@ -2419,25 +2440,26 @@ mod tests {
         let first = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
         let second = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
         assert_eq!(
-            first.model_name, second.model_name,
+            first.model_name(),
+            second.model_name(),
             "both launches must reach the registry under one key"
         );
         assert!(
-            !registry.ctx.registry.is_loaded(&first.model_name),
+            !registry.ctx.registry.is_loaded(first.model_name()),
             "nothing is loaded yet, so the first launch announces a cold load"
         );
 
         let engines: crate::llm::LlmRegistry<Stub> = crate::llm::LlmRegistry::new();
         let loads = AtomicUsize::new(0);
         let one = engines
-            .get_or_init(&first.model_name, || async {
+            .get_or_init(first.model_name(), || async {
                 loads.fetch_add(1, Ordering::SeqCst);
                 Ok(Stub)
             })
             .await
             .expect("first load");
         let two = engines
-            .get_or_init(&second.model_name, || async {
+            .get_or_init(second.model_name(), || async {
                 loads.fetch_add(1, Ordering::SeqCst);
                 Ok(Stub)
             })
@@ -2451,7 +2473,7 @@ mod tests {
             "two subagents on one model must not load the weights twice"
         );
         assert!(
-            engines.is_loaded(&first.model_name),
+            engines.is_loaded(first.model_name()),
             "a loaded model must not be announced as cold again"
         );
     }

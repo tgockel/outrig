@@ -355,10 +355,31 @@ reach**: its provider exists, its style is one this build has a client for, and 
 laptop with `ANTHROPIC_API_KEY` and a CI runner with a Bedrock role.
 
 Selection happens once, when the session starts, and answers *"am I configured for
-this"* -- **not** *"is this endpoint up"*. Building a remote client does no network I/O, so
-an alias does not fail over when a vendor rate-limits or goes down mid-session; a turn that
-loses its endpoint still ends the turn. An alias with no reachable candidate fails the
+this"* -- **not** *"is this endpoint up"*. An alias with no reachable candidate fails the
 session, naming each candidate and why it was skipped.
+
+The order is a runtime fallback as well. A model call that fails against one candidate --
+after that endpoint's own retries are spent, or immediately on a failure no retry fixes,
+such as a `401` -- moves to the next, and prints that it did. Every call starts again at
+the head of the list, so one rate-limit window does not demote the preferred vendor for the
+rest of the session.
+
+The whole chain is bounded by one `retry-budget-secs` rather than one per candidate, and
+the value used is the one on the **first selectable remote candidate's** provider -- a
+`retry-budget-secs` set on any later candidate's provider is not consulted. So a `0` there
+disables retries for the whole chain, and reordering an alias can change which budget
+governs it.
+
+In-process candidates are skipped when finding that value, since `style = "mistralrs"` has
+no `retry-budget-secs` key -- it does no HTTP and so has nothing to retry. An alias headed
+by a local model takes its budget from the first remote candidate after it. An alias of
+only local models has none, and needs none.
+
+When every candidate has failed the report names each one's reason, and what ends depends
+on why. If at least one failed recoverably -- a rate limit, an unusable response -- the
+**turn** ends and the prompt can be sent again. If every one was terminal, such as a `401`
+at each vendor, the **session** ends, exactly as that failure ends it for a single model:
+no resend can satisfy credentials that are refused everywhere.
 
 A single-target alias is pure renaming, so it keeps its target's own errors -- an unset key
 still names the variable, and an in-process model in a build without `local-llm` still says

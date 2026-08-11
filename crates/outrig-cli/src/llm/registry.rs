@@ -64,17 +64,62 @@ impl<T: Send + Sync + 'static> LlmRegistry<T> {
         Ok(arc.clone())
     }
 
-    /// Whether this model already has a slot, i.e. a load has been started for
-    /// it. Takes the same lock [`Self::get_or_init`] does and constructs
-    /// nothing, so it is safe to ask on a path that must not load.
+    /// Whether this model is actually *loaded* -- the slot exists and its cell
+    /// holds a model. Takes the same lock [`Self::get_or_init`] does and
+    /// constructs nothing, so it is safe to ask on a path that must not load.
     ///
-    /// Racing a concurrent load is acceptable: the caller uses this to decide
-    /// whether to *announce* a cold load, and the worst case is a spurious or
-    /// missing advisory line.
+    /// Slot existence is deliberately not the test. A load that failed or was
+    /// cancelled leaves its `OnceCell` behind, empty, and `get_or_try_init`
+    /// will re-run the initializer on the next attempt -- so a retry after a
+    /// failed load is every bit as cold as the first try. Answering on
+    /// membership alone reported it as warm and swallowed the advisory line
+    /// before exactly the wait it exists to explain.
+    ///
+    /// Racing a concurrent load is still acceptable: the caller uses this to
+    /// decide whether to *announce* a cold load, and the worst case there is a
+    /// spurious or missing advisory line.
     pub(crate) fn is_loaded(&self, model_name: &str) -> bool {
         self.models
             .lock()
             .expect("registry mutex poisoned")
-            .contains_key(model_name)
+            .get(model_name)
+            .is_some_and(|cell| cell.get().is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Stub;
+
+    fn boom() -> crate::error::CliError {
+        crate::llm::LlmResolveError::RigClientBuild("boom".to_string()).into()
+    }
+
+    /// A slot is not a model. The module's failure semantics promise that a
+    /// loader returning `Err` leaves the slot empty so the next caller retries
+    /// -- so that next caller is facing a cold load, and the advisory line
+    /// explaining the wait must not be suppressed by the corpse of the attempt
+    /// that failed.
+    #[tokio::test]
+    async fn a_failed_load_does_not_count_as_loaded() {
+        let registry: LlmRegistry<Stub> = LlmRegistry::new();
+        assert!(!registry.is_loaded("qwen"), "nothing has been tried yet");
+
+        let failed = registry.get_or_init("qwen", || async { Err(boom()) }).await;
+        assert!(failed.is_err(), "the loader failed");
+        assert!(
+            !registry.is_loaded("qwen"),
+            "a failed load leaves an empty slot behind, and an empty slot is \
+             still a cold load for whoever comes next",
+        );
+
+        // ...and the retry the empty slot exists to allow does load.
+        registry
+            .get_or_init("qwen", || async { Ok(Stub) })
+            .await
+            .expect("the retry loads");
+        assert!(registry.is_loaded("qwen"), "now it is genuinely warm");
     }
 }

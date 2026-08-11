@@ -103,20 +103,20 @@ max-tokens  = 4096
 
     let r = resolve_agent(&cfg, Some("coding")).expect("resolves");
     assert_eq!(r.agent_name.as_deref(), Some("coding"));
-    assert_eq!(r.model_name, "fast");
-    assert_eq!(r.model_identifier, "gpt-4o-mini");
-    assert_eq!(r.provider_name, "openai");
+    assert_eq!(r.model_name(), "fast");
+    assert_eq!(r.model_identifier(), "gpt-4o-mini");
+    assert_eq!(r.provider_name(), "openai");
     let ResolvedProvider::OpenAi {
         base_url, api_key, ..
-    } = &r.provider
+    } = r.provider()
     else {
-        panic!("expected OpenAi resolved-provider, got {:?}", r.provider);
+        panic!("expected OpenAi resolved-provider, got {:?}", r.provider());
     };
     assert_eq!(base_url, "https://api.openai.com/v1");
     assert_eq!(api_key, "test-key");
     assert_eq!(r.preamble.as_deref(), Some("you are a careful coder"));
     assert_eq!(r.temperature, Some(0.2));
-    assert_eq!(r.max_tokens, Some(4096));
+    assert_eq!(r.max_tokens(), Some(4096));
     assert_eq!(r.tool_call_max, MAX_TOOL_CALLS);
     assert_eq!(r.tool_result_max_bytes, DEFAULT_TOOL_RESULT_MAX_BYTES);
     assert_eq!(
@@ -142,8 +142,8 @@ preamble = "be meticulous"
     ));
 
     let r = resolve_agent(&cfg, Some("review")).expect("resolves");
-    assert_eq!(r.model_name, "smart");
-    assert_eq!(r.model_identifier, "gpt-4o");
+    assert_eq!(r.model_name(), "smart");
+    assert_eq!(r.model_identifier(), "gpt-4o");
 
     unset_env(var);
 }
@@ -164,8 +164,8 @@ preamble = "be meticulous"
 
     let r =
         resolve_agent_with_overrides(&cfg, Some("review"), Some("smart"), None).expect("resolves");
-    assert_eq!(r.model_name, "smart");
-    assert_eq!(r.model_identifier, "gpt-4o");
+    assert_eq!(r.model_name(), "smart");
+    assert_eq!(r.model_identifier(), "gpt-4o");
     assert_eq!(r.preamble.as_deref(), Some("be meticulous"));
 
     unset_env(var);
@@ -186,8 +186,8 @@ preamble = "code"
 
     let r =
         resolve_agent_with_overrides(&cfg, Some("coding"), Some("smart"), None).expect("resolves");
-    assert_eq!(r.model_name, "smart");
-    assert_eq!(r.model_identifier, "gpt-4o");
+    assert_eq!(r.model_name(), "smart");
+    assert_eq!(r.model_identifier(), "gpt-4o");
 
     unset_env(var);
 }
@@ -207,8 +207,8 @@ preamble = "code"
 
     let r =
         resolve_agent_with_overrides(&cfg, Some("coding"), Some("fast"), None).expect("resolves");
-    assert_eq!(r.model_name, "fast");
-    assert_eq!(r.model_identifier, "gpt-4o-mini");
+    assert_eq!(r.model_name(), "fast");
+    assert_eq!(r.model_identifier(), "gpt-4o-mini");
 
     unset_env(var);
 }
@@ -430,9 +430,9 @@ fn no_agent_resolves_against_the_defaults() {
     assert_eq!(r.preamble, None);
     assert_eq!(r.image, None);
     assert_eq!(r.temperature, None);
-    assert_eq!(r.max_tokens, None);
-    assert_eq!(r.model_name, "fast");
-    assert_eq!(r.model_identifier, "gpt-4o-mini");
+    assert_eq!(r.max_tokens(), None);
+    assert_eq!(r.model_name(), "fast");
+    assert_eq!(r.model_identifier(), "gpt-4o-mini");
     assert_eq!(r.tool_call_max, MAX_TOOL_CALLS);
     assert_eq!(r.tool_result_max_bytes, DEFAULT_TOOL_RESULT_MAX_BYTES);
 
@@ -460,7 +460,11 @@ image    = "coding"
     assert_eq!(r.agent_name, None);
     assert_eq!(r.preamble, None);
     assert_eq!(r.image, None);
-    assert_eq!(r.model_name, "fast", "default-model, not the agent's model");
+    assert_eq!(
+        r.model_name(),
+        "fast",
+        "default-model, not the agent's model"
+    );
 
     unset_env(var);
 }
@@ -474,8 +478,8 @@ fn no_agent_takes_the_model_override() {
 
     let r = resolve_agent_with_overrides(&cfg, None, Some("smart"), None)
         .expect("resolves without an agent");
-    assert_eq!(r.model_name, "smart");
-    assert_eq!(r.model_identifier, "gpt-4o");
+    assert_eq!(r.model_name(), "smart");
+    assert_eq!(r.model_identifier(), "gpt-4o");
 
     unset_env(var);
 }
@@ -510,7 +514,7 @@ fn no_agent_and_no_model_errors() {
 fn mistralrs_device_defaults_to_cpu() {
     let cfg = local_mistralrs_cfg(None);
     let r = resolve_agent(&cfg, Some("smoke")).expect("resolves");
-    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    let weights = r.model_weights().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }
 
@@ -518,7 +522,7 @@ fn mistralrs_device_defaults_to_cpu() {
 fn mistralrs_cpu_device_resolves_to_weights() {
     let cfg = local_mistralrs_cfg(Some("cpu"));
     let r = resolve_agent(&cfg, Some("smoke")).expect("resolves");
-    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    let weights = r.model_weights().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }
 
@@ -543,7 +547,7 @@ fn mistralrs_device_override_replaces_model_device() {
     let cfg = local_mistralrs_cfg(Some("cuda"));
     let r = resolve_agent_with_device_override(&cfg, Some("smoke"), Some(MistralrsDeviceSpec::Cpu))
         .expect("resolves");
-    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    let weights = r.model_weights().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }
 
@@ -567,8 +571,8 @@ preamble = "hi"
         Some(MistralrsDeviceSpec::Cpu),
     )
     .expect("resolves");
-    assert_eq!(r.model_name, "claude");
-    let weights = r.model_weights.as_ref().expect("mistralrs weights");
+    assert_eq!(r.model_name(), "claude");
+    let weights = r.model_weights().expect("mistralrs weights");
     assert_eq!(weights.device, MistralrsDeviceSpec::Cpu);
 }
 
@@ -761,9 +765,9 @@ preamble = "hi"
     ));
     let resolved = resolve_agent(&cfg, Some("review")).expect("resolves");
     assert!(
-        matches!(resolved.provider, ResolvedProvider::Mistralrs),
+        matches!(resolved.provider(), ResolvedProvider::Mistralrs),
         "expected Mistralrs resolved-provider, got {:?}",
-        resolved.provider,
+        resolved.provider(),
     );
     let result = build_agent(&resolved, vec![], Path::new("/tmp/outrig-test-cache")).await;
     unset_env(var);
@@ -823,16 +827,19 @@ preamble = "you are a careful coder"
     );
 
     let r = resolve_agent(&cfg, Some("coding")).expect("resolves");
-    assert_eq!(r.model_identifier, "claude-sonnet-4-6");
-    assert_eq!(r.provider_name, "claude");
+    assert_eq!(r.model_identifier(), "claude-sonnet-4-6");
+    assert_eq!(r.provider_name(), "claude");
     let ResolvedProvider::Anthropic {
         base_url,
         api_key,
         request_timeout_secs,
         retry_budget_secs,
-    } = &r.provider
+    } = r.provider()
     else {
-        panic!("expected Anthropic resolved-provider, got {:?}", r.provider);
+        panic!(
+            "expected Anthropic resolved-provider, got {:?}",
+            r.provider()
+        );
     };
     assert_eq!(base_url, "https://api.anthropic.com");
     assert_eq!(api_key, "sk-ant-test");
@@ -842,7 +849,7 @@ preamble = "you are a careful coder"
         "an unset budget resolves to None, and the client default applies",
     );
     assert!(
-        r.model_weights.is_none(),
+        r.model_weights().is_none(),
         "a remote model carries no weight spec"
     );
 
@@ -871,13 +878,13 @@ max-tokens = 4096
     assert_eq!(
         resolve_agent(&cfg, Some("inherits"))
             .expect("resolves")
-            .max_tokens,
+            .max_tokens(),
         Some(16384),
     );
     assert_eq!(
         resolve_agent(&cfg, Some("overrides"))
             .expect("resolves")
-            .max_tokens,
+            .max_tokens(),
         Some(4096),
     );
 
@@ -895,7 +902,7 @@ preamble = "hi"
     assert_eq!(
         resolve_agent(&cfg, Some("inherits"))
             .expect("resolves")
-            .max_tokens,
+            .max_tokens(),
         None,
     );
 
@@ -1055,9 +1062,9 @@ fn single_target_alias_resolves_through_model_flag_default_and_agent() {
         cfg_with_key_var(var, "", "[agents.coding]\npreamble = \"hi\"")
     ));
     let r = resolve_agent_with_overrides(&cfg, Some("coding"), Some("opus"), None).unwrap();
-    assert_eq!(r.model_name, "fast", "the concrete row wins the name");
+    assert_eq!(r.model_name(), "fast", "the concrete row wins the name");
     assert_eq!(r.alias_name.as_deref(), Some("opus"));
-    assert_eq!(r.model_identifier, "gpt-4o-mini");
+    assert_eq!(r.model_identifier(), "gpt-4o-mini");
 
     // via default-model
     let cfg = parse(&format!(
@@ -1069,7 +1076,7 @@ fn single_target_alias_resolves_through_model_flag_default_and_agent() {
         )
     ));
     let r = resolve_agent(&cfg, Some("coding")).unwrap();
-    assert_eq!(r.model_name, "fast");
+    assert_eq!(r.model_name(), "fast");
     assert_eq!(r.alias_name.as_deref(), Some("opus"));
 
     // via [agents.<n>].model
@@ -1082,7 +1089,7 @@ fn single_target_alias_resolves_through_model_flag_default_and_agent() {
         )
     ));
     let r = resolve_agent(&cfg, Some("coding")).unwrap();
-    assert_eq!(r.model_name, "fast");
+    assert_eq!(r.model_name(), "fast");
     assert_eq!(r.alias_name.as_deref(), Some("opus"));
 }
 
@@ -1100,7 +1107,10 @@ fn repointing_an_alias_moves_every_agent_naming_it() {
     ));
 
     for agent in ["one", "two"] {
-        assert_eq!(resolve_agent(&cfg, Some(agent)).unwrap().model_name, "fast");
+        assert_eq!(
+            resolve_agent(&cfg, Some(agent)).unwrap().model_name(),
+            "fast"
+        );
     }
 
     // The single edit.
@@ -1109,8 +1119,8 @@ fn repointing_an_alias_moves_every_agent_naming_it() {
 
     for agent in ["one", "two"] {
         let r = resolve_agent(&cfg, Some(agent)).unwrap();
-        assert_eq!(r.model_name, "smart");
-        assert_eq!(r.model_identifier, "gpt-4o");
+        assert_eq!(r.model_name(), "smart");
+        assert_eq!(r.model_identifier(), "gpt-4o");
         assert_eq!(r.alias_name.as_deref(), Some("opus"));
     }
 }
@@ -1133,15 +1143,15 @@ fn alias_selects_the_first_candidate_whose_key_is_set() {
     unset_env(vars[2]);
 
     let r = resolve_agent(&cfg, Some("coding")).unwrap();
-    assert_eq!(r.model_name, "opus-5-anthropic");
+    assert_eq!(r.model_name(), "opus-5-anthropic");
     assert_eq!(r.alias_name.as_deref(), Some("smart"));
-    assert_eq!(r.model_identifier, "claude-opus-5");
-    assert!(matches!(r.provider, ResolvedProvider::Anthropic { .. }));
+    assert_eq!(r.model_identifier(), "claude-opus-5");
+    assert!(matches!(r.provider(), ResolvedProvider::Anthropic { .. }));
 
     // With the first also set, preference order decides.
     set_env(vars[0], "sk-test");
     let r = resolve_agent(&cfg, Some("coding")).unwrap();
-    assert_eq!(r.model_name, "opus-5-bedrock");
+    assert_eq!(r.model_name(), "opus-5-bedrock");
 }
 
 /// An empty variable is not a set one: `std::env::var` returns `Ok("")` for
@@ -1160,7 +1170,7 @@ fn an_empty_api_key_variable_does_not_select_a_candidate() {
     unset_env(vars[2]);
 
     let r = resolve_agent(&cfg, Some("coding")).unwrap();
-    assert_eq!(r.model_name, "opus-5-anthropic");
+    assert_eq!(r.model_name(), "opus-5-anthropic");
 }
 
 /// A list of three failing for three different reasons is exactly the case a
@@ -1215,7 +1225,7 @@ preamble = "hi"
         // The first two are unreachable, so selection walks past them to the
         // in-process candidate this build *can* run.
         let r = resolved.expect("the mistralrs candidate is reachable in this build");
-        assert_eq!(r.model_name, "opus-5-local");
+        assert_eq!(r.model_name(), "opus-5-local");
         assert_eq!(r.alias_name.as_deref(), Some("smart"));
     }
 
@@ -1293,7 +1303,7 @@ preamble = "hi"
     ));
 
     let r = resolve_agent(&cfg, Some("coding")).expect("falls through to the hosted candidate");
-    assert_eq!(r.model_name, "hosted-fallback");
+    assert_eq!(r.model_name(), "hosted-fallback");
     assert_eq!(r.alias_name.as_deref(), Some("smart"));
 }
 
@@ -1313,7 +1323,8 @@ fn an_alias_and_its_target_resolve_to_the_same_registry_key() {
     let direct = resolve_agent_with_overrides(&cfg, Some("coding"), Some("fast"), None).unwrap();
 
     assert_eq!(
-        via_alias.model_name, direct.model_name,
+        via_alias.model_name(),
+        direct.model_name(),
         "the registry key must not depend on which name was typed"
     );
     // ... while attribution still distinguishes them. The rendering itself is
@@ -1366,10 +1377,10 @@ fn device_override_applies_through_a_single_target_mistralrs_alias() {
 
     let r = resolve_agent_with_device_override(&cfg, Some("smoke"), Some(MistralrsDeviceSpec::Cpu))
         .unwrap();
-    assert_eq!(r.model_name, "local");
+    assert_eq!(r.model_name(), "local");
     assert_eq!(r.alias_name.as_deref(), Some("onprem"));
     assert_eq!(
-        r.model_weights.expect("mistralrs weights").device,
+        r.model_weights().expect("mistralrs weights").device,
         MistralrsDeviceSpec::Cpu
     );
 }
@@ -1436,7 +1447,7 @@ async fn a_single_target_local_alias_still_reports_the_missing_feature() {
     cfg.default_model = Some("onprem".to_string());
 
     let resolved = resolve_agent(&cfg, Some("smoke")).expect("resolution succeeds");
-    assert_eq!(resolved.model_name, "local");
+    assert_eq!(resolved.model_name(), "local");
 
     let err = match build_agent(&resolved, vec![], Path::new("/tmp/outrig-test-cache")).await {
         Ok(_) => panic!("expected build_agent to error on feature-off mistralrs"),

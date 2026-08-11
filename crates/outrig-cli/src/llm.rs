@@ -57,6 +57,7 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// fixable with one config line, which is the trade this number is chosen for.
 pub const ANTHROPIC_FALLBACK_MAX_TOKENS: u64 = 32_768;
 
+pub mod failover;
 pub mod retry;
 
 #[cfg(feature = "local-llm")]
@@ -207,6 +208,36 @@ pub struct MistralrsWeights {
     pub device: MistralrsDeviceSpec,
 }
 
+/// One concrete `[models.<name>]` row a session may run against, fully
+/// resolved.
+///
+/// These five fields used to sit directly on [`ResolvedAgent`], describing the
+/// one row a session had picked. Under failover they travel *per candidate*: an
+/// alias over three provider-equivalent rows resolves to three of these, and
+/// the chain moves between them within one `completion()` call. Everything that
+/// is a property of the *agent* rather than of the row it runs on -- the
+/// preamble, the temperature, the tool limits -- stays on `ResolvedAgent`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedCandidate {
+    /// The *concrete* `[models.<name>]` row, which is also the `LlmRegistry`
+    /// cache key -- so two names for one in-process model share one loaded
+    /// engine. Never the alias's name, per candidate as much as per session.
+    pub model_name: String,
+    pub model_identifier: String,
+    pub provider_name: String,
+    pub provider: ResolvedProvider,
+    /// `Some` for mistralrs-style models, `None` for remote ones. Carries
+    /// the per-model weight spec that used to live on the provider config.
+    pub model_weights: Option<MistralrsWeights>,
+    /// This row's output-token ceiling: the agent's if it set one, this
+    /// model's otherwise.
+    ///
+    /// Per candidate because the fallback half is, and because a chain that
+    /// moved the identifier while keeping candidate one's ceiling would send a
+    /// number the new endpoint never agreed to.
+    pub max_tokens: Option<u32>,
+}
+
 /// Fully-resolved view of one agent: every knob the agent loop needs to
 /// build a Rig client and run a turn.
 ///
@@ -220,26 +251,25 @@ pub struct ResolvedAgent {
     /// top-level config and the built-in defaults, exactly as it would for an
     /// `[agents.<name>]` block with no keys set.
     pub agent_name: Option<String>,
-    /// The *concrete* `[models.<name>]` row this session runs against, which is
-    /// also the `LlmRegistry` cache key -- so two names for one in-process
-    /// model share one loaded engine.
-    pub model_name: String,
-    /// The name the caller asked for, when it was an alias standing for
-    /// `model_name`; `None` when no alias was involved. Kept beside
-    /// `model_name` rather than replacing it so attribution can show the hop
-    /// without the alias reaching the registry.
+    /// The rows this session may run against, in preference order, and never
+    /// empty.
+    ///
+    /// One element for a direct model name or a single-target alias, which is
+    /// every pre-failover session and stays exactly that. More than one only
+    /// for a multi-candidate alias, where the extras are what a mid-turn
+    /// failure moves to. The first is what every reader that wants "the model"
+    /// means, which is why [`primary`](Self::primary) exists rather than
+    /// indexing at each site.
+    pub candidates: Vec<ResolvedCandidate>,
+    /// The name the caller asked for, when it was an alias standing for the
+    /// candidates below; `None` when no alias was involved. Kept beside them
+    /// rather than replacing them so attribution can show the hop without the
+    /// alias reaching the registry.
     pub alias_name: Option<String>,
-    pub model_identifier: String,
-    pub provider_name: String,
-    pub provider: ResolvedProvider,
-    /// `Some` for mistralrs-style models, `None` for remote ones. Carries
-    /// the per-model weight spec that used to live on the provider config.
-    pub model_weights: Option<MistralrsWeights>,
     /// `None` sends no system prompt at all. That is what an agent which omits
     /// `preamble` resolves to, and what every agentless session resolves to.
     pub preamble: Option<String>,
     pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
     pub tool_call_max: usize,
     pub tool_result_max_bytes: usize,
     /// Maximum subagent nesting depth: the primary is the root at depth 1, and
@@ -251,6 +281,63 @@ pub struct ResolvedAgent {
 }
 
 impl ResolvedAgent {
+    /// The first candidate: the row this session runs against until something
+    /// fails.
+    ///
+    /// Every reader that predates failover means this one, so it is a method
+    /// rather than an index at each site -- and the `expect` states the
+    /// invariant once. Resolution builds the list from a walk that either
+    /// yields at least one candidate or returns an error, so an empty chain is
+    /// a construction bug rather than a config the user can write.
+    pub fn primary(&self) -> &ResolvedCandidate {
+        self.candidates
+            .first()
+            .expect("a resolved agent always has at least one candidate")
+    }
+
+    /// The candidates after the first: what a mid-turn failure moves to, in
+    /// order. Empty for every single-candidate session.
+    ///
+    /// For attribution. A chain means one session can span two models, so the
+    /// banner names the fallbacks up front rather than leaving the first move
+    /// to be the first the user hears of them.
+    pub fn fallback_names(&self) -> Vec<&str> {
+        self.candidates[1..]
+            .iter()
+            .map(|candidate| candidate.model_name.as_str())
+            .collect()
+    }
+
+    /// The concrete row this session runs against. See [`primary`](Self::primary).
+    pub fn model_name(&self) -> &str {
+        &self.primary().model_name
+    }
+
+    /// The wire identifier the first candidate sends.
+    pub fn model_identifier(&self) -> &str {
+        &self.primary().model_identifier
+    }
+
+    /// The `[providers.<name>]` entry serving the first candidate.
+    pub fn provider_name(&self) -> &str {
+        &self.primary().provider_name
+    }
+
+    /// The first candidate's resolved provider.
+    pub fn provider(&self) -> &ResolvedProvider {
+        &self.primary().provider
+    }
+
+    /// The first candidate's weight spec, for in-process models.
+    pub fn model_weights(&self) -> Option<&MistralrsWeights> {
+        self.primary().model_weights.as_ref()
+    }
+
+    /// The first candidate's output-token ceiling.
+    pub fn max_tokens(&self) -> Option<u32> {
+        self.primary().max_tokens
+    }
+
     /// The model as it should be *shown*: `alias -> concrete` when an alias was
     /// involved, and the bare name otherwise.
     ///
@@ -264,8 +351,8 @@ impl ResolvedAgent {
     /// model name prints exactly what it printed before aliases existed.
     pub(crate) fn model_display(&self) -> String {
         match &self.alias_name {
-            Some(alias) => format!("{alias} -> {}", self.model_name),
-            None => self.model_name.clone(),
+            Some(alias) => format!("{alias} -> {}", self.model_name()),
+            None => self.model_name().to_string(),
         }
     }
 }
@@ -408,39 +495,75 @@ pub(crate) fn first_selectable<'a>(
     cfg: &Config,
     candidates: &[&'a str],
 ) -> std::result::Result<&'a str, Vec<(&'a str, Unselectable)>> {
-    // Deliberately not `with_capacity`: the common case returns on the first
-    // candidate, and this vector exists only to build a failure message.
+    // Infallible indexing: `selectable_candidates` returns `Ok` only for a
+    // non-empty list.
+    selectable_candidates(cfg, candidates).map(|kept| kept[0])
+}
+
+/// *Every* candidate this build could reach, in preference order, or every
+/// candidate paired with why it was skipped.
+///
+/// The failover counterpart of [`first_selectable`], and the same traversal:
+/// selection answers "am I configured for this", so a chain is built from the
+/// candidates that pass it and failover decides among *those* which is working.
+/// Dropping the unreachable ones here rather than at the first turn is what
+/// keeps a chain from spending a move on a candidate whose api-key was never
+/// set.
+///
+/// Returns `Err` only when nothing survives, carrying the same per-candidate
+/// reasons a single selection would have reported.
+pub(crate) fn selectable_candidates<'a>(
+    cfg: &Config,
+    candidates: &[&'a str],
+) -> std::result::Result<Vec<&'a str>, Vec<(&'a str, Unselectable)>> {
+    let mut kept = Vec::new();
     let mut tried = Vec::new();
     for candidate in candidates {
         match selectability(cfg, candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(()) => kept.push(*candidate),
             Err(reason) => tried.push((*candidate, reason)),
         }
     }
-    Err(tried)
+    if kept.is_empty() { Err(tried) } else { Ok(kept) }
 }
 
-/// [`first_selectable`] with the alias's name attached, rendering the failure
-/// as one line per candidate.
+/// [`selectable_candidates`] with the alias's name attached, rendering the
+/// failure as one line per candidate.
 ///
 /// Only reached when there is a genuine choice to make -- a single-target alias
 /// resolves its one target directly, so this never turns a legible single-model
 /// error into a list of one. The per-candidate shape is for the case worth
 /// serving: three candidates failing for three different reasons, where one
 /// line costs the user an afternoon.
-fn select_candidate<'a>(cfg: &Config, alias: &str, candidates: &[&'a str]) -> Result<&'a str> {
-    first_selectable(cfg, candidates).map_err(|tried| {
-        let width = tried.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+fn select_candidates<'a>(cfg: &Config, alias: &str, candidates: &[&'a str]) -> Result<Vec<&'a str>> {
+    selectable_candidates(cfg, candidates).map_err(|tried| {
+        let rows: Vec<_> = tried
+            .iter()
+            .map(|(name, reason)| (*name, reason.to_string()))
+            .collect();
         LlmResolveError::NoUsableAliasCandidate {
             alias: alias.to_string(),
-            tried: tried
-                .iter()
-                .map(|(name, reason)| format!("  {name:width$} -- {reason}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+            tried: render_candidate_reasons(&rows),
         }
         .into()
     })
+}
+
+/// One line per candidate: the name, padded so the reasons align, and why that
+/// candidate is not the one serving this turn.
+///
+/// Shared by the two halves of the same message. The static half reports it
+/// when no candidate is *selectable* at resolve time; the chain reports it when
+/// every selectable candidate has *failed* mid-turn. Same list, same question
+/// from the user's side -- "what did you try, and what went wrong with each" --
+/// at two different moments, so one renderer rather than two that drift on
+/// alignment or separator with nothing failing.
+pub(crate) fn render_candidate_reasons(rows: &[(&str, String)]) -> String {
+    let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(name, reason)| format!("  {name:width$} -- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
@@ -512,8 +635,7 @@ pub fn resolve_agent_with_overrides(
             None => LlmResolveError::MissingModel,
         })?;
 
-    let mut model_name = model_name;
-    let mut model = cfg
+    let root = cfg
         .models
         .get(model_name)
         .ok_or_else(|| LlmResolveError::UnknownModel {
@@ -531,7 +653,7 @@ pub fn resolve_agent_with_overrides(
     // above that it does not assume `cfg.validate()` ran, and a hand-built or
     // mutated `Config` can reach it through the library API -- a promise of a
     // `Result` has to be kept with a `Result`.
-    if model.alias.is_some() {
+    let concrete: Vec<&str> = if root.alias.is_some() {
         let candidates = cfg
             .model_candidates(model_name)
             .map_err(|e| CliError::Outrig(e.into()))?;
@@ -549,26 +671,81 @@ pub fn resolve_agent_with_overrides(
             .into());
         }
 
-        let concrete = match candidates.as_slice() {
+        let chain = match candidates.as_slice() {
             // One candidate is renaming, not choosing. Resolve it exactly as if
             // the user had typed it, rather than filtering it: that keeps every
             // existing error with its own text *and its own remedy* -- an unset
             // api key names the variable, and a mistralrs model in a default
             // build still reports `MistralrsFeatureDisabled`, the one that says
             // "rebuild with --features local-llm".
-            [only] => *only,
-            _ => select_candidate(cfg, model_name, &candidates)?,
+            [only] => vec![*only],
+            // Every selectable candidate, not just the first: the extras are
+            // the chain a mid-turn failure moves along. Selection still drops
+            // the ones this build could never reach, so failover only ever
+            // chooses among candidates that were configured.
+            _ => select_candidates(cfg, model_name, &candidates)?,
         };
 
         alias_name = Some(model_name);
-        model_name = concrete;
-        // Infallible: every candidate is a key of `cfg.models` by construction
-        // -- `model_candidates` only ever yields names it found in the table.
-        model = &cfg.models[concrete];
+        chain
+    } else {
+        vec![model_name]
+    };
+
+    // From here down each row resolves exactly as the single row did before
+    // aliases existed -- the loop is the only new thing.
+    let mut resolved = Vec::with_capacity(concrete.len());
+    for name in concrete {
+        resolved.push(resolve_candidate(cfg, agent, name, device_override)?);
     }
 
-    // From here down the resolution is of one concrete row, exactly as it was
-    // before aliases existed.
+    Ok(ResolvedAgent {
+        agent_name: agent_name.map(str::to_string),
+        candidates: resolved,
+        alias_name: alias_name.map(str::to_string),
+        preamble: agent.preamble.clone(),
+        temperature: agent.temperature,
+        tool_call_max: agent
+            .tool_call_max
+            .or(cfg.tool_call_max)
+            .unwrap_or(DEFAULT_TOOL_CALL_MAX) as usize,
+        tool_result_max_bytes: agent
+            .tool_result_max
+            .or(cfg.tool_result_max)
+            .unwrap_or(outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES)
+            as usize,
+        subagent_depth_max: agent
+            .subagent_depth_max
+            .or(cfg.subagent_depth_max)
+            .unwrap_or(outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX),
+        subagent_width_max: agent
+            .subagent_width_max
+            .or(cfg.subagent_width_max)
+            .unwrap_or(outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX),
+        image: agent.image.clone(),
+    })
+}
+
+/// Resolve one concrete `[models.<name>]` row against the provider serving it.
+///
+/// Lifted out of [`resolve_agent_with_overrides`] whole when failover made the
+/// resolution happen `N` times instead of once. Every error it raises names the
+/// row it was resolving, so a chain's candidate reports the same text it would
+/// have if the user had named it directly -- the property the static half's
+/// `Unselectable` also exists to preserve.
+fn resolve_candidate(
+    cfg: &Config,
+    agent: &outrig::config::Agent,
+    model_name: &str,
+    device_override: Option<MistralrsDeviceSpec>,
+) -> Result<ResolvedCandidate> {
+    let model = cfg
+        .models
+        .get(model_name)
+        .ok_or_else(|| LlmResolveError::UnknownModel {
+            name: model_name.to_string(),
+        })?;
+
     let Some(provider_name) = model.provider.as_deref() else {
         // A row that is neither shape. Validation rejects it on every load
         // path, so this is reachable only through a `Config` built or mutated
@@ -684,43 +861,25 @@ pub fn resolve_agent_with_overrides(
         }
     };
 
-    Ok(ResolvedAgent {
-        agent_name: agent_name.map(str::to_string),
+    Ok(ResolvedCandidate {
         // The *concrete* row, never the alias. `LlmRegistry` is keyed on this
         // (`llm/registry.rs`), so an alias name reaching it loads the same
         // multi-gigabyte GGUF twice in one process. The name the caller asked
-        // for rides in `alias_name` instead.
+        // for rides in `ResolvedAgent::alias_name` instead.
         model_name: model_name.to_string(),
-        alias_name: alias_name.map(str::to_string),
         model_identifier,
         provider_name: provider_name.to_string(),
         provider: resolved_provider,
         model_weights,
-        preamble: agent.preamble.clone(),
-        temperature: agent.temperature,
         // The agent's ceiling wins; the model's is the fallback. A model that
         // carries one covers every agent pointed at it, which is what an
         // Anthropic identifier rig does not recognize needs -- it has no
         // provider-side default and errors without a ceiling from somewhere.
+        //
+        // Per candidate because the fallback half is: two rows in one chain can
+        // publish different ceilings, and the one that travels must be the one
+        // belonging to the row actually being called.
         max_tokens: agent.max_tokens.or(model.max_tokens),
-        tool_call_max: agent
-            .tool_call_max
-            .or(cfg.tool_call_max)
-            .unwrap_or(DEFAULT_TOOL_CALL_MAX) as usize,
-        tool_result_max_bytes: agent
-            .tool_result_max
-            .or(cfg.tool_result_max)
-            .unwrap_or(outrig::config::DEFAULT_TOOL_RESULT_MAX_BYTES)
-            as usize,
-        subagent_depth_max: agent
-            .subagent_depth_max
-            .or(cfg.subagent_depth_max)
-            .unwrap_or(outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX),
-        subagent_width_max: agent
-            .subagent_width_max
-            .or(cfg.subagent_width_max)
-            .unwrap_or(outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX),
-        image: agent.image.clone(),
     })
 }
 
@@ -798,6 +957,18 @@ pub enum RigAgent {
         agent: rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
         tool_call_max: usize,
     },
+    /// A multi-candidate alias: one agent over a chain that moves between
+    /// provider-equivalent rows when one fails mid-turn.
+    ///
+    /// A fourth variant rather than a wrapper around the three above, for the
+    /// reason the enum exists at all -- the chain is its own concrete
+    /// `CompletionModel`, and a chain spanning an OpenAI row and an Anthropic
+    /// one is neither of those variants. A single-candidate alias never lands
+    /// here; it builds the variant its provider always built.
+    Failover {
+        agent: rig::agent::Agent<failover::FailoverModel>,
+        tool_call_max: usize,
+    },
 }
 
 /// Build a Rig `Agent` ready to receive a turn. Preamble, sampling params,
@@ -872,11 +1043,107 @@ pub async fn build_agent(
     resolved: &ResolvedAgent,
     tools: Vec<SessionTool>,
     cache_root: &Path,
-    #[cfg(feature = "local-llm")] registry: &LlmRegistry,
+    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
 ) -> Result<RigAgent> {
     #[cfg(not(feature = "local-llm"))]
     let _ = cache_root;
-    match &resolved.provider {
+
+    // A chain of one is not a special case: it takes the single-candidate path
+    // below and produces exactly the `RigAgent` it always did, wrapper and all.
+    // That is what keeps every no-alias session byte-for-byte what it was --
+    // the same variant, the same retry stack, the same error text -- rather
+    // than merely equivalent to it.
+    if resolved.candidates.len() == 1 {
+        return build_single(resolved, resolved.primary(), tools, cache_root,
+            #[cfg(feature = "local-llm")]
+            registry,
+        )
+        .await;
+    }
+
+    // One policy for the whole chain, so its `chain_deadline` is the same
+    // handle in every candidate's HTTP client and model wrapper. Arming it once
+    // per `completion()` call is what bounds the chain's worst case at one
+    // budget rather than one per candidate.
+    //
+    // The budget itself comes from the first candidate's provider. A chain
+    // spanning providers that disagree on `retry-budget-secs` has no single
+    // right answer, and the head of a preference order is the defensible one --
+    // it is the endpoint the user said to use.
+    let policy = retry_policy(chain_retry_budget_secs(&resolved.candidates));
+
+    let mut candidates: Vec<Box<dyn failover::Candidate>> =
+        Vec::with_capacity(resolved.candidates.len());
+    for candidate in &resolved.candidates {
+        candidates.push(
+            build_candidate(candidate, &policy, cache_root,
+                #[cfg(feature = "local-llm")]
+                registry,
+            )
+            .await?,
+        );
+    }
+
+    Ok(RigAgent::Failover {
+        agent: finish_agent(
+            failover::FailoverModel::new(candidates, policy),
+            resolved,
+            // The chain rewrites `max_tokens` per candidate inside the call, so
+            // the ceiling baked into the agent here is only the starting one.
+            resolved.max_tokens(),
+            tools,
+        ),
+        tool_call_max: resolved.tool_call_max,
+    })
+}
+
+/// The `retry-budget-secs` governing a whole chain. See [`build_agent`].
+///
+/// The first *remote* candidate's, rather than the first candidate's.
+/// `[providers.<name>] style = "mistralrs"` has no such key at all -- an
+/// in-process model does no HTTP and so has nothing to retry -- so a local head
+/// is skipped. Reading it anyway meant a local-first alias fell through to the
+/// compiled 600 seconds and handed that to a remote fallback, ignoring a
+/// `retry-budget-secs = 0` the user had set and the docs call the one "no
+/// retries" knob.
+///
+/// The two `None`s are *not* the same and the nesting is what keeps them apart.
+/// A local row contributes no `Option` and is skipped; a remote row whose
+/// `retry_budget_secs` is `None` contributes `Some(None)` and **stops** the
+/// search, because that `None` is an answer -- "the compiled default" -- and
+/// not an absence. Flattening one level of it is deliberate: collapsing them
+/// instead would let a later candidate's explicit override govern a preferred
+/// remote candidate that had simply inherited the default.
+///
+/// So the rule the head-of-preference-order argument actually supports holds:
+/// the earliest candidate that *can* answer decides. A chain of only local rows
+/// yields `None`, harmlessly, because nothing in it retries over HTTP.
+fn chain_retry_budget_secs(candidates: &[ResolvedCandidate]) -> Option<u64> {
+    candidates
+        .iter()
+        .find_map(|candidate| match &candidate.provider {
+            ResolvedProvider::OpenAi {
+                retry_budget_secs, ..
+            }
+            | ResolvedProvider::Anthropic {
+                retry_budget_secs, ..
+            } => Some(*retry_budget_secs),
+            ResolvedProvider::Mistralrs => None,
+        })
+        .flatten()
+}
+
+/// Build the one-candidate agent: the pre-failover path, unchanged.
+async fn build_single(
+    resolved: &ResolvedAgent,
+    candidate: &ResolvedCandidate,
+    tools: Vec<SessionTool>,
+    cache_root: &Path,
+    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
+) -> Result<RigAgent> {
+    #[cfg(not(feature = "local-llm"))]
+    let _ = cache_root;
+    match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
             api_key,
@@ -884,22 +1151,16 @@ pub async fn build_agent(
             retry_budget_secs,
         } => {
             use rig::client::CompletionClient;
-            use rig::providers::openai::CompletionsClient;
 
             let policy = retry_policy(*retry_budget_secs);
-            let http = remote_http_client(*request_timeout_secs, policy)?;
-            let client = CompletionsClient::builder()
-                .api_key(api_key.clone())
-                .base_url(base_url)
-                .http_client(http)
-                .build()
-                .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
-            let model = client.completion_model(&resolved.model_identifier);
+            let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let client = openai_client(base_url, api_key, http)?;
+            let model = client.completion_model(&candidate.model_identifier);
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
                     resolved,
-                    resolved.max_tokens,
+                    candidate.max_tokens,
                     tools,
                 ),
                 tool_call_max: resolved.tool_call_max,
@@ -911,49 +1172,10 @@ pub async fn build_agent(
             request_timeout_secs,
             retry_budget_secs,
         } => {
-            use rig::client::CompletionClient;
-            use rig::providers::anthropic;
-
             let policy = retry_policy(*retry_budget_secs);
-            let http = remote_http_client(*request_timeout_secs, policy)?;
-            // Rig's client owns the protocol: `x-api-key`, the
-            // `anthropic-version` header, `POST {base-url}/v1/messages`, and
-            // the native content blocks. It also normalizes a trailing `/v1`
-            // or `/messages` off the configured base URL.
-            let client = anthropic::Client::builder()
-                .api_key(api_key.clone())
-                .base_url(base_url)
-                .http_client(http)
-                .build()
-                .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()))?;
-            // `completion_model`, never `CompletionModel::with_model`: the two
-            // disagree about a model identifier rig does not recognize. This
-            // one leaves the default unset, which is the signal the fallback
-            // below keys off. `with_model` would have already capped every
-            // reply at 2048 tokens, silently and without outrig ever seeing
-            // that it happened. `tests/anthropic_mock.rs` pins the difference.
-            let mut model = client.completion_model(&resolved.model_identifier);
-            // Precedence, highest first: the agent's or model's `max-tokens`
-            // (already merged into `resolved.max_tokens` by `resolve_agent`),
-            // then rig's published ceiling for an identifier it recognizes,
-            // then ours. Anthropic rejects a request carrying no ceiling at
-            // all, so the last tier has to exist; filling it *silently* is the
-            // failure mode the warning exists to prevent.
-            if resolved.max_tokens.is_none() && model.default_max_tokens.is_none() {
-                warn_fallback_ceiling(resolved);
-                model.default_max_tokens = Some(ANTHROPIC_FALLBACK_MAX_TOKENS);
-            }
-            // Tier 2 is also a cap, not only a default. A configured ceiling
-            // above what this identifier can serve is a request the API refuses
-            // outright, so the whole turn fails rather than being cut short --
-            // lowering it is the only outcome that runs at all, and the number
-            // is not invented, it is what the model publishes. Only reachable
-            // for an identifier rig recognizes; for one it does not there is no
-            // ceiling to compare against, and outrig guesses none.
-            let max_tokens = match (resolved.max_tokens, model.default_max_tokens) {
-                (Some(want), Some(ceiling)) => Some(u64::from(want).min(ceiling) as u32),
-                _ => resolved.max_tokens,
-            };
+            let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let client = anthropic_client(base_url, api_key, http)?;
+            let (model, max_tokens) = anthropic_model(&client, candidate);
             Ok(RigAgent::Anthropic {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
@@ -968,44 +1190,15 @@ pub async fn build_agent(
             #[cfg(not(feature = "local-llm"))]
             {
                 Err(LlmResolveError::MistralrsFeatureDisabled {
-                    name: resolved.provider_name.clone(),
+                    name: candidate.provider_name.clone(),
                 }
                 .into())
             }
             #[cfg(feature = "local-llm")]
             {
-                let weights = resolved.model_weights.as_ref().ok_or_else(|| {
-                    LlmResolveError::MistralrsLoad {
-                        model: resolved.model_name.clone(),
-                        source: anyhow::anyhow!(
-                            "internal: resolved mistralrs agent has no model_weights"
-                        ),
-                    }
-                })?;
-                let model_name = resolved.model_name.as_str();
-                let model_id = weights.model_id.as_deref();
-                let model_path = weights.model_path.as_deref();
-                let model_file = weights.model_file.as_deref();
-                let revision = weights.revision.as_deref();
-                let context_length = weights.context_length;
-                let device = weights.device;
-                let model = registry
-                    .get_or_init(model_name, || async move {
-                        crate::llm::mistralrs::load(
-                            model_name,
-                            model_id,
-                            model_path,
-                            model_file,
-                            revision,
-                            context_length,
-                            device,
-                            cache_root,
-                        )
-                        .await
-                    })
-                    .await?;
+                let model = mistralrs_model(candidate, cache_root, registry).await?;
                 Ok(RigAgent::Mistralrs {
-                    agent: finish_agent((*model).clone(), resolved, resolved.max_tokens, tools),
+                    agent: finish_agent((*model).clone(), resolved, candidate.max_tokens, tools),
                     tool_call_max: resolved.tool_call_max,
                 })
             }
@@ -1013,29 +1206,339 @@ pub async fn build_agent(
     }
 }
 
-/// Say, once, that outrig picked an output-token ceiling nobody asked for.
+/// Build one link of a chain: the same client and the same retry stack
+/// `build_single` builds, behind the object-safe shim a chain holds.
+///
+/// Every candidate takes the *chain's* policy rather than its own provider's,
+/// so they share one deadline. The rest -- the client, the ceiling precedence,
+/// the Anthropic cap -- is per candidate and identical to the single path,
+/// which is what makes a move land on a correctly-built model rather than a
+/// simplified one.
+async fn build_candidate(
+    candidate: &ResolvedCandidate,
+    policy: &retry::RetryPolicy,
+    cache_root: &Path,
+    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
+) -> Result<Box<dyn failover::Candidate>> {
+    #[cfg(not(feature = "local-llm"))]
+    let _ = cache_root;
+    match &candidate.provider {
+        ResolvedProvider::OpenAi {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            ..
+        } => {
+            use rig::client::CompletionClient;
+
+            let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let client = openai_client(base_url, api_key, http)?;
+            let model = client.completion_model(&candidate.model_identifier);
+            Ok(Box::new(failover::ModelCandidate::new(
+                retry::RetryingModel::new(model, policy.clone()),
+                &candidate.model_name,
+                &candidate.model_identifier,
+                candidate.max_tokens,
+            )))
+        }
+        ResolvedProvider::Anthropic {
+            base_url,
+            api_key,
+            request_timeout_secs,
+            ..
+        } => {
+            let http = remote_http_client(*request_timeout_secs, policy.clone())?;
+            let client = anthropic_client(base_url, api_key, http)?;
+            let (model, max_tokens) = anthropic_model(&client, candidate);
+            Ok(Box::new(failover::ModelCandidate::new(
+                retry::RetryingModel::new(model, policy.clone()),
+                &candidate.model_name,
+                &candidate.model_identifier,
+                max_tokens,
+            )))
+        }
+        ResolvedProvider::Mistralrs => {
+            #[cfg(not(feature = "local-llm"))]
+            {
+                Err(LlmResolveError::MistralrsFeatureDisabled {
+                    name: candidate.provider_name.clone(),
+                }
+                .into())
+            }
+            #[cfg(feature = "local-llm")]
+            {
+                // Deliberately *not* loaded here -- see `LazyLocalCandidate`.
+                Ok(Box::new(LazyLocalCandidate {
+                    registry: Arc::clone(registry),
+                    candidate: candidate.clone(),
+                    cache_root: cache_root.to_path_buf(),
+                }))
+            }
+        }
+    }
+}
+
+/// A chain candidate whose weights load the first time the chain reaches it.
+///
+/// Every other candidate is built eagerly, and design fork §6 is right that
+/// this costs nothing: constructing a remote client does no I/O, so building
+/// three of them is free and a move pays no build cost mid-turn. A mistralrs
+/// row breaks that premise twice over. Its "construction" is a multi-gigabyte
+/// load, and unlike a remote client it can *fail* -- missing weights, a corrupt
+/// file, no room on the device.
+///
+/// Eagerly, both land on the wrong session. A fallback whose weights are
+/// missing takes down a session whose hosted primary is perfectly healthy,
+/// which inverts the reason for naming a fallback at all: the chain exists to
+/// make an outage survivable, and it would instead make a *second* model a new
+/// way to fail to start. So the load happens when the candidate is actually
+/// reached, and a failure there is that candidate's failure, which the chain
+/// reports and moves past like any other.
+///
+/// The first-use wait is announced by the load path itself, which is the
+/// mitigation `plan/done/0101-subagent-model-selection.md`'s decision 7 already
+/// built for exactly this surprise.
+#[cfg(feature = "local-llm")]
+struct LazyLocalCandidate {
+    registry: Arc<LlmRegistry>,
+    candidate: ResolvedCandidate,
+    cache_root: PathBuf,
+}
+
+#[cfg(feature = "local-llm")]
+impl failover::Candidate for LazyLocalCandidate {
+    fn model_name(&self) -> &str {
+        &self.candidate.model_name
+    }
+
+    fn model_identifier(&self) -> &str {
+        &self.candidate.model_identifier
+    }
+
+    fn max_tokens(&self) -> Option<u64> {
+        self.candidate.max_tokens.map(u64::from)
+    }
+
+    /// Answered without loading, which is what makes the laziness possible at
+    /// all: `FailoverModel::new` ANDs this across the chain at build time.
+    ///
+    /// Sound because it is a property of the *type*, not of the loaded weights:
+    /// `MistralrsModel` does not override rig's `false` default. That is an
+    /// assumption rather than something the compiler holds, so it is stated
+    /// here -- if the in-process model ever does compose native structured
+    /// output with tools, this hardcoded answer becomes wrong for every chain
+    /// naming a local row, and the conservative direction is the safe one to be
+    /// wrong in (a chain that says `false` loses guaranteed structured output;
+    /// one that wrongly says `true` promises what a candidate cannot honor).
+    fn composes_native_output_with_tools(&self) -> bool {
+        false
+    }
+
+    fn completion(
+        &self,
+        request: rig::completion::CompletionRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        rig::completion::CompletionResponse<()>,
+                        rig::completion::CompletionError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            // The wait this laziness moved here. Deferring the load is only
+            // defensible if the surprise moves with it: reaching this candidate
+            // can mean minutes of downloading or mapping weights, in the middle
+            // of a turn, and the move line above says only that the chain moved
+            // on -- which reads as "and the next one is answering now". The
+            // wording is the subagent path's, because it is the same wait.
+            if !self.registry.is_loaded(&self.candidate.model_name) {
+                eprintln!(
+                    "[outrig] loading in-process model {} (first use; this may take \
+                     several minutes)",
+                    self.candidate.model_name,
+                );
+            }
+            let model = mistralrs_model(&self.candidate, &self.cache_root, &self.registry)
+                .await
+                // A load failure is this candidate's failure, not the session's.
+                // Terminal rather than transient: a missing GGUF is still missing
+                // on a resend, so a chain of only these ends the process instead
+                // of advising a retry that cannot help.
+                .map_err(|e| rig::completion::CompletionError::ProviderError(e.to_string()))?;
+            let response =
+                rig::completion::CompletionModel::completion(&*model, request).await?;
+            Ok(rig::completion::CompletionResponse {
+                choice: response.choice,
+                usage: response.usage,
+                raw_response: (),
+                message_id: response.message_id,
+            })
+        })
+    }
+}
+
+/// Rig's OpenAI-compatible client for one candidate.
+///
+/// Shared by the single path and the chain for the same reason its Anthropic
+/// sibling is: a candidate built by a simplified copy of this is how a chain
+/// would quietly stop talking to the endpoint the same way a lone model does.
+fn openai_client(
+    base_url: &str,
+    api_key: &str,
+    http: retry::RetryingHttpClient,
+) -> Result<rig::providers::openai::CompletionsClient<retry::RetryingHttpClient>> {
+    use rig::providers::openai::CompletionsClient;
+
+    CompletionsClient::builder()
+        .api_key(api_key.to_string())
+        .base_url(base_url)
+        .http_client(http)
+        .build()
+        .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
+}
+
+/// Rig's Anthropic client for one candidate.
+///
+/// Rig's client owns the protocol: `x-api-key`, the `anthropic-version` header,
+/// `POST {base-url}/v1/messages`, and the native content blocks. It also
+/// normalizes a trailing `/v1` or `/messages` off the configured base URL.
+fn anthropic_client(
+    base_url: &str,
+    api_key: &str,
+    http: retry::RetryingHttpClient,
+) -> Result<rig::providers::anthropic::Client<retry::RetryingHttpClient>> {
+    use rig::providers::anthropic;
+
+    anthropic::Client::builder()
+        .api_key(api_key.to_string())
+        .base_url(base_url)
+        .http_client(http)
+        .build()
+        .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
+}
+
+/// One candidate's Anthropic model, and the output-token ceiling that reaches
+/// the wire with it.
+///
+/// Shared by the single path and the chain so the three-tier precedence is
+/// stated once. Under a chain it runs per candidate, which is what makes the
+/// ceiling travel with the identifier instead of staying candidate one's.
+fn anthropic_model(
+    client: &rig::providers::anthropic::Client<retry::RetryingHttpClient>,
+    candidate: &ResolvedCandidate,
+) -> (
+    rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
+    Option<u32>,
+) {
+    use rig::client::CompletionClient;
+
+    // `completion_model`, never `CompletionModel::with_model`: the two
+    // disagree about a model identifier rig does not recognize. This one
+    // leaves the default unset, which is the signal the fallback below keys
+    // off. `with_model` would have already capped every reply at 2048 tokens,
+    // silently and without outrig ever seeing that it happened.
+    // `tests/anthropic_mock.rs` pins the difference.
+    let mut model = client.completion_model(&candidate.model_identifier);
+    // Precedence, highest first: the agent's or model's `max-tokens` (already
+    // merged into the candidate by `resolve_candidate`), then rig's published
+    // ceiling for an identifier it recognizes, then ours. Anthropic rejects a
+    // request carrying no ceiling at all, so the last tier has to exist;
+    // filling it *silently* is the failure mode the warning exists to prevent.
+    if candidate.max_tokens.is_none() && model.default_max_tokens.is_none() {
+        warn_fallback_ceiling(candidate);
+        model.default_max_tokens = Some(ANTHROPIC_FALLBACK_MAX_TOKENS);
+    }
+    // Tier 2 is also a cap, not only a default. A configured ceiling above what
+    // this identifier can serve is a request the API refuses outright, so the
+    // whole turn fails rather than being cut short -- lowering it is the only
+    // outcome that runs at all, and the number is not invented, it is what the
+    // model publishes. Only reachable for an identifier rig recognizes; for one
+    // it does not there is no ceiling to compare against, and outrig guesses
+    // none.
+    let max_tokens = match (candidate.max_tokens, model.default_max_tokens) {
+        (Some(want), Some(ceiling)) => Some(u64::from(want).min(ceiling) as u32),
+        _ => candidate.max_tokens,
+    };
+    (model, max_tokens)
+}
+
+/// One candidate's in-process model, from the registry that keys them by
+/// concrete name -- so two candidates naming one model share a loaded engine.
+#[cfg(feature = "local-llm")]
+async fn mistralrs_model(
+    candidate: &ResolvedCandidate,
+    cache_root: &Path,
+    registry: &LlmRegistry,
+) -> Result<std::sync::Arc<crate::llm::mistralrs::MistralrsModel>> {
+    let weights =
+        candidate
+            .model_weights
+            .as_ref()
+            .ok_or_else(|| LlmResolveError::MistralrsLoad {
+                model: candidate.model_name.clone(),
+                source: anyhow::anyhow!("internal: resolved mistralrs agent has no model_weights"),
+            })?;
+    let model_name = candidate.model_name.as_str();
+    let model_id = weights.model_id.as_deref();
+    let model_path = weights.model_path.as_deref();
+    let model_file = weights.model_file.as_deref();
+    let revision = weights.revision.as_deref();
+    let context_length = weights.context_length;
+    let device = weights.device;
+    registry
+        .get_or_init(model_name, || async move {
+            crate::llm::mistralrs::load(
+                model_name,
+                model_id,
+                model_path,
+                model_file,
+                revision,
+                context_length,
+                device,
+                cache_root,
+            )
+            .await
+        })
+        .await
+}
+
+/// Say, once per model, that outrig picked an output-token ceiling nobody asked
+/// for.
 ///
 /// The whole hazard of a fallback ceiling is that a reply cut off at it looks
 /// like a bad model rather than a config gap, so the operator hears about it
-/// before the first turn. Once per process, not once per build: `build_agent`
-/// runs again on `/sidecar add` and once more per subagent launch, and a fan-out
-/// of subagents repeating an identical line would bury the traces around it.
-fn warn_fallback_ceiling(resolved: &ResolvedAgent) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // An agentless session has no `[agents.<name>]` table to point at, so
-        // offer only the knob that exists for it.
-        let also = match &resolved.agent_name {
-            Some(agent) => format!(" (or [agents.{agent}].max-tokens)"),
-            None => String::new(),
-        };
-        eprintln!(
-            "[outrig] {} has no published output-token ceiling in this build, so turns \
-             are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens{also} \
-             to choose your own.",
-            resolved.model_identifier, resolved.model_name,
-        );
-    });
+/// before the first turn. Not once per *build*: `build_agent` runs again on
+/// `/sidecar add` and once more per subagent launch, and a fan-out of subagents
+/// repeating an identical line would bury the traces around it.
+///
+/// Keyed per concrete model rather than by a process-wide `Once`, which is what
+/// failover asks of it: a chain builds several candidates, and a `Once` would
+/// spend the warning on the first and stay silent about a second candidate with
+/// a different published ceiling -- exactly the case where a reply cut short
+/// reads as the model's doing. The name is the concrete row, so two agents on
+/// one model still warn once between them.
+fn warn_fallback_ceiling(candidate: &ResolvedCandidate) {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    // The guard drops with the condition's temporary, so the warning below is
+    // printed unlocked.
+    if !WARNED
+        .lock()
+        .expect("fallback ceiling warnings")
+        .insert(candidate.model_name.clone())
+    {
+        return;
+    }
+    eprintln!(
+        "[outrig] {} has no published output-token ceiling in this build, so turns \
+         are capped at {ANTHROPIC_FALLBACK_MAX_TOKENS}. Set [models.{}].max-tokens \
+         (or the agent's) to choose your own.",
+        candidate.model_identifier, candidate.model_name,
+    );
 }
 
 impl RigAgent {
@@ -1062,6 +1565,17 @@ impl RigAgent {
             .await
             .map(|end| end.reply),
             RigAgent::Anthropic {
+                agent,
+                tool_call_max,
+            } => run_turn_inner(
+                agent,
+                prompt,
+                history,
+                OutrigPromptHook::new(*tool_call_max),
+            )
+            .await
+            .map(|end| end.reply),
+            RigAgent::Failover {
                 agent,
                 tool_call_max,
             } => run_turn_inner(
@@ -1114,6 +1628,13 @@ impl RigAgent {
                 run_turn_inner(agent, prompt, history, hook).await
             }
             RigAgent::Anthropic {
+                agent,
+                tool_call_max,
+            } => {
+                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
+                run_turn_inner(agent, prompt, history, hook).await
+            }
+            RigAgent::Failover {
                 agent,
                 tool_call_max,
             } => {
@@ -1430,11 +1951,69 @@ where
 /// `res?` and unwound past the REPL loop, tearing down the containers and
 /// dropping the conversation. They end the *turn* instead, so the user can wait
 /// out the window and send the prompt again in the same session.
+/// End the *turn* -- not the session -- because the endpoint failed.
+///
+/// The shared tail of [`handle_prompt_error`]'s three endpoint arms: a chain
+/// that exhausted every candidate, one endpoint that stayed transiently broken
+/// for its whole budget, and a response rig could not use. They differ in
+/// `reason`, and the chain additionally prints its per-candidate report through
+/// `tried`; everything after that is common, because all three leave the
+/// history untouched.
+///
+/// The advice is deliberately not the "continue" advice the truncation paths
+/// give: nothing was appended, so there is no partial turn to continue -- the
+/// prompt itself is what wants resending. No budget is named, because with
+/// `retry-budget-secs = 0` there was none; the retry progress lines above name
+/// it whenever there was one.
+fn endpoint_failed(reason: String, tried: Option<&str>) -> Result<TurnEnd> {
+    eprintln!("[outrig] {reason}; ending turn");
+    if let Some(tried) = tried {
+        eprintln!("[outrig] tried:\n{tried}");
+    }
+    eprintln!(
+        "[outrig] history unchanged -- send the prompt again to retry, \
+         or \"/quit\" to stop."
+    );
+    Ok(TurnEnd {
+        // The model never spoke, so nothing belongs on stdout. `repl.rs`'s
+        // `if !reply.is_empty()` guard handles it.
+        reply: String::new(),
+        stopped: Some(TurnStop::EndpointFailed(reason)),
+    })
+}
+
 fn handle_prompt_error(
     err: rig::completion::PromptError,
     history: &mut Vec<Message>,
     hook: &OutrigPromptHook,
 ) -> Result<TurnEnd> {
+    // A whole chain gave up, which is a different claim from either of the two
+    // below: `exhausted_transient_label`'s wording is about *one* endpoint that
+    // stayed broken for its budget, and under a chain that sentence would be
+    // false. The three do not depend on this order to stay apart -- they are
+    // disjoint by `CompletionError` variant, and what keeps them so is a
+    // property of `FailoverModel` rather than of the sequence here: a chain
+    // aggregates its candidates into a `ProviderError` instead of letting any
+    // one candidate's `HttpError` escape. The single-candidate paths below
+    // therefore keep the exact text they have always had.
+    // A whole chain gave up. Whether that ends the turn or the process is the
+    // question a single candidate's failure already answers, asked of all of
+    // them: if even one failed for a reason a resend could fix -- a rate limit,
+    // an unusable body -- then waiting and resending is worth advising. If
+    // every one was terminal, a resend is futile and this has to end the
+    // process exactly as the same failure on a lone candidate does. A revoked
+    // key on all three vendors is not an outage to wait out.
+    if let Some(chain) = failover::chain_exhausted_label(&err) {
+        let recoverable = chain.recoverable;
+        let tried = chain.tried.to_string();
+        if !recoverable {
+            // The message already carries every candidate and its reason, so
+            // propagating it names them all without re-rendering.
+            return Err(err.into());
+        }
+        return endpoint_failed("every model candidate failed".to_string(), Some(&tried));
+    }
+
     // Handled ahead of the match because it shares almost nothing with the
     // other two: no history to splice, no reply to print, and different advice.
     if let Some(label) = retry::exhausted_transient_label(&err) {
@@ -1442,39 +2021,20 @@ fn handle_prompt_error(
         // that died on a *later* model call loses the tool calls it already
         // ran. Filed as
         // `plan/next/partial-turn-history-on-failed-model-call.md`.
-        let reason = format!("LLM endpoint failed and did not recover ({label})");
-        eprintln!("[outrig] {reason}; ending turn");
-        // Deliberately not the "continue" advice below: nothing was appended,
-        // so there is no partial turn to continue -- the prompt itself is what
-        // wants resending. The budget is not named, because with
-        // `retry-budget-secs = 0` there was none; the retry progress lines
-        // above name it whenever there was one.
-        eprintln!(
-            "[outrig] history unchanged -- send the prompt again to retry, \
-             or \"/quit\" to stop."
+        return endpoint_failed(
+            format!("LLM endpoint failed and did not recover ({label})"),
+            None,
         );
-        return Ok(TurnEnd {
-            // The model never spoke, so nothing belongs on stdout. `repl.rs`'s
-            // `if !reply.is_empty()` guard handles it.
-            reply: String::new(),
-            stopped: Some(TurnStop::EndpointFailed(reason)),
-        });
     }
 
     // A response rig could not use, still unusable after `RetryingModel` spent
     // its attempts. Handled the same way and for the same reasons: nothing was
     // appended, and the prompt is what wants resending.
     if let Some(detail) = retry::unusable_response_label(&err) {
-        let reason = format!("the model returned a response outrig could not use ({detail})");
-        eprintln!("[outrig] {reason}; ending turn");
-        eprintln!(
-            "[outrig] history unchanged -- send the prompt again to retry, \
-             or \"/quit\" to stop."
+        return endpoint_failed(
+            format!("the model returned a response outrig could not use ({detail})"),
+            None,
         );
-        return Ok(TurnEnd {
-            reply: String::new(),
-            stopped: Some(TurnStop::EndpointFailed(reason)),
-        });
     }
 
     let (reason, chat_history) = match err {
@@ -1804,6 +2364,92 @@ mod tests {
     use rig::completion::{CompletionError, CompletionRequest, CompletionResponse, Usage};
     #[cfg(feature = "local-llm")]
     use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
+
+    /// A candidate on `provider`, with only the fields these tests read.
+    fn candidate(name: &str, provider: ResolvedProvider) -> ResolvedCandidate {
+        ResolvedCandidate {
+            model_name: name.to_string(),
+            model_identifier: name.to_string(),
+            provider_name: name.to_string(),
+            provider,
+            model_weights: None,
+            max_tokens: None,
+        }
+    }
+
+    fn remote(retry_budget_secs: Option<u64>) -> ResolvedProvider {
+        ResolvedProvider::OpenAi {
+            base_url: "http://127.0.0.1:9".to_string(),
+            api_key: "k".to_string(),
+            request_timeout_secs: None,
+            retry_budget_secs,
+        }
+    }
+
+    /// A chain takes its budget from the first candidate that *has* one.
+    ///
+    /// The head of a preference order decides, but an in-process row has no
+    /// `retry-budget-secs` to give -- it does no HTTP -- and that is not the
+    /// same as asking for the default. Reading only the head sent a
+    /// local-first alias to the compiled 600 seconds and handed that to a
+    /// remote fallback, quietly overriding the `0` the user set and the docs
+    /// call the one "no retries" knob.
+    #[test]
+    fn a_chain_budget_skips_candidates_that_have_none() {
+        // The case that regressed: local head, remote fallback carrying the
+        // effective top-level `retry-budget-secs = 0`.
+        assert_eq!(
+            chain_retry_budget_secs(&[
+                candidate("local", ResolvedProvider::Mistralrs),
+                candidate("hosted", remote(Some(0))),
+            ]),
+            Some(0),
+            "a local head must not discard the fallback's configured budget",
+        );
+
+        // The head still wins whenever it has an opinion of its own.
+        assert_eq!(
+            chain_retry_budget_secs(&[
+                candidate("hosted-a", remote(Some(30))),
+                candidate("hosted-b", remote(Some(600))),
+            ]),
+            Some(30),
+        );
+
+        // ...and "inherit the compiled default" *is* an opinion. A remote head
+        // with no configured budget must not be skipped in favor of a later
+        // candidate's override: that would let a fallback's `0` disable retries
+        // for the vendor the user actually preferred.
+        assert_eq!(
+            chain_retry_budget_secs(&[
+                candidate("hosted-a", remote(None)),
+                candidate("hosted-b", remote(Some(0))),
+            ]),
+            None,
+            "the head answered `use the default`; a later override does not overrule it",
+        );
+
+        // The local skip and that rule composing: skip the row that cannot
+        // answer, then stop at the first that can, default or not.
+        assert_eq!(
+            chain_retry_budget_secs(&[
+                candidate("local", ResolvedProvider::Mistralrs),
+                candidate("hosted-a", remote(None)),
+                candidate("hosted-b", remote(Some(0))),
+            ]),
+            None,
+        );
+
+        // An all-local chain has nothing to say, which is harmless: nothing in
+        // it retries over HTTP.
+        assert_eq!(
+            chain_retry_budget_secs(&[
+                candidate("local-a", ResolvedProvider::Mistralrs),
+                candidate("local-b", ResolvedProvider::Mistralrs),
+            ]),
+            None,
+        );
+    }
 
     /// Feed one failing call repeatedly and collect the verdict each time.
     fn repeat_verdicts(times: usize) -> Vec<RepeatVerdict> {
@@ -2175,13 +2821,17 @@ mod tests {
         assert_eq!(test_resolved_for_display().model_display(), "opus-5");
     }
 
-    /// The display helper only reads `model_name` and `alias_name`, so this
-    /// borrows the session fixture rather than spelling a fifth full
-    /// `ResolvedAgent` literal.
+    /// The display helper only reads the first candidate's name and
+    /// `alias_name`, so this borrows the session fixture rather than spelling a
+    /// fifth full `ResolvedAgent` literal.
     fn test_resolved_for_display() -> ResolvedAgent {
+        let base = crate::subagent::fixtures::test_resolved(1);
         ResolvedAgent {
-            model_name: "opus-5".to_string(),
-            ..crate::subagent::fixtures::test_resolved(1)
+            candidates: vec![ResolvedCandidate {
+                model_name: "opus-5".to_string(),
+                ..base.primary().clone()
+            }],
+            ..base
         }
     }
 }

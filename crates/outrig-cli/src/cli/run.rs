@@ -754,7 +754,7 @@ fn print_banner(banner: StartupBanner<'_>) {
         all_tools,
         session_id,
     } = banner;
-    let provider_label = match &resolved.provider {
+    let provider_label = match resolved.provider() {
         llm::ResolvedProvider::OpenAi { .. } => "openai",
         llm::ResolvedProvider::Anthropic { .. } => "anthropic",
         llm::ResolvedProvider::Mistralrs => "mistralrs",
@@ -772,14 +772,21 @@ fn print_banner(banner: StartupBanner<'_>) {
         Some(agent) => writeln!(
             buf,
             "[outrig] agent:             {} (model: {} / provider: {} / {})",
-            agent, model_label, provider_label, resolved.model_identifier
+            agent, model_label, provider_label, resolved.model_identifier()
         ),
         None => writeln!(
             buf,
             "[outrig] model:             {} (provider: {} / {})",
-            model_label, provider_label, resolved.model_identifier
+            model_label, provider_label, resolved.model_identifier()
         ),
     };
+    // A chain can change models between two calls of one turn, so the vendors
+    // it may move to are named before the session starts rather than first
+    // appearing in a move announcement mid-reply.
+    let fallbacks = resolved.fallback_names();
+    if !fallbacks.is_empty() {
+        let _ = writeln!(buf, "[outrig] model failover:    {}", fallbacks.join(", "));
+    }
     let _ = writeln!(
         buf,
         "[outrig] tool-call max:     {}",
@@ -790,7 +797,7 @@ fn print_banner(banner: StartupBanner<'_>) {
         "[outrig] tool-result max:   {} bytes",
         resolved.tool_result_max_bytes
     );
-    if let Some(weights) = &resolved.model_weights {
+    if let Some(weights) = resolved.model_weights() {
         let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
     }
     let origin = crate::builtin_image::banner_suffix(builtin_default);
@@ -890,15 +897,17 @@ mod tests {
     fn test_resolved_agent() -> llm::ResolvedAgent {
         llm::ResolvedAgent {
             agent_name: Some("coding".to_string()),
-            model_name: "fast".to_string(),
+            candidates: vec![llm::ResolvedCandidate {
+                model_name: "fast".to_string(),
+                model_identifier: "gpt-4o-mini".to_string(),
+                provider_name: "local".to_string(),
+                provider: llm::ResolvedProvider::Mistralrs,
+                model_weights: None,
+                max_tokens: None,
+            }],
             alias_name: None,
-            model_identifier: "gpt-4o-mini".to_string(),
-            provider_name: "local".to_string(),
-            provider: llm::ResolvedProvider::Mistralrs,
-            model_weights: None,
             preamble: Some("test".to_string()),
             temperature: None,
-            max_tokens: None,
             tool_call_max: 100,
             tool_result_max_bytes: llm::DEFAULT_TOOL_RESULT_MAX_BYTES,
             subagent_depth_max: outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
@@ -956,19 +965,23 @@ mod tests {
                     None,
                 );
                 let resolved = llm::ResolvedAgent {
-                    provider: llm::ResolvedProvider::OpenAi {
-                        base_url: "http://127.0.0.1:9".to_string(),
-                        api_key: "test-key".to_string(),
-                        request_timeout_secs: None,
-                        // Retries left at their default. Nothing here drives a
-                        // turn -- these tests call `handle_sidecar_command`,
-                        // and the discard port only has to make `build_agent`
-                        // do no I/O -- so pinning the budget off would be
-                        // claiming a promptness this module never measures.
-                        // Were a turn added, the short connect budget bounds a
-                        // refused connection on its own.
-                        retry_budget_secs: None,
-                    },
+                    candidates: vec![llm::ResolvedCandidate {
+                        provider: llm::ResolvedProvider::OpenAi {
+                            base_url: "http://127.0.0.1:9".to_string(),
+                            api_key: "test-key".to_string(),
+                            request_timeout_secs: None,
+                            // Retries left at their default. Nothing here
+                            // drives a turn -- these tests call
+                            // `handle_sidecar_command`, and the discard port
+                            // only has to make `build_agent` do no I/O -- so
+                            // pinning the budget off would be claiming a
+                            // promptness this module never measures. Were a
+                            // turn added, the short connect budget bounds a
+                            // refused connection on its own.
+                            retry_budget_secs: None,
+                        },
+                        ..test_resolved_agent().candidates[0].clone()
+                    }],
                     tool_result_max_bytes: 1024,
                     ..test_resolved_agent()
                 };

@@ -96,7 +96,7 @@ async fn offline_path_smoke() {
     let resolved = resolve_agent(&cfg, Some("smoke")).expect("agent resolves");
 
     let cache = TempDir::new().expect("tempdir");
-    let registry = LlmRegistry::new();
+    let registry = std::sync::Arc::new(LlmRegistry::new());
     let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
         .expect("agent builds");
@@ -125,7 +125,7 @@ async fn download_path_smoke() {
 
     // First load: downloads.
     let resolved = resolve_agent(&cfg, Some("smoke")).expect("agent resolves");
-    let registry = LlmRegistry::new();
+    let registry = std::sync::Arc::new(LlmRegistry::new());
     let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
         .expect("first agent build (download path)");
@@ -165,4 +165,74 @@ fn file_mtime(p: std::path::PathBuf) -> std::time::SystemTime {
     std::fs::metadata(&p)
         .and_then(|m| m.modified())
         .unwrap_or_else(|e| panic!("metadata failed for {p:?}: {e}"))
+}
+
+/// A local *fallback* must not be able to stop a healthy primary from starting.
+///
+/// Every other chain candidate is built eagerly on the premise that building
+/// one costs nothing -- true for a remote client, which does no I/O. A
+/// mistralrs row breaks that premise twice: its construction is a
+/// multi-gigabyte load, and it can *fail*. Built eagerly, the missing GGUF
+/// named below would take down a session whose hosted primary is perfectly
+/// healthy, which inverts the reason for naming a fallback at all.
+///
+/// Needs no env var and no weights, precisely because the point is that
+/// nothing is loaded: the path named here does not exist, and building still
+/// succeeds. A failure to load is deferred to the moment the chain actually
+/// reaches this candidate, where it becomes that candidate's failure.
+#[tokio::test]
+async fn a_broken_local_fallback_does_not_stop_the_session_from_starting() {
+    let var = "OUTRIG_TEST_MISTRALRS_LAZY_FALLBACK_KEY";
+    // SAFETY: single-threaded test, and the name is unique to it.
+    unsafe { std::env::set_var(var, "sk-test") };
+    let cfg = Config::load_from_str(&format!(
+        r#"
+default-model = "chain"
+
+[providers.hosted]
+style    = "anthropic"
+base-url = "http://127.0.0.1:9"
+api-key  = "${{{var}}}"
+
+[providers.local]
+style = "mistralrs"
+
+[models.chain]
+alias = ["hosted-model", "local-model"]
+
+[models.hosted-model]
+provider   = "hosted"
+identifier = "claude-sonnet-4-6"
+
+[models.local-model]
+provider   = "local"
+model-path = "/nonexistent/outrig-test/no-such-model.gguf"
+
+[agents.smoke]
+preamble = "You are a terse assistant."
+"#
+    ))
+    .expect("config parses");
+    cfg.validate(None).expect("config validates");
+
+    let resolved = resolve_agent(&cfg, Some("smoke")).expect("resolves");
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(var) };
+    assert_eq!(
+        resolved.candidates.len(),
+        2,
+        "both rows are selectable, so the chain holds both",
+    );
+
+    let registry = std::sync::Arc::new(LlmRegistry::new());
+    let cache = TempDir::new().expect("temp cache");
+    let agent = build_agent(&resolved, vec![], cache.path(), &registry)
+        .await
+        .expect("a missing fallback GGUF must not fail the build of a healthy chain");
+    // Reaching here at all is the proof that nothing was loaded: the path does
+    // not exist, so an eager load could only have failed.
+    assert!(
+        matches!(agent, RigAgent::Failover { .. }),
+        "two candidates build a chain",
+    );
 }

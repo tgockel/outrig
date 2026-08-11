@@ -22,7 +22,10 @@
 //!   without taking the session with it;
 //! * a `200` carrying no usable content is retried above the HTTP client,
 //!   which is the only place it is visible at all, and ends the turn rather
-//!   than the session when it persists.
+//!   than the session when it persists;
+//! * an alias chain moves to its next candidate *inside* a `completion()`
+//!   call, so a turn that has already run a tool keeps its history and does
+//!   not re-execute it -- which needs two endpoints, and so needs two mocks.
 
 mod common;
 
@@ -166,6 +169,57 @@ tool-call-max = {TOOL_CALL_MAX}
     cfg
 }
 
+/// Two provider-equivalent rows on two mocks, plus an alias naming them in
+/// preference order -- the shape `build_agent` turns into a `FailoverModel`
+/// rather than a lone retrying model.
+///
+/// Both providers pin `retry-budget-secs = 0`, which is how a test makes the
+/// head give up at once: zero is its bound, so the move happens without
+/// waiting out a backoff curve. It also makes the assertion about *when* the
+/// move happens exact -- one failed request, not an unpredictable number.
+fn mock_chain_config(head: SocketAddr, next: SocketAddr, vars: [&str; 2]) -> Config {
+    let [head_var, next_var] = vars;
+    let cfg = format!(
+        r#"
+default-model = "chain"
+
+[providers.head]
+style                = "anthropic"
+base-url             = "http://{head}"
+api-key              = "${{{head_var}}}"
+request-timeout-secs = 10
+retry-budget-secs    = 0
+
+[providers.next]
+style                = "anthropic"
+base-url             = "http://{next}"
+api-key              = "${{{next_var}}}"
+request-timeout-secs = 10
+retry-budget-secs    = 0
+
+[models.chain]
+alias = ["head-model", "next-model"]
+
+[models.head-model]
+provider   = "head"
+identifier = "{MODEL}"
+max-tokens = 4096
+
+[models.next-model]
+provider   = "next"
+identifier = "{MODEL}"
+max-tokens = 4096
+
+[agents.coding]
+preamble      = "{PREAMBLE}"
+tool-call-max = {TOOL_CALL_MAX}
+"#
+    );
+    let cfg = Config::load_from_str(&cfg).expect("config parses");
+    cfg.validate(None).expect("config validates");
+    cfg
+}
+
 /// Resolve and build an agent against the mock, then run one turn through it.
 /// `var` is the test's own env-var name for the fake key -- unique per test,
 /// which is what makes the `set_test_env` calls safe.
@@ -177,7 +231,7 @@ async fn run_one_turn(
     tools: Vec<EchoTool>,
 ) -> anyhow::Result<String> {
     let cfg = mock_config(addr, var, identifier, max_tokens, None);
-    let agent = build_mock_agent(&cfg, var, tools).await;
+    let agent = build_mock_agent(&cfg, &[var], tools).await;
     let mut history = Vec::new();
     agent
         .run_turn("echo ping for me", &mut history)
@@ -208,17 +262,25 @@ async fn recorded_max_tokens(
 /// Build an agent from `cfg` through the real resolve -> build path. Split out
 /// of [`run_one_turn`] so a test can drive more than one turn through the same
 /// agent, which is what "the session survived" means.
+///
+/// `vars` is a slice rather than one name because a failover chain has a key
+/// per candidate, and candidate selection drops any row whose key is unset --
+/// so a chain that set only the head's var would resolve to a chain of one.
 async fn build_mock_agent(
     cfg: &Config,
-    var: &str,
+    vars: &[&str],
     tools: Vec<EchoTool>,
 ) -> outrig_cli::llm::RigAgent {
-    set_test_env(var, KEY);
+    for var in vars {
+        set_test_env(var, KEY);
+    }
     let resolved = resolve_agent(cfg, Some("coding")).expect("resolves");
-    unset_test_env(var);
+    for var in vars {
+        unset_test_env(var);
+    }
 
     #[cfg(feature = "local-llm")]
-    let registry = outrig_cli::llm::LlmRegistry::new();
+    let registry = std::sync::Arc::new(outrig_cli::llm::LlmRegistry::new());
     build_agent(
         &resolved,
         session_tool::erase(tools),
@@ -479,7 +541,7 @@ async fn retry_after_header_is_honored() {
 
     let var = "OUTRIG_TEST_ANTHROPIC_RETRY_AFTER";
     let cfg = mock_config(addr, var, MODEL, Some(1024), Some(30));
-    let agent = build_mock_agent(&cfg, var, vec![]).await;
+    let agent = build_mock_agent(&cfg, &[var], vec![]).await;
 
     let started = std::time::Instant::now();
     let mut history = Vec::new();
@@ -530,7 +592,7 @@ async fn exhausted_budget_ends_the_turn_without_killing_the_agent() {
 
     let var = "OUTRIG_TEST_ANTHROPIC_BUDGET_SPENT";
     let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
-    let agent = build_mock_agent(&cfg, var, vec![]).await;
+    let agent = build_mock_agent(&cfg, &[var], vec![]).await;
 
     let mut history = Vec::new();
     let reply = agent
@@ -652,6 +714,83 @@ async fn a_retry_mid_turn_does_not_re_run_the_tool_calls_before_it() {
     );
 }
 
+/// The same property one layer down, and the one that decides where failover
+/// sits: a move replays one *model call* against the next candidate, not the
+/// turn around it. The head serves a `tool_use`, the tool runs, and only then
+/// does the head go down -- so the move happens with a tool result already in
+/// the history, which is the state re-running the turn would destroy.
+///
+/// Failing over around `agent.prompt(..)` instead would re-execute the tool --
+/// harmless for this echo, a repeat for a container tool call that wrote
+/// something. `llm/failover.rs`'s module doc cites this test by name for that
+/// argument, and 0113 asked for it as a test rather than a comment.
+///
+/// It carries the head's `503` case too: the first candidate fails past its
+/// bounds -- zero, here -- and the turn completes on the second.
+#[tokio::test]
+async fn tools_run_before_a_move_are_not_re_executed() {
+    let (head, mut head_requests) = start_mock_http(vec![
+        message(
+            json!([{
+                "type": "tool_use",
+                "id": "toolu_mock_1",
+                "name": "outrig_test_echo",
+                "input": { "value": "ping" }
+            }]),
+            "tool_use",
+        ),
+        // Down from here on: `start_mock_http` repeats its last entry, so any
+        // further request to the head is a `503` as well.
+        CannedResponse::status(503, json!({ "type": "error" })),
+    ])
+    .await;
+    let (next, mut next_requests) =
+        start_mock_http(vec![text_reply("The echo said pong:ping.")]).await;
+
+    let vars = [
+        "OUTRIG_TEST_ANTHROPIC_FAILOVER_HEAD",
+        "OUTRIG_TEST_ANTHROPIC_FAILOVER_NEXT",
+    ];
+    let cfg = mock_chain_config(head, next, vars);
+    let tool = EchoTool::default();
+    let agent = build_mock_agent(&cfg, &vars, vec![tool.clone()]).await;
+
+    let mut history = Vec::new();
+    let reply = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("the move should carry the turn through the head's outage");
+
+    assert_eq!(
+        reply, "The echo said pong:ping.",
+        "the turn finished on the second candidate",
+    );
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "the move replays the model call, not the turn, so the tool runs once",
+    );
+
+    let head_recorded = drain_recorded(&mut head_requests);
+    let next_recorded = drain_recorded(&mut next_requests);
+    assert_eq!(head_recorded.len(), 2, "the tool_use, then the 503");
+    assert_eq!(
+        next_recorded.len(),
+        1,
+        "one model call moved, not the turn around it: {next_recorded:#?}",
+    );
+    assert_eq!(
+        head_recorded[1].body, next_recorded[0].body,
+        "the moved call carries the same history the failed one did -- \
+         including the tool_result, which is what was at risk",
+    );
+    assert!(
+        next_recorded[0].body.to_string().contains("tool_result"),
+        "the move landed mid-turn, after a tool had already run: {:#?}",
+        next_recorded[0].body,
+    );
+}
+
 /// A response that stays unusable ends the *turn*, not the process -- and the
 /// same agent takes the next turn.
 ///
@@ -670,7 +809,7 @@ async fn a_persistently_unusable_response_ends_the_turn_not_the_session() {
 
     let var = "OUTRIG_TEST_ANTHROPIC_UNUSABLE_PERSISTS";
     let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
-    let agent = build_mock_agent(&cfg, var, vec![]).await;
+    let agent = build_mock_agent(&cfg, &[var], vec![]).await;
 
     let mut history = Vec::new();
     let reply = agent

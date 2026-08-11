@@ -54,6 +54,7 @@
 //!
 //! [`CompletionModel`]: rig::completion::CompletionModel
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -130,9 +131,65 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// unusable three times running is not a hiccup.
 const RESPONSE_RETRY_ATTEMPTS: u32 = 2;
 
-/// Knobs for one client's retry loop. `Copy` so the whole policy moves into a
-/// `'static` per-request future without an `Arc`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A deadline shared by every candidate in one failover chain.
+///
+/// The chain's problem is that its bound cannot be a per-candidate one. Three
+/// candidates at the default `retry-budget-secs = 600` is a thirty-minute turn
+/// against a total outage, and most of that is spent retrying endpoints already
+/// known to be down -- a worst case worse than no failover at all. Splitting the
+/// budget `N` ways instead shrinks it in the case that matters most: candidate
+/// one instantly dead, candidate two deserving the whole thing.
+///
+/// So the bound is one wall-clock instant, armed once per `completion()` call by
+/// [`FailoverModel`] and consulted by every candidate's retry loop underneath
+/// it. The handle is shared rather than copied because the arming happens above
+/// the candidates and has to be visible inside them -- through rig's
+/// `HttpClientExt::send`, which has no per-call context channel of its own.
+///
+/// [`FailoverModel`]: super::failover::FailoverModel
+#[derive(Debug, Default)]
+pub struct ChainDeadline {
+    /// `None` until armed, which is every single-candidate path: the
+    /// per-attempt budgets are then the only bound, exactly as before failover
+    /// existed.
+    at: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl ChainDeadline {
+    /// Start the clock: `budget` from now, for whatever the chain does next.
+    ///
+    /// Re-armed on every `completion()` call, which is what makes the bound
+    /// per-call rather than per-session. A turn is a sequence of calls with tool
+    /// calls between them, and each call gets a whole budget to find a working
+    /// candidate -- bounding the turn instead would make a long agentic turn's
+    /// last model call inherit a budget its first one spent.
+    pub(crate) fn arm(&self, budget: Duration) {
+        *self.at.lock().expect("chain deadline") = Some(tokio::time::Instant::now() + budget);
+    }
+
+    /// How long is left, or `None` when no deadline is armed.
+    ///
+    /// `Some(Duration::ZERO)` once it has passed; the `Option` distinguishes
+    /// armed from unarmed, never expired from live.
+    fn remaining(&self) -> Option<Duration> {
+        let at = (*self.at.lock().expect("chain deadline"))?;
+        Some(at.saturating_duration_since(tokio::time::Instant::now()))
+    }
+}
+
+/// Knobs for one client's retry loop.
+///
+/// Not `Copy`, which it was until failover arrived: the whole policy used to
+/// move into a `'static` per-request future without an `Arc`, and it now
+/// carries one. That `Arc` is [`chain_deadline`], the bound a failover chain
+/// shares across its candidates -- a handle rather than a value precisely
+/// because the arming happens outside the candidate that must observe it.
+/// Cloning stays cheap (four `Duration`s and a refcount bump), and a clone
+/// deliberately *shares* the deadline rather than copying it, which is the
+/// whole point of the indirection.
+///
+/// [`chain_deadline`]: Self::chain_deadline
+#[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Wall clock from the first attempt's start, including the time each
     /// attempt spends in flight -- not only the time spent sleeping. Zero
@@ -154,6 +211,13 @@ pub struct RetryPolicy {
     pub base_delay: Duration,
     /// Ceiling on one backoff delay. Does not cap a server's `Retry-After`.
     pub max_delay: Duration,
+    /// The failover chain's shared bound, when this policy belongs to one.
+    ///
+    /// Unarmed on every single-candidate path, where it costs an uncontended
+    /// lock and an `Option` check per delay decision -- a path that then sleeps
+    /// for at least `MIN_DELAY` -- and changes no outcome. See
+    /// [`ChainDeadline`].
+    pub chain_deadline: Arc<ChainDeadline>,
 }
 
 impl RetryPolicy {
@@ -166,13 +230,42 @@ impl RetryPolicy {
     /// One method rather than the rule spelled out at each reader, because the
     /// loop both decides against it and prints it, and the two must agree.
     ///
+    /// A duration measured from this request's first attempt, which is what
+    /// makes it the denominator the retry line prints and the value [`left`]
+    /// subtracts elapsed time from. The chain deadline is deliberately *not*
+    /// folded in here: it counts down in absolute time and so is already net of
+    /// elapsed time, and mixing the two would subtract elapsed twice -- halving
+    /// the effective budget and moving off the preferred candidate early.
+    ///
     /// [`budget`]: Self::budget
     /// [`connect_budget`]: Self::connect_budget
+    /// [`left`]: Self::left
     fn bound(&self, answered: bool) -> Duration {
         if answered {
             self.budget
         } else {
             self.budget.min(self.connect_budget)
+        }
+    }
+
+    /// How much of [`bound`] is left after `elapsed`, capped by the chain
+    /// deadline when one is armed.
+    ///
+    /// Two quantities that must not be confused. `elapsed` counts against
+    /// *this request's* own budget, so it is subtracted from it. The chain
+    /// deadline is an absolute instant shared across candidates, so it is
+    /// already counting down on its own and must be compared against rather
+    /// than reduced by `elapsed`. Whichever remainder is smaller wins, which is
+    /// what makes a chain's worst case one budget rather than one per
+    /// candidate, and keeps `budget = 0` meaning no retries anywhere -- the
+    /// minimum of zero and anything is still zero.
+    ///
+    /// [`bound`]: Self::bound
+    fn left(&self, answered: bool, elapsed: Duration) -> Duration {
+        let own_left = self.bound(answered).saturating_sub(elapsed);
+        match self.chain_deadline.remaining() {
+            Some(deadline_left) => own_left.min(deadline_left),
+            None => own_left,
         }
     }
 }
@@ -184,6 +277,7 @@ impl Default for RetryPolicy {
             connect_budget: CONNECT_BUDGET,
             base_delay: BASE_DELAY,
             max_delay: MAX_DELAY,
+            chain_deadline: Arc::default(),
         }
     }
 }
@@ -220,7 +314,9 @@ impl HttpClientExt for RetryingHttpClient {
         U: WasmCompatSend + 'static,
     {
         let client = self.inner.clone();
-        let policy = self.policy;
+        // Cloned, not copied: the policy carries the chain's shared deadline
+        // handle, and the clone shares it rather than duplicating it.
+        let policy = self.policy.clone();
         let (parts, body) = req.into_parts();
         // Converted once: `Bytes::clone` is a refcount bump, so replaying the
         // body on each attempt costs nothing.
@@ -557,7 +653,7 @@ fn next_delay(
     retry_after: Option<Duration>,
     jitter: f64,
 ) -> Option<Duration> {
-    let remaining = policy.bound(answered).checked_sub(elapsed)?;
+    let remaining = policy.left(answered, elapsed);
     let delay = match retry_after {
         // No jitter on a server-named delay: the server told us when to come
         // back, and jittering *down* means hammering it early.
@@ -599,11 +695,24 @@ fn is_transient(err: &HttpError) -> bool {
 /// Did this turn fail transiently -- and so recoverably -- rather than for a
 /// reason a second attempt could not fix? Returns the label to report if so.
 ///
-/// Sound only because there is exactly one retry layer, and everything it can
-/// retry it *did* retry until the budget stopped it. Adding a second retry
-/// layer, or an early return for a retryable status in [`send_with_retry`],
-/// would make this claim more than it knows. Note it stays true when the budget
-/// is `0`: nothing was retried, and there was nothing to retry with.
+/// Sound only because everything that can retry an [`HttpError`] *did* retry it
+/// until the budget stopped it. An early return for a retryable status in
+/// [`send_with_retry`], or a second layer that retried this class, would make
+/// this claim more than it knows. Note it stays true when the budget is `0`:
+/// nothing was retried, and there was nothing to retry with.
+///
+/// A failover chain is a third layer and does not disturb that, but the reason
+/// is a property of [`FailoverModel`] rather than of this predicate: a
+/// multi-candidate chain never lets a candidate's `HttpError` escape, because
+/// it aggregates every abandoned candidate into a `ProviderError` that
+/// [`chain_exhausted_label`] claims instead. So an `HttpError` reaching here
+/// still means what it always did -- *the* endpoint this turn had stayed broken
+/// for its whole budget. Widening the chain's "a chain of one returns its error
+/// unwrapped" rule to any other case is what would break this.
+///
+/// [`FailoverModel`]: super::failover::FailoverModel
+/// [`chain_exhausted_label`]: super::failover::chain_exhausted_label
+/// [`HttpError`]: CompletionError::HttpError
 ///
 /// Note the deliberate reach: a wrong `base-url` fails with a connection error,
 /// which is transient by this predicate, so an unreachable endpoint ends the
@@ -625,16 +734,45 @@ pub fn exhausted_transient_label(err: &PromptError) -> Option<String> {
     }
 }
 
+/// Would this failure, on its own, end the *turn* rather than the process?
+///
+/// The union of the two recoverable classes below, asked of a bare
+/// [`CompletionError`] rather than a [`PromptError`]: a transient `HttpError`,
+/// which [`exhausted_transient_label`] claims, and a `ResponseError`, which
+/// [`unusable_response_label`] does. Everything else -- a `401`, a model that
+/// does not exist, a provider-reported fault -- is terminal, and telling a user
+/// to resend a prompt their config can never satisfy would loop them forever.
+///
+/// Exists because a failover chain has to ask this of each candidate's error
+/// *before* aggregating them, at which point they are `CompletionError`s and
+/// not yet a `PromptError`. Defined here, beside the two predicates it is the
+/// union of, so a chain's verdict on an error cannot drift from what the
+/// single-candidate paths do with that same error.
+pub(crate) fn is_recoverable(err: &CompletionError) -> bool {
+    match err {
+        CompletionError::HttpError(http) => is_transient(http),
+        CompletionError::ResponseError(_) => true,
+        _ => false,
+    }
+}
+
 /// Did this turn fail because the provider's response could not be used, after
 /// [`RetryingModel`] spent its attempts on it? Returns the provider-side detail
 /// to report if so.
 ///
 /// The companion to [`exhausted_transient_label`], and sound for the same
 /// reason: there is exactly one layer that retries this class, and it retried
-/// until its attempts ran out. Deliberately *not* extended to
-/// [`CompletionError::ProviderError`], which carries provider-reported faults
-/// that include genuine misconfiguration -- telling a user to resend a prompt
-/// their config can never satisfy would loop them forever.
+/// until its attempts ran out. A chain does not become a second one -- it
+/// aggregates rather than re-runs, so a `ResponseError` arriving here came from
+/// a single candidate that already spent its attempts.
+///
+/// Deliberately *not* extended to [`CompletionError::ProviderError`], which
+/// carries provider-reported faults that include genuine misconfiguration --
+/// telling a user to resend a prompt their config can never satisfy would loop
+/// them forever. A chain's exhaustion report is a `ProviderError` too, and is
+/// claimed by [`chain_exhausted_label`] before either of these predicates runs.
+///
+/// [`chain_exhausted_label`]: super::failover::chain_exhausted_label
 pub fn unusable_response_label(err: &PromptError) -> Option<&str> {
     match err {
         PromptError::CompletionError(CompletionError::ResponseError(message)) => Some(message),
@@ -717,6 +855,31 @@ mod tests {
         // misconfiguration no retry and no resend can fix.
         assert!(label_of(CompletionError::ProviderError("nope".into())).is_none());
         assert!(unusable_label_of(CompletionError::ProviderError("nope".into())).is_none());
+    }
+
+    /// Failover is a third class, and the three stay disjoint by
+    /// `CompletionError` variant rather than by the order they are consulted.
+    ///
+    /// This is what `exhausted_transient_label`'s soundness rests on: a chain
+    /// aggregates into a marked `ProviderError`, so no candidate's `HttpError`
+    /// reaches the transient predicate carrying "one endpoint failed" when the
+    /// truth is "every candidate did".
+    #[test]
+    fn a_chain_exhaustion_is_a_class_of_its_own() {
+        use super::super::failover::chain_exhausted_label;
+
+        let chain_label_of = |err: CompletionError| {
+            chain_exhausted_label(&PromptError::CompletionError(err))
+                .map(|chain| chain.tried.to_owned())
+        };
+
+        // The classes the other two claim are not claimed by this one.
+        assert!(chain_label_of(http_status(503)).is_none());
+        assert!(chain_label_of(CompletionError::ResponseError("empty".into())).is_none());
+        // Nor is a provider fault that is not a chain's report: an unmarked
+        // `ProviderError` still belongs to none of the three and stays
+        // terminal, which is what keeps a bad key an exit-1.
+        assert!(chain_label_of(CompletionError::ProviderError("nope".into())).is_none());
     }
 
     /// A model that fails the way the bug does, every time, counting the calls
@@ -1013,6 +1176,141 @@ mod tests {
         assert_eq!(next_delay(&policy, 0, elapsed, false, None, 1.0), None);
     }
 
+    /// Unarmed is every single-candidate path, and it must cost nothing: the
+    /// two bounds are exactly what they were before failover existed.
+    ///
+    /// Sync rather than a `tokio::test` on purpose -- `remaining` returns
+    /// through `?` before it reads the clock, so an unarmed deadline needs no
+    /// runtime. That is what keeps every other `bound` test above sync.
+    #[test]
+    fn an_unarmed_chain_deadline_changes_nothing() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.left(true, Duration::ZERO), policy.budget);
+        assert_eq!(policy.left(false, Duration::ZERO), policy.connect_budget);
+    }
+
+    /// The chain's bound is the third input to the same minimum the two own
+    /// bounds already take, so an armed deadline caps both of them.
+    #[tokio::test(start_paused = true)]
+    async fn an_armed_chain_deadline_caps_the_bound() {
+        let policy = RetryPolicy::default();
+        // Shorter than either own bound, so the deadline is unambiguously what
+        // wins rather than coinciding with something else.
+        let left = Duration::from_secs(5);
+        assert!(left < policy.connect_budget);
+        policy.chain_deadline.arm(left);
+        assert_eq!(policy.left(true, Duration::ZERO), left);
+        assert_eq!(policy.left(false, Duration::ZERO), left);
+
+        // It is a deadline, not an allowance: spending part of it leaves the
+        // rest, which is what makes the *chain* the thing being bounded.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(policy.left(true, Duration::ZERO), Duration::from_secs(2));
+    }
+
+    /// The acceptance criterion the deadline exists for: once the chain's one
+    /// budget is gone it is gone for every candidate, so candidate N gets no
+    /// retries rather than a fresh `retry-budget-secs` of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_chain_deadline_leaves_no_retries_for_the_next_candidate() {
+        let policy = RetryPolicy::default();
+        policy.chain_deadline.arm(Duration::from_secs(5));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(policy.left(true, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            next_delay(&policy, 0, Duration::ZERO, true, None, 1.0),
+            None,
+            "a candidate reached after the chain's budget is spent must not retry",
+        );
+    }
+
+    /// Arming happens on the `FailoverModel`, above the candidates, and has to
+    /// be visible in the retry loops underneath it. That is the whole reason
+    /// the handle is an `Arc` and why `RetryPolicy` gave up `Copy` -- a clone
+    /// that copied the deadline would leave every candidate unbounded.
+    #[tokio::test(start_paused = true)]
+    async fn a_cloned_policy_shares_the_deadline_rather_than_copying_it() {
+        let policy = RetryPolicy::default();
+        let candidate = policy.clone();
+        policy.chain_deadline.arm(Duration::from_secs(5));
+        assert_eq!(
+            candidate.left(true, Duration::ZERO),
+            Duration::from_secs(5),
+            "arming above a candidate must be visible inside it",
+        );
+    }
+
+    /// A deadline caps the own bounds; it never widens them. A chain does not
+    /// buy a candidate more time than its provider was configured for.
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_deadline_never_widens_a_candidates_own_bound() {
+        let policy = RetryPolicy::default();
+        policy.chain_deadline.arm(policy.budget * 2);
+        assert_eq!(policy.left(true, Duration::ZERO), policy.budget);
+        assert_eq!(policy.left(false, Duration::ZERO), policy.connect_budget);
+    }
+
+    /// Elapsed time counts once, not twice.
+    ///
+    /// `elapsed` is measured against this request's own budget; the chain
+    /// deadline is an absolute instant already counting down on its own. Folding
+    /// the deadline into `bound` and *then* subtracting `elapsed` charged the
+    /// same seconds to both, so a chain gave up after roughly half its budget
+    /// and moved off the preferred candidate early.
+    #[tokio::test(start_paused = true)]
+    async fn elapsed_is_not_charged_against_the_deadline_as_well() {
+        let policy = RetryPolicy::default();
+        policy.chain_deadline.arm(policy.budget);
+
+        // Half the budget gone, by the clock and by the loop's own reckoning:
+        // both describe the same seconds.
+        let half = policy.budget / 2;
+        tokio::time::advance(half).await;
+
+        assert_eq!(
+            policy.left(true, half),
+            half,
+            "half the budget spent must leave the other half, not nothing",
+        );
+        assert!(
+            next_delay(&policy, 0, half, true, None, 1.0).is_some(),
+            "a retry at the halfway point is still inside the budget",
+        );
+    }
+
+    /// The deadline still bites when it is genuinely the shorter bound -- the
+    /// property the double-subtraction fix must not undo.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_still_caps_a_candidate_that_started_late() {
+        let policy = RetryPolicy::default();
+        policy.chain_deadline.arm(Duration::from_secs(10));
+        // The chain has burned nine of its ten seconds on an earlier candidate.
+        // This one has spent nothing of its own budget, but inherits what is
+        // left of the chain's.
+        tokio::time::advance(Duration::from_secs(9)).await;
+
+        assert_eq!(
+            policy.left(true, Duration::ZERO),
+            Duration::from_secs(1),
+            "a fresh candidate gets what the chain has left, not a whole budget",
+        );
+    }
+
+    /// `retry-budget-secs = 0` is the one "no retries" knob, and a chain does
+    /// not give it an exception either: the minimum of zero and anything is
+    /// still zero, anywhere in the chain.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_budget_stays_zero_under_an_armed_deadline() {
+        let policy = RetryPolicy {
+            budget: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        policy.chain_deadline.arm(Duration::from_secs(600));
+        assert_eq!(policy.left(true, Duration::ZERO), Duration::ZERO);
+        assert_eq!(policy.left(false, Duration::ZERO), Duration::ZERO);
+        assert_eq!(next_delay(&policy, 0, Duration::ZERO, true, None, 1.0), None);
+    }
+
     /// The two bounds are distinct fields, not one field that means different
     /// things depending on state -- 0113 reads the short one directly.
     #[test]
@@ -1095,6 +1393,7 @@ mod tests {
             connect_budget: Duration::from_secs(4),
             base_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(8),
+            chain_deadline: Arc::default(),
         }
     }
 
