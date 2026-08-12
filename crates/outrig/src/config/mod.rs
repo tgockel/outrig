@@ -1687,13 +1687,17 @@ pub struct ContainerSecurity {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cap_add: Vec<String>,
     /// Whether to apply `--security-opt=no-new-privileges`. Setting this to
-    /// false restores setuid escalation inside the container, which a nested
-    /// rootless container runtime needs so that `newuidmap` can map its
-    /// subordinate UID range.
+    /// false restores setuid escalation inside the container, so any
+    /// setuid-root binary in the image becomes usable again.
     pub no_new_privileges: bool,
     /// Host device nodes to pass through, one `--device=<path>` each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<String>,
+    /// Paths to exclude from podman's default masking, one
+    /// `--security-opt=unmask=<path>` each. A nested container runtime needs
+    /// `/proc/*` here; see `doc/concepts/containers.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmask: Vec<String>,
 }
 
 /// Hand-written rather than derived: `no_new_privileges` must default to
@@ -1708,6 +1712,7 @@ impl Default for ContainerSecurity {
             cap_add: Vec::new(),
             no_new_privileges: true,
             devices: Vec::new(),
+            unmask: Vec::new(),
         }
     }
 }

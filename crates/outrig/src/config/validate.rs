@@ -257,6 +257,45 @@ pub enum ConfigValidationError {
     #[error("image {image:?}: `devices` entry {device:?} is declared more than once")]
     DevicePathDuplicate { image: String, device: String },
 
+    #[error("image {image:?}: `unmask` entry must not be empty")]
+    UnmaskPathEmpty { image: String },
+
+    #[error("image {image:?}: `unmask` entry {path:?} must be an absolute path or `ALL`")]
+    UnmaskPathRelative { image: String, path: String },
+
+    #[error(
+        "image {image:?}: `unmask` entry {path:?} must not contain `:`; podman splits an \
+         unmask value on it, so declare one path per entry"
+    )]
+    UnmaskPathListSeparator { image: String, path: String },
+
+    #[error("image {image:?}: `unmask` entry {path:?} is declared more than once")]
+    UnmaskPathDuplicate { image: String, path: String },
+
+    #[error(
+        "image {image:?}: `unmask` entry {path:?} must be spelled `ALL`; podman only lifts \
+         the read-only paths for that exact casing, so {path:?} would leave `/sys/fs/cgroup` \
+         read-only while looking like a full unmask"
+    )]
+    UnmaskAllNotCanonical { image: String, path: String },
+
+    #[error(
+        "image {image:?}: `unmask` must be exactly [\"ALL\"] when it lists `ALL`; podman \
+         applies the full unmask only when `ALL` comes first, and every other entry is \
+         redundant beside it"
+    )]
+    UnmaskAllNotAlone { image: String },
+
+    #[error(
+        "image {image:?}: `unmask` entry {path:?} {detail}; podman logs a pattern syntax \
+         error and leaves the path masked instead of failing the launch"
+    )]
+    UnmaskPathBadGlob {
+        image: String,
+        path: String,
+        detail: &'static str,
+    },
+
     #[error("{path} must be between 1 and {max}; got {value}")]
     ToolCallMaxOutOfRange { path: String, value: u32, max: u32 },
 
@@ -791,7 +830,8 @@ fn validate_security(
         });
     }
 
-    validate_device_list(scope, &security.devices)
+    validate_device_list(scope, &security.devices)?;
+    validate_unmask_list(scope, &security.unmask)
 }
 
 /// Shape-check the `devices` list. Whether the node exists is deliberately not
@@ -817,6 +857,137 @@ fn validate_device_list(scope: &str, devices: &[String]) -> Result<(), ConfigVal
                 image: scope.to_string(),
                 device: device.clone(),
             });
+        }
+    }
+
+    Ok(())
+}
+
+/// Shape-check the `unmask` list. Entries reach podman verbatim, which is what
+/// keeps `ALL` -- podman's "mask nothing" token rather than a path -- from
+/// being something a caller who asked for `/proc/*` gets by accident. The two
+/// rules that look pedantic are the ones measured against podman 5.7, where
+/// both near-misses are silent:
+///
+/// - `ALL` only clears the *read-only* paths (`/sys/fs/cgroup` becomes
+///   writable) when it is spelled in exact uppercase and comes first. Lowercase
+///   `all` still clears the masked paths, so the container looks right while
+///   cgroup stays read-only, and `["/proc/*", "ALL"]` does the same. Rather than
+///   silently reordering a caller's list, `ALL` has to stand alone -- every
+///   other entry is redundant beside it anyway.
+/// - A malformed glob is a no-op, not an error: podman logs `syntax error in
+///   pattern` and creates the container with the path still masked, so the
+///   failure surfaces later as an unrelated-looking one.
+fn validate_unmask_list(scope: &str, unmask: &[String]) -> Result<(), ConfigValidationError> {
+    let mut seen = BTreeSet::new();
+
+    for path in unmask {
+        if path.trim().is_empty() {
+            return Err(ConfigValidationError::UnmaskPathEmpty {
+                image: scope.to_string(),
+            });
+        }
+        // Checked before the absolute-path rule: a colon-joined list is made of
+        // absolute paths, so the rule below would wave it through into an
+        // argument podman then splits back into several.
+        if path.contains(':') {
+            return Err(ConfigValidationError::UnmaskPathListSeparator {
+                image: scope.to_string(),
+                path: path.clone(),
+            });
+        }
+        if path.eq_ignore_ascii_case(UNMASK_ALL) {
+            if path != UNMASK_ALL {
+                return Err(ConfigValidationError::UnmaskAllNotCanonical {
+                    image: scope.to_string(),
+                    path: path.clone(),
+                });
+            }
+            if unmask.len() > 1 {
+                return Err(ConfigValidationError::UnmaskAllNotAlone {
+                    image: scope.to_string(),
+                });
+            }
+        } else {
+            if !Path::new(path).is_absolute() {
+                return Err(ConfigValidationError::UnmaskPathRelative {
+                    image: scope.to_string(),
+                    path: path.clone(),
+                });
+            }
+            if let Err(detail) = check_glob_syntax(path) {
+                return Err(ConfigValidationError::UnmaskPathBadGlob {
+                    image: scope.to_string(),
+                    path: path.clone(),
+                    detail,
+                });
+            }
+        }
+        if !seen.insert(path.clone()) {
+            return Err(ConfigValidationError::UnmaskPathDuplicate {
+                image: scope.to_string(),
+                path: path.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Podman's "mask nothing" token. Load-bearing in exactly this casing.
+const UNMASK_ALL: &str = "ALL";
+
+/// Reject the patterns Go's `filepath.Match` reports `ErrBadPattern` for, since
+/// podman matches unmask entries with it and treats that error as a log line
+/// rather than a failure. Deliberately a shape check against Go's documented
+/// grammar rather than a port of `Match` itself: a pattern this accepts and Go
+/// rejects is no worse than today, while every malformed form seen in practice
+/// -- an unterminated class, a dangling escape -- is caught here where the
+/// config is read instead of going quiet at launch.
+fn check_glob_syntax(pattern: &str) -> Result<(), &'static str> {
+    let mut chars = pattern.chars();
+
+    while let Some(c) = chars.next() {
+        match c {
+            // Go's Match escapes the next character; a trailing `\` has none.
+            '\\' => {
+                if chars.next().is_none() {
+                    return Err("ends with a dangling `\\` escape");
+                }
+            }
+            '[' => {
+                // A class may open with a negation, then needs at least one
+                // character before the `]` that closes it -- `[]` and `[^]`
+                // are both `ErrBadPattern` in Go, not empty classes.
+                let mut len = 0usize;
+                let mut closed = false;
+                let mut first = true;
+                while let Some(c) = chars.next() {
+                    if first {
+                        first = false;
+                        if c == '^' || c == '!' {
+                            continue;
+                        }
+                    }
+                    match c {
+                        '\\' => {
+                            if chars.next().is_none() {
+                                return Err("ends with a dangling `\\` escape");
+                            }
+                            len += 1;
+                        }
+                        ']' if len > 0 => {
+                            closed = true;
+                            break;
+                        }
+                        _ => len += 1,
+                    }
+                }
+                if !closed {
+                    return Err("has an unterminated `[` character class");
+                }
+            }
+            _ => {}
         }
     }
 

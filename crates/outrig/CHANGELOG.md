@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[<...>.security]` gains an `unmask` key**, an ordered list of paths excluded from podman's
+  default masking, lowered one `--security-opt=unmask=<path>` per entry beside the existing
+  `--device` loop. It rides `ContainerSecurity`, `SecuritySpec`, and `ContainerLaunchSpec`, so
+  images and sidecars declare it the same way and both `podman run` and `podman create` carry
+  it. Default empty: no existing launch changes.
+
+  This is the key that makes a **nested container runtime** possible at all. The kernel's
+  "fully visible" rule for procfs (`mount_too_revealing` in `fs/namespace.c`) lets a process in
+  a non-initial user namespace mount a fresh `procfs` only while the `/proc` already in its
+  mount namespace is unobstructed. Podman's default hardening mounts read-only tmpfs over
+  `/proc/acpi`, `/proc/scsi`, and friends, and those mounts are created by a more privileged
+  namespace and locked -- so no capability the container can hold will remove them, and an
+  inner `podman run` dies at creation with ``crun: mount `proc` to `proc`: Operation not
+  permitted``. Measured against podman 5.7 on Linux 7.0, the working recipe is
+  `unmask = ["/proc/*"]`, `cap-add = ["SYS_ADMIN"]` (inner-namespace capabilities are bounded
+  by the outer set), and `devices = ["/dev/fuse", "/dev/net/tun"]` -- the second device for
+  `pasta`, podman 5's default rootless network backend, which the previous entry on this
+  subject missed.
+
+  Entries reach podman verbatim, so `unmask = ["ALL"]` stays expressible without an image that
+  asked for `/proc/*` being silently widened into it. Seven `ConfigValidationError` variants
+  come with it, and every one of them exists because the alternative is silence rather than a
+  failure: `UnmaskPathEmpty`; `UnmaskPathRelative` (absolute paths and `ALL` only);
+  `UnmaskPathListSeparator`, since podman splits an unmask value on `:` and a colon-joined
+  entry would expand back into several at launch; `UnmaskPathDuplicate`; `UnmaskPathBadGlob`,
+  because podman answers a malformed pattern with a log line and a container whose path is
+  still masked; and `UnmaskAllNotCanonical` / `UnmaskAllNotAlone`, because podman lifts the
+  *read-only* paths -- the ones that make `/sys/fs/cgroup` writable -- only when `ALL` is
+  spelled in exact uppercase and comes first. Lowercase `all` and `["/proc/*", "ALL"]` both
+  still clear the masked paths, so they look like a full unmask and are not one. outrig
+  rejects them rather than reordering a caller's list behind their back.
+
+  **This retracts the rationale published with the `no-new-privileges` key below.** That entry
+  said a nested rootless podman needs `newuidmap`, a setuid binary, so `no_new_privs` must be
+  cleared for it. Under `--userns=keep-id` that never happens: the primary's user namespace is
+  owned by the host user, so its owner is inside-UID 1000 rather than 0, and the kernel grants
+  capabilities in a namespace only to a process whose effective UID *is* the owner -- so
+  reaching euid 0 through `newuidmap` gains nothing and fails. With no `/etc/subuid` entry
+  podman takes its rootless single-mapping path instead, creating the namespace with a plain
+  `unshare` and never calling `newuidmap` at all. That is the path the recipe above runs on,
+  with `--security-opt=no-new-privileges` still applied. Adding `/etc/subuid` and
+  `/etc/subgid` entries actively breaks nesting by pushing podman back onto the `newuidmap`
+  path. The key itself is unchanged and still useful for images that do carry setuid tooling;
+  only its stated motivation was wrong.
+
 - **A `[models.<name>]` entry can name other models instead of a provider.** The new `alias`
   key takes one model name (`alias = "opus-5"`) or an ordered list of them
   (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`), and both spellings deserialize through

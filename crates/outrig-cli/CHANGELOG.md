@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[<...>.security]` accepts `unmask`**, so a session container can host a container runtime
+  of its own. `outrig run` carries the key from the selected image-config onto the primary and
+  from each `[sidecars.<sc>.security]` block onto that sidecar. Combined with
+  `cap-add = ["SYS_ADMIN"]` and `devices = ["/dev/fuse", "/dev/net/tun"]`, `unmask = ["/proc/*"]`
+  is what lets an agent build an image or run a throwaway container inside its own session --
+  see [Nested container runtimes](../../doc/concepts/containers.md#nested-container-runtimes),
+  which also retracts the `newuidmap` rationale previously given for `no-new-privileges`.
+
 - **`[models.<name>]` entries can be aliases**, so `--model`, `default-model`,
   `[agents.<name>].model`, and a subagent's `model` argument all accept a name that stands
   for one other model or for an ordered set of provider-equivalent ones. The session picks

@@ -230,6 +230,26 @@ pub outrig::config::ConfigValidationError::UnknownModelAliasTarget::target: allo
 pub outrig::config::ConfigValidationError::UnknownModelProvider
 pub outrig::config::ConfigValidationError::UnknownModelProvider::model: alloc::string::String
 pub outrig::config::ConfigValidationError::UnknownModelProvider::provider: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskAllNotAlone
+pub outrig::config::ConfigValidationError::UnmaskAllNotAlone::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskAllNotCanonical
+pub outrig::config::ConfigValidationError::UnmaskAllNotCanonical::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskAllNotCanonical::path: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathBadGlob
+pub outrig::config::ConfigValidationError::UnmaskPathBadGlob::detail: &'static str
+pub outrig::config::ConfigValidationError::UnmaskPathBadGlob::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathBadGlob::path: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathDuplicate
+pub outrig::config::ConfigValidationError::UnmaskPathDuplicate::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathDuplicate::path: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathEmpty
+pub outrig::config::ConfigValidationError::UnmaskPathEmpty::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathListSeparator
+pub outrig::config::ConfigValidationError::UnmaskPathListSeparator::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathListSeparator::path: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathRelative
+pub outrig::config::ConfigValidationError::UnmaskPathRelative::image: alloc::string::String
+pub outrig::config::ConfigValidationError::UnmaskPathRelative::path: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::path: std::path::PathBuf
@@ -443,6 +463,7 @@ pub outrig::config::ContainerSecurity::cap_drop: alloc::vec::Vec<alloc::string::
 pub outrig::config::ContainerSecurity::capability_profile: outrig::config::CapabilityProfile
 pub outrig::config::ContainerSecurity::devices: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::ContainerSecurity::no_new_privileges: bool
+pub outrig::config::ContainerSecurity::unmask: alloc::vec::Vec<alloc::string::String>
 impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::SecuritySpec
 pub fn outrig::SecuritySpec::from(&outrig::config::ContainerSecurity) -> Self
 impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::container::ContainerCapabilities
@@ -739,6 +760,7 @@ pub outrig::container::ContainerLaunchSpec::labels: alloc::collections::btree::m
 pub outrig::container::ContainerLaunchSpec::mounts: alloc::vec::Vec<outrig::container::ContainerMount>
 pub outrig::container::ContainerLaunchSpec::no_new_privileges: bool
 pub outrig::container::ContainerLaunchSpec::primary_view: core::option::Option<outrig::container::PrimaryView>
+pub outrig::container::ContainerLaunchSpec::unmask: alloc::vec::Vec<alloc::string::String>
 pub outrig::container::ContainerLaunchSpec::workspace: core::option::Option<outrig::container::ContainerWorkspace>
 impl outrig::container::ContainerLaunchSpec
 pub fn outrig::container::ContainerLaunchSpec::workspace(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
@@ -1070,6 +1092,7 @@ pub fn outrig::Outrig::tools(&self) -> &[outrig::ToolHandle]
 pub outrig::SecuritySpec::capabilities: outrig::CapabilitySpec
 pub outrig::SecuritySpec::devices: alloc::vec::Vec<alloc::string::String>
 pub outrig::SecuritySpec::no_new_privileges: bool
+pub outrig::SecuritySpec::unmask: alloc::vec::Vec<alloc::string::String>
 impl core::convert::From<&outrig::config::ContainerSecurity> for outrig::SecuritySpec
 pub fn outrig::SecuritySpec::from(&outrig::config::ContainerSecurity) -> Self
 impl core::default::Default for outrig::SecuritySpec

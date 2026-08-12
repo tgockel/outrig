@@ -280,10 +280,13 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(coding_ctr.security.cap_add, ["NET_BIND_SERVICE"]);
         assert!(!coding_ctr.security.no_new_privileges);
         assert_eq!(coding_ctr.security.devices, ["/dev/fuse"]);
-        // The sidecar block sets `devices` but leaves `no-new-privileges`
-        // alone, so it keeps the safe default independently of the primary.
+        assert_eq!(coding_ctr.security.unmask, ["/proc/*"]);
+        // The sidecar block sets `devices` and `unmask` but leaves
+        // `no-new-privileges` alone, so it keeps the safe default independently
+        // of the primary.
         let tools_security = &cfg.sidecars["tools"].security;
         assert_eq!(tools_security.devices, ["/dev/fuse"]);
+        assert_eq!(tools_security.unmask, ["/proc/*"]);
         assert!(tools_security.no_new_privileges);
 
         assert!(matches!(coding_ctr.mcp["shell"], McpServerSpec::Short(_)));
@@ -398,6 +401,7 @@ context    = "ctx"
         assert!(security.cap_add.is_empty());
         assert!(security.no_new_privileges);
         assert!(security.devices.is_empty());
+        assert!(security.unmask.is_empty());
     }
 
     /// `no-new-privileges` defaults to `true`, which is the opposite of
@@ -422,10 +426,13 @@ context    = "ctx"
         let security = &cfg.images["coding"].security;
         assert!(security.no_new_privileges);
         assert!(security.devices.is_empty());
+        assert!(security.unmask.is_empty());
 
         let rendered = toml::to_string(&cfg).expect("config serializes");
         assert!(
-            !rendered.contains("no-new-privileges") && !rendered.contains("devices"),
+            !rendered.contains("no-new-privileges")
+                && !rendered.contains("devices")
+                && !rendered.contains("unmask"),
             "an untouched security block should be elided, got:\n{rendered}",
         );
     }

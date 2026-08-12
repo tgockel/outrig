@@ -97,9 +97,13 @@ pub struct SecuritySpec {
     /// Host device nodes to pass through, one `--device=<path>` each.
     pub devices: Vec<String>,
     /// Whether to apply `--security-opt=no-new-privileges`. Clearing this
-    /// restores setuid escalation inside the container, which is what a nested
-    /// rootless container runtime needs; see `doc/concepts/containers.md`.
+    /// restores setuid escalation inside the container; see
+    /// `doc/concepts/containers.md`.
     pub no_new_privileges: bool,
+    /// Paths to exclude from podman's default masking, one
+    /// `--security-opt=unmask=<path>` each. A nested container runtime needs
+    /// `/proc/*` here; see `doc/concepts/containers.md`.
+    pub unmask: Vec<String>,
 }
 
 /// Hand-written rather than derived so that `no_new_privileges` defaults to
@@ -112,6 +116,7 @@ impl Default for SecuritySpec {
             capabilities: CapabilitySpec::default(),
             devices: Vec::new(),
             no_new_privileges: true,
+            unmask: Vec::new(),
         }
     }
 }
@@ -372,6 +377,7 @@ impl From<&ContainerSecurity> for SecuritySpec {
             },
             devices: security.devices.clone(),
             no_new_privileges: security.no_new_privileges,
+            unmask: security.unmask.clone(),
         }
     }
 }
@@ -771,6 +777,7 @@ impl Outrig {
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
             devices: spec.security.devices.clone(),
             no_new_privileges: spec.security.no_new_privileges,
+            unmask: spec.security.unmask.clone(),
             labels: BTreeMap::new(),
             // The programmatic path never hosts entrypoint-stdio servers, so
             // it never uses the primary-view placement.
@@ -921,6 +928,7 @@ impl Outrig {
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
             devices: spec.security.devices.clone(),
             no_new_privileges: spec.security.no_new_privileges,
+            unmask: spec.security.unmask.clone(),
             labels: BTreeMap::from([
                 (
                     LABEL_SESSION.to_string(),

@@ -763,6 +763,7 @@ cap-drop = ["MKNOD", "SETFCAP"]
 cap-add  = ["NET_BIND_SERVICE"]
 no-new-privileges = false
 devices  = ["/dev/fuse"]
+unmask   = ["/proc/*"]
 ```
 
 - `capability-profile` (string, optional, default: `"default"`): named Linux capability
@@ -776,12 +777,21 @@ devices  = ["/dev/fuse"]
   explicit drops are rendered.
 - `no-new-privileges` (bool, optional, default: `true`): emit
   `--security-opt=no-new-privileges`. Setting it to `false` restores setuid escalation inside
-  the container, which is what a nested rootless container runtime needs and which also lets
-  any setuid-root binary in the image be used; see
+  the container, letting any setuid-root binary in the image be used; see
   [Containers](../concepts/containers.md#devices-and-privilege-escalation) for the tradeoff.
+  A nested container runtime does **not** need this cleared -- see
+  [Nested container runtimes](../concepts/containers.md#nested-container-runtimes).
 - `devices` (array, optional, default: `[]`): host device nodes to pass through, emitted as
   one `--device=<path>` per entry in declaration order. Entries are plain absolute paths;
   podman's `<src>:<dst>:<perms>` form is not accepted.
+- `unmask` (array, optional, default: `[]`): paths to exclude from podman's default masking,
+  emitted as one `--security-opt=unmask=<path>` per entry in declaration order. Entries are
+  absolute paths with `filepath.Match` glob syntax, and reach podman verbatim -- asking for
+  `/proc/*` never widens into `ALL`. The one non-path value is `ALL`, podman's "mask nothing"
+  token, which must be spelled in exact uppercase and must be the list's only entry; see the
+  validation rules below for why. This turns a hardening flag off; see
+  [Containers](../concepts/containers.md#devices-and-privilege-escalation) for what it
+  re-exposes.
 
 Capability names may be written as `NET_RAW` or `CAP_NET_RAW`; outrig normalizes to the
 podman form without the `CAP_` prefix. This section does not configure seccomp, AppArmor,
@@ -1226,6 +1236,21 @@ image-config in the merged config but does not require agent/model/provider wiri
   Whether the node exists is not checked -- validation may run on a machine that is not the
   launch host, so podman reports a missing node at launch instead.
 - Device paths must not be duplicated within one `devices` list.
+- Every `[images.<name>.security].unmask` entry must be non-empty and either an absolute path
+  or the literal `ALL`.
+- `ALL` must be spelled in exact uppercase, and must be the only entry in the list. Measured
+  against podman 5.7, both near-misses fail silently: lowercase `all` still clears the masked
+  paths -- so `/proc/acpi` looks unmasked -- while leaving the read-only ones, so
+  `/sys/fs/cgroup` stays read-only. `["/proc/*", "ALL"]` does the same, because podman lifts
+  the read-only paths only when `ALL` comes first. outrig rejects both rather than silently
+  reordering the list; every other entry is redundant beside `ALL` anyway.
+- Every non-`ALL` entry must be a well-formed `filepath.Match` glob -- no unterminated `[`
+  class, no dangling `\` escape. Podman logs a pattern syntax error for a malformed one and
+  creates the container with the path still masked, so an unchecked typo would go quiet at
+  launch and resurface later as an unrelated-looking failure.
+- No `unmask` entry may contain `:`. Podman splits an unmask value on it, so a colon-joined
+  entry would be several paths wearing one entry's clothes; declare one path per entry.
+- Unmask paths must not be duplicated within one `unmask` list.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
 - Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
   directory. Relative host paths resolve against the declaring file's directory.

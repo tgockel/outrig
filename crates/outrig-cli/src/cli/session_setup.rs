@@ -460,6 +460,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     launch.capabilities = (&image_cfg.security).into();
     launch.devices = image_cfg.security.devices.clone();
     launch.no_new_privileges = image_cfg.security.no_new_privileges;
+    launch.unmask = image_cfg.security.unmask.clone();
     launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
     if let Some(p) = args.explicit_session_dir
@@ -1047,8 +1048,8 @@ async fn ensure_sidecar_image(
 
 /// The launch inputs every sidecar container shares, whichever path starts
 /// it: session + sidecar labels and the block's security policy -- capability
-/// profile, device passthrough, and privilege escalation alike -- plus the
-/// workspace view and extra mounts, which `podman create` and `podman run`
+/// profile, device passthrough, path unmasking, and privilege escalation alike
+/// -- plus the workspace view and extra mounts, which `podman create` and `podman run`
 /// accept alike, so a named block hosting an entrypoint server gets them too.
 /// An anonymous sidecar declares neither and lands on the empty defaults.
 fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> ContainerLaunchSpec {
@@ -1067,6 +1068,7 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
     launch.capabilities = (&sc.security).into();
     launch.devices = sc.security.devices.clone();
     launch.no_new_privileges = sc.security.no_new_privileges;
+    launch.unmask = sc.security.unmask.clone();
     launch.labels = BTreeMap::from([
         (LABEL_SESSION.to_string(), ctx.sid.to_string()),
         (LABEL_SIDECAR.to_string(), sc.name.clone()),

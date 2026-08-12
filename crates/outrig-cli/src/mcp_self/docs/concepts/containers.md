@@ -155,13 +155,15 @@ back one narrow capability. Capability names may include or omit the `CAP_` pref
 
 ### Devices and privilege escalation
 
-Two further keys in the same block cover what capabilities cannot express. A device node is
-not a capability, and `no_new_privs` is a separate process flag, so each gets its own key:
+Three further keys in the same block cover what capabilities cannot express. A device node is
+not a capability, a masked path is not a capability, and `no_new_privs` is a separate process
+flag, so each gets its own key:
 
 ```toml
 [images.coding.security]
 no-new-privileges = false          # default true
 devices           = ["/dev/fuse"]  # default []
+unmask            = ["/proc/*"]    # default []
 ```
 
 **`no-new-privileges = false` weakens the container boundary.** Under `no_new_privs` the
@@ -175,17 +177,70 @@ unprivileged rootless podman container in a user namespace -- clearing the flag 
 container's own namespace-local root, not root on the host.
 
 `devices` passes host device nodes through, one `--device=<path>` per entry, in declaration
-order. This is the sharper of the two in the general case: `/dev/kvm` or a raw block device
+order. This is the sharpest of the three in the general case: `/dev/kvm` or a raw block device
 hands out real hardware access. It is explicit per path and per image-config, and outrig does
 not police which paths you may ask for.
 
-The motivating case for both is a **nested container runtime** -- an agent whose job is to
-build an image or run a throwaway container. A nested rootless podman needs `newuidmap` to
-map its subordinate UID range, and `newuidmap` is setuid-root, so `no_new_privs` breaks it.
-The session container's rootfs is overlayfs and the kernel refuses overlay-on-overlay, so the
-nested runtime also needs `fuse-overlayfs`, which needs `/dev/fuse`. outrig supplies the two
-primitives; assembling them into a working nested runtime (and installing the tools in your
-Dockerfile) is yours to do.
+`unmask` excludes paths from podman's default masking, one `--security-opt=unmask=<path>` per
+entry. Entries are absolute paths, globs allowed, or the literal `ALL` -- and they reach podman
+as written, so an image that asks for `/proc/*` is never widened into `ALL`. `ALL` is fussier
+than it looks: podman lifts the read-only paths (making `/sys/fs/cgroup` writable) only for
+that exact uppercase spelling, and only when it comes first, so outrig requires it to be the
+list's sole entry rather than accept a spelling that half-works. **This turns a
+hardening flag off.** Podman hides `/proc/acpi`, `/proc/scsi`, `/proc/keys`, `/proc/kcore`, and
+the rest of its masked set behind read-only tmpfs mounts and `/dev/null` binds; unmasking
+`/proc/*` puts all of them back. Inside a rootless container in a user namespace these are
+read-only to an unprivileged user and mostly uninteresting, but that is a reason the exposure
+is usually tolerable, not a reason it is absent.
+
+### Nested container runtimes
+
+The motivating case for all three is a **nested container runtime** -- an agent whose job is to
+build an image or run a throwaway container. The measured recipe, against podman 5.7 on Linux
+7.0:
+
+```toml
+[images.coding.security]
+cap-add = ["SYS_ADMIN"]
+devices = ["/dev/fuse", "/dev/net/tun"]
+unmask  = ["/proc/*"]
+```
+
+Each line is load-bearing, and removing any one of them breaks the inner `podman run`:
+
+- `unmask = ["/proc/*"]` is what the kernel's "fully visible" procfs rule demands. A process in
+  a non-initial user namespace may mount a fresh `procfs` only while the `/proc` already in its
+  mount namespace is unobstructed, and podman's masking mounts *are* an obstruction. They are
+  created by a more privileged namespace and locked, so the container cannot unmount them
+  itself, whatever capabilities it holds. Without this the inner create fails with
+  ``crun: mount `proc` to `proc`: Operation not permitted``.
+- `cap-add = ["SYS_ADMIN"]` because the capabilities available in the inner user namespace are
+  bounded by the outer set. Without it: `crun: sethostname: Operation not permitted`.
+- `/dev/fuse` because the session container's rootfs is overlayfs and the kernel refuses
+  overlay-on-overlay, so the nested runtime needs `fuse-overlayfs`.
+- `/dev/net/tun` because `pasta`, podman 5's default rootless network backend, opens it to
+  build its tap device. A container passing through only `/dev/fuse` gets as far as pulling the
+  inner image and then fails to configure its network.
+
+**`no-new-privileges` is not in that list, and does not need to be.** The usual claim is that a
+nested rootless podman calls setuid-root `newuidmap` to map its subordinate UID range, so
+`no_new_privs` must be cleared. Under `--userns=keep-id` that never happens. The primary's user
+namespace is created by the host user, so its owner is inside-UID 1000 rather than 0; the
+kernel grants capabilities in a user namespace only to a process whose effective UID *is* that
+owner, so `execve`ing `newuidmap` to euid 0 gains nothing and fails anyway. With no
+`/etc/subuid` entry, podman instead takes its rootless single-mapping path, which creates the
+namespace with a plain `unshare` -- making the caller its owner -- and never invokes
+`newuidmap` at all. That is the path the recipe above runs on, with
+`--security-opt=no-new-privileges` still applied.
+
+The corollary is a trap worth naming: **adding `/etc/subuid` and `/etc/subgid` entries to the
+image breaks nesting**, because podman then takes the `newuidmap` path and hits the failure
+above. Leave them out.
+
+outrig supplies the primitives; assembling them into a working nested runtime is yours to do.
+Your Dockerfile still has to install `podman`, `fuse-overlayfs`, and `passt`, select the
+`overlay` storage driver with `mount_program = "/usr/bin/fuse-overlayfs"` and
+`ignore_chown_errors = "true"`, and set `default_sysctls = []` in `containers.conf`.
 
 ### Using a pre-built image
 
@@ -325,11 +380,11 @@ access         = "read-write"   # "read-only" (default) | "read-write"
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
 (Dockerfile-built sidecars get content-hash caching for free), then a raw podman ref, which
 must be present locally. An optional `[sidecars.<sc>.security]` block reuses the
-whole security surface of the primary -- capability keys, `no-new-privileges`, and `devices`
-alike -- and each sidecar's block stands on its own, so opting one out of `no-new-privileges`
-leaves the others hardened. `start = "manual"` declares a sidecar that does not start with the
-session (a later release adds the surfaces that start one mid-session; until then its servers
-are skipped with a notice).
+whole security surface of the primary -- capability keys, `no-new-privileges`, `devices`, and
+`unmask` alike -- and each sidecar's block stands on its own, so opting one out of
+`no-new-privileges` leaves the others hardened. `start = "manual"` declares a sidecar that does
+not start with the session (a later release adds the surfaces that start one mid-session; until
+then its servers are skipped with a notice).
 
 **Naming and labels.** Sidecar containers are named `outrig-<sid>-<sc>`; an anonymous sidecar
 uses its server's name as `<sc>`. Every session container -- primary included -- carries the
@@ -375,9 +430,10 @@ in place, then becomes that user for the exec, so the *server* runs unprivileged
 container was created privileged.
 `--security-opt=no-new-privileges` goes on too unless the selected image-config sets
 `no-new-privileges = false`. Capability flags are emitted only when that image-config opts
-into a capability profile or explicit `cap-drop` / `cap-add` entries, and `--device=<path>`
-flags only when it declares `devices`. Session containers additionally carry the
-`org.outrig.session` label (and sidecars `org.outrig.sidecar`).
+into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<path>` flags
+only when it declares `devices`, and `--security-opt=unmask=<path>` flags only when it declares
+`unmask`. Session containers additionally carry the `org.outrig.session` label (and sidecars
+`org.outrig.sidecar`).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode

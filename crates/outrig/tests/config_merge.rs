@@ -841,6 +841,241 @@ devices = ["dev/fuse"]
     }
 
     #[test]
+    fn empty_unmask_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["   "]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::UnmaskPathEmpty { image } => {
+                assert_eq!(image, "coding");
+            }
+            other => panic!("expected UnmaskPathEmpty, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_unmask_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["proc/acpi"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::UnmaskPathRelative { image, path } => {
+                assert_eq!(image, "coding");
+                assert_eq!(path, "proc/acpi");
+            }
+            other => panic!("expected UnmaskPathRelative, got: {other:?}"),
+        }
+    }
+
+    /// Podman splits an unmask value on `:`, so a colon-joined list would be
+    /// two paths wearing one entry's clothes -- accepted by the absolute-path
+    /// rule, then silently expanded at launch.
+    #[test]
+    fn colon_joined_unmask_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["/proc/acpi:/proc/scsi"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::UnmaskPathListSeparator { image, path } => {
+                assert_eq!(image, "coding");
+                assert_eq!(path, "/proc/acpi:/proc/scsi");
+            }
+            other => panic!("expected UnmaskPathListSeparator, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_unmask_path_errors() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["/proc/*", "/sys/firmware", "/proc/*"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::UnmaskPathDuplicate { image, path } => {
+                assert_eq!(image, "coding");
+                assert_eq!(path, "/proc/*");
+            }
+            other => panic!("expected UnmaskPathDuplicate, got: {other:?}"),
+        }
+    }
+
+    /// `ALL` is podman's "mask nothing" token rather than a path, so the
+    /// absolute-path rule must let it through.
+    #[test]
+    fn unmask_all_alone_is_accepted() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["ALL"]
+"#,
+        );
+        cfg.validate(None).expect("`ALL` is not a relative path");
+        assert_eq!(cfg.images["coding"].security.unmask, ["ALL"]);
+    }
+
+    /// Measured against podman 5.7: lowercase `all` still clears the *masked*
+    /// paths, so `/proc/acpi` appears unmasked, but it does not clear the
+    /// read-only ones -- `/sys/fs/cgroup` stays read-only. A config that looks
+    /// like a full unmask and is not one is worth an error rather than a
+    /// silent half-measure.
+    #[test]
+    fn lowercase_unmask_all_errors() {
+        for value in ["all", "All", "aLL"] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["{value}"]
+"#,
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::UnmaskAllNotCanonical { image, path } => {
+                    assert_eq!(image, "coding");
+                    assert_eq!(path, value);
+                }
+                other => panic!("expected UnmaskAllNotCanonical for {value:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Same measurement, the other half: podman lifts the read-only paths only
+    /// when `ALL` is the *first* value, so `["/proc/*", "ALL"]` is another
+    /// silent half-unmask. Rejecting rather than reordering keeps outrig from
+    /// rewriting a caller's list behind their back, and every entry beside
+    /// `ALL` is redundant anyway.
+    #[test]
+    fn unmask_all_beside_other_entries_errors() {
+        for list in [r#"["/proc/*", "ALL"]"#, r#"["ALL", "/proc/*"]"#] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = {list}
+"#,
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::UnmaskAllNotAlone { image } => assert_eq!(image, "coding"),
+                other => panic!("expected UnmaskAllNotAlone for {list}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Measured against podman 5.7: `unmask=/proc/[` logs `syntax error in
+    /// pattern`, creates the container anyway, and leaves `/proc/acpi` masked.
+    /// The request is dropped in a log line, so the failure only surfaces later
+    /// as something that looks unrelated.
+    #[test]
+    fn malformed_unmask_glob_errors() {
+        for value in ["/proc/[", "/proc/[abc", "/proc/[]", "/proc/x\\"] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["{}"]
+"#,
+                value.escape_default(),
+            ));
+            match expect_validation_err(&cfg, None) {
+                ConfigValidationError::UnmaskPathBadGlob { image, path, .. } => {
+                    assert_eq!(image, "coding");
+                    assert_eq!(path, value);
+                }
+                other => panic!("expected UnmaskPathBadGlob for {value:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// The globs that motivate the key must survive the syntax check.
+    #[test]
+    fn well_formed_unmask_globs_are_accepted() {
+        for value in ["/proc/*", "/proc/a[cd]pi", "/proc/?cpi", "/proc/[^x]cpi"] {
+            let cfg = parse(&format!(
+                r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[images.coding.security]
+unmask = ["{value}"]
+"#,
+            ));
+            cfg.validate(None)
+                .unwrap_or_else(|e| panic!("{value:?} should be a valid glob, got: {e:?}"));
+        }
+    }
+
+    /// Sidecars reuse the whole `[security]` block, so the unmask rules reach
+    /// them too -- and the error names the sidecar's scope.
+    #[test]
+    fn sidecar_unmask_path_errors_name_the_sidecar_scope() {
+        let cfg = parse(
+            r#"
+[images.coding]
+dockerfile = "D"
+context    = "ctx"
+
+[sidecars.tools]
+image = "mcp-tools"
+
+[sidecars.tools.security]
+unmask = ["proc/acpi"]
+"#,
+        );
+        let err = expect_validation_err(&cfg, None);
+        match err {
+            ConfigValidationError::UnmaskPathRelative { image, path } => {
+                assert_eq!(image, "sidecars.tools");
+                assert_eq!(path, "proc/acpi");
+            }
+            other => panic!("expected UnmaskPathRelative, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn top_level_tool_call_max_zero_errors() {
         let cfg = parse(
             r#"

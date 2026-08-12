@@ -1,7 +1,7 @@
-//! End-to-end smoke for the two security primitives a nested container
-//! runtime needs: device passthrough and the `no-new-privileges` opt-out.
-//! Gated behind `--features e2e` because it shells out to a real `podman` and
-//! starts an `alpine:latest` container.
+//! End-to-end smoke for the security primitives a nested container runtime
+//! needs: device passthrough, path unmasking, and the `no-new-privileges`
+//! opt-out. Gated behind `--features e2e` because it shells out to a real
+//! `podman` and starts an `alpine:latest` container.
 //!
 //! Run with:
 //!
@@ -136,5 +136,78 @@ async fn declared_device_appears_inside_the_container() {
     assert_eq!(
         probe, "present",
         "devices = [{FUSE:?}] should pass the node through",
+    );
+}
+
+/// `/proc/acpi` is one of the paths podman hides behind a read-only tmpfs, and
+/// that mount is the obstruction the kernel's "fully visible" procfs rule
+/// refuses to mount a nested `procfs` over -- see `doc/concepts/containers.md`
+/// for why a nested container runtime needs it gone. Reading
+/// `/proc/self/mountinfo` measures that obstruction directly, without needing
+/// an image carrying a whole second container runtime. Both directions,
+/// because asserting only the unmasked case would pass just as happily against
+/// a build that stopped masking everywhere.
+#[tokio::test]
+async fn unmask_removes_the_masking_mounts_in_both_directions() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    // The masking mounts are locked and created by a more privileged namespace,
+    // so `grep`ing them out of mountinfo is the whole measurement.
+    let probe = "grep ' /proc/acpi ' /proc/self/mountinfo | wc -l";
+
+    let masked = start_alpine(ContainerLaunchSpec::default()).await;
+    let baseline = sh(&masked, probe);
+    masked.stop(Duration::from_secs(2)).await.expect("stop");
+    if baseline == "0" {
+        eprintln!("skipping: this podman does not mask /proc/acpi, so there is nothing to unmask");
+        return;
+    }
+
+    let mut unmasked_spec = ContainerLaunchSpec::default();
+    unmasked_spec.unmask = vec!["/proc/*".to_string()];
+    let unmasked = start_alpine(unmasked_spec).await;
+    let value = sh(&unmasked, probe);
+    unmasked.stop(Duration::from_secs(2)).await.expect("stop");
+    assert_eq!(
+        value, "0",
+        "unmask = [\"/proc/*\"] should leave no tmpfs over /proc/acpi, got: {value:?}",
+    );
+}
+
+/// `ALL` does strictly more than a `/proc/*` glob: it lifts the *read-only*
+/// paths too, which is what makes `/sys/fs/cgroup` writable. Config validation
+/// rejects every other spelling -- lowercase, or `ALL` beside other entries --
+/// because podman applies this half of the behavior only for exact uppercase
+/// `ALL` in first position and says nothing when it does not. That rule is only
+/// worth its strictness while the measurement holds, so pin the measurement:
+/// if podman ever makes the spellings equivalent, this test keeps passing and
+/// `validate_unmask_list` can be relaxed on purpose rather than by guess.
+#[tokio::test]
+async fn unmask_all_lifts_the_read_only_paths_too() {
+    common::init_tracing();
+    pull_alpine().await;
+
+    // `mount` renders the cgroup line as `... type cgroup2 (ro,nosuid,...)`, so
+    // the leading `(rw,` is the whole signal. Counted with `wc`, like the probe
+    // above, because `sh` requires exit 0 and `grep -c` calls "no matches" 1.
+    let probe = "mount | grep ' /sys/fs/cgroup ' | grep '(rw,' | wc -l";
+
+    let masked = start_alpine(ContainerLaunchSpec::default()).await;
+    let baseline = sh(&masked, probe);
+    masked.stop(Duration::from_secs(2)).await.expect("stop");
+    assert_eq!(
+        baseline, "0",
+        "a default container should get cgroup read-only, got: {baseline:?}",
+    );
+
+    let mut all_spec = ContainerLaunchSpec::default();
+    all_spec.unmask = vec!["ALL".to_string()];
+    let all = start_alpine(all_spec).await;
+    let value = sh(&all, probe);
+    all.stop(Duration::from_secs(2)).await.expect("stop");
+    assert_ne!(
+        value, "0",
+        "unmask = [\"ALL\"] should make cgroup writable, got: {value:?}",
     );
 }

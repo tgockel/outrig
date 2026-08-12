@@ -165,6 +165,9 @@ pub struct ContainerLaunchSpec {
     pub devices: Vec<String>,
     /// Whether to apply `--security-opt=no-new-privileges`.
     pub no_new_privileges: bool,
+    /// Paths to exclude from podman's default masking, one
+    /// `--security-opt=unmask=<path>` each.
+    pub unmask: Vec<String>,
     pub labels: BTreeMap<String, String>,
     /// Set for a `view = "primary"` sidecar; drives the namespace-joining
     /// flags. `None` is every other container.
@@ -182,6 +185,7 @@ impl Default for ContainerLaunchSpec {
             capabilities: ContainerCapabilities::default(),
             devices: Vec::new(),
             no_new_privileges: true,
+            unmask: Vec::new(),
             labels: BTreeMap::new(),
             primary_view: None,
         }
@@ -931,7 +935,8 @@ fn build_podman_create_cmd(options: &ContainerCreateOptions, selinux: bool) -> C
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
 /// extra bind mounts, keep-id, workspace workdir, capability policy, device
 /// passthrough, and the hardening tail. `--security-opt=no-new-privileges` is
-/// part of that tail only when the launch spec keeps it.
+/// part of that tail only when the launch spec keeps it, and each `unmask`
+/// entry follows it as a second `--security-opt`.
 fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool) -> Cmd {
     for (key, value) in &launch.labels {
         cmd = cmd.arg("--label").arg(format!("{key}={value}"));
@@ -988,6 +993,11 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     }
     if launch.no_new_privileges {
         cmd = cmd.arg("--security-opt=no-new-privileges");
+    }
+    // One flag per entry rather than podman's colon-joined form: the lowering
+    // stays trivial and a failed launch's argv stays readable.
+    for path in &launch.unmask {
+        cmd = cmd.arg(format!("--security-opt=unmask={path}"));
     }
     if launch.primary_view.is_some() {
         cmd = cmd.arg("--entrypoint").arg(PRIMARY_VIEW_HELPER_MOUNT);
@@ -1665,6 +1675,90 @@ mod tests {
         );
     }
 
+    /// Each entry gets its own `--security-opt`, and `ALL` reaches podman as
+    /// written -- an image asking for `/proc/*` must not be widened into it.
+    #[test]
+    fn podman_run_args_render_unmask_entries_in_declaration_order() {
+        let launch = ContainerLaunchSpec {
+            unmask: vec!["/proc/*".to_string(), "ALL".to_string()],
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag::new("local:test"),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--security-opt=no-new-privileges",
+                "--security-opt=unmask=/proc/*",
+                "--security-opt=unmask=ALL",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
+    /// The measured recipe for a nested rootless podman, pinned whole so the
+    /// combination cannot rot one flag at a time; `doc/concepts/containers.md`
+    /// explains what each one buys. Note what is *not* here:
+    /// `no_new_privileges` stays on.
+    #[test]
+    fn podman_run_args_carry_the_whole_nested_runtime_recipe() {
+        let launch = ContainerLaunchSpec {
+            capabilities: ContainerCapabilities {
+                profile: CapabilityProfile::Default,
+                cap_drop: Vec::new(),
+                cap_add: vec!["SYS_ADMIN".to_string()],
+            },
+            devices: vec!["/dev/fuse".to_string(), "/dev/net/tun".to_string()],
+            unmask: vec!["/proc/*".to_string()],
+            ..Default::default()
+        };
+
+        let args = argv(build_podman_run_cmd(
+            &ImageTag::new("local:test"),
+            "outrig-test",
+            &launch,
+            false,
+        ));
+
+        assert_eq!(
+            args,
+            vec![
+                "podman",
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                "outrig-test",
+                "--userns=keep-id",
+                "--cap-add=SYS_ADMIN",
+                "--device=/dev/fuse",
+                "--device=/dev/net/tun",
+                "--security-opt=no-new-privileges",
+                "--security-opt=unmask=/proc/*",
+                "--pull=never",
+                "local:test",
+                "sleep",
+                "infinity",
+            ]
+        );
+    }
+
     /// Clearing `no_new_privileges` must remove exactly one flag. `--pull=never`
     /// and `--userns=keep-id` are the neighbors most at risk from an edit to the
     /// hardening tail, so this pins them explicitly.
@@ -1742,12 +1836,15 @@ mod tests {
     }
 
     /// Sidecars go out through `podman create`, which shares
-    /// `append_launch_flags`, so both keys must reach them too.
+    /// `append_launch_flags`, so all three keys must reach them too. Clearing
+    /// `no_new_privileges` here also pins that `unmask` stands on its own: it
+    /// is emitted with no `--security-opt=no-new-privileges` ahead of it.
     #[test]
     fn podman_create_args_carry_devices_and_privileges() {
         let launch = ContainerLaunchSpec {
             devices: vec!["/dev/fuse".to_string()],
             no_new_privileges: false,
+            unmask: vec!["/proc/*".to_string()],
             ..Default::default()
         };
 
@@ -1765,6 +1862,7 @@ mod tests {
                 "outrig-test-fetch",
                 "--userns=keep-id",
                 "--device=/dev/fuse",
+                "--security-opt=unmask=/proc/*",
                 "--pull=never",
                 "--interactive",
                 "--rm",
