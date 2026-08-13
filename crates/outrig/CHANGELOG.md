@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-rc.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.2) - 2026-08-12
+
+A second release candidate, cut because the cycle kept breaking the public surface after rc.1
+went out. Everything here is measured against **0.2.0-rc.1**; a consumer still on 0.1.0 should
+read that section first.
+
+The breaks an rc.1 consumer hits, all detailed under **Changed**: `LlmProvider::openai` and
+`::anthropic` take an options struct instead of a positional timeout (and
+`with_retry_budget_secs` moves onto it), `Model::provider` is `Option<String>`, the four exec
+methods take an `ExecOptions` in place of a bare environment map, `Workspace`'s `host-path` and
+`container-path` are accessors rather than public fields, and the five `MountRuleViolation`
+variants are struct variants carrying the file that declared the mount.
+
 ### Added
 
 - **`[<...>.security]` gains an `unmask` key**, an ordered list of paths excluded from podman's
@@ -155,6 +168,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, on stderr -- not as an `Err`. Validating existence up front would cost an extra exec on
   every call to pre-empt a case podman already handles.
 
+- **Breaking: `Workspace::host_path` and `Workspace::container_path` are accessors, not public
+  fields.** Both are private `Option<PathBuf>` now. Read the effective value -- what was declared,
+  else the built-in default -- with `host_path()` / `container_path()`, and ask what a config
+  actually wrote with `declared_host_path()` / `declared_container_path()`; `set_host_path` and
+  `set_container_path` write them. `impl Default for Workspace` is gone with the fields, while
+  `Workspace::new(host, container)` is unchanged and remains the way to build one.
+
+  The `Option` is what per-key merge needs: `PathBuf` cannot tell an absent key from one written
+  out to the value the default happens to have, and the merge fix below turns on exactly that
+  distinction. Leaving the fields public would then have let a caller replace a `host-path` while
+  leaving behind the `ConfigSource` it is paired with, resolving the substitute against a
+  directory it never came from -- and the primary mount is read-write. The setters clear that
+  provenance; only a *declared* path carries any, since the built-in `.` belongs to no file.
+
+  Making a public field private is a break `#[non_exhaustive]` does not cover, so it is free
+  before the 0.2.0 freeze and costs a major version after -- the same trade the `Model::provider`
+  entry above takes.
+
 - **Breaking: `request-timeout-secs` is now range-checked**, closing an asymmetry with its
   sibling `retry-budget-secs`, which has validated against `RETRY_BUDGET_SECS_CEILING` since it
   landed. A remote provider's `request-timeout-secs` must be between `1` and the new
@@ -223,6 +254,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind -- only in that a namespace-entry failure is now reported rather than absorbed.
 
 ### Fixed
+
+- **A global `[workspace]` block is no longer thrown away.** `host-path` and `container-path` in
+  `~/.outrig/config.toml` were parsed, validated, merged, and then discarded in silence: merge
+  took the repo's `Workspace` whole and combined only `mounts`, and `Workspace` is
+  `#[serde(default)]`, so a repo config with no `[workspace]` table at all still contributed a
+  default that beat the global every time. A machine-wide `container-path = "/src"` reached
+  nothing. The reference called this "repo-owned as a block", which reads as *repo overrides
+  global when both are set* rather than *global is unreachable*, and the two descriptions diverge
+  in precisely the case someone writing that stanza expects to work.
+
+  The two primary fields now merge per key -- a repo declaration wins, then a global one, then
+  the built-in default -- which is what every other top-level scalar already does, and it lets a
+  repo override one field without forfeiting the other. Extra `workspace.mounts` keep their
+  existing asymmetric merge, global entries first and then repo, which was already deliberate.
+  `Config::load` resolves the global config path to an absolute one before reading it, so a
+  `host-path` a global config declared relatively resolves against the directory that file
+  actually lives in. `[workspace]` is now the one block that merges per key rather than by name.
 
 - **A `view = "primary"` sidecar on a Debian/glibc base no longer dies on SIGSEGV with an
   empty stderr.** The visible failure was `mcp server "..." failed to start: connection
