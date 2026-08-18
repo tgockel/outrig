@@ -454,7 +454,35 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
             let mut h = std::mem::take(&mut *history.borrow_mut());
             let result = agent.run_turn(&line, &mut h).await;
             *history.borrow_mut() = h;
-            result
+            // A turn that finished on its own and still has nothing to show is
+            // reported here rather than returned as an empty reply the REPL
+            // would print as nothing. Every *deliberate* stop already printed
+            // its own reason on the way out, so `is_silent` is what separates
+            // "outrig explained itself" from the one outcome that used to
+            // reach the user as pure silence.
+            result.map(|end| {
+                if end.is_silent() {
+                    eprintln!("{}", end.silent_report());
+                    // Deliberately not the "history retained" advice the
+                    // truncation paths give. The turn *is* in outrig's history,
+                    // but on an OpenAI-compatible provider an assistant message
+                    // carrying only reasoning is dropped on the way back out,
+                    // so promising the model will see it would be false for the
+                    // arm this failure shows up on most.
+                    eprintln!(
+                        "[outrig] send another prompt (e.g. \"continue\") to keep going, \
+                         or \"/reset\" to start over -- but say what you need again \
+                         rather than referring back, as the model may not see this turn."
+                    );
+                    // Whitespace is exact-non-empty, so returning it would
+                    // put a stray blank line on stdout directly under the
+                    // report that just said the turn produced nothing. A turn
+                    // classified silent has been accounted for on stderr; it
+                    // has nothing left to print.
+                    return String::new();
+                }
+                end.reply
+            })
         }
     };
 

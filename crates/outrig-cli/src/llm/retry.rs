@@ -404,6 +404,45 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+        // Read off the request before rig consumes it: naming the ceiling that
+        // was in force is most of what makes a truncation report actionable,
+        // and `None` -- no ceiling sent, provider's default silently in charge
+        // -- is the case worth naming loudest.
+        let max_tokens = request.max_tokens;
+        let outcome = self.completion_retried(request).await;
+        if let Ok(response) = &outcome {
+            report_textless_completion(response, max_tokens);
+        }
+        outcome
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        // No retry, for the same reason `send_streaming` has none: outrig's
+        // remote turns are non-streaming, and a failure can land mid-stream,
+        // after content the caller already saw.
+        self.inner.stream(request).await
+    }
+
+    /// Delegated, not defaulted. The trait's `false` is the safe answer for a
+    /// provider whose native structured output suppresses tool calls; answering
+    /// it for OpenAI and Anthropic, which compose the two, would cost them
+    /// guaranteed structured output on every turn that has tools.
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.inner.composes_native_output_with_tools()
+    }
+}
+
+impl<M: CompletionModel> RetryingModel<M> {
+    /// The retry loop proper. Split out so [`CompletionModel::completion`] can
+    /// inspect what came back without the reporting having to live inside the
+    /// loop and fire once per attempt.
+    async fn completion_retried(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<CompletionResponse<M::Response>, CompletionError> {
         // rig takes the request by value, so replaying one means holding a copy
         // of the whole conversation for the duration of the call. With retries
         // off there is nothing to replay, so the wrapper costs nothing at all.
@@ -453,24 +492,69 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
             attempt += 1;
         }
     }
+}
 
-    async fn stream(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        // No retry, for the same reason `send_streaming` has none: outrig's
-        // remote turns are non-streaming, and a failure can land mid-stream,
-        // after content the caller already saw.
-        self.inner.stream(request).await
+/// Report a completion that came back with nothing to show for itself.
+///
+/// A response carrying no text and no tool call is a turn the user paid for and
+/// cannot see. Rig treats it as an ordinary success -- `output` is the text
+/// parts concatenated, so a reasoning-only turn is simply the empty string --
+/// and every layer above here has already lost the provider's own account of
+/// what happened. This is the last point that still holds it.
+///
+/// Deliberately keyed on the *decoded* content rather than on the finish
+/// reason: that check is free on every turn, and the raw response is only
+/// serialized in the rare case that already went wrong.
+fn report_textless_completion<R: serde::Serialize>(
+    response: &CompletionResponse<R>,
+    max_tokens: Option<u64>,
+) {
+    // An empty text part is not content: it is the sentinel rig normalizes an
+    // empty provider turn into, so treating it as "the model spoke" is exactly
+    // the mistake this function exists to catch.
+    let showed_something = response.choice.iter().any(|part| match part {
+        rig::message::AssistantContent::Text(text) => !text.text.trim().is_empty(),
+        rig::message::AssistantContent::ToolCall(_) => true,
+        _ => false,
+    });
+    if showed_something {
+        return;
     }
 
-    /// Delegated, not defaulted. The trait's `false` is the safe answer for a
-    /// provider whose native structured output suppresses tool calls; answering
-    /// it for OpenAI and Anthropic, which compose the two, would cost them
-    /// guaranteed structured output on every turn that has tools.
-    fn composes_native_output_with_tools(&self) -> bool {
-        self.inner.composes_native_output_with_tools()
+    let ceiling = match max_tokens {
+        Some(limit) => format!("the request carried max-tokens = {limit}"),
+        None => "the request carried no max-tokens, so the provider's own default applied"
+            .to_string(),
+    };
+    match provider_finish_reason(&response.raw_response) {
+        Some(reason) => eprintln!(
+            "[outrig] the model produced no text and no tool call this turn \
+             (provider finish reason: {reason:?}); {ceiling}."
+        ),
+        None => eprintln!(
+            "[outrig] the model produced no text and no tool call this turn; {ceiling}."
+        ),
     }
+}
+
+/// The provider's own word for why generation stopped.
+///
+/// Rig parses this out of the wire and then drops it before any type outrig
+/// sees, so the only way back to it is the raw response the completion still
+/// carries. Both dialects are checked because both are reachable:
+/// `choices[].finish_reason` is the OpenAI shape and `stop_reason` the
+/// Anthropic one. Returns `None` for a provider that names neither, which
+/// costs the report one clause and nothing else.
+fn provider_finish_reason<R: serde::Serialize>(raw: &R) -> Option<String> {
+    let value = serde_json::to_value(raw).ok()?;
+    let openai = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("finish_reason"));
+    openai
+        .or_else(|| value.get("stop_reason"))
+        .and_then(|reason| reason.as_str())
+        .map(str::to_string)
 }
 
 /// The retry loop. A free function rather than a method because the future

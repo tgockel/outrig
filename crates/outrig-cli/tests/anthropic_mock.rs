@@ -236,6 +236,7 @@ async fn run_one_turn(
     agent
         .run_turn("echo ping for me", &mut history)
         .await
+        .map(|end| end.reply)
         .map_err(anyhow::Error::from)
 }
 
@@ -548,7 +549,8 @@ async fn retry_after_header_is_honored() {
     let reply = agent
         .run_turn("echo ping for me", &mut history)
         .await
-        .expect("the retry should carry the turn through the 429");
+        .expect("the retry should carry the turn through the 429")
+        .reply;
     let elapsed = started.elapsed();
 
     assert_eq!(reply, "Recovered.");
@@ -598,7 +600,8 @@ async fn exhausted_budget_ends_the_turn_without_killing_the_agent() {
     let reply = agent
         .run_turn("echo ping for me", &mut history)
         .await
-        .expect("a spent budget ends the turn, it does not fail the session");
+        .expect("a spent budget ends the turn, it does not fail the session")
+        .reply;
     assert_eq!(
         reply, "",
         "the model never spoke, so nothing belongs on stdout",
@@ -617,7 +620,8 @@ async fn exhausted_budget_ends_the_turn_without_killing_the_agent() {
     let reply = agent
         .run_turn("try again", &mut history)
         .await
-        .expect("the next turn runs on the same agent");
+        .expect("the next turn runs on the same agent")
+        .reply;
     assert_eq!(reply, "Second turn.");
     assert_eq!(drain_recorded(&mut requests).len(), 1);
 }
@@ -759,7 +763,8 @@ async fn tools_run_before_a_move_are_not_re_executed() {
     let reply = agent
         .run_turn("echo ping for me", &mut history)
         .await
-        .expect("the move should carry the turn through the head's outage");
+        .expect("the move should carry the turn through the head's outage")
+        .reply;
 
     assert_eq!(
         reply, "The echo said pong:ping.",
@@ -815,7 +820,8 @@ async fn a_persistently_unusable_response_ends_the_turn_not_the_session() {
     let reply = agent
         .run_turn("echo ping for me", &mut history)
         .await
-        .expect("an unusable response ends the turn, it does not fail the session");
+        .expect("an unusable response ends the turn, it does not fail the session")
+        .reply;
     assert_eq!(
         reply, "",
         "the model never said anything usable, so nothing belongs on stdout",
@@ -834,7 +840,8 @@ async fn a_persistently_unusable_response_ends_the_turn_not_the_session() {
     let reply = agent
         .run_turn("try again", &mut history)
         .await
-        .expect("the next turn runs on the same agent");
+        .expect("the next turn runs on the same agent")
+        .reply;
     assert_eq!(reply, "Second turn.");
     assert_eq!(drain_recorded(&mut requests).len(), 1);
 }
@@ -1013,5 +1020,134 @@ fn rig_max_tokens_defaults_differ_between_constructors() {
         Some(2_048),
         "with_model still invents a silent ceiling; build_agent must keep \
          using completion_model",
+    );
+}
+
+/// A turn whose only content is a thinking block is reported, not swallowed.
+///
+/// This is the failure that prompted the change. A think-heavy turn cut off at
+/// the provider's output ceiling comes back carrying reasoning and no text.
+/// Rig treats that as an ordinary success whose `output` is the empty string --
+/// text parts are all `output` concatenates -- so before this, `run_turn`
+/// returned `""` with no stop reason, the REPL's `if !reply.is_empty()` guard
+/// printed nothing, and a minute of billed generation reached the user as
+/// silence indistinguishable from outrig having ignored the prompt.
+///
+/// Pins all three of the properties that make it reportable: the turn is
+/// recognizably silent, the reasoning is recovered rather than dropped, and the
+/// report says which of the two silences this was.
+#[tokio::test]
+async fn a_reasoning_only_turn_is_recovered_and_reported() {
+    let (addr, mut requests) = start_mock_http(vec![message(
+        json!([{
+            "type": "thinking",
+            "thinking": "weighing the two-image split against one",
+            "signature": "sig-1",
+        }]),
+        "max_tokens",
+    )])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_REASONING_ONLY";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let agent = build_mock_agent(&cfg, &[var], vec![]).await;
+
+    let mut history = Vec::new();
+    let end = agent
+        .run_turn("two images, then", &mut history)
+        .await
+        .expect("a reasoning-only turn ends the turn, it does not fail the session");
+
+    assert_eq!(
+        end.reply, "",
+        "rig's `output` is text-parts-only, so the reply is genuinely empty",
+    );
+    assert!(
+        end.stopped.is_none(),
+        "nothing cut this turn short -- the model finished on its own, which is \
+         exactly why nothing else would have reported it: {:?}",
+        end.stopped,
+    );
+    assert!(
+        end.is_silent(),
+        "a turn with no text and no stop reason is the one outcome that used to \
+         reach the user as pure silence",
+    );
+    assert_eq!(
+        end.recovered.as_deref(),
+        Some("weighing the two-image split against one"),
+        "the reasoning the user paid for is salvaged instead of dropped",
+    );
+    let report = end.silent_report();
+    assert!(
+        report.contains("weighing the two-image split against one"),
+        "the report carries the recovered reasoning: {report}",
+    );
+    assert!(
+        report.contains("hidden reasoning"),
+        "the report names which silence this was, so the user can act on it: {report}",
+    );
+
+    assert!(
+        !history.is_empty(),
+        "the turn was completed, not abandoned, so its history is retained and the \
+         advice to send \"continue\" is honest: {history:#?}",
+    );
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        1,
+        "a reasoning-only turn is a completed turn, not a retryable one",
+    );
+}
+
+/// A whitespace-only text part alongside the reasoning is still a silent turn,
+/// and its reasoning is still salvaged.
+///
+/// The two questions -- "is this turn silent?" and "is there non-text content
+/// worth recovering?" -- are the same question, and they were once asked with
+/// different predicates: `trim`-based for silence, exact-emptiness for
+/// recovery. A turn shaped like this one fell in the gap, reporting "without
+/// producing any content at all" while the reasoning it did produce went
+/// unread. Nothing trims text parts on the way in, so the shape reaches
+/// `TurnEnd` exactly as the provider sent it.
+#[tokio::test]
+async fn a_whitespace_reply_beside_reasoning_is_still_recovered() {
+    let (addr, _requests) = start_mock_http(vec![message(
+        json!([
+            { "type": "thinking", "thinking": "still weighing it", "signature": "sig-1" },
+            { "type": "text", "text": "   " },
+        ]),
+        "max_tokens",
+    )])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_WHITESPACE_REPLY";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let agent = build_mock_agent(&cfg, &[var], vec![]).await;
+
+    let mut history = Vec::new();
+    let end = agent
+        .run_turn("two images, then", &mut history)
+        .await
+        .expect("a whitespace reply ends the turn, it does not fail the session");
+
+    assert!(
+        end.is_silent(),
+        "whitespace renders as a blank line, which is not a reply: {:?}",
+        end.reply,
+    );
+    assert_eq!(
+        end.recovered.as_deref(),
+        Some("still weighing it"),
+        "the recovery gate must read blankness the same way the silence gate does",
+    );
+    let report = end.silent_report();
+    assert!(
+        report.contains("hidden reasoning"),
+        "the cause must be the one that happened, not \"no content at all\": {report}",
+    );
+    assert!(
+        report.contains("still weighing it"),
+        "and the reasoning must reach the user: {report}",
     );
 }

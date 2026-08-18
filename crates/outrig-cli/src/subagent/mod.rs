@@ -889,6 +889,15 @@ async fn run_rounds(
                     // truncated report: running out of tool calls is what
                     // follows from a report that would not fit.
                     Some(TurnStop::Interrupted(reason)) => shared.note_ended_early(reason),
+                    // A round that finished on its own and produced no text at
+                    // all. Without this the parent is told only that the
+                    // subagent "stopped without calling outrig__set_result",
+                    // which blames the model for declining to report when in
+                    // fact it never got a turn out at all -- and the two want
+                    // different responses from the parent.
+                    None if end.is_silent() => {
+                        shared.note_ended_early(end.silent_reason().to_string());
+                    }
                     None => {}
                 }
             }

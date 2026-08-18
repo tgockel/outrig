@@ -1470,9 +1470,21 @@ fn anthropic_model(
     // model publishes. Only reachable for an identifier rig recognizes; for one
     // it does not there is no ceiling to compare against, and outrig guesses
     // none.
+    //
+    // Returned even when it comes from tier 2 or 3, which the earlier shape did
+    // not do: it handed back `candidate.max_tokens` unchanged, so a request
+    // relying on rig's substitution left `finish_agent` -- and therefore the
+    // outer `CompletionRequest` -- carrying no ceiling at all. Rig filled it in
+    // just before wire conversion, so the wire was right and every layer in
+    // between was told there was no ceiling. That is exactly the fact
+    // `report_textless_completion` reports on, and it reported the opposite.
+    // Naming the effective number here leaves the wire value unchanged (rig
+    // substitutes the same one) and makes it true everywhere else.
     let max_tokens = match (candidate.max_tokens, model.default_max_tokens) {
         (Some(want), Some(ceiling)) => Some(u64::from(want).min(ceiling) as u32),
-        _ => candidate.max_tokens,
+        (Some(want), None) => Some(want),
+        (None, Some(ceiling)) => Some(u32::try_from(ceiling).unwrap_or(u32::MAX)),
+        (None, None) => None,
     };
     (model, max_tokens)
 }
@@ -1617,7 +1629,7 @@ impl RigAgent {
     /// the resolved tool-call max. If the hook terminates the loop, Rig
     /// returns the partial chat history it had accumulated; outrig splices in
     /// that new suffix so the user can send a follow-up prompt to continue.
-    pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
+    pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<TurnEnd> {
         match self {
             RigAgent::OpenAi {
                 agent,
@@ -1628,8 +1640,7 @@ impl RigAgent {
                 history,
                 OutrigPromptHook::new(*tool_call_max),
             )
-            .await
-            .map(|end| end.reply),
+            .await,
             RigAgent::Anthropic {
                 agent,
                 tool_call_max,
@@ -1639,8 +1650,7 @@ impl RigAgent {
                 history,
                 OutrigPromptHook::new(*tool_call_max),
             )
-            .await
-            .map(|end| end.reply),
+            .await,
             RigAgent::Failover {
                 agent,
                 tool_call_max,
@@ -1650,8 +1660,7 @@ impl RigAgent {
                 history,
                 OutrigPromptHook::new(*tool_call_max),
             )
-            .await
-            .map(|end| end.reply),
+            .await,
             #[cfg(feature = "local-llm")]
             RigAgent::Mistralrs {
                 agent,
@@ -1786,7 +1795,7 @@ impl RebuildingAgent {
 
     /// Rebuild the agent if the tool list grew since the last turn, then
     /// delegate to [`RigAgent::run_turn`].
-    pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
+    pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<TurnEnd> {
         if self.dirty.get() {
             let tools_snapshot = self.tools.borrow().clone();
             let rebuilt = build_agent(
@@ -1820,6 +1829,110 @@ pub struct TurnEnd {
     /// Why the loop was cut short, when it was. `None` means the model
     /// finished on its own.
     pub stopped: Option<TurnStop>,
+    /// Non-text assistant content recovered from a turn whose `reply` came
+    /// back blank -- reasoning, in practice.
+    ///
+    /// Rig's `output` is the concatenation of the final turn's *text* parts
+    /// only, so a turn that produced reasoning and nothing else arrives here
+    /// as an empty string even though the model generated (and the user paid
+    /// for) real content. Rig hands the structured turn back alongside it;
+    /// this is what outrig salvages from it, so the work is reported rather
+    /// than dropped. `None` whenever the reply has visible text -- blank, not
+    /// non-empty, since a whitespace reply shows the user nothing and is
+    /// salvaged from like any other ([`is_blank`]).
+    pub recovered: Option<String>,
+    /// The reply already reached the user while it decoded, so `reply` was
+    /// blanked to stop the REPL printing it twice.
+    ///
+    /// Only the primary streaming path sets this, and only when it actually
+    /// wrote something. That condition is the point: without it a blanked
+    /// reply is indistinguishable from a turn that produced nothing, and
+    /// [`TurnEnd::is_silent`] would call every streamed turn silent.
+    pub already_displayed: bool,
+}
+
+impl TurnEnd {
+    /// A turn that ended with nothing to show and no reason given for it.
+    ///
+    /// The model finished on its own -- no hook stop, no dead endpoint, no
+    /// exhausted budget -- and still produced no text. Every deliberate stop
+    /// prints its own explanation on the way out, so this is the one outcome
+    /// that would otherwise reach the user as pure silence, which reads as
+    /// outrig having ignored the prompt.
+    /// Whitespace does not count as a reply, matching
+    /// `report_textless_completion`'s reading of an all-whitespace text part.
+    /// One predicate, so a turn cannot be textless to the model layer and
+    /// spoken-for to this one.
+    pub fn is_silent(&self) -> bool {
+        is_blank(&self.reply) && self.stopped.is_none() && !self.already_displayed
+    }
+
+    /// The one-line cause, for a subagent's parent.
+    ///
+    /// A parent that is only told its subagent "stopped without calling
+    /// outrig__set_result" would read a model that never got to speak as a
+    /// model that declined to report. Naming which of the two happened is the
+    /// difference between a retry that might work and one that cannot.
+    pub fn silent_reason(&self) -> &'static str {
+        match self.recovered {
+            Some(_) => {
+                "the model ended its turn having produced only hidden reasoning and no reply \
+                 text, which usually means it was cut off at the provider's output-token ceiling"
+            }
+            None => "the model ended its turn without producing any content at all",
+        }
+    }
+
+    /// What to tell the user about a silent turn, recovered content included.
+    ///
+    /// Kept beside [`TurnEnd::is_silent`] so the REPL and a subagent round
+    /// describe the same outcome the same way.
+    pub fn silent_report(&self) -> String {
+        let mut report = format!("[outrig] {}.", self.silent_reason());
+        if let Some(recovered) = &self.recovered {
+            report.push_str(" Recovered reasoning follows.\n");
+            report.push_str(recovered);
+        }
+        report
+    }
+}
+
+/// Whether a reply is anything the user could actually have seen.
+///
+/// Whitespace is not: it renders as a blank line and tells them nothing. Four
+/// sites need this question answered the same way -- whether to salvage the
+/// turn's non-text content, whether a streamed reply was really displayed, and
+/// whether the turn was silent -- and they disagreed once already, which put a
+/// turn in the state of being reported as having produced nothing while its
+/// reasoning sat unread. Named, so they cannot drift apart again.
+fn is_blank(reply: &str) -> bool {
+    reply.trim().is_empty()
+}
+
+/// Salvage a display string from a final turn that carried no text.
+///
+/// Only reasoning is recoverable in practice; images and tool calls either
+/// cannot be rendered here or mean the turn was not textless in the first
+/// place. Returns `None` when there is nothing worth showing, so the caller
+/// can say "nothing at all" rather than print an empty block.
+///
+/// Blankness is [`is_blank`] here too, for that contract to hold: a reasoning
+/// block that is all whitespace is nothing worth showing, and returning it
+/// would have `silent_reason` claim the model produced hidden reasoning and
+/// `silent_report` promise "Recovered reasoning follows" above an empty block.
+fn recover_non_text(content: &rig::OneOrMany<rig::message::AssistantContent>) -> Option<String> {
+    let recovered = content
+        .iter()
+        .filter_map(|part| match part {
+            rig::message::AssistantContent::Reasoning(reasoning) => {
+                let text = reasoning.display_text();
+                (!is_blank(&text)).then_some(text)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!is_blank(&recovered)).then_some(recovered)
 }
 
 /// Why a turn stopped short of the model finishing.
@@ -1881,23 +1994,37 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
                 .messages
                 .expect("rig populates messages on extended_details");
             history.extend(messages);
+            // `output` is the final turn's *text* parts concatenated, so a turn
+            // that produced only reasoning lands here as "". Rig hands the
+            // structured turn back in `content`; consulting it is what keeps a
+            // textless turn reportable instead of indistinguishable from a turn
+            // that never happened.
+            let recovered = is_blank(&response.output)
+                .then(|| recover_non_text(&response.content))
+                .flatten();
             Ok(TurnEnd {
                 reply: response.output,
                 // A hook stop normally surfaces as an error, but reading the
                 // reason back unconditionally means a stop can never be lost to
                 // a path that ends the run cleanly instead.
                 stopped: observer.stop_reason().map(TurnStop::Interrupted),
+                recovered,
+                already_displayed: false,
             })
         }
         Err(other) => handle_prompt_error(other, history, &observer),
     }
 }
 
-/// The primary agent's streaming path. Returns the empty string on purpose:
-/// the reply already reached `sink` chunk by chunk while decoding, so handing
-/// it back would make the REPL print it a second time. Discarding here -- and
-/// not inside [`run_turn_streaming_inner`] -- is what lets subagents reuse the
-/// same loop and actually receive the text.
+/// The primary agent's streaming path. Blanks the reply on purpose: it already
+/// reached `sink` chunk by chunk while decoding, so handing it back would make
+/// the REPL print it a second time. Discarding here -- and not inside
+/// [`run_turn_streaming_inner`] -- is what lets subagents reuse the same loop
+/// and actually receive the text.
+///
+/// [`TurnEnd::already_displayed`] records that the blanking happened, and only
+/// when there was something to blank: a stream that decoded no text at all
+/// leaves it `false` so the turn still registers as silent.
 ///
 /// `sink` is a parameter rather than a captured `tokio::io::stdout()` purely so
 /// that suppression is testable: it is a one-line behavior the REPL's
@@ -1910,13 +2037,18 @@ async fn run_turn_streaming_to<M, W>(
     history: &mut Vec<Message>,
     hook: OutrigPromptHook,
     sink: &mut W,
-) -> Result<String>
+) -> Result<TurnEnd>
 where
     M: CompletionModel + 'static,
     W: AsyncWrite + Unpin,
 {
-    run_turn_streaming_inner(agent, prompt, history, hook, sink).await?;
-    Ok(String::new())
+    let mut end = run_turn_streaming_inner(agent, prompt, history, hook, sink).await?;
+    // `is_blank`, not `is_empty`: the mistralrs adapter forwards whitespace-only
+    // deltas, and nothing wraps that arm to notice a visually blank turn, so
+    // exact-emptiness here would mark one as displayed and silence the report.
+    end.already_displayed = !is_blank(&end.reply);
+    end.reply = String::new();
+    Ok(end)
 }
 
 #[cfg(feature = "local-llm")]
@@ -1960,6 +2092,7 @@ where
 
     let mut streamed_reply = String::new();
     let mut final_history: Option<Vec<Message>> = None;
+    let mut final_content: Option<rig::OneOrMany<rig::message::AssistantContent>> = None;
 
     while let Some(item) = stream.next().await {
         match item {
@@ -1975,6 +2108,11 @@ where
             }
             Ok(MultiTurnStreamItem::FinalResponse(response)) => {
                 final_history = response.messages().map(|messages| messages.to_vec());
+                // Same salvage as `run_turn_inner`, for the same reason: the
+                // decoded text is the only thing this loop accumulates, so a
+                // turn whose content was all reasoning leaves `streamed_reply`
+                // empty with nothing printed.
+                final_content = Some(response.content().clone());
             }
             Ok(_) => {}
             Err(err) => {
@@ -1995,9 +2133,14 @@ where
     // Not just `finished`: a stream that ends without yielding an error can
     // still have been cut short by the hook, and this is the only place that
     // would notice.
+    let recovered = is_blank(&streamed_reply)
+        .then(|| final_content.as_ref().and_then(recover_non_text))
+        .flatten();
     Ok(TurnEnd {
         reply: streamed_reply,
         stopped: observer.stop_reason().map(TurnStop::Interrupted),
+        recovered,
+        already_displayed: false,
     })
 }
 
@@ -2045,6 +2188,10 @@ fn endpoint_failed(reason: String, tried: Option<&str>) -> Result<TurnEnd> {
         // `if !reply.is_empty()` guard handles it.
         reply: String::new(),
         stopped: Some(TurnStop::EndpointFailed(reason)),
+        // Nothing to salvage: the endpoint never produced a turn to salvage
+        // from. The `stopped` reason above is what gets reported.
+        recovered: None,
+        already_displayed: false,
     })
 }
 
@@ -2139,6 +2286,10 @@ fn handle_prompt_error(
     Ok(TurnEnd {
         reply: format!("(turn ended: {reason})"),
         stopped: Some(TurnStop::Interrupted(reason)),
+        // The reply above already says why the turn ended, and `stopped`
+        // carries the reason for callers that need it.
+        recovered: None,
+        already_displayed: false,
     })
 }
 
@@ -2838,6 +2989,11 @@ mod tests {
     /// The REPL prints `on_prompt`'s return value when it is non-empty
     /// (`repl.rs`), so the primary streaming path must return empty or the
     /// reply appears twice: once streamed while decoding, once reprinted.
+    ///
+    /// Blanking the reply is now only half the contract: a blanked reply and a
+    /// reply that never existed are the same two fields, so this also pins the
+    /// flag that tells them apart. Without it every streamed turn would report
+    /// itself as silent.
     #[cfg(feature = "local-llm")]
     #[tokio::test]
     async fn primary_streaming_path_suppresses_the_reprint() {
@@ -2849,7 +3005,7 @@ mod tests {
         let mut history = Vec::new();
         let mut sink = Vec::new();
 
-        let reply = run_turn_streaming_to(
+        let end = run_turn_streaming_to(
             &agent,
             "hi",
             &mut history,
@@ -2859,7 +3015,20 @@ mod tests {
         .await
         .expect("streaming turn succeeds");
 
-        assert_eq!(reply, "", "a non-empty return would double-print the reply");
+        assert!(
+            end.reply.is_empty(),
+            "a non-empty return would double-print the reply: {:?}",
+            end.reply,
+        );
+        assert!(
+            end.already_displayed,
+            "the reply did reach the user, and only this flag records that the \
+             blank above is a suppression rather than an empty turn",
+        );
+        assert!(
+            !end.is_silent(),
+            "a turn the user watched decode is not a silent turn",
+        );
         assert_eq!(
             String::from_utf8(sink).expect("sink utf-8"),
             "hello world\n",
@@ -2898,6 +3067,99 @@ mod tests {
     /// selection is otherwise invisible: picking a candidate because of an
     /// environment variable is exactly the kind of decision that stays hidden
     /// until it is wrong, so every surface that prints a model prints this.
+    /// `recover_non_text` returns nothing when there is nothing worth showing,
+    /// whitespace included.
+    ///
+    /// Its callers treat `Some` as proof the model produced hidden reasoning:
+    /// `silent_reason` says so and `silent_report` prints "Recovered reasoning
+    /// follows" above it. A whitespace-only block satisfying that would put
+    /// both claims above an empty block, and rig trims neither Anthropic
+    /// `thinking` nor OpenAI `reasoning_content` on the way in.
+    #[test]
+    fn only_reasoning_worth_showing_is_recovered() {
+        use rig::message::AssistantContent;
+
+        let recover = |parts: Vec<AssistantContent>| {
+            recover_non_text(&rig::OneOrMany::many(parts).expect("non-empty"))
+        };
+
+        assert_eq!(
+            recover(vec![AssistantContent::reasoning("weighing it")]),
+            Some("weighing it".to_string()),
+        );
+        assert_eq!(
+            recover(vec![AssistantContent::reasoning("   \n  ")]),
+            None,
+            "whitespace reasoning is nothing worth showing, so the caller must \
+             be free to say the turn produced no content at all",
+        );
+        assert_eq!(
+            recover(vec![
+                AssistantContent::reasoning("  "),
+                AssistantContent::reasoning("but this is real"),
+            ]),
+            Some("but this is real".to_string()),
+            "a blank block among real ones is dropped, not joined as an empty line",
+        );
+        assert_eq!(
+            recover(vec![AssistantContent::text("spoken")]),
+            None,
+            "text is not what this salvages -- it is already the reply",
+        );
+    }
+
+    /// The ceiling `anthropic_model` hands back is the one that will actually
+    /// be in force, not just one the config named.
+    ///
+    /// It used to return `candidate.max_tokens` unchanged, so a request relying
+    /// on rig's own substitution left `finish_agent` -- and the outer
+    /// `CompletionRequest` -- carrying `None`. Rig filled the number in just
+    /// before wire conversion, so the wire was correct and every layer above it
+    /// was told no ceiling had been set. `report_textless_completion` reads
+    /// exactly that field to tell the user whether a ceiling applied, so for
+    /// the un-configured case it stated the opposite of the truth.
+    #[test]
+    fn the_anthropic_ceiling_handed_back_is_the_one_in_force() {
+        const RECOGNIZED: &str = "claude-sonnet-4-6";
+        const UNRECOGNIZED: &str = "claude-3-5-sonnet-20241022";
+
+        let client = || {
+            let http = retry::RetryingHttpClient::new(
+                reqwest::Client::new(),
+                retry::RetryPolicy::default(),
+            );
+            anthropic_client("http://127.0.0.1:1", "test-key", http).expect("client builds")
+        };
+        let ceiling = |identifier: &str, configured: Option<u32>| {
+            let mut c = candidate(identifier, remote(None));
+            c.max_tokens = configured;
+            anthropic_model(&client(), &c).1
+        };
+
+        assert_eq!(
+            ceiling(RECOGNIZED, None),
+            Some(64_000),
+            "nothing configured, but rig publishes a ceiling for this identifier \
+             and substitutes it -- so that is the ceiling in force",
+        );
+        assert_eq!(
+            ceiling(UNRECOGNIZED, None),
+            Some(ANTHROPIC_FALLBACK_MAX_TOKENS as u32),
+            "nothing configured and nothing published, so outrig's own fallback \
+             is what the request will be capped at",
+        );
+        assert_eq!(
+            ceiling(RECOGNIZED, Some(8_192)),
+            Some(8_192),
+            "a configured ceiling under the published one still wins",
+        );
+        assert_eq!(
+            ceiling(RECOGNIZED, Some(999_999)),
+            Some(64_000),
+            "and one over it is still lowered, not reported as asked for",
+        );
+    }
+
     #[test]
     fn model_display_shows_the_alias_hop() {
         let resolved = ResolvedAgent {
