@@ -484,7 +484,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         container_name: container_name.clone(),
         sidecar_container_names: Vec::new(),
         image_tag: image_tag.to_string(),
-        image_config_name: image_cfg_name.clone(),
+        image_config_name: Some(image_cfg_name.clone()),
         agent_name: session_agent_name,
         working_dir: repo_root.clone(),
         session_dir: PathBuf::new(), // set by `create` below
@@ -1229,9 +1229,19 @@ fn resolve_attach_target(
     match fs::symlink_metadata(&session_entry) {
         Ok(_) => {
             let (_, session) = store.get_by_id(&sid)?;
+            // Pre-2026-06-01 records carry no image config; there's nothing
+            // to inherit, so make the user name the image explicitly.
+            let image_cfg_name = image_flag
+                .map(str::to_string)
+                .or(session.image_config_name)
+                .ok_or_else(|| {
+                    OutrigError::Configuration(format!(
+                        "session {raw:?} has no recorded image config; pass --image <name>"
+                    ))
+                })?;
             Ok(AttachResolution {
                 container_name: session.container_name,
-                image_cfg_name: image_flag.unwrap_or(&session.image_config_name).to_string(),
+                image_cfg_name,
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

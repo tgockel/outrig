@@ -43,6 +43,13 @@ plus `sidecar_container_names` when the config declares
 [sidecars](../concepts/containers.md#sidecar-containers). Sidecar-less sessions omit the
 field, so records from older versions read and write unchanged.
 
+A session record is history: it describes a run that already happened, so it has to keep
+reading after the schema moves on. `image_config_name` may be absent -- records written
+before the `container` -> `image` rename stored the same value under
+`container_config_name`, which is still accepted on read and rewritten under the current
+name the next time outrig updates the record. A record with no image-config name at all
+shows `-` in the `IMAGE` column.
+
 When you run `outrig run --session-dir <path>`, outrig writes the session content into
 `<path>` directly and creates a symlink at `<root>/<sid> -> <path>` so `outrig ls` still finds
 it:
@@ -84,6 +91,21 @@ sessions whose root entry is a symlink (created via `outrig run --session-dir`).
 on-disk `session.json` files omit `agent_name`, and older records with `"agent_name": null`
 mean the same thing. `outrig ls` does not currently show an agent column, so these sessions appear
 with the same `ID / STARTED / DURATION / IMAGE / EXIT` columns as `outrig run` sessions.
+
+An entry that can't be read -- a truncated write, or a schema outrig no longer understands
+-- costs only its own row. `outrig ls` reports it on stderr and lists everything else:
+
+```
+[outrig] skipping 20260430T091203-44d2: session.json at ...: missing field `image_tag`
+```
+
+If nothing in the root parsed, the notice says `no readable sessions (N skipped)` rather
+than `no sessions`, so an unreadable store isn't mistaken for an empty one. Either way the
+exit status is 0 -- skipping applies to reading and parsing a `session.json`, which is
+reported rather than failed on. A fault reaching the entry at all (an unreadable session
+root, or a directory entry outrig can't stat) is still an error. `outrig clean` treats an
+unreadable record as still owning its container, so the container is not swept up as a
+stray.
 
 Override the root for a single invocation with `--session-root`:
 

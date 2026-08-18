@@ -87,6 +87,8 @@ With `--attach`, image-config selection is different:
    `image_config_name`.
 3. If the attach value is not a known session id, outrig treats it as a podman
    container name and requires `--image <name-or-local-ref>`.
+4. If the session row predates `image_config_name` there is nothing to inherit, so
+   `--image <name-or-local-ref>` is required there too.
 
 `--network audit` and `--network filter` are rejected with `--attach`; borrowed containers are
 not retrofitted with a new interceptor.

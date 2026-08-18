@@ -1,0 +1,12 @@
+{
+  "id": "20260601T210702-4759",
+  "started_at": "2026-06-01T21:07:02.944186425Z",
+  "ended_at": "2026-06-01T21:32:37.781459785Z",
+  "container_name": "outrig-20260601T210702-4759",
+  "image_tag": "outrig-cache:53e082e721df8ecc",
+  "container_config_name": "outrig-standard",
+  "agent_name": "coding",
+  "working_dir": "/home/user/projects/demo",
+  "session_dir": "/home/user/.local/share/outrig/sessions/20260601T210702-4759",
+  "exit_code": 0
+}

@@ -1,0 +1,15 @@
+{
+  "id": "20260712T164416-f507",
+  "started_at": "2026-07-12T16:44:16.101223000Z",
+  "ended_at": "2026-07-12T16:48:18.559901000Z",
+  "container_name": "outrig-20260712T164416-f507",
+  "sidecar_container_names": [
+    "outrig-20260712T164416-f507-db"
+  ],
+  "image_tag": "outrig-cache:0f1e2d3c4b5a6978",
+  "image_config_name": "outrig-standard",
+  "agent_name": "coding",
+  "working_dir": "/home/user/projects/demo",
+  "session_dir": "/home/user/.local/share/outrig/sessions/20260712T164416-f507",
+  "exit_code": 0
+}

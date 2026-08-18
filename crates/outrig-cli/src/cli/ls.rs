@@ -1,9 +1,15 @@
 //! `outrig ls` -- list sessions newest-first under the session root.
 //!
 //! Output discipline: the table goes to stdout (it's the scriptable thing); a
-//! "no sessions" notice goes to stderr. Symlinked entries (created via
-//! `outrig run --session-dir`) get a trailing `-> <target>` so the user can
-//! see where the real bytes live.
+//! "no sessions" notice goes to stderr, as does one `skipping <sid>: <reason>`
+//! line per unreadable record -- listing the rest still beats failing outright.
+//! Symlinked entries (created via `outrig run --session-dir`) get a trailing
+//! `-> <target>` so the user can see where the real bytes live.
+//!
+//! A `session.json` that can't be read or parsed is skipped and reported rather
+//! than failed on, including when that leaves nothing to list -- so an
+//! all-skipped root still exits 0. Faults reaching an entry in the first place
+//! (reading the root, stat'ing or resolving an entry under it) are still errors.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -42,13 +48,27 @@ where
     W: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let sessions = store.list()?;
-    if sessions.is_empty() {
-        stderr.write_all(b"[outrig] no sessions\n").await?;
+    let listing = store.list()?;
+    for skipped in &listing.skipped {
+        let line = format!("[outrig] skipping {}: {}\n", skipped.entry, skipped.reason);
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    if listing.sessions.is_empty() {
+        // An empty root and a root where nothing parsed are different facts;
+        // saying "no sessions" for the latter hides the records entirely.
+        let notice = if listing.skipped.is_empty() {
+            "[outrig] no sessions\n".to_string()
+        } else {
+            format!(
+                "[outrig] no readable sessions ({} skipped)\n",
+                listing.skipped.len()
+            )
+        };
+        stderr.write_all(notice.as_bytes()).await?;
         return Ok(0);
     }
     let now = SystemTime::now();
-    let table = render_table(&sessions, now);
+    let table = render_table(&listing.sessions, now);
     stdout.write_all(table.as_bytes()).await?;
     Ok(0)
 }
@@ -116,7 +136,7 @@ impl Row {
             .duration_since(s.started_at)
             .map(session::format_duration)
             .unwrap_or_else(|_| "?".to_string());
-        let image = s.image_config_name.clone();
+        let image = s.image_config_name.clone().unwrap_or_else(|| "-".to_string());
         let exit = match s.exit_code {
             Some(c) => c.to_string(),
             None => "-".to_string(),

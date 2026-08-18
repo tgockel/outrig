@@ -113,7 +113,7 @@ fn create_host_session(
         container_name: container.name().to_string(),
         sidecar_container_names: Vec::new(),
         image_tag: image.to_string(),
-        image_config_name: "smoke".to_string(),
+        image_config_name: Some("smoke".to_string()),
         agent_name: Some("smoke".to_string()),
         working_dir: repo.to_path_buf(),
         session_dir: PathBuf::new(),

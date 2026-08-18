@@ -139,7 +139,7 @@ pub fn sample_session(id: &SessionId) -> Session {
         container_name: format!("outrig-{}", id.as_str()),
         sidecar_container_names: Vec::new(),
         image_tag: "outrig/test:abc123".to_string(),
-        image_config_name: "coding".to_string(),
+        image_config_name: Some("coding".to_string()),
         agent_name: Some("default".to_string()),
         working_dir: PathBuf::from("/some/repo"),
         session_dir: PathBuf::new(),
@@ -394,4 +394,40 @@ pub fn set_test_env(var: &str, value: &str) {
 #[allow(dead_code)]
 pub fn unset_test_env(var: &str) {
     unsafe { std::env::remove_var(var) }
+}
+
+/// Materialize `<root>/<sid>/session.json` from [`sample_session`], letting
+/// `mutate` reshape the JSON first. Tests on-disk shapes the current code
+/// wouldn't write itself -- legacy key names, dropped fields, corruption --
+/// without hand-writing a whole record. Returns the session directory.
+#[allow(dead_code)]
+pub fn write_raw_session(
+    root: &std::path::Path,
+    sid: &SessionId,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) -> PathBuf {
+    let dir = root.join(sid.as_str());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut session = sample_session(sid);
+    session.session_dir = dir.clone();
+    let mut value = serde_json::to_value(&session).expect("to_value");
+    mutate(&mut value);
+    std::fs::write(dir.join("session.json"), value.to_string()).expect("write");
+    dir
+}
+
+/// Mutator for [`write_raw_session`]: rewrite the record the way versions
+/// before the 2026-06-01 `container` -> `image` rename did.
+#[allow(dead_code)]
+pub fn as_legacy_image_key(value: &mut serde_json::Value) {
+    let obj = value.as_object_mut().expect("object");
+    let name = obj.remove("image_config_name").expect("image_config_name");
+    obj.insert("container_config_name".into(), name);
+}
+
+/// Mutator for [`write_raw_session`]: drop a field that is still required,
+/// standing in for whatever the next unaliased rename breaks.
+#[allow(dead_code)]
+pub fn drop_image_tag(value: &mut serde_json::Value) {
+    value.as_object_mut().expect("object").remove("image_tag");
 }

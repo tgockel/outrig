@@ -66,6 +66,13 @@ impl Default for SessionId {
 /// On-disk session record. Mirrors `doc/usage/sessions.md`'s `session.json`.
 /// `link_target` is in-memory only -- populated by `list`/`get_by_id` when
 /// the entry under `<root>/<sid>` is a symlink, never written to disk.
+///
+/// These fields are *data outrig itself wrote*, not user-authored config, so
+/// they can't be migrated by asking the user to edit a file: every record
+/// already on disk has to keep loading. Renaming a field needs a
+/// `#[serde(alias = "<old name>")]`; dropping one needs `Option` +
+/// `#[serde(default)]`. Skipping that is what made `outrig ls` fail outright
+/// on every pre-2026-06-01 session (see `image_config_name` below).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct Session {
@@ -85,7 +92,16 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecar_container_names: Vec<String>,
     pub image_tag: String,
-    pub image_config_name: String,
+    /// Absent on records written before the 2026-06-01 `container` -> `image`
+    /// rename, which stored the same value under `container_config_name`; the
+    /// alias recovers it, and any read-modify-write (`finalize`,
+    /// `set_sidecar_containers`) rewrites the record under the current name.
+    #[serde(
+        default,
+        alias = "container_config_name",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_config_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub working_dir: PathBuf,
@@ -94,6 +110,25 @@ pub struct Session {
     pub exit_code: Option<i32>,
     #[serde(skip)]
     pub link_target: Option<PathBuf>,
+}
+
+/// A `<root>/<sid>` entry that exists but could not be read as a session --
+/// a truncated write, or a record whose schema predates a field rename. Kept
+/// out-of-band by [`SessionStore::list`] so one bad record can't take down a
+/// whole listing, while still leaving the CLI something to report.
+#[derive(Debug)]
+pub struct SkippedSession {
+    /// The `<sid>` directory name under the session root.
+    pub entry: String,
+    pub reason: String,
+}
+
+/// The result of [`SessionStore::list`]: the records that parsed, plus the
+/// entries that didn't.
+#[derive(Debug, Default)]
+pub struct SessionListing {
+    pub sessions: Vec<Session>,
+    pub skipped: Vec<SkippedSession>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,9 +212,12 @@ impl SessionStore {
 
     /// Newest-first. Symlinked entries get `link_target = Some(read_link_result)`.
     /// Entries without a `session.json` are skipped silently (foreign content under
-    /// the root shouldn't crash listings).
-    pub fn list(&self) -> Result<Vec<Session>> {
-        let mut out = Vec::new();
+    /// the root shouldn't crash listings). Entries that have one but can't be parsed
+    /// are skipped too, but reported via [`SessionListing::skipped`] -- a single
+    /// corrupt or schema-drifted record shouldn't cost the user every other session.
+    /// Faults reading the root itself are still hard errors.
+    pub fn list(&self) -> Result<SessionListing> {
+        let mut out = SessionListing::default();
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -193,17 +231,26 @@ impl SessionStore {
             match read_session_json(&resolved.join(SESSION_JSON)) {
                 Ok(mut session) => {
                     session.link_target = link_target;
-                    out.push(session);
+                    out.sessions.push(session);
                 }
                 Err(OutrigError::Path { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => out.skipped.push(SkippedSession {
+                    entry: entry.file_name().to_string_lossy().into_owned(),
+                    // Unwrap the `configuration:` framing: this is a stale
+                    // record, not something the user misconfigured.
+                    reason: match e {
+                        OutrigError::Configuration(msg) => msg,
+                        other => other.to_string(),
+                    },
+                }),
             }
         }
-        out.sort_by(|a, b| b.id.0.cmp(&a.id.0));
+        out.sessions.sort_by(|a, b| b.id.0.cmp(&a.id.0));
+        out.skipped.sort_by(|a, b| b.entry.cmp(&a.entry));
         Ok(out)
     }
 

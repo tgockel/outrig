@@ -16,7 +16,7 @@ use outrig_cli::session::{Session, SessionId, SessionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 mod common;
-use common::sample_session;
+use common::{as_legacy_image_key, drop_image_tag, sample_session, write_raw_session};
 
 async fn drain<R: AsyncReadExt + Unpin>(mut r: R) -> String {
     let mut buf = Vec::new();
@@ -55,6 +55,164 @@ async fn ls_lists_newest_first() {
     assert!(out.contains("DURATION"));
     assert!(out.contains("IMAGE"));
     assert!(out.contains("EXIT"));
+}
+
+/// The IMAGE column for the two shapes a record can take after the rename: a
+/// legacy record keeps its value via the alias, and one with no image config
+/// at all degrades to `-` rather than failing. Asserted from a single table so
+/// the two cells are compared against the same rendering.
+#[tokio::test]
+async fn ls_renders_image_column_for_legacy_and_absent_records() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+
+    let legacy = SessionId("20260501T134412-3f2a".into());
+    write_raw_session(root.path(), &legacy, as_legacy_image_key);
+
+    let absent = SessionId("20260430T091203-44d2".into());
+    write_raw_session(root.path(), &absent, |v| {
+        v.as_object_mut()
+            .expect("object")
+            .remove("image_config_name");
+    });
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, stderr_r) = duplex(4096);
+    let rc = ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls");
+    drop(sw);
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    let out = drain(stdout_r).await;
+    let legacy_row = out
+        .lines()
+        .find(|l| l.contains(legacy.as_str()))
+        .expect("legacy row");
+    assert!(
+        legacy_row.contains("coding"),
+        "the alias should recover IMAGE; got {legacy_row:?}"
+    );
+    let absent_row = out
+        .lines()
+        .find(|l| l.contains(absent.as_str()))
+        .expect("absent row");
+    assert!(
+        absent_row.contains(" -  "),
+        "an absent image config should render `-`; got {absent_row:?}"
+    );
+    assert!(
+        drain(stderr_r).await.is_empty(),
+        "neither shape is a skip -- both parsed"
+    );
+}
+
+/// The bug that prompted this: one record `ls` can't parse used to abort the
+/// whole listing. It must now cost only that row, and say so on stderr.
+#[tokio::test]
+async fn ls_warns_and_continues_on_unparseable_record() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+
+    let good = SessionId("20260501T134412-3f2a".into());
+    let mut s = sample_session(&good);
+    store.create(&good, None, &mut s).expect("create");
+
+    let bad = SessionId("20260430T091203-44d2".into());
+    write_raw_session(root.path(), &bad, drop_image_tag);
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, stderr_r) = duplex(4096);
+    let rc = ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls must not fail on one bad record");
+    drop(sw);
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    let out = drain(stdout_r).await;
+    assert!(
+        out.contains(good.as_str()),
+        "good row should list; got\n{out}"
+    );
+    assert!(
+        !out.contains(bad.as_str()),
+        "bad row should not list; got\n{out}"
+    );
+
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("[outrig] skipping") && err.contains(bad.as_str()),
+        "stderr should name the skipped entry; got\n{err}"
+    );
+    assert!(err.contains("image_tag"), "and the reason; got\n{err}");
+}
+
+/// A root where nothing parsed is not an empty root. Reporting "no sessions"
+/// there would hide every record behind a message that reads like success.
+#[tokio::test]
+async fn ls_distinguishes_all_skipped_from_empty_root() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let bad = SessionId("20260430T091203-44d2".into());
+    write_raw_session(root.path(), &bad, drop_image_tag);
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, stderr_r) = duplex(4096);
+    let rc = ls::execute_with(&mut sw, &mut ew, &store)
+        .await
+        .expect("ls");
+    drop(sw);
+    drop(ew);
+    // The root itself read fine; only its records didn't.
+    assert_eq!(rc, 0);
+    assert!(drain(stdout_r).await.is_empty(), "no table without rows");
+
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("no readable sessions (1 skipped)"),
+        "stderr should not claim the root is empty; got\n{err}"
+    );
+    assert!(!err.contains("[outrig] no sessions"), "got\n{err}");
+}
+
+/// The other half of the skip contract: skipping covers reading and parsing a
+/// `session.json`, not reaching the entry at all. A directory entry outrig
+/// can't stat is still an error, so the docs must not promise a blanket exit 0.
+#[tokio::test]
+async fn ls_still_errors_when_an_entry_cannot_be_stat_ed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    write_raw_session(root.path(), &sid, |_| {});
+
+    // Listable but not traversable: read_dir sees the entry, stat on it fails.
+    let restore = std::fs::metadata(root.path()).expect("meta").permissions();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o400)).expect("chmod");
+
+    // root (and some filesystems) ignore the mode bits, which would make the
+    // assertion below vacuous rather than wrong. Bail instead of failing.
+    if std::fs::symlink_metadata(root.path().join(sid.as_str())).is_ok() {
+        std::fs::set_permissions(root.path(), restore).expect("restore");
+        eprintln!("skipping: permissions not enforced for this user");
+        return;
+    }
+
+    let (mut sw, _stdout_r) = duplex(4096);
+    let (mut ew, _stderr_r) = duplex(4096);
+    let result = ls::execute_with(&mut sw, &mut ew, &store).await;
+    drop(sw);
+    drop(ew);
+    std::fs::set_permissions(root.path(), restore).expect("restore");
+
+    let err = result.expect_err("an unstat-able entry is not a skip");
+    assert!(
+        err.to_string().contains("stat"),
+        "should surface the stat failure; got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -226,6 +384,46 @@ async fn logs_substring_resolves_uniquely() {
     assert!(
         out.contains("20260501T134412-3f2a"),
         "expected unique match content: {out}"
+    );
+}
+
+/// An entry that exists but can't be parsed must not be reported as absent --
+/// "no session matching" sends the user looking for a record that is right
+/// there on disk. Before the listing learned to skip, the parse error at least
+/// reached them.
+#[tokio::test]
+async fn logs_reports_unreadable_record_rather_than_not_found() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let bad = SessionId("20260430T091203-44d2".into());
+    write_raw_session(root.path(), &bad, drop_image_tag);
+
+    let err = outrig_cli::cli::resolve_session_arg(&store, "0430")
+        .expect_err("an unreadable record is not a clean miss");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not be read") && msg.contains(bad.as_str()),
+        "should name the unreadable entry; got: {msg}"
+    );
+    assert!(msg.contains("image_tag"), "and the reason; got: {msg}");
+    assert!(
+        !msg.contains("no session matching"),
+        "should not claim nothing matched; got: {msg}"
+    );
+}
+
+/// A query matching nothing at all still gets the plain not-found error.
+#[tokio::test]
+async fn logs_still_reports_a_genuine_miss_as_not_found() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let bad = SessionId("20260430T091203-44d2".into());
+    write_raw_session(root.path(), &bad, drop_image_tag);
+
+    let err = outrig_cli::cli::resolve_session_arg(&store, "nonesuch").expect_err("miss");
+    assert!(
+        err.to_string().contains("no session matching"),
+        "got: {err}"
     );
 }
 
@@ -1016,6 +1214,67 @@ async fn clean_removes_old_stopped_stray_containers() {
         err.contains("cleaned 2 stray containers"),
         "summary should mention strays: {err}"
     );
+}
+
+#[tokio::test]
+/// A record `clean` can't parse still owns its container. Its directory
+/// survives the run (nothing can remove it), so treating the container as a
+/// record-less stray would `podman rm -f` it out from under a session that is
+/// still on disk -- worse than the parse error this listing used to raise.
+async fn clean_spares_containers_of_unreadable_records() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let broken = SessionId("20260501T134412-3f2a".into());
+    write_raw_session(root.path(), &broken, drop_image_tag);
+
+    // Stopped, older than the cutoff: everything the stray sweep looks for,
+    // except that the record it belongs to is merely unreadable, not gone.
+    let strays = vec![labeled(
+        "outrig-20260501T134412-3f2a",
+        broken.as_str(),
+        None,
+        false,
+        days(40),
+        now,
+    )];
+
+    let batches: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let batches_ref = batches.clone();
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        strays,
+        move |names: Vec<String>| {
+            let batches = batches_ref.clone();
+            async move {
+                batches.lock().unwrap().push(names);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("clean must survive an unreadable record");
+    drop(ew);
+
+    assert!(
+        batches.lock().unwrap().is_empty(),
+        "the container of an unreadable record is not a stray; removed: {:?}",
+        batches.lock().unwrap()
+    );
+    assert!(
+        root.path().join(broken.as_str()).exists(),
+        "the unreadable record's directory should still be on disk"
+    );
+    let _ = drain(stderr_r).await;
 }
 
 #[tokio::test]

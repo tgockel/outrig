@@ -100,7 +100,8 @@ where
     D: FnMut(Vec<String>) -> DFut,
     DFut: Future<Output = Result<()>>,
 {
-    let sessions = store.list()?;
+    let listing = store.list()?;
+    let sessions = listing.sessions;
     let mut targets = Vec::new();
     let mut skipped_running = Vec::new();
 
@@ -119,8 +120,18 @@ where
     }
 
     let target_ids: BTreeSet<&str> = targets.iter().map(|t| t.session.id.as_str()).collect();
-    let (stray_targets, stray_running) =
-        classify_strays(&sessions, &target_ids, labeled, args.older_than, now);
+    // A record we couldn't parse is still a record: its directory survives this
+    // run, so its container is not a stray and must not be force-removed out
+    // from under it.
+    let unreadable: Vec<&str> = listing.skipped.iter().map(|s| s.entry.as_str()).collect();
+    let (stray_targets, stray_running) = classify_strays(
+        &sessions,
+        &target_ids,
+        &unreadable,
+        labeled,
+        args.older_than,
+        now,
+    );
 
     write_skipped_running(stderr, &skipped_running).await?;
     write_stray_running(stderr, &stray_running).await?;
@@ -215,11 +226,14 @@ struct CleanTarget {
 /// Split labeled containers into `(removable strays, running strays)`.
 /// A stray is a labeled container with no *surviving* session record -- a
 /// record being removed this run counts as gone, so a failed `--rm` and its
-/// record clean up together. Running containers are never removable, and
-/// stopped strays must be older than the cutoff (podman `Created` time).
+/// record clean up together. `unreadable` names entries that exist on disk but
+/// couldn't be parsed; they survive too, so their containers are record-backed
+/// rather than stray. Running containers are never removable, and stopped
+/// strays must be older than the cutoff (podman `Created` time).
 fn classify_strays(
     sessions: &[Session],
     removed_ids: &BTreeSet<&str>,
+    unreadable: &[&str],
     labeled: Vec<LabeledContainer>,
     older_than: Duration,
     now: SystemTime,
@@ -228,6 +242,7 @@ fn classify_strays(
         .iter()
         .map(|s| s.id.as_str())
         .filter(|id| !removed_ids.contains(id))
+        .chain(unreadable.iter().copied())
         .collect();
     let mut removable = Vec::new();
     let mut running = Vec::new();
