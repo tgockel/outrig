@@ -65,10 +65,13 @@ carries one explicitly rather than leaving a model whose identifier outrig does 
 recognize to run on the conservative fallback outrig would otherwise apply. See
 [Concepts -> LLM Providers](../concepts/llm-providers.md#native-anthropic-style--anthropic).
 
-If you pick `mistralrs` as the provider style, the provider itself has no follow-up
+If you pick `mistralrs` as the provider style -- **deprecated**, and offered only for builds
+that still carry `--features local-llm` -- the provider itself has no follow-up
 prompts -- it's just a tag. The weight-source prompts (`Use auto-download by model
 ID?`, `HuggingFace model-id` or `Local model-path`, `revision`, `context-length`) are
 asked once per model in the model loop, since each model carries its own weight spec.
+New configs should pick `openai` and point it at a local Ollama/vLLM/`llama.cpp` server
+instead; see [In-process LLMs](../concepts/in-process-llm.md).
 
 ### Help at any prompt
 
@@ -78,10 +81,12 @@ prompt is then re-displayed so you can answer:
 ```
 ? Pick a provider style [default: openai]: ?
 
-  Which wire format / runtime this provider speaks.
+  Which wire format / runtime this provider speaks. 'mistralrs' is DEPRECATED and will
+  be removed -- prefer 'openai' pointed at a local Ollama/vLLM/llama.cpp server.
   openai  OpenAI Chat Completions wire format. Works with OpenAI, OpenRouter, vLLM, Ollama.
   anthropic  Anthropic's native Messages wire format. Talks to Claude directly.
-  mistralrs  In-process LLM via the mistralrs crate. Loads a local or HuggingFace model.
+  mistralrs  DEPRECATED (will be removed): in-process LLM via the mistralrs crate. Prefer
+  'openai' pointed at a local Ollama/vLLM/llama.cpp server.
 
   See: https://tgockel.github.io/outrig/concepts/llm-providers.html
 

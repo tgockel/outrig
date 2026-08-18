@@ -253,5 +253,7 @@ want non-overlapping scopes.
 
 - [MCP Servers](mcp-servers.md) -- where a subagent's tools come from.
 - [MCP Trust Model](mcp-trust-model.md) -- why sharing the container keeps the boundary intact.
-- [Providers, Models, and Agents](llm-providers.md) -- the `[agents.<name>]` block.
-- [Usage -> outrig run](../usage/run.md) -- the REPL these run underneath.
+- [Providers, Models, and Agents](https://tgockel.github.io/outrig/concepts/llm-providers.html) --
+  the `[agents.<name>]` block.
+- [Usage -> outrig run](https://tgockel.github.io/outrig/usage/run.html) --
+  the REPL these run underneath.

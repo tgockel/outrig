@@ -14,10 +14,10 @@ later.
 `.agents/outrig/images/<name>/Dockerfile` and appends matching `[images.<name>]` and
 `[images.<name>.mcp]` blocks to your repo's `config.toml`.
 
-Run it any time you want to add an image-config -- e.g., a `planning` config alongside
-the `<repo>-standard` one [`outrig init`](init.md) creates by default. `init` calls
-`image add` in a loop for the first (and any further) image-configs you create during
-initial setup.
+Run it any time you want to add an image-config -- e.g., a `planning` config alongside the
+`<repo>-standard` one [`outrig init`](https://tgockel.github.io/outrig/usage/init.html) creates by
+default. `init` calls `image add` in a loop for the first (and any further) image-configs
+you create during initial setup.
 
 ### Bootstrapping a fresh repo
 
@@ -29,8 +29,9 @@ If you run `outrig image add` in a directory without an `.agents/outrig/config.t
 ? Configure outrig in this directory now? [Y/n]:
 ```
 
-Answering `y` walks the same repo-config prompts that [`outrig init`](init.md) uses
-(workspace, default agent, preamble), then continues with the `image add` flow.
+Answering `y` walks the same repo-config prompts that
+[`outrig init`](https://tgockel.github.io/outrig/usage/init.html) uses (workspace, default
+agent, preamble), then continues with the `image add` flow.
 Answering `n` exits with the same error a strict `find` would have produced -- run
 `outrig init` later when you're ready.
 
@@ -275,7 +276,8 @@ error: rust-dev/Dockerfile, rust-dev/image.toml, rust-dev/README.md
 
 `outrig image build` builds a standalone image project (the output of `outrig image init`) and
 validates that the result is a working OutRig toolset image. It is the standalone-project
-counterpart to [`outrig build`](build.md), which builds repo-local image-configs.
+counterpart to [`outrig build`](https://tgockel.github.io/outrig/usage/build.html), which builds
+repo-local image-configs.
 
 It reads the project's `image.toml`, serializes it into OCI labels, builds the declared
 `Dockerfile` with buildah, and tags the result with the `[image].ref` from `image.toml` --
@@ -416,7 +418,8 @@ The command exits nonzero -- printing `error: ...` -- in these cases:
 
 ## See also
 
-- [outrig init](init.md) -- runs `image add` in a loop as the last step of initial setup.
+- [outrig init](https://tgockel.github.io/outrig/usage/init.html) -- runs `image add` in a loop as
+  the last step of initial setup.
 - [Concepts -> Containers](../concepts/containers.md) -- Dockerfile conventions and named
   image-configs.
 - [Concepts -> MCP Servers](../concepts/mcp-servers.md) -- the MCP servers `image add`

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **The `local-llm` Cargo feature and the `style = "mistralrs"` provider**, along with the
+  `cuda` and `metal` features that select a backend for them, the six `[models.<name>]` weight
+  keys (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `device`), the
+  top-level `model-cache-root`, and `outrig run --device`. They will be removed in a future
+  release.
+
+  **Nothing changes today.** A build with `--features local-llm` still runs in-process models,
+  every config still parses and validates, and no key changed spelling. What changed is that
+  outrig now says the feature is going away, at three moments: `cargo build --features
+  local-llm` emits a build warning, loading an in-process model prints a one-line warning per
+  model, and the error a default build already raised for `style = "mistralrs"` now names the
+  deprecation and the replacement alongside the `--features local-llm` flag that still works.
+
+  Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com), vLLM, or
+  `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
+  `base-url`. Migration, before and after, is in
+  [In-process LLMs](../../doc/concepts/in-process-llm.md).
+
+  Two consequences worth stating plainly. Running a local model well is a problem with good
+  dedicated tools, and outrig was a worse place to solve it: the backend roughly triples the
+  dependency count, and outrig's config duplicated weight, quantization, and device knobs those
+  servers expose better. And outrig is **giving up a property it claimed** -- that a question
+  never crosses a process boundary. A localhost server does serialize payloads over a socket.
+  That trade is deliberate, and the documentation retracts the argument it made against
+  localhost servers rather than quietly dropping it; the unimplemented egress filter, tool-use
+  filter, and prompt-injection scanner that were the stated consumers of the property will have
+  to answer the question on their own terms.
+
 ### Added
 
 - **`[<...>.security]` accepts `unmask`**, so a session container can host a container runtime

@@ -65,6 +65,12 @@ pub async fn run_with(
 
 // ---- prompt-flow helpers --------------------------------------------------
 
+// The order is the recommendation. `mistralrs` stays offered because a build
+// with `--features local-llm` can still serve it and init should be able to
+// describe a config that build can run -- but it is last and it says it is
+// deprecated, so a user meeting this list for the first time is not steered
+// onto a backend that is scheduled to be removed. The openai row already names
+// the recommended replacement path (Ollama, vLLM) for exactly this case.
 const STYLES: &[(&str, &str)] = &[
     (
         "openai",
@@ -76,13 +82,20 @@ const STYLES: &[(&str, &str)] = &[
     ),
     (
         "mistralrs",
-        "In-process LLM via the mistralrs crate. Loads a local or HuggingFace model.",
+        "DEPRECATED (will be removed): in-process LLM via the mistralrs crate. \
+         Prefer 'openai' pointed at a local Ollama/vLLM/llama.cpp server.",
     ),
 ];
 
+// The deprecation lives in `description`, not just in the `mistralrs` blurb
+// above: the dialoguer picker renders option values only, so on a TTY -- the
+// path most users take -- the blurb reaches nobody. `description` is written
+// by both prompt backends before the picker opens.
 const STYLE_FIELD: Field = Field {
     name: "Pick a provider style",
-    description: "Which wire format / runtime this provider speaks.",
+    description: "Which wire format / runtime this provider speaks. 'mistralrs' is \
+                  DEPRECATED and will be removed -- prefer 'openai' pointed at a local \
+                  Ollama/vLLM/llama.cpp server.",
     options: STYLES,
     doc_link: "doc/concepts/llm-providers.md",
 };

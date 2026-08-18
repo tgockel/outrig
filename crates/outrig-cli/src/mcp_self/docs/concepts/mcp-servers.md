@@ -15,7 +15,8 @@ granted. See [Sidecar placement](#sidecar-placement) below and
 The same `[images.<name>.mcp]` table is consumed by both `outrig run` and
 `outrig mcp`. `outrig run` registers those tools with its built-in agent; `outrig mcp`
 republishes them as one stdio MCP server for an external client. See
-[Usage -> outrig mcp](../usage/mcp.md) for client setup and transport rules.
+[Usage -> outrig mcp](https://tgockel.github.io/outrig/usage/mcp.html) for client setup and
+transport rules.
 When `outrig mcp --attach` points at an existing container, it still starts its own
 MCP child processes inside that container; it does not share or proxy the host
 session's existing MCP protocol state.
@@ -410,7 +411,7 @@ errors, and nothing restarts. If the *primary* container dies out from under out
 > **TODO: Incomplete** -- auto-restart and per-server health-checking are deferred.
 
 The server's stderr, captured to `<session_dir>/logs/<server>.stderr`, usually has the actual
-error. See [Sessions](../usage/sessions.md) for how to view it.
+error. See [Sessions](https://tgockel.github.io/outrig/usage/sessions.html) for how to view it.
 
 Attach mode can run more than one copy of the same MCP server in one container. Prefer
 servers that are reentrant-safe: no fixed listening port, global pidfile, or exclusive
@@ -435,6 +436,7 @@ Two practical guidelines:
   practical.
 - [AI-assisted design](../usage/ai-assisted-design.md) -- use `outrig mcp self` to design custom
   MCP-enabled image-configs.
-- [Sessions](../usage/sessions.md) -- `outrig logs <session> <server>` for stderr.
+- [Sessions](https://tgockel.github.io/outrig/usage/sessions.html) --
+  `outrig logs <session> <server>` for stderr.
 - [Reference -> Config](../reference/config.md) -- full schema for the `[images.<name>.mcp]`
   block.

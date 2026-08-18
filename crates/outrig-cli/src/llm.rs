@@ -97,10 +97,21 @@ pub enum LlmResolveError {
     )]
     UnsupportedProvider { name: String },
 
+    /// The remedy this carries is deliberately no longer "rebuild with
+    /// `--features local-llm`" alone. That feature is deprecated and scheduled
+    /// for removal, so sending a user to adopt it -- and to pay a
+    /// several-hundred-crate build -- for something that will be gone is advice
+    /// with a short shelf life. It still names the flag, because it remains the
+    /// only way to run this config *today* and a message that withheld it would
+    /// be unactionable; it just no longer recommends it without saying what the
+    /// flag's future is.
     #[error(
         "mistralrs provider {name:?} requested but this build of outrig \
-         does not include the 'local-llm' feature; rebuild with \
-         --features local-llm to enable"
+         does not include the 'local-llm' feature. That feature is \
+         deprecated and will be removed in a future release: prefer an \
+         OpenAI-compatible local server (Ollama, vLLM, llama.cpp) reached \
+         through a style=\"openai\" provider with a localhost base-url. To \
+         run this config as-is meanwhile, rebuild with --features local-llm"
     )]
     MistralrsFeatureDisabled { name: String },
 
@@ -1474,6 +1485,7 @@ async fn mistralrs_model(
     cache_root: &Path,
     registry: &LlmRegistry,
 ) -> Result<std::sync::Arc<crate::llm::mistralrs::MistralrsModel>> {
+    warn_local_llm_deprecated(candidate);
     let weights =
         candidate
             .model_weights
@@ -1504,6 +1516,60 @@ async fn mistralrs_model(
             .await
         })
         .await
+}
+
+/// The deprecation notice shown for an in-process model, as text.
+///
+/// Split from the printing so the wording is assertable without capturing
+/// stderr. The sibling `warn_fallback_ceiling` has no test for exactly that
+/// reason, and this message is load-bearing in a way that one is not: it is the
+/// only warning a user with a *working* local model ever sees, and it names the
+/// migration path the docs and the resolve error also name, so drift between
+/// the three is the failure worth a test.
+#[cfg(feature = "local-llm")]
+pub(crate) fn local_llm_deprecation_notice(model_name: &str) -> String {
+    format!(
+        "[outrig] warning: model {model_name} runs on the in-process 'local-llm' \
+         backend, which is deprecated and will be removed in a future release. \
+         Run the model under an OpenAI-compatible local server (Ollama, vLLM, \
+         llama.cpp) and point a style=\"openai\" provider at its localhost \
+         base-url instead. See doc/concepts/in-process-llm.md."
+    )
+}
+
+/// Say, once per model, that the in-process backend serving it is going away.
+///
+/// The deprecation's whole user-visible substance in a build that *has* the
+/// feature. The error path covers the build that lacks it, but a user who
+/// compiled `--features local-llm` and has a working local model is precisely
+/// the one who would otherwise hear nothing until the removal broke them --
+/// they are not reading release notes for a flag that currently works.
+///
+/// Modeled on [`warn_fallback_ceiling`] deliberately, including the per-model
+/// keying rather than a process-wide `Once`. `build_agent` runs again on
+/// `/sidecar add` and once per subagent launch, so an unkeyed line would repeat
+/// through a fan-out and bury the traces around it; keying it per concrete row
+/// means a session naming two local models hears about both, which is the case a
+/// `Once` would get wrong.
+///
+/// Placed at the *load* path rather than at resolution so it fires exactly when
+/// an in-process model is really used. A chain that lists a local fallback it
+/// never reaches should not warn about a backend it did not run -- and
+/// `LazyLocalCandidate` only loads when the chain actually moves to it.
+#[cfg(feature = "local-llm")]
+fn warn_local_llm_deprecated(candidate: &ResolvedCandidate) {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    // The guard drops with the condition's temporary, so the warning below is
+    // printed unlocked.
+    if !WARNED
+        .lock()
+        .expect("local-llm deprecation warnings")
+        .insert(candidate.model_name.clone())
+    {
+        return;
+    }
+    eprintln!("{}", local_llm_deprecation_notice(&candidate.model_name));
 }
 
 /// Say, once per model, that outrig picked an output-token ceiling nobody asked
@@ -2798,6 +2864,33 @@ mod tests {
             String::from_utf8(sink).expect("sink utf-8"),
             "hello world\n",
             "the reply should still have been streamed exactly once"
+        );
+    }
+
+    /// The deprecation notice has to name the model, say the feature is going
+    /// away, and point at the replacement. All three are the message's whole
+    /// job: a warning that said only "deprecated" would leave the user with
+    /// nowhere to go, which is the failure mode that makes deprecation warnings
+    /// noise instead of guidance.
+    ///
+    /// Pinned alongside `mistralrs_provider_feature_off_explains_clearly` in
+    /// `tests/llm_resolve.rs`, which covers the same migration advice on the
+    /// build that *lacks* the feature. The two together are why a future edit
+    /// cannot move the recommendation in one place only.
+    #[cfg(feature = "local-llm")]
+    #[test]
+    fn the_deprecation_notice_names_the_model_and_the_replacement() {
+        let notice = local_llm_deprecation_notice("phi3-fast");
+        assert!(notice.contains("phi3-fast"), "got: {notice}");
+        assert!(notice.contains("deprecated"), "got: {notice}");
+        assert!(
+            notice.contains("removed in a future release"),
+            "a deprecation has to say it is going away, got: {notice}"
+        );
+        // The replacement, not just the complaint.
+        assert!(
+            notice.contains("Ollama") && notice.contains("style=\"openai\""),
+            "the notice must name where to go instead, got: {notice}"
         );
     }
 

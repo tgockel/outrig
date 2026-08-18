@@ -77,12 +77,13 @@ entries override global by name.
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
 config value and the default; `--session-dir <path>` (on `outrig run`/`logs`/`discard`) instead
-points at one specific session directory. See [Sessions](../usage/sessions.md).
+points at one specific session directory. See
+[Sessions](https://tgockel.github.io/outrig/usage/sessions.html).
 
 `model-cache-root` defaults to `<XDG_CACHE_HOME>/outrig/models/` (typically
 `~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` models configured
 with `model-id` -- that's where the auto-downloaded GGUFs land. See
-[Concepts -> In-process LLMs](../concepts/in-process-llm.md).
+[Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
 
 `tool-call-max` is the default maximum number of tool calls in one user turn. The compiled-in
 default is `50`; config may set any value from `1` through `2000`.
@@ -198,7 +199,8 @@ before it could be answered. `retry-budget-secs` bounds *all* the attempts toget
 LLM request that fails transiently is retried until it succeeds or the budget runs out, then
 ends the turn without ending the session. Which failures count as transient, how the wait is
 chosen, and how `Retry-After` is honored are described in
-[Concepts -> LLM providers](../concepts/llm-providers.md#transient-failures); this page is
+[LLM providers](https://tgockel.github.io/outrig/concepts/llm-providers.html#transient-failures);
+this page is
 the reference for the keys themselves.
 
 Two things about the budget that belong here, because they are about the keys:
@@ -260,11 +262,18 @@ agent, or the first turn fails saying so. See
 
 ### `style = "mistralrs"`
 
+> **Deprecated.** This provider style and the `local-llm` build feature are deprecated and
+> will be removed in a future release. Run the model under an OpenAI-compatible local server
+> (Ollama, vLLM, `llama.cpp`) and use a [`style = "openai"`](#style--openai) provider with a
+> `localhost` `base-url` instead. Existing configs keep parsing and working for now. See
+> [Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html)
+> for a before/after migration.
+
 In-process LLM backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. No
 HTTP, no API key. The provider table is bare -- just the `style` tag. Each set of
 weights is its own `[models.<name>]` row referencing this provider, so a single
 `mistralrs` provider can back many models. See
-[Concepts -> In-process LLMs](../concepts/in-process-llm.md).
+[Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
 
 ```toml
 [providers.local]
@@ -308,7 +317,7 @@ api-key = "OPENAI_API_KEY"      # ERROR -- ${...} required
 The variable name must match `^[A-Z_][A-Z0-9_]*$`. If the named environment variable is unset
 when outrig needs the key, outrig fails with a pointed error.
 
-See [Concepts -> LLM Providers](../concepts/llm-providers.md).
+See [Concepts -> LLM Providers](https://tgockel.github.io/outrig/concepts/llm-providers.html).
 
 ## `[models.<name>]`
 
@@ -471,6 +480,11 @@ mid-sentence with nothing logged, which is much harder to recognize as a config 
 generated config carries an explicit one either way.
 
 ### mistralrs models
+
+> **Deprecated** with the provider style above, and removed at the same time. The six weight
+> fields below have no counterpart on a `style = "openai"` model: a local server owns the
+> weights, quantization and device placement itself. See
+> [Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
 
 For an in-process `style = "mistralrs"` provider, the model row carries the weight
 spec. Either `model-id` (HuggingFace auto-download) or `model-path` (local GGUF file)
@@ -1262,5 +1276,7 @@ image-config in the merged config but does not require agent/model/provider wiri
 
 ## See also
 
-- [Concepts](../concepts/README.md) -- narrative explanations of what these keys mean.
-- [Reference -> CLI](cli.md) -- flags that override or interact with config.
+- [Concepts](https://tgockel.github.io/outrig/concepts/index.html) -- narrative explanations of what
+  these keys mean.
+- [Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html) -- flags that override or
+  interact with config.

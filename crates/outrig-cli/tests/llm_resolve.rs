@@ -746,10 +746,11 @@ preamble = "hi"
 }
 
 /// Feature-off build: building an agent for a `mistralrs` provider fails
-/// with a message that names both the provider and the missing feature
-/// flag, so the fix ("rebuild with --features local-llm") is one shot.
-/// Pinned verbatim because `doc/concepts/llm-providers.md` promises this
-/// wording.
+/// with a message that names the provider, says the feature is deprecated,
+/// points at the replacement, and still names the flag that runs this config
+/// today. Pinned verbatim because `doc/concepts/llm-providers.md` promises
+/// this wording -- including the deprecation clause, which is the whole
+/// user-visible half of the deprecation on a default build.
 #[cfg(not(feature = "local-llm"))]
 #[tokio::test]
 async fn mistralrs_provider_feature_off_explains_clearly() {
@@ -785,8 +786,11 @@ preamble = "hi"
     assert_eq!(
         err.to_string(),
         "mistralrs provider \"local\" requested but this build of outrig \
-         does not include the 'local-llm' feature; rebuild with \
-         --features local-llm to enable",
+         does not include the 'local-llm' feature. That feature is \
+         deprecated and will be removed in a future release: prefer an \
+         OpenAI-compatible local server (Ollama, vLLM, llama.cpp) reached \
+         through a style=\"openai\" provider with a localhost base-url. To \
+         run this config as-is meanwhile, rebuild with --features local-llm",
     );
 }
 

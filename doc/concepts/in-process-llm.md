@@ -1,5 +1,21 @@
 # In-process LLMs
 
+> **Deprecated.** The `local-llm` feature and the `style = "mistralrs"` provider are
+> deprecated and will be removed in a future release. Nothing changes today: a build with
+> `--features local-llm` still works, configs still parse, and no key has changed spelling.
+> New setups should run the model under an OpenAI-compatible local server -- Ollama, vLLM,
+> or `llama.cpp`'s server -- and point a
+> [`style = "openai"`](llm-providers.md#pointing-at-openai-compatible-endpoints) provider at
+> its `localhost` base-url. See
+> [Migrating off the in-process provider](#migrating-off-the-in-process-provider) below.
+>
+> Running a local model well is a problem with good dedicated tools, and outrig was a worse
+> place to solve it than any of them: the in-process backend roughly tripled the dependency
+> count, and outrig's own configuration surface duplicated knobs (weights, quantization,
+> device selection) those servers already expose better. This page keeps the original
+> rationale below, including the part this deprecation **retracts** -- see
+> [What this retracts](#what-this-retracts).
+
 An **in-process LLM provider** runs the model in the same address space as the outrig CLI
 itself, backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. The model
 weights load into outrig's process; questions never cross a socket, never get serialized into
@@ -8,7 +24,96 @@ JSON, never reach a network.
 This is a feature you opt into at build time and at config time. Most users running outrig
 against a hosted API never need it.
 
+## Migrating off the in-process provider
+
+The replacement is a local server speaking the OpenAI wire format, which every tool in this
+space now does. Start the model however that tool wants -- note the tool-calling flags, which
+outrig's agent loop needs and none of these servers turn on by default:
+
+```sh
+ollama serve                 # then: ollama pull qwen3:4b
+# or: vllm serve Qwen/Qwen3-4B --enable-auto-tool-choice --tool-call-parser hermes
+# or: llama-server -m ./qwen3-4b-q4.gguf --port 8080 --jinja
+```
+
+Then replace the bare `mistralrs` provider and its weight-bearing model row with an ordinary
+remote pair. The weight fields (`model-id`, `model-path`, `model-file`, `revision`,
+`context-length`, `device`) have no counterpart here on purpose -- the server owns all six,
+and that is the point of the move:
+
+```toml
+# Before -- deprecated:
+[providers.local]
+style = "mistralrs"
+
+[models.local-fast]
+provider   = "local"
+model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"
+
+# After:
+[providers.local]
+style    = "openai"
+base-url = "http://127.0.0.1:11434/v1"   # Ollama's default; vLLM 8000, llama-server 8080
+api-key  = "${OLLAMA_API_KEY}"           # see the note below
+
+[models.local-fast]
+provider   = "local"
+identifier = "qwen3:4b"                  # whatever name the server serves it under
+```
+
+The `[models.<name>]` key is yours. Keep whatever the old row was called and every
+`[agents.<name>].model` reference to it keeps working -- only the row's *contents* change.
+
+Three wrinkles worth knowing before you hit them:
+
+- **The model must support tool calling.** outrig's loop needs the model to emit tool calls in
+  the provider's native format, and not every local model does. Ollama's `phi3` has no `tools`
+  capability and rejects outright a request that carries any; vLLM emits no tool calls at all
+  without `--enable-auto-tool-choice --tool-call-parser <parser>`; `llama-server` needs
+  `--jinja` to apply the template that produces them. Pick a tool-capable model (`qwen3`,
+  `llama3.1`, `mistral-nemo`) and pass those flags -- see
+  [Tool calling](llm-providers.md#tool-calling) for the symptom and a one-shot test. A session
+  with no MCP servers and subagents disabled sends no tools at all, so a model without the
+  capability still answers plain prompts there; it just cannot run an agent.
+- **`api-key` is still required**, and must still use the `"${VAR}"` form -- outrig refuses a
+  literal. Local servers generally ignore the value, so export any non-empty placeholder
+  (`export OLLAMA_API_KEY=unused`). An unset or empty variable makes the model unselectable,
+  which is a deliberate rule and not a bug: see
+  [Providers, Models, and Agents](llm-providers.md).
+- **`--device` does not apply.** Device placement moves to the server's own flags
+  (`CUDA_VISIBLE_DEVICES`, `--n-gpu-layers`, and friends). `outrig run --device` is
+  mistralrs-only and is deprecated with it.
+
+What you keep, given a tool-capable model: the tool loop, subagents, the tool-call and
+tool-result limits, aliases and failover, and the ability to name the local model as one
+candidate of an alias beside a hosted one. What you give up is the trust property the next two
+sections describe.
+
+## What this retracts
+
+The section below ("Why in-process and not localhost") argued that a localhost server is
+*not* an adequate substitute, because the payload still crosses a socket and can be observed
+by any process with the right uid. **That argument was sound and is being knowingly traded
+away.** It is recorded here rather than deleted, because it is the actual cost of this
+deprecation and a future reader deciding whether to reverse it needs the real reason it
+existed:
+
+- A localhost server does mean sensitive payloads get serialized and cross a socket.
+- outrig no longer claims the stronger property. If your threat model genuinely requires that
+  a question never leave the outrig process, outrig is not the tool that gives you that, and
+  after the removal it will not pretend to.
+
+The three downstream features named under "Why you might want this" -- the egress filter, the
+tool-use filter, and the prompt-injection scanner -- were the stated consumers of that
+property. They are unimplemented, and if they land they will need to answer this question
+again on their own terms rather than inheriting an answer from a provider that shipped as
+plumbing for them and was never wired up.
+
 ## Why you might want this
+
+> **Historical.** This section states the original rationale, which the deprecation above
+> supersedes. Kept for the record.
 
 Three downstream features (none of which ship with the in-process provider itself) need an
 LLM whose *input* must not leave the host:
@@ -33,6 +138,10 @@ enough that the question never crosses a process boundary.
 > outrig calls it automatically yet.
 
 ## Why in-process and not localhost
+
+> **Historical, and retracted.** This section is the argument the deprecation above trades
+> away; see [What this retracts](#what-this-retracts). A localhost server *is* now the
+> recommended answer.
 
 A local LLM server (Ollama on `127.0.0.1`, for instance) puts the model in another process
 under the same user. That's not the same trust boundary as in-process:
@@ -153,6 +262,8 @@ its auto mapper decides the model needs them. Explicit sharding controls and ROC
 support are not part of this surface yet.
 
 ### Build flag and the "still parses" rule
+
+> **Deprecated.** Enabling this feature now also emits a build warning saying so.
 
 The in-process backend is gated behind a Cargo feature:
 

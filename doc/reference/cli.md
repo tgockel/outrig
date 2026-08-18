@@ -206,8 +206,9 @@ outrig run [--agent <name>]
   the `${VAR}` host-env-reference syntax described in
   [config.md#mcp-env-value-syntax](config.md#mcp-env-value-syntax). Within a scope, last wins
   on duplicate keys. Precedence per key: config-file env < global `--env` < per-server `--env`.
-- `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`): override
-  the in-process mistralrs model device for this run. Rejected for OpenAI-style models, and
+- `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
+  **deprecated** with the in-process backend it selects hardware for; override the in-process
+  mistralrs model device for this run. Rejected for OpenAI-style models, and
   for an alias spanning more than one candidate -- it selects hardware for one in-process
   model, and an alias may span several styles. A single-target alias is accepted.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): per-turn tool-call

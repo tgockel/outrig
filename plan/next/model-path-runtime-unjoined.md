@@ -1,5 +1,12 @@
 # A relative `model-path` validates against one base and loads against another
 
+> **On a deprecated surface.** `model-path` belongs to `style = "mistralrs"`, now
+> deprecated and scheduled for removal -- see
+> `plan/next/remove-deprecated-local-llm.md`. This is a real bug, but it is in code
+> slated for deletion, so weigh fixing it against closing it unfixed. It is a
+> genuine wrong-directory hazard for anyone still on the feature, which is the
+> argument for fixing it anyway.
+
 ## Context
 
 `[models.<name>].model-path` is checked for existence against the repo root

@@ -50,14 +50,19 @@ outrig image inspect      # read an image's OCI labels without starting it
 outrig ls|logs|discard|clean   # inspect and prune sessions
 ```
 
-## Local models (optional)
+## Local models (optional, deprecated)
+
+> **Deprecated.** The `local-llm` feature is deprecated and will be removed in a future
+> release. Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com),
+> vLLM, or `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
+> base-url instead. Builds using the feature keep working for now and emit a build warning.
 
 The `local-llm` feature adds an in-process [mistral.rs](https://github.com/EricLBuehler/mistral.rs)
 backend so the agent can run a model without an external API; `cuda` and `metal` features enable
-GPU acceleration.
+GPU acceleration. It roughly triples the dependency count, which is part of why it is going away.
 
 ```sh
-$ cargo install outrig-cli --features local-llm
+$ cargo install outrig-cli --features local-llm   # deprecated
 ```
 
 ## Documentation

@@ -35,7 +35,8 @@ outrig run [--agent <name>]
 - `--config <path>` (default: walks up from cwd; if not found, run config-less -- see
   [Config-less runs](#config-less-runs)): load config from a non-standard location.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
-  override the in-process mistralrs model device for this run.
+  override the in-process mistralrs model device for this run. **Deprecated** with the
+  in-process backend; see [In-process LLMs](../concepts/in-process-llm.md).
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): override the
   per-turn tool-call max for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):

@@ -141,15 +141,27 @@ mod tests {
         }
 
         for doc in DOCS {
-            for (_, rest) in doc.markdown.match_indices("](") {
-                let Some(end) = rest[2..].find(')') else {
+            // Bind the offset, not the matched text: `match_indices` yields the
+            // needle itself as the second element, so slicing *that* past its
+            // own length gave an empty string, no `)`, and a `continue` before
+            // every assertion -- the test inspected nothing at all.
+            for (idx, _) in doc.markdown.match_indices("](") {
+                let rest = &doc.markdown[idx + 2..];
+                let Some(end) = rest.find(')') else {
                     continue;
                 };
-                let link = &rest[2..2 + end];
-                if !link.ends_with(".md") || link.contains("://") {
+                let link = &rest[..end];
+                if link.contains("://") {
                     continue;
                 }
-                let Some(target) = resolve(doc.page, link) else {
+                // Strip the anchor before the extension test: `foo.md#bar` is
+                // just as dead a link as `foo.md`, and testing `ends_with`
+                // first let every anchored link through unchecked.
+                let path = link.split('#').next().unwrap_or(link);
+                if !path.ends_with(".md") {
+                    continue;
+                }
+                let Some(target) = resolve(doc.page, path) else {
                     panic!("{}: link {link:?} escapes the bundle", doc.page);
                 };
                 assert!(

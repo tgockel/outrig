@@ -391,6 +391,13 @@ containers, stay up.
 
 ## In-process providers (`mistralrs`)
 
+> **Deprecated.** `style = "mistralrs"` and the `local-llm` build feature are deprecated and
+> will be removed in a future release. Run the model under an OpenAI-compatible local server
+> (Ollama, vLLM, `llama.cpp`) and use a `style = "openai"` provider with a `localhost`
+> `base-url` instead -- see
+> [Migrating off the in-process provider](in-process-llm.md#migrating-off-the-in-process-provider).
+> Existing configs keep working unchanged for now.
+
 An in-process provider runs the model in the outrig process itself, with no socket and no
 serialization. The use case is questions whose *content* must not leave the host -- the
 eventual egress filter, tool-use filter, and prompt-injection scanner all want this. See

@@ -1,5 +1,12 @@
 # `style = "mistralrs"` accepts any key at all
 
+> **Superseded, probably.** `style = "mistralrs"` is now deprecated and scheduled
+> for removal -- see `plan/next/remove-deprecated-local-llm.md`. Reshaping the
+> variant to make `deny_unknown_fields` bite is work on a surface that is going
+> away, and it is a source break in its own right. Do not execute this without
+> first settling the removal's open question (does the style become a parse error,
+> or keep parsing as a no-op?). If it becomes a parse error, close this unfixed.
+
 `LlmProvider` is an internally-tagged enum with `deny_unknown_fields`, which
 rejects unknown keys correctly on the two remote variants:
 

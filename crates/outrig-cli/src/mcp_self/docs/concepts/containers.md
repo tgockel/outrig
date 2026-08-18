@@ -321,7 +321,8 @@ $ outrig run --image planning      # different Dockerfile, different MCPs
 This is useful when you want lighter-weight environments for different kinds of work -- e.g. a
 `planning` image that has no compiler, no shell, and only research-oriented MCPs; a `coding`
 image with the full toolchain. Agents can also pin their own default image via
-`agents.<name>.image`; see [Providers, Models, and Agents](llm-providers.md).
+`agents.<name>.image`; see
+[Providers, Models, and Agents](https://tgockel.github.io/outrig/concepts/llm-providers.html).
 
 Every image-config is built and cached independently. Switching between them is fast after
 the first build.
@@ -404,7 +405,7 @@ and the panic-hook sweep -- cover every container. In addition, sessions with si
 `podman kill`, OOM), the watcher reaps all sidecars and ends the session with an error.
 A stray that survives even that (say, a SIGKILLed outrig) is caught by `outrig clean`, which
 sweeps stopped, record-less containers carrying `org.outrig.session`; see
-[Sessions -> outrig clean](../usage/sessions.md#outrig-clean).
+[Sessions -> outrig clean](https://tgockel.github.io/outrig/usage/sessions.html#outrig-clean).
 
 Session `[network]` policy applies to every container: the network interceptor attaches to each
 sidecar the same way it attaches to the primary, before any MCP server connects.

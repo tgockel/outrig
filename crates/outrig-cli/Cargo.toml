@@ -25,7 +25,13 @@ default   = []
 e2e       = []
 # Test-only; see the `src/lib.rs` module doc.
 internal-test-api = []
+# DEPRECATED -- scheduled for removal. Compiles in the in-process mistralrs
+# backend, and with it several hundred dependency crates. Run local models under
+# an OpenAI-compatible server (Ollama, vLLM, llama.cpp) and point a
+# `style = "openai"` provider at its localhost base-url instead; see
+# `doc/concepts/in-process-llm.md`. `build.rs` warns when this is enabled.
 local-llm = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap"]
+# DEPRECATED with `local-llm`, which these select a backend for.
 cuda      = ["candle-core?/cuda", "mistralrs-core?/cuda"]
 # Metal's upstream dependency features are Apple-only. The public feature
 # gates outrig's runtime path; macOS local-llm builds carry the backend deps.
