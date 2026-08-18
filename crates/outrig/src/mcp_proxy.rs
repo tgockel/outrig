@@ -13,14 +13,18 @@
 
 #![deny(clippy::print_stdout)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    Implementation, JsonObject, ListPromptsRequestMethod, ListPromptsResult,
+    ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
@@ -28,6 +32,35 @@ use serde_json::Value;
 use crate::error::{OutrigError, Result};
 use crate::mcp::{self, McpClient, McpTool, McpToolResult};
 use crate::tool_name;
+
+/// Protocol revisions OutRig's MCP servers are known to serve correctly.
+///
+/// Deliberately explicit rather than deferring to rmcp's default of
+/// [`ProtocolVersion::KNOWN_VERSIONS`]: that default moves whenever rmcp learns a
+/// new revision, so a dependency bump silently widens what OutRig agrees to speak.
+/// That is exactly how the servers began negotiating `2026-07-28` -- which requires
+/// the SEP-2549 `ttlMs`/`cacheScope` fields on every list result -- without emitting
+/// them, leaving clients unable to fetch the tool list at all.
+///
+/// Adding an entry here asserts that both [`ProxyServer`] and the `outrig mcp self`
+/// server meet that revision's requirements. Review it on every rmcp upgrade.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
+];
+
+/// How long a client may treat a `tools/list` response as fresh (SEP-2549).
+///
+/// The proxy's tool table is frozen at [`ProxyServer::build`] time and the server
+/// advertises no `listChanged` capability, so the list genuinely cannot change for
+/// the life of the connection -- a far longer TTL would still be honest. Five
+/// minutes is chosen instead so that a config edit or a rebuilt image is picked up
+/// promptly on the next session, which matters more than cache efficiency for a
+/// list this small.
+const TOOLS_TTL_MS: u64 = 300_000;
 
 /// Private supertrait bound: nothing outside this crate can name
 /// [`sealed::Sealed`], so nothing outside can implement [`BackingClient`].
@@ -269,7 +302,11 @@ impl<C: BackingClient> ProxyServer<C> {
                 )
             })
             .collect();
+        // `Private`: the union depends on this session's config, image, and `--env`
+        // overrides, so it is not shareable across users or intermediaries.
         ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(TOOLS_TTL_MS)
+            .with_cache_scope(CacheScope::Private)
     }
 
     /// Dispatch a `tools/call` to the appropriate backing client. Returns a
@@ -314,12 +351,47 @@ impl<C: BackingClient> ServerHandler for ProxyServer<C> {
         self.inner.server_info.clone()
     }
 
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
         Ok(self.list_tools_inner())
+    }
+
+    // rmcp answers these from default handler bodies with an empty, successful
+    // result -- advertised capabilities do not gate dispatch. That is wrong twice
+    // over: it claims a surface the proxy does not have, and from revision `2026-07-28`
+    // the default result is malformed, carrying `resultType` but neither `ttlMs`
+    // nor `cacheScope`. It advertises tools only, so say so.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourcesResult, McpError> {
+        Err(McpError::method_not_found::<ListResourcesRequestMethod>())
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourceTemplatesResult, McpError> {
+        Err(McpError::method_not_found::<
+            ListResourceTemplatesRequestMethod,
+        >())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListPromptsResult, McpError> {
+        Err(McpError::method_not_found::<ListPromptsRequestMethod>())
     }
 
     async fn call_tool(

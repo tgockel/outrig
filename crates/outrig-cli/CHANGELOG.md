@@ -254,6 +254,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (config):** a sidecar starts only when an `[images.<name>.mcp]` entry names it.
   Declaring a block no longer starts it -- with blocks shared and global, it cannot.
 
+- **`outrig mcp` and `outrig mcp self` list their tools again to a client speaking protocol
+  revision `2026-07-28`.** That revision requires `ttlMs` and `cacheScope` on every list
+  result, both servers omitted them, and the client's answer to a malformed `tools/list` is to
+  retry a few times and then give up -- so the session came up clean, reported the servers
+  ready, and offered the agent nothing to call. A client on an older revision was unaffected,
+  which is what made this look like a client bug rather than outrig's.
+
+  The two servers scope their answers differently. `mcp self` is `public`: its tool set is
+  compiled into the binary, identical for every user of a given outrig, and any intermediary
+  may cache it. `mcp` is `private`: the list is the union of one session's backing servers.
+  Both declare a five-minute window. Both also advertise an explicit list of revisions they
+  serve, so a client asking for something newer is negotiated down instead of being answered in
+  a revision outrig has never spoken.
+
+  Both also stop answering `resources/list`, `prompts/list`, and `resources/templates/list`,
+  which they never had a resource or a prompt to put in. rmcp replied to all three from default
+  handler bodies with an empty success -- a surface neither server advertises, malformed on
+  `2026-07-28` in the same way `tools/list` was. They now return method-not-found.
+
 ### Removed
 
 - **Breaking (library):** this crate's internals are no longer a public path. `builtin_tool`,

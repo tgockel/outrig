@@ -397,6 +397,45 @@ You can list every tool currently registered with the agent from inside the REPL
 >
 ```
 
+## Protocol revisions and list caching
+
+Both servers outrig exposes -- the session proxy (`outrig mcp`) and the self-description server
+(`outrig mcp self`) -- advertise an explicit list of MCP protocol revisions rather than deferring
+to whatever the underlying SDK happens to know:
+
+| Revision     | Served |
+| ------------ | ------ |
+| `2024-11-05` | yes    |
+| `2025-03-26` | yes    |
+| `2025-06-18` | yes    |
+| `2025-11-25` | yes    |
+| `2026-07-28` | yes    |
+
+The list is pinned deliberately. An SDK upgrade that teaches the library a newer revision would
+otherwise widen what outrig agrees to speak without anyone checking that outrig actually meets the
+new revision's requirements -- and a revision can add *mandatory* response fields, which turns a
+silent widening into a client that cannot load any tools at all. A client asking for a revision
+outside this list is answered with the server's own default -- `2025-11-25` today -- which is
+always one of the pinned revisions. Note that this is a fallback rather than a step down: a
+client asking for something older than anything listed is answered in a *newer* revision, not an
+older one.
+
+From `2026-07-28` onward, list results must carry cache metadata (SEP-2549): how long the result
+may be treated as fresh, and who may cache it. Both servers tag `tools/list` accordingly:
+
+`outrig mcp self`
+: `cacheScope: public`. The tool set is compiled into the binary, so it is identical for every
+  user of a given outrig version and any intermediary may cache it.
+
+`outrig mcp`
+: `cacheScope: private`. The tool list is the union of this session's backing servers, which
+  depends on the active config, image-config, and any `--env` overrides -- not shareable.
+
+Both declare a five-minute freshness window. Neither tool list can actually change mid-connection
+(the table is built once at startup, and no `listChanged` capability is advertised), so a longer
+window would still be truthful; five minutes is chosen so that a config edit or a rebuilt image is
+picked up promptly on the next session.
+
 ## What if a server crashes mid-session?
 
 A crashed MCP server is surfaced as a tool-call error to the LLM, which usually causes the model

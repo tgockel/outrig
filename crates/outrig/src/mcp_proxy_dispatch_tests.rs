@@ -6,10 +6,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rmcp::model::{CallToolRequestParams, ContentBlock};
+use rmcp::ServerHandler;
+use rmcp::model::{CacheScope, CallToolRequestParams, ContentBlock, ProtocolVersion};
 use serde_json::{Value, json};
 
-use super::{BackingClient, ProxyServer, sealed};
+use super::{BackingClient, ProxyServer, SUPPORTED_PROTOCOL_VERSIONS, TOOLS_TTL_MS, sealed};
 use crate::error::OutrigError;
 use crate::mcp::{McpTool, McpToolResult};
 
@@ -141,6 +142,33 @@ async fn list_tools_unions_namespaces_and_preserves_order() {
         Value::Object(read_file.input_schema.as_ref().clone()),
         json!({"type": "object"})
     );
+}
+
+#[tokio::test]
+async fn list_tools_carries_sep_2549_cache_metadata() {
+    let fs = Arc::new(FakeClient::new("fs").with_tool("read_file"));
+    let proxy = ProxyServer::build(vec![fs]).await.unwrap();
+
+    // Required fields as of protocol revision 2026-07-28; omitting them makes a
+    // conforming client reject `tools/list` outright.
+    let listing = proxy.list_tools_inner();
+    assert_eq!(listing.ttl_ms, Some(TOOLS_TTL_MS));
+    // `Private`: the union is specific to this session's config and overrides.
+    assert_eq!(listing.cache_scope, Some(CacheScope::Private));
+}
+
+#[tokio::test]
+async fn advertises_the_audited_protocol_versions() {
+    // Pinned rather than inherited from `ProtocolVersion::KNOWN_VERSIONS`, so an
+    // rmcp upgrade cannot widen what this server agrees to speak without review.
+    let proxy = ProxyServer::build(vec![Arc::new(FakeClient::new("fs"))])
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy.supported_protocol_versions().as_ref(),
+        SUPPORTED_PROTOCOL_VERSIONS,
+    );
+    assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28));
 }
 
 #[tokio::test]

@@ -1,11 +1,15 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
+use outrig::mcp_proxy::SUPPORTED_PROTOCOL_VERSIONS;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-    ToolAnnotations,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    Implementation, JsonObject, ListPromptsRequestMethod, ListPromptsResult,
+    ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use schemars::JsonSchema;
@@ -20,6 +24,13 @@ use crate::mcp_self::args::{
     ValidateConfigArgs, ValidateDockerfileArgs,
 };
 use crate::mcp_self::{docs, schema, suggestions, validate};
+
+/// How long a client may treat a `tools/list` response as fresh (SEP-2549).
+///
+/// This server's tool set is compiled in, so the list cannot change for the life
+/// of the process and no `listChanged` capability is advertised. Five minutes
+/// keeps an `outrig` upgrade visible promptly rather than maximizing cache hits.
+const TOOLS_TTL_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct SelfServer;
@@ -41,6 +52,17 @@ pub async fn serve_stdio() -> Result<i32> {
 }
 
 impl SelfServer {
+    /// Build a `tools/list` response. Split out of [`ServerHandler::list_tools`]
+    /// -- as [`outrig::mcp_proxy::ProxyServer::list_tools_inner`] is -- so the
+    /// listing can be read without fabricating an rmcp [`RequestContext`].
+    pub(crate) fn list_tools_inner() -> ListToolsResult {
+        // `Public`: the tool set is compiled in, so it is identical for every user
+        // of a given binary version and any intermediary may cache it.
+        ListToolsResult::with_all_items(Self::tools())
+            .with_ttl_ms(TOOLS_TTL_MS)
+            .with_cache_scope(CacheScope::Public)
+    }
+
     pub(crate) fn tools() -> Vec<Tool> {
         vec![
             tool::<EmptyArgs>(
@@ -137,6 +159,10 @@ impl SelfServer {
 }
 
 impl ServerHandler for SelfServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
@@ -157,7 +183,38 @@ impl ServerHandler for SelfServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(Self::tools()))
+        Ok(Self::list_tools_inner())
+    }
+
+    // rmcp answers these from default handler bodies with an empty, successful
+    // result -- advertised capabilities do not gate dispatch. That is wrong twice
+    // over: it claims a surface this server does not have, and from revision `2026-07-28`
+    // the default result is malformed, carrying `resultType` but neither `ttlMs`
+    // nor `cacheScope`. It advertises tools only, so say so.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourcesResult, McpError> {
+        Err(McpError::method_not_found::<ListResourcesRequestMethod>())
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListResourceTemplatesResult, McpError> {
+        Err(McpError::method_not_found::<
+            ListResourceTemplatesRequestMethod,
+        >())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListPromptsResult, McpError> {
+        Err(McpError::method_not_found::<ListPromptsRequestMethod>())
     }
 
     async fn call_tool(
@@ -270,6 +327,26 @@ mod tests {
             assert_eq!(annotations.open_world_hint, Some(false));
             assert!(annotations.title.is_some());
         }
+    }
+
+    #[test]
+    fn tool_list_carries_sep_2549_cache_metadata() {
+        // Required fields as of protocol revision 2026-07-28; omitting them makes
+        // a conforming client reject `tools/list` outright.
+        let listing = SelfServer::list_tools_inner();
+        assert_eq!(listing.ttl_ms, Some(TOOLS_TTL_MS));
+        assert_eq!(listing.cache_scope, Some(CacheScope::Public));
+    }
+
+    #[test]
+    fn advertises_the_audited_protocol_versions() {
+        // Pinned rather than inherited from `ProtocolVersion::KNOWN_VERSIONS`, so an
+        // rmcp upgrade cannot widen what this server agrees to speak without review.
+        assert_eq!(
+            SelfServer.supported_protocol_versions().as_ref(),
+            SUPPORTED_PROTOCOL_VERSIONS,
+        );
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2026_07_28));
     }
 
     #[test]

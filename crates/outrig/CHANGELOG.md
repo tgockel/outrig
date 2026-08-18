@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`mcp_proxy::SUPPORTED_PROTOCOL_VERSIONS`**, the ordered list of MCP protocol revisions
+  outrig's servers are known to serve correctly, and
+  `ProxyServer::supported_protocol_versions` returning it. Both exist so the ceiling on what
+  `initialize` may agree to is outrig's own rather than whichever revisions the SDK happens to
+  know; see **Fixed** for what the inherited one cost.
+
+### Fixed
+
+- **`tools/list` carries the cache metadata protocol revision `2026-07-28` requires.** That
+  revision adopted SEP-2549, which makes `ttlMs` and `cacheScope` mandatory on list results.
+  `ListToolsResult::with_all_items` leaves both `None`, and both are
+  `skip_serializing_if = "Option::is_none"`, so neither ever reached the wire and a conforming
+  client rejected the response outright -- not a short tool list but no tools at all, every
+  backing server unreachable through a proxy that had started perfectly. The proxy now answers
+  `ttlMs = 300000` and `cacheScope = private`: private because the union is specific to one
+  session's config, image-config, and `--env` overrides, and five minutes because although the
+  table is frozen at `ProxyServer::build` time and no `listChanged` capability is advertised --
+  so a far longer window would still be truthful -- a config edit or a rebuilt image ought to
+  be picked up by the next session.
+
+  No outrig source had to change for this to start happening. `supported_protocol_versions`
+  defaults to every revision the SDK can name, so upgrading rmcp 2.2 -> 3.1 moved the ceiling
+  onto `2026-07-28` underneath a server that did not satisfy it. `ProxyServer` now overrides
+  the method with `SUPPORTED_PROTOCOL_VERSIONS`, and a client asking for a revision outside
+  that list is answered with the server's own default -- `2025-11-25` today -- rather than in
+  one outrig has never served. That is a fallback, not a step down: a request older than
+  anything listed is answered in a newer revision, not an older one. Adding an
+  entry there is an assertion that the servers meet that revision's requirements, which makes
+  it a deliberate step on an rmcp upgrade instead of a silent one.
+
+- **`resources/list`, `prompts/list`, and `resources/templates/list` say method-not-found**
+  instead of answering. `ProxyServer` advertises `tools` only, but advertised capabilities do
+  not gate dispatch: rmcp answered all three from default handler bodies with an empty,
+  successful result. That claimed a surface the proxy does not have, and from `2026-07-28` the
+  default result was malformed in exactly the way `tools/list` was -- `resultType` present,
+  `ttlMs` and `cacheScope` absent. A capability-respecting client never asked, which is why this
+  went unnoticed; the three methods now return `-32601`, matching the capability set.
+
 ## [0.2.0-rc.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.2) - 2026-08-12
 
 A second release candidate, cut because the cycle kept breaking the public surface after rc.1

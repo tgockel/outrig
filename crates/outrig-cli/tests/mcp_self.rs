@@ -249,3 +249,155 @@ where
     serde_json::from_str(&body)
         .unwrap_or_else(|err| panic!("tools/call {name} returned invalid JSON {body:?}: {err}"))
 }
+
+/// Regression for the `tools/list` rejection reported against protocol revision
+/// `2026-07-28`, which made the SEP-2549 `ttlMs` / `cacheScope` fields mandatory
+/// on list results. The server negotiated that revision but omitted both, so a
+/// conforming client rejected the response and loaded no tools at all.
+///
+/// Deliberately raw line-delimited JSON-RPC rather than rmcp's own client: both
+/// fields deserialize into `Option`, so a typed client happily accepts their
+/// absence and would not have caught the regression. Only the wire bytes will.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_list_carries_cache_metadata_on_the_2026_07_28_revision() {
+    init_tracing();
+
+    for (requested, expected_negotiated) in [
+        ("2026-07-28", "2026-07-28"),
+        // A revision OutRig has not audited must never be echoed back. rmcp
+        // answers an unsupported request with the server's own default rather
+        // than the highest version it supports, so this lands on 2025-11-25 --
+        // the point is only that it is a version from the pinned list.
+        ("2027-01-01", "2025-11-25"),
+    ] {
+        let result = raw_tools_list(requested).await;
+
+        assert_eq!(
+            result["initialize"]["protocolVersion"], expected_negotiated,
+            "requesting {requested} should negotiate {expected_negotiated}: {result}",
+        );
+
+        let listing = &result["tools/list"];
+        assert!(
+            listing["ttlMs"].is_number(),
+            "tools/list must carry a numeric ttlMs on {expected_negotiated}: {listing}",
+        );
+        assert!(
+            matches!(listing["cacheScope"].as_str(), Some("public" | "private")),
+            "tools/list must carry a public/private cacheScope on \
+             {expected_negotiated}: {listing}",
+        );
+        assert_eq!(
+            listing["cacheScope"], "public",
+            "the self server's tool set is compiled in, so it is publicly cacheable",
+        );
+        assert_eq!(
+            listing["ttlMs"], 300_000,
+            "tools/list TTL should match the server's declared freshness window",
+        );
+        assert!(
+            !listing["tools"].as_array().expect("tools array").is_empty(),
+            "tools/list should not be empty: {listing}",
+        );
+
+        // The capability set is tools-only, so the other list methods must say
+        // method-not-found rather than answer. rmcp's default handler bodies
+        // return an empty success carrying `resultType` but neither cache field
+        // -- the same malformed shape, on a surface this server does not have.
+        for method in ["resources/list", "resources/templates/list", "prompts/list"] {
+            let error = &result["errors"][method];
+            assert_eq!(
+                error["code"], -32601,
+                "{method} should be method-not-found on {expected_negotiated}: {error}",
+            );
+        }
+    }
+}
+
+/// Drive `outrig mcp self` over stdio with hand-written JSON-RPC, initializing at
+/// `protocol_version`. Returns the raw `initialize` and `tools/list` result objects.
+async fn raw_tools_list(protocol_version: &str) -> Value {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    let mut child = Command::new(bin)
+        .args(["mcp", "self"])
+        .current_dir(cwd.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn outrig mcp self");
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
+
+    let work = async {
+        for request in [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "outrig-test", "version": "1.0.0"},
+                },
+            }),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "resources/templates/list"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 5, "method": "prompts/list"}),
+        ] {
+            stdin
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .expect("write request");
+            stdin.flush().await.expect("flush request");
+        }
+
+        // Responses carry the request id; notifications carry none. Collect the
+        // two replies we asked for and ignore anything else on the stream.
+        let mut initialize = Value::Null;
+        let mut tools_list = Value::Null;
+        let mut errors = serde_json::Map::new();
+        while initialize.is_null() || tools_list.is_null() || errors.len() < 3 {
+            let line = stdout
+                .next_line()
+                .await
+                .expect("read stdout")
+                .expect("server closed stdout before answering");
+            let message: Value = match serde_json::from_str(&line) {
+                Ok(message) => message,
+                Err(_) => continue,
+            };
+            match message.get("id").and_then(Value::as_u64) {
+                Some(1) => initialize = message["result"].clone(),
+                Some(2) => tools_list = message["result"].clone(),
+                Some(id @ 3..=5) => {
+                    let method = match id {
+                        3 => "resources/list",
+                        4 => "resources/templates/list",
+                        _ => "prompts/list",
+                    };
+                    errors.insert(method.to_string(), message["error"].clone());
+                }
+                _ => continue,
+            }
+        }
+        serde_json::json!({
+            "initialize": initialize,
+            "tools/list": tools_list,
+            "errors": Value::Object(errors),
+        })
+    };
+
+    let result = timeout(TEST_TIMEOUT, work)
+        .await
+        .unwrap_or_else(|_| panic!("raw tools/list did not finish within {TEST_TIMEOUT:?}"));
+    let _ = child.kill().await;
+    result
+}
