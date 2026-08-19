@@ -51,4 +51,7 @@ walkdir            = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json", "rustls"] }
+# `test-util` pauses the clock so the interceptor's sniff window can be driven
+# deterministically rather than slept through.
+tokio   = { workspace = true, features = ["test-util"] }
 toml    = { workspace = true, features = ["parse", "serde"] }

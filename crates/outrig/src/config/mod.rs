@@ -1622,8 +1622,16 @@ impl NetworkConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NetworkHostPattern {
     Ip(IpAddr),
-    Cidr { base: IpAddr, prefix: u8 },
+    Cidr {
+        base: IpAddr,
+        prefix: u8,
+    },
+    /// A glob over hostnames, so it needs a name to match against.
     HostGlob(String),
+    /// A glob with no letter in it (`*`, `10.0.*`): it describes addresses
+    /// rather than names, so the interceptor matches it against the
+    /// destination address itself.
+    AddressGlob(String),
 }
 
 pub(crate) fn parse_network_host_pattern(
@@ -1674,7 +1682,12 @@ pub(crate) fn parse_network_host_pattern(
             return Err("has an invalid hostname glob".to_string());
         }
     }
-    Ok(NetworkHostPattern::HostGlob(host.to_ascii_lowercase()))
+    let glob = host.to_ascii_lowercase();
+    if glob.chars().any(|c| c.is_ascii_alphabetic()) {
+        Ok(NetworkHostPattern::HostGlob(glob))
+    } else {
+        Ok(NetworkHostPattern::AddressGlob(glob))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

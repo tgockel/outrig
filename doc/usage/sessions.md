@@ -170,8 +170,10 @@ The log uses Zeek field names where OutRig has equivalent data: `ts` is Unix epo
 `id.resp_h` / `id.resp_p` identify the remote endpoint, `proto` is the transport, `service` is
 the sniffed application (`http`, `ssl`, `ssh`, or `-`), `duration` is seconds, and
 `orig_bytes` / `resp_bytes` count bytes sent and received by the container. OutRig-specific
-metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`, and
-`outrig.host`.
+metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule`,
+`outrig.host`, and `outrig.host_source`. The last of those is `resolved` when the name in
+`outrig.host` is one the interceptor validated for that address and `asserted` when the
+container merely claimed it -- only a resolved name can have granted a hostname allow rule.
 
 ## `outrig discard`
 

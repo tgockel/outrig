@@ -1,9 +1,9 @@
 # 0064 -- Network interceptor MITM
 
-> **Not `plan/todo/0114-hostname-rules-need-a-bound-destination.md`.** 0114 fixes a policy
-> bypass: a client-supplied `Host`/SNI can currently authorize an unrelated destination IP. It
-> needs no TLS termination and does not overlap this entry, which is the opt-in MITM work that
-> makes URLs and bodies visible to policy. This entry stays post-v0.
+> **Not `plan/done/0114-hostname-rules-need-a-bound-destination.md`.** 0114 fixed a policy
+> bypass: a client-supplied `Host`/SNI could authorize an unrelated destination IP. It needed
+> no TLS termination and does not overlap this entry, which is the opt-in MITM work that makes
+> URLs and bodies visible to policy. This entry stays post-v0.
 
 ## Context
 

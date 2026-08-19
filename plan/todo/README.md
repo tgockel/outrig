@@ -8,7 +8,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Queue
 
-`0114`-`0129` are the 0.2.0 release gate, derived from an external release-readiness audit of
+`0115`-`0129` are the 0.2.0 release gate, derived from an external release-readiness audit of
 `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering below is that report's
 recommended sequencing: security semantics, then lifecycle, then the public-surface changes that
 have to happen before the freeze, then release engineering. Each task carries its own evidence;
@@ -18,7 +18,6 @@ the report is not in the tree.
 
 | Task   | What it settles                                                     |
 | ------ | ------------------------------------------------------------------- |
-| `0114` | A hostname rule grants only against a destination bound to that name |
 | `0115` | A declared repo `[network]` is structural, not a hidden bit         |
 
 **Process and attachment lifecycle**

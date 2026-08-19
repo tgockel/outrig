@@ -951,9 +951,7 @@ fn check_glob_syntax(pattern: &str) -> Result<(), &'static str> {
         match c {
             // Go's Match escapes the next character; a trailing `\` has none.
             '\\' => {
-                if chars.next().is_none() {
-                    return Err("ends with a dangling `\\` escape");
-                }
+                chars.next().ok_or("ends with a dangling `\\` escape")?;
             }
             '[' => {
                 // A class may open with a negation, then needs at least one

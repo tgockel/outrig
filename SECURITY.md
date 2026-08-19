@@ -39,6 +39,9 @@ Issues that bear on **host integrity** are in scope, for example:
 - OutRig leaking host secrets, credentials, or environment into the container when not
   configured to.
 - The network interceptor failing to enforce a configured host:port allow/deny policy.
+- A name the container merely asserts -- a TLS `ClientHello` SNI or an HTTP `Host:` header --
+  satisfying a hostname `allow` entry. A hostname rule grants only against a destination the
+  interceptor itself resolved to that name.
 - Capability handling that is more permissive than the selected capability profile
   (`default` / `no-net-raw` / `drop-all`).
 - A container launched more permissively than its `[images.<name>.security]` block asks for --
@@ -65,8 +68,13 @@ Issues that bear on **host integrity** are in scope, for example:
   image is as trusted as the primary image. It is opt-in, defaults to `"none"`, and remains a
   container (cgroups, seccomp, network policy, and `no-new-privileges` still apply; only the
   mount namespace is joined). See [MCP Trust Model](doc/concepts/mcp-trust-model.md).
-- Network filtering in 0.1 is **host:port allow/deny plus DNS and audit logging**, not TLS
+- Network filtering is **host:port allow/deny plus DNS and audit logging**, not TLS
   interception. HTTPS MITM is explicitly deferred to a later release.
+- Hostname **deny** rules are best-effort against a hostile client. A container that resolves a
+  name through the interceptor is bound to it and cannot shed that binding, but one that
+  connects by address and asserts no name at all offers nothing to match against. Hostname deny
+  rules describe traffic, not a containment boundary; bound a hostile container with address,
+  CIDR, and port rules, or with `default = "deny"`.
 
 Treat the container as you would any environment where you grant an agent real tools: put only
 what the agent should be able to use inside the boundary.

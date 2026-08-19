@@ -181,6 +181,16 @@ allow entries, and unmatched connections use `default`. A denied connection is c
 immediately and still writes a `network.jsonl` record with `outrig.action = "deny"` and zero
 byte counts, so the audit log is the place to diagnose network policy failures.
 
+A hostname entry in `allow` grants only against a destination outrig resolved to that name
+itself, through the container's own lookup at the interceptor's DNS listener. A name the
+container writes into a `Host:` header or a TLS `ClientHello` is a claim rather than evidence:
+it can match a `deny` entry, but it cannot authorize an address outrig never resolved to that
+name. A glob with no letter in it (`*`, `10.0.*`) is matched against the destination
+address instead, and never against a name. An `allow` entry with no such binding does not
+match, and evaluation falls through to the remaining entries and then `default`. This
+narrowed in 0.2.0; see
+[Reference -> Config](../reference/config.md) for what an existing allowlist now permits.
+
 When network mode is `default`, outrig leaves Podman's configured default networking in place,
 does not install nftables rules, does not rewrite container DNS, and does not create
 `network.jsonl`. Systems without nftables or namespace support therefore keep running normal

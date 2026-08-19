@@ -1,6 +1,8 @@
 //! End-to-end smoke for audit-mode network interception. Gated behind
 //! `--features e2e` because it needs podman/buildah and nftables namespace
-//! access.
+//! access. [`a_resolved_name_grants_a_hostname_allow`] additionally needs
+//! working outbound DNS, since resolving through the interceptor is the whole
+//! point of it.
 //!
 //! Run with:
 //!
@@ -574,4 +576,143 @@ async fn two_containers_filter_mode_attributes_denials() {
     }
 
     shutdown_and_stop(interceptor, [container_a, container_b]).await;
+}
+
+/// A hostname rule grants against a destination the container resolved through
+/// the interceptor's own DNS listener. This is the test that fails if the fix
+/// for the forged-identity bypass stops at refusing client-asserted names: with
+/// nothing else granting, `allow[0]` can only have come from a validated
+/// binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resolved_name_grants_a_hostname_allow() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("example.com", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    // No `--resolve`: the name has to go through the interceptor's DNS
+    // listener, which is what earns the binding.
+    let _ = try_capture(&mut curl_cmd(&container, &[], "https://example.com/"));
+
+    let records = read_audit_records_until(&log_dir, |records| {
+        records
+            .iter()
+            .any(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+    })
+    .await;
+    let record = records
+        .iter()
+        .find(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+        .unwrap_or_else(|| panic!("no example.com:443 audit record in {records:#?}"));
+
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("allow"),
+        "a resolved name should grant its hostname rule: {record:#?}"
+    );
+    assert_eq!(
+        record.get("outrig.rule").and_then(Value::as_str),
+        Some("allow[0]")
+    );
+
+    interceptor.shutdown().await;
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// The audited bypass, live: connect straight to an address and claim the
+/// allowlisted name in the `ClientHello`. The claim never reaches the allow
+/// list, and the record says the name in it was asserted rather than resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_sni_does_not_grant_a_hostname_allow() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+    let host_ip = container_host_ipv4(&container);
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("allowed.test", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let output = try_capture(&mut curl_cmd(
+        &container,
+        &["--resolve", &format!("allowed.test:443:{host_ip}")],
+        "https://allowed.test/",
+    ));
+    assert!(
+        !output.status.success(),
+        "a client-asserted name must not grant a hostname allow"
+    );
+
+    let records = read_audit_records(&log_dir).await;
+    let record = records
+        .iter()
+        .find(|record| record.get("id.resp_p").and_then(Value::as_u64) == Some(443))
+        .unwrap_or_else(|| panic!("no allowed.test:443 audit record in {records:#?}"));
+
+    assert_eq!(
+        record.get("outrig.action").and_then(Value::as_str),
+        Some("deny")
+    );
+    assert_eq!(
+        record.get("outrig.rule").and_then(Value::as_str),
+        Some("default"),
+        "the allow entry must not have matched: {record:#?}"
+    );
+    assert_eq!(record_host(record), Some("allowed.test"));
+    assert_eq!(
+        record.get("outrig.host_source").and_then(Value::as_str),
+        Some("asserted"),
+        "the record should say the name in it was a claim: {record:#?}"
+    );
+    assert_eq!(record.get("orig_bytes").and_then(Value::as_u64), Some(0));
+
+    interceptor.shutdown().await;
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
 }

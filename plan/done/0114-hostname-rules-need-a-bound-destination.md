@@ -183,3 +183,118 @@ is exercised by 0128.
   (844), `dns_loop` (805), `handle_tcp` (624), `SNIFF_TIMEOUT` (50).
 - `plan/next/network-interceptor-mitm.md` -- the adjacent entry this task is *not*.
 - `plan/done/0060-network-interceptor-enforcement.md` -- where host:port enforcement was built.
+
+## Decisions
+
+- **Fork 1 -- an unbound hostname rule does not match.** A hostname `allow` entry with no
+  resolved binding falls through: evaluation continues with the remaining entries and then
+  `default`. Denying outright was rejected because it turns an allow entry into a deny and so
+  inverts what `default = "allow"` means; resolving rule hostnames in the interceptor was
+  rejected because it puts a host-side lookup on the policy path and lets a hostile authority
+  choose which addresses an allow entry covers. Under `default = "deny"` the practical effect
+  is that name resolution has to go through the interceptor, which it does by construction --
+  `/etc/resolv.conf` is rewritten and nft redirects UDP/53.
+
+- **Fork 2 -- late identity is re-evaluated, not documented away.** `bridge` re-runs `decide`
+  on the client's first bytes whenever the sniff window expired without an assertion, and tears
+  the connection down with a deny record before any of those bytes reach upstream. Rejecting
+  the `default = "allow"` plus hostname-deny configuration shape at validation time was the
+  alternative; it was rejected because that shape is legal today and useful, and because the
+  window is closed properly rather than declared unreachable. The cost is that the un-sniffed
+  path uses a manual split bridge instead of `copy_bidirectional`.
+
+- **Fork 3 -- address-shaped globs keep the destination-address path, and *only* that path.**
+  A glob with no ASCII letter in it (`*`, `10.0.*`) still matches the destination address's
+  text; a glob with a letter needs resolved identity. An address glob is deliberately not
+  matched against resolved names either: `10.0.attacker.example` is a name anyone can register,
+  and letting it satisfy `allow = ["10.0.*"]` would grant an arbitrary destination. The base
+  code did match the cached hostname there, so this narrows an existing rule rather than
+  preserving it. `allow = ["*"]` and `deny = ["*:22"]` are documented examples
+  and both keep working. The distinction is drawn by `parse_network_host_pattern`, which owns
+  the pattern grammar: it now returns `NetworkHostPattern::AddressGlob` alongside `HostGlob`,
+  so the interceptor matches on a variant rather than re-scanning the glob for letters. Keeping
+  the classification next to the parser means a future change to the glob charset cannot
+  silently change what counts as address-shaped.
+
+- **Fork 4 -- stated as a breaking change** in `doc/reference/config.md`, since an existing
+  allowlist is narrower under the new rule.
+
+- **Trusted identity and client assertion are separate types.** `Sniff` is gone. `ResolvedNames`
+  carries what the attachment's DNS listener validated; `ClientAssertion` carries what the
+  client claimed. `CompiledNetworkEntry::matches` takes `claimed: Option<&str>`, and `decide`
+  passes `asserted.asserted_host()` when walking the deny list and `None` when walking the
+  allow list. That puts the whole property on one readable line in `decide` rather than behind
+  a discriminant an entry could misread. `Ip` and `Cidr` allow entries lost their
+  asserted-address disjunct for the same reason the hostname one went.
+
+- **The service label moved off `ClientAssertion`.** It is derived from which parser matched,
+  and the ssh case is settled by the *server's* banner -- so a field on the untrusted-input
+  type would have had a standing exemption from being untrusted input. `ConnOutcome` and
+  `AuditEvent` carry it instead, leaving `ClientAssertion` to hold only what the client said.
+
+- **`NameBindings` replaces `DnsCache`.** Keyed address -> name -> expiry, so one address holds
+  several names; TTLs are clamped to `[30s, 1h]` (a TTL-0 answer must still serve the
+  connection that prompted it, and a generous TTL must not pin a name for the session); the map
+  is capped at 4096 addresses and evicts the soonest-expiring entry. It is constructed in
+  `attach`, and `NetworkInterceptor` no longer has a field for it at all -- the absence of a
+  session-global map is the compile-time half of the per-attachment guarantee.
+
+- **A decoded name has to be a name that could have been written.** A wire label is a counted
+  byte string and may legally contain a `.`, so `read_dns_name` validated nothing while
+  producing the one string able to grant a hostname rule. The wire labels
+  `["allowed.evil", "attacker", "example"]` -- a name genuinely delegated to whoever runs
+  `attacker.example` -- decoded to `allowed.evil.attacker.example` and satisfied
+  `allow = ["allowed.*"]`, binding any address that authority chose, with no client assertion
+  anywhere in it. Labels are now rejected unless they are 1-63 bytes of letters, digits, `-`,
+  or `_`; an unrepresentable name parses to nothing and therefore binds nothing. The length
+  half matters independently: a length byte with reserved high bits can claim more than 63.
+
+  Framing and meaning are decided separately, by `skip_dns_name` and `read_dns_name`
+  respectively. Walking the answer section with the strict decoder made one record the policy
+  cannot name end the walk, so a resolver that put such a record first would hide the address
+  record after it and turn a hostname allow into a denial. A structurally malformed packet
+  still stops the walk; a merely unnameable owner only makes its own record ineligible.
+
+- **Addresses bind under the queried name only.** The CNAME chain decides *which* answer
+  records belong to the query; the name recorded is always the queried one. Binding chain
+  members would let an authority for `attacker.example` answer
+  `attacker.example CNAME allowed.example` plus `allowed.example A <its own address>` and mint
+  a binding for a name it does not own.
+
+- **Truncated and error responses are forwarded but bind nothing.** Retrying over TCP was out of
+  scope; the container's stub resolver retries on its own, and a `TC=1` answer authorizing
+  nothing is the safe reading. The same holds for a query the interceptor cannot parse at all:
+  it is forwarded and its reply passed straight back, binding nothing. The receive loop has to
+  accept that reply explicitly, because a loop whose acceptance test can never pass would hold
+  the attachment's only DNS listener for the full timeout per resolver and stall every query
+  behind it.
+
+- **Bytes are counted as they move, not when a copy returns.** `try_join!` cancels the sibling
+  direction when one fails -- which the late-deny path does deliberately -- and a cancelled
+  `tokio::io::copy` takes its running total with it. A connection denied on a late name had
+  already delivered the server's greeting to the container, and the record claimed zero
+  response bytes, which also mislabeled `conn_state` as `S0`. `write_counting` credits each
+  write as it lands rather than each completed `write_all`, so a write that delivers a prefix
+  and then fails or is cancelled does not drop up to a chunk from the record.
+
+- **Audit records gained `outrig.host_source`.** `outrig.host` keeps its meaning (the asserted
+  name when there is one, else a resolved name) so existing tooling and e2e assertions still
+  work; the new field says whether that name was evidence or a claim.
+
+- **The DNS-validation acceptance criteria are met at the unit tier, not the live tier.** The
+  task listed "a DNS response from an unexpected source or with a mismatched transaction ID
+  binds nothing" under the live interceptor. Driving that through a live attachment would need
+  control of the host's resolver path, which the e2e harness does not have.
+  `forward_dns_ignores_datagrams_that_do_not_answer_the_query` gets the same evidence with real
+  UDP sockets: a fake resolver, a second socket spoofing a response to the interceptor's
+  ephemeral port, and a stale transaction id, all discarded in favor of the genuine answer.
+
+- **The resolved set is read after the sniff, not before.** The window is up to
+  `SNIFF_TIMEOUT` long, and a lookup the container completes inside it is evidence the
+  connection is entitled to have weighed. Reading first could only lose a deny -- a missing
+  binding fails a hostname allow closed -- but the base code did refresh after the read, and
+  dropping that was an unforced narrowing.
+
+- **One out-of-scope fix rode along.** `check_glob_syntax` in `config/validate.rs` tripped
+  `clippy::collapsible_match` on current stable, which made the task's own
+  `clippy -D warnings` gate unpassable. It is a one-line rewrite to `ok_or(..)?`.

@@ -157,6 +157,53 @@ connections are closed immediately and still write an audit record with
 `outrig.action = "deny"`, `outrig.rule`, and zero byte counts. `mode = "filter"` requires at
 least one `allow` or `deny` entry, even when `default = "allow"`.
 
+### What a hostname rule matches
+
+A hostname entry in `allow` grants only against a destination outrig itself resolved to that
+name. The evidence is the container's own DNS lookup: the interceptor answers the query,
+validates the response, and binds the addresses that response attributes to the queried name.
+A binding lasts as long as the answering record's TTL, clamped to between 30 seconds and one
+hour -- the floor keeps a TTL-0 answer usable by the connection that prompted it, and the
+ceiling stops a generous TTL from pinning a name for the whole session. Bindings belong to the
+container that earned them and are shared with nothing else in the session.
+
+The name a client writes into a TLS `ClientHello` or an HTTP `Host:` header is a claim, not
+evidence. It can match a `deny` entry -- a forged name there costs that client only its own
+connection -- but it never matches an `allow` entry. Under the policy below, a container that
+connects straight to `203.0.113.66:443` and announces `allowed.example` is denied, and the same
+container is allowed once it has resolved `allowed.example` to that address through the
+interceptor:
+
+```toml
+[network]
+mode    = "filter"
+default = "deny"
+allow   = ["allowed.example:443"]
+```
+
+A hostname `allow` entry with no binding simply does not match. Evaluation continues with the
+remaining entries and then `default`; the entry is never turned into a deny, so
+`default = "allow"` keeps meaning what it says.
+
+Two consequences worth planning for:
+
+- A container that reaches an address without asking the interceptor's resolver -- a baked
+  `/etc/hosts` entry, a hardcoded address, DNS carried over TCP or HTTPS -- earns no binding, so
+  hostname `allow` entries do not cover it. Address and CIDR entries still do.
+- A host glob with no letter in it (`*`, `10.0.*`, `192.168.*`) describes addresses rather than
+  names: it is matched against the destination address and never against a resolved name, so a
+  registrable hostname that happens to match it (`10.0.attacker.example` against `10.0.*`)
+  grants nothing. `allow = ["*"]` and `deny = ["*:22"]` mean exactly what they always did.
+
+Client-asserted names are still recorded. An audit record carries the best known name in
+`outrig.host` and says where it came from in `outrig.host_source`, which is `resolved` for a
+name the interceptor validated and `asserted` for one the client claimed.
+
+> **Changed in 0.2.0.** Before this release a client-supplied `Host:` or SNI satisfied a
+> hostname `allow` entry on its own, so an allowlist permitted more than it appeared to. The
+> same allowlist is narrower now. A container whose name resolution does not go through the
+> interceptor may need address or CIDR entries to keep working.
+
 `outrig run --network default|audit|filter` and `outrig mcp --network default|audit|filter`
 override this setting for one fresh session. `--network audit` and `--network filter` are
 rejected with `outrig mcp --attach` because borrowed containers are not retrofitted with a new
