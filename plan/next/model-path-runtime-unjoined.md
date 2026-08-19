@@ -1,5 +1,9 @@
 # A relative `model-path` validates against one base and loads against another
 
+> **Queued as part of `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md`.** That task
+> decides whether the provider ships operational in 0.2.0 and, if it does, fixes this. The
+> analysis below is why; do not duplicate it there.
+
 > **On a deprecated surface.** `model-path` belongs to `style = "mistralrs"`, now
 > deprecated and scheduled for removal -- see
 > `plan/next/remove-deprecated-local-llm.md`. This is a real bug, but it is in code

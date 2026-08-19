@@ -1,5 +1,10 @@
 # rmcp negotiates protocol revisions it does not fully satisfy
 
+> **Evidence for `plan/todo/0124-narrow-or-freeze-the-low-level-surfaces.md`.** This entry is the
+> concrete measurement of what an rmcp major costs outrig, which is the input to 0124's verdict on
+> whether `ProxyServer`'s rmcp coupling is frozen as supported 0.2.x surface or narrowed. The
+> upstream issue and the three unhandled list methods stay here as work in their own right.
+
 `rmcp` 3.1.0 lists every revision it knows in `ProtocolVersion::KNOWN_VERSIONS`, and
 `ServerHandler::supported_protocol_versions` defaults to exactly that list. A server that does not
 override it therefore agrees to speak whatever the SDK knows -- including revisions whose *required*

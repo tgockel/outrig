@@ -1,5 +1,11 @@
 # A `[security]` key is lowered onto `ContainerLaunchSpec` by hand at four sites
 
+> **Adjacent to `plan/todo/0115-from-config-lowers-the-network-policy.md`**, which fixes a
+> `[network]` block that `LaunchSpec::from_config` does not lower at all. This entry is the
+> ergonomic half for `[security]`: four hand-copied lowering sites, any of which can be forgotten.
+> A single conversion targeting `ContainerLaunchSpec` would close both, so read this before
+> taking 0115.
+
 ## Problem
 
 Adding one `[security]` key costs four identical hand-edits, and the failure mode for

@@ -90,8 +90,8 @@ still needs, in rough order of how often it will bite:
   Entrypoint-stdio containers already skip it (they get `--dns` at create time); the default
   network mode never runs it. Making it argv-shaped, or reusing the namespace-write path the
   user bootstrap already has, would remove the last shell dependency. Unfiled; note that
-  `plan/next/interceptor-detach-resolv-conf.md` wants to snapshot and restore the same file on
-  detach, so whoever touches this write path should read that entry first.
+  `plan/todo/0117-attach-and-detach-are-a-true-inverse-pair.md` snapshots and restores the same
+  file, so whoever touches this write path should read that task first.
 - **`/mnt` and `/proc`, for `view = "primary"` sidecars only.** The launcher's own error text
   asks for them by name.
 
@@ -130,4 +130,5 @@ reason but still inert.
   embed-and-place pattern to copy.
 - `crates/outrig/tests/library_surface.rs` -- `build_shell_less_image`, both a precedent for the
   test fixture and an existing statement that no `CMD` is needed.
-- `plan/next/interceptor-detach-resolv-conf.md` -- the other work on the `resolv.conf` write.
+- `plan/todo/0117-attach-and-detach-are-a-true-inverse-pair.md` -- the other work on the
+  `resolv.conf` write; it absorbed the buffer entry this used to point at.

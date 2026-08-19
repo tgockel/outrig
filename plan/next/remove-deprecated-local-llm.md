@@ -1,5 +1,10 @@
 # Remove the deprecated `local-llm` feature
 
+> **Still buffered, and still post-0.2.0** -- the deprecation has to ship in a released version
+> first. But the open question below (parse error versus no-op) is answered by
+> `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md`, which settles the 0.2.0 behavior.
+> Read 0123's `## Decisions` before executing this entry; the removal inherits that answer.
+
 ## Context
 
 The `local-llm` Cargo feature, the `style = "mistralrs"` provider, and the

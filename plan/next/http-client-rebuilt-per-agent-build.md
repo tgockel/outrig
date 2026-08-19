@@ -61,4 +61,4 @@ unaffected either way -- the cert loading happens during setup, before the clock
 
 - `plan/done/0109-subagent-tree-shutdown-grace.md` -- where this was found.
 - `crates/outrig-cli/src/llm.rs:538` -- `remote_http_client`.
-- `plan/todo/0113-model-alias-failover.md` -- also touches `RetryPolicy`.
+- `plan/done/0113-model-alias-failover.md` -- also touches `RetryPolicy`.

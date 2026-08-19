@@ -1,5 +1,9 @@
 # `style = "mistralrs"` accepts any key at all
 
+> **Queued as part of `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md`.** That task
+> makes the decision this entry is blocked on -- whether `style = "mistralrs"` keeps parsing in
+> 0.2.0 -- and executes this fix if it does. The analysis below is why; do not duplicate it there.
+
 > **Superseded, probably.** `style = "mistralrs"` is now deprecated and scheduled
 > for removal -- see `plan/next/remove-deprecated-local-llm.md`. Reshaping the
 > variant to make `deny_unknown_fields` bite is work on a surface that is going
