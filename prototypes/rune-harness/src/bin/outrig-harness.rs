@@ -1,110 +1,71 @@
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use clap::Parser;
-use outrig_cli::llm::{build_agent, resolve_agent_with_overrides};
-use outrig_cli::session_tool::SessionTool;
-use outrig_rune_harness_prototype::{ExecuteArgs, Invocation};
-use rig::completion::Message;
-use rig::tool::{ToolDyn, ToolError};
-use rig::wasm_compat::WasmBoxedFuture;
-use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use outrig_cli::llm::{build_agent, resolve_agent_with_overrides, RigAgent};
+use outrig_rune_harness_prototype::{
+    channels, ActivationRequest, AgentDriver, Decision, EventBridge, ExternalEvent, Invocation,
+    ModelBackend,
+};
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser, Debug)]
-#[command(about = "Scenario-specific real-model Rune harness prototype")]
+#[command(about = "Event-driven, host-scoped Rune agent prototype")]
 struct Args {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    #[arg(long)]
-    file: PathBuf,
     #[arg(long)]
     agent: Option<String>,
     #[arg(long)]
     model: Option<String>,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct RuneToolError(String);
-
-#[derive(Clone)]
-struct ExecuteRune {
-    invocation: Arc<Mutex<Invocation>>,
+struct RealModel {
+    agent: RigAgent,
 }
-impl ToolDyn for ExecuteRune {
-    fn name(&self) -> String {
-        "execute_rune".to_string()
-    }
-    fn description(&self) -> String {
-        "Execute one supported Rune source form in the persistent scenario scope. Use doc(fs), read the selected path once into retained source, or print a numeric source slice.".to_string()
-    }
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "source": { "type": "string", "description": "One documented supported Rune source form." } },
-            "required": ["source"],
-            "additionalProperties": false
-        })
-    }
-    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let args: ExecuteArgs = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
-            self.invocation
-                .lock()
-                .expect("Rune invocation mutex")
-                .execute(&args.source)
-                .map_err(|error| {
-                    ToolError::ToolCallError(Box::new(RuneToolError(error.to_string())))
-                })
-        })
-    }
-}
-
-fn selected_file(repo: &Path, file: &Path) -> Result<(PathBuf, PathBuf)> {
-    let repo = repo
-        .canonicalize()
-        .with_context(|| format!("canonicalize repo {}", repo.display()))?;
-    let candidate = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        repo.join(file)
-    };
-    let file = candidate
-        .canonicalize()
-        .with_context(|| format!("canonicalize selected file {}", candidate.display()))?;
-    if !file.starts_with(&repo) {
-        bail!(
-            "selected file {} is outside repo root {}",
-            file.display(),
-            repo.display()
+#[async_trait(?Send)]
+impl ModelBackend for RealModel {
+    async fn activate(&mut self, request: ActivationRequest) -> Result<Decision> {
+        let schema = r#"Reply with JSON only, exactly one of:
+{"decision":"execute_rune","source":"Rune snippet body"}
+{"decision":"emit","text":"user-facing answer"}
+Do not add markdown fences."#;
+        let prompt = format!(
+            "{schema}\n\nActivation request (there are no prior provider messages):\n{}",
+            serde_json::to_string_pretty(&request)?
         );
+        let text = self
+            .agent
+            .activate_text_once(&prompt)
+            .await
+            .context("history-free model completion")?;
+        parse_decision(&text)
     }
-    if !file.is_file() {
-        bail!("selected path is not a regular file: {}", file.display());
-    }
-    Ok((repo, file))
 }
 
-fn harness_preamble(existing: Option<String>, selected: &Path) -> String {
-    let instructions = format!(
-        r#"You have exactly one provider tool: execute_rune. It runs a persistent Rune invocation scope with globals fs, path (the selected file {:?}), and a retained source binding after a read. Call println!(\"{{}}\", doc(fs)); to inspect the canonical FileSystem capability. Supported source shapes are exactly: println!(\"{{}}\", doc(fs)); ; let source = fs.read(path).await?; println!(\"{{}}\", source); ; println!(\"{{}}\", source[START..END]); with numeric ranges. Output is bounded to 16 KiB and reports attempted bytes, truncation, and retained bindings. Reuse retained source instead of reading again. Unsupported programs return a recoverable tool error. Use execute_rune when observation is needed, then answer the user's terminal message as ordinary final assistant text; do not call a finish tool."#,
-        selected
-    );
-    match existing {
-        Some(mut preamble) if !preamble.is_empty() => {
-            preamble.push_str("\n\n");
-            preamble.push_str(&instructions);
-            preamble
-        }
-        _ => instructions,
+fn parse_decision(text: &str) -> Result<Decision> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
+    let body = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .map(str::trim);
+    match body {
+        Some(body) => serde_json::from_str(body).context("parse fenced Decision JSON"),
+        None => bail!("model did not return Decision JSON: {trimmed}"),
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (repo, file) = selected_file(&args.repo, &args.file)?;
+    let repo = args
+        .repo
+        .canonicalize()
+        .with_context(|| format!("canonicalize --repo {}", args.repo.display()))?;
     let (config, config_root) =
         outrig::load_project(&repo, None).context("load .agents/outrig/config.toml")?;
     if config_root.canonicalize()? != repo {
@@ -117,41 +78,51 @@ async fn main() -> Result<()> {
     let mut resolved =
         resolve_agent_with_overrides(&config, selected_agent, args.model.as_deref(), None)
             .context("resolve configured agent/model/provider")?;
-    resolved.preamble = Some(harness_preamble(resolved.preamble.take(), &file));
-
-    let invocation = Invocation::new(file.clone()).context("create persistent Rune scope")?;
-    let tools = vec![SessionTool::new(ExecuteRune {
-        invocation: Arc::new(Mutex::new(invocation)),
-    })];
-    let cache_root = std::env::temp_dir().join("outrig-rune-harness-cache");
-    let agent = build_agent(&resolved, tools, &cache_root)
+    let stable = "You are an event-driven Rune agent. Durable state is the host binding inventory, not chat history. Discover capabilities with doc(fs), then choose files yourself through the persistent fs.read(relative_path). Use events::next().await only when the same Rune run must wait for the next terminal event. Never assume a previous provider message exists.";
+    resolved.preamble = Some(match resolved.preamble.take() {
+        Some(p) if !p.is_empty() => format!("{p}\n\n{stable}"),
+        _ => stable.into(),
+    });
+    let cache = std::env::temp_dir().join("outrig-rune-event-cache");
+    let agent = build_agent(&resolved, vec![], &cache)
         .await
-        .context("build configured Rig agent")?;
+        .context("build configured tool-free Rig agent")?;
+    let bridge = EventBridge::new();
+    let invocation =
+        Invocation::new(&repo, bridge).context("create host-owned Rune invocation scope")?;
+    let (input_tx, input_rx, output_tx, mut output_rx) = channels();
 
+    // Stdin is an independent producer; it never waits for model or Rune work.
+    let reader = tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut id = 0;
+        while let Some(text) = lines.next_line().await? {
+            id += 1;
+            if input_tx
+                .send(ExternalEvent::UserInput { id, text })
+                .is_err()
+            {
+                return Ok::<_, std::io::Error>(());
+            }
+        }
+        let _ = input_tx.send(ExternalEvent::Eof);
+        Ok::<_, std::io::Error>(())
+    });
+    let printer = tokio::spawn(async move {
+        while let Some(text) = output_rx.recv().await {
+            println!("{text}");
+        }
+    });
     eprintln!(
-        "[outrig-harness] repo={} file={} agent={} model={}",
+        "[outrig-harness] event-driven repo={} agent={} model={}",
         repo.display(),
-        file.display(),
         selected_agent.unwrap_or("(agentless)"),
         resolved.model_name()
     );
-    let mut history: Vec<Message> = Vec::new();
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await.context("read stdin")? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let end = agent
-            .run_turn(&line, &mut history)
-            .await
-            .context("model turn")?;
-        if !end.reply.is_empty() {
-            println!("{}", end.reply);
-        }
-        if end.is_silent() {
-            println!("{}", end.silent_report());
-        }
-    }
+    let driver = AgentDriver::new(RealModel { agent }, invocation, input_rx, output_tx);
+    let _driver = driver.run().await?;
+    reader.await.context("stdin task join")??;
+    printer.await.context("output task join")?;
     Ok(())
 }
 
@@ -159,18 +130,14 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn path_boundary_rejects_escape() -> Result<()> {
-        let base = std::env::temp_dir().join(format!("outrig-boundary-{}", std::process::id()));
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo)?;
-        std::fs::write(base.join("outside"), "no")?;
-        assert!(selected_file(&repo, Path::new("../outside")).is_err());
-        Ok(())
-    }
-    #[test]
-    fn preamble_preserves_agent_text_first() {
-        let text = harness_preamble(Some("configured words".into()), Path::new("/repo/file"));
-        assert!(text.starts_with("configured words\n\n"));
-        assert!(text.contains("execute_rune"));
+    fn parses_plain_and_fenced_decisions() {
+        assert!(matches!(
+            parse_decision(r#"{"decision":"emit","text":"ok"}"#).unwrap(),
+            Decision::Emit { .. }
+        ));
+        assert!(
+            parse_decision("```json\n{\"decision\":\"execute_rune\",\"source\":\"1\"}\n```")
+                .is_ok()
+        );
     }
 }

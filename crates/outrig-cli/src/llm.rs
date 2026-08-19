@@ -1620,6 +1620,26 @@ fn warn_fallback_ceiling(candidate: &ResolvedCandidate) {
 }
 
 impl RigAgent {
+    /// Perform one history-free completion. This temporary internal prototype API
+    /// deliberately supplies no chat history and agents built with no tools cannot
+    /// enter Rig's tool loop.
+    #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
+    pub async fn activate_text_once(&self, prompt: &str) -> Result<String> {
+        async fn once<M: CompletionModel + 'static>(
+            agent: &rig::agent::Agent<M>,
+            prompt: &str,
+        ) -> Result<String> {
+            Ok(agent.prompt(prompt.to_string()).await?)
+        }
+        match self {
+            RigAgent::OpenAi { agent, .. } => once(agent, prompt).await,
+            RigAgent::Anthropic { agent, .. } => once(agent, prompt).await,
+            RigAgent::Failover { agent, .. } => once(agent, prompt).await,
+            #[cfg(feature = "local-llm")]
+            RigAgent::Mistralrs { agent, .. } => once(agent, prompt).await,
+        }
+    }
+
     /// Run one user turn: prompt the model, drive the model->tool->model loop,
     /// extend `history` with everything emitted (user prompt + tool turns +
     /// final assistant reply), and return the assistant's text reply.
