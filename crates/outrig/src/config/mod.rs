@@ -259,15 +259,13 @@ pub struct Config {
 
 impl Config {
     pub fn load_from_str(s: &str) -> Result<Self> {
-        let mut cfg: Self = match toml::from_str(s) {
-            Ok(c) => c,
+        match toml::from_str(s) {
+            Ok(cfg) => Ok(cfg),
             Err(e) if error_lands_on_unquoted_dotted_header(&e, s) => {
-                return Err(OutrigError::ConfigDottedKey { source: e });
+                Err(OutrigError::ConfigDottedKey { source: e })
             }
-            Err(e) => return Err(e.into()),
-        };
-        cfg.network.declared = declares_top_level_network(s)?;
-        Ok(cfg)
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Read repo + (optional) global config files, merge with repo precedence,
@@ -315,7 +313,7 @@ impl Config {
             Err(e) => return Err(e).path_ctx("read", &repo_path),
         };
         let mut repo_cfg = Self::load_from_str(&repo_text)?;
-        reject_repo_network_policy(&repo_text)?;
+        repo_cfg.validate_as_repo()?;
         repo_cfg.stamp_source(&ConfigSource::Repo {
             root: repo_root.to_path_buf(),
         });
@@ -387,6 +385,24 @@ impl Config {
     /// `None` keeps the check pure-structural for unit tests.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
+        Ok(())
+    }
+
+    /// Validate the rules that apply to a *repo* config file specifically, on
+    /// the unmerged value.
+    ///
+    /// [`validate`](Self::validate) runs on the merged config, which by
+    /// construction has already taken its `[network]` policy from the global
+    /// side and so cannot say which file declared what. These rules therefore
+    /// run per-file, before [`merge`](fn@merge). Today there is one: a repo
+    /// config may choose `[network].mode`, but `default`, `allow`, and `deny`
+    /// describe the machine's egress and stay with the operator.
+    ///
+    /// `Config::load` applies this to the repo file it reads. An embedder
+    /// assembling a repo-side `Config` by hand should call it too -- `merge`
+    /// is infallible and simply drops a repo policy rather than reporting it.
+    pub fn validate_as_repo(&self) -> Result<()> {
+        validate::validate_as_repo(self)?;
         Ok(())
     }
 
@@ -622,30 +638,6 @@ impl Config {
         )?;
         Ok(())
     }
-}
-
-fn declares_top_level_network(text: &str) -> Result<bool> {
-    let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
-        crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
-    })?;
-    Ok(value.as_table().contains_key("network"))
-}
-
-fn reject_repo_network_policy(text: &str) -> Result<()> {
-    let value = text.parse::<toml_edit::DocumentMut>().map_err(|source| {
-        crate::error::OutrigError::Configuration(format!("parsing config for [network]: {source}"))
-    })?;
-    let Some(network) = value.get("network").and_then(toml_edit::Item::as_table) else {
-        return Ok(());
-    };
-    for key in ["default", "allow", "deny"] {
-        if network.contains_key(key) {
-            return Err(OutrigError::Configuration(format!(
-                "repo config may set [network].mode only; [network].{key} belongs in global config"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Optional settings for an OpenAI-compatible provider.
@@ -1552,68 +1544,110 @@ impl NetworkPolicyBuilder {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// The `[network]` block: the interception mode, and -- in the global config
+/// only -- the filter policy.
+///
+/// Every field is optional and private, so `None` (or an empty list) *is* "the
+/// config did not declare this key" rather than a value that happens to match
+/// the built-in default. [`merge`](fn@merge) turns on exactly that
+/// distinction: it reads [`declared_mode`](Self::declared_mode) from the repo
+/// side and nothing else, so a repo can choose the mode and cannot reach the
+/// operator's policy. Read the effective values with [`mode`](Self::mode) and
+/// [`policy`](Self::policy).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct NetworkConfig {
-    pub mode: NetworkMode,
-    #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
-    pub default: NetworkAction,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<NetworkEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny: Vec<NetworkEntry>,
-    #[serde(skip)]
-    #[schemars(skip)]
-    declared: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<NetworkMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<NetworkAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<NetworkEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deny: Option<Vec<NetworkEntry>>,
 }
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            mode: NetworkMode::Default,
-            default: NetworkAction::Deny,
-            allow: Vec::new(),
-            deny: Vec::new(),
-            declared: false,
-        }
-    }
-}
-
-impl PartialEq for NetworkConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.mode == other.mode
-            && self.default == other.default
-            && self.allow == other.allow
-            && self.deny == other.deny
-    }
-}
-
-impl Eq for NetworkConfig {}
 
 impl NetworkConfig {
-    pub(crate) fn is_declared(&self) -> bool {
-        self.declared
+    /// The declared `mode`, or [`NetworkMode::Default`].
+    pub fn mode(&self) -> NetworkMode {
+        self.mode.unwrap_or_default()
     }
 
-    pub(crate) fn set_declared(&mut self, declared: bool) {
-        self.declared = declared;
+    /// `mode` exactly as declared, or `None` when the config was silent -- the
+    /// state [`merge`](fn@merge) acts on, as opposed to the value it
+    /// resolves to. A `[network]` table that declares no `mode` is `None`, so
+    /// it inherits rather than resetting an inherited mode to `default`.
+    pub fn declared_mode(&self) -> Option<NetworkMode> {
+        self.mode
     }
 
+    /// Declare `mode`.
+    pub fn set_mode(&mut self, mode: NetworkMode) {
+        self.mode = Some(mode);
+    }
+
+    /// The effective filter policy: whatever was declared, with an undeclared
+    /// `default` reading as [`NetworkAction::Deny`].
     pub fn policy(&self) -> NetworkPolicy {
         NetworkPolicy {
-            default: self.default,
-            allow: self.allow.clone(),
-            deny: self.deny.clone(),
+            default: self.default.unwrap_or_default(),
+            allow: self.allow.clone().unwrap_or_default(),
+            deny: self.deny.clone().unwrap_or_default(),
         }
     }
 
-    pub fn has_policy_entries(&self) -> bool {
-        !self.allow.is_empty() || !self.deny.is_empty()
+    /// Declare all three policy keys at once. The counterpart to
+    /// [`policy`](Self::policy), and the only way to give a `Config` a filter
+    /// policy now that the fields are private.
+    pub fn set_policy(&mut self, policy: NetworkPolicy) {
+        self.default = Some(policy.default);
+        self.allow = Some(policy.allow);
+        self.deny = Some(policy.deny);
     }
-}
 
-impl NetworkConfig {
+    /// Whether any `allow` or `deny` entry exists -- the question
+    /// `mode = "filter"` asks, since a filter with no entries cannot decide
+    /// anything. Distinct from `declared_policy_key`, which counts a declared
+    /// `default` and counts an empty `allow = []` too, because the question
+    /// *there* is whether a config touched the operator's policy at all.
+    pub fn has_policy_entries(&self) -> bool {
+        [&self.allow, &self.deny]
+            .into_iter()
+            .any(|list| list.as_ref().is_some_and(|l| !l.is_empty()))
+    }
+
+    /// The first policy key this config declared, in schema order. `None` when
+    /// it declared no policy at all -- the predicate behind the
+    /// global-versus-repo trust rule, applied by
+    /// [`Config::validate_as_repo`].
+    pub(super) fn declared_policy_key(&self) -> Option<&'static str> {
+        if self.default.is_some() {
+            Some("default")
+        } else if self.allow.is_some() {
+            Some("allow")
+        } else if self.deny.is_some() {
+            Some("deny")
+        } else {
+            None
+        }
+    }
+
+    /// Apply the keys a repo config is allowed to choose. `self` is the
+    /// operator's global block, and the policy keys are never read from
+    /// `repo`, so a repo value carrying its own policy cannot reach the
+    /// merged result whatever built it.
+    ///
+    /// The direction is the opposite of
+    /// [`Workspace::inherit_missing_primary_fields`]: the global side is the
+    /// base rather than the fallback, because that asymmetry *is* the trust
+    /// rule.
+    fn apply_repo_overrides(&mut self, repo: &Self) {
+        if let Some(mode) = repo.mode {
+            self.mode = Some(mode);
+        }
+    }
+
     fn is_default(&self) -> bool {
         self == &Self::default()
     }

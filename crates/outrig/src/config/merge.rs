@@ -15,9 +15,11 @@ use super::Config;
 ///   `tool-call-max`, `tool-result-max`, `subagent-depth-max`,
 ///   `subagent-width-max`, `retry-budget-secs`): repo's value wins if set,
 ///   else global's.
-/// - `[network].mode` follows repo precedence when the repo file declares the
-///   table. Policy keys (`default`, `allow`, `deny`) are global-only and are
-///   always taken from the global config.
+/// - `[network].mode` follows repo precedence when the repo config declares
+///   `mode`; a `[network]` table that declares no mode inherits the global
+///   one. Policy keys (`default`, `allow`, `deny`) are global-only: this
+///   function never reads them from the repo side, so a repo value carrying
+///   its own policy cannot widen or inject one, whatever built it.
 /// - `[workspace]` primary fields merge per key, like the scalars above: a
 ///   repo declaration wins, otherwise a global one is inherited, otherwise the
 ///   key stays `None` and [`Workspace`](super::Workspace)'s accessors apply
@@ -53,12 +55,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
     workspace.mounts = mounts;
 
     let mut network = global.network;
-    if repo.network.is_declared() {
-        network.mode = repo.network.mode;
-        network.set_declared(true);
-    } else {
-        network.set_declared(false);
-    }
+    network.apply_repo_overrides(&repo.network);
 
     Config {
         default_image: repo.default_image.or(global.default_image),

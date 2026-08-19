@@ -10,7 +10,8 @@ use tempfile::tempdir;
 use outrig::config::{
     Config, ConfigSource, ConfigValidationError, ImageConfig, LlmProvider, McpServerSpec,
     MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode,
-    SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace, merge,
+    NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
+    merge,
 };
 use outrig::error::OutrigError;
 
@@ -72,21 +73,16 @@ deny    = ["*:22", { host = "169.254.169.254", port = 80 }]
 "#,
         );
         cfg.validate(None).expect("network filter policy validates");
-        assert_eq!(cfg.network.mode, NetworkMode::Filter);
-        assert_eq!(cfg.network.default, NetworkAction::Allow);
+        assert_eq!(cfg.network.mode(), NetworkMode::Filter);
+        let policy = cfg.network.policy();
+        assert_eq!(policy.default, NetworkAction::Allow);
+        assert_eq!(policy.allow[0], NetworkEntry::with_port("github.com", 443));
+        assert_eq!(policy.allow[1], NetworkEntry::new("*.npmjs.org"));
+        assert_eq!(policy.allow[2], NetworkEntry::new("10.0.0.0/8"));
+        assert_eq!(policy.allow[3], NetworkEntry::with_port("2001:db8::1", 443),);
+        assert_eq!(policy.deny[0], NetworkEntry::with_port("*", 22),);
         assert_eq!(
-            cfg.network.allow[0],
-            NetworkEntry::with_port("github.com", 443),
-        );
-        assert_eq!(cfg.network.allow[1], NetworkEntry::new("*.npmjs.org"));
-        assert_eq!(cfg.network.allow[2], NetworkEntry::new("10.0.0.0/8"));
-        assert_eq!(
-            cfg.network.allow[3],
-            NetworkEntry::with_port("2001:db8::1", 443),
-        );
-        assert_eq!(cfg.network.deny[0], NetworkEntry::with_port("*", 22),);
-        assert_eq!(
-            cfg.network.deny[1],
+            policy.deny[1],
             NetworkEntry::with_port("169.254.169.254", 80),
         );
     }
@@ -1850,40 +1846,244 @@ access         = "read-write"
         assert_eq!(merged.workspace.mounts[1].access, MountAccess::ReadWrite);
     }
 
+    /// The behavior the declaration state exists to protect: a repo that says
+    /// nothing inherits the whole global block. A fix that always applied the
+    /// repo value would fail here.
     #[test]
-    fn repo_network_config_overrides_global_during_merge() {
+    fn absent_repo_network_keeps_global_during_merge() {
         let global = parse(
             r#"
 [network]
+mode = "filter"
+allow = ["github.com:443"]
+"#,
+        );
+        let global_policy = global.network.policy();
+
+        let merged = merge(global, parse(""));
+        assert_eq!(merged.network.mode(), NetworkMode::Filter);
+        assert_eq!(merged.network.policy(), global_policy);
+    }
+
+    /// The mode is the repo's to choose; the policy is not. Whichever mode a
+    /// repo picks -- including `default`, the only way it turns interception
+    /// off -- it gets *exactly* the operator's rules.
+    #[test]
+    fn repo_mode_wins_and_the_global_policy_survives_intact() {
+        for (declared, expected) in [
+            ("default", NetworkMode::Default),
+            ("audit", NetworkMode::Audit),
+            ("filter", NetworkMode::Filter),
+        ] {
+            let global = parse(
+                r#"
+[network]
 mode = "audit"
+default = "allow"
+allow = ["github.com:443"]
+deny = ["*:22"]
+"#,
+            );
+            let global_policy = global.network.policy();
+            let repo = parse(&format!("[network]\nmode = \"{declared}\"\n"));
+
+            let merged = merge(global, repo);
+            assert_eq!(merged.network.mode(), expected, "mode = {declared:?}");
+            assert_eq!(
+                merged.network.policy(),
+                global_policy,
+                "mode = {declared:?} must not disturb the policy",
+            );
+        }
+    }
+
+    /// A repo `Config` built the way an embedder builds one -- `default()`
+    /// plus the public setter -- must merge like one parsed from a file. The
+    /// declaration used to be a `#[serde(skip)]` bit only the file loader
+    /// could set, so this case silently lost its mode.
+    #[test]
+    fn programmatic_repo_network_mode_survives_merge() {
+        let global = parse(
+            r#"
+[network]
+mode = "default"
+"#,
+        );
+        let mut repo = Config::default();
+        repo.network.set_mode(NetworkMode::Audit);
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.mode(), NetworkMode::Audit);
+    }
+
+    /// `Config` is `Deserialize`, so `toml::from_str` is a public construction
+    /// path that never goes through `Config::load_from_str`. It has to reach
+    /// the same merge outcome.
+    #[test]
+    fn bare_serde_repo_network_mode_survives_merge() {
+        let global: Config = toml::from_str(
+            r#"
+[network]
+mode = "default"
+"#,
+        )
+        .expect("global parses");
+        let repo: Config = toml::from_str(
+            r#"
+[network]
+mode = "audit"
+"#,
+        )
+        .expect("repo parses");
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.mode(), NetworkMode::Audit);
+    }
+
+    /// A `[network]` table declaring no `mode` declares no mode. It used to
+    /// count as a declaration and reset the merged mode to `default` -- the
+    /// least restrictive one -- so a repo file containing nothing but the
+    /// table header disabled a global filter.
+    #[test]
+    fn bare_repo_network_table_does_not_downgrade_global_mode() {
+        let global = parse(
+            r#"
+[network]
+mode = "filter"
+allow = ["github.com:443"]
+"#,
+        );
+        let repo = parse("[network]\n");
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.mode(), NetworkMode::Filter);
+    }
+
+    /// `merge` is public and infallible, so it cannot reject a repo value that
+    /// carries policy -- it must be unable to apply one. Built programmatically:
+    /// the load-time check never ran on this config.
+    #[test]
+    fn programmatic_repo_policy_cannot_widen_the_global_one() {
+        let global = parse(
+            r#"
+[network]
+mode = "filter"
+allow = ["github.com:443"]
+"#,
+        );
+        let global_policy = global.network.policy();
+
+        let mut repo = Config::default();
+        repo.network.set_mode(NetworkMode::Filter);
+        repo.network.set_policy(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Allow)
+                .allow_host("evil.example")
+                .build()
+                .expect("policy builds"),
+        );
+        assert!(
+            repo.validate_as_repo().is_err(),
+            "the repo value really is carrying policy",
+        );
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.policy(), global_policy);
+    }
+
+    /// The same injection attempt through `Deserialize`, which reaches neither
+    /// `Config::load` nor any check the loader performs.
+    #[test]
+    fn serde_repo_policy_cannot_widen_the_global_one() {
+        let global = parse(
+            r#"
+[network]
+mode = "filter"
+allow = ["github.com:443"]
+"#,
+        );
+        let global_policy = global.network.policy();
+        let repo: Config = toml::from_str(
+            r#"
+[network]
+mode = "filter"
+default = "allow"
+allow = ["evil.example:443"]
+deny = ["github.com:443"]
+"#,
+        )
+        .expect("repo parses");
+
+        let merged = merge(global, repo);
+        assert_eq!(merged.network.mode(), NetworkMode::Filter);
+        assert_eq!(merged.network.policy(), global_policy);
+    }
+
+    /// Declaration is serialized state, not a hidden bit, so a merged config
+    /// written out and read back is the same config -- and merges the same way
+    /// a second time. A `#[serde(skip)]` replacement would fail the second
+    /// assertion while passing the first.
+    #[test]
+    fn merged_network_survives_a_serialize_reparse_round_trip() {
+        let global = parse(
+            r#"
+[network]
+mode = "filter"
+default = "allow"
 allow = ["github.com:443"]
 "#,
         );
         let repo = parse(
             r#"
 [network]
-mode = "default"
-"#,
-        );
-        let merged = merge(global, repo);
-        assert_eq!(merged.network.mode, NetworkMode::Default);
-        assert_eq!(
-            merged.network.allow,
-            vec![NetworkEntry::with_port("github.com", 443)],
-        );
-    }
-
-    #[test]
-    fn absent_repo_network_keeps_global_during_merge() {
-        let global = parse(
-            r#"
-[network]
 mode = "audit"
 "#,
         );
-        let repo = parse("");
         let merged = merge(global, repo);
-        assert_eq!(merged.network.mode, NetworkMode::Audit);
+
+        let text = toml::to_string(&merged).expect("merged config serializes");
+        let reparsed: Config = toml::from_str(&text).expect("merged config reparses");
+        assert_eq!(reparsed.network, merged.network);
+        assert_eq!(reparsed.network.declared_mode(), Some(NetworkMode::Audit));
+
+        let remerged = merge(Config::default(), reparsed);
+        assert_eq!(remerged.network.mode(), NetworkMode::Audit);
+    }
+
+    /// An empty policy list is a key the author wrote, not a key they left
+    /// out. `Vec::is_empty` cannot tell those apart, which is the same
+    /// absence-versus-explicit-value problem `default` carries an `Option`
+    /// for, so `allow` and `deny` carry one too.
+    #[test]
+    fn empty_policy_list_is_declared_and_survives_a_round_trip() {
+        let cfg = parse("[network]\nallow = []\n");
+        assert_ne!(cfg.network, Config::default().network);
+        assert!(
+            !cfg.network.has_policy_entries(),
+            "declared but empty is still no entries to filter on",
+        );
+
+        let text = toml::to_string(&cfg).expect("config serializes");
+        let reparsed: Config = toml::from_str(&text).expect("config reparses");
+        assert_eq!(reparsed.network, cfg.network);
+    }
+
+    /// `mode = "default"` is an explicit opt-out that happens to name the
+    /// built-in value. It used to compare equal to an undeclared block and get
+    /// dropped by `skip_serializing_if`, so the opt-out did not survive.
+    #[test]
+    fn explicit_default_mode_survives_a_round_trip() {
+        let cfg = parse(
+            r#"
+[network]
+mode = "default"
+"#,
+        );
+        let text = toml::to_string(&cfg).expect("config serializes");
+        let reparsed: Config = toml::from_str(&text).expect("config reparses");
+
+        assert_eq!(reparsed.network.declared_mode(), Some(NetworkMode::Default));
+        assert_ne!(reparsed.network, Config::default().network);
     }
 }
 
@@ -2311,7 +2511,7 @@ mode = "audit"
         write_repo_cfg(tmp.path(), "");
 
         let cfg = Config::load(tmp.path(), Some(&global_cfg)).expect("global network loads");
-        assert_eq!(cfg.network.mode, NetworkMode::Audit);
+        assert_eq!(cfg.network.mode(), NetworkMode::Audit);
     }
 
     #[test]
@@ -2326,7 +2526,7 @@ mode = "audit"
         );
 
         let cfg = Config::load(tmp.path(), None).expect("repo network should load");
-        assert_eq!(cfg.network.mode, NetworkMode::Audit);
+        assert_eq!(cfg.network.mode(), NetworkMode::Audit);
     }
 
     #[test]
@@ -2351,7 +2551,7 @@ mode = "default"
 
         let cfg = Config::load(tmp.path(), Some(&global_cfg))
             .expect("repo network should override global network");
-        assert_eq!(cfg.network.mode, NetworkMode::Default);
+        assert_eq!(cfg.network.mode(), NetworkMode::Default);
     }
 
     #[test]
@@ -2377,18 +2577,53 @@ mode = "filter"
 
         let cfg = Config::load(tmp.path(), Some(&global_cfg))
             .expect("repo mode should combine with global policy");
-        assert_eq!(cfg.network.mode, NetworkMode::Filter);
+        assert_eq!(cfg.network.mode(), NetworkMode::Filter);
         assert_eq!(
-            cfg.network.allow,
+            cfg.network.policy().allow,
             vec![NetworkEntry::with_port("github.com", 443)],
         );
     }
 
+    /// Policy is the operator's, so every policy key is rejected in a repo
+    /// file -- including `default = "deny"`, which names the built-in value.
+    /// That last case is the fidelity the parsed check keeps and a bare
+    /// `NetworkAction` could not have: it cannot tell an absent key from an
+    /// explicit one, which is why the rule used to need the file's raw text.
     #[test]
     fn repo_network_policy_keys_are_rejected() {
+        for (body, key) in [
+            ("default = \"allow\"", "default"),
+            ("default = \"deny\"", "default"),
+            ("allow = [\"github.com:443\"]", "allow"),
+            ("allow = []", "allow"),
+            ("deny = [\"*:22\"]", "deny"),
+            ("deny = []", "deny"),
+        ] {
+            let tmp = tempdir().unwrap();
+            write_repo_cfg(
+                tmp.path(),
+                &format!("[network]\nmode = \"filter\"\n{body}\n"),
+            );
+
+            let err = Config::load(tmp.path(), None).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("[network].{key} belongs in global config")),
+                "{body} should be rejected, got: {err:?}",
+            );
+        }
+    }
+
+    /// A repo file whose `[network]` table declares no `mode` leaves the
+    /// global mode in force. It used to reset it to `default`, silently
+    /// turning off a global filter.
+    #[test]
+    fn bare_repo_network_table_keeps_the_global_mode_on_load() {
         let tmp = tempdir().unwrap();
-        write_repo_cfg(
-            tmp.path(),
+        let global_dir = tempdir().unwrap();
+        write_repo_cfg(tmp.path(), "[network]\n");
+        let global_cfg = write_global_cfg(
+            global_dir.path(),
             r#"
 [network]
 mode = "filter"
@@ -2396,12 +2631,8 @@ allow = ["github.com:443"]
 "#,
         );
 
-        let err = Config::load(tmp.path(), None).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("[network].allow belongs in global config"),
-            "got: {err:?}",
-        );
+        let cfg = Config::load(tmp.path(), Some(&global_cfg)).expect("configs load");
+        assert_eq!(cfg.network.mode(), NetworkMode::Filter);
     }
 
     #[test]

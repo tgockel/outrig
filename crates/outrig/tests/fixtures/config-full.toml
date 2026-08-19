@@ -12,6 +12,9 @@ subagent-depth-max = 4
 subagent-width-max = 6
 retry-budget-secs  = 300
 
+[network]
+mode = "audit"
+
 [providers.openai]
 style                = "openai"
 base-url             = "https://api.openai.com/v1"

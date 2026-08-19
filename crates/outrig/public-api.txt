@@ -147,6 +147,8 @@ pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::style: 
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
+pub outrig::config::ConfigValidationError::RepoNetworkPolicy
+pub outrig::config::ConfigValidationError::RepoNetworkPolicy::key: &'static str
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::max: u64
 pub outrig::config::ConfigValidationError::RequestTimeoutSecsTooLarge::path: alloc::string::String
@@ -456,6 +458,7 @@ pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Opti
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::model_candidates<'a>(&'a self, &str) -> core::result::Result<alloc::vec::Vec<&'a str>, outrig::config::ConfigValidationError>
 pub fn outrig::config::Config::validate(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
+pub fn outrig::config::Config::validate_as_repo(&self) -> outrig::error::Result<()>
 pub fn outrig::config::Config::validate_workspace_mounts(&self, core::option::Option<&std::path::Path>) -> outrig::error::Result<()>
 #[non_exhaustive] pub struct outrig::config::ContainerSecurity
 pub outrig::config::ContainerSecurity::cap_add: alloc::vec::Vec<alloc::string::String>
@@ -512,18 +515,13 @@ pub fn outrig::config::MountConfig::config_source(&self) -> core::option::Option
 pub fn outrig::config::MountConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
 pub fn outrig::config::MountConfig::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
 #[non_exhaustive] pub struct outrig::config::NetworkConfig
-pub outrig::config::NetworkConfig::allow: alloc::vec::Vec<outrig::config::NetworkEntry>
-pub outrig::config::NetworkConfig::default: outrig::config::NetworkAction
-pub outrig::config::NetworkConfig::deny: alloc::vec::Vec<outrig::config::NetworkEntry>
-pub outrig::config::NetworkConfig::mode: outrig::config::NetworkMode
 impl outrig::config::NetworkConfig
+pub fn outrig::config::NetworkConfig::declared_mode(&self) -> core::option::Option<outrig::config::NetworkMode>
 pub fn outrig::config::NetworkConfig::has_policy_entries(&self) -> bool
+pub fn outrig::config::NetworkConfig::mode(&self) -> outrig::config::NetworkMode
 pub fn outrig::config::NetworkConfig::policy(&self) -> outrig::config::NetworkPolicy
-impl core::cmp::Eq for outrig::config::NetworkConfig
-impl core::cmp::PartialEq for outrig::config::NetworkConfig
-pub fn outrig::config::NetworkConfig::eq(&self, &Self) -> bool
-impl core::default::Default for outrig::config::NetworkConfig
-pub fn outrig::config::NetworkConfig::default() -> Self
+pub fn outrig::config::NetworkConfig::set_mode(&mut self, outrig::config::NetworkMode)
+pub fn outrig::config::NetworkConfig::set_policy(&mut self, outrig::config::NetworkPolicy)
 #[non_exhaustive] pub struct outrig::config::NetworkEntry
 pub outrig::config::NetworkEntry::host: alloc::string::String
 pub outrig::config::NetworkEntry::port: core::option::Option<u16>

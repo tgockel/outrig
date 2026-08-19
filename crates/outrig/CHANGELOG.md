@@ -15,7 +15,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initialize` may agree to is outrig's own rather than whichever revisions the SDK happens to
   know; see **Fixed** for what the inherited one cost.
 
+- **`Config::validate_as_repo`**, the rules that apply to a repo config file rather than to a
+  merged one. Today there is one: `[network]`'s `default`, `allow`, and `deny` describe the
+  machine's egress and belong to the operator, so a repo config may declare `mode` and
+  nothing else. `Config::load` applies it to the repo file it reads; an embedder assembling a
+  repo-side `Config` by hand should call it too, because `merge` is infallible and drops a
+  repo policy rather than reporting it. The new `ConfigValidationError::RepoNetworkPolicy`
+  carries the offending key.
+
+  The rule previously lived in a raw-TOML text scan, so it applied only to configs that came
+  from files and could be defeated by formatting; it now reads the parsed value. Keeping its
+  fidelity is why every policy key is an `Option` and not a bare value -- a bare
+  `NetworkAction` or `Vec` cannot tell an absent key from an explicit `default = "deny"` or
+  `allow = []`, so moving off the text without them would have quietly started accepting the
+  spellings the scan rejected. `outrig` no longer depends on `toml_edit`; the two text scans
+  were its only users.
+
+### Changed
+
+- **Breaking: `NetworkConfig`'s four fields are accessors, not public fields.** All four
+  are private `Option`s now. Read the
+  effective mode -- what was declared, else `default` -- with `mode()`, ask what a config
+  actually wrote with `declared_mode()`, and write it with `set_mode()`. The policy keys are
+  reached as a unit: `policy()` for the effective `NetworkPolicy`, unchanged and already the
+  type every consumer takes, and `set_policy()` to write all three. `impl Default` and the
+  hand-written `PartialEq` are gone with the fields, both replaced by derives.
+
+  The `Option` is what a per-key merge and a per-file trust rule both need: `NetworkMode`
+  cannot tell an absent key from one written out to the value the default happens to have,
+  `NetworkAction` cannot tell an absent `default` from an explicit `default = "deny"`, and
+  `Vec` cannot tell an absent `allow` from an explicit `allow = []`. The **Fixed** entries
+  below all turn on exactly that distinction. `None` now *is* "the config did not declare
+  this", carried by the type through serde like every other key, rather than by a
+  `#[serde(skip)]` bit only the file loader could set.
+
+  Making a public field private is a break `#[non_exhaustive]` does not cover, so it is free
+  before the 0.2.0 freeze and costs a major version after -- the same trade the `Workspace`
+  entry in 0.2.0-rc.2 took, and for the same reason.
+
+- **`merge` cannot apply a repo config's network policy, whatever built that config.** It
+  reads the repo's declared mode and nothing else, so the operator-owned policy is safe by
+  construction rather than by a check that has to run. The signature stays infallible.
+
 ### Fixed
+
+- **A repo `[network].mode` set programmatically or by direct serde is now honored.** Only
+  `Config::load_from_str` could mark a `[network]` block as declared -- it re-parsed the
+  file's raw text to do it -- so an embedder who built a repo `Config` in memory with
+  `mode = "audit"`, or deserialized one with `toml::from_str`, merged to `default`: no
+  interception at all, and nothing to indicate the setting had been dropped. The
+  declaration-blind `PartialEq` meant the two configs compared equal, so a test could not
+  have caught it by comparison either.
+
+- **A bare `[network]` table no longer disables a global filter.** The declaration test was
+  "does the file contain a `[network]` table", so a repo config consisting of nothing but the
+  table header counted as declaring a mode and overwrote the global one with
+  `NetworkMode::Default`, the least restrictive mode. A table that declares no `mode` now
+  declares nothing and inherits. A repo that means to opt out still writes `mode = "default"`
+  explicitly, which is honored as before.
+
+- **`[network].mode` survives a serialize/reparse round trip.** `NetworkConfig::is_default`
+  compared through the declaration-blind `PartialEq`, so a config that wrote `mode = "default"`
+  was byte-identical to one that wrote no `[network]` block and got dropped by
+  `skip_serializing_if` -- losing an explicit opt-out on the way back out.
 
 - **`tools/list` carries the cache metadata protocol revision `2026-07-28` requires.** That
   revision adopted SEP-2549, which makes `ttlMs` and `cacheScope` mandatory on list results.

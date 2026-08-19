@@ -42,6 +42,9 @@ Issues that bear on **host integrity** are in scope, for example:
 - A name the container merely asserts -- a TLS `ClientHello` SNI or an HTTP `Host:` header --
   satisfying a hostname `allow` entry. A hostname rule grants only against a destination the
   interceptor itself resolved to that name.
+- A repo config's `[network]` block reaching the egress policy. A repo may choose
+  `[network].mode`; `default`, `allow`, and `deny` belong to the operator's global config, and
+  a repo value carrying them must not widen or replace what the global config set.
 - Capability handling that is more permissive than the selected capability profile
   (`default` / `no-net-raw` / `drop-all`).
 - A container launched more permissively than its `[images.<name>.security]` block asks for --

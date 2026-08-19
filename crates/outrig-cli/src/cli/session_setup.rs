@@ -279,7 +279,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         Some(target) => Some(resolve_attach_target(target, args.image_flag, &store)?),
         None => None,
     };
-    let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode);
+    let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode());
     if attach.is_some() && matches!(network_mode, NetworkMode::Audit | NetworkMode::Filter) {
         return Err(OutrigError::Configuration(
             "`--network audit` and `--network filter` cannot be used with \

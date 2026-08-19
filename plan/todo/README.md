@@ -8,17 +8,11 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Queue
 
-`0115`-`0129` are the 0.2.0 release gate, derived from an external release-readiness audit of
+`0116`-`0129` are the 0.2.0 release gate, derived from an external release-readiness audit of
 `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering below is that report's
-recommended sequencing: security semantics, then lifecycle, then the public-surface changes that
-have to happen before the freeze, then release engineering. Each task carries its own evidence;
+recommended sequencing: security semantics first (`0114`-`0115`, both landed), then lifecycle,
+then the public-surface changes that have to happen before the freeze, then release engineering. Each task carries its own evidence;
 the report is not in the tree.
-
-**Network policy semantics**
-
-| Task   | What it settles                                                     |
-| ------ | ------------------------------------------------------------------- |
-| `0115` | A declared repo `[network]` is structural, not a hidden bit         |
 
 **Process and attachment lifecycle**
 
@@ -51,7 +45,6 @@ the report is not in the tree.
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
-- `0115` is sequenced before `0118` because `0118` lowers the field `0115` reshapes.
 - `0120` records where rmcp stops being an implementation detail, and `0124` applies that answer
   to the surfaces `0120` does not touch. The decision sits in `0120` because the queue runs one
   task at a time and `0120` is the first that has to commit; neutral content types do not on

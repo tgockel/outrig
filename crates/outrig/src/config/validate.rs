@@ -1,6 +1,12 @@
 //! Cross-reference validation for a merged `Config`. Mirrors the rules in
 //! `doc/reference/config.md`'s "Validation rules" section.
 //!
+//! Two entry points, because two kinds of rule live here. [`validate`] runs on
+//! the *merged* config and checks that it hangs together. [`validate_as_repo`]
+//! runs on a single *unmerged* repo file and checks what that file was allowed
+//! to say -- a question the merged value cannot answer, since the merge has by
+//! then taken each global-only key from the global side.
+//!
 //! `api-key` syntax is enforced at parse time by `super::api_key`; this module
 //! only checks cross-references, MCP server-name shape, and disk-existence of
 //! image `dockerfile` / `context` paths.
@@ -326,6 +332,12 @@ pub enum ConfigValidationError {
 
     #[error("{message}")]
     NetworkPolicyInvalid { message: String },
+
+    #[error(
+        "repo config may set [network].mode only; [network].{key} belongs in \
+         global config"
+    )]
+    RepoNetworkPolicy { key: &'static str },
 
     #[error(
         "model {model:?} (provider style=mistralrs) must set exactly one of \
@@ -800,10 +812,22 @@ pub(super) fn validate_with_options(
     Ok(())
 }
 
+/// The rules that apply to a repo config file, checked on the unmerged value.
+///
+/// Today there is one: `[network]`'s policy keys describe the machine's egress
+/// and belong to the operator, so a repo config may declare `mode` and nothing
+/// else. See [`Config::validate_as_repo`](super::Config::validate_as_repo).
+pub(super) fn validate_as_repo(cfg: &Config) -> Result<(), ConfigValidationError> {
+    match cfg.network.declared_policy_key() {
+        Some(key) => Err(ConfigValidationError::RepoNetworkPolicy { key }),
+        None => Ok(()),
+    }
+}
+
 fn validate_network_policy(cfg: &Config) -> Result<(), ConfigValidationError> {
     cfg.network
         .policy()
-        .validate(cfg.network.mode == NetworkMode::Filter)
+        .validate(cfg.network.mode() == NetworkMode::Filter)
         .map_err(|message| ConfigValidationError::NetworkPolicyInvalid { message })
 }
 

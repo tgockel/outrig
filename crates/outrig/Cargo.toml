@@ -44,7 +44,6 @@ thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "signal", "fs", "time", "sync"] }
 tokio-util         = { workspace = true }
 toml               = { workspace = true, features = ["display", "parse", "serde"] }
-toml_edit          = { workspace = true, features = ["display", "parse"] }
 tracing            = { workspace = true, features = ["std", "attributes"] }
 tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "tracing-log", "smallvec", "env-filter"] }
 walkdir            = { workspace = true }
@@ -54,4 +53,4 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 # `test-util` pauses the clock so the interceptor's sniff window can be driven
 # deterministically rather than slept through.
 tokio   = { workspace = true, features = ["test-util"] }
-toml    = { workspace = true, features = ["parse", "serde"] }
+toml    = { workspace = true, features = ["display", "parse", "serde"] }

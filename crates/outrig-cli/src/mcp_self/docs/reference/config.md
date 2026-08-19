@@ -70,9 +70,9 @@ usually belongs there too, although repo or agent config can tighten it for a no
 sets its own overrides it, which is usually the better place since rate limits are a property
 of the endpoint.
 `[network].mode` can live in either file; when both set it, the repo value wins for that repo.
-Network policy keys (`default`, `allow`, and `deny`) are global-only because they describe the
-machine's egress policy, not a project preference. Each may also appear in the other file; repo
-entries override global by name.
+A `[network]` table that declares no `mode` declares nothing, so it inherits. Network policy
+keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
+egress policy, not a project preference; a repo config that sets one is rejected at load.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -1061,10 +1061,14 @@ repo mounts. Duplicate final `container-path` values are rejected during validat
 `[sidecars.<sc>]` merges by name like the other top-level maps, so a repo image-config can
 reference a sidecar the user declared globally.
 
-`[network].mode` follows repo precedence when the repo config declares the table. If the repo
-omits `[network]`, the global mode remains in effect. This matters when global config enables
-audit or filter mode and a repo explicitly sets `mode = "default"`. Network policy keys are
-global-only; repo config cannot set `network.default`, `network.allow`, or `network.deny`.
+`[network].mode` merges per key like `[workspace]`'s primary fields: a repo `mode` overrides
+the global one, and when the repo is silent -- whether it omits `[network]` entirely or writes
+the table without a `mode` -- the global mode remains in effect. If neither file declares it,
+the built-in `default` applies. This matters when global config enables audit or filter mode
+and a repo explicitly sets `mode = "default"`, which is the only way a repo turns interception
+off. Network policy keys are global-only: a repo config that sets `network.default`,
+`network.allow`, or `network.deny` is rejected at load, and no repo value can reach the
+effective policy even if it carries one.
 
 ### Path resolution
 
@@ -1168,6 +1172,9 @@ device     = "cpu"
 default-image = "coding"
 default-agent = "coding"
 
+[network]
+mode = "audit"   # the only `[network]` key a repo config may set
+
 [workspace]
 host-path      = "."
 container-path = "/workspace"
@@ -1263,7 +1270,10 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `request-timeout-secs`, if set on a remote provider, must be between `1` and `3600` seconds.
   Unlike `retry-budget-secs`, `0` is **not** legal: it is an immediate timeout rather than a
   disabled one, so every request would fail before it could be answered.
-- `[network].mode`, if set, must be `default` or `audit`.
+- `[network].mode`, if set, must be `default`, `audit`, or `filter`. `filter` additionally
+  requires at least one global `allow` or `deny` entry.
+- A repo config may set `[network].mode` only; `[network].default`, `[network].allow`, and
+  `[network].deny` are rejected there.
 - Every server name in `[images.<name>.mcp]` must match `^[a-zA-Z][a-zA-Z0-9_-]*$` and be
   unique within its image-config.
 - Every `command` array must be non-empty.
