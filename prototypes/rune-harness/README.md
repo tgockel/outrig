@@ -30,12 +30,12 @@ independent stdin task ──ExternalEvent::UserInput──▶ AgentDriver
 * `ModelBackend::activate(ActivationRequest) -> Decision` is fresh for every activation. `ActivationRequest` contains stable instructions, the exact cause, one bounded observation/diagnostic, capability summaries, and retained-binding inventory—never provider transcript/history.
 * `RealModel` reuses OutRig's config resolution, provider construction, retries, failover, and token ceilings through temporary `outrig-cli` internal APIs. Its Rig agent is built with **no tools**. `RigAgent::activate_text_once` performs one prompt with no supplied history; the host parses the tagged decision JSON. There is no Rig tool loop.
 * `ScriptedModel` records every request for deterministic tests.
-* Each Rune snippet is separately compiled to an async entrypoint. Host binding names are predeclared with `Statics`; a fresh unit-specific `Globals` is seeded by name, then extracted by name after completion. Values remain Rune `Value`s and are not serialized into model context.
+* Each Rune snippet is separately compiled to an async entrypoint. Host binding names are predeclared with `Statics`; a fresh unit-specific `Globals` is seeded by name, then extracted by name after completion. Values remain Rune `Value`s and are not serialized into model context. The entrypoint's anonymous final expression is observed automatically but is not retained as a binding: String and common scalar values render directly, while other types produce a bounded type-aware placeholder rather than blind serialization. End with `preview(value, start, end)` to observe a bounded slice of a large retained String.
 * A bounded transformer promotes top-level `let IDENT = expression;` to assignment into a persistent root static. It handles arbitrary ASCII Rune identifiers and skips strings, line comments, and nested delimiters. This is intentionally a prototype transformer rather than a complete Rune AST rewrite.
 * `events::next().await` installs one oneshot waiter before yielding. Tests wait on its registration notification rather than sleeping. Cancellation drops the native future and clears the epoch-matched waiter.
 * `FileSystem` is read-only. A persistent global `fs` value is seeded into every unit; `fs.read(relative_path)` synchronously canonicalizes beneath `--repo`, rejects traversal, symlink escape and non-files, requires UTF-8, and tracks reads. The model—not a CLI `--file`—selects paths.
 * `FILE_SYSTEM` is the canonical capability definition used both for Rune trait metadata and Python-like dynamic model documentation. `doc(fs)` renders `trait FileSystem` and its actual synchronous `fn read(path: String) -> String` signature inside Rune.
-* `Context::with_config(false)` disables normal stdio. Replacement `std::io::{print,println}` hooks retain at most 16 KiB including the metadata suffix and report attempted/captured/truncated bytes plus binding inventory. `preview(value,start,end)` slices a retained String before formatting.
+* `Context::with_config(false)` disables normal stdio. Replacement `std::io::{print,println}` hooks and the automatic final-expression observation share a UTF-8-safe 16 KiB limit including the metadata suffix, and report attempted/captured/truncated bytes plus binding inventory. `preview(value,start,end)` slices a retained String before formatting; prefer it as the final expression instead of printing or returning an entire large value.
 
 ## Rune dependency
 
@@ -102,7 +102,7 @@ cargo run --manifest-path prototypes/rune-harness/Cargo.toml --bin rune-harness-
 cargo check --manifest-path prototypes/rune-harness/Cargo.toml --bin outrig-harness
 ```
 
-Tests cover fresh activations, scope across Units and arbitrary names, one-read large-file retention plus bounded preview, waiter-synchronized awaited events, exact-cause unawaited cancellation with a drop counter, path/symlink boundaries, Emit/Idle behavior, and the total output cap.
+Tests cover fresh activations (with no transcript), automatic String/scalar final-expression observations, unit and huge UTF-8 String results, scope across Units and arbitrary names, one-read large-file retention plus bounded preview, waiter-synchronized awaited events, exact-cause unawaited cancellation with a drop counter, path/symlink boundaries, Emit/Idle behavior, and the total output cap.
 
 ## Honest limitations
 

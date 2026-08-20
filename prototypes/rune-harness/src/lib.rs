@@ -80,7 +80,10 @@ impl Capture {
     fn append(&mut self, text: &str, newline: bool) {
         self.attempted += text.len() + usize::from(newline);
         let room = MODEL_VISIBLE_LIMIT.saturating_sub(self.bytes.len());
-        let take = room.min(text.len());
+        let mut take = room.min(text.len());
+        while !text.is_char_boundary(take) {
+            take -= 1;
+        }
         self.bytes.extend_from_slice(&text.as_bytes()[..take]);
         self.truncated |= take < text.len();
         if newline {
@@ -446,11 +449,12 @@ impl Invocation {
             counter: self.cancellations.clone(),
             complete: false,
         };
-        execution
+        let final_value = execution
             .async_complete()
             .await
             .context("execute Rune activation")?;
         guard.complete = true;
+        self.observe_final_value(&final_value);
         for name in names {
             if let Some(value) = globals.get([name.as_str()])? {
                 if let Ok(s) = value.borrow_string_ref() {
@@ -461,6 +465,32 @@ impl Invocation {
         }
         Ok(self.observation())
     }
+    fn observe_final_value(&self, value: &Value) {
+        if value.into_unit().is_ok() {
+            return;
+        }
+
+        let rendered = if let Ok(value) = value.borrow_string_ref() {
+            value.to_string()
+        } else if let Ok(value) = rune::from_value::<bool>(value.clone()) {
+            value.to_string()
+        } else if let Ok(value) = rune::from_value::<i64>(value.clone()) {
+            value.to_string()
+        } else if let Ok(value) = rune::from_value::<u64>(value.clone()) {
+            value.to_string()
+        } else if let Ok(value) = rune::from_value::<f64>(value.clone()) {
+            value.to_string()
+        } else if let Ok(value) = rune::from_value::<char>(value.clone()) {
+            format!("{value:?}")
+        } else {
+            format!("<{} value; preview not available>", value.type_info())
+        };
+        self.capture
+            .lock()
+            .expect("capture")
+            .append(&format!("final expression: {rendered}"), true);
+    }
+
     fn observation(&self) -> String {
         let capture = self.capture.lock().expect("capture");
         let inventory = if self.scope.values.is_empty() {
@@ -470,9 +500,13 @@ impl Invocation {
         };
         let suffix0 = format!("\n---\nattempted_bytes={} captured_bytes={{}} truncated={{}}\nretained_bindings: {inventory}", capture.attempted);
         let room = MODEL_VISIBLE_LIMIT.saturating_sub(suffix0.len() + 32);
-        let take = room.min(capture.bytes.len());
+        let capture_text = std::str::from_utf8(&capture.bytes).expect("capture is UTF-8");
+        let mut take = room.min(capture.bytes.len());
+        while !capture_text.is_char_boundary(take) {
+            take -= 1;
+        }
         let truncated = capture.truncated || take < capture.bytes.len();
-        let mut result = String::from_utf8_lossy(&capture.bytes[..take]).into_owned();
+        let mut result = capture_text[..take].to_owned();
         result.push_str(&format!("\n---\nattempted_bytes={} captured_bytes={} truncated={}\nretained_bindings: {inventory}", capture.attempted, take, truncated));
         if result.len() > MODEL_VISIBLE_LIMIT {
             let mut end = MODEL_VISIBLE_LIMIT;
@@ -600,7 +634,7 @@ impl<M: ModelBackend> AgentDriver<M> {
         input: mpsc::UnboundedReceiver<ExternalEvent>,
         output: mpsc::UnboundedSender<String>,
     ) -> Self {
-        Self { model, invocation, input, output, queued: VecDeque::new(), instructions: "Return exactly one Decision. Execute Rune to observe or retain state; Emit is the only user-facing output. No provider history exists. Available: persistent fs, doc(value), preview(value,start,end), events::next().await. Discover filesystem capability with doc(fs), then call fs.read(relative_path).".into() }
+        Self { model, invocation, input, output, queued: VecDeque::new(), instructions: "Return exactly one Decision. Execute Rune to observe or retain state; its final expression is observed automatically, so end with preview(value,start,end) for a bounded view of a large String. Emit is the only user-facing output. No provider history exists. Available: persistent fs, doc(value), preview(value,start,end), events::next().await. Discover filesystem capability with doc(fs), then call fs.read(relative_path).".into() }
     }
     fn request(&self, cause: ActivationCause, observation: String) -> ActivationRequest {
         ActivationRequest {
@@ -712,6 +746,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn final_string_expression_is_observed_without_binding() -> Result<()> {
+        let d = TempDir::new()?;
+        let mut i = inv(&d)?;
+        let observation = i.execute(r#""expression result""#).await?;
+        assert!(observation.starts_with("final expression: expression result\n"));
+        assert!(!i
+            .binding_inventory()
+            .iter()
+            .any(|b| b.contains("expression result")));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn common_scalar_final_expressions_and_other_type_are_readable() -> Result<()> {
+        let d = TempDir::new()?;
+        let mut i = inv(&d)?;
+        assert!(i
+            .execute("true")
+            .await?
+            .starts_with("final expression: true"));
+        assert!(i.execute("-42").await?.starts_with("final expression: -42"));
+        assert!(i.execute("3.5").await?.starts_with("final expression: 3.5"));
+        assert!(i.execute("'z'").await?.starts_with("final expression: 'z'"));
+        let other = i.execute("(1, 2)").await?;
+        assert!(other.starts_with("final expression: <"));
+        assert!(other.contains("value; preview not available>"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn huge_final_string_is_utf8_safe_bounded_and_truncated() -> Result<()> {
+        let d = TempDir::new()?;
+        let mut i = inv(&d)?;
+        let source = format!("{:#?}", "x".repeat(100_000));
+        let observation = i.execute(&source).await?;
+        assert!(observation.len() <= MODEL_VISIBLE_LIMIT);
+        assert!(
+            observation.contains("attempted_bytes=100019"),
+            "got: {observation}"
+        );
+        assert!(observation.contains("truncated=true"), "got: {observation}");
+        assert!(observation.is_char_boundary(observation.len()));
+        let mut capture = Capture::default();
+        capture.append(&"α".repeat(MODEL_VISIBLE_LIMIT), false);
+        assert!(std::str::from_utf8(&capture.bytes).is_ok());
+        assert!(capture.truncated);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_final_expression_adds_no_capture() -> Result<()> {
+        let d = TempDir::new()?;
+        let mut i = inv(&d)?;
+        let observation = i.execute("()").await?;
+        assert!(observation.starts_with("\n---\nattempted_bytes=0 captured_bytes=0"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn scope_across_units_and_arbitrary_binding() -> Result<()> {
         let d = TempDir::new()?;
         let mut i = inv(&d)?;
@@ -812,6 +905,42 @@ mod tests {
         assert_eq!(p.names, vec!["any_identifier_7"]);
         assert!(p.source.contains("any_identifier_7 ="));
         assert!(p.source.contains("let local"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn driver_fresh_activation_sees_final_expression_without_transcript() -> Result<()> {
+        let d = TempDir::new()?;
+        let invocation = inv(&d)?;
+        let model = ScriptedModel::new([
+            Decision::ExecuteRune {
+                source: r#""anonymous result""#.into(),
+            },
+            Decision::Emit {
+                text: "done".into(),
+            },
+        ]);
+        let (tx, rx, otx, mut orx) = channels();
+        tx.send(ExternalEvent::UserInput {
+            id: 1,
+            text: "start".into(),
+        })?;
+        let mut running = Box::pin(AgentDriver::new(model, invocation, rx, otx).run());
+        assert_eq!(
+            tokio::select! {v=orx.recv()=>v, _r=&mut running=>panic!("driver ended unexpectedly")}
+                .as_deref(),
+            Some("done")
+        );
+        tx.send(ExternalEvent::Eof)?;
+        let driver = running.await?;
+        let request = &driver.model.requests[1];
+        assert!(request
+            .observation
+            .contains("final expression: anonymous result"));
+        assert!(matches!(request.cause, ActivationCause::RuneObservation(_)));
+        let serialized = serde_json::to_string(request)?;
+        assert!(!serialized.contains("execute_rune"));
+        assert!(!serialized.contains("source"));
         Ok(())
     }
 

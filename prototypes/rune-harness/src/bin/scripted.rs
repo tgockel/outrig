@@ -16,10 +16,10 @@ async fn main() -> Result<()> {
         )
         .await?;
     let second = invocation
-        .execute("println!(\"{}\", preview(arbitrary_source, 50000, 50100));")
+        .execute("preview(arbitrary_source, 50000, 50100)")
         .await?;
     assert!(first.len() <= MODEL_VISIBLE_LIMIT);
-    assert!(second.starts_with(&"x".repeat(100)));
+    assert!(second.starts_with(&format!("final expression: {}", "x".repeat(100))));
     assert_eq!(invocation.reads(), 1);
     println!("event_driven=true units={} reads={} retained=arbitrary_source output_cap={MODEL_VISIBLE_LIMIT}", invocation.units(), invocation.reads());
     Ok(())
