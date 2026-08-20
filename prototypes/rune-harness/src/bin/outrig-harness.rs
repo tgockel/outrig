@@ -9,6 +9,20 @@ use outrig_rune_harness_prototype::{
 };
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::Instrument as _;
+use tracing_subscriber::EnvFilter;
+
+const TRACE_TARGET: &str = "outrig_harness::activation";
+
+fn init_tracing() -> Result<()> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,outrig_harness=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("initialize harness tracing subscriber: {error}"))
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Event-driven, host-scoped Rune agent prototype")]
@@ -22,6 +36,10 @@ struct Args {
     /// Override the user-level OutRig configuration file.
     #[arg(long)]
     global_config: Option<PathBuf>,
+    /// Trace activation requests and raw provider responses to stderr.
+    /// WARNING: this may expose sensitive model/provider content.
+    #[arg(long)]
+    trace_model: bool,
 }
 
 fn global_config_path_with(
@@ -67,24 +85,73 @@ fn resolve_global_config(override_path: Option<&Path>) -> Result<Option<PathBuf>
 
 struct RealModel {
     agent: RigAgent,
+    trace: bool,
+    activation_sequence: u64,
 }
 #[async_trait(?Send)]
 impl ModelBackend for RealModel {
     async fn activate(&mut self, request: ActivationRequest) -> Result<Decision> {
-        let schema = r#"Reply with JSON only, exactly one of:
+        self.activation_sequence += 1;
+        let sequence = self.activation_sequence;
+        let span = tracing::info_span!(target: TRACE_TARGET, "model_activation", sequence);
+        async {
+            let schema = r#"Reply with JSON only, exactly one of:
 {"decision":"execute_rune","source":"Rune snippet body"}
 {"decision":"emit","text":"user-facing answer"}
 Do not add markdown fences."#;
-        let prompt = format!(
-            "{schema}\n\nActivation request (there are no prior provider messages):\n{}",
-            serde_json::to_string_pretty(&request)?
-        );
-        let text = self
-            .agent
-            .activate_text_once(&prompt)
-            .await
-            .context("history-free model completion")?;
-        parse_decision(&text)
+            let serialized_request = serde_json::to_string_pretty(&request)?;
+            let prompt = format!(
+                "{schema}\n\nActivation request (there are no prior provider messages):\n{serialized_request}"
+            );
+            tracing::info!(target: TRACE_TARGET, "activation started");
+            tracing::debug!(
+                target: TRACE_TARGET,
+                activation_request = %serialized_request,
+                "serialized ActivationRequest"
+            );
+            if self.trace {
+                eprintln!("[outrig-harness trace] activation {sequence} begin");
+                eprintln!(
+                    "[outrig-harness trace] activation {sequence} ActivationRequest:\n{serialized_request}"
+                );
+            }
+            let text = match self.agent.activate_text_once(&prompt).await {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %error,
+                        "model completion failed"
+                    );
+                    if self.trace {
+                        eprintln!(
+                            "[outrig-harness trace] activation {sequence} completion failed: {error:#}"
+                        );
+                    }
+                    return Err(error).context("history-free model completion");
+                }
+            };
+            tracing::debug!(target: TRACE_TARGET, decoded_model_text = %text, "model text decoded");
+            if self.trace {
+                eprintln!("[outrig-harness trace] activation {sequence} decoded model text:\n{text}");
+            }
+            match parse_decision(&text) {
+                Ok(decision) => {
+                    let kind = match &decision {
+                        Decision::ExecuteRune { .. } => "execute_rune",
+                        Decision::Emit { .. } => "emit",
+                    };
+                    tracing::info!(target: TRACE_TARGET, decision = kind, "model decision decoded");
+                    Ok(decision)
+                }
+                Err(error) => {
+                    tracing::error!(target: TRACE_TARGET, error = %error, "model decision decode failed");
+                    Err(error)
+                }
+            }
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -106,7 +173,14 @@ fn parse_decision(text: &str) -> Result<Decision> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    init_tracing()?;
     let args = Args::parse();
+    outrig_cli::llm::retry::set_trace_model_responses(args.trace_model);
+    if args.trace_model {
+        eprintln!(
+            "[outrig-harness trace] tracing enabled; model/provider content may be sensitive"
+        );
+    }
     let repo = args
         .repo
         .canonicalize()
@@ -165,7 +239,16 @@ async fn main() -> Result<()> {
         selected_agent.unwrap_or("(agentless)"),
         resolved.model_name()
     );
-    let driver = AgentDriver::new(RealModel { agent }, invocation, input_rx, output_tx);
+    let driver = AgentDriver::new(
+        RealModel {
+            agent,
+            trace: args.trace_model,
+            activation_sequence: 0,
+        },
+        invocation,
+        input_rx,
+        output_tx,
+    );
     let _driver = driver.run().await?;
     reader.await.context("stdin task join")??;
     printer.await.context("output task join")?;
@@ -175,6 +258,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trace_model_flag_is_opt_in() {
+        assert!(
+            !Args::try_parse_from(["outrig-harness"])
+                .unwrap()
+                .trace_model
+        );
+        assert!(
+            Args::try_parse_from(["outrig-harness", "--trace-model"])
+                .unwrap()
+                .trace_model
+        );
+    }
+
     #[test]
     fn global_config_override_wins() {
         let explicit = Path::new("/explicit/config.toml");

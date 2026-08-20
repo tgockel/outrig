@@ -54,7 +54,7 @@ From the OutRig repository root (there is no `--file`):
 ```sh
 cargo run --manifest-path prototypes/rune-harness/Cargo.toml \
   --bin outrig-harness -- --repo . [--agent NAME] [--model NAME] \
-  [--global-config PATH]
+  [--global-config PATH] [--trace-model]
 ```
 
 `--repo` defaults to the current directory and must be the configured project root. The CLI loads `.agents/outrig/config.toml` plus an existing global config. `--global-config PATH` is an explicit override and must name a file; otherwise resolution matches OutRig: `$XDG_CONFIG_HOME/outrig/config.toml` when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml`. A missing default global config is optional. `--agent` defaults to the merged `default-agent`; `--model` overrides the selected agent's model, while an agentless run can use the merged global `default-model`.
@@ -80,6 +80,10 @@ preamble = "Investigate with Rune before making unsupported claims."
 ```
 
 Export the environment variable named by `api-key` (here `OPENAI_API_KEY`) before launch. Anthropic providers and model aliases/failover use the existing OutRig resolver and runtime. No Podman, image, MCP, or sidecar is started.
+
+The harness installs a `tracing-subscriber` and honors `RUST_LOG`. Its default is modest (`outrig_harness=info`, with other targets at `warn`). Enable structured request and decoded-text diagnostics with, for example, `RUST_LOG=outrig_harness=debug`; those debug events can contain model-visible content.
+
+`--trace-model` is an opt-in diagnostic for real-model runs. It prints each activation sequence, the exact serialized `ActivationRequest`, decoded model text or completion error, and successful raw provider response bodies to stderr. Raw bodies are capped at 64 KiB with a truncation marker. **Tracing may expose sensitive prompts, model output, provider metadata, or other provider content; it is off by default.** The normal OutRig CLI does not enable this internal tracing switch.
 
 ## Manual real-model scenario
 

@@ -54,6 +54,7 @@
 //!
 //! [`CompletionModel`]: rig::completion::CompletionModel
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -130,6 +131,29 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// purpose: each one resends the whole conversation, and a body that is
 /// unusable three times running is not a hiccup.
 const RESPONSE_RETRY_ATTEMPTS: u32 = 2;
+
+/// Process-wide, opt-in provider body tracing for the experimental harness.
+///
+/// This is deliberately an internal diagnostic seam rather than normal CLI
+/// configuration. It defaults off, and callers must warn that response bodies
+/// can contain sensitive provider/model content.
+static TRACE_MODEL_RESPONSES: AtomicBool = AtomicBool::new(false);
+const TRACE_BODY_LIMIT: usize = 64 * 1024;
+
+/// Enable or disable raw successful-response tracing.
+#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
+pub fn set_trace_model_responses(enabled: bool) {
+    TRACE_MODEL_RESPONSES.store(enabled, Ordering::Relaxed);
+}
+
+fn render_traced_body(bytes: &[u8]) -> String {
+    let take = bytes.len().min(TRACE_BODY_LIMIT);
+    let mut rendered = String::from_utf8_lossy(&bytes[..take]).into_owned();
+    if bytes.len() > TRACE_BODY_LIMIT {
+        rendered.push_str("\n[outrig-harness trace] ... response body truncated at 65536 bytes ...");
+    }
+    rendered
+}
 
 /// A deadline shared by every candidate in one failover chain.
 ///
@@ -667,15 +691,24 @@ fn into_lazy_response<U>(
 where
     U: From<Bytes> + WasmCompatSend + 'static,
 {
-    let mut res = Response::builder().status(response.status());
+    let status = response.status();
+    let mut res = Response::builder().status(status);
     if let Some(hs) = res.headers_mut() {
         *hs = response.headers().clone();
     }
-    let body: LazyBody<U> = Box::pin(async {
+    let body: LazyBody<U> = Box::pin(async move {
         let bytes = response
             .bytes()
             .await
             .map_err(|e| HttpError::Instance(e.into()))?;
+        if TRACE_MODEL_RESPONSES.load(Ordering::Relaxed) {
+            eprintln!(
+                "[outrig-harness trace] raw model response status={} length={} bytes\n{}",
+                status,
+                bytes.len(),
+                render_traced_body(&bytes),
+            );
+        }
         Ok(U::from(bytes))
     });
     res.body(body).map_err(HttpError::Protocol)
@@ -867,6 +900,16 @@ pub fn unusable_response_label(err: &PromptError) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traced_body_rendering_is_bounded_and_marks_truncation() {
+        assert_eq!(render_traced_body(b"hello"), "hello");
+        let oversized = vec![b'x'; TRACE_BODY_LIMIT + 17];
+        let rendered = render_traced_body(&oversized);
+        assert!(rendered.starts_with(&"x".repeat(TRACE_BODY_LIMIT)));
+        assert!(rendered.contains("truncated at 65536 bytes"));
+        assert!(rendered.len() < TRACE_BODY_LIMIT + 100);
+    }
 
     fn http_status(code: u16) -> CompletionError {
         CompletionError::HttpError(HttpError::InvalidStatusCodeWithMessage(
