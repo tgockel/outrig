@@ -53,10 +53,11 @@ From the OutRig repository root (there is no `--file`):
 
 ```sh
 cargo run --manifest-path prototypes/rune-harness/Cargo.toml \
-  --bin outrig-harness -- --repo . [--agent NAME] [--model NAME]
+  --bin outrig-harness -- --repo . [--agent NAME] [--model NAME] \
+  [--global-config PATH]
 ```
 
-`--repo` defaults to the current directory and must be the configured project root. The CLI loads `.agents/outrig/config.toml`. `--agent` defaults to `default-agent`; `--model` overrides its model.
+`--repo` defaults to the current directory and must be the configured project root. The CLI loads `.agents/outrig/config.toml` plus an existing global config. `--global-config PATH` is an explicit override and must name a file; otherwise resolution matches OutRig: `$XDG_CONFIG_HOME/outrig/config.toml` when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml`. A missing default global config is optional. `--agent` defaults to the merged `default-agent`; `--model` overrides the selected agent's model, while an agentless run can use the merged global `default-model`.
 
 Example configuration:
 

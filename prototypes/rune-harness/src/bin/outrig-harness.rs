@@ -1,12 +1,13 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
+use directories::BaseDirs;
 use outrig_cli::llm::{build_agent, resolve_agent_with_overrides, RigAgent};
 use outrig_rune_harness_prototype::{
     channels, ActivationRequest, AgentDriver, Decision, EventBridge, ExternalEvent, Invocation,
     ModelBackend,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser, Debug)]
@@ -18,6 +19,50 @@ struct Args {
     agent: Option<String>,
     #[arg(long)]
     model: Option<String>,
+    /// Override the user-level OutRig configuration file.
+    #[arg(long)]
+    global_config: Option<PathBuf>,
+}
+
+fn global_config_path_with(
+    override_path: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home: &Path,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.to_path_buf();
+    }
+    if let Some(xdg) = xdg_config_home {
+        return xdg.join("outrig").join("config.toml");
+    }
+    home.join(".outrig").join("config.toml")
+}
+
+fn resolve_global_config_with(
+    override_path: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home: &Path,
+    is_file: impl FnOnce(&Path) -> bool,
+) -> Result<Option<PathBuf>> {
+    let path = global_config_path_with(override_path, xdg_config_home, home);
+    if is_file(&path) {
+        Ok(Some(path))
+    } else if override_path.is_some() {
+        bail!(
+            "--global-config does not exist or is not a file: {}",
+            path.display()
+        )
+    } else {
+        Ok(None)
+    }
+}
+
+fn resolve_global_config(override_path: Option<&Path>) -> Result<Option<PathBuf>> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .unwrap_or_default();
+    resolve_global_config_with(override_path, xdg.as_deref(), &home, Path::is_file)
 }
 
 struct RealModel {
@@ -66,8 +111,9 @@ async fn main() -> Result<()> {
         .repo
         .canonicalize()
         .with_context(|| format!("canonicalize --repo {}", args.repo.display()))?;
-    let (config, config_root) =
-        outrig::load_project(&repo, None).context("load .agents/outrig/config.toml")?;
+    let global_config = resolve_global_config(args.global_config.as_deref())?;
+    let (config, config_root) = outrig::load_project(&repo, global_config.as_deref())
+        .context("load project and global OutRig configuration")?;
     if config_root.canonicalize()? != repo {
         bail!(
             "--repo must be the configured repository root (config resolved at {})",
@@ -129,6 +175,75 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn global_config_override_wins() {
+        let explicit = Path::new("/explicit/config.toml");
+        assert_eq!(
+            global_config_path_with(
+                Some(explicit),
+                Some(Path::new("/xdg")),
+                Path::new("/home/alice")
+            ),
+            explicit
+        );
+    }
+
+    #[test]
+    fn global_config_uses_xdg_before_home() {
+        assert_eq!(
+            global_config_path_with(None, Some(Path::new("/xdg")), Path::new("/home/alice")),
+            Path::new("/xdg/outrig/config.toml")
+        );
+    }
+
+    #[test]
+    fn global_config_falls_back_to_outrig_home() {
+        assert_eq!(
+            global_config_path_with(None, None, Path::new("/home/alice")),
+            Path::new("/home/alice/.outrig/config.toml")
+        );
+    }
+
+    #[test]
+    fn missing_explicit_global_config_is_an_error_but_missing_default_is_optional() {
+        let explicit = Path::new("/missing/config.toml");
+        let error = resolve_global_config_with(
+            Some(explicit),
+            Some(Path::new("/xdg")),
+            Path::new("/home/alice"),
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--global-config"));
+        assert!(error.to_string().contains("/missing/config.toml"));
+        assert_eq!(
+            resolve_global_config_with(
+                None,
+                Some(Path::new("/xdg")),
+                Path::new("/home/alice"),
+                |_| false
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn existing_default_global_config_is_passed_to_loader() {
+        let expected = Path::new("/xdg/outrig/config.toml");
+        assert_eq!(
+            resolve_global_config_with(
+                None,
+                Some(Path::new("/xdg")),
+                Path::new("/home/alice"),
+                |path| path == expected
+            )
+            .unwrap()
+            .as_deref(),
+            Some(expected)
+        );
+    }
+
     #[test]
     fn parses_plain_and_fenced_decisions() {
         assert!(matches!(

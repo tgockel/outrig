@@ -1662,6 +1662,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "directories",
  "outrig",
  "outrig-cli",
  "rig-core",
