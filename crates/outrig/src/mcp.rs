@@ -20,12 +20,11 @@ use std::time::Duration;
 use rmcp::model::{CallToolRequestParams, ContentBlock, ResourceContents};
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use serde_json::Value;
-use tokio::process::Child;
 
 use crate::config::{EnvValue, McpServerSpec};
 use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, OutrigError, Result};
-use crate::process::{Cmd, Transcript};
+use crate::process::{Cmd, Owned, StdioSpec, Transcript};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -75,14 +74,23 @@ impl McpToolResult {
     }
 }
 
-/// On `Drop` without an explicit [`McpClient::shutdown`], the underlying
-/// `tokio::process::Child` was spawned with `kill_on_drop(true)`, so the
-/// server gets SIGKILLed -- not graceful, but no leaked process.
+/// On `Drop` without an explicit [`McpClient::shutdown`], the child is owned by
+/// outrig's process layer: it is SIGKILLed synchronously and reaped by the
+/// runtime -- not graceful, but no leaked process and no zombie.
+///
+/// The child is the **host-side transport**, not the server. Both shapes are
+/// clients of a container: `podman exec -i` for a server started per session,
+/// `podman start --attach` for one that is the container's entrypoint. Killing
+/// either closes the transport and tells outrig nothing about the server,
+/// which conmon supervises inside the container's own namespaces and which may
+/// keep running. Stopping the container is what ends it, and session teardown
+/// is what does that -- so a caller that drops an `McpClient` without also
+/// stopping the container has closed a pipe, not shut down a server.
 #[derive(Debug)]
 pub struct McpClient {
     name: String,
     service: RunningService<RoleClient, ()>,
-    child: Child,
+    child: Owned,
 }
 
 impl McpClient {
@@ -216,15 +224,14 @@ impl McpClient {
                 .await?;
         }
 
-        let mut cmd = cmd.to_tokio_command();
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr_std))
-            .kill_on_drop(true);
-
-        let mut child = cmd.spawn()?;
-        let stdin = child.stdin.take().expect("stdin was piped above");
-        let stdout = child.stdout.take().expect("stdout was piped above");
+        // Through the shared spawn chokepoint rather than a hand-rolled
+        // `Command`, so this child gets the same ownership guarantee as every
+        // other: see `crate::process`. The stderr override is the only reason
+        // this site needs a spec of its own.
+        let mut child =
+            cmd.spawn_owned(StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_std)))?;
+        let stdin = child.take_stdin();
+        let stdout = child.take_stdout();
 
         // The unwrapped pipe halves go straight to rmcp via the blanket
         // `IntoTransport for (R, W)` impl. Going through
@@ -353,7 +360,19 @@ impl McpClient {
 
     /// Cancel the rmcp service (which closes the child's stdin -- the MCP
     /// spec's normal shutdown signal), wait up to `SHUTDOWN_GRACE` for the
-    /// server to exit on its own, then SIGKILL if it doesn't.
+    /// **transport** to exit on its own, then SIGKILL it if it does not.
+    ///
+    /// On that last path `Ok` means the kill was issued and the reap is owed,
+    /// not that it has happened: the bounded `terminate` can itself time out
+    /// against a client that cannot be collected, and what covers that is
+    /// `Owned`'s `Drop`, which is where the obligation belongs. A transport
+    /// that exits within the grace *is* reaped before this returns.
+    ///
+    /// The transport is the host-side podman client, and it is all this owns.
+    /// The server runs in the container, outlives the client that spoke to
+    /// it, and is terminated by container teardown -- so a returned `Ok` says
+    /// the pipe is closed and the client is gone, not that the server has
+    /// stopped.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
             service, mut child, ..
@@ -368,9 +387,16 @@ impl McpClient {
         match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
+            // `terminate` kills and awaits the reap, so on the ordinary
+            // outcome this returns with the *transport* confirmed gone --
+            // the host-side podman client, and only it. The server itself
+            // runs in the container, outlives the client that spoke to it,
+            // and goes when the container does. The timeout keeps the old
+            // bound for a client that cannot be reaped at all; dropping
+            // `terminate` there leaves the obligation with `Owned`, which is
+            // where it belongs.
             Err(_) => {
-                let _ = child.start_kill();
-                let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await;
+                let _ = tokio::time::timeout(SHUTDOWN_GRACE, child.terminate()).await;
                 Ok(())
             }
         }
@@ -417,7 +443,7 @@ async fn enrich_startup_error(
     declaration_source: Option<&str>,
     command: &[String],
     stderr_path: &Path,
-    child: &mut Child,
+    child: &mut Owned,
     source: rmcp::service::ClientInitializeError,
 ) -> OutrigError {
     let exit_status = match tokio::time::timeout(Duration::from_millis(250), child.wait()).await {
@@ -622,13 +648,11 @@ mod tests {
         let stderr_path = dir.path().join("svc.stderr");
         let stderr_file = tokio::fs::File::create(&stderr_path).await.unwrap();
 
-        let mut child = tokio::process::Command::new("sh")
+        let mut child = Cmd::new("sh")
             .args(["-c", "echo boom 1>&2; exit 7"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr_file.into_std().await))
-            .kill_on_drop(true)
-            .spawn()
+            .spawn_owned(
+                StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_file.into_std().await)),
+            )
             .unwrap();
 
         let argv = vec![

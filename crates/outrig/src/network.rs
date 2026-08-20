@@ -22,7 +22,6 @@ use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -595,17 +594,19 @@ impl Cleanup {
         Ok(())
     }
 
+    /// The `Drop` form of [`Self::delete_table`]: a destructor cannot await an
+    /// `nsenter`, so the command is detached and its reap handed to
+    /// [`crate::supervise`].
     fn spawn_detached_delete(&self) {
-        let mut cmd = std::process::Command::new("nsenter");
-        let _ = cmd
-            .arg("-t")
-            .arg(self.pid.to_string())
-            .args(["-U", "-n", "nft", "delete", "table", "inet"])
-            .arg(&self.table)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        // Issued once: this selects a namespace by pid, and a pid is reused.
+        // A retry landing after the container exited would enter whatever
+        // holds that pid now and delete a table belonging to it.
+        crate::supervise::detach_cleanup(
+            nsenter_nft(self.pid)
+                .args(["delete", "table", "inet"])
+                .arg(&self.table),
+            crate::supervise::Reissue::Once,
+        );
     }
 }
 

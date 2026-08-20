@@ -8,7 +8,7 @@ design-first and `doc/reference/config.md` ships inside the binary via `include_
 false sentence is a defect with the same standing as a wrong branch.
 
 This task fixes what is **false now** and drafts the migration material. Cutting the final
-`[0.2.0]` headings, dates, links, version prose, and support table is **0129**'s job: those can
+`[0.2.0]` headings, dates, links, version prose, and support table is **0130**'s job: those can
 only be written once, at the version that ships, and this task runs before an RC. Splitting them
 is what keeps `0126` from having to be redone after rc.3.
 
@@ -54,7 +54,7 @@ Each was checked against the tree while this task was written.
 ## Goal
 
 Every documented claim about behavior is true at rc.3, and the migration material a 0.1 consumer
-needs exists in draft, ready for 0129 to date and publish.
+needs exists in draft, ready for 0130 to date and publish.
 
 ## Deliverables
 
@@ -77,7 +77,7 @@ needs exists in draft, ready for 0129 to date and publish.
   fixed symbol layer; public layouts changed and downstream crates rebuild, as Cargo normally
   does. Say it explicitly and do not claim ABI compatibility anywhere.
 - **Not in this task:** dated `[0.2.0]` headings, tag links, the quickstart version sample, and
-  `SECURITY.md`'s supported-version table. Those are 0129's, because they are only writable once.
+  `SECURITY.md`'s supported-version table. Those are 0130's, because they are only writable once.
 
 ## Acceptance
 
@@ -98,7 +98,7 @@ needs exists in draft, ready for 0129 to date and publish.
   rule permits, 0115 changes how `[network]` precedence is expressed, 0119-0124 change public
   API, and 0123 decides what `style = "mistralrs"` does. Writing the checklist before them means
   writing it twice.
-- Must precede 0127, which cuts the RC these notes describe.
+- Must precede 0128, which cuts the RC these notes describe.
 
 ## See also
 
@@ -106,4 +106,4 @@ needs exists in draft, ready for 0129 to date and publish.
 - `plan/next/startup-banner-has-no-tests.md` -- item 8's buffered entry.
 - `doc/usage/mcp.md`, `doc/usage/run.md`, `doc/reference/cli.md`, `crates/outrig-cli/README.md`,
   both `CHANGELOG.md` files.
-- `plan/todo/0129-release-0.2.0.md` -- takes the final-only half of this work.
+- `plan/todo/0130-release-0.2.0.md` -- takes the final-only half of this work.

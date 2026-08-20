@@ -1,12 +1,63 @@
-//! Process transcript support.
+//! Subprocess ownership, capture, and transcript support.
 //!
 //! The public piece is [`Transcript`], which mirrors command lines and output
 //! into a log file for runtime startup paths. The generic command/capture
 //! helpers in this module are crate-private implementation details used by
 //! the container and image runtimes.
+//!
+//! # What owning a child guarantees
+//!
+//! Every process this crate spawns goes through [`Cmd::spawn_owned`] and comes
+//! back as an [`Owned`]. Other modules are entitled to rely on two properties
+//! of that.
+//!
+//! **Dropping the future kills the child.** `Owned`'s destructor sends
+//! `SIGKILL` synchronously -- the signal has been delivered by the time the
+//! drop returns -- and hands the reap to a task on the runtime that spawned
+//! the child, since a tokio `Child` is bound to its own runtime's signal
+//! driver. The command also carries `kill_on_drop(true)`, which covers the
+//! case where that task is never polled: the child is killed again (harmless)
+//! and tokio's orphan queue reaps it instead.
+//!
+//! So the bound a caller who never passes a stop signal gets is **terminated
+//! synchronously, reaped as soon as the runtime is next driven** -- measured
+//! in single-digit milliseconds in `process_tests`. It is deliberately not an
+//! *instant* reap, and it is not a reap that can happen while the runtime is
+//! blocked: `Drop` cannot await, so neither this nor tokio's own orphan queue
+//! can promise more. A caller that drops a future and then blocks its runtime
+//! thread will see the process dead but not yet reaped, which is why the
+//! tests for this bound poll rather than read once.
+//!
+//! **A cooperating caller gets a confirmed reap.** The `*_until` helpers take
+//! a stop signal. When it fires they kill the child and `wait` on it before
+//! returning [`OutrigError::Canceled`], so the process is already gone -- and
+//! already reaped -- when the caller sees the error.
+//!
+//! Nothing separates the two. [`Cmd::spawn_owned`] is a synchronous function,
+//! so no `.await` sits between the `spawn` and the `Owned` that owns its
+//! child, and there is therefore no instant at which the process exists and
+//! nothing is responsible for it.
+//!
+//! # The one exception
+//!
+//! [`spawn_stdio`] hands its [`Child`] to the caller. The child keeps
+//! `kill_on_drop(true)`, so dropping the handle still kills the process, but
+//! the reap becomes the holder's -- this module does not supervise a child it
+//! has given away. That is deliberate: `podman exec -i` callers want full
+//! bidirectional control of the handle.
+//!
+//! # What this module does not cover
+//!
+//! Killing a client is not cleaning up what it created. A dead `podman exec`
+//! leaves the process it started running inside the container, and a dead
+//! `podman run` can leave a container behind, because the workload is
+//! supervised by conmon in its own namespaces rather than by the client this
+//! module owns. Engine-side obligations belong to [`crate::supervise`] and to
+//! the scope guards in [`crate::container`] and [`crate::image`].
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::Arc;
@@ -14,7 +65,8 @@ use std::time::Instant;
 
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::error::{IoPathExt, OutrigError, Result};
@@ -72,6 +124,46 @@ impl Cmd {
             .join(" ")
     }
 
+    /// Spawn this command with `stdio`, returning the child already owned.
+    ///
+    /// The single chokepoint every spawn in this crate goes through, which is
+    /// what makes ownership structural rather than something each call site
+    /// has to remember. `kill_on_drop(true)` is applied here and nowhere else.
+    ///
+    /// Synchronous on purpose. An `async fn` would put a cancellation point
+    /// between the `spawn` and the `Owned` that owns its child, which is the
+    /// window this abstraction exists to close.
+    pub(crate) fn spawn_owned(&self, stdio: StdioSpec) -> Result<Owned> {
+        // The reap has to run on the runtime that created the child, because
+        // a tokio `Child` polls that runtime's SIGCHLD driver. Both this and
+        // the spawn below need a runtime to be current; taking the handle
+        // first means a caller who has none is told so here rather than from
+        // inside tokio's process driver.
+        let handle = Handle::current();
+
+        let mut command = self.to_tokio_command();
+        command
+            .stdin(stdio.stdin)
+            .stdout(stdio.stdout)
+            .stderr(stdio.stderr)
+            .kill_on_drop(true);
+
+        let child = command.spawn().map_err(|e| self.spawn_error(e))?;
+        Ok(Owned {
+            child: Some(child),
+            handle,
+        })
+    }
+
+    /// Report that this command was stopped by its caller's signal. Consumes
+    /// the argv, so it is the last thing a helper does on that path.
+    fn canceled_error(self) -> OutrigError {
+        OutrigError::Canceled {
+            program: self.program,
+            argv: self.args,
+        }
+    }
+
     /// Label a failure to start this command with the program and full argv.
     /// Without this a missing `podman` / `buildah` / `git` surfaces as a bare
     /// "No such file or directory (os error 2)" with nothing to act on.
@@ -81,6 +173,237 @@ impl Cmd {
             command: self.render(),
             source,
         }
+    }
+}
+
+/// The stdio a spawn wants. Built per call rather than stored, because
+/// [`Stdio`] is a one-shot value: it can carry an owned file descriptor, so it
+/// is neither `Clone` nor reusable across spawns.
+pub(crate) struct StdioSpec {
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+}
+
+impl StdioSpec {
+    /// stdin closed, stdout and stderr piped -- what the capture helpers want.
+    fn captured() -> Self {
+        Self {
+            stdin: Stdio::null(),
+            stdout: Stdio::piped(),
+            stderr: Stdio::piped(),
+        }
+    }
+
+    /// [`Self::captured`] but with the parent's stdin. `try_capture` was built
+    /// on `Command::output()`, which (unlike `std`'s) does not redirect stdin,
+    /// so its children have always inherited it. Preserved deliberately:
+    /// `Container::exec_capture` is public and runs through this.
+    fn captured_inheriting_stdin() -> Self {
+        Self {
+            stdin: Stdio::inherit(),
+            ..Self::captured()
+        }
+    }
+
+    /// stdin closed, stdout inherited, stderr piped for line forwarding.
+    fn streamed() -> Self {
+        Self {
+            stdout: Stdio::inherit(),
+            ..Self::captured()
+        }
+    }
+
+    /// All three piped, for callers driving the child both ways.
+    pub(crate) fn bidirectional() -> Self {
+        Self {
+            stdin: Stdio::piped(),
+            ..Self::captured()
+        }
+    }
+
+    /// Send stderr somewhere other than a pipe -- a log file, in practice.
+    pub(crate) fn with_stderr(self, stderr: Stdio) -> Self {
+        Self { stderr, ..self }
+    }
+}
+
+/// A child process this crate owns.
+///
+/// See the [module docs](self) for what that ownership guarantees. The short
+/// version: dropping this kills the process synchronously and hands the reap
+/// off, and [`Owned::terminate`] does both and waits.
+#[derive(Debug)]
+pub(crate) struct Owned {
+    /// `None` once the child has been reaped by [`Owned::terminate`] or handed
+    /// to a caller by [`Owned::into_child`]. Either way nothing is owed, and
+    /// `Drop` has nothing to do.
+    child: Option<Child>,
+    handle: Handle,
+}
+
+/// A stream-draining task that is **aborted** when dropped, rather than
+/// detached.
+///
+/// Dropping a bare `JoinHandle` lets its task keep running, and a drain task
+/// holds one end of the child's pipe. Killing the child does not necessarily
+/// close the other end: anything the child left behind that inherited the
+/// descriptor keeps it open, and the drain would go on reading -- and go on
+/// growing its unbounded buffer -- long after the call that wanted the output
+/// was abandoned. Aborting drops the read end instead, which is also what
+/// tells such a descendant, via `EPIPE`, that nobody is listening.
+struct Drain<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T: Send + 'static> Drain<T> {
+    fn spawn(fut: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(Some(tokio::spawn(fut)))
+    }
+
+    /// Await the drain to completion.
+    ///
+    /// The handle is awaited **through** the guard and taken out only once it
+    /// has resolved. Taking it first would move it into a temporary, and a
+    /// caller cancelled during this await would drop that temporary -- which
+    /// detaches the task instead of aborting it, leaving the reader, its
+    /// descriptor and its buffer alive. That is exactly the case this join is
+    /// most likely to be cancelled in: it is reached after the child exited,
+    /// so if it is still running, something the child left behind is holding
+    /// the pipe open.
+    async fn join(mut self) -> T {
+        let joined = {
+            let handle = self
+                .0
+                .as_mut()
+                .expect("the handle is present until it is joined");
+            handle.await
+        };
+        // Resolved, so there is nothing left for `Drop` to abort.
+        self.0 = None;
+        joined.expect("stream capture task panicked")
+    }
+}
+
+impl<T> Drop for Drain<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// How a child stopped, when it was awaited under a stop signal.
+enum Waited {
+    Exited(ExitStatus),
+    /// The stop signal fired first. The child was killed **and reaped** before
+    /// this was produced, so a caller holding it has a finished process, not a
+    /// kill in flight.
+    Canceled,
+}
+
+impl Owned {
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("the child is present until it is reaped or released")
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> ChildStdin {
+        self.child_mut()
+            .stdin
+            .take()
+            .expect("stdin was configured as piped")
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> ChildStdout {
+        self.child_mut()
+            .stdout
+            .take()
+            .expect("stdout was configured as piped")
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> ChildStderr {
+        self.child_mut()
+            .stderr
+            .take()
+            .expect("stderr was configured as piped")
+    }
+
+    /// Await the child's exit. The ordinary success path.
+    pub(crate) async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child_mut().wait().await
+    }
+
+    /// Await the child, unless `stop` completes first -- in which case kill it
+    /// and await the reap before returning [`Waited::Canceled`].
+    ///
+    /// `stop` is any future: `CancellationToken::cancelled()` for a caller
+    /// with a token, `tokio::time::sleep(..)` for one with a budget, and
+    /// `std::future::pending()` for one with neither.
+    async fn wait_until(&mut self, stop: impl Future<Output = ()>) -> std::io::Result<Waited> {
+        let exited = {
+            let child = self.child_mut();
+            tokio::select! {
+                status = child.wait() => Some(status?),
+                () = stop => None,
+            }
+        };
+        match exited {
+            Some(status) => Ok(Waited::Exited(status)),
+            None => {
+                self.terminate().await?;
+                Ok(Waited::Canceled)
+            }
+        }
+    }
+
+    /// Kill the child and wait for it. Returns only once the process is gone
+    /// and reaped, which is the guarantee `Drop` cannot make.
+    ///
+    /// Idempotent, and safe to follow with [`Owned::wait`]: tokio caches the
+    /// exit status on the `Child`, so a second wait returns it rather than
+    /// asking the kernel about a pid nobody owns any more. `Drop` sees the
+    /// same cached status through `try_wait` and does nothing.
+    pub(crate) async fn terminate(&mut self) -> std::io::Result<()> {
+        // The only `start_kill` failure is "already exited", which is the
+        // state this is trying to reach.
+        let _ = self.child_mut().start_kill();
+        self.child_mut().wait().await?;
+        Ok(())
+    }
+
+    /// Release the child to the caller, who takes on the reap. Used only by
+    /// [`spawn_stdio`]; see the module docs for why it is the exception.
+    pub(crate) fn into_child(mut self) -> Child {
+        self.child
+            .take()
+            .expect("the child is present until it is reaped or released")
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // A child that already exited is already reaped by this call, so
+        // nothing is owed and there is no task worth spawning.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // Synchronous, so termination does not wait on a task being
+        // scheduled. `kill_on_drop` would send this too, but only once
+        // `child` is dropped -- which is after the reap task below has been
+        // handed it, or after that task has itself been dropped.
+        let _ = child.start_kill();
+        // Spawning on a runtime that has already shut down does not panic;
+        // the task is dropped instead. That drops `child`, which tokio puts
+        // on its orphan queue to reap on a later SIGCHLD -- so the reap still
+        // happens, by the backstop rather than by this task. `kill_on_drop`
+        // is what makes sure the kill has been sent by then; the queueing
+        // happens either way.
+        self.handle.spawn(async move {
+            let _ = child.wait().await;
+        });
     }
 }
 
@@ -139,10 +462,23 @@ impl Transcript {
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
 pub(crate) async fn try_capture(cmd: Cmd) -> Result<Output> {
-    cmd.to_tokio_command()
-        .output()
-        .await
-        .map_err(|e| cmd.spawn_error(e))
+    let mut child = cmd.spawn_owned(StdioSpec::captured_inheriting_stdin())?;
+    let stdout_task = Drain::spawn(capture_all(child.take_stdout()));
+    let stderr_task = Drain::spawn(capture_all(child.take_stderr()));
+
+    // This used `Command::output()`, which folds a mid-read I/O failure into
+    // the same error as a failure to start. Preserved rather than refined:
+    // `Container::exec_capture` is public and reports through here.
+    let status = child.wait().await.map_err(|e| cmd.spawn_error(e))?;
+
+    let stdout = stdout_task.join().await.map_err(|e| cmd.spawn_error(e))?;
+    let stderr = stderr_task.join().await.map_err(|e| cmd.spawn_error(e))?;
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Spawn the command, capture stdout and stderr, and optionally tee a
@@ -152,6 +488,35 @@ pub(crate) async fn try_capture_logged(
     cmd: Cmd,
     prefix: &'static str,
     transcript: Option<&Transcript>,
+) -> Result<Output> {
+    try_capture_logged_until(cmd, prefix, transcript, std::future::pending()).await
+}
+
+/// [`try_capture_logged`], stoppable.
+///
+/// The only stoppable helper, because it is the only one with a caller that
+/// passes a real signal ([`crate::container::Container::stop`]). The others
+/// would be the same four lines; adding them is what the day a caller needs
+/// one is for. The transcript keeps whatever the child wrote before the
+/// signal, and the tee tasks are dropped rather than drained -- a child that
+/// leaked its pipes to a grandchild would otherwise hold the drain open past
+/// the reap this promises.
+///
+/// The signal covers the **whole** call, exit included, and not just the wait
+/// on the child. A pipe outlives the process that was given it: a child can
+/// exit on time while a descendant it leaked stdout to holds the read end
+/// open, and the drain that follows then blocks on a stream nobody will close.
+/// Retiring the signal at the child's exit would leave that final stretch
+/// unbounded -- which is precisely where `Drain`'s own docs place the most
+/// likely cancellation -- so a caller with a budget could hang past it having
+/// already got what it asked for. A stop landing there reports `Canceled` like
+/// any other: the command ran, but its output cannot be produced, and a caller
+/// that re-dispatches on `Canceled` loses nothing by doing so again.
+pub(crate) async fn try_capture_logged_until(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+    stop: impl Future<Output = ()>,
 ) -> Result<Output> {
     let transcript = transcript.cloned();
     if let Some(t) = &transcript {
@@ -163,26 +528,22 @@ pub(crate) async fn try_capture_logged(
     tracing::debug!(target: "outrig::process", command = %cmd.render(), "spawn");
     let started = Instant::now();
 
-    let mut child = cmd
-        .to_tokio_command()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| cmd.spawn_error(e))?;
-    let stdout = child
-        .stdout
-        .take()
-        .expect("stdout was configured as piped above");
-    let stderr = child
-        .stderr
-        .take()
-        .expect("stderr was configured as piped above");
+    let mut child = cmd.spawn_owned(StdioSpec::captured())?;
+    let stdout_task = Drain::spawn(capture_stream(
+        child.take_stdout(),
+        prefix,
+        transcript.clone(),
+    ));
+    let stderr_task = Drain::spawn(capture_stream(child.take_stderr(), prefix, transcript));
 
-    let stdout_task = tokio::spawn(capture_stream(stdout, prefix, transcript.clone()));
-    let stderr_task = tokio::spawn(capture_stream(stderr, prefix, transcript));
+    // Pinned so the same signal can be awaited twice: once against the child,
+    // and again against the drain that outlives it.
+    tokio::pin!(stop);
 
-    let status = child.wait().await?;
+    let Waited::Exited(status) = child.wait_until(&mut stop).await? else {
+        // The drains abort as they drop, which is what closes the read ends.
+        return Err(cmd.canceled_error());
+    };
     tracing::debug!(
         target: "outrig::process",
         program = cmd.program,
@@ -190,8 +551,20 @@ pub(crate) async fn try_capture_logged(
         elapsed_ms = started.elapsed().as_millis(),
         "exit"
     );
-    let stdout = stdout_task.await.expect("stdout capture task panicked")?;
-    let stderr = stderr_task.await.expect("stderr capture task panicked")?;
+
+    // Both drains are joined *inside* one branch, so a stop dropping it drops
+    // them together and each aborts through its guard. Biased, so a drain that
+    // finished in the same instant the budget expired is reported as the
+    // output it is rather than as a cancellation.
+    let (stdout, stderr) = tokio::select! {
+        biased;
+        drained = async {
+            let stdout = stdout_task.join().await?;
+            let stderr = stderr_task.join().await?;
+            Ok::<_, std::io::Error>((stdout, stderr))
+        } => drained?,
+        () = &mut stop => return Err(cmd.canceled_error()),
+    };
 
     Ok(Output {
         status,
@@ -208,24 +581,9 @@ pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
     tracing::debug!(target: "outrig::process", command = %cmd.render(), "spawn");
     let started = Instant::now();
 
-    let mut child = cmd
-        .to_tokio_command()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| cmd.spawn_error(e))?;
-    let stdout = child
-        .stdout
-        .take()
-        .expect("stdout was configured as piped above");
-    let stderr = child
-        .stderr
-        .take()
-        .expect("stderr was configured as piped above");
-
-    let stdout_task = tokio::spawn(capture_all(stdout));
-    let stderr_task = tokio::spawn(capture_stderr_tail(stderr));
+    let mut child = cmd.spawn_owned(StdioSpec::captured())?;
+    let stdout_task = Drain::spawn(capture_all(child.take_stdout()));
+    let stderr_task = Drain::spawn(capture_stderr_tail(child.take_stderr()));
 
     let status = child.wait().await?;
     tracing::debug!(
@@ -235,8 +593,8 @@ pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
         elapsed_ms = started.elapsed().as_millis(),
         "exit"
     );
-    let stdout = stdout_task.await.expect("stdout capture task panicked")?;
-    let stderr_tail = stderr_task.await.expect("stderr capture task panicked")?;
+    let stdout = stdout_task.join().await?;
+    let stderr_tail = stderr_task.join().await?;
 
     if status.success() {
         Ok(Output {
@@ -280,20 +638,10 @@ pub(crate) async fn run_capture_logged(
 /// non-zero exit is **not** an error, since callers may want to inspect
 /// status before deciding what it means.
 pub(crate) async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> {
-    let mut child = cmd
-        .to_tokio_command()
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| cmd.spawn_error(e))?;
+    let mut child = cmd.spawn_owned(StdioSpec::streamed())?;
+    let stderr = child.take_stderr();
 
-    let stderr = child
-        .stderr
-        .take()
-        .expect("stderr was configured as piped above");
-
-    let log_task = tokio::spawn(async move {
+    let log_task = Drain::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::info!(target: "outrig::process", "[{prefix}] {line}");
@@ -301,22 +649,21 @@ pub(crate) async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitS
     });
 
     let status = child.wait().await?;
-    let _ = log_task.await;
+    log_task.join().await;
     Ok(status)
 }
 
 /// Spawn the command with all three of stdin/stdout/stderr piped, returning
-/// the [`Child`]. The caller owns the child and is responsible for waiting on
-/// it. Used by `podman exec -i` callers that want full bidirectional control.
+/// the [`Child`]. Used by `podman exec -i` callers that want full
+/// bidirectional control.
+///
+/// **This is the module's one ownership exception.** The child is spawned
+/// `kill_on_drop(true)`, so dropping the returned handle SIGKILLs the process
+/// -- but the reap is the caller's, because this module does not supervise a
+/// child it has handed away. Nor does killing the client stop what it started:
+/// a dead `podman exec` leaves its in-container process running under conmon.
 pub(crate) async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
-    let child = cmd
-        .to_tokio_command()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| cmd.spawn_error(e))?;
-    Ok(child)
+    Ok(cmd.spawn_owned(StdioSpec::bidirectional())?.into_child())
 }
 
 fn tail_string(bytes: &[u8], limit: usize) -> String {

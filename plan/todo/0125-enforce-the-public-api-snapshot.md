@@ -98,7 +98,7 @@ obligations on this task rather than notes:
 
 - **This task records the exception in its `## Decisions`**, with the reasoning above, so the
   waiver is recoverable later.
-- **0129's release record says gate item 17 was *partially* met**, not met. If the final notes
+- **0130's release record says gate item 17 was *partially* met**, not met. If the final notes
   claim the release gate was completed in full, this decision has been quietly reversed.
 
 ## Dependencies

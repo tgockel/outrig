@@ -48,6 +48,20 @@ Measured rates:
 The third and fourth rows are the finding: removing one specific *other* test makes it
 disappear, and that one test alone is enough to bring it back.
 
+## What it looks like from CI
+
+Every `cargo` matrix row runs the lib unit tests, so this can fail any one of them and
+usually fails only one -- which reads as "one row is broken and the others are fine" rather
+than as a flake. The job exits 101 with the panic above; a reviewer looking at row names
+rather than at the panic text has nothing to connect it to.
+
+Sighted again while landing 0116, as an unexplained `cargo (local-llm)` failure on a head
+whose other seven checks passed. Re-measured there on the compiled binary: 1 failure in 80
+runs and 1 in 120, always this test, on a tree that had added seven new subscriber-less
+callers of the same two callsites. So the rate moves with machine and load rather than with
+how many other tests reach the callsites -- worth knowing, since the mechanism below would
+predict the opposite.
+
 ## Cause
 
 Cross-test interference through tracing's global callsite state, not a timing race in the

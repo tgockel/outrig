@@ -1085,6 +1085,16 @@ impl Outrig {
     /// stays private, because the session owns it and will stop it at
     /// [`Outrig::shutdown`]. For a command you just want the output of, use
     /// [`Outrig::exec_capture`].
+    ///
+    /// # The returned child is yours, and it is kill-on-drop
+    ///
+    /// Hold the handle and `wait()` for the command's own exit, or `kill()`
+    /// then `wait()` to stop it and see it stop. Dropping the handle instead
+    /// SIGKILLs the `podman exec` client without leaving anything to wait on,
+    /// which is the fallback rather than the way to cancel. Killing the client
+    /// does not stop the command: that runs in the container and outlives its
+    /// client, so stopping the workload means stopping the session. See
+    /// [`Container::exec_stdio`] for the whole of it.
     pub async fn exec_stdio(&self, argv: &[String], options: &ExecOptions) -> Result<Child> {
         self.container.exec_stdio(argv, options).await
     }

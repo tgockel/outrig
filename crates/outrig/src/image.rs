@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::ErrorKind;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +20,7 @@ use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec};
 use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_to_labels};
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
+use crate::supervise::{CleanupGuard, Reissue};
 
 /// Repository used for build-type images that have no image-config name (the
 /// nameless library path: [`crate::Outrig::launch`] with a raw build spec).
@@ -370,6 +370,7 @@ async fn build_image_with_build_args(
     build_args: &BTreeMap<String, String>,
 ) -> Result<()> {
     let temp_tag = temporary_build_tag(tag);
+    let temp_owned = temp_tag_guard(&temp_tag);
     let result = async {
         let cmd = build_image_cmd(cfg, repo_root, &temp_tag, no_cache, build_args);
         let argv_for_error = cmd.args.clone();
@@ -386,6 +387,7 @@ async fn build_image_with_build_args(
     }
     .await;
     cleanup_temp_image(&temp_tag, None).await;
+    temp_owned.release();
     result
 }
 
@@ -398,6 +400,7 @@ async fn build_image_logged_with_build_args(
     build_args: &BTreeMap<String, String>,
 ) -> Result<()> {
     let temp_tag = temporary_build_tag(tag);
+    let temp_owned = temp_tag_guard(&temp_tag);
     let result = async {
         process::run_capture_logged(
             build_image_cmd(cfg, repo_root, &temp_tag, no_cache, build_args),
@@ -409,6 +412,7 @@ async fn build_image_logged_with_build_args(
     }
     .await;
     cleanup_temp_image(&temp_tag, transcript).await;
+    temp_owned.release();
     result
 }
 
@@ -709,6 +713,22 @@ struct SkopeoInspect {
     labels: Option<BTreeMap<String, String>>,
 }
 
+/// Arm the removal of a build's temporary tag.
+///
+/// `cleanup_temp_image` below each build is what runs on every path that
+/// reaches it; this covers the one that does not, since the cleanup is a
+/// statement after an `.await` and a dropped future never gets there. The tag
+/// is named before `buildah build` runs, so arming it first leaves no instant
+/// at which the store could hold it unowned.
+fn temp_tag_guard(temp_tag: &ImageTag) -> CleanupGuard {
+    // The tag carries this build's pid and nonce, so it names nothing another
+    // build could create -- a retry is safe.
+    CleanupGuard::arm(
+        Cmd::new("buildah").arg("rmi").arg(temp_tag.as_str()),
+        Reissue::Safe,
+    )
+}
+
 fn temporary_build_tag(final_tag: &ImageTag) -> ImageTag {
     let (repo, key) = final_tag
         .as_str()
@@ -725,11 +745,24 @@ fn temporary_builder_name() -> String {
     format!("outrig-label-{}-{}", std::process::id(), temp_nonce())
 }
 
+/// A value no other build can share.
+///
+/// Random rather than a timestamp. `SystemTime::now()` is not distinct per
+/// call -- two builds reaching it inside one clock tick get the same reading,
+/// and NTP can step it backwards -- and `std::process::id()` does not separate
+/// them either, since concurrent builds in one process share a pid. These
+/// names are what a *detached* cleanup selects by, sometimes seconds after the
+/// build that owned them ended, and a shared one would have each build
+/// removing the other's temporary tag or working container. That is also what
+/// lets them be `Reissue::Safe`: a selector nothing else can become is one a
+/// retry cannot misdirect. Same 128 bits, and the same reasoning, as
+/// `container::attempt_token`.
 fn temp_nonce() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default()
+    use rand::Rng;
+
+    let mut buf = [0_u8; 16];
+    rand::rng().fill_bytes(&mut buf);
+    u128::from_be_bytes(buf)
 }
 
 async fn stamp_repo_image_labels(
@@ -750,6 +783,9 @@ async fn commit_image_with_labels(
     transcript: Option<&Transcript>,
 ) -> Result<()> {
     let builder = temporary_builder_name();
+    // `outrig-label-<pid>-<nonce>`, so likewise this build's alone.
+    let builder_owned =
+        CleanupGuard::arm(Cmd::new("buildah").arg("rm").arg(&builder), Reissue::Safe);
     let result = async {
         run_buildah_capture(
             Cmd::new("buildah")
@@ -783,9 +819,13 @@ async fn commit_image_with_labels(
     }
     .await;
 
+    // `commit --rm` takes the working container on the success path, and
+    // `cleanup_builder` on the failure path -- so by here it is gone either
+    // way and the guard has nothing left to owe.
     if result.is_err() {
         cleanup_builder(&builder, transcript).await;
     }
+    builder_owned.release();
     result
 }
 

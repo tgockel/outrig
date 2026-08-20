@@ -40,6 +40,7 @@ mod nsfork;
 mod outrig_;
 mod process;
 mod repo;
+mod supervise;
 mod tool_name;
 
 pub use config::{

@@ -1,8 +1,8 @@
 # Close the remaining "declared but never compiled" gaps in CI
 
 > **Partly queued.** The live-e2e and AArch64 coverage moved to
-> `plan/todo/0128-live-podman-e2e-and-a-green-aarch64-row.md`, and the `cargo publish --dry-run`
-> item to `plan/todo/0127-cut-0.2.0-rc.3.md`. What stays here: the generalizing
+> `plan/todo/0129-live-podman-e2e-and-a-green-aarch64-row.md`, and the `cargo publish --dry-run`
+> item to `plan/todo/0128-cut-0.2.0-rc.3.md`. What stays here: the generalizing
 > `cargo hack --each-feature` job, the MSRV check, and the cache-bucket and sccache cleanups. The
 > `macos-latest` x `local-llm,metal` item is contingent on
 > `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md` and may evaporate entirely.

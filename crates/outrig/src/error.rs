@@ -69,6 +69,16 @@ pub enum OutrigError {
         stderr_tail: String,
     },
 
+    /// The caller's stop signal fired before the command finished. The child
+    /// was killed **and reaped** before this error was produced, so receiving
+    /// it means the process is gone -- not that a kill is in flight.
+    #[error("`{program}` was stopped before it finished\nargv: {argv:?}")]
+    #[non_exhaustive]
+    Canceled {
+        program: &'static str,
+        argv: Vec<OsString>,
+    },
+
     /// The command could never be started -- the binary is missing from `PATH`,
     /// is not executable, or the fork itself failed. Distinct from
     /// [`OutrigError::Process`], which means the command ran and exited badly.

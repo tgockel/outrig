@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initialize` may agree to is outrig's own rather than whichever revisions the SDK happens to
   know; see **Fixed** for what the inherited one cost.
 
+- **`OutrigError::Canceled`**, carrying the program and argv of a command that a caller's
+  stop signal ended before it finished. Distinct from `Process` (the command ran and exited
+  badly) and from `Spawn` (it never started). Receiving it means the child is already dead
+  *and* already reaped -- the cooperative path waits for that before it returns.
+
 - **`Config::validate_as_repo`**, the rules that apply to a repo config file rather than to a
   merged one. Today there is one: `[network]`'s `default`, `allow`, and `deny` describe the
   machine's egress and belong to the operator, so a repo config may declare `mode` and
@@ -32,6 +37,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were its only users.
 
 ### Changed
+
+- **A dropped future no longer leaves its subprocess running.** Every process outrig spawns
+  is now owned: dropping the future that holds it -- which is what `tokio::time::timeout`
+  and any cancelled task do -- delivers `SIGKILL` **synchronously**, before the drop
+  returns, and the reap happens as soon as the runtime is next driven, with no further
+  caller involvement. That is the bound; it is measured in single-digit milliseconds in the
+  suite, and it is deliberately not an *instant* reap, because `Drop` cannot await and so
+  nothing can promise one. A caller that drops a future and then blocks its runtime thread
+  will see the process dead but not yet reaped.
+
+  Previously nothing was killed at all: tokio does not kill on drop by default, so a
+  cancelled `Container::start`, `exec_capture`, or image build orphaned its podman or
+  buildah client. `Container::start` was the worst of them -- no `Container` value exists
+  until the run returns, so `Drop for Container` could not compensate.
+
+  Engine-side resources are covered too, which killing a client does not do on its own: a
+  cancelled create removes the container it made, a cancelled build removes its temporary
+  tag, and a cancelled label-stamping pass removes its buildah working container. All three
+  are owned by a scope guard armed *before* the command that creates them, so no instant
+  exists at which the resource can be in the engine with nothing responsible for it.
+
+  The container case removes by a **per-attempt label**, not by name: each attempt stamps a
+  fresh `org.outrig.attempt` value on the container it asks podman to create, and the guard
+  removes by that label. A name is a request, not a claim -- `--name N` fails when N is
+  already in use, and that is an ordinary outcome -- so a name-based cleanup on that path
+  would destroy a container the call never created. A create that collided made nothing
+  carrying the label, so the distinction falls out of the mechanism, and a cleanup still in
+  flight cannot reach a same-name container the caller has since started. Labels are applied
+  at creation, so there is no interval in which the container exists unidentified.
+
+  A caller cannot set `org.outrig.attempt` itself: it is refused before anything is spawned,
+  since podman takes the last `--label` for a key and a duplicate would quietly disable the
+  cleanup. outrig also emits its own after the caller's, so neither half has to hold alone.
+
+  Removing by label needs `podman rm --filter`, which arrived in **podman 4.3** -- now the
+  documented floor in the quickstart's prerequisites.
+
+- **`Container::exec_stdio`'s child is kill-on-drop.** The signature is unchanged; the
+  behavior is not. Dropping the returned `tokio::process::Child` now SIGKILLs the `podman
+  exec` client instead of orphaning it. **The reap is the holder's** -- outrig does not
+  supervise a child it has handed away -- and, as before, killing the client does not stop
+  the process running *inside* the container, which conmon supervises in its own
+  namespaces. This is the one deliberate exception to the ownership guarantee above, and it
+  is now written down in the rustdoc rather than left implicit.
+
+- **`Container::stop` returns with its `podman rm -f` client confirmed gone.** The removal
+  gets `max(grace, 30 seconds)` -- the floor keeps a zero `grace`, which legitimately means
+  "do not wait for the container's processes", from reducing the removal to no attempt at
+  all, and is set far enough out to separate a client that will never return from one that is
+  merely slow on a loaded engine. The bound is applied cooperatively, so the client is killed
+  *and reaped* before `stop` returns rather than merely abandoned, and if the budget is spent
+  the removal is handed to the supervisor rather than dropped. `stop` is the last thing to touch the
+  container name, and a podman client still holding it is how the next run under that name
+  fails.
+
+- **A `McpClient` that cannot start its transport reports `Spawn`, not `Io`.** Routing that
+  spawn through the shared chokepoint gave it the same labelling as every other: the program
+  name, the full argv, and -- for a missing binary -- the pointer at the prerequisites. It
+  used to surface as a bare `io::Error`.
+
+- **Detached cleanup commands no longer leave zombies.** `container::force_remove_detached`
+  and the interceptor's `Drop`-path nft delete both spawn a command and cannot await it.
+  They now hand the reap to a single supervisor thread, so a long-lived embedder accumulates
+  one fewer defunct process per cleanup. That thread polls rather than waiting on one child
+  at a time, and there is one of it per process rather than one per cleanup, so neither a
+  burst of cancellations nor a wedged `podman rm` costs threads or delays anything else.
+  Behavior is otherwise unchanged: both are still synchronous, still need no tokio runtime,
+  and are still safe to call from a destructor or a panic hook.
 
 - **Breaking: `NetworkConfig`'s four fields are accessors, not public fields.** All four
   are private `Option`s now. Read the

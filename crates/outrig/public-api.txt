@@ -812,6 +812,9 @@ pub outrig::error::OutrigError::BootstrapNamespace::step: alloc::string::String
 pub outrig::error::OutrigError::BuildArgResolveFailed::image: alloc::string::String
 pub outrig::error::OutrigError::BuildArgResolveFailed::key: alloc::string::String
 pub outrig::error::OutrigError::BuildArgResolveFailed::source: outrig::config::EnvValueError
+#[non_exhaustive] pub outrig::error::OutrigError::Canceled
+pub outrig::error::OutrigError::Canceled::argv: alloc::vec::Vec<std::ffi::os_str::OsString>
+pub outrig::error::OutrigError::Canceled::program: &'static str
 pub outrig::error::OutrigError::Config(toml::de::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::ConfigDottedKey
 pub outrig::error::OutrigError::ConfigDottedKey::source: toml::de::error::Error

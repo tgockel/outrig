@@ -1,4 +1,4 @@
-# 0128 -- Run the e2e suite for real, on both architectures
+# 0129 -- Run the e2e suite for real, on both architectures
 
 ## Context
 
@@ -88,7 +88,7 @@ ready on either architecture.
 ## Dependencies
 
 - **Soft: after 0116 and 0117**, whose regressions this is meant to exercise for real.
-- Independent of 0127; it can run against the rc.3 tree or before it, but the release should not
+- Independent of 0128; it can run against the rc.3 tree or before it, but the release should not
   be described as ready on an architecture until this lands.
 
 ## See also

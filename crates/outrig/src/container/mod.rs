@@ -19,7 +19,7 @@ mod userdb;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::Output;
 use std::sync::{Mutex, OnceLock};
 
 use std::time::Duration;
@@ -33,9 +33,34 @@ use crate::config::{CapabilityProfile, MountAccess, capability_name_without_pref
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd, Transcript};
+use crate::supervise::Reissue;
 
 /// Maximum `_`-suffix retries before bootstrap gives up.
 const BOOTSTRAP_RETRIES: usize = 10;
+
+/// Marks the container that one `Container::start_named` or
+/// `create_initialized` attempt asked podman to create.
+///
+/// Cleanup filters on this with `podman rm --filter`, which arrived in podman
+/// 4.3 (it is absent from 4.2's `podman-rm` man page and present in 4.3's). Its value is fresh per
+/// attempt; see [`NameGuard`] for why cleanup is scoped to it and not to the
+/// container name.
+const ATTEMPT_LABEL: &str = "org.outrig.attempt";
+
+/// Floor on the budget [`Container::stop`] gives its removal client.
+///
+/// `stop`'s `grace` is what podman waits for the *container's* processes, and
+/// zero is a legitimate value there -- "do not wait, kill now". The removal
+/// that follows is a different command with a different job, so a zero grace
+/// must not silently reduce it to no attempt at all.
+///
+/// Calibrated to separate *wedged* from *slow*, and deliberately far to the
+/// slow side. A healthy `podman rm -f` returns in well under a second, but a
+/// loaded machine -- a parallel test suite, a busy engine -- can stretch that
+/// by an order of magnitude without anything being wrong, and cutting the
+/// client short there trades a hang that was not happening for a removal that
+/// has to be retried. The bound exists for the client that will never return.
+const MIN_REMOVAL_BUDGET: Duration = Duration::from_secs(30);
 
 static TRACKED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
@@ -65,6 +90,10 @@ pub struct Container {
     /// Init PID, cached by [`Container::pid`] after the first `podman
     /// inspect`.
     pid: OnceCell<u32>,
+    /// The attempt token stamped on this container at creation, for a removal
+    /// that has to name it after the fact. `None` for an attached container,
+    /// which is nobody's here to remove. See [`removal_cmd`].
+    attempt: Option<String>,
     disposed: bool,
 }
 
@@ -408,21 +437,28 @@ impl Container {
         name: String,
         transcript: Option<Transcript>,
     ) -> Result<Self> {
-        // Register before spawning so a SIGKILL between the spawn call and
-        // its return can still be cleaned up by the panic hook.
-        track(&name);
+        // Armed before anything is spawned, and the only owner of what podman
+        // creates until the `Container` below exists. A `?` or a dropped
+        // future in between drops the guard, which removes the container it
+        // recorded and untracks the name -- neither of which `Drop for
+        // Container` can do, because no `Container` has been constructed yet.
+        reject_reserved_labels(&launch.labels)?;
+        let reserved = NameGuard::reserve(&name);
 
-        let cmd = build_podman_run_cmd(image, &name, &launch, selinux_enforcing().await);
-
-        if let Err(e) = process::run_capture_logged(cmd, "podman", transcript.as_ref()).await {
-            untrack(&name);
-            return Err(e);
-        }
+        let cmd = build_podman_run_cmd(
+            image,
+            &name,
+            &launch,
+            selinux_enforcing().await,
+            &reserved.attempt_label(),
+        );
+        process::run_capture_logged(cmd, "podman", transcript.as_ref()).await?;
 
         let workspace = match &launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
             None => (PathBuf::new(), PathBuf::new()),
         };
+        let attempt = reserved.release();
         Ok(Self::handle(
             name,
             image.clone(),
@@ -430,6 +466,7 @@ impl Container {
             transcript,
             ContainerOwnership::Owned,
             false,
+            Some(attempt),
         ))
     }
 
@@ -444,26 +481,29 @@ impl Container {
     /// the interceptor's pid probe. See [`ContainerCreateOptions`] for what
     /// each input does.
     pub async fn create_initialized(options: ContainerCreateOptions) -> Result<Self> {
-        // As in start_named: register before spawning so a SIGKILL between
-        // the spawn call and its return can still be cleaned up.
-        track(&options.name);
+        // As in start_named. The guard matters more here: an `init` that
+        // fails, or a future dropped between `create` and `init`, leaves the
+        // created container behind, and it is the guard that removes it. A
+        // `create` that failed on a name collision records no id, so the same
+        // guard removes nothing.
+        reject_reserved_labels(&options.launch.labels)?;
+        let reserved = NameGuard::reserve(&options.name);
 
-        let create = build_podman_create_cmd(&options, selinux_enforcing().await);
+        let create = build_podman_create_cmd(
+            &options,
+            selinux_enforcing().await,
+            &reserved.attempt_label(),
+        );
         let init = Cmd::new("podman").arg("init").arg(&options.name);
         for cmd in [create, init] {
-            let logged = process::run_capture_logged(cmd, "podman", options.transcript.as_ref());
-            if let Err(e) = logged.await {
-                // An init failure leaves the created container behind.
-                spawn_detached_rm(&options.name);
-                untrack(&options.name);
-                return Err(e);
-            }
+            process::run_capture_logged(cmd, "podman", options.transcript.as_ref()).await?;
         }
 
         let workspace = match &options.launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
             None => (PathBuf::new(), PathBuf::new()),
         };
+        let attempt = reserved.release();
         Ok(Self::handle(
             options.name,
             options.image,
@@ -471,6 +511,7 @@ impl Container {
             options.transcript,
             ContainerOwnership::Owned,
             options.intercept_dns,
+            Some(attempt),
         ))
     }
 
@@ -494,6 +535,7 @@ impl Container {
             transcript,
             ContainerOwnership::Attached,
             false,
+            None,
         )
     }
 
@@ -506,6 +548,7 @@ impl Container {
         transcript: Option<Transcript>,
         ownership: ContainerOwnership,
         dns_preconfigured: bool,
+        attempt: Option<String>,
     ) -> Self {
         Self {
             name,
@@ -520,6 +563,7 @@ impl Container {
             ownership,
             dns_preconfigured,
             pid: OnceCell::new(),
+            attempt,
             disposed: false,
         }
     }
@@ -794,6 +838,30 @@ impl Container {
     /// Spawn a command inside the container as the host user, with all three
     /// stdio streams piped back to the caller. See [`ExecOptions`] for the
     /// environment and working directory the exec runs under.
+    ///
+    /// # The returned child is yours, and it is kill-on-drop
+    ///
+    /// This is the one handle outrig hands out rather than supervises, so the
+    /// caller chooses one of three endings for it:
+    ///
+    /// - **Let it finish.** Hold the handle and `wait()` (or
+    ///   `wait_with_output()`) for the command's own exit.
+    /// - **Stop it and see it stop.** Hold the handle and `kill().await` --
+    ///   or `start_kill()` then `wait()` -- which signals and then reaps.
+    /// - **Drop it.** The child is spawned `kill_on_drop(true)`, so a handle
+    ///   that goes out of scope -- including one dropped by a cancelled
+    ///   future -- SIGKILLs the client. This is the unobserved ending: the
+    ///   handle is gone, so nothing is left to `wait()` on, and the reap is
+    ///   tokio's orphan queue rather than yours. Prefer one of the two above
+    ///   when the outcome matters.
+    ///
+    /// Outrig does not wait on a child it has given away, which is what makes
+    /// the reap the caller's in the first two.
+    ///
+    /// What is killed is the **host-side `podman exec` client**, not the
+    /// process it started: that runs in the container under conmon and
+    /// survives its client. Stopping the workload means stopping the
+    /// container.
     pub async fn exec_stdio(&self, cmd: &[String], options: &ExecOptions) -> Result<Child> {
         process::spawn_stdio(self.build_exec_argv(cmd, options)).await
     }
@@ -829,14 +897,43 @@ impl Container {
         .await?;
         // `--rm` in start() makes this redundant on the success path, but
         // run it defensively in case `--rm` got disabled or the daemon
-        // failed to honor it. try_capture so "no such container" doesn't
-        // turn into an error.
-        let _ = process::try_capture_logged(
-            Cmd::new("podman").args(["rm", "-f"]).arg(&self.name),
+        // failed to honor it. try_capture so a removal that finds nothing
+        // doesn't turn into an error.
+        //
+        // Scoped to the attempt like the detached removals, and for the same
+        // reason rather than a weaker version of it: the `podman stop` above
+        // has already returned, so with `--rm` the container is gone and the
+        // name is free *before* this command resolves it. That interval is
+        // short, but "short" is not "absent", and what it costs is someone
+        // else's container.
+        //
+        // Bounded, where it used to be an unbounded await whose result was
+        // discarded: `rm -f` SIGKILLs rather than waiting, so a client still
+        // running after this is wedged, not working, and `stop` must return
+        // regardless. Stopping it cooperatively rather than dropping the
+        // future is what makes the client confirmed gone on return -- this is
+        // the last thing to touch the container name, and a podman client
+        // still holding it is how the next run under that name fails.
+        let removal_budget = grace.max(MIN_REMOVAL_BUDGET);
+        let removal = process::try_capture_logged_until(
+            removal_cmd(&self.name, self.attempt.as_deref()).cmd,
             "podman",
             self.transcript.as_ref(),
+            tokio::time::sleep(removal_budget),
         )
         .await;
+        if matches!(removal, Err(OutrigError::Canceled { .. })) {
+            // Bounding the wait must not turn into dropping the obligation:
+            // a slow engine should cost `stop` its budget, not the container.
+            // The detached form is what `Drop` would have used anyway.
+            //
+            // Scoped to the attempt, not to the name. This retry outlives the
+            // call that owed it -- that is the whole point of detaching it --
+            // and a name freed in the meantime can already belong to a
+            // replacement, which a bare `rm -f <name>` would destroy on this
+            // container's behalf.
+            removal_cmd(&self.name, self.attempt.as_deref()).detach();
+        }
         untrack(&self.name);
         self.disposed = true;
         Ok(())
@@ -855,9 +952,155 @@ impl Drop for Container {
         if self.disposed || self.ownership == ContainerOwnership::Attached {
             return;
         }
-        spawn_detached_rm(&self.name);
+        removal_cmd(&self.name, self.attempt.as_deref()).detach();
         untrack(&self.name);
     }
+}
+
+/// Ownership of a container this call is creating, covering the window
+/// between the name being chosen and a [`Container`] existing to own it.
+///
+/// [`Drop`] for `Container` cannot cover that window -- there is no
+/// `Container` yet -- and the panic hook only fires on a panic, so a cancelled
+/// or failed create used to leave the name in `TRACKED` forever and, if podman
+/// had already made the container, the container running with nothing that
+/// would remove it.
+///
+/// # Why this removes by label and not by name
+///
+/// A name is a request, not a claim. `podman run --name N` fails when N is
+/// already in use, and that is an ordinary outcome -- a caller reusing a name,
+/// a previous session that outlived its record, a container made by hand.
+/// Removing N on the way out of that failure would destroy **someone else's
+/// container**, which is a far worse outcome than the leak this guard exists
+/// to prevent. The same is true under cancellation, where outrig never learns
+/// why the command ended, and of a cleanup still in flight when the caller
+/// retries under the same name.
+///
+/// So each attempt stamps a fresh random [`ATTEMPT_LABEL`] onto the container
+/// it asks for, and the guard removes by that label. A run that failed on a
+/// collision created nothing carrying the label, so it removes nothing -- the
+/// distinction falls out of the mechanism rather than being a case anyone has
+/// to remember.
+///
+/// A label rather than a `--cidfile` because a label exists from the instant
+/// the container does: it is part of the creation request, so there is no
+/// interval in which podman has registered a container the guard cannot yet
+/// name. A cidfile is written *after* creation, and a cancellation landing in
+/// between would leave behind exactly the container this guard is for.
+struct NameGuard {
+    /// `None` once [`Self::release`] has handed the obligation on.
+    name: Option<String>,
+    /// Identifies the container *this attempt* asked podman to create, and
+    /// nothing else on the machine.
+    attempt: String,
+}
+
+impl NameGuard {
+    /// Reserve `name`, registering it with `TRACKED` so the panic hook sees it
+    /// as well.
+    fn reserve(name: &str) -> Self {
+        track(name);
+        Self {
+            name: Some(name.to_string()),
+            attempt: attempt_token(),
+        }
+    }
+
+    /// The `--label` this attempt's container must carry for the guard to
+    /// recognize it as its own.
+    fn attempt_label(&self) -> String {
+        format!("{ATTEMPT_LABEL}={}", self.attempt)
+    }
+
+    /// Hand the container to a constructed [`Container`], whose own `Drop`
+    /// covers it from here on, and give it the attempt token so that its
+    /// removals can be scoped the same way this one's are.
+    fn release(mut self) -> String {
+        self.name = None;
+        std::mem::take(&mut self.attempt)
+    }
+}
+
+impl Drop for NameGuard {
+    fn drop(&mut self) {
+        let Some(name) = self.name.take() else {
+            return;
+        };
+        removal_cmd(&name, Some(&self.attempt)).detach();
+        untrack(&name);
+    }
+}
+
+/// The removal for a container this process created: by its attempt label
+/// where that is known, and by name only where it is not.
+///
+/// One selector for every owned removal, rather than a filtered one in the
+/// guard and a bare one everywhere else. The distinction bites hardest on a
+/// removal that runs *later* than the call that owed it -- `Container::stop`'s
+/// fallback after a spent budget, and `Drop for Container`, both of which are
+/// detached and resolve their target whenever the engine gets to them. By then
+/// the container can be gone and its name can belong to a replacement: a name
+/// is a request, not a claim, and the label is the only part of the request
+/// that is this attempt's alone. See [`NameGuard`] for the argument in full.
+fn removal_cmd(name: &str, attempt: Option<&str>) -> Removal {
+    match attempt {
+        Some(token) => Removal {
+            cmd: Cmd::new("podman")
+                .args(["rm", "-f", "--filter"])
+                .arg(format!("label={ATTEMPT_LABEL}={token}")),
+            // The label is this attempt's alone, so re-issuing the removal
+            // later can still only reach what this attempt made.
+            reissue: Reissue::Safe,
+        },
+        // An attached container has no attempt of outrig's behind it, so
+        // there is nothing to scope to. Nothing that reaches here removes
+        // one: `Drop` and `stop` both return early for them.
+        None => Removal {
+            cmd: Cmd::new("podman").args(["rm", "-f"]).arg(name),
+            reissue: Reissue::Once,
+        },
+    }
+}
+
+/// A removal, and whether issuing it a second time could reach something else.
+struct Removal {
+    cmd: Cmd,
+    reissue: Reissue,
+}
+
+impl Removal {
+    /// Hand the removal to the supervisor, with the reissue policy its
+    /// selector earns.
+    fn detach(self) {
+        crate::supervise::detach_cleanup(self.cmd, self.reissue);
+    }
+}
+
+/// Reject a caller trying to set outrig's own bookkeeping label.
+///
+/// podman takes the last `--label` for a key, so a caller supplying this one
+/// would replace the value the guard removes by and quietly disable it. The
+/// internal label is also emitted *after* the caller's as defense in depth;
+/// this is the half that says so rather than silently winning.
+fn reject_reserved_labels(labels: &BTreeMap<String, String>) -> Result<()> {
+    if labels.contains_key(ATTEMPT_LABEL) {
+        return Err(OutrigError::Configuration(format!(
+            "`{ATTEMPT_LABEL}` is reserved: outrig sets it per container-start attempt \
+             so that a cancelled start removes what it created and nothing else"
+        )));
+    }
+    Ok(())
+}
+
+/// A value no other container on the machine carries, so a removal scoped to
+/// it cannot reach anything this process did not ask for.
+fn attempt_token() -> String {
+    use rand::Rng;
+
+    let mut buf = [0_u8; 16];
+    rand::rng().fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Best-effort, fire-and-forget `podman rm -f <name>`. Public form of the
@@ -870,13 +1113,15 @@ pub fn force_remove_detached(name: &str) {
 
 /// Best-effort `podman rm -f <name>` with stdio nulled. Synchronous,
 /// detached, requires no tokio runtime -- safe from `Drop` and panic hooks.
+/// Through [`crate::supervise`], so the `podman rm` it starts is reaped
+/// rather than left a zombie for the life of the process.
 fn spawn_detached_rm(name: &str) {
-    let _ = std::process::Command::new("podman")
-        .args(["rm", "-f", name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    // By name, so issued once: the name can belong to a replacement by the
+    // time a retry would land, and removing that is worse than the leak.
+    crate::supervise::detach_cleanup(
+        Cmd::new("podman").args(["rm", "-f"]).arg(name),
+        Reissue::Once,
+    );
 }
 
 fn build_podman_run_cmd(
@@ -884,11 +1129,16 @@ fn build_podman_run_cmd(
     name: &str,
     launch: &ContainerLaunchSpec,
     selinux: bool,
+    attempt_label: &str,
 ) -> Cmd {
     let cmd = Cmd::new("podman")
         .args(["run", "-d", "--rm", "--name"])
         .arg(name);
+    // After the caller's labels, so podman's last-wins parsing cannot let one
+    // of theirs displace the value cleanup removes by.
     append_launch_flags(cmd, launch, selinux)
+        .arg("--label")
+        .arg(attempt_label)
         .arg(image.as_str())
         .args(["sleep", "infinity"])
 }
@@ -904,7 +1154,11 @@ fn build_podman_run_cmd(
 /// exec-form ENTRYPOINT and *replaces* CMD, so it is for images whose server
 /// is an ENTRYPOINT. Empty `args` emits nothing, leaving the argument vector
 /// byte-identical to the pre-`args` one.
-fn build_podman_create_cmd(options: &ContainerCreateOptions, selinux: bool) -> Cmd {
+fn build_podman_create_cmd(
+    options: &ContainerCreateOptions,
+    selinux: bool,
+    attempt_label: &str,
+) -> Cmd {
     let mut cmd = Cmd::new("podman")
         .args(["create", "--name"])
         .arg(&options.name);
@@ -927,7 +1181,10 @@ fn build_podman_create_cmd(options: &ContainerCreateOptions, selinux: bool) -> C
         cmd = cmd.arg("--env").arg(format!("{k}={v}"));
     }
 
-    cmd.args(["--interactive", "--rm"])
+    // After the caller's labels; see `build_podman_run_cmd`.
+    cmd.arg("--label")
+        .arg(attempt_label)
+        .args(["--interactive", "--rm"])
         .arg(options.image.as_str())
         .args(&options.args)
 }
@@ -1163,6 +1420,47 @@ mod tests {
             .collect()
     }
 
+    /// The removal a created container owes names *that* container, and a
+    /// name is not a name of it: the same string can belong to a replacement
+    /// by the time a detached removal runs.
+    #[test]
+    fn a_removal_for_a_created_container_is_scoped_to_its_attempt() {
+        assert_eq!(
+            argv(removal_cmd("outrig-test", Some("testtoken")).cmd),
+            vec![
+                "podman",
+                "rm",
+                "-f",
+                "--filter",
+                "label=org.outrig.attempt=testtoken",
+            ],
+            "the container's own name must not appear: it is what a \
+             replacement would share with it"
+        );
+        assert_eq!(
+            removal_cmd("outrig-test", Some("testtoken")).reissue,
+            Reissue::Safe,
+            "a per-attempt label still means this attempt however late it is used"
+        );
+    }
+
+    /// Without an attempt there is nothing to scope to, so the name is all
+    /// there is. Nothing that removes reaches this: `Drop` and `stop` both
+    /// return early for an attached container, which is the only kind that
+    /// has no attempt behind it.
+    #[test]
+    fn a_removal_without_an_attempt_falls_back_to_the_name() {
+        assert_eq!(
+            argv(removal_cmd("outrig-test", None).cmd),
+            vec!["podman", "rm", "-f", "outrig-test"]
+        );
+        assert_eq!(
+            removal_cmd("outrig-test", None).reissue,
+            Reissue::Once,
+            "a bare name may be reused, so this one must never be re-issued"
+        );
+    }
+
     #[test]
     fn podman_run_args_include_workspace_then_extra_mounts() {
         let launch = ContainerLaunchSpec {
@@ -1193,6 +1491,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1215,6 +1514,8 @@ mod tests {
                 "/workspace",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1247,6 +1548,7 @@ mod tests {
             "outrig-20260711T000000-abcd-tools",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1269,6 +1571,8 @@ mod tests {
                 "/workspace",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1295,6 +1599,7 @@ mod tests {
             "outrig-test",
             &launch,
             true,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1311,6 +1616,8 @@ mod tests {
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1351,6 +1658,7 @@ mod tests {
             .with_env(env)
             .with_intercept_dns(true),
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1376,6 +1684,8 @@ mod tests {
                 "A_FIRST=1",
                 "--env",
                 "TOKEN=secret value",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "--interactive",
                 "--rm",
                 "ghcr.io/example/mcp-fetch:2",
@@ -1392,6 +1702,7 @@ mod tests {
                 "outrig-test-fetch",
             ),
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1404,6 +1715,8 @@ mod tests {
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "--interactive",
                 "--rm",
                 "local:test",
@@ -1424,6 +1737,7 @@ mod tests {
             .with_env(BTreeMap::from([("MARKER".to_string(), "1".to_string())]))
             .with_args(vec!["/workspace".to_string(), "--read-only".to_string()]),
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1438,6 +1752,8 @@ mod tests {
                 "--pull=never",
                 "--env",
                 "MARKER=1",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "--interactive",
                 "--rm",
                 "docker.io/mcp/filesystem:latest",
@@ -1488,6 +1804,7 @@ mod tests {
             )
             .with_args(launcher_argv),
             true,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1510,6 +1827,8 @@ mod tests {
                 "--pull=never",
                 "--env",
                 "HOME=/home/tgockel",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "--interactive",
                 "--rm",
                 "docker.io/mcp/filesystem:latest",
@@ -1538,6 +1857,7 @@ mod tests {
                 "outrig-test-noview",
             ),
             false,
+            "org.outrig.attempt=testtoken",
         ));
         assert_eq!(
             args,
@@ -1549,6 +1869,8 @@ mod tests {
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "--interactive",
                 "--rm",
                 "local:test",
@@ -1575,6 +1897,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1590,6 +1913,8 @@ mod tests {
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1616,6 +1941,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1633,6 +1959,8 @@ mod tests {
                 "--cap-add=NET_BIND_SERVICE",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1652,6 +1980,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1668,6 +1997,8 @@ mod tests {
                 "--device=/dev/kvm",
                 "--security-opt=no-new-privileges",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1689,6 +2020,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1705,6 +2037,8 @@ mod tests {
                 "--security-opt=unmask=/proc/*",
                 "--security-opt=unmask=ALL",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1734,6 +2068,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1752,6 +2087,8 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1774,6 +2111,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1787,6 +2125,8 @@ mod tests {
                 "outrig-test",
                 "--userns=keep-id",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1812,6 +2152,7 @@ mod tests {
             "outrig-test",
             &launch,
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1828,6 +2169,8 @@ mod tests {
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "local:test",
                 "sleep",
                 "infinity",
@@ -1851,6 +2194,7 @@ mod tests {
         let args = argv(build_podman_create_cmd(
             &ContainerCreateOptions::new(ImageTag::new("local:test"), launch, "outrig-test-fetch"),
             false,
+            "org.outrig.attempt=testtoken",
         ));
 
         assert_eq!(
@@ -1864,6 +2208,8 @@ mod tests {
                 "--device=/dev/fuse",
                 "--security-opt=unmask=/proc/*",
                 "--pull=never",
+                "--label",
+                "org.outrig.attempt=testtoken",
                 "--interactive",
                 "--rm",
                 "local:test",
@@ -1889,7 +2235,11 @@ mod tests {
         .with_intercept_dns(true)
         .with_args(vec!["/workspace".to_string()]);
 
-        let args = argv(build_podman_create_cmd(&options, false));
+        let args = argv(build_podman_create_cmd(
+            &options,
+            false,
+            "org.outrig.attempt=testtoken",
+        ));
 
         assert!(args.contains(&"outrig-test-fs".to_string()), "{args:?}");
         assert!(

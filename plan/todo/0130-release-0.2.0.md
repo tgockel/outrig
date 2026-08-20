@@ -1,17 +1,17 @@
-# 0129 -- Release 0.2.0
+# 0130 -- Release 0.2.0
 
 ## Context
 
-The queue up to here fixes the blockers, corrects the docs, cuts `0.2.0-rc.3` (0127), and gathers
-live runtime evidence (0128). Then it stopped. Nothing joined those two into a final release, and
+The queue up to here fixes the blockers, corrects the docs, cuts `0.2.0-rc.3` (0128), and gathers
+live runtime evidence (0129). Then it stopped. Nothing joined those two into a final release, and
 the two tasks nearest the end actively contradict each other if read as the end: 0126 was written
-to produce final `[0.2.0]` documentation, while 0127 explicitly cuts an RC, says it is not final,
+to produce final `[0.2.0]` documentation, while 0128 explicitly cuts an RC, says it is not final,
 and requires integration time afterward. Something has to own the decision that the integration
 time was enough, and the mechanics that follow it.
 
 That is this task. It is deliberately last, deliberately gated on a judgment rather than on a
-test, and deliberately separate from 0127 so that a second RC -- if rc.3 exposes another
-public-surface correction -- costs one more pass through 0127 rather than a rewrite of the final.
+test, and deliberately separate from 0128 so that a second RC -- if rc.3 exposes another
+public-surface correction -- costs one more pass through 0128 rather than a rewrite of the final.
 
 The audit's own sequencing says the same thing: cut rc.3, exercise it, "release 0.2.0 only after
 rc.3 gets integration time with no further public-surface corrections."
@@ -28,14 +28,14 @@ Written down before the soak starts, not judged afterward. The release proceeds 
 - **No public-surface change since rc.3.** `crates/outrig/public-api.txt` and
   `crates/outrig-cli/public-api.txt` are byte-identical to the rc.3 tag under 0125's pinned
   toolchain. A single moved line means another RC, not a judgment call about severity.
-- **0128's evidence exists** for both architectures and is green, including 0114's live tier.
-- **0127's recorded soak parameters are satisfied** -- the window, the qualifying use, the
-  evidence source, and the blocker policy, all decided in 0127 before rc.3 shipped. This task
+- **0129's evidence exists** for both architectures and is green, including 0114's live tier.
+- **0128's recorded soak parameters are satisfied** -- the window, the qualifying use, the
+  evidence source, and the blocker policy, all decided in 0128 before rc.3 shipped. This task
   checks that record; it does not write it. An RC nobody installed has not been
   integration-tested, however many days elapsed.
-- **No open defect of the class 0127's record calls blocking.**
+- **No open defect of the class 0128's record calls blocking.**
 
-If any fails, the outcome is a new RC through 0127, and this task waits.
+If any fails, the outcome is a new RC through 0128, and this task waits.
 
 ## Deliverables
 
@@ -51,7 +51,7 @@ If any fails, the outcome is a new RC through 0127, and this task waits.
     for a pre-release and therefore has been skipped through three RCs;
   - no file describing 0.2.0 as a candidate.
 - **Final package validation**, re-run rather than assumed to still hold: 0125's snapshot gate,
-  0127's version guard, 0127's install-shaped check, and the combined
+  0128's version guard, 0128's install-shaped check, and the combined
   `cargo publish --dry-run -p outrig -p outrig-cli`.
 - **Publication in dependency order** -- `outrig`, then `outrig-cli` once the index has caught up
   -- followed by the post-publish `cargo install outrig-cli` smoke test, the two tags, and the
@@ -91,8 +91,8 @@ If any fails, the outcome is a new RC through 0127, and this task waits.
 
 ## Dependencies
 
-- **Hard: 0127** -- there is no final without the RC it cuts.
-- **Hard: 0128** -- the runtime evidence is an exit criterion.
+- **Hard: 0128** -- there is no final without the RC it cuts.
+- **Hard: 0129** -- the runtime evidence is an exit criterion.
 - **Hard: 0125** -- the snapshot comparison is only meaningful under a pinned toolchain.
 
 ## See also
@@ -101,4 +101,4 @@ If any fails, the outcome is a new RC through 0127, and this task waits.
   version-bearing docs are still unwritten.
 - `plan/todo/0126-documentation-contracts-and-one-migration-guide.md` -- drafted the migration
   material this publishes.
-- `plan/todo/0127-cut-0.2.0-rc.3.md` -- the RC, and the loop this task returns to on failure.
+- `plan/todo/0128-cut-0.2.0-rc.3.md` -- the RC, and the loop this task returns to on failure.

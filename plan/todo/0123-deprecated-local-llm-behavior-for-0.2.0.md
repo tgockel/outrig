@@ -118,7 +118,7 @@ Conditional on the decision:
 ## Dependencies
 
 None hard. Must precede 0126, which writes the 0.1 -> 0.2 migration guide and has to state this
-behavior, and 0127, which cuts the release that ships it.
+behavior, and 0128, which cuts the release that ships it.
 
 ## See also
 

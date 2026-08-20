@@ -131,7 +131,7 @@ rule that will be dropped during implementation:
 - The same for a late cleartext `Host:` header. It reaches the same window through a different
   parser, and testing only the TLS side leaves half the bypass unproven.
 
-**Live interceptor** -- against a real attachment, gated with the other e2e work (0128):
+**Live interceptor** -- against a real attachment, gated with the other e2e work (0129):
 
 - A container that resolves `allowed.example` through the interceptor's own DNS and then connects
   is allowed. This is the test that fails if the fix is "delete the sniff disjunct" and stops.
@@ -174,7 +174,7 @@ rule that will be dropped during implementation:
 ## Dependencies
 
 None. Independent of every other queued task, which is why it leads. Its live-interceptor tier
-is exercised by 0128.
+is exercised by 0129.
 
 ## See also
 

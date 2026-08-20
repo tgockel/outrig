@@ -12,8 +12,10 @@ crates publish from this repository.
 
 - Linux on x86-64 or AArch64. WSL2 counts; macOS and native Windows are not supported.
 - Rust toolchain (you'll need it to install outrig itself).
-- [podman](https://podman.io) installed and working in rootless mode. Verify with `podman info`
-  -- it should print without errors.
+- [podman](https://podman.io) **4.3 or newer**, installed and working in rootless mode.
+  Verify with `podman info` -- it should print without errors. The floor is 4.3 because
+  outrig's cancellation cleanup removes containers with `podman rm --filter`, which older
+  podman does not accept.
 - [buildah](https://buildah.io) installed alongside podman. They share image storage by default.
 - An API key for an OpenAI-compatible chat endpoint, exported as `OPENAI_API_KEY`.
 

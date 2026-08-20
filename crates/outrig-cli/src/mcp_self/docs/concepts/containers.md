@@ -399,13 +399,36 @@ launch-time sidecars are abort-only. Naming, labels, and lifecycle coupling are 
 so `outrig clean` sweeps a library session's strays the same way.)
 
 **Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
-after the primary and stop before it, and the same three cleanup layers -- explicit stop, Drop,
-and the panic-hook sweep -- cover every container. In addition, sessions with sidecars run a
-`podman wait` watcher on the primary: if the primary dies out from under outrig (manual
-`podman kill`, OOM), the watcher reaps all sidecars and ends the session with an error.
+after the primary and stop before it, and the same four cleanup layers -- explicit stop, the
+name guard, Drop, and the panic-hook sweep -- cover every container. In addition, sessions with
+sidecars run a `podman wait` watcher on the primary: if the primary dies out from under outrig
+(manual `podman kill`, OOM), the watcher reaps all sidecars and ends the session with an error.
 A stray that survives even that (say, a SIGKILLed outrig) is caught by `outrig clean`, which
 sweeps stopped, record-less containers carrying `org.outrig.session`; see
 [Sessions -> outrig clean](https://tgockel.github.io/outrig/usage/sessions.html#outrig-clean).
+
+**The start guard** is the layer that covers cancellation. Between the moment a container name
+is reserved and the moment outrig holds a handle for the container, there is no handle for
+`Drop` to run on -- so a start that is abandoned partway (a timeout, a cancelled task, an
+error) used to leave both the podman client and, potentially, the container itself. The guard
+owns that window instead: it is armed before the first podman command and removes the container
+unless a handle takes over. The same shape covers an image build's temporary tag and its
+buildah working container, neither of which any sweeper knows the name of.
+
+It removes by a **per-attempt label**, not by the name it asked for. `--name` can fail because
+the name is already in use -- another session, a stray, a container you made yourself -- and
+that is an ordinary outcome, not a reason to delete whatever holds the name. So each attempt
+stamps a fresh `org.outrig.attempt` value on the container it asks for and removes by that: a
+create that collided made nothing carrying it, and a cleanup still in flight cannot reach a
+container you have since started under the same name. Labels are part of the creation request,
+so there is no instant in which the container exists without the mark that identifies it.
+
+Abandoning a call also terminates the podman client it was waiting on. The signal is sent
+synchronously, as the call is abandoned; the process is reaped shortly after, without the caller
+doing anything further. Note what that does **not** mean: killing a `podman exec` client does
+not stop the command running inside the container, which conmon supervises in the container's
+own namespaces. Removing the container is what stops that, which is why the guard exists rather
+than just a kill.
 
 Session `[network]` policy applies to every container: the network interceptor attaches to each
 sidecar the same way it attaches to the primary, before any MCP server connects.

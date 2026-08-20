@@ -418,6 +418,12 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
   so you can redirect the agent. It stops the agent *waiting*, not work already handed to the
   container: a `shell__exec` that started a build runs to completion, and any
   [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn.
+
+  Nothing is killed. The MCP servers, and the `podman exec` transports outrig talks to them
+  over, belong to the session and not to the turn, so they stay up for the next prompt; what
+  Ctrl-C abandons is the request in flight over one of them. A server that is midway through
+  the work runs it to completion and simply has no one to answer. Ending the session, with
+  Ctrl-D, is what stops those.
 - **Ctrl-D** at an empty prompt ends the session: closes MCP server stdios, stops the container,
   finalizes the session record, exits.
 - A second Ctrl-C without an intervening prompt also exits.
