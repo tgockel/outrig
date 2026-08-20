@@ -13,6 +13,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 pub const MODEL_VISIBLE_LIMIT: usize = 16 * 1024;
+const RUNE_TRACE_TARGET: &str = "outrig_harness::rune";
+
+fn rune_log_block(label: &str, source: &str) -> String {
+    format!("{label}:\n{source}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExternalEvent {
@@ -409,6 +414,11 @@ impl Invocation {
             statics.insert([name.as_str()])?;
         }
         let wrapped = format!("pub async fn __outrig_main() {{\n{}\n}}", promoted.source);
+        tracing::debug!(
+            target: RUNE_TRACE_TARGET,
+            "{}",
+            rune_log_block("expanded Rune", &wrapped)
+        );
         let mut sources = Sources::new();
         sources.insert(Source::new(
             format!("activation-{}.rn", self.units + 1),
@@ -687,6 +697,11 @@ impl<M: ModelBackend> AgentDriver<M> {
                             cause = ActivationCause::ExternalEvent(event);
                             continue;
                         }
+                        tracing::info!(
+                            target: RUNE_TRACE_TARGET,
+                            "{}",
+                            rune_log_block("execute_rune", &source)
+                        );
                         let bridge = self.invocation.bridge();
                         let mut run = Box::pin(self.invocation.execute(&source));
                         enum RunEnd {
@@ -897,6 +912,20 @@ mod tests {
         *i.capture.lock().unwrap() = c;
         assert!(i.observation().len() <= MODEL_VISIBLE_LIMIT);
         assert!(i.observation().contains("attempted_bytes="));
+    }
+
+    #[test]
+    fn rune_log_blocks_preserve_exact_multiline_source() {
+        assert_eq!(
+            rune_log_block("execute_rune", "let answer = 42;\nanswer"),
+            "execute_rune:\nlet answer = 42;\nanswer"
+        );
+        let promoted = promote_top_level_lets("let answer = 42;\nanswer").unwrap();
+        let wrapped = format!("pub async fn __outrig_main() {{\n{}\n}}", promoted.source);
+        assert_eq!(
+            rune_log_block("expanded Rune", &wrapped),
+            "expanded Rune:\npub async fn __outrig_main() {\nanswer = 42;\nanswer\n}"
+        );
     }
 
     #[test]

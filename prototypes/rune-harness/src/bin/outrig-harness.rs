@@ -7,6 +7,7 @@ use outrig_rune_harness_prototype::{
     channels, ActivationRequest, AgentDriver, Decision, EventBridge, ExternalEvent, Invocation,
     ModelBackend,
 };
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::Instrument as _;
@@ -17,9 +18,11 @@ const TRACE_TARGET: &str = "outrig_harness::activation";
 fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,outrig_harness=info"));
+    let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(ansi)
         .try_init()
         .map_err(|error| anyhow::anyhow!("initialize harness tracing subscriber: {error}"))
 }

@@ -81,9 +81,11 @@ preamble = "Investigate with Rune before making unsupported claims."
 
 Export the environment variable named by `api-key` (here `OPENAI_API_KEY`) before launch. Anthropic providers and model aliases/failover use the existing OutRig resolver and runtime. No Podman, image, MCP, or sidecar is started.
 
-The harness installs a `tracing-subscriber` and honors `RUST_LOG`. Its default is modest (`outrig_harness=info`, with other targets at `warn`). Enable structured request and decoded-text diagnostics with, for example, `RUST_LOG=outrig_harness=debug`; those debug events can contain model-visible content.
+The harness installs a `tracing-subscriber`, writes tracing output to **stderr**, and honors `RUST_LOG`. Its default (`outrig_harness=info`, with other targets at `warn`) prints every model-submitted `ExecuteRune` script as an `execute_rune` multiline block before it runs. `RUST_LOG=outrig_harness=debug` additionally prints the `expanded Rune` block: the exact source after top-level-`let` promotion and async-entrypoint wrapping that is compiled and executed. Terminal output uses the subscriber's ANSI level colors (automatically disabled when stderr is not a terminal or `NO_COLOR` is set), so INFO scripts and DEBUG expansion/control messages remain visually distinct without raw escape sequences.
 
-`--trace-model` is an opt-in diagnostic for real-model runs. It prints each activation sequence, the exact serialized `ActivationRequest`, decoded model text or completion error, and successful raw provider response bodies to stderr. Raw bodies are capped at 64 KiB with a truncation marker. **Tracing may expose sensitive prompts, model output, provider metadata, or other provider content; it is off by default.** The normal OutRig CLI does not enable this internal tracing switch.
+Script visibility does **not** require `--trace-model`. Model-generated Rune can include file contents, credentials, tokens, or other sensitive literals, so stderr logs must be handled as sensitive data.
+
+`--trace-model` remains a separate opt-in diagnostic for real-model runs. It prints each activation sequence, the exact serialized `ActivationRequest`, decoded model text or completion error, and successful raw provider response bodies to stderr. Raw bodies are capped at 64 KiB with a truncation marker. **This broader provider-body tracing may expose sensitive prompts, model output, provider metadata, or other provider content; it is off by default.** The normal OutRig CLI does not enable this internal tracing switch.
 
 ## Manual real-model scenario
 
