@@ -141,6 +141,15 @@ pub struct SessionSetupArgs<'a> {
 /// `sidecars` is declared before `primary` so field-order `Drop` reaps
 /// sidecars first, mirroring orderly teardown.
 pub struct SessionContainers {
+    /// Containers the session still owns for cleanup only.
+    ///
+    /// A sidecar that failed to attach *and* failed to stop is still running,
+    /// so the handle must be kept -- but it is no longer part of the session:
+    /// [`container_for`](Self::container_for) does not look here, so nothing
+    /// starts an MCP server in a container the session has warned it is
+    /// skipping. In filter mode that is the difference between a skipped
+    /// sidecar and one serving MCP with no interception on it.
+    pub abandoned: Vec<Container>,
     pub sidecars: BTreeMap<String, Container>,
     pub primary: Container,
 }
@@ -593,6 +602,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     span.done("container user ready");
 
     let mut containers = SessionContainers {
+        abandoned: Vec::new(),
         sidecars: BTreeMap::new(),
         primary: container,
     };
@@ -728,9 +738,17 @@ pub(crate) async fn launch_declared_sidecar(
     ctx: &SidecarStartCtx<'_>,
     plan: &SessionMcpPlan,
     sc: &SidecarPlan,
+    abandoned: &mut Vec<Container>,
 ) -> Result<Container> {
     let tag = ensure_sidecar_image(ctx.cfg, ctx.repo_root, &sc.image, ctx.transcript).await?;
-    start_one_sidecar(ctx, &tag, sc, plan.sidecar_needs_bootstrap(sc)).await
+    start_one_sidecar(
+        ctx,
+        &tag,
+        sc,
+        plan.sidecar_needs_bootstrap(sc),
+        abandoned,
+    )
+    .await
 }
 
 /// Build the placement plan (config + primary and sidecar label merges),
@@ -927,6 +945,9 @@ async fn start_auto_sidecars(
 
     let started =
         futures_util::future::join_all(to_start.into_iter().map(|(name, tag, sc)| async move {
+            // Per task, since these run concurrently and nothing may hold a
+            // mutable borrow of the session's list across them.
+            let mut abandoned: Vec<Container> = Vec::new();
             let result = match plan.entrypoint_server_in(&sc) {
                 Some((server_name, placed)) => {
                     create_one_entrypoint_sidecar(
@@ -942,14 +963,25 @@ async fn start_auto_sidecars(
                 }
                 None => {
                     let needs_bootstrap = plan.sidecar_needs_bootstrap(&sc);
-                    start_one_sidecar(&args.start_ctx(), &tag, &sc, needs_bootstrap).await
+                    start_one_sidecar(
+                        &args.start_ctx(),
+                        &tag,
+                        &sc,
+                        needs_bootstrap,
+                        &mut abandoned,
+                    )
+                    .await
                 }
             };
-            (name, sc, result)
+            (name, sc, result, abandoned)
         }))
         .await;
 
-    for (name, sc, result) in started {
+    for (name, sc, result, abandoned) in started {
+        // Whatever could not be stopped comes back regardless of what the
+        // start returned: it is running, and the session has to keep a handle
+        // on it even when the sidecar it was for is being warned away.
+        containers.abandoned.extend(abandoned);
         match result {
             Ok(container) => {
                 containers.sidecars.insert(name, container);
@@ -998,9 +1030,31 @@ async fn attach_interceptor(
         // connect_mcp_clients -- is what puts policy ahead of the
         // entrypoint's first packet.
         if let Err(e) = interceptor.attach(&containers.sidecars[&name]).await {
+            let attached = e.to_string();
             warn_or_bail(plan, &plan.sidecars[&name], e.into())?;
-            if let Some(container) = containers.sidecars.remove(&name) {
-                let _ = container.stop(STOP_GRACE).await;
+            // Dropped from the session's containers only once it is actually
+            // stopped. One that would not stop is still running, and taking it
+            // off the map is what removes the session's last chance to try
+            // again at teardown -- so it stays, and the failure is said out
+            // loud rather than discarded with the handle.
+            // Out of the session either way: nothing may treat a container
+            // the session just warned it was skipping as somewhere to start
+            // an MCP server. Taking it out first is safe because the stop
+            // hands it back if it did not work, which is what keeps a
+            // still-running sidecar owned by something teardown will retry.
+            let kept = match containers.sidecars.remove(&name) {
+                Some(container) => container.stop_or_keep(STOP_GRACE).await,
+                None => None,
+            };
+            if let Some((stopped, kept)) = kept {
+                tracing::warn!(
+                    target: "outrig::cli::session_setup",
+                    sidecar = %name,
+                    "sidecar {name:?} could not be attached ({attached}) and could not \
+                     be stopped either ({stopped}); it is abandoned to teardown and \
+                     serves nothing"
+                );
+                containers.abandoned.push(kept);
             }
         }
     }
@@ -1104,6 +1158,9 @@ async fn start_one_sidecar(
     tag: &ImageTag,
     sc: &SidecarPlan,
     needs_bootstrap: bool,
+    // Where a container that could not be stopped goes, so teardown still has
+    // a handle on it.
+    abandoned: &mut Vec<Container>,
 ) -> Result<Container> {
     let launch = sidecar_launch_base(ctx, sc);
     let container_name = sidecar_container_name(ctx, sc);
@@ -1111,8 +1168,29 @@ async fn start_one_sidecar(
     let mut container =
         Container::start_named(tag, launch, container_name, ctx.transcript.cloned()).await?;
     if needs_bootstrap && let Err(e) = container.bootstrap_user().await {
-        let _ = container.stop(STOP_GRACE).await;
-        return Err(e.into());
+        // Stopped in place so the handle survives a stop that fails. One that
+        // would not stop is still running, and `stop`'s consuming form leaves
+        // only `Drop`'s best-effort detached cleanup behind -- which reports
+        // nothing and which teardown cannot retry. A caller that can own it
+        // takes it; one that cannot gets the same error either way.
+        // Stopping is a compensation, and its failure is not a detail: a
+        // sidecar that was created, failed to bootstrap, and then could not be
+        // stopped is still running with nothing left holding a handle to it.
+        // The caller is told both rather than only the first.
+        // Typed rather than flattened into a message: `/sidecar add` has to
+        // tell a clean unwind from a container still running, and a string
+        // saying so is not something it can branch on -- it mapped straight
+        // through to "session unaffected", which was the opposite of true.
+        return match container.stop_or_keep(STOP_GRACE).await {
+            None => Err(e.into()),
+            Some((stopped, kept)) => {
+                abandoned.push(kept);
+                Err(OutrigError::SidecarNotUnwound(Box::new(
+                    outrig::error::SidecarUnwindFailure::new(sc.name.clone(), e, vec![stopped]),
+                ))
+                .into())
+            }
+        };
     }
     span.done(format!("sidecar {} ready: {}", sc.name, container.name()));
     Ok(container)
@@ -1185,7 +1263,14 @@ async fn create_one_entrypoint_sidecar(
 /// Stop every session container (sidecars before the primary) and finalize
 /// the session row with a failure exit. Setup's bail-out path.
 async fn abort_containers(containers: SessionContainers, store: &SessionStore, sid: &SessionId) {
-    let SessionContainers { sidecars, primary } = containers;
+    let SessionContainers {
+        abandoned,
+        sidecars,
+        primary,
+    } = containers;
+    for container in abandoned {
+        let _ = container.stop(STOP_GRACE).await;
+    }
     for (_, container) in sidecars {
         let _ = container.stop(STOP_GRACE).await;
     }
@@ -1337,8 +1422,22 @@ pub async fn connect_mcp_clients(
                     }
                 }
                 connected = kept;
-                if let Some(container) = containers.sidecars.remove(&sc) {
-                    let _ = container.stop(STOP_GRACE).await;
+                // Out of the map, then stopped: the stop hands the handle
+                // back if it failed, so a container that may still be running
+                // is never left with nothing holding it -- it is abandoned to
+                // teardown rather than to nothing.
+                let kept = match containers.sidecars.remove(&sc) {
+                    Some(container) => container.stop_or_keep(STOP_GRACE).await,
+                    None => None,
+                };
+                if let Some((e, kept)) = kept {
+                    tracing::warn!(
+                        target: "outrig::cli::session_setup",
+                        sidecar = %sc,
+                        "sidecar {sc:?} lost its MCP servers and could not be stopped \
+                         ({e}); it is abandoned to teardown"
+                    );
+                    containers.abandoned.push(kept);
                 }
             }
         }
@@ -1389,10 +1488,26 @@ pub async fn teardown(
             }
         }
     }
-    if let Some(network) = network {
-        network.shutdown().await;
+    if let Some(network) = network
+        && let Err(e) = network.shutdown().await
+    {
+        tracing::warn!(target: "outrig::cli::session_setup", "network shutdown: {e}");
     }
-    let SessionContainers { sidecars, primary } = containers;
+    let SessionContainers {
+        abandoned,
+        sidecars,
+        primary,
+    } = containers;
+    // Cleanup-only containers first: they are the ones already known not to
+    // have stopped.
+    for container in abandoned {
+        if let Err(e) = container.stop(STOP_GRACE).await {
+            tracing::warn!(
+                target: "outrig::cli::session_setup",
+                "abandoned sidecar stop failed: {e}"
+            );
+        }
+    }
     for (name, container) in sidecars {
         // A watcher-reaped sidecar is already gone; podman's "no such
         // container" lands here as a logged, non-fatal error.

@@ -71,7 +71,7 @@ use tokio::sync::Mutex;
 
 use crate::error::{IoPathExt, OutrigError, Result};
 
-const STDERR_TAIL_LIMIT: usize = 1024 * 1024;
+pub(crate) const STDERR_TAIL_LIMIT: usize = 1024 * 1024;
 const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
 const STREAM_READ_CHUNK: usize = 8 * 1024;
 
@@ -666,7 +666,7 @@ pub(crate) async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
     Ok(cmd.spawn_owned(StdioSpec::bidirectional())?.into_child())
 }
 
-fn tail_string(bytes: &[u8], limit: usize) -> String {
+pub(crate) fn tail_string(bytes: &[u8], limit: usize) -> String {
     if bytes.len() <= limit {
         String::from_utf8_lossy(bytes).into_owned()
     } else {

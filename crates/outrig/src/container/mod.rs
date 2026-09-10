@@ -47,6 +47,10 @@ const BOOTSTRAP_RETRIES: usize = 10;
 /// container name.
 const ATTEMPT_LABEL: &str = "org.outrig.attempt";
 
+/// Length of the container id podman prints from a `create` or a detached
+/// `run`: a full sha256, in lowercase hex. Anything else is not an id.
+const PODMAN_ID_LEN: usize = 64;
+
 /// Floor on the budget [`Container::stop`] gives its removal client.
 ///
 /// `stop`'s `grace` is what podman waits for the *container's* processes, and
@@ -90,6 +94,29 @@ pub struct Container {
     /// Init PID, cached by [`Container::pid`] after the first `podman
     /// inspect`.
     pid: OnceCell<u32>,
+    /// The engine's own id for this container, from the `create`/`run` that
+    /// made it. `None` for a container outrig only borrowed, which it never
+    /// stops.
+    ///
+    /// A name is a request and can be granted again; an id is the engine's and
+    /// is never handed out twice. Anything this handle does *to* the container
+    /// goes through the id, so a handle kept for a retry -- which is the whole
+    /// point of [`stop_or_keep`](Self::stop_or_keep) -- cannot act on whatever
+    /// holds the name by the time that retry runs.
+    id: Option<ContainerId>,
+    /// Stands in for the engine call whose rendering contains the fragment,
+    /// first match winning, so a test can wedge the stop or the removal in
+    /// particular and hold the other one still. Every bounded-call path here
+    /// ends at a `podman` a test cannot install.
+    #[cfg(test)]
+    engine_override: Vec<(&'static str, Cmd)>,
+    /// How long each bounded engine call gets. `None` is the real budget,
+    /// which is tens of seconds -- too long to wait out in a test, and not
+    /// something a paused clock can help with, since a bounded call waiting on
+    /// a real child leaves the runtime idle and every deadline in the test
+    /// fires at once.
+    #[cfg(test)]
+    engine_budget: Option<Duration>,
     /// The attempt token stamped on this container at creation, for a removal
     /// that has to name it after the fact. `None` for an attached container,
     /// which is nobody's here to remove. See [`removal_cmd`].
@@ -452,7 +479,12 @@ impl Container {
             selinux_enforcing().await,
             &reserved.attempt_label(),
         );
-        process::run_capture_logged(cmd, "podman", transcript.as_ref()).await?;
+        let created = process::run_capture_logged(cmd, "podman", transcript.as_ref()).await?;
+        // Before the guard is released, so a creation that will not say what
+        // it made is removed by the attempt label it was stamped with rather
+        // than left behind under a handle that cannot name it.
+        let id = engine_id(&created.stdout)
+            .ok_or_else(|| unidentified_container(&name, &created.stdout))?;
 
         let workspace = match &launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
@@ -460,13 +492,11 @@ impl Container {
         };
         let attempt = reserved.release();
         Ok(Self::handle(
-            name,
+            EngineIdentity::Owned { name, attempt, id },
             image.clone(),
             workspace,
             transcript,
-            ContainerOwnership::Owned,
             false,
-            Some(attempt),
         ))
     }
 
@@ -494,10 +524,17 @@ impl Container {
             selinux_enforcing().await,
             &reserved.attempt_label(),
         );
+        // The create's own output carries the engine's id for what it made,
+        // which is the only name for this container that cannot later mean
+        // something else.
+        let created =
+            process::run_capture_logged(create, "podman", options.transcript.as_ref()).await?;
+        // As in `start_named`, and before `init` as well as before the guard
+        // is released: a container this cannot name is not one to go on with.
+        let id = engine_id(&created.stdout)
+            .ok_or_else(|| unidentified_container(&options.name, &created.stdout))?;
         let init = Cmd::new("podman").arg("init").arg(&options.name);
-        for cmd in [create, init] {
-            process::run_capture_logged(cmd, "podman", options.transcript.as_ref()).await?;
-        }
+        process::run_capture_logged(init, "podman", options.transcript.as_ref()).await?;
 
         let workspace = match &options.launch.workspace {
             Some(workspace) => (workspace.host.clone(), workspace.container.clone()),
@@ -505,13 +542,15 @@ impl Container {
         };
         let attempt = reserved.release();
         Ok(Self::handle(
-            options.name,
+            EngineIdentity::Owned {
+                name: options.name,
+                attempt,
+                id,
+            },
             options.image,
             workspace,
             options.transcript,
-            ContainerOwnership::Owned,
             options.intercept_dns,
-            Some(attempt),
         ))
     }
 
@@ -529,27 +568,29 @@ impl Container {
             None => (PathBuf::new(), PathBuf::new()),
         };
         Self::handle(
-            name.into(),
+            EngineIdentity::Borrowed { name: name.into() },
             image_tag,
             workspace,
             transcript,
-            ContainerOwnership::Attached,
             false,
-            None,
         )
     }
 
     /// Handle constructor shared by every path that materializes a
     /// [`Container`], so a new field is threaded through one place.
     fn handle(
-        name: String,
+        engine: EngineIdentity,
         image_tag: ImageTag,
         (host_workspace, container_workspace): (PathBuf, PathBuf),
         transcript: Option<Transcript>,
-        ownership: ContainerOwnership,
         dns_preconfigured: bool,
-        attempt: Option<String>,
     ) -> Self {
+        let (name, attempt, id, ownership) = match engine {
+            EngineIdentity::Owned { name, attempt, id } => {
+                (name, Some(attempt), Some(id), ContainerOwnership::Owned)
+            }
+            EngineIdentity::Borrowed { name } => (name, None, None, ContainerOwnership::Attached),
+        };
         Self {
             name,
             image_tag,
@@ -563,9 +604,57 @@ impl Container {
             ownership,
             dns_preconfigured,
             pid: OnceCell::new(),
+            id,
+            #[cfg(test)]
+            engine_override: Vec::new(),
+            #[cfg(test)]
+            engine_budget: None,
             attempt,
             disposed: false,
         }
+    }
+
+    /// A handle to an owned container that can never be stopped, for tests of
+    /// what a caller does with one it could not stop.
+    ///
+    /// The engine call is pointed at `/bin/false`, so the stop fails the same
+    /// way on every machine and without podman having to be installed or to
+    /// answer in any particular way. A test that wants a different stop
+    /// assigns its own `engine_override`, which replaces this one.
+    #[cfg(test)]
+    pub(crate) fn unstoppable() -> Self {
+        let mut container = Self::handle(
+            EngineIdentity::Owned {
+                name: "outrig-test-unstoppable".to_string(),
+                attempt: "outrig-test-never-created".to_string(),
+                // An id no container has. Nothing is ever run against it
+                // here, but an owned handle cannot be built without one --
+                // which is the point of that type.
+                id: engine_id(&[b'0'; PODMAN_ID_LEN]).expect("64 hex digits is an id"),
+            },
+            ImageTag::new("outrig-test-unstoppable"),
+            (PathBuf::new(), PathBuf::new()),
+            None,
+            false,
+        );
+        container.engine_override = vec![("stop", Cmd::new("/bin/false"))];
+        container
+    }
+
+    /// A handle whose stop is a no-op that cannot fail: a *borrowed*
+    /// container, which outrig never stops because it never started it. The
+    /// clean-unwind counterpart to [`unstoppable`](Self::unstoppable).
+    #[cfg(test)]
+    pub(crate) fn stops_cleanly() -> Self {
+        Self::handle(
+            EngineIdentity::Borrowed {
+                name: "outrig-test-borrowed".to_string(),
+            },
+            ImageTag::new("outrig-test-borrowed"),
+            (PathBuf::new(), PathBuf::new()),
+            None,
+            false,
+        )
     }
 
     /// Inspect an existing podman container by name. This is intentionally
@@ -877,24 +966,111 @@ impl Container {
     }
 
     pub async fn stop(mut self, grace: Duration) -> Result<()> {
+        self.stop_inner(grace).await
+    }
+
+    /// The stop this container answers to.
+    ///
+    /// By id where there is one, because this handle can outlive the name. A
+    /// stop that failed or timed out is *kept* for teardown to try again --
+    /// and between those two moments the container can go away and free its
+    /// name for something else, which a retry aimed at the name would then
+    /// stop on this container's behalf. The removal has been scoped to the
+    /// attempt label for exactly this reason; the stop had not been.
+    ///
+    /// `--ignore`: an already-gone container counts as stopped -- an
+    /// entrypoint-stdio sidecar exits with its server and `--rm` removes it
+    /// before this orderly stop runs. Other stop failures propagate.
+    fn stop_cmd(&self, secs: &str) -> Cmd {
+        Cmd::new("podman")
+            .args(["stop", "--ignore", "-t"])
+            .arg(secs)
+            .arg(self.id.as_ref().map_or(&*self.name, ContainerId::as_str))
+    }
+
+    /// The command to actually run for `real`. Itself outside tests.
+    fn engine_call(&self, real: Cmd) -> Cmd {
+        #[cfg(test)]
+        {
+            let rendered = real.render();
+            if let Some((_, stand_in)) = self
+                .engine_override
+                .iter()
+                .find(|(fragment, _)| rendered.contains(fragment))
+            {
+                return stand_in.clone();
+            }
+        }
+        real
+    }
+
+    /// How long one bounded engine call gets before it counts as wedged.
+    fn engine_budget(&self, real: Duration) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = self.engine_budget {
+            return budget;
+        }
+        real
+    }
+
+    /// [`stop`](Self::stop), handing the container back if it did not stop.
+    ///
+    /// `None` means it is gone and the handle with it. `Some` means it is
+    /// still running, and carries both the failure and the handle -- because
+    /// a container nothing holds has only [`Drop`]'s detached removal left,
+    /// which reports nothing and which teardown cannot retry.
+    ///
+    /// This is the form for a caller compensating for some earlier failure:
+    /// the handle comes back whether it is wanted or not, so keeping it is
+    /// not something a call site can forget to do.
+    pub async fn stop_or_keep(mut self, grace: Duration) -> Option<(OutrigError, Self)> {
+        match self.stop_inner(grace).await {
+            Ok(()) => None,
+            Err(e) => Some((e, self)),
+        }
+    }
+
+    async fn stop_inner(&mut self, grace: Duration) -> Result<()> {
         if self.ownership == ContainerOwnership::Attached {
             self.disposed = true;
             return Ok(());
         }
 
         let secs = grace.as_secs().to_string();
-        // `--ignore`: an already-gone container counts as stopped -- an
-        // entrypoint-stdio sidecar exits with its server and `--rm` removes
-        // it before this orderly stop runs. Other stop failures propagate.
-        process::run_capture_logged(
-            Cmd::new("podman")
-                .args(["stop", "--ignore", "-t"])
-                .arg(&secs)
-                .arg(&self.name),
+        let stop = self.stop_cmd(&secs);
+        // Bounded, and not by `-t`: that is how long podman waits for the
+        // *container's* processes before it kills them, and says nothing about
+        // the client asking for it. A wedged client, or an engine that never
+        // answers, would otherwise hold this await forever -- and this await
+        // is on the path of every sidecar compensation and every shutdown, so
+        // "forever" is the whole session. The budget is the grace the
+        // container is owed plus the client's own floor on top of it.
+        let stopped = process::try_capture_logged_until(
+            self.engine_call(stop.clone()),
             "podman",
             self.transcript.as_ref(),
+            // Saturating, because `grace` is a caller's number and
+            // `Duration`'s `+` panics on overflow: a library caller passing
+            // `Duration::MAX` -- or anything within `MIN_REMOVAL_BUDGET` of it
+            // -- would have brought the process down before any cleanup ran.
+            // Saturating gives such a caller what they asked for, which is a
+            // budget longer than the machine will be up for.
+            tokio::time::sleep(self.engine_budget(grace.saturating_add(MIN_REMOVAL_BUDGET))),
         )
-        .await?;
+        .await;
+        match classify_engine_call(&stop, stopped) {
+            EngineOutcome::Done => {}
+            // Nothing here can tell whether the container stopped, so it is
+            // not disposed of and not untracked: the caller keeps a handle to
+            // try again through, and `Drop` still has its detached removal.
+            EngineOutcome::TimedOut => {
+                return Err(OutrigError::Canceled {
+                    program: stop.program,
+                    argv: stop.args,
+                });
+            }
+            EngineOutcome::Failed(e) => return Err(e),
+        }
         // `--rm` in start() makes this redundant on the success path, but
         // run it defensively in case `--rm` got disabled or the daemon
         // failed to honor it. try_capture so a removal that finds nothing
@@ -915,24 +1091,36 @@ impl Container {
         // the last thing to touch the container name, and a podman client
         // still holding it is how the next run under that name fails.
         let removal_budget = grace.max(MIN_REMOVAL_BUDGET);
-        let removal = process::try_capture_logged_until(
-            removal_cmd(&self.name, self.attempt.as_deref()).cmd,
+        let removal = removal_cmd(&self.name, self.attempt.as_deref()).cmd;
+        let removed = process::try_capture_logged_until(
+            self.engine_call(removal.clone()),
             "podman",
             self.transcript.as_ref(),
-            tokio::time::sleep(removal_budget),
+            tokio::time::sleep(self.engine_budget(removal_budget)),
         )
         .await;
-        if matches!(removal, Err(OutrigError::Canceled { .. })) {
-            // Bounding the wait must not turn into dropping the obligation:
-            // a slow engine should cost `stop` its budget, not the container.
-            // The detached form is what `Drop` would have used anyway.
-            //
-            // Scoped to the attempt, not to the name. This retry outlives the
-            // call that owed it -- that is the whole point of detaching it --
-            // and a name freed in the meantime can already belong to a
-            // replacement, which a bare `rm -f <name>` would destroy on this
-            // container's behalf.
-            removal_cmd(&self.name, self.attempt.as_deref()).detach();
+        match classify_engine_call(&removal, removed) {
+            EngineOutcome::Done => {}
+            // A removal that did not answer has not removed anything that
+            // anything here can see. It used to be handed to a detached retry
+            // and then reported as a completed stop, which said "gone, and the
+            // handle with it" about a container whose state was unknown --
+            // and if the detached retries also failed, what was left had no
+            // observable owner and nothing orderly coming for it. Reported
+            // instead, with the handle intact: the caller decides whether to
+            // try again or to abandon it to teardown, and `Drop` still has the
+            // detached removal if the handle is let go.
+            EngineOutcome::TimedOut => {
+                return Err(OutrigError::Canceled {
+                    program: removal.program,
+                    argv: removal.args,
+                });
+            }
+            // Neither disposed nor untracked, so the caller keeps something to
+            // try again through and `Drop` still has its detached removal to
+            // fall back on. A stop that says it worked is how a leak becomes
+            // nobody's.
+            EngineOutcome::Failed(e) => return Err(e),
         }
         untrack(&self.name);
         self.disposed = true;
@@ -1061,6 +1249,116 @@ fn removal_cmd(name: &str, attempt: Option<&str>) -> Removal {
             reissue: Reissue::Once,
         },
     }
+}
+
+/// What a removal that has been run leaves for its caller.
+enum EngineOutcome {
+    /// It did what was asked. For a removal, that includes matching nothing:
+    /// the filter form exits zero when `--rm` has already done the work.
+    Done,
+    /// The engine did not answer inside the budget. Nothing is known about the
+    /// container, so the obligation is handed to a detached retry rather than
+    /// dropped -- and that retry is what lets the handle be disposed of.
+    TimedOut,
+    /// It ran and did not work, or could not be run at all. Either way the
+    /// container may still be there, under a name still spoken for.
+    Failed(OutrigError),
+}
+
+/// Read a removal's outcome, the distinction being whether anything is still
+/// owed afterwards.
+///
+/// A non-zero exit is a failure and was not treated as one: only the timeout
+/// was, so podman refusing the removal -- a storage error, a container the
+/// engine will not let go of -- read as success, and the handle was disposed
+/// of on the strength of it. The filter form matches nothing when `--rm` has
+/// already done the work and exits zero for that (measured against podman
+/// 4.9.3), so a non-zero exit here is the engine saying it could not do what
+/// was asked, not that there was nothing to do.
+fn classify_engine_call(cmd: &Cmd, outcome: Result<Output>) -> EngineOutcome {
+    match outcome {
+        Ok(output) if output.status.success() => EngineOutcome::Done,
+        Ok(output) => EngineOutcome::Failed(OutrigError::Process {
+            program: cmd.program,
+            argv: cmd.args.clone(),
+            exit_code: output.status.code(),
+            stderr_tail: process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
+        }),
+        Err(OutrigError::Canceled { .. }) => EngineOutcome::TimedOut,
+        // It could not be run at all, which says nothing about whether the
+        // container is gone.
+        Err(e) => EngineOutcome::Failed(e),
+    }
+}
+
+/// Everything podman knows one container by, in the two shapes there are.
+///
+/// The three names are not interchangeable and the difference is the whole
+/// point: the *name* is what was asked for and can be granted again, the
+/// *attempt* label is stamped on one request and scopes a removal to what that
+/// request made, and the *id* is the engine's own and is never handed out
+/// twice.
+///
+/// An enum rather than three fields with three `Option`s, so that "a container
+/// outrig made, whose id it did not get" cannot be built at all. That state is
+/// what makes a stop fall back to the name, and a handle kept for a retry can
+/// outlive its name -- so the compiler refuses it here instead of a test
+/// hoping to catch it at the other end.
+enum EngineIdentity {
+    /// One outrig created and is responsible for stopping and removing.
+    Owned {
+        name: String,
+        attempt: String,
+        id: ContainerId,
+    },
+    /// One outrig only borrowed: it neither stops nor removes it, and podman
+    /// never told it an id.
+    Borrowed { name: String },
+}
+
+/// The container id `podman create` or `podman run -d` printed, if what it
+/// printed is one.
+///
+/// Podman writes the full 64-character hex id and nothing else on success, so
+/// that is what is required. Taking any single token instead -- which this
+/// did -- makes whatever a wrapper script, a shim, or an engine with a
+/// different output format happens to print into a *container selector*, and
+/// that selector is then what every stop this handle issues names.
+///
+/// `None` is not a fallback to the name here: the callers refuse to build a
+/// handle without an id, so an unreadable answer fails the creation while the
+/// guard that removes by attempt label is still armed. Only a container outrig
+/// borrowed rather than made has no id, and it is never stopped.
+fn engine_id(stdout: &[u8]) -> Option<ContainerId> {
+    let printed = std::str::from_utf8(stdout).ok()?.trim();
+    (printed.len() == PODMAN_ID_LEN && printed.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| ContainerId(printed.to_string()))
+}
+
+/// Podman's own id for one container, and only ever that.
+///
+/// A newtype with no `Default`, no `From<String>` and a private field, so the
+/// single way to have one is [`engine_id`] reading it out of what the engine
+/// printed. Without that, "the id" is a `String` like any other and every
+/// fallback that produces one -- an empty default, the container's name --
+/// type-checks, which is how the name this exists to avoid gets back in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContainerId(String);
+
+impl ContainerId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What a creation that would not say what it made reports.
+fn unidentified_container(name: &str, stdout: &[u8]) -> OutrigError {
+    OutrigError::Configuration(format!(
+        "podman did not report a container id for {name:?}; it printed {:?}, and \
+         a handle that cannot name what it made can only name it by a name that \
+         may later be something else's",
+        process::tail_string(stdout, PODMAN_ID_LEN * 2)
+    ))
 }
 
 /// A removal, and whether issuing it a second time could reach something else.
@@ -1409,6 +1707,226 @@ async fn selinux_enforcing() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stop names the container the engine made, not the name it was
+    /// asked for. A handle kept for a retry -- which is what a failed stop
+    /// leaves behind -- can outlive the name: the container goes away, the
+    /// name is free, and something else takes it before teardown gets around
+    /// to trying again. A retry aimed at the name stops *that* container. The
+    /// removal has been scoped to the attempt label all along for the same
+    /// reason; the stop had not been.
+    #[test]
+    fn a_stop_names_the_container_and_not_a_name_something_else_can_have() {
+        let id = "2f8b1c0d".repeat(8);
+        let mut container = Container::unstoppable();
+        container.name = "outrig-a-name-that-can-come-round-again".to_string();
+        container.id = engine_id(id.as_bytes());
+
+        let asked = container.stop_cmd("2").render();
+        assert!(
+            asked.contains(&id),
+            "the stop has to name the engine's id: {asked}"
+        );
+        assert!(
+            !asked.contains("come-round-again"),
+            "and not a name that can come round again: {asked}"
+        );
+
+        // A container outrig only borrowed has no id -- and never reaches a
+        // stop either, since stopping one is a no-op it returns early from.
+        let borrowed = Container::stops_cleanly();
+        assert_eq!(borrowed.id, None);
+    }
+
+    /// An id is what podman prints for a `create`, and nothing else counts as
+    /// one. Taking any single token makes whatever a wrapper, a shim or an
+    /// engine with another output format prints into a *container selector* --
+    /// and that selector is what every stop this handle issues would name.
+    #[test]
+    fn an_engine_id_is_taken_only_from_output_that_is_one() {
+        let real = "8a29737190d0a814b5930e4a5eb1a1dd4dbf0da72b40ad6ac7d6fd0f0bbf3ca1";
+        assert_eq!(real.len(), PODMAN_ID_LEN);
+        assert_eq!(
+            engine_id(real.as_bytes()).as_ref().map(ContainerId::as_str),
+            Some(real)
+        );
+        // Podman ends it with a newline, and a stray blank line is still it.
+        assert_eq!(
+            engine_id(format!("{real}\n\n").as_bytes())
+                .as_ref()
+                .map(ContainerId::as_str),
+            Some(real)
+        );
+
+        for not_an_id in [
+            // Nothing at all.
+            String::new(),
+            "   \n".to_string(),
+            // A token, but not an id: this is what a wrapper script or an
+            // engine with its own output format gets to inject.
+            "some-other-container".to_string(),
+            "--all".to_string(),
+            // A short id. Podman would accept it as a selector, which is
+            // exactly why it is not accepted as *this* one's identity.
+            real[..12].to_string(),
+            // Right length, wrong alphabet.
+            "z".repeat(PODMAN_ID_LEN),
+            // Right shape, but two of them.
+            format!("{real} {real}"),
+        ] {
+            assert_eq!(
+                engine_id(not_an_id.as_bytes()),
+                None,
+                "not an id: {not_an_id:?}"
+            );
+        }
+        // Not text at all.
+        assert_eq!(engine_id(&[0xff, 0xfe]), None);
+    }
+
+    /// A stop whose client never returns is given up on, and the container
+    /// comes back. `-t` bounds how long podman waits for the container's
+    /// *processes*; it says nothing about the client asking for it, so a
+    /// wedged client or an engine that never answers used to hold this await
+    /// for the rest of the session -- and this await is on the path of every
+    /// sidecar compensation and every shutdown.
+    #[tokio::test]
+    async fn a_stop_client_that_never_returns_is_given_up_on() {
+        let mut container = Container::unstoppable();
+        // Ten seconds, against a budget of one: long enough to be wedged
+        // relative to the deadline under test, short enough that losing that
+        // deadline costs the suite ten seconds and a failed assertion rather
+        // than a hang. Real time, not a paused clock: a bounded call waiting
+        // on a child leaves the runtime idle, and a paused clock fires every
+        // deadline in the test at once, including the one belonging to the
+        // call this is not about.
+        container.engine_override = vec![("stop", Cmd::new("/bin/sleep").arg("10"))];
+        container.engine_budget = Some(Duration::from_secs(1));
+
+        let (why, kept) = container
+            .stop_or_keep(Duration::from_secs(2))
+            .await
+            .expect("a stop that never answered is not a stop");
+        let OutrigError::Canceled { argv, .. } = &why else {
+            panic!("a wedged client is given up on, not failed: {why:?}");
+        };
+        assert_eq!(
+            argv.first().map(|a| a.to_string_lossy().into_owned()),
+            Some("stop".to_string()),
+            "and it is the *stop* that was given up on: {argv:?}"
+        );
+        // Nothing here can tell whether the container stopped, so the handle
+        // is the caller's to try again through.
+        assert!(
+            kept.stop(Duration::from_secs(1)).await.is_err(),
+            "the handle has to still be the container"
+        );
+    }
+
+    /// A removal that never answers is not a removal either. It used to be
+    /// handed to a detached retry and then reported as a completed stop --
+    /// "gone, and the handle with it" about a container whose state was
+    /// unknown, with nothing observable left if those retries also failed.
+    #[tokio::test]
+    async fn a_removal_that_never_returns_does_not_count_as_a_stop() {
+        let mut container = Container::unstoppable();
+        // The stop is held still so the removal is reached at all, and so the
+        // test needs no engine of its own.
+        container.engine_override = vec![
+            ("stop", Cmd::new("/bin/true")),
+            ("rm", Cmd::new("/bin/sleep").arg("10")),
+        ];
+        container.engine_budget = Some(Duration::from_secs(1));
+
+        let (why, _kept) = container
+            .stop_or_keep(Duration::from_secs(2))
+            .await
+            .expect("an unconfirmed removal is not a completed stop");
+        let OutrigError::Canceled { argv, .. } = &why else {
+            panic!("a wedged removal is given up on, not failed: {why:?}");
+        };
+        assert_eq!(
+            argv.first().map(|a| a.to_string_lossy().into_owned()),
+            Some("rm".to_string()),
+            "and it is the *removal* that was given up on: {argv:?}"
+        );
+    }
+
+    /// A removal that ran and failed is not a removal. Reading every outcome
+    /// but a timeout as success is how a container the engine refused to
+    /// remove became nobody's: the handle was disposed of on the strength of
+    /// it, so nothing retried and `Drop` had nothing left to do either.
+    #[test]
+    fn a_removal_that_did_not_work_is_not_read_as_success() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let cmd = Cmd::new("podman").args(["rm", "-f"]);
+        let output = |code: i32, stderr: &str| {
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+
+        // Nothing matched the filter, which is what `--rm` having already done
+        // the work looks like.
+        assert!(matches!(
+            classify_engine_call(&cmd, output(0, "")),
+            EngineOutcome::Done
+        ));
+
+        // The engine ran it and refused.
+        let failed = classify_engine_call(&cmd, output(125, "Error: container is in use"));
+        let EngineOutcome::Failed(e) = failed else {
+            panic!("a non-zero removal must be reported");
+        };
+        assert!(
+            e.to_string().contains("container is in use"),
+            "and say what the engine said: {e}"
+        );
+
+        // It could not be run at all, which says nothing about the container.
+        let failed =
+            classify_engine_call(&cmd, Err(OutrigError::Configuration("no podman".into())));
+        assert!(
+            matches!(failed, EngineOutcome::Failed(_)),
+            "a removal that never ran has not removed anything"
+        );
+
+        // The one outcome that is still owed to something else: the detached
+        // retry the caller hands over, which is what lets it dispose.
+        let timed_out = classify_engine_call(
+            &cmd,
+            Err(OutrigError::Canceled {
+                program: "podman",
+                argv: Vec::new(),
+            }),
+        );
+        assert!(matches!(timed_out, EngineOutcome::TimedOut));
+    }
+
+    /// A stop that failed hands the container back. Every caller of this is
+    /// compensating for an earlier failure, and one that dropped the handle
+    /// would leave a container running with nothing that can retry stopping
+    /// it -- only `Drop`'s detached removal, which reports nothing.
+    #[tokio::test]
+    async fn a_container_that_will_not_stop_comes_back_to_its_caller() {
+        let container = Container::unstoppable();
+
+        let kept = container
+            .stop_or_keep(Duration::from_secs(1))
+            .await
+            .expect("a stop that cannot work has to hand the container back");
+        let (_, kept) = kept;
+
+        // And what comes back is usable: the point of keeping it is that
+        // teardown can try the same container again.
+        assert!(
+            kept.stop(Duration::from_secs(1)).await.is_err(),
+            "the handle has to be the container, not a husk of one"
+        );
+    }
 
     fn argv(cmd: Cmd) -> Vec<String> {
         std::iter::once(cmd.program.to_string())

@@ -166,17 +166,49 @@ const REAP_BATCH: usize = 64;
 /// that can await and wants the status should run the command through
 /// [`crate::process`] instead.
 pub(crate) fn detach_cleanup(cmd: Cmd, reissue: Reissue) {
+    detach_cleanup_chain(vec![cmd], reissue);
+}
+
+/// [`detach_cleanup`] for obligations that have to run *in order*.
+///
+/// Handing the reaper one command at a time hands it no ordering: each call
+/// spawns its own child and returns, so two cleanups race. Where the second
+/// depends on the first having finished -- removing a redirect before
+/// restoring the resolver that pointed at it, so the container is never left
+/// resolving through a rule aimed at a listener that is gone -- they have to
+/// arrive as one obligation, which is what this is.
+///
+/// Every command runs, in the order given. They are sequenced, not
+/// conditional: the later ones are owed whatever became of the earlier, and
+/// each gets its own attempt budget.
+pub(crate) fn detach_cleanup_chain(cmds: Vec<Cmd>, reissue: Reissue) {
+    let mut cmds = std::collections::VecDeque::from(cmds);
+    let Some(cmd) = cmds.pop_front() else {
+        return;
+    };
+    // Asked before the head is started, not after it has failed to be taken.
+    // Without a reaper there is nothing to notice one command ending and start
+    // the next, and the only sequencer left is a shell -- so a chain goes out
+    // as one from the start, rather than being launched and then needing a
+    // thread to put back in order. That matters because the paths that lose
+    // the reaper are the ones out of threads.
+    if !cmds.is_empty() && reaper().is_none() {
+        let mut whole = std::collections::VecDeque::from(vec![cmd]);
+        whole.extend(cmds);
+        spawn_orphaned_chain(whole);
+        return;
+    }
     let program = cmd.program;
     let waiting = match spawn_cleanup(&cmd) {
         // Timestamped at spawn, not at dequeue: the deadline is about how long
         // the command has been running, and time spent queued is time running.
-        Ok(child) => Wait::running(cmd, child, reissue),
+        Ok(child) => Wait::running(cmd, child, reissue, cmds),
         // It never started. A binary that is missing or not executable will
         // still be missing in 250 ms, but a process table that was briefly
         // full will not -- and dropping the obligation there loses a resource
         // to a moment of pressure, which is exactly when cleanups arrive in
         // bulk.
-        Err(e) => match Wait::pending(cmd, reissue, &e) {
+        Err(e) => match Wait::pending(cmd, reissue, cmds, &e) {
             Some(waiting) => waiting,
             None => return,
         },
@@ -192,39 +224,212 @@ pub(crate) fn detach_cleanup(cmd: Cmd, reissue: Reissue) {
         None => waiting,
     };
 
-    if unqueued.child.is_some() {
-        // The cleanup is running; only its reap is lost. Deliberately left
-        // alone rather than killed: the point of this module is that the
-        // cleanup *happens*, and a zombie is the smaller loss than a
-        // container that stays.
+    hand_back(unqueued, program);
+}
+
+/// What becomes of an obligation the reaper would not take.
+///
+/// Split out because it is the only path on which a chain loses its
+/// sequencing, and a path that is only reached when a process is out of
+/// threads is a path nothing exercises by accident.
+fn hand_back(unqueued: Wait, program: &'static str) {
+    // A thread rather than a task because this is reached from destructors,
+    // where there may be no runtime, and only on a path that already means the
+    // process is out of threads for the reaper.
+    tracing::debug!(
+        target: "outrig::supervise",
+        program,
+        "no reaper available; this cleanup is supervised on a thread of its own"
+    );
+    // The obligation is handed over whole -- the attempt in flight, its wedge
+    // deadline, its retries and the rest of its chain -- and driven by the same
+    // `still_owed` the reaper polls. Waiting the head out and then launching
+    // the tail, which this used to do, dropped every one of those: a wedged
+    // head held the thread forever, a `wait` that failed started the tail with
+    // nothing proving the head had ended, and a replayable command that exited
+    // non-zero was never retried.
+    let handed = std::sync::Arc::new(std::sync::Mutex::new(Some(unqueued)));
+    let taken = handed.clone();
+    let spawned = std::thread::Builder::new()
+        .name("outrig-cleanup-tail".to_string())
+        .spawn(move || {
+            // A failed spawn drops the closure rather than handing it back, so
+            // the obligation travels through the mutex: whichever side gets it
+            // out is the one that owes it.
+            let Some(mut waiting) = taken.lock().ok().and_then(|mut held| held.take()) else {
+                return;
+            };
+            while waiting.still_owed() {
+                std::thread::sleep(REAP_POLL);
+            }
+        });
+    if spawned.is_ok() {
+        return;
+    }
+    let Some(waiting) = handed.lock().ok().and_then(|mut held| held.take()) else {
+        return;
+    };
+
+    let Some(mut head) = waiting.child else {
+        // Nothing is running at all: the first attempt hit a transient spawn
+        // failure and the retry it was queued for has nowhere to happen now.
+        // One more attempt, inline and unreaped, because `Drop` cannot wait out
+        // a backoff and an unreaped cleanup still beats no cleanup. If even
+        // that fails, the obligation is genuinely lost -- say so plainly rather
+        // than logging the running-cleanup line, which would read as though
+        // something were still in flight.
+        spawn_orphaned_chain(waiting.then);
+        match spawn_cleanup(&waiting.cmd) {
+            Ok(_) => tracing::debug!(
+                target: "outrig::supervise",
+                program,
+                "no reaper available; retried cleanup runs unreaped"
+            ),
+            Err(_) => tracing::debug!(
+                target: "outrig::supervise",
+                program,
+                "cleanup could not be started and could not be queued; the \
+                 resource is abandoned"
+            ),
+        }
+        return;
+    };
+    if waiting.then.is_empty() {
+        // Nothing is queued behind it, so there is no ordering to keep and
+        // nothing to wait for. It runs unreaped, which is what this path costs.
+        return;
+    }
+    // Reached only when the reaper thread has died *and* no thread can be made,
+    // at which point a short block is the least bad of three bad options: the
+    // tail started beside a head still running is the ordering failure the
+    // chain exists to prevent, and dropping it loses the resolver undo for
+    // good, after the listeners it points at have stopped.
+    tracing::debug!(
+        target: "outrig::supervise",
+        "the rest of a cleanup chain has no thread to sequence it; \
+         waiting the head out in place"
+    );
+    if !proved_gone(&mut head, WEDGED_CLEANUP) {
+        // Abandoned rather than run beside a head that may still be going.
+        // This is the one outcome that is merely bad rather than wrong.
         tracing::debug!(
             target: "outrig::supervise",
-            program,
-            "no reaper available; cleanup runs unreaped"
+            remaining = waiting.then.len(),
+            "a wedged cleanup head could not be proved gone; the rest of \
+             its chain is abandoned rather than run beside it"
         );
         return;
     }
+    spawn_orphaned_chain(waiting.then);
+}
 
-    // Nothing is running at all: the first attempt hit a transient spawn
-    // failure and the retry it was queued for has nowhere to happen now. One
-    // more attempt, inline and unreaped, because `Drop` cannot wait out a
-    // backoff and an unreaped cleanup still beats no cleanup. If even that
-    // fails, the obligation is genuinely lost -- say so plainly rather than
-    // logging the running-cleanup line, which would read as though something
-    // were still in flight.
-    match spawn_cleanup(&unqueued.cmd) {
-        Ok(_) => tracing::debug!(
-            target: "outrig::supervise",
-            program,
-            "no reaper available; retried cleanup runs unreaped"
-        ),
-        Err(_) => tracing::debug!(
-            target: "outrig::supervise",
-            program,
-            "cleanup could not be started and could not be queued; the \
-             resource is abandoned"
-        ),
+/// Waits `head` out for `patience`, kills it if it is still running by then,
+/// and answers whether it is *proved* gone -- signalled **and** collected,
+/// rather than merely signalled.
+///
+/// Only a `true` here lets the rest of a cleanup chain start. A head that
+/// cannot be collected may still be running, and a tail started beside it is
+/// the overlap the chain exists to prevent; a kill that was refused proves
+/// nothing either. Both waits are bounded because the caller may be a
+/// destructor.
+///
+/// What is proved is about *this* process. A command that acts through an
+/// agent -- `podman exec`, whose container-side process outlives its killed
+/// client -- may still have work going on the other side, and no kill here can
+/// establish otherwise.
+fn proved_gone(head: &mut Child, patience: Duration) -> bool {
+    let deadline = Instant::now() + patience;
+    loop {
+        match head.try_wait() {
+            Ok(Some(_)) => return true,
+            // It cannot be collected, so nothing will ever prove it ended,
+            // and signalling something unreapable proves nothing either.
+            Err(_) => return false,
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(REAP_POLL),
+        }
     }
+    // `patience` is this module's definition of wedged, and what it does to a
+    // wedged command everywhere else is kill it. What is lost is a command
+    // that was not going to finish anyway; what is kept is the sequence.
+    tracing::debug!(
+        target: "outrig::supervise",
+        "a cleanup head did not end within the wedged deadline; killing it so \
+         the rest of its chain can run in order"
+    );
+    if head.kill().is_err() {
+        return false;
+    }
+    let until = Instant::now() + patience;
+    loop {
+        match head.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) if Instant::now() >= until => return false,
+            Ok(None) => std::thread::sleep(REAP_POLL),
+        }
+    }
+}
+
+/// Start what is left of a chain with nobody to sequence it.
+///
+/// Reached only when the reaper is unavailable or gone, which is also the only
+/// path on which ordering cannot be kept: there is nothing left to notice one
+/// command ending and start the next. Launching them anyway is the lesser
+/// loss -- the alternative is dropping them, which for the delete-then-restore
+/// chain means a live container left pointing at a DNS listener that has
+/// stopped, with nothing coming to put it back.
+fn spawn_orphaned_chain(then: std::collections::VecDeque<Cmd>) {
+    if then.is_empty() {
+        return;
+    }
+    let remaining = then.len();
+    if let Err(e) = spawn_cleanup(&ordered_shell(then)) {
+        tracing::debug!(
+            target: "outrig::supervise",
+            error = %e,
+            remaining,
+            "the rest of a cleanup chain could not be started and is abandoned"
+        );
+        return;
+    }
+    tracing::debug!(
+        target: "outrig::supervise",
+        remaining,
+        "no reaper available; the rest of the chain runs unreaped, in one shell"
+    );
+}
+
+/// The commands as a single `sh` that runs them in order.
+///
+/// A sequencer that needs no runtime and no reaper, for the path where
+/// neither is available. Ordering still has to hold there: the resolver must
+/// not go back while the redirect aimed at it is still in place, and launching
+/// the commands side by side is exactly that failure.
+///
+/// Every argv element is passed as a positional parameter and referenced by
+/// index, so nothing is interpolated into the script -- which matters because
+/// one of those elements is a container's resolver, arbitrary bytes that no
+/// quoting rule gets to see.
+fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
+    let mut script = String::new();
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
+    for cmd in cmds {
+        let mut words = Vec::new();
+        for word in std::iter::once(std::ffi::OsString::from(cmd.program)).chain(cmd.args) {
+            argv.push(word);
+            words.push(format!("\"${{{}}}\"", argv.len()));
+        }
+        if !script.is_empty() {
+            script.push_str("; ");
+        }
+        script.push_str(&words.join(" "));
+    }
+    Cmd::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("outrig")
+        .args(argv)
 }
 
 /// Start one attempt at `cmd`, with stdio nulled.
@@ -351,10 +556,17 @@ struct Wait {
     /// When the attempt in flight began. Reset per attempt, since the wedged
     /// deadline is about one command rather than the obligation.
     since: Instant,
+    /// How long an attempt gets before it counts as wedged. Always
+    /// [`WEDGED_CLEANUP`] outside tests, which drive it down rather than
+    /// sleeping out a minute to watch one deadline pass.
+    patience: Duration,
     /// What this module has done to the attempt in flight. Reset alongside
     /// `since`, for the same reason: it is a fact about one command.
     kill: Kill,
     reissue: Reissue,
+    /// The rest of an ordered chain, each started only once the one before it
+    /// has ended. Empty for the single-command case.
+    then: std::collections::VecDeque<Cmd>,
     /// Attempts left after this one.
     retries_left: u8,
     /// When the next attempt may start, while `child` is `None`.
@@ -363,13 +575,20 @@ struct Wait {
 
 impl Wait {
     /// An obligation whose first attempt is already running.
-    fn running(cmd: Cmd, child: Child, reissue: Reissue) -> Self {
+    fn running(
+        cmd: Cmd,
+        child: Child,
+        reissue: Reissue,
+        then: std::collections::VecDeque<Cmd>,
+    ) -> Self {
         Self {
             cmd,
             child: Some(child),
             since: Instant::now(),
+            patience: WEDGED_CLEANUP,
             kill: Kill::Untried,
             reissue,
+            then,
             retries_left: Self::budget(reissue),
             retry_at: None,
         }
@@ -379,20 +598,47 @@ impl Wait {
     /// that may not hold in a moment. `None` when there is nothing worth
     /// queueing -- a one-shot cleanup, a budget of zero, or a permanent
     /// failure like a missing binary.
-    fn pending(cmd: Cmd, reissue: Reissue, e: &std::io::Error) -> Option<Self> {
+    fn pending(
+        cmd: Cmd,
+        reissue: Reissue,
+        then: std::collections::VecDeque<Cmd>,
+        e: &std::io::Error,
+    ) -> Option<Self> {
         let retries_left = Self::budget(reissue);
         if retries_left == 0 || !spawn_failure_is_transient(e) {
+            // The rest of the chain is still owed even though this one never
+            // started, so it is handed back rather than dropped with it.
+            if !then.is_empty() {
+                detach_cleanup_chain(then.into(), reissue);
+            }
             return None;
         }
         Some(Self {
             cmd,
             child: None,
             since: Instant::now(),
+            patience: WEDGED_CLEANUP,
             kill: Kill::Untried,
             reissue,
+            then,
             retries_left: retries_left - 1,
             retry_at: Some(Instant::now() + RETRY_BACKOFF),
         })
+    }
+
+    /// Start the next command in the chain, if there is one. Returns whether
+    /// this obligation is still owed.
+    fn advance(&mut self) -> bool {
+        let Some(next) = self.then.pop_front() else {
+            return false;
+        };
+        self.cmd = next;
+        self.child = None;
+        self.since = Instant::now();
+        self.kill = Kill::Untried;
+        self.retries_left = Self::budget(self.reissue);
+        self.retry_at = None;
+        self.start_retry()
     }
 
     fn budget(reissue: Reissue) -> u8 {
@@ -417,7 +663,7 @@ impl Wait {
             // it either way so the kill is collected rather than left a
             // zombie.
             Ok(None) => {
-                if self.kill == Kill::Untried && self.since.elapsed() >= WEDGED_CLEANUP {
+                if self.kill == Kill::Untried && self.since.elapsed() >= self.patience {
                     match child.kill() {
                         Ok(()) => {
                             self.kill = Kill::Sent;
@@ -444,7 +690,7 @@ impl Wait {
                 }
                 true
             }
-            Ok(Some(status)) if status.success() => false,
+            Ok(Some(status)) if status.success() => self.advance(),
             // Killed by this module for wedging, and so terminal whatever the
             // budget says: the next attempt would be the same command against
             // the same engine that just held it for `WEDGED_CLEANUP`, and the
@@ -455,7 +701,7 @@ impl Wait {
                     program = self.cmd.program,
                     "cleanup command was killed for wedging; the resource is abandoned"
                 );
-                false
+                self.advance()
             }
             Ok(Some(_)) if self.retries_left == 0 => {
                 tracing::debug!(
@@ -465,7 +711,7 @@ impl Wait {
                     "cleanup command failed with no attempts left; the \
                      resource is abandoned"
                 );
-                false
+                self.advance()
             }
             // Everything else that did not exit zero, signals included. A
             // signal leaves the engine-side outcome *unknown* rather than
@@ -481,8 +727,23 @@ impl Wait {
                 true
             }
             // `try_wait` itself failing means this child can never be
-            // collected, so holding it achieves nothing.
-            Err(_) => false,
+            // collected, so nothing will ever prove it ended -- and a tail
+            // started on an unproved head is the overlap the chain exists to
+            // prevent. Holding it achieves nothing either, so the obligation
+            // ends here and what was queued behind it is abandoned rather than
+            // run beside something that may still be going.
+            Err(_) => {
+                if !self.then.is_empty() {
+                    tracing::debug!(
+                        target: "outrig::supervise",
+                        program = self.cmd.program,
+                        remaining = self.then.len(),
+                        "a cleanup head could not be collected; the rest of its \
+                         chain is abandoned rather than run beside it"
+                    );
+                }
+                false
+            }
         }
     }
 
@@ -579,6 +840,127 @@ mod tests {
         }
     }
 
+    /// The obligation a [`hand_back`] thread is handed, with a wedge deadline
+    /// short enough to watch pass. `program` is what the caller would have
+    /// passed for logging.
+    fn handed(cmd: Cmd, then: Vec<Cmd>, reissue: Reissue, patience: Duration) -> Wait {
+        let child = spawn_cleanup(&cmd).expect("the head starts");
+        let mut waiting = Wait::running(cmd, child, reissue, then.into());
+        waiting.patience = patience;
+        waiting
+    }
+
+    /// The fallback carries the whole obligation, not just "wait, then go".
+    /// A head that will not end is killed at its deadline and collected, and
+    /// only then does the rest of the chain run -- where an unbounded `wait`
+    /// would hold the thread for as long as the head held out, which for a
+    /// wedged engine is forever.
+    #[test]
+    fn the_fallback_kills_a_wedged_head_before_running_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after = dir.path().join("after");
+
+        hand_back(
+            handed(
+                // Directly rather than through a shell: a kill reaches the
+                // process this owns, and a shell's child is not it. Thirty
+                // seconds rather than ten minutes: far past both the deadline
+                // below and the wait below that, so an implementation that
+                // merely waits it out still fails here -- but not so far that
+                // the failing run leaves a process behind for the rest of the
+                // afternoon.
+                Cmd::new("/bin/sleep").arg("30"),
+                vec![
+                    Cmd::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!(": > {}", after.display())),
+                ],
+                Reissue::Safe,
+                Duration::from_millis(100),
+            ),
+            "sleep",
+        );
+
+        wait_for(&after, Duration::from_secs(10), "the rest of the chain");
+    }
+
+    /// A head that cannot be collected does not start what was queued behind
+    /// it. Nothing will ever prove it ended -- `try_wait` is the only thing
+    /// that could -- and the restore is what would run beside it.
+    #[test]
+    fn the_fallback_abandons_a_chain_whose_head_cannot_be_collected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after = dir.path().join("after");
+
+        let cmd = Cmd::new("/bin/sh").arg("-c").arg("exit 0");
+        let child = spawn_cleanup(&cmd).expect("the head starts");
+        // Reaped out from under the `Child`, which is what makes every later
+        // `try_wait` fail with `ECHILD`. A real one comes from a `SIGCHLD`
+        // handler or a `wait` elsewhere in the process.
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            Some(nix::sys::wait::WaitPidFlag::empty()),
+        )
+        .expect("the head is reapable");
+        let waiting = Wait::running(
+            cmd,
+            child,
+            Reissue::Safe,
+            vec![
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!(": > {}", after.display())),
+            ]
+            .into(),
+        );
+
+        hand_back(waiting, "sh");
+
+        // Long enough that a tail which was going to run would have: the
+        // thread polls at `REAP_POLL` and the command is a `:`.
+        std::thread::sleep(REAP_POLL * 8);
+        assert!(
+            !after.exists(),
+            "the rest of a chain must not run beside a head nothing can prove ended"
+        );
+    }
+
+    /// The fallback retries a replayable head that failed, where waiting it
+    /// out and moving on would spend its whole retry budget on nothing. The
+    /// tail still runs, because a chain is a sequence and not a condition.
+    #[test]
+    fn the_fallback_retries_a_head_that_failed_and_still_runs_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tried = dir.path().join("tried");
+        let after = dir.path().join("after");
+
+        hand_back(
+            handed(
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!("echo x >> {}; exit 1", tried.display())),
+                vec![
+                    Cmd::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!(": > {}", after.display())),
+                ],
+                Reissue::Safe,
+                WEDGED_CLEANUP,
+            ),
+            "sh",
+        );
+
+        wait_for(&after, Duration::from_secs(10), "the rest of the chain");
+        let attempts = std::fs::read_to_string(&tried)
+            .map(|t| t.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            attempts,
+            CLEANUP_RETRIES as usize + 1,
+            "a replayable head keeps its retries on this path too"
+        );
+    }
+
     /// A cleanup that exits non-zero has not discharged its obligation, so it
     /// is tried again. Nothing else is coming for the resource -- the guard
     /// that owed the removal is already gone -- which is why a transient
@@ -665,15 +1047,205 @@ mod tests {
     /// wedge deadline -- the deadline only fires while nothing has been tried
     /// yet -- and filed whatever signal ended it as this module's doing, which
     /// is terminal for the obligation.
+    /// The reaper is created once per process and its channel is unbounded, so
+    /// the only way an obligation comes back is a process out of threads. That
+    /// is exactly when cleanups arrive in bulk, and dropping the rest of a
+    /// chain there means the delete-then-restore pair loses its restore: a
+    /// live container left pointing at a DNS listener that has stopped, with
+    /// nothing coming to put it back.
+    #[test]
+    fn an_obligation_the_reaper_will_not_take_still_runs_its_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queued = dir.path().join("queued");
+
+        // A `Wait` whose first command is already running and whose chain
+        // still has work in it, handed back as the reaper would hand it back.
+        let running = spawn_cleanup(&Cmd::new("/bin/sh").arg("-c").arg("exit 0"))
+            .expect("spawn the first command");
+        let unqueued = Wait::running(
+            Cmd::new("/bin/sh").arg("-c").arg("exit 0"),
+            running,
+            Reissue::Safe,
+            std::collections::VecDeque::from(vec![
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!(": > {}", queued.display())),
+            ]),
+        );
+
+        hand_back(unqueued, "sh");
+
+        wait_for(
+            &queued,
+            Duration::from_secs(10),
+            "the rest of the chain to run anyway",
+        );
+    }
+
+    /// The fallback must not race the head it was handed. Its tail can only
+    /// start once the command already running has ended, or the restore lands
+    /// while the redirect is still in place.
+    #[test]
+    fn an_orphaned_tail_waits_for_the_head_it_was_handed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let head = dir.path().join("head");
+        let tail = dir.path().join("tail");
+
+        let running = spawn_cleanup(
+            &Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("sleep 0.4; : > {}", head.display())),
+        )
+        .expect("spawn the head");
+        let unqueued = Wait::running(
+            Cmd::new("/bin/sh").arg("-c").arg("exit 0"),
+            running,
+            Reissue::Safe,
+            std::collections::VecDeque::from(vec![
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!(": > {}", tail.display())),
+            ]),
+        );
+
+        hand_back(unqueued, "sh");
+
+        wait_for(&tail, Duration::from_secs(10), "the tail to run");
+        assert!(head.exists(), "the head must have finished first");
+        let head_at = head.metadata().expect("head").modified().expect("mtime");
+        let tail_at = tail.metadata().expect("tail").modified().expect("mtime");
+        assert!(
+            head_at <= tail_at,
+            "the tail started before the head it was handed had ended"
+        );
+    }
+
+    /// The fallback keeps the order too. Launching the remainder side by side
+    /// is the failure the chain exists to prevent, and the path that loses the
+    /// reaper is not a path that gets to lose the ordering with it.
+    #[test]
+    fn an_orphaned_chain_still_runs_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+
+        spawn_orphaned_chain(std::collections::VecDeque::from(vec![
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("sleep 0.4; : > {}", first.display())),
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(": > {}", second.display())),
+        ]));
+
+        wait_for(&second, Duration::from_secs(10), "the orphaned chain");
+        let first_at = first.metadata().expect("first").modified().expect("mtime");
+        let second_at = second
+            .metadata()
+            .expect("second")
+            .modified()
+            .expect("mtime");
+        assert!(
+            first_at <= second_at,
+            "the fallback started the second command before the first had ended"
+        );
+    }
+
+    /// Argv travels as positional parameters, so a command carrying arbitrary
+    /// bytes -- a container's resolver -- is never interpolated into a script.
+    #[test]
+    fn an_ordered_shell_passes_argv_rather_than_quoting_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out");
+        let nasty = "a'b\"c $(touch pwned) `id` \\ %s\n";
+
+        spawn_orphaned_chain(std::collections::VecDeque::from(vec![
+            Cmd::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf '%s' \"$1\" > {}", out.display()))
+                .arg("_")
+                .arg(nasty),
+        ]));
+
+        wait_for(&out, Duration::from_secs(10), "the orphaned command");
+        // The file may still be being written when it first appears.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&out).unwrap_or_default() != nasty {
+            assert!(Instant::now() < deadline, "bytes did not survive the shell");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!dir.path().join("pwned").exists(), "argv is data");
+    }
+
+    /// A chain runs in order, and the second command does not start until the
+    /// first has ended. Two `detach_cleanup` calls would spawn two children
+    /// and race; where the second undoes something the first must remove
+    /// first, that race is the bug.
+    #[test]
+    fn a_chain_runs_its_commands_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+
+        detach_cleanup_chain(
+            vec![
+                // Slow on purpose: if the second is not waiting for this, it
+                // lands first and the order is observable in the timestamps.
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!("sleep 0.4; : > {}", first.display())),
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!(": > {}", second.display())),
+            ],
+            Reissue::Safe,
+        );
+
+        wait_for(&second, Duration::from_secs(10), "the chain to finish");
+        assert!(first.exists(), "the first command must have run");
+        let first_at = first.metadata().expect("first").modified().expect("mtime");
+        let second_at = second
+            .metadata()
+            .expect("second")
+            .modified()
+            .expect("mtime");
+        assert!(
+            first_at <= second_at,
+            "the second command started before the first had ended"
+        );
+    }
+
+    /// A command that fails does not cancel the rest of its chain: the
+    /// ordering is a sequence, not a condition.
+    #[test]
+    fn a_chain_continues_past_a_command_that_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after = dir.path().join("after");
+
+        detach_cleanup_chain(
+            vec![
+                Cmd::new("/bin/sh").arg("-c").arg("exit 1"),
+                Cmd::new("/bin/sh")
+                    .arg("-c")
+                    .arg(format!(": > {}", after.display())),
+            ],
+            Reissue::Once,
+        );
+
+        wait_for(&after, Duration::from_secs(10), "the rest of the chain");
+    }
+
     #[test]
     fn a_retry_starts_a_fresh_attempt() {
         let mut owed = Wait {
             cmd: Cmd::new("/bin/sh").arg("-c").arg("exit 0"),
             child: None,
             since: Instant::now(),
+            patience: WEDGED_CLEANUP,
             // As if the attempt before this one had been killed for wedging.
             kill: Kill::Sent,
             reissue: Reissue::Safe,
+            then: std::collections::VecDeque::new(),
             retries_left: 1,
             retry_at: None,
         };
@@ -726,6 +1298,68 @@ mod tests {
             &ran,
             Duration::from_secs(5),
             "a signalled cleanup was never retried",
+        );
+    }
+
+    /// A head that ends on its own is proved gone by collecting it, and the
+    /// status collected is its own -- not a kill this delivered. Nothing is
+    /// signalled when nothing needed to be.
+    #[test]
+    fn a_head_that_ends_on_its_own_is_proved_gone_without_a_kill() {
+        let mut head = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("spawn head");
+
+        // Patience far longer than the command needs, so reaching the kill at
+        // all would be the failure.
+        assert!(
+            proved_gone(&mut head, Duration::from_secs(5)),
+            "a head that exits has to be proved gone"
+        );
+        let status = head
+            .try_wait()
+            .expect("collected")
+            .expect("and the status kept");
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "it ended on its own, so its own status is what was collected: {status:?}"
+        );
+    }
+
+    /// A head that will not end is killed and *collected* before the rest of
+    /// its chain may start. Returning true off the kill alone would let the
+    /// tail run beside a head still winding down, which is the overlap the
+    /// chain exists to prevent.
+    #[test]
+    fn a_wedged_head_is_proved_gone_only_once_it_has_been_reaped() {
+        // `sleep` directly rather than through a shell: killing a shell
+        // reaches the shell, and its own child would outlive this test by ten
+        // minutes holding the harness's pipe open.
+        let mut head = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn head");
+
+        let proved = proved_gone(&mut head, Duration::from_millis(100));
+        let status = head.try_wait().expect("collected");
+        // Observed, then cleaned up, then asserted. An implementation that
+        // answered without killing would otherwise leave a ten-minute process
+        // holding the test harness's pipes open, and a suite that hangs on a
+        // broken mechanism reports nothing about it.
+        let _ = head.kill();
+        let _ = head.wait();
+
+        assert!(
+            proved,
+            "a wedged head has to be killed and collected, not abandoned"
+        );
+        let status = status.expect("proved gone means reaped, so the status is kept");
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9),
+            "and this one was reaped off a kill: {status:?}"
         );
     }
 

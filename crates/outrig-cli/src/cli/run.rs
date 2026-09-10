@@ -560,7 +560,68 @@ async fn sidecar_add(state: &ReplSession<'_>, name: &str) -> String {
     }
     match try_sidecar_add(state, name, sc).await {
         Ok(text) => text,
-        Err(e) => format!("[outrig] sidecar add failed: {e}; session unaffected"),
+        // "session unaffected" is a claim about the machine, not about the
+        // session's bookkeeping, and it is only true when unwinding worked. A
+        // sidecar left running with interception nothing owns is exactly what
+        // the user needs told apart from a clean failure.
+        Err(SidecarAddError::Unwound(e)) => {
+            format!("[outrig] sidecar add failed: {e}; session unaffected")
+        }
+        Err(SidecarAddError::Residue { source, residue }) => format!(
+            "[outrig] sidecar add failed: {source}; cleaning up after it also failed, so \
+             container {name:?} may still be running and still intercepted: {}",
+            residue
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+/// Why adding a sidecar failed, and whether anything was left behind.
+///
+/// `Unwound` is every ordinary failure: the attempt is undone and the machine
+/// is as it was. `Residue` is the one the user has to be able to tell apart,
+/// because a sidecar is still running with interception nothing owns.
+enum SidecarAddError {
+    /// The attempt failed and everything it started was undone.
+    Unwound(anyhow::Error),
+    /// The attempt failed and undoing it did not finish.
+    Residue {
+        source: anyhow::Error,
+        residue: Vec<outrig::error::OutrigError>,
+    },
+}
+
+impl From<crate::error::CliError> for SidecarAddError {
+    fn from(e: crate::error::CliError) -> Self {
+        // An error that already says something was left behind must not be
+        // laundered into a clean unwind by the blanket conversion. This is the
+        // one shape that carries residue across a `?`.
+        if let crate::error::CliError::Outrig(outrig::error::OutrigError::SidecarNotUnwound(
+            failure,
+        )) = e
+        {
+            let failure = *failure;
+            return SidecarAddError::Residue {
+                source: anyhow::Error::msg(failure.source.to_string()),
+                residue: failure.residue,
+            };
+        }
+        SidecarAddError::Unwound(e.into())
+    }
+}
+
+impl From<outrig::error::OutrigError> for SidecarAddError {
+    fn from(e: outrig::error::OutrigError) -> Self {
+        SidecarAddError::from(crate::error::CliError::from(e))
+    }
+}
+
+impl From<anyhow::Error> for SidecarAddError {
+    fn from(e: anyhow::Error) -> Self {
+        SidecarAddError::Unwound(e)
     }
 }
 
@@ -568,7 +629,11 @@ async fn sidecar_add(state: &ReplSession<'_>, name: &str) -> String {
 /// connect servers -> commit. Any failure unwinds everything this call
 /// started (clients, interceptor attachment, container) and leaves the
 /// session state untouched.
-async fn try_sidecar_add(state: &ReplSession<'_>, name: &str, sc: &SidecarPlan) -> Result<String> {
+async fn try_sidecar_add(
+    state: &ReplSession<'_>,
+    name: &str,
+    sc: &SidecarPlan,
+) -> std::result::Result<String, SidecarAddError> {
     let (host_workspace, container_workspace, transcript) = {
         let runtime = state.runtime.borrow();
         let primary = &runtime.containers.primary;
@@ -586,7 +651,18 @@ async fn try_sidecar_add(state: &ReplSession<'_>, name: &str, sc: &SidecarPlan) 
         container_workspace: &container_workspace,
         transcript: transcript.as_ref(),
     };
-    let container = session_setup::launch_declared_sidecar(&ctx, state.mcp_plan, sc).await?;
+    // A sidecar that is created and then cannot be stopped goes here, so the
+    // session keeps a handle on something that is still running.
+    let mut abandoned = Vec::new();
+    let launched =
+        session_setup::launch_declared_sidecar(&ctx, state.mcp_plan, sc, &mut abandoned).await;
+    state
+        .runtime
+        .borrow_mut()
+        .containers
+        .abandoned
+        .append(&mut abandoned);
+    let container = launched?;
 
     // Take the interceptor out of the shared slot around the await so no
     // RefCell borrow is held across it; slash callbacks run sequentially,
@@ -596,8 +672,28 @@ async fn try_sidecar_add(state: &ReplSession<'_>, name: &str, sc: &SidecarPlan) 
         let attached = interceptor.attach(&container).await;
         state.runtime.borrow_mut().network = Some(interceptor);
         if let Err(e) = attached {
-            let _ = container.stop(STOP_GRACE).await;
-            return Err(e.into());
+            // The same rule as the post-connect path below: stopping is a
+            // compensation and its failure is not a detail. A sidecar that was
+            // created, possibly half-attached, and then could not be stopped
+            // has no later owner, and `attach` itself reports through
+            // `NetworkAttachNotUndone` whether it left anything behind. The
+            // handle moves to the session's cleanup-only list so teardown
+            // gets one more orderly try at it.
+            if let Some((stopped, kept)) = container.stop_or_keep(STOP_GRACE).await {
+                state.runtime.borrow_mut().containers.abandoned.push(kept);
+                return Err(SidecarAddError::Residue {
+                    source: e.into(),
+                    residue: vec![stopped],
+                });
+            }
+            // Stopping it worked, so the container `attach` was worried about
+            // is gone and so is anything it left on it. What the caller is
+            // told is what stopped the attach, not obligations against
+            // something that no longer exists -- this pairs with "session
+            // unaffected", and the two must not contradict each other.
+            return Err(SidecarAddError::Unwound(
+                outrig::error::superseded_by_a_confirmed_stop(e, name).into(),
+            ));
         }
     }
 
@@ -605,13 +701,44 @@ async fn try_sidecar_add(state: &ReplSession<'_>, name: &str, sc: &SidecarPlan) 
         match connect_added_sidecar_servers(state, name, &container).await {
             Ok(connected) => connected,
             Err(e) => {
+                // Both compensations are attempted and neither failure is
+                // discarded: a detach that failed leaves a live sidecar still
+                // carrying interception that no attachment owns, there is no
+                // retained handle to try again through, and this is the last
+                // place anything is going to notice.
+                let mut detach_failed = None;
                 let taken = state.runtime.borrow_mut().network.take();
                 if let Some(mut interceptor) = taken {
-                    let _ = interceptor.detach(container.name()).await;
+                    if let Err(detached) = interceptor.detach(container.name()).await {
+                        detach_failed = Some(detached);
+                    }
                     state.runtime.borrow_mut().network = Some(interceptor);
                 }
-                let _ = container.stop(STOP_GRACE).await;
-                return Err(e);
+                let Some((stopped, kept)) = container.stop_or_keep(STOP_GRACE).await else {
+                    // The container is gone, and its namespaces with it -- so
+                    // is the interception a failed detach could not undo, and
+                    // the rules and resolver it would have undone. Residue is
+                    // a claim about what is still running, and there is
+                    // nothing: saying otherwise sends someone looking for a
+                    // container that no longer exists. Kept as a log line,
+                    // because a detach that failed is still worth knowing
+                    // about, but it is not what the caller is told.
+                    if let Some(detached) = detach_failed {
+                        tracing::warn!(
+                            target: "outrig::cli::run",
+                            sidecar = %name,
+                            "detaching {name:?} failed ({detached}); stopping it \
+                             afterwards worked, so nothing is left behind"
+                        );
+                    }
+                    return Err(SidecarAddError::Unwound(e.into()));
+                };
+                // It is still running, so whatever detach could not undo is
+                // still on it.
+                let mut residue: Vec<_> = detach_failed.into_iter().collect();
+                residue.push(stopped);
+                state.runtime.borrow_mut().containers.abandoned.push(kept);
+                return Err(SidecarAddError::Residue { source: e.into(), residue });
             }
         };
 
@@ -1029,6 +1156,7 @@ mod tests {
                         None,
                         None,
                         SessionContainers {
+                            abandoned: Vec::new(),
                             sidecars: std::collections::BTreeMap::new(),
                             primary,
                         },

@@ -20,6 +20,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   badly) and from `Spawn` (it never started). Receiving it means the child is already dead
   *and* already reaped -- the cooperative path waits for that before it returns.
 
+- **`OutrigError::SidecarNotUnwound`**, carrying a `SidecarUnwindFailure` with the sidecar, why
+  it was being torn down, and what tearing it down could not finish.
+  `SidecarUnwindFailure::new` builds one from outside the crate, which the CLI needs for the
+  sidecars it starts itself. A sidecar whose servers
+  fail to start is detached and stopped; when that also fails, a live container is left
+  carrying interception no attachment owns, and the caller used to see only the startup error.
+
+- **`Container::stop_or_keep`**, `stop` that hands the container back when it did not stop:
+  `None` means it is gone and the handle with it, `Some` carries both the failure and the
+  handle. For a caller compensating for an earlier failure, where a container that would not
+  stop is still running and dropping the handle removes the last chance to try again in an
+  orderly way. The disposition is in the signature so that keeping it is not something a call
+  site can forget -- it was forgotten in three of them.
+
+  Both forms now report a stop or a removal that did not work, where every outcome but a
+  timeout used to read as success and a timeout read as a completed stop: podman refusing the
+  removal left the handle disposed and untracked with nothing retrying it, and a removal that
+  never answered was reported as "gone" about a container whose state was unknown. Anything but
+  a confirmed removal hands the container back. A filter matching nothing -- what `--rm` having
+  already done the work looks like -- is still a success.
+
+  The stop now names the container podman made rather than the name it was asked for. A handle
+  kept for a retry can outlive its name -- the container goes away, the name is free, something
+  else takes it -- and a retry aimed at the name would stop that one. Removals have been scoped
+  to the creating attempt since names were first guarded, on the grounds that a name is a
+  request and not a claim; stops had not been.
+
+  That id is the full hex podman prints from the `create` that made the container, and nothing
+  else is accepted as one: a wrapper script or an engine with another output format would
+  otherwise hand back a *container selector* that every later stop would name. A creation whose
+  output carries no id fails while the attempt-label guard is still armed, so what was made is
+  removed rather than kept under a handle that cannot name it.
+
+  The stop itself is bounded now. `-t` is how long podman waits for the *container's* processes
+  before killing them and says nothing about the client asking for it, so a wedged client or an
+  engine that never answered used to hold `stop` for the rest of the session -- on the path of
+  every sidecar compensation and every shutdown. It gets the grace the container is owed plus a
+  floor for the client, and a timeout hands the container back. That sum saturates: `Duration`
+  addition panics on overflow, so a caller passing `Duration::MAX` -- or anything within the
+  floor of it -- used to bring the process down before any cleanup ran.
+
+- **`error::superseded_by_a_confirmed_stop`**, which takes a failure and the thing it was
+  attached for and returns what is still worth telling a caller once the container has been
+  confirmed stopped. A `NetworkAttachNotUndone` says a container may still be carrying
+  interception nothing owns; stopping it ends that claim, and handing the error on anyway
+  reports obligations against something that no longer exists. Public because the CLI unwinds
+  its own sidecars and needs the same rule.
+
+- **`OutrigError::NetworkAuditUnwritten`**, carrying a container, how many of its audit
+  records could not be written, the first failure, and -- when the log may hold a partial
+  record -- what stopped the writer proving otherwise. A writer that had to be stopped
+  reports one of these per attachment whose records it was still holding, with that
+  attachment's own count. Both, not one in place of the other:
+  they say which record was lost, and whether the file can still be trusted. A count rather
+  than an entry per record: a container that can open connections can make the sink fail as
+  often as it likes,
+  so an outage such as `ENOSPC` would otherwise grow host memory, and the teardown error, for
+  as long as it lasted.
+
+- **`OutrigError::NetworkAttachNotUndone`**, carrying a `NetworkAttachFailure` with the
+  container, the failure that stopped the attach, and everything undoing it could not put back.
+  An attach that fails and is fully undone still returns the plain cause -- the container is as
+  it was and the call can be retried. This is the other case, and it is a different thing to be
+  told, because the container may still be carrying interception that no attachment owns. The
+  residue stays armed for the destructor to reissue, so it is a report rather than the last word.
+
+- **`OutrigError::NetworkConnectionsUnfinished`**, carrying the grace that expired. Distinct
+  from `NetworkTasksAborted`, which says an attachment's accept and DNS loops had to be
+  stopped: this says a *connection* was still running after that, so a bridge may still be
+  moving bytes for a container the caller has been told is detached. Both windows can expire in
+  one teardown.
+
+- **`OutrigError::NetworkTeardown`**, carrying a `NetworkTeardownFailure` of
+  `NetworkTeardownCause`s -- one per obligation a detach could not discharge, each naming its
+  container and boxing the error that stopped it. Detaching runs several independent
+  obligations, and one failing is no reason to skip the others, so teardown collects rather
+  than short-circuits. `NetworkTasksAborted` and `NetworkTaskPanicked` carry what used to be
+  prose: a task that had to be aborted after its grace, and one that panicked.
+
 - **`Config::validate_as_repo`**, the rules that apply to a repo config file rather than to a
   merged one. Today there is one: `[network]`'s `default`, `allow`, and `deny` describe the
   machine's egress and belong to the operator, so a repo config may declare `mode` and
@@ -37,6 +116,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were its only users.
 
 ### Changed
+
+- **`NetworkInterceptor::shutdown` returns `Result<()>`.** It previously returned `()` and
+  reached `tracing::warn!` with everything that went wrong, so a session could report a clean
+  shutdown having failed to remove a container's redirect rules. `detach` kept its signature
+  and gained the same honesty: it used to return `Ok(())` unconditionally. The CLI and
+  `Outrig::shutdown` log the failure and carry on stopping containers, which is what they
+  already did for a sidecar that would not stop.
 
 - **A dropped future no longer leaves its subprocess running.** Every process outrig spawns
   is now owned: dropping the future that holds it -- which is what `tokio::time::timeout`
@@ -131,6 +217,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction rather than by a check that has to run. The signature stays infallible.
 
 ### Fixed
+
+- **A failed or interrupted `NetworkInterceptor::attach` leaves the container as it found it.**
+  `attach` rewrote the container's `/etc/resolv.conf` to point at its DNS listener and only
+  then applied the nft redirect table, so a failure in between left a *running* container
+  resolving to a loopback port with nothing behind it -- DNS dead, silently, and an error
+  returned that said nothing about it. Cancellation was worse: dropping the future anywhere
+  between the first rewrite and the `attachments` insert left both the resolver and the table
+  owned by nothing at all, since nothing had yet recorded that either was owed.
+
+  The resolver is read before it is written, and every change is armed for undo before it is
+  made. The undo list is one value that *moves*: built on `attach`'s own stack, moved into the
+  `Attachment` on success, moved on into teardown. There is no release step and so no window
+  between "the change is made" and "something owns its inverse" -- a move cannot be interrupted
+  by a cancellation, which is what makes the property structural rather than a rule about where
+  an `.await` may go. On any awaited path the undos run awaited and their failures are
+  reported; on any unawaited one, `Drop` hands each to `supervise::detach_cleanup`, which is
+  synchronous and runtime-free and therefore still completes when the runtime the caller was
+  running on is being torn down underneath it -- the case an embedder, which owns that runtime,
+  is most likely to produce.
+
+  `nft -f` commits a file as one kernel transaction, so the table a failed apply would have
+  created never exists, and the undo for it is idempotent besides. A container that has already
+  exited is asked about through `/proc/<pid>/ns/net`: it took its namespace, its table and its
+  `/etc` with it, so nothing is owed and nothing is reported.
+
+  What teardown removes is the table it created. The apply runs with `--echo --handle`, so the
+  kernel reports the handle it assigned in the same transaction that created the table, and the
+  undo is narrowed to `nft list table inet <name> ; delete table inet handle <n>` -- one
+  invocation, so one transaction, and therefore a check rather than a race. A handle is never
+  reissued, so a table deleted and recreated under outrig's name by anything else with
+  `NET_ADMIN` in the namespace no longer answers to it. That is the only selector the removal
+  carries: nftables numbers table handles per network namespace and never reissues one, so
+  within a namespace a handle names the table that transaction created or it names nothing.
+  Which namespace is a separate question, and one outrig now answers before issuing any undo --
+  it records the namespace instance behind `/proc/<pid>/ns/net` before it arms anything, and a
+  pid that has since been handed to another container reads the same as one whose process is
+  gone. The removal carries that check into the namespace with it, asking `/proc/self/ns/net`
+  once it is inside rather than trusting an answer from before `nsenter` resolved the pid.
+
+  This requires nft 0.9.0 or later for `--echo`, which is no newer than the `create table`
+  outrig already depends on. Ownership comes from that transaction and from nowhere else: an
+  apply whose echo cannot be read -- no echo, output that is not UTF-8, a format that moved --
+  fails the attach and removes nothing: a name stops being this attach's the moment the
+  transaction that created it commits and makes it visible, so a removal that can only name its
+  target is not one to issue, then or later. The table is reported to the caller as left in
+  place, which is what makes it recoverable by hand.
+
+- **`detach` ends every connection it started, and says so.** The accept loop spawned each
+  bridged connection and dropped the handle, and no cancellation token reached it, so `detach`
+  cancelled two loops, deleted the nft table and returned while connections went on moving
+  bytes and appending audit records for a container the interceptor had declared detached.
+  Connections are now held in a `JoinSet` the accept loop owns and does not return without
+  draining, and the whole of each one runs under its attachment's token -- so the sniff read, a
+  stalled upstream connect, the replayed opening bytes and a mid-stream copy are all covered by
+  the same cancellation. A connection that is cut is still recorded, before `detach` returns
+  rather than after. The DNS loop's forwarding await is cancellable for the same reason; it
+  could previously hold that loop for `DNS_TIMEOUT` per resolver, well past the grace teardown
+  allows, so a detach racing an in-flight lookup reported a failure that had not happened.
+
+  Termination is cancel, a grace, abort, then an unconditional join. It previously wrapped each
+  `JoinHandle` in a `tokio::time::timeout` and dropped the expired result, which *detaches* a
+  task rather than ending it -- so a wedged loop was reported as joined -- and spent the whole
+  grace per task rather than across them. Finished connections are taken back out of the
+  carrier as they complete, so an attachment that serves a long session does not accumulate one
+  handle per connection it has ever served.
+
+- **`detach` restores the resolver it replaced**, so attach and detach are a genuine inverse
+  pair rather than a one-way door. The bytes ride back as the restoring command's own argument
+  rather than quoted into a shell script, so a resolver containing anything at all comes back
+  exactly. A container with no resolver file gets none back, which is a state to restore and
+  not an error, and one whose resolver was baked in at `podman create --dns` is the deliberate
+  exception: nothing was rewritten, so nothing is restored.
+
+- **A non-zero `nft delete` is no longer read as success.** The teardown path used
+  `try_capture_logged`, which does not check exit status.
+
+- **The resolver is mutated by a process outrig owns, not by `podman exec`.** `podman exec`
+  starts the writer under conmon, so killing the client -- which is all a dropped future can do
+  -- leaves it running. Measured against podman 4.9.3: a `podman exec` whose client was killed
+  went on to complete its write two seconds later, which a rollback racing it loses, leaving the
+  container pointing at a listener that was never installed. The read, the install and the
+  restore now run through `nsenter -t <pid> -U -m`, which execs the shell directly, so killing
+  it kills the writer. The same check under `nsenter` left the write undone.
+
+- **An attach will not adopt an nft table it did not create.** A plain `table` block merges
+  into an existing table rather than failing -- measured, a second apply took the chain count
+  from one to two and exited zero -- so a stale table from a crashed run of the same session,
+  or an operator's own, used to be merged into on the way in and deleted whole on the way out.
+  The table name now carries a per-attach random tail, so a table by that name is one this
+  attach created; `create table`, which fails rather than merging, backs it up. A preflight
+  check was not enough on its own, because another actor in the same namespace can create the
+  name between the check and the apply.
+
+- **An undo will not act on a namespace it was not aimed at.** These commands name a namespace
+  by pid and the kernel hands pids out again, so an undo delayed past its container's exit --
+  by a slow command ahead of it in the chain, or a destructor firing late -- could write one
+  container's resolver into whatever holds that pid now. The resolver undos fire only if the
+  file still holds what this attach installed, which also means they will not clobber a
+  resolver something else legitimately changed. What it looks for is a marker carrying the
+  attach's own table name, written into the installed resolver as a comment, so a pid reused by
+  *another* outrig container does not satisfy it. The check is plain shell: the obvious
+  spelling used `cmp`, which a minimal image need not ship, and a missing one exits 127 --
+  which `|| exit 0` reads as "not ours", skipping the undo while `detach` reports success. The
+  nft delete needs no such guard: its table name is unique to the attach, so there is nothing
+  to find in a stranger's namespace. What the undo compares is the whole installed text, not
+  just the marker in it, so a resolver something has legitimately changed since is left
+  alone rather than reverted -- including one that differs only in a terminal newline, which
+  needs a sentinel inside the comparison because command substitution strips them, and the
+  file's own byte count is checked alongside its text, since shells differ on what they do
+  with an embedded NUL. A resolver
+  that cannot be *read* fails the undo rather than retiring it, since an unreadable file and
+  one belonging to someone else are not the same
+  thing; an absent one is checked separately, because that is the case that genuinely owes
+  nothing.
+
+- **The commands a destructor hands over run in order.** `supervise::detach_cleanup_chain`
+  takes an ordered list and starts each command only once the one before it has ended, where
+  submitting them one at a time spawned independent children that raced. The redirect has to
+  go before the resolver that was pointed at it, or the container is left resolving through a
+  rule aimed at a listener that is gone. They are sequenced, not conditional: a command that
+  fails does not cancel the rest of its chain.
+
+- **Resolver states that could not be put back are refused before anything is changed.** A
+  resolver that is a symbolic link to a file that does not exist reads as absent, so installing
+  would follow the link and create its target while the undo would remove the link. A resolver
+  containing a NUL byte, or larger than 64 KiB, cannot be carried in the argument the restore
+  puts it back with -- `execve` refuses the first outright and caps the second. Each is now an
+  error from `attach` before the resolver is touched, rather than an undo discovered to be
+  unrunnable after it.
+
+- **An audit record is written whole or not at all.** The log has one writer, a task that owns
+  the file; producers queue a record over a bounded channel and wait for it to be written, so
+  no caller's cancellation reaches the bytes and a stalled log applies backpressure rather than
+  growing. Teardown drains the writer rather than treating a joined connection as proof its
+  record landed. A write that fails partway is rolled back to where the file ended before it,
+  because `write_all` is a retry loop and not an atomic commit -- a leftover prefix would make
+  every record appended after it unparseable, costing the file rather than the record. That
+  rollback truncates, so the writer claims the file with an exclusive `flock` for its lifetime
+  and a second interceptor pointed at the same log is refused rather than allowed to have its
+  records destroyed by the first.
+
+  "Written" means in the file and readable, not synced: the acknowledgement a producer waits
+  for does not survive the host losing power, and nothing here promises that it would.
+
+- **An audit record that could not be written is reported.** `detach` treats a connection's
+  task returning as proof its record landed, which was only true if a failed write was kept
+  rather than logged and dropped. The sink retains them, stamped with their container, and
+  teardown collects them once the tasks are joined.
 
 - **A repo `[network].mode` set programmatically or by direct serde is now honored.** Only
   `Config::load_from_str` could mark a `[network]` block as declared -- it re-parsed the

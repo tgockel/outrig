@@ -719,6 +719,7 @@ pub fn outrig::container::Container::session_suffix(&self) -> &str
 pub async fn outrig::container::Container::start(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::start_named(&outrig::image::ImageTag, outrig::container::ContainerLaunchSpec, alloc::string::String, core::option::Option<outrig::Transcript>) -> outrig::error::Result<Self>
 pub async fn outrig::container::Container::stop(self, core::time::Duration) -> outrig::error::Result<()>
+pub async fn outrig::container::Container::stop_or_keep(self, core::time::Duration) -> core::option::Option<(outrig::error::OutrigError, Self)>
 pub fn outrig::container::Container::transcript(&self) -> core::option::Option<outrig::Transcript>
 pub fn outrig::container::Container::uid(&self) -> u32
 pub fn outrig::container::Container::user_name(&self) -> core::option::Option<&str>
@@ -837,6 +838,19 @@ pub outrig::error::OutrigError::McpStartupFailed(alloc::boxed::Box<outrig::error
 #[non_exhaustive] pub outrig::error::OutrigError::McpToolsListFailed
 pub outrig::error::OutrigError::McpToolsListFailed::name: alloc::string::String
 pub outrig::error::OutrigError::McpToolsListFailed::source: alloc::boxed::Box<rmcp::service::ServiceError>
+pub outrig::error::OutrigError::NetworkAttachNotUndone(alloc::boxed::Box<outrig::error::NetworkAttachFailure>)
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkAuditUnwritten
+pub outrig::error::OutrigError::NetworkAuditUnwritten::container: alloc::string::String
+pub outrig::error::OutrigError::NetworkAuditUnwritten::integrity: core::option::Option<alloc::boxed::Box<outrig::error::OutrigError>>
+pub outrig::error::OutrigError::NetworkAuditUnwritten::records: u64
+pub outrig::error::OutrigError::NetworkAuditUnwritten::source: alloc::boxed::Box<outrig::error::OutrigError>
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkConnectionsUnfinished
+pub outrig::error::OutrigError::NetworkConnectionsUnfinished::grace: core::time::Duration
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkTaskPanicked
+pub outrig::error::OutrigError::NetworkTaskPanicked::source: tokio::runtime::task::error::JoinError
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkTasksAborted
+pub outrig::error::OutrigError::NetworkTasksAborted::grace: core::time::Duration
+pub outrig::error::OutrigError::NetworkTeardown(alloc::boxed::Box<outrig::error::NetworkTeardownFailure>)
 pub outrig::error::OutrigError::NoRepoConfig
 #[non_exhaustive] pub outrig::error::OutrigError::Path
 pub outrig::error::OutrigError::Path::op: &'static str
@@ -847,6 +861,7 @@ pub outrig::error::OutrigError::Process::argv: alloc::vec::Vec<std::ffi::os_str:
 pub outrig::error::OutrigError::Process::exit_code: core::option::Option<i32>
 pub outrig::error::OutrigError::Process::program: &'static str
 pub outrig::error::OutrigError::Process::stderr_tail: alloc::string::String
+pub outrig::error::OutrigError::SidecarNotUnwound(alloc::boxed::Box<outrig::error::SidecarUnwindFailure>)
 #[non_exhaustive] pub outrig::error::OutrigError::Spawn
 pub outrig::error::OutrigError::Spawn::command: alloc::string::String
 pub outrig::error::OutrigError::Spawn::program: &'static str
@@ -863,10 +878,26 @@ pub outrig::error::McpStartupFailure::name: alloc::string::String
 pub outrig::error::McpStartupFailure::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
 pub outrig::error::McpStartupFailure::stderr_path: std::path::PathBuf
 pub outrig::error::McpStartupFailure::stderr_tail: alloc::string::String
+#[non_exhaustive] pub struct outrig::error::NetworkAttachFailure
+pub outrig::error::NetworkAttachFailure::container: alloc::string::String
+pub outrig::error::NetworkAttachFailure::residue: alloc::vec::Vec<outrig::error::OutrigError>
+pub outrig::error::NetworkAttachFailure::source: alloc::boxed::Box<outrig::error::OutrigError>
+#[non_exhaustive] pub struct outrig::error::NetworkTeardownCause
+pub outrig::error::NetworkTeardownCause::container: alloc::string::String
+pub outrig::error::NetworkTeardownCause::source: alloc::boxed::Box<outrig::error::OutrigError>
+#[non_exhaustive] pub struct outrig::error::NetworkTeardownFailure
+pub outrig::error::NetworkTeardownFailure::causes: alloc::vec::Vec<outrig::error::NetworkTeardownCause>
+#[non_exhaustive] pub struct outrig::error::SidecarUnwindFailure
+pub outrig::error::SidecarUnwindFailure::residue: alloc::vec::Vec<outrig::error::OutrigError>
+pub outrig::error::SidecarUnwindFailure::sidecar: alloc::string::String
+pub outrig::error::SidecarUnwindFailure::source: alloc::boxed::Box<outrig::error::OutrigError>
+impl outrig::error::SidecarUnwindFailure
+pub fn outrig::error::SidecarUnwindFailure::new(impl core::convert::Into<alloc::string::String>, outrig::error::OutrigError, alloc::vec::Vec<outrig::error::OutrigError>) -> Self
 pub trait outrig::error::IoPathExt<T>
 pub fn outrig::error::IoPathExt::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
 impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, std::io::error::Error>
 pub fn core::result::Result<T, std::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
+pub fn outrig::error::superseded_by_a_confirmed_stop(outrig::error::OutrigError, &str) -> outrig::error::OutrigError
 pub type outrig::error::Result<T> = core::result::Result<T, outrig::error::OutrigError>
 pub mod outrig::image
 #[non_exhaustive] pub struct outrig::image::ImageBuildOutcome
@@ -931,7 +962,7 @@ impl outrig::network::NetworkInterceptor
 pub async fn outrig::network::NetworkInterceptor::attach(&mut self, &outrig::container::Container) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::detach(&mut self, &str) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::new(&std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
-pub async fn outrig::network::NetworkInterceptor::shutdown(self)
+pub async fn outrig::network::NetworkInterceptor::shutdown(self) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::start(&outrig::container::Container, &std::path::Path, &str) -> outrig::error::Result<Self>
 pub async fn outrig::network::NetworkInterceptor::start_with_policy(&outrig::container::Container, &std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
 impl core::ops::drop::Drop for outrig::network::NetworkInterceptor

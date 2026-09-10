@@ -154,6 +154,15 @@ case "$1" in
       printf '%s\n' "$subject" > "$journal/labeled.$label"
     fi
     publish
+    # What podman writes for a `create` or a detached `run`: the container's
+    # id, 64 hex digits and nothing else. Outrig refuses to build a handle
+    # without one -- a handle that cannot name what it made can only name it by
+    # a name something else can later have -- so a fake that printed nothing
+    # would be modelling an engine outrig declines to work with. From the pid,
+    # so two containers never share one.
+    case "$1" in
+      run|create) printf '%064x\n' "$$" ;;
+    esac
     for marker in "$journal"/fast."$1".*; do
       [ -e "$marker" ] || continue
       token=${marker##*/fast.$1.}

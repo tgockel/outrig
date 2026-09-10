@@ -17,10 +17,14 @@
 //! that name.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::File as StdFile;
+use std::future::Future;
 use std::io::{self, Write as _};
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,24 +35,28 @@ use serde::Serialize;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
     NetworkAction, NetworkEntry, NetworkHostPattern, NetworkPolicy, parse_network_host_pattern,
 };
 use crate::container::Container;
-use crate::error::{IoPathExt, OutrigError, Result};
+use crate::error::{
+    IoPathExt, NetworkAttachFailure, NetworkTeardownCause, NetworkTeardownFailure, OutrigError,
+    Result,
+};
 use crate::nsfork;
 use crate::process::{self, Cmd, Transcript};
+use crate::supervise::{Reissue, detach_cleanup_chain};
 
 const NETWORK_LOG: &str = "network.jsonl";
 
 /// Resolver the interceptor requires inside every attached container: DNS to
 /// the loopback listener, `ndots:0` so bare names resolve without
 /// search-domain expansion. Installed by `podman exec` on running containers
-/// ([`install_audit_resolv_conf`]) and baked in via `podman create --dns` for
+/// ([`install_resolv_conf`]) and baked in via `podman create --dns` for
 /// entrypoint-stdio containers, which cannot be exec'd before start.
 pub(crate) const INTERCEPT_DNS_NAMESERVER: &str = "127.0.0.1";
 pub(crate) const INTERCEPT_DNS_OPTION: &str = "ndots:0";
@@ -60,6 +68,27 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Leading byte [`read_resolv_conf`] answers with when the container has a
+/// resolver file; anything else means it has none.
+const RESOLV_PRESENT: u8 = b'1';
+/// The probe's verdict for a resolver that is a symbolic link to something
+/// that does not exist. `[ -e ]` alone reports that as absent, which is the
+/// one shape whose restore would destroy the original: installing follows the
+/// link and creates its target, while `rm -f` removes the link.
+const RESOLV_DANGLING: u8 = b'L';
+/// The largest resolver a restore can promise to put back.
+///
+/// The bytes travel as one `execve` argument, and Linux caps a single argument
+/// at `MAX_ARG_STRLEN`, 128 KiB. Arming an undo whose process could never
+/// start -- and finding that out only after the resolver had been replaced --
+/// is the failure this bound exists to make impossible. A resolver file
+/// anywhere near it is not a resolver file.
+const MAX_RESOLV_SNAPSHOT: usize = 64 * 1024;
+/// How many audit records may be queued ahead of the writer. Bounded so a
+/// stalled log applies backpressure to the connections producing records
+/// instead of growing, and so a session cannot be made to hold an unbounded
+/// number of them by opening connections faster than the disk accepts them.
+const AUDIT_QUEUE: usize = 1024;
 
 /// Bounds on how long one validated answer keeps authorizing an address. The
 /// floor keeps a TTL-0 answer usable by the connection that prompted it; the
@@ -400,18 +429,40 @@ pub struct NetworkInterceptor {
     cancel: CancellationToken,
     policy: Arc<CompiledNetworkPolicy>,
     audit: AuditSink,
-    table: String,
+    /// Kept rather than a table name, because the name is per attach: see
+    /// [`nft_table_name`].
+    session_id: String,
+    /// Handed out once per attach, so an attachment's audit losses are filed
+    /// under something a later attachment of the same name cannot be.
+    generation: u64,
     attachments: BTreeMap<String, Attachment>,
 }
 
-/// Per-container interception state: the container's accept loops and the
-/// handle that deletes its nft table. Sockets live inside the container's
+/// Per-container interception state: the container's loops, the undo log for
+/// everything [`NetworkInterceptor::attach`] changed about it, and the
+/// transcript that undo is logged to. Sockets live inside the container's
 /// namespaces, so every attachment owns its own listeners and loops.
 #[derive(Debug)]
 struct Attachment {
     cancel: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
-    cleanup: Cleanup,
+    /// The accept and DNS loops. A `JoinSet` rather than handles because
+    /// dropping one aborts what it holds: an interceptor that is dropped
+    /// rather than shut down leaves nothing behind still moving bytes.
+    tasks: JoinSet<()>,
+    rollback: Rollback,
+    transcript: Option<Transcript>,
+    /// This container's handle on the session's audit sink, kept so teardown
+    /// can collect the records its connections could not write.
+    audit: AuditSink,
+    /// Answers once no connection task is still running.
+    ///
+    /// The accept loop normally drains its own connections before it returns,
+    /// so joining it is enough -- but a loop that outlasts the grace is
+    /// *aborted*, and that drops the set it kept them in, which requests their
+    /// abort without awaiting it. Every connection holds a clone of the sender
+    /// this receives from and never sends on it, so this comes back when the
+    /// last one is gone, whichever way it went.
+    idle: mpsc::Receiver<()>,
 }
 
 impl NetworkInterceptor {
@@ -447,7 +498,8 @@ impl NetworkInterceptor {
             cancel: CancellationToken::new(),
             policy,
             audit,
-            table: nft_table_name(session_id),
+            session_id: session_id.to_string(),
+            generation: 0,
             attachments: BTreeMap::new(),
         })
     }
@@ -482,89 +534,248 @@ impl NetworkInterceptor {
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
 
-        let cleanup = Cleanup {
-            pid,
-            table: self.table.clone(),
-            transcript: container.transcript(),
-        };
+        let target = Target::for_attach(name, pid, &self.session_id, container.dns_preconfigured());
+        let transcript = container.transcript();
+        let run = |cmd: Cmd| run_step(cmd, transcript.clone());
 
-        // A dns-preconfigured container had the loopback resolver baked in
-        // via `podman create --dns` (`podman exec` cannot reach it before
-        // start); everything else gets the exec-based install.
-        if !container.dns_preconfigured() {
-            install_audit_resolv_conf(container).await?;
+        // The undo log is this frame's, so a caller that drops this future
+        // while a command is in flight drops it too, and its destructor puts
+        // the container back without needing a runtime to do it.
+        // Before the first mutation, so a namespace that cannot be identified
+        // is a refusal to start rather than an undo that cannot be trusted.
+        let mut rollback = Rollback::new(pid)?;
+        if let Err(e) = install_interception(&run, &mut rollback, &target, tcp_port, dns_port).await
+        {
+            let residue = rollback.undo_now(&run).await;
+            if residue.is_empty() {
+                // Undone completely: the container is as this found it, so the
+                // failure that stopped the attach is the whole story and the
+                // call can simply be tried again.
+                return Err(e);
+            }
+            // Otherwise the caller is owed more than the cause. Whatever could
+            // not be undone is still armed, so `rollback` dropping on the way
+            // out of this frame hands it to `supervise`.
+            return Err(OutrigError::NetworkAttachNotUndone(Box::new(
+                NetworkAttachFailure {
+                    container: name.to_string(),
+                    source: Box::new(e),
+                    residue,
+                },
+            )));
         }
-        apply_nft_rules(&cleanup, tcp_port, dns_port).await?;
 
+        // One generation per attach, never reused. Audit losses are filed
+        // under it rather than under the container's name, which a later
+        // attachment can have again -- so a failure arriving after this
+        // attachment's drain gave up cannot be read as the next one's.
+        self.generation += 1;
+        let generation = self.generation;
         let bindings: Bindings = Arc::new(Mutex::new(NameBindings::default()));
         let cancel = self.cancel.child_token();
-        let tasks = vec![
-            tokio::spawn(tcp_accept_loop(
-                sockets.tcp,
-                self.audit.for_container(name),
-                bindings.clone(),
-                self.policy.clone(),
-                cancel.clone(),
-            )),
-            tokio::spawn(dns_loop(sockets.dns, bindings, cancel.clone())),
-        ];
+        let mut tasks = JoinSet::new();
+        // Cloned into every connection and never sent on, so the receiver
+        // answers exactly when the last one has gone. One is enough: nothing
+        // is ever queued on it.
+        let (live, idle) = mpsc::channel(1);
+        tasks.spawn(tcp_accept_loop(
+            sockets.tcp,
+            self.audit.for_attachment(name, generation),
+            bindings.clone(),
+            self.policy.clone(),
+            cancel.clone(),
+            live,
+        ));
+        tasks.spawn(dns_loop(
+            sockets.dns,
+            host_resolvers(),
+            bindings,
+            cancel.clone(),
+        ));
 
         self.attachments.insert(
             name.to_string(),
             Attachment {
+                idle,
                 cancel,
                 tasks,
-                cleanup,
+                rollback,
+                transcript,
+                audit: self.audit.for_attachment(name, generation),
             },
         );
         Ok(())
     }
 
-    /// Detaches one container: cancels its loops and deletes its nft table
-    /// without disturbing other attachments. Takes the container name rather
-    /// than a [`Container`] so an already-dead container can still be
-    /// detached (the nft delete against its defunct pid fails harmlessly).
-    /// The container's `/etc/resolv.conf` is left pointing at the loopback
-    /// listener; detach is intended to run just before the container stops.
+    /// Detaches one container, undoing exactly what [`attach`](Self::attach)
+    /// did to it: its connections are ended, its `/etc/resolv.conf` is put
+    /// back to the bytes attach found there, and its nft table is deleted.
+    /// Other attachments are undisturbed.
+    ///
+    /// Takes the container name rather than a [`Container`] so an
+    /// already-dead container can still be detached; that case is a success,
+    /// since a container that has exited took both the namespace holding the
+    /// table and the resolver worth restoring with it.
+    ///
+    /// Every obligation is attempted, and the ones that failed are reported
+    /// together as [`OutrigError::NetworkTeardown`].
     pub async fn detach(&mut self, container: &str) -> Result<()> {
         let attachment = self.attachments.remove(container).ok_or_else(|| {
             OutrigError::Configuration(format!(
                 "container {container:?} is not attached to the network interceptor"
             ))
         })?;
-        teardown_attachment(attachment).await;
-        Ok(())
+        teardown_result(teardown_attachment(container, attachment).await)
     }
 
-    pub async fn shutdown(mut self) {
+    /// Detaches every attachment, reporting what none of them could
+    /// discharge. One container's failure does not skip another's teardown.
+    pub async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
-        // Attachments live in disjoint namespaces, so their grace periods and
-        // nft deletes can overlap.
-        futures_util::future::join_all(
-            std::mem::take(&mut self.attachments)
-                .into_values()
-                .map(teardown_attachment),
-        )
-        .await;
+        // Attachments live in disjoint namespaces, so their grace periods,
+        // resolver restores and nft deletes can overlap.
+        let failures =
+            futures_util::future::join_all(std::mem::take(&mut self.attachments).into_iter().map(
+                |(name, attachment)| async move { teardown_attachment(&name, attachment).await },
+            ))
+            .await;
+        let mut causes: Vec<NetworkTeardownCause> = failures.into_iter().flatten().collect();
+        // Quiesced before the sweep, not after. An attachment whose drain
+        // timed out left the writer still holding its records, and a failure
+        // landing after the sweep would go into a map whose only collector had
+        // already run. Dropping the last sender ends the writer once it has
+        // worked through what it has; joining it is what makes "everything it
+        // was ever going to record is recorded" true.
+        if let Some(writer) = self.audit.close().await {
+            causes.push(NetworkTeardownCause {
+                container: String::new(),
+                source: Box::new(writer),
+            });
+        }
+        // The sweep. Any attachment whose drain timed out left its losses
+        // behind rather than reporting an account it knew was short; this is
+        // the last thing that outlives them, so it collects whatever the
+        // writer ended up recording.
+        causes.extend(self.audit.take_every_unwritten().into_iter().map(|source| {
+            NetworkTeardownCause {
+                container: String::new(),
+                source: Box::new(source),
+            }
+        }));
+        teardown_result(causes)
     }
 }
 
 impl Drop for NetworkInterceptor {
     fn drop(&mut self) {
+        // The attachments go with `self`: each one's `JoinSet` aborts its
+        // tasks and each one's `Rollback` detaches its undo commands, which
+        // is everything a destructor can do about either.
         self.cancel.cancel();
-        for attachment in self.attachments.values() {
-            attachment.cleanup.spawn_detached_delete();
-        }
     }
 }
 
-async fn teardown_attachment(attachment: Attachment) {
-    attachment.cancel.cancel();
-    for task in attachment.tasks {
-        let _ = tokio::time::timeout(SHUTDOWN_GRACE, task).await;
+/// Ends one attachment and undoes everything [`NetworkInterceptor::attach`]
+/// did to its container, returning one rendering per obligation it could not
+/// discharge.
+async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkTeardownCause> {
+    let Attachment {
+        cancel,
+        mut idle,
+        mut tasks,
+        mut rollback,
+        transcript,
+        audit,
+    } = attachment;
+    cancel.cancel();
+    let mut failures = stop_tasks(&mut tasks).await;
+    // The accept loop drains its own connections before it returns, so joining
+    // it is normally the whole story -- but a loop that outlasted the grace
+    // was *aborted*, and that drops the set holding them, which asks for their
+    // abort without waiting for it. Waiting here is what makes "nothing this
+    // attachment started is still running" true on that path too, and it has
+    // to happen before the audit drain below, or a connection could still
+    // queue a record behind the marker that drain sends.
+    if tokio::time::timeout(SHUTDOWN_GRACE, idle.recv())
+        .await
+        .is_err()
+    {
+        // Its own variant, not the one `stop_tasks` uses: that says the loops
+        // had to be aborted, this says a connection outlived the abort, and
+        // the second is the one worth acting on.
+        failures.push(OutrigError::NetworkConnectionsUnfinished {
+            grace: SHUTDOWN_GRACE,
+        });
     }
-    if let Err(e) = attachment.cleanup.delete_table().await {
-        tracing::warn!(target: "outrig::network", "network cleanup failed: {e}");
+    // After the join, and then drained. Joining makes "every record this
+    // attachment owed is queued" true; the drain makes it "written". Without
+    // the second half a `detach` could return while the writer still had the
+    // last record in hand, which is the claim this whole path exists to
+    // support. A record promised and not written is a teardown that did not
+    // complete, not a log line.
+    // A drain that gave up leaves the writer still holding records this
+    // attachment queued, so what it reports now is not the whole account. The
+    // generation stays registered in that case: a failure arriving afterwards
+    // lands in a slot `shutdown` sweeps rather than one nobody will ever read.
+    let drained = audit.drain().await;
+    if let Some(e) = drained.as_ref().err() {
+        failures.push(OutrigError::Configuration(e.to_string()));
+    }
+    if drained.is_ok() {
+        failures.extend(audit.take_unwritten());
+    }
+    let run = |cmd: Cmd| run_step(cmd, transcript.clone());
+    failures.extend(rollback.undo_now(&run).await);
+    failures
+        .into_iter()
+        .map(|source| NetworkTeardownCause {
+            container: name.to_string(),
+            source: Box::new(source),
+        })
+        .collect()
+}
+
+/// Ends `tasks`, which have already been cancelled: each gets
+/// [`SHUTDOWN_GRACE`] to stop on its own, and whatever is left is aborted and
+/// then joined. The join is the point -- a handle that is merely dropped
+/// after a timeout *detaches* its task, leaving it running past the detach
+/// that was supposed to have ended it.
+///
+/// This covers these tasks and not what they spawned. The accept loop keeps
+/// its connections in a set of its own and drains it before returning, so on
+/// every path but this one they are joined with it -- but aborting the loop
+/// drops that set, which requests their abort and does not wait. The caller
+/// waits them out separately; see `Attachment::idle`.
+async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
+    let mut failures = Vec::new();
+    let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while let Some(joined) = tasks.join_next().await {
+            // Nothing has been aborted yet, so the only way a join fails
+            // inside the grace is a task that panicked.
+            if let Err(source) = joined {
+                failures.push(OutrigError::NetworkTaskPanicked { source });
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        failures.push(OutrigError::NetworkTasksAborted {
+            grace: SHUTDOWN_GRACE,
+        });
+        tasks.shutdown().await;
+    }
+    failures
+}
+
+/// One error carrying every obligation a teardown could not discharge, or
+/// `Ok(())` when it discharged them all.
+fn teardown_result(causes: Vec<NetworkTeardownCause>) -> Result<()> {
+    if causes.is_empty() {
+        Ok(())
+    } else {
+        Err(OutrigError::NetworkTeardown(Box::new(
+            NetworkTeardownFailure { causes },
+        )))
     }
 }
 
@@ -574,47 +785,511 @@ struct InterceptorSockets {
     dns: UdpSocket,
 }
 
+/// Everything the commands that install and remove interception are keyed to.
 #[derive(Debug, Clone)]
-struct Cleanup {
+struct Target {
+    name: String,
     pid: u32,
     table: String,
-    transcript: Option<Transcript>,
+    /// What the installed resolver is stamped with. Separate from `table` on
+    /// purpose: see [`resolv_marker`].
+    marker: String,
+    /// A container whose resolver was baked in by `podman create --dns` has
+    /// no resolv.conf to snapshot and none to put back.
+    dns_preconfigured: bool,
 }
 
-impl Cleanup {
-    async fn delete_table(&self) -> Result<()> {
-        let _ = process::try_capture_logged(
-            nsenter_nft(self.pid)
-                .args(["delete", "table", "inet"])
-                .arg(&self.table),
-            "network",
-            self.transcript.as_ref(),
-        )
-        .await?;
-        Ok(())
+impl Target {
+    /// Everything one attach's commands are keyed to.
+    ///
+    /// The table name and the resolver marker are drawn independently, and
+    /// that is the point rather than an accident: the resolver is written
+    /// before the table exists, so whatever is in it is readable inside the
+    /// container first. A marker that *was* the table name would tell an actor
+    /// in that namespace which table to create ahead of outrig, making its
+    /// `create table` fail and its rollback delete a table it never made.
+    fn for_attach(name: &str, pid: u32, session_id: &str, dns_preconfigured: bool) -> Self {
+        Self {
+            name: name.to_string(),
+            pid,
+            table: nft_table_name(session_id),
+            marker: attach_nonce(),
+            dns_preconfigured,
+        }
+    }
+}
+
+/// The undo log for one container's interception.
+///
+/// Every mutation is armed here *before* it is made, so no instant exists at
+/// which the container is changed with nothing responsible for changing it
+/// back. The ordinary paths discharge it awaited and report what failed
+/// ([`Self::undo_now`]); a destructor cannot await, so `Drop` hands the same
+/// commands to [`crate::supervise`], which runs them as detached processes
+/// that survive this runtime being torn down.
+#[derive(Debug)]
+struct Rollback {
+    /// The container's init pid: how the commands get to the namespace, and
+    /// on its own no evidence that the namespace is still the right one.
+    pid: u32,
+    /// Which namespace instance they were armed against, as its nsfs device
+    /// and inode. Compared before any undo is issued, so a pid that has been
+    /// handed to another container does not carry this attach's undos into it.
+    netns: (u64, u64),
+    /// Undo commands in the order their mutations were made, discharged in
+    /// reverse.
+    undo: Vec<Cmd>,
+    /// Mutations this made and then could neither undo nor keep owed: they are
+    /// reported with whatever the caller is told, and nothing reissues them.
+    ///
+    /// The one shape that lands here is a command that is safe to run *now*
+    /// and not later. Keeping it armed would mean issuing it at some distant
+    /// teardown, against whatever answers to its target by then; dropping it
+    /// silently would leave the caller thinking the machine is as it was. So
+    /// it is run once, here, and what it could not do is said out loud.
+    left_behind: Vec<OutrigError>,
+}
+
+impl Rollback {
+    /// Records which namespace these undos are for, before anything is armed.
+    ///
+    /// Fails when it cannot be identified, which is the fail-closed direction:
+    /// an undo that cannot tell its namespace from a stranger's is one that
+    /// must not run, and this is asked before the first mutation, so a refusal
+    /// here means there is nothing to undo yet.
+    fn new(pid: u32) -> Result<Self> {
+        Ok(Self {
+            netns: match namespace_id(pid) {
+                NamespaceAnswer::Is(netns) => netns,
+                NamespaceAnswer::Gone | NamespaceAnswer::Unknown => {
+                    return Err(OutrigError::Configuration(format!(
+                        "the network namespace of the container at pid {pid} could not \
+                         be identified, so nothing could tell it later from another \
+                         container's"
+                    )));
+                }
+            },
+            pid,
+            undo: Vec::new(),
+            left_behind: Vec::new(),
+        })
     }
 
-    /// The `Drop` form of [`Self::delete_table`]: a destructor cannot await an
-    /// `nsenter`, so the command is detached and its reap handed to
-    /// [`crate::supervise`].
-    fn spawn_detached_delete(&self) {
-        // Issued once: this selects a namespace by pid, and a pid is reused.
-        // A retry landing after the container exited would enter whatever
-        // holds that pid now and delete a table belonging to it.
-        crate::supervise::detach_cleanup(
-            nsenter_nft(self.pid)
-                .args(["delete", "table", "inet"])
-                .arg(&self.table),
-            crate::supervise::Reissue::Once,
-        );
+    /// The inode of the namespace these undos were armed against, for an undo
+    /// that carries the check into the namespace with it.
+    fn netns_inode(&self) -> u64 {
+        self.netns.1
     }
+
+    /// Whether the namespace the undos name is still the one they were armed
+    /// against.
+    ///
+    /// The pid is how `nsenter` gets there and pids come round again, so
+    /// "something is at that pid" is not the question -- "is it still the same
+    /// namespace" is. A container that exited took its namespace with it, and
+    /// with it the nft table and any point in restoring its resolv.conf, so
+    /// there is nothing left to undo and nothing to report.
+    fn same_namespace(&self) -> NamespaceAnswer {
+        match namespace_id(self.pid) {
+            NamespaceAnswer::Is(now) if now == self.netns => NamespaceAnswer::Is(now),
+            // A different namespace is as good as gone for these undos: what
+            // they were armed against is not there any more.
+            NamespaceAnswer::Is(_) | NamespaceAnswer::Gone => NamespaceAnswer::Gone,
+            NamespaceAnswer::Unknown => NamespaceAnswer::Unknown,
+        }
+    }
+
+    /// Take responsibility for `undo`, before the mutation it reverses runs.
+    /// Every undo here is idempotent, so arming one that turns out never to
+    /// have been needed costs nothing -- while arming afterwards would lose
+    /// whichever mutation a cancellation landed in the middle of.
+    ///
+    /// Returns where it was armed, for [`narrow`](Self::narrow).
+    fn arm(&mut self, undo: Cmd) -> usize {
+        self.undo.push(undo);
+        self.undo.len() - 1
+    }
+
+    /// Take an armed undo back, so nothing issues it later.
+    fn disarm(&mut self, armed: usize) -> Option<Cmd> {
+        (armed < self.undo.len()).then(|| self.undo.remove(armed))
+    }
+
+    /// Record a mutation this could not undo and will not try again.
+    fn leave_behind(&mut self, why: OutrigError) {
+        self.left_behind.push(why);
+    }
+
+    /// Replace an armed undo with one that names its target more exactly.
+    ///
+    /// Some identities only exist once the mutation has been made: the kernel
+    /// assigns an nft table its handle when it creates it, and until then the
+    /// name is all there is to arm with. Narrowing afterwards keeps the
+    /// invariant -- at no instant is the mutation unowned -- while ending up
+    /// with the stronger undo. Only ever narrower: a replacement must be
+    /// unable to reach anything the command it replaces could not.
+    fn narrow(&mut self, armed: usize, undo: Cmd) {
+        if let Some(slot) = self.undo.get_mut(armed) {
+            *slot = undo;
+        }
+    }
+
+    /// Discharges every armed undo, most recent first, returning one
+    /// rendering per command that failed. A command stays armed until it has
+    /// returned, so a cancellation mid-command leaves it to `Drop` rather
+    /// than dropping it on the floor.
+    async fn undo_now<F, Fut>(&mut self, run: &F) -> Vec<OutrigError>
+    where
+        F: Fn(Cmd) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>>>,
+    {
+        let mut failures = std::mem::take(&mut self.left_behind);
+        match self.same_namespace() {
+            // It took the table, the resolver and anything else these would
+            // have put back with it.
+            NamespaceAnswer::Gone => {
+                self.undo.clear();
+                return failures;
+            }
+            // Owed, and unrunnable: entering a namespace this cannot identify
+            // is the thing the guard exists to prevent, and clearing the list
+            // on an answer that was never given would discharge obligations
+            // against a namespace that is still there.
+            NamespaceAnswer::Unknown => {
+                failures.push(OutrigError::Configuration(format!(
+                    "whether the network namespace of the container at pid {} is \
+                     still the one these undos were armed against could not be \
+                     determined, so none of them were run",
+                    self.pid
+                )));
+                return failures;
+            }
+            NamespaceAnswer::Is(_) => {}
+        }
+        // Walked back to front by index, and an entry leaves the list only
+        // once its command has *returned* successfully. Everything not yet
+        // discharged therefore stays in `self.undo` across every await,
+        // including the one in flight, so a caller cancelled here drops a
+        // future that owns nothing and the destructor still holds every
+        // obligation.
+        //
+        // Removing first and putting the failures back at the end -- which
+        // this used to do -- got both halves wrong: a cancellation mid-command
+        // lost the command, since it existed only in the dropped frame, and
+        // the ones it kept came back newest-first for `Drop` to reverse a
+        // second time, undoing the resolver before the redirect that pointed
+        // at it.
+        let mut idx = self.undo.len();
+        while idx > 0 {
+            idx -= 1;
+            match run(self.undo[idx].clone()).await {
+                Ok(_) => {
+                    self.undo.remove(idx);
+                }
+                Err(e) => failures.push(e),
+            }
+        }
+        failures
+    }
+
+    #[cfg(test)]
+    fn armed(&self) -> Vec<String> {
+        self.undo.iter().map(Cmd::render).collect()
+    }
+}
+
+impl Drop for Rollback {
+    fn drop(&mut self) {
+        // Only a namespace that is provably gone lets the destructor drop
+        // these; an answer it could not get leaves them to be reissued, which
+        // is what `detach_cleanup_chain` is for.
+        if matches!(self.same_namespace(), NamespaceAnswer::Gone) {
+            return;
+        }
+        // One obligation, not one apiece. Handing the reaper each command
+        // separately hands it no ordering -- every call spawns its own child
+        // and returns -- and the resolver must not go back while the redirect
+        // aimed at it is still there, or the container resolves through a rule
+        // pointing at a listener that is gone.
+        //
+        // Issued once: these select namespaces by pid, and the kernel hands
+        // pids out again. A retry landing after the container exited would
+        // enter whatever holds that pid now -- rewriting some other
+        // container's resolver, or dropping its nft table.
+        let ordered: Vec<Cmd> = self.undo.drain(..).rev().collect();
+        detach_cleanup_chain(ordered, Reissue::Once);
+    }
+}
+
+/// Which network namespace `pid` is in, as the nsfs device and inode behind
+/// `/proc/<pid>/ns/net`. `None` when there is no such namespace to name.
+///
+/// The namespace rather than the pid entry: a zombie init keeps the latter
+/// after the container is gone, and the namespace is what `nsenter` enters and
+/// what the container's `/etc` lives beside. The identity rather than mere
+/// existence: pids come round again, and "a namespace is there" says nothing
+/// about whose.
+///
+/// # What this does not establish
+///
+/// nsfs inode numbers are drawn from a pool that a destroyed namespace returns
+/// to, and a handle is only unique within the namespace that issued it. So
+/// three recycled values -- the pid, the inode behind it, and a table handle
+/// in the new namespace matching this one -- would together satisfy every
+/// check here. Each is independently unlikely and the undos are issued
+/// promptly and never retried (`Reissue::Once`), but "unlikely" is the claim,
+/// not "impossible".
+///
+/// The stronger identity is an open descriptor on the namespace, which cannot
+/// be recycled while it is held. It is not used because these undos have to
+/// survive the thing that armed them: they are issued from a destructor with
+/// no runtime, through commands `supervise` spawns and may re-spawn, and an
+/// inherited descriptor does not survive an `exec` that closes it -- carrying
+/// one would mean outrig's own launcher in place of `nsenter` on the one path
+/// that must work when everything else is being torn down.
+fn namespace_id(pid: u32) -> NamespaceAnswer {
+    use std::os::unix::fs::MetadataExt;
+    classify_namespace(
+        std::fs::metadata(format!("/proc/{pid}/ns/net")).map(|ns| (ns.dev(), ns.ino())),
+        // Only consulted for the one error that is ambiguous, and asked at
+        // that point rather than up front.
+        || !Path::new(&format!("/proc/{pid}")).exists(),
+    )
+}
+
+/// What a probe's answer means for the undos armed against that namespace.
+///
+/// Only "there is no such namespace" ends an obligation. Every other error
+/// says nothing about whether the namespace is there -- the kernel can fail
+/// this for its own reasons, allocating the nsfs dentry for one -- and reading
+/// them all as "gone", which is what mapping the error away did, throws away
+/// every undo still owed to a namespace that is very much alive.
+fn classify_namespace(
+    probed: io::Result<(u64, u64)>,
+    task_gone: impl FnOnce() -> bool,
+) -> NamespaceAnswer {
+    match probed {
+        Ok(id) => NamespaceAnswer::Is(id),
+        // The ordinary answer for a container that has exited: its `nsproxy`
+        // is cleared, so the link is not there.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => NamespaceAnswer::Gone,
+        // The kernel's other way of saying the task went: the lookup behind
+        // this link fails with `ESRCH` when it loses the race with an exit.
+        // Rust has no `ErrorKind` for that one, so it is matched raw.
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => NamespaceAnswer::Gone,
+        // Ambiguous on its own: permission is refused both for a task that is
+        // not ours to look at and for one that went while being looked at. The
+        // pid's own directory tells them apart, and is only asked here.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && task_gone() => {
+            NamespaceAnswer::Gone
+        }
+        Err(_) => NamespaceAnswer::Unknown,
+    }
+}
+
+/// What asking which namespace a pid is in can come back with.
+enum NamespaceAnswer {
+    /// It is this one.
+    Is((u64, u64)),
+    /// There is no such namespace. Whatever was owed to it went with it.
+    Gone,
+    /// The question could not be answered. Not the same as `Gone`, and the
+    /// difference is what stops a transient failure discharging obligations
+    /// that are still owed.
+    Unknown,
+}
+
+/// How the real interceptor runs one interception command: exit status
+/// checked -- a teardown that quietly failed is the thing this reports --
+/// output teed to the container's transcript, stdout handed back.
+async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
+    process::run_capture_logged(cmd, "network", transcript.as_ref())
+        .await
+        .map(|output| output.stdout)
+}
+
+/// The container-mutating half of [`NetworkInterceptor::attach`]: snapshot the
+/// resolver and point it at the DNS listener, then install the redirect
+/// table. Split from the socket and task plumbing, and parameterized over how
+/// a command runs, so the ordering and the rollback are exercisable without a
+/// container.
+///
+/// All-or-nothing rests on `rollback` belonging to the caller: a failure
+/// returns with the undos armed, and a caller who drops this future
+/// mid-command drops it holding them.
+async fn install_interception<F, Fut>(
+    run: &F,
+    rollback: &mut Rollback,
+    target: &Target,
+    tcp_port: u16,
+    dns_port: u16,
+) -> Result<()>
+where
+    F: Fn(Cmd) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>>>,
+{
+    // A dns-preconfigured container had the loopback resolver baked in via
+    // `podman create --dns` (`podman exec` cannot reach it before start), so
+    // there is nothing here to change and nothing to change back.
+    if !target.dns_preconfigured {
+        let snapshot =
+            checked_resolv_snapshot(&target.name, run(read_resolv_conf(target.pid)).await?)?;
+        rollback.arm(restore_resolv_conf(target.pid, &target.marker, snapshot));
+        run(install_resolv_conf(target.pid, &target.marker)).await?;
+    }
+
+    let mut rules = tempfile::NamedTempFile::new()?;
+    rules.write_all(nft_rules(&target.table, tcp_port, dns_port).as_bytes())?;
+    rules.as_file_mut().sync_all()?;
+    // Safe to arm before the apply because the name belongs to this attach
+    // alone -- see `nft_table_name`. `create table` is belt to that brace: it
+    // fails rather than merging if anything by this name somehow exists, where
+    // a plain `table` block would merge into it, take the chain count from one
+    // to two and exit zero (measured against nft in podman 4.9.3), leaving the
+    // undo to delete whatever it merged into along with its own rules.
+    //
+    // By name and not yet by handle, because there is no handle until the
+    // kernel has made the table. A cancellation landing in the apply therefore
+    // undoes by the name -- which is correct there: the name is unobservable
+    // until this transaction commits, so nothing else can be holding it.
+    let armed = rollback.arm(delete_nft_table(target.pid, &target.table));
+    // `--echo --handle` makes the commit report the handle it assigned, in the
+    // same transaction that created the table. (nft 0.9.0 and later; outrig
+    // already requires `create table`, which is no older.)
+    let echo = run(nsenter_nft(target.pid)
+        .args(["--echo", "--handle", "-f"])
+        .arg(rules.path()))
+    .await?;
+    // The table exists from here on, and so does its name in a ruleset anyone
+    // in the namespace can list. Narrowing the undo to the handle is what
+    // stops a table deleted and recreated under that name from being deleted
+    // by this attach's teardown.
+    //
+    // A handle that cannot be read fails the attach rather than leaving the
+    // name-based undo in place: an nft too old for `--echo`, output that is
+    // not UTF-8, a format that moved. Removal by name alone is the thing this
+    // exists to stop, and carrying on would mean promising a teardown that
+    // could reach a table this attach did not create.
+    // Ownership is taken only from the transaction that created the table:
+    // the echo is that transaction's own word, and a handle read from it can
+    // be nothing but this table's. A later look cannot make that claim -- a
+    // ruleset can move between the commit and it, and what came back would
+    // then be a replacement's handle, adopted as though it were ours and
+    // deleted at teardown.
+    let Some(handle) = table_handle_in(&echo, &target.table) else {
+        // No identity, so no removal -- not later, and not here either.
+        //
+        // The delete armed before the apply can only name the table, and a
+        // name is not this attach's to act on once the transaction has
+        // committed and made it visible. Running it "immediately" only makes
+        // the window small: the delete is still an await, so a cancellation
+        // inside it strands the table with nothing owning it, and an actor
+        // that replaced the table first has that replacement deleted instead.
+        // Both were reachable, and neither is worth the table this would
+        // otherwise clear up.
+        //
+        // So it comes off the rollback unrun, and what was made is reported as
+        // left behind. There is no await between here and the error, which is
+        // what makes the outcome the same whether the caller waits for it or
+        // walks away.
+        rollback.disarm(armed);
+        rollback.leave_behind(OutrigError::Configuration(format!(
+            "the redirect table {} is still in the container: nft would not say \
+             what handle it gave the table it had just created, and removing it \
+             by name could reach a table of that name that this attach did not \
+             create",
+            target.table
+        )));
+        return Err(OutrigError::Configuration(format!(
+            "nft reported no handle for the redirect table {} it created, so \
+             nothing can tell that table from one of the same name that \
+             replaced it; the attach is undone rather than kept on that footing",
+            target.table
+        )));
+    };
+    rollback.narrow(
+        armed,
+        delete_nft_table_by_handle(target.pid, rollback.netns_inode(), handle),
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 struct AuditSink {
-    file: Arc<AsyncMutex<tokio::fs::File>>,
+    /// Records queued for the session's writer. Bounded, so a sink that
+    /// cannot keep up applies backpressure to the connections producing
+    /// records rather than growing without limit.
+    /// `None` once [`close`](Self::close) has ended the writer.
+    records: Option<mpsc::Sender<AuditJob>>,
     session_id: String,
     container: String,
+    /// The writer's handle, held only by the session-level sink so `shutdown`
+    /// can end it and wait. `None` on every per-attachment clone.
+    writer: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Which attachment this handle belongs to. Failures are filed under it
+    /// rather than under the container's name, which a later attachment can
+    /// have again.
+    generation: u64,
+    /// Records the writer has been handed and has not answered for, per
+    /// attachment.
+    ///
+    /// The writer is the only thing that knows what is in its queue, and
+    /// stopping it by abort takes that with it -- so the same fact is kept
+    /// where a caller can still read it. Whatever is left here when the writer
+    /// stops is exactly what it accepted and never accounted for, by owner and
+    /// by count.
+    pending: AuditPending,
+    /// What the writer could not write, per attachment: the first failure and
+    /// how many followed it.
+    ///
+    /// A connection's task returning is what `detach` treats as proof its
+    /// record landed, and that holds only once the writer has been drained.
+    /// Bounded on purpose -- one entry per container rather than per record --
+    /// because a container that can open connections can make writing fail as
+    /// often as it likes, and an outage such as `ENOSPC` would otherwise grow
+    /// host memory, and the teardown error, for as long as it lasted.
+    unwritten: AuditLosses,
+}
+
+/// Which attachment a record belongs to: the generation `attach` handed out,
+/// and the container's name. The generation is what makes it an identity --
+/// a name comes round again, an attachment does not.
+type AuditOwner = (u64, String);
+
+/// Per attachment: how many of its records were lost, and the failure worth
+/// telling someone about.
+type AuditLosses = Arc<Mutex<BTreeMap<AuditOwner, AuditLoss>>>;
+
+/// Per attachment: how many of its records the writer has taken and not yet
+/// answered for. Zero entries are removed rather than kept.
+type AuditPending = Arc<Mutex<BTreeMap<AuditOwner, u64>>>;
+
+/// One attachment's audit losses: how many records, the failure that broke the
+/// first append, and -- if the log may hold a partial record -- what stopped
+/// the writer proving otherwise.
+#[derive(Debug)]
+struct AuditLoss {
+    records: u64,
+    source: OutrigError,
+    integrity: Option<OutrigError>,
+}
+
+/// What the audit writer is asked to do.
+enum AuditJob {
+    /// One record, already encoded, with the container it belongs to and a
+    /// channel the writer answers on once it has dealt with it. The producer
+    /// waits on that, so a connection's task returning still means its record
+    /// is on disk -- the queue moves the bytes out of reach of the producer's
+    /// cancellation without moving the guarantee.
+    Record {
+        who: AuditOwner,
+        line: Vec<u8>,
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Answer once everything queued ahead of this has been written. This is
+    /// what lets teardown say "every record this attachment owed is on disk"
+    /// rather than assuming it because the connections returned.
+    Drained(tokio::sync::oneshot::Sender<()>),
 }
 
 impl AuditSink {
@@ -633,30 +1308,493 @@ impl AuditSink {
             .open(&path)
             .await
             .path_ctx("open", &path)?;
+        // Claimed exclusively, because the writer's rollback truncates this
+        // file back to where a failed record began -- and `ftruncate` acts on
+        // the inode, not on one descriptor's appends. A second writer's record
+        // sitting past that mark would be destroyed, and its owner would
+        // report a clean teardown having lost it. The lock is advisory and
+        // held by the open file description, so it also refuses a second
+        // interceptor in another process, and the kernel drops it when the
+        // file closes with the writer.
+        //
+        // `flock` on a `tokio::fs::File` is a raw-fd call and does not block:
+        // the non-blocking form is the point, since the answer wanted here is
+        // "someone already has this" rather than a wait.
+        //
+        // Only for a regular file, which is the only thing that truncation
+        // means anything for. A caller who points this at a device or a pipe
+        // has no rollback to protect and no exclusivity to lose -- and the
+        // tests that need every write to fail point it at `/dev/full`, whose
+        // one inode every one of them would otherwise queue behind.
+        //
+        // The exemption is for a file positively known not to be regular. A
+        // `stat` that *failed* says nothing, and taking the exemption on it
+        // would pair a truncating writer with no lock, which is the one
+        // combination this exists to prevent.
+        if claims_exclusively(file.metadata().await).path_ctx("stat", &path)? {
+            // The typed `fcntl::Flock` that replaces this takes *ownership*
+            // of the file and unlocks on drop, and the writer owns a
+            // `tokio::fs::File` it goes on appending to -- so the lock has to
+            // outlive the call that takes it, which is what the raw form does.
+            #[allow(deprecated)]
+            nix::fcntl::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                nix::fcntl::FlockArg::LockExclusiveNonblock,
+            )
+            .map_err(|e| {
+                OutrigError::Configuration(format!(
+                    "the network audit log {} is already owned by another \
+                     interceptor ({e}); one writer owns it, because the rollback \
+                     that keeps it a sequence of whole records truncates the file",
+                    path.display()
+                ))
+            })?;
+        }
+
+        let unwritten: AuditLosses = Arc::new(Mutex::new(BTreeMap::new()));
+        let pending: AuditPending = Arc::new(Mutex::new(BTreeMap::new()));
+        let (records, queue) = mpsc::channel(AUDIT_QUEUE);
+        // The writer owns the file and is the only thing that touches it, so
+        // no caller's cancellation can land inside a record. It ends when the
+        // last sink handle drops.
+        let writer = tokio::spawn(audit_writer(
+            file,
+            queue,
+            unwritten.clone(),
+            pending.clone(),
+        ));
+
         Ok(Self {
-            file: Arc::new(AsyncMutex::new(file)),
+            writer: Arc::new(Mutex::new(Some(writer))),
+            records: Some(records),
             session_id,
             container: String::new(),
+            generation: 0,
+            pending,
+            unwritten,
         })
+    }
+
+    /// Waits until every record queued so far has been written.
+    ///
+    /// Teardown calls this after joining an attachment's connections, which is
+    /// what makes "queued so far" mean "everything this attachment owed".
+    /// Bounded: a writer that cannot drain is reported rather than waited on
+    /// forever, since the caller is a `detach` that has to return.
+    async fn drain(&self) -> Result<()> {
+        // One deadline over both halves. Getting the marker *into* the queue
+        // is itself a wait -- the queue is bounded, and a stalled writer with
+        // every slot full never accepts it -- so timing only the answer would
+        // leave `detach` blocked here forever and never reach the resolver and
+        // nft undos behind it.
+        let Some(records) = self.records.as_ref() else {
+            return Ok(());
+        };
+        let queued = tokio::time::timeout(SHUTDOWN_GRACE, async {
+            let (done, wait) = tokio::sync::oneshot::channel();
+            if records.send(AuditJob::Drained(done)).await.is_err() {
+                // The writer is gone; nothing is still queued behind it.
+                return Ok(());
+            }
+            wait.await.map_err(|_| ())
+        })
+        .await;
+        match queued {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(OutrigError::Configuration(format!(
+                "the network audit log did not finish writing within {SHUTDOWN_GRACE:?}"
+            ))),
+        }
     }
 
     /// A handle writing to the same file whose records are stamped with
     /// `container`.
-    fn for_container(&self, container: &str) -> Self {
+    /// A handle for one attachment, keyed by a generation nothing else can
+    /// reuse.
+    ///
+    /// Keying failures by container name alone misattributes them across
+    /// generations: a drain that timed out leaves the writer still holding a
+    /// record, and a failure arriving after that would land in the slot a
+    /// *new* attachment of the same name is reading. The name is still stamped
+    /// on the records themselves; this is only about whose loss it is.
+    fn for_attachment(&self, container: &str, generation: u64) -> Self {
         Self {
             container: container.to_string(),
+            generation,
             ..self.clone()
         }
     }
 
+    #[cfg(test)]
+    fn for_container(&self, container: &str) -> Self {
+        self.for_attachment(container, 0)
+    }
+
+    /// End the writer and wait for it to finish, so nothing can record a loss
+    /// after the sweep that follows.
+    ///
+    /// Returns what went wrong if it could not be waited out; the sweep runs
+    /// either way, since a writer that will not stop is a reason to report
+    /// rather than a reason to skip collecting what it already recorded.
+    async fn close(&mut self) -> Option<OutrigError> {
+        let writer = self.writer.lock().ok().and_then(|mut w| w.take())?;
+        // Every other handle is gone by now: `shutdown` has taken the
+        // attachments, and this is the session's own. Taking the sender ends
+        // the writer's loop once its queue is empty; a record offered
+        // afterwards has nowhere to go and is reported rather than lost
+        // quietly.
+        self.records.take();
+        // Held by reference, then aborted and joined -- not moved into the
+        // timeout. Dropping a timed-out `JoinHandle` *detaches* the task, and
+        // a detached writer goes on appending and recording losses after the
+        // sweep that was supposed to be the last word on both. This is the
+        // same mistake `terminate` exists to avoid, one level down.
+        let mut writer = writer;
+        let stopped = match tokio::time::timeout(SHUTDOWN_GRACE, &mut writer).await {
+            Ok(Ok(())) => return None,
+            // It ended on its own, badly. Whatever it was holding is as lost
+            // as if it had been stopped, so the same accounting runs.
+            Ok(Err(joined)) => format!("the network audit writer ended abnormally: {joined}"),
+            Err(_) => {
+                writer.abort();
+                let _ = writer.await;
+                format!(
+                    "the network audit writer did not finish within {SHUTDOWN_GRACE:?} \
+                     and was stopped"
+                )
+            }
+        };
+        // Aborting ends the task, not the syscall. `tokio::fs` runs its writes
+        // on a blocking pool, and one already submitted completes whatever
+        // happens to the future awaiting it -- so bytes may still land, and the
+        // rollback that would have undone a partial write will not run because
+        // the task that does it is gone. The log is therefore of unknown
+        // integrity, and that is recorded where the sweep will find it rather
+        // than only described in the error returned here.
+        //
+        // Per owner and by count, from what the writer was actually holding.
+        // One synthetic entry under this sink's own name -- which this used to
+        // record -- named nobody, claimed one record however many were lost,
+        // and left every real owner unreported.
+        self.convert_pending(&stopped);
+        Some(OutrigError::Configuration(format!(
+            "{stopped}; what it still held is unaccounted for"
+        )))
+    }
+
+    /// File everything the writer accepted and never answered for as lost, by
+    /// the attachment that queued it.
+    ///
+    /// Called only once the writer is joined, so nothing can still be moving
+    /// records out of `pending` while this reads it.
+    fn convert_pending(&self, stopped: &str) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        for (who, records) in std::mem::take(&mut *pending) {
+            Self::remember_stopped(&self.unwritten, &who, records, stopped);
+        }
+    }
+
+    /// Every loss still on the books, whichever attachment incurred it.
+    ///
+    /// `shutdown`'s sweep. A detach whose drain timed out left its generation
+    /// registered rather than taking an account it knew was incomplete, so
+    /// whatever the writer reported afterwards is collected here -- once, at
+    /// the end, by the only caller that outlives every attachment.
+    fn take_every_unwritten(&self) -> Vec<OutrigError> {
+        let Ok(mut unwritten) = self.unwritten.lock() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut *unwritten)
+            .into_iter()
+            .map(
+                |((_, container), loss)| OutrigError::NetworkAuditUnwritten {
+                    container,
+                    integrity: loss.integrity.map(Box::new),
+                    records: loss.records,
+                    source: Box::new(loss.source),
+                },
+            )
+            .collect()
+    }
+
+    /// Takes the failures recorded for `container`. Called once its
+    /// connections have been joined, so everything they were going to write
+    /// has been attempted by then.
+    fn take_unwritten(&self) -> Vec<OutrigError> {
+        let Ok(mut unwritten) = self.unwritten.lock() else {
+            return Vec::new();
+        };
+        unwritten
+            .remove(&(self.generation, self.container.clone()))
+            .map(|loss| OutrigError::NetworkAuditUnwritten {
+                container: self.container.clone(),
+                integrity: loss.integrity.map(Box::new),
+                records: loss.records,
+                source: Box::new(loss.source),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Queues one record for the writer.
+    ///
+    /// The bytes never leave this task, so nothing a caller does can cut a
+    /// record in half: what gets cancelled here is the *queueing*, which
+    /// leaves a record absent rather than a line truncated. Absent is already
+    /// reported -- a connection cancelled that late is one teardown aborted,
+    /// and says so.
     async fn write(&self, record: &AuditRecord) -> Result<()> {
         let mut line = serde_json::to_vec(record)
             .map_err(|e| OutrigError::Configuration(format!("encoding network audit: {e}")))?;
         line.push(b'\n');
-        let mut file = self.file.lock().await;
-        file.write_all(&line).await?;
-        file.flush().await?;
-        Ok(())
+        let (done, written) = tokio::sync::oneshot::channel();
+        let records = self.records.as_ref().ok_or_else(|| {
+            OutrigError::Configuration("the network audit writer has stopped".to_string())
+        })?;
+        let who = (self.generation, self.container.clone());
+        // Capacity first, then the count, then the send -- and no await
+        // between the last two, which is what makes the count mean something.
+        //
+        // The queue is bounded, so offering a record can wait, and a producer
+        // cancelled in that wait used to leave its owner counted for a record
+        // the writer never saw: over-reported if the writer was later stopped,
+        // and silently dropped if it closed cleanly, which is a connection
+        // record missing from the log with nothing saying so. `reserve` is
+        // cancellation-safe -- tokio guarantees nothing was sent if it is
+        // dropped -- and the permit it hands back sends synchronously and
+        // infallibly, so the record is counted only once nothing can stop it
+        // being queued.
+        let Ok(permit) = records.reserve().await else {
+            return Err(OutrigError::Configuration(
+                "the network audit writer has stopped".to_string(),
+            ));
+        };
+        Self::enter_pending(&self.pending, &who);
+        permit.send(AuditJob::Record {
+            who: who.clone(),
+            line,
+            done,
+        });
+        // Deliberately *not* released on this error: the writer took the
+        // record and then died holding it, so it is one of the records
+        // `close` reports, under the owner that is still counted here.
+        written.await.map_err(|_| {
+            OutrigError::Configuration("the network audit writer has stopped".to_string())
+        })
+    }
+
+    fn enter_pending(pending: &Mutex<BTreeMap<AuditOwner, u64>>, who: &AuditOwner) {
+        if let Ok(mut pending) = pending.lock() {
+            *pending.entry(who.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Releases one of `who`'s counted records. The writer is the only caller:
+    /// a record is counted when nothing can stop it reaching the queue, so
+    /// from there on the writer is the only thing that can account for it.
+    fn leave_pending(pending: &Mutex<BTreeMap<AuditOwner, u64>>, who: &AuditOwner) {
+        if let Ok(mut pending) = pending.lock()
+            && let std::collections::btree_map::Entry::Occupied(mut held) =
+                pending.entry(who.clone())
+        {
+            *held.get_mut() -= 1;
+            if *held.get() == 0 {
+                held.remove();
+            }
+        }
+    }
+
+    /// Records why the log cannot be trusted for `container`, without
+    /// counting a record as lost on its own: a write that failed has already
+    /// counted itself through [`remember_unwritten`](Self::remember_unwritten),
+    /// and adding to the count here would report the same record twice.
+    fn remember_integrity(
+        unwritten: &Mutex<BTreeMap<AuditOwner, AuditLoss>>,
+        who: &AuditOwner,
+        why: &str,
+    ) {
+        if let Ok(mut unwritten) = unwritten.lock() {
+            let slot = unwritten.entry(who.clone()).or_insert_with(|| AuditLoss {
+                records: 1,
+                source: std::io::Error::other(why.to_string()).into(),
+                integrity: None,
+            });
+            // Alongside the write failure, not instead of it: one says what
+            // broke the append, the other what stopped it being undone, and a
+            // reader needs both to know the file's state.
+            slot.integrity = Some(std::io::Error::other(why.to_string()).into());
+        }
+    }
+
+    /// Records `records` losses for `who`, with the file's integrity in doubt.
+    ///
+    /// The writer stopped holding them, so which one was mid-write is not
+    /// knowable from here -- what is knowable is that the file may hold a
+    /// partial line, and that is a fact about the file rather than about one
+    /// record, so every owner that lost records is told it.
+    fn remember_stopped(
+        unwritten: &Mutex<BTreeMap<AuditOwner, AuditLoss>>,
+        who: &AuditOwner,
+        records: u64,
+        stopped: &str,
+    ) {
+        if let Ok(mut unwritten) = unwritten.lock() {
+            let slot = unwritten.entry(who.clone()).or_insert_with(|| AuditLoss {
+                records: 0,
+                source: std::io::Error::other(format!(
+                    "{stopped}, so these records were never written"
+                ))
+                .into(),
+                integrity: None,
+            });
+            slot.records = slot.records.saturating_add(records);
+            slot.integrity = Some(
+                std::io::Error::other(format!(
+                    "{stopped} with a write in flight, so the log may hold a partial \
+                     record that nothing rolled back"
+                ))
+                .into(),
+            );
+        }
+    }
+
+    fn remember_unwritten(
+        unwritten: &Mutex<BTreeMap<AuditOwner, AuditLoss>>,
+        who: &AuditOwner,
+        error: std::io::Error,
+    ) {
+        if let Ok(mut unwritten) = unwritten.lock() {
+            unwritten
+                .entry(who.clone())
+                .and_modify(|loss| loss.records = loss.records.saturating_add(1))
+                .or_insert_with(|| AuditLoss {
+                    records: 1,
+                    source: error.into(),
+                    integrity: None,
+                });
+        }
+    }
+}
+
+/// Whether this file is one the writer has to claim exclusively.
+///
+/// Only a regular file: truncation is what the claim protects, and truncation
+/// means nothing for a device or a pipe -- the tests that need every write to
+/// fail point at `/dev/full`, whose single inode they would otherwise queue
+/// on. A `stat` that *failed* is neither answer: taking the exemption on it
+/// would pair a truncating writer with no lock, which is the one combination
+/// the lock exists to prevent, so it is an error rather than a default.
+fn claims_exclusively(opened: io::Result<std::fs::Metadata>) -> io::Result<bool> {
+    opened.map(|f| f.is_file())
+}
+
+/// The one thing that writes `network.jsonl`.
+///
+/// Owning the file in a single task is what makes a record atomic: no caller's
+/// cancellation reaches the bytes, and there is exactly one writer, so no
+/// interleaving either. It runs until the last sink handle drops.
+///
+/// "Written" here means handed to the filesystem and visible to anything that
+/// reads the file. It is not `fsync`ed: the acknowledgement a producer waits
+/// for says its record is in the file, not that it would survive the host
+/// losing power. Durability would cost a sync per connection on a log that
+/// gets one record per connection, and nothing here promises it.
+async fn audit_writer(
+    mut file: tokio::fs::File,
+    mut queue: mpsc::Receiver<AuditJob>,
+    unwritten: AuditLosses,
+    pending: AuditPending,
+) {
+    // Set when the file may hold a partial record: see the rollback below.
+    // Everything after that point is refused rather than appended -- but still
+    // received, answered and counted, because a caller waiting for its record
+    // is owed an answer and a record refused is still a record lost.
+    let mut poisoned: Option<String> = None;
+    while let Some(job) = queue.recv().await {
+        let AuditJob::Record { who, line, done } = job else {
+            // A drain marker: everything queued ahead of it is written by the
+            // time this is reached, so answering is the whole job. A receiver
+            // that has given up is not an error.
+            if let AuditJob::Drained(done) = job {
+                let _ = done.send(());
+            }
+            continue;
+        };
+
+        if let Some(why) = &poisoned {
+            AuditSink::remember_unwritten(&unwritten, &who, std::io::Error::other(why.clone()));
+            AuditSink::leave_pending(&pending, &who);
+            let _ = done.send(());
+            continue;
+        }
+
+        // Where the file ended before this record. `write_all` is a retry
+        // loop, not an atomic commit: a filesystem can take a prefix and then
+        // fail with `ENOSPC`, and the prefix would make every later record
+        // unparseable. Truncating back to here is what keeps the file a
+        // sequence of whole records even when a write fails partway.
+        let before = match file.metadata().await {
+            Ok(meta) => Some(meta.len()),
+            Err(_) => None,
+        };
+        let written = async {
+            file.write_all(&line).await?;
+            file.flush().await
+        }
+        .await;
+
+        if let Err(e) = written {
+            // Rolling back is what keeps the file a sequence of whole records.
+            // When it cannot be done -- the length before the append was never
+            // read, or the truncation itself failed -- a prefix may be sitting
+            // there, and appending the next record to it would produce a line
+            // nothing can parse. There is no recovering from that by writing
+            // more, so the writer stops: every later record is reported
+            // unwritten rather than added to a file already broken.
+            // Why recovery could not be proved, kept rather than collapsed to
+            // a boolean: if no further record ever arrives, this is the only
+            // thing that will tell a reader the file may be corrupt and what
+            // stopped it being repaired.
+            let recovery = match before {
+                None => Some("the file's length before the record was never read".to_string()),
+                Some(before) => match file.set_len(before).await {
+                    Err(e) => Some(format!("truncating back to {before} failed: {e}")),
+                    Ok(()) => match file.flush().await {
+                        Err(e) => Some(format!("flushing the truncation failed: {e}")),
+                        Ok(()) => None,
+                    },
+                },
+            };
+            tracing::warn!(target: "outrig::network", "network audit write failed: {e}");
+            AuditSink::remember_unwritten(&unwritten, &who, e);
+            if let Some(why) = recovery {
+                tracing::error!(
+                    target: "outrig::network",
+                    "the network audit log may hold a partial record and cannot be \
+                     recovered ({why}); no further records will be written to it"
+                );
+                let integrity = format!(
+                    "the network audit log may hold a partial record that could not be \
+                     rolled back ({why}), so nothing further may be appended to it"
+                );
+                // Replaces the write error this record already recorded
+                // rather than counting a second loss: the same record, and
+                // this is the more useful thing to be told about it. Recorded
+                // now so a teardown that follows immediately still learns the
+                // file is suspect, even if nothing else is ever written.
+                AuditSink::remember_integrity(&unwritten, &who, &integrity);
+                poisoned = Some(integrity);
+            }
+        }
+        // Answered whatever the outcome: the producer is waiting to learn the
+        // record has been dealt with, and a failure it can read back from
+        // `take_unwritten` is dealt with. Released for the same reason -- this
+        // record has been accounted for one way or the other, so it is no
+        // longer one the writer is holding.
+        AuditSink::leave_pending(&pending, &who);
+        let _ = done.send(());
     }
 }
 
@@ -781,35 +1919,121 @@ fn zeek_uid() -> String {
     )
 }
 
+/// Accepts redirected connections and owns the ones it accepted. Holding them
+/// in a `JoinSet` rather than detaching them is what lets a detach end them:
+/// this task is joined, and it does not return until every connection it
+/// started has.
 async fn tcp_accept_loop(
     listener: TcpListener,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
     cancel: CancellationToken,
+    live: mpsc::Sender<()>,
+) {
+    // A child of the attachment's token. Connections are still cancelled when
+    // the attachment is, but the accept-failure path below can end them
+    // without reaching the DNS listener, which is a separate socket in a
+    // separate task and is still working.
+    let conn_cancel = cancel.child_token();
+    let mut conns = JoinSet::new();
+    accept_into(
+        &listener,
+        &audit,
+        &bindings,
+        &policy,
+        &cancel,
+        &conn_cancel,
+        &mut conns,
+        &live,
+    )
+    .await;
+    // Every connection watches `conn_cancel`, which by here has been cancelled
+    // either way -- directly on the accept-failure path, and through its
+    // parent on the detach path -- so their records are all written before
+    // this task, and therefore the detach joining it, returns.
+    conn_cancel.cancel();
+    while conns.join_next().await.is_some() {}
+}
+
+/// The accepting half, with its carrier passed in.
+///
+/// Split out for one reason: the claim that finished connections are taken
+/// back out of the set as they complete is only observable in the set itself,
+/// and a test cannot see one the loop owns privately. Removing the
+/// `reap_finished` call below otherwise fails nothing -- a finished task is
+/// not an alive task, so no task count notices the handles piling up.
+#[allow(clippy::too_many_arguments)]
+async fn accept_into(
+    listener: &TcpListener,
+    audit: &AuditSink,
+    bindings: &Bindings,
+    policy: &Arc<CompiledNetworkPolicy>,
+    cancel: &CancellationToken,
+    conn_cancel: &CancellationToken,
+    conns: &mut JoinSet<()>,
+    live: &mpsc::Sender<()>,
 ) {
     loop {
+        reap_finished(conns);
         tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, peer)) => {
-                        tokio::spawn(handle_tcp(
-                            stream,
-                            peer,
-                            audit.clone(),
-                            bindings.clone(),
-                            policy.clone(),
-                        ));
-                    }
+                    Ok((stream, peer)) => match original_dst(&stream) {
+                        Ok(dst) => {
+                            // The connection carries a clone of `live` for
+                            // as long as it runs, so teardown can wait every
+                            // one of them out even on the path where this
+                            // loop is aborted and its carrier dropped.
+                            let held = live.clone();
+                            let (audit, bindings) = (audit.clone(), bindings.clone());
+                            let (policy, cancel) = (policy.clone(), conn_cancel.clone());
+                            conns.spawn(async move {
+                                handle_tcp(
+                                    stream,
+                                    peer,
+                                    dst,
+                                    audit,
+                                    bindings,
+                                    policy,
+                                    cancel,
+                                )
+                                .await;
+                                drop(held);
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "outrig::network",
+                                "SO_ORIGINAL_DST failed: {e}"
+                            );
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(target: "outrig::network", "tcp accept failed: {e}");
+                        // The listener is gone, so this attachment is over.
+                        // Cancelling ends the connections it already has the
+                        // same cooperative way a detach would -- each still
+                        // writes its audit record -- rather than parking this
+                        // task on connections nothing is coming to end. The
+                        // child token, so a TCP listener failing does not take
+                        // this attachment's DNS interception down with it.
+                        conn_cancel.cancel();
                         break;
                     }
                 }
             }
         }
     }
+}
+
+/// Takes the handles of connections that have already finished out of
+/// `conns`. Without this a `JoinSet` only ever spawned into keeps one handle
+/// per connection the attachment has ever served, which is exactly the state
+/// a long-lived attachment must not accumulate.
+fn reap_finished(conns: &mut JoinSet<()>) {
+    while conns.try_join_next().is_some() {}
 }
 
 /// Whether the server on `port` is expected to write first. Sniffing such a
@@ -859,53 +2083,70 @@ struct ConnOutcome {
     bytes_rx: u64,
 }
 
+/// Bridges one accepted connection to `dst` and records it. `dst` is the
+/// original destination the redirect displaced, read from the socket by the
+/// accept loop.
 async fn handle_tcp(
     mut client: TcpStream,
     orig: SocketAddr,
+    dst: SocketAddr,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
+    cancel: CancellationToken,
 ) {
     let opened = SystemTime::now();
     let started = Instant::now();
-    let dst = match original_dst(&client) {
-        Ok(dst) => dst,
-        Err(e) => {
-            tracing::warn!(target: "outrig::network", "SO_ORIGINAL_DST failed: {e}");
-            return;
-        }
-    };
 
-    let sniffed = if server_speaks_first(dst.port()) {
-        Sniffed::default()
-    } else {
-        sniff_client_stream(&mut client).await
-    };
-    // Read after the sniff, not before: the window is up to `SNIFF_TIMEOUT`
-    // long, and a lookup the container completes inside it is evidence this
-    // connection is entitled to have weighed.
-    let resolved = resolved_names(&bindings, dst.ip());
-
+    // Seeded with what this destination earns on no evidence at all. A
+    // connection cut before its client ever spoke is recorded as exactly
+    // that: the decision its address alone earned, and no bytes -- which is
+    // the truth about it, since nothing it might have claimed was ever read
+    // and nothing was ever forwarded.
+    let mut resolved = ResolvedNames::default();
     let mut outcome = ConnOutcome {
-        decision: policy.decide(dst, &resolved, &sniffed.assertion),
-        service: sniffed.assertion.service(),
-        assertion: sniffed.assertion,
+        decision: policy.decide(dst, &resolved, &ClientAssertion::default()),
+        service: "-",
+        assertion: ClientAssertion::default(),
         bytes_tx: 0,
         bytes_rx: 0,
     };
-    if outcome.decision.action == NetworkAction::Deny {
-        let _ = client.shutdown().await;
-    } else {
-        proxy(
-            &mut client,
-            dst,
-            &sniffed.initial,
-            &resolved,
-            &policy,
-            &mut outcome,
-        )
+
+    // Cancellation cuts the connection wherever it is parked -- the sniff
+    // read, the upstream connect, the copy -- and falls through to the audit
+    // write below. That write is deliberately outside the cancelled region:
+    // a connection detach cut still owes a record of what it moved.
+    let _ = cancel
+        .run_until_cancelled(async {
+            let sniffed = if server_speaks_first(dst.port()) {
+                Sniffed::default()
+            } else {
+                sniff_client_stream(&mut client).await
+            };
+            // Read after the sniff, not before: the window is up to
+            // `SNIFF_TIMEOUT` long, and a lookup the container completes
+            // inside it is evidence this connection is entitled to have
+            // weighed.
+            resolved = resolved_names(&bindings, dst.ip());
+
+            outcome.decision = policy.decide(dst, &resolved, &sniffed.assertion);
+            outcome.service = sniffed.assertion.service();
+            outcome.assertion = sniffed.assertion;
+            if outcome.decision.action == NetworkAction::Deny {
+                let _ = client.shutdown().await;
+            } else {
+                proxy(
+                    &mut client,
+                    dst,
+                    &sniffed.initial,
+                    &resolved,
+                    &policy,
+                    &mut outcome,
+                )
+                .await;
+            }
+        })
         .await;
-    }
 
     write_audit(
         &audit,
@@ -994,23 +2235,30 @@ async fn bridge(
 ) {
     let (mut client_rx, mut client_tx) = client.split();
     let (mut upstream_rx, mut upstream_tx) = upstream.split();
-    let mut late = None;
 
-    // Counted as they move rather than at the end. `try_join!` cancels the
-    // sibling direction when one fails -- which the late-deny path does on
-    // purpose -- and a returned total dies with it, so bytes the container
-    // already sent or received would vanish from the audit record.
-    let mut bytes_tx = 0u64;
-    let mut bytes_rx = 0u64;
+    // Written through to the outcome as they happen rather than applied at
+    // the end. Three things end this copy without returning: `try_join!`
+    // cancelling the sibling direction when one fails (which the late-deny
+    // path does on purpose), one direction erroring, and a detach dropping
+    // this whole future -- and anything only applied on a clean return would
+    // erase from the record every byte the container had already moved, and
+    // the identity it turned out to be talking to.
+    let ConnOutcome {
+        assertion,
+        service,
+        decision,
+        bytes_tx,
+        bytes_rx,
+    } = outcome;
     let bridged = {
         let downstream = async {
-            copy_counting(&mut upstream_rx, &mut client_tx, &mut bytes_rx).await?;
+            copy_counting(&mut upstream_rx, &mut client_tx, bytes_rx).await?;
             let _ = client_tx.shutdown().await;
             io::Result::Ok(())
         };
         let upward = async {
             if !initial.is_empty() {
-                write_counting(&mut upstream_tx, initial, &mut bytes_tx).await?;
+                write_counting(&mut upstream_tx, initial, bytes_tx).await?;
             }
             if let Some(recheck) = recheck {
                 // Scoped so the sniff buffer is not held for the life of the
@@ -1018,16 +2266,19 @@ async fn bridge(
                 let mut buf = vec![0; SNIFF_BUFFER];
                 let n = client_rx.read(&mut buf).await?;
                 if n > 0 {
-                    let assertion = sniff_client_bytes(&buf[..n]).unwrap_or_default();
-                    let decision = recheck
-                        .policy
-                        .decide(recheck.dst, recheck.resolved, &assertion);
                     // `recheck` is only set when the sniff window closed with
                     // no assertion, so an empty one here re-derives the
                     // decision already taken and has nothing to record.
-                    if !assertion.is_empty() {
-                        let denied = decision.action == NetworkAction::Deny;
-                        late = Some((assertion, decision));
+                    let claimed = sniff_client_bytes(&buf[..n]).unwrap_or_default();
+                    if !claimed.is_empty() {
+                        let verdict =
+                            recheck
+                                .policy
+                                .decide(recheck.dst, recheck.resolved, &claimed);
+                        let denied = verdict.action == NetworkAction::Deny;
+                        *service = claimed.service();
+                        *assertion = claimed;
+                        *decision = verdict;
                         if denied {
                             return Err(io::Error::new(
                                 io::ErrorKind::PermissionDenied,
@@ -1035,25 +2286,18 @@ async fn bridge(
                             ));
                         }
                     }
-                    write_counting(&mut upstream_tx, &buf[..n], &mut bytes_tx).await?;
+                    write_counting(&mut upstream_tx, &buf[..n], bytes_tx).await?;
                 }
             }
-            copy_counting(&mut client_rx, &mut upstream_tx, &mut bytes_tx).await?;
+            copy_counting(&mut client_rx, &mut upstream_tx, bytes_tx).await?;
             let _ = upstream_tx.shutdown().await;
             io::Result::Ok(())
         };
         tokio::try_join!(downstream, upward)
     };
 
-    outcome.bytes_tx += bytes_tx;
-    outcome.bytes_rx += bytes_rx;
     if let Err(e) = bridged {
         tracing::debug!(target: "outrig::network", "tcp bridge ended with error: {e}");
-    }
-    if let Some((assertion, decision)) = late {
-        outcome.service = assertion.service();
-        outcome.assertion = assertion;
-        outcome.decision = decision;
     }
 }
 
@@ -1098,12 +2342,22 @@ async fn write_counting<W: AsyncWrite + Unpin>(
 async fn write_audit(audit: &AuditSink, event: AuditEvent) {
     let record = AuditRecord::new(&audit.session_id, &audit.container, event);
     if let Err(e) = audit.write(&record).await {
-        tracing::warn!(target: "outrig::network", "network audit write failed: {e}");
+        // Failures of the write itself are kept by the writer, which is the
+        // only thing that can see them; this is the queueing half, and a
+        // queue that will not take a record means the writer has stopped.
+        tracing::warn!(target: "outrig::network", "network audit record not queued: {e}");
     }
 }
 
-async fn dns_loop(socket: UdpSocket, bindings: Bindings, cancel: CancellationToken) {
-    let resolvers = host_resolvers();
+/// Answers the container's lookups from the host's resolvers, recording what
+/// each name validly resolved to. `resolvers` is passed in rather than read
+/// here so a caller -- and a test -- decides who this forwards to.
+async fn dns_loop(
+    socket: UdpSocket,
+    resolvers: Vec<SocketAddr>,
+    bindings: Bindings,
+    cancel: CancellationToken,
+) {
     let mut buf = vec![0u8; 4096];
     loop {
         tokio::select! {
@@ -1120,7 +2374,18 @@ async fn dns_loop(socket: UdpSocket, bindings: Bindings, cancel: CancellationTok
                     query.as_ref().map(|query| &query.question.name)
                 );
                 let socket_ref = &socket;
-                match forward_dns(&raw, query.as_ref(), &resolvers).await {
+                // A forward waits out `DNS_TIMEOUT` per resolver, which
+                // outlasts the grace a detach gives this task. Awaited bare,
+                // a detach landing mid-query would abort this task and report
+                // the abort -- a routine detach returning an error for
+                // nothing having gone wrong.
+                let Some(forwarded) = cancel
+                    .run_until_cancelled(forward_dns(&raw, query.as_ref(), &resolvers))
+                    .await
+                else {
+                    break;
+                };
+                match forwarded {
                     Ok(response) => {
                         if let Some(query) = &query
                             && dns_response_is_bindable(&response)
@@ -1269,21 +2534,241 @@ fn select_host_resolvers(
     }
 }
 
-async fn install_audit_resolv_conf(container: &Container) -> Result<()> {
-    process::run_capture_logged(
-        Cmd::new("podman")
-            .args(["exec", "--user=0:0"])
-            .arg(container.name())
-            .args(["sh", "-c"])
-            .arg(format!(
-                "printf 'nameserver {INTERCEPT_DNS_NAMESERVER}\noptions \
-                 {INTERCEPT_DNS_OPTION}\n' > /etc/resolv.conf"
-            )),
-        "podman",
-        container.transcript().as_ref(),
+/// Reads the container's current resolver, so the undo armed against the
+/// install can put exactly that state back.
+///
+/// Answers with [`RESOLV_PRESENT`] followed by the file's bytes, or with `0`
+/// and nothing else when the container has no resolver file at all. A bare
+/// `cat` could report neither: it cannot tell an absent file from an empty
+/// one, and it fails on the absent one, which would make a container that
+/// never had a resolver impossible to attach to rather than a state to put
+/// back.
+fn read_resolv_conf(pid: u32) -> Cmd {
+    nsenter_sh(pid).args([
+        "if [ -L /etc/resolv.conf ] && [ ! -e /etc/resolv.conf ]; then printf L; \
+             elif [ -e /etc/resolv.conf ]; then printf 1; cat /etc/resolv.conf; \
+             else printf 0; fi",
+    ])
+}
+
+/// The command that puts back whatever [`read_resolv_conf`] found: the file
+/// with exactly its old bytes, or its absence.
+fn restore_resolv_conf(pid: u32, marker: &str, snapshot: Vec<u8>) -> Cmd {
+    match snapshot.split_first() {
+        Some((&RESOLV_PRESENT, original)) => write_resolv_conf(pid, marker, original.to_vec()),
+        _ => remove_resolv_conf(pid, marker),
+    }
+}
+
+/// The inverse of an absent resolver.
+///
+/// Reachable only for a container that has no resolver file at all. Podman
+/// bind-mounts one, and `rm` on a bind mount fails with `EBUSY` -- checked
+/// against podman 4.9.3 -- so for a container it created the snapshot says
+/// present and this is never the undo that gets armed. Where it is armed the
+/// file is a real one and the removal works; where it somehow is not, the
+/// failure is reported and the undo stays armed rather than being dropped.
+fn remove_resolv_conf(pid: u32, marker: &str) -> Cmd {
+    let installed = intercepted_resolv(marker);
+    let bytes = installed.len().to_string();
+    nsenter_sh(pid)
+        .args([REMOVE_RESOLV_SCRIPT, "_", ""])
+        .arg(installed)
+        .arg(bytes)
+}
+
+/// Points the resolver at the DNS listener.
+///
+/// Unguarded, unlike the undos: this is the change, and what it is replacing
+/// is whatever the snapshot just read.
+fn install_resolv_conf(pid: u32, marker: &str) -> Cmd {
+    nsenter_sh(pid)
+        .args(["printf '%s' \"$1\" > /etc/resolv.conf", "_"])
+        .arg(intercepted_resolv(marker))
+}
+
+/// Writes the bytes handed in as `$1` to the resolver file.
+///
+/// They ride in as an argument rather than interpolated into the script, so
+/// nothing between the snapshot and the file interprets them -- no quoting, no
+/// escape processing -- and `printf '%s'` adds no newline of its own. What an
+/// argument cannot carry is a NUL, and it cannot carry more than
+/// `MAX_ARG_STRLEN`; [`checked_resolv_snapshot`] refuses both before anything
+/// is mutated, because a restore that cannot be spawned is not a restore.
+///
+/// A `const` so a test can run this exact script rather than a paraphrase: the
+/// claim is that it reproduces arbitrary bytes, and a copy proves that about
+/// the copy.
+/// Acts only on a resolver carrying this attach's own marker.
+///
+/// Pure shell, deliberately. The obvious spelling is `printf ... | cmp -s -`,
+/// and `cmp` is not something a container has to have: a missing one exits
+/// 127, which `|| exit 0` reads as "not ours" -- so the undo would skip
+/// silently and `detach` would report success over a resolver still pointing
+/// at a stopped listener. `case` and `cat` are what the snapshot already
+/// needs, so this adds no dependency of its own.
+///
+/// A read that *fails* is not a mismatch. Discarding `cat`'s status made an
+/// unreadable resolver look like one that was never this attach's: the undo
+/// exited zero, teardown struck it off, and `detach` reported success over a
+/// container still pointing at a listener that has stopped. An absent file is
+/// the one case that legitimately owes nothing, and it is checked separately
+/// so it cannot be confused with a file that is there and could not be read.
+///
+/// The whole installed text, not just the marker it carries. Containment of
+/// the marker answers "did this attach install this", but not "is this still
+/// what it installed" -- a resolver manager that changed the nameservers and
+/// left the comment alone would have had its work discarded. The marker is
+/// still what makes the text unique to this attachment; comparing all of it is
+/// what keeps a later legitimate change.
+///
+/// Both sides go through command substitution with a `.` appended inside it.
+/// Command substitution strips trailing newlines, so without that a file that
+/// gained or lost a terminal newline compared equal to one that had not --
+/// byte-distinct state the undo would then have overwritten, which is the
+/// opposite of the contract. The sentinel is the last thing in each
+/// substitution, so nothing before it is stripped, and the comparison needs no
+/// external tool.
+///
+/// The byte count is checked where `wc` exists, because a shell variable is
+/// not a byte string: implementations differ on what command substitution does
+/// with an embedded NUL, and one that drops them would let a resolver with a
+/// NUL added after installation compare equal to one without. `wc -c` reads
+/// the file rather than a variable, and `-eq` rather than `=` because some
+/// `wc`s pad their output.
+///
+/// Guarded by `command -v`, a builtin, and deliberately so. A container need
+/// not ship `wc`, and an unguarded call exits 127 -- which `|| exit 0` reads
+/// as "not this attach's", retiring the undo while `detach` reports success
+/// over a resolver still pointing at a stopped listener. That is the `cmp`
+/// mistake again, and it is worse than the gap it closes: without `wc` the
+/// text comparison still stands, and what is lost is only a NUL inserted after
+/// installation on a shell that drops NULs in substitution.
+const RESTORE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; fi; \
+     current=$(cat /etc/resolv.conf && printf .) || exit 1; \
+     [ \"$current\" = \"$(printf '%s.' \"$2\")\" ] || exit 0; \
+     if command -v wc > /dev/null 2>&1; then \
+     [ \"$(wc -c < /etc/resolv.conf)\" -eq \"$3\" ] || exit 0; fi; \
+     printf '%s' \"$1\" > /etc/resolv.conf";
+
+/// The inverse of an absent resolver, under the same marker.
+const REMOVE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; fi; \
+     current=$(cat /etc/resolv.conf && printf .) || exit 1; \
+     [ \"$current\" = \"$(printf '%s.' \"$2\")\" ] || exit 0; \
+     if command -v wc > /dev/null 2>&1; then \
+     [ \"$(wc -c < /etc/resolv.conf)\" -eq \"$3\" ] || exit 0; fi; \
+     rm -f /etc/resolv.conf";
+
+/// What [`install_resolv_conf`] writes, and therefore what an undo expects to
+/// find before it acts.
+///
+/// The trailing comment carries `marker`, which is [`attach_nonce`]'s and
+/// *not* the table's name -- the two are drawn independently, and
+/// `a_resolver_marker_never_names_the_table_it_was_attached_with` is there to
+/// keep them that way. This file becomes readable inside the container the
+/// moment it is written, which is before the nft table exists; a marker that
+/// named the table would hand anyone in that namespace the one thing they
+/// need to create that table first and make `create table` fail.
+///
+/// Per attach rather than per outrig, because the text is otherwise identical
+/// for every attachment: a pid reused by *another* outrig container would
+/// satisfy a shared sentinel and get the first container's resolver written
+/// into it. Resolver files ignore `#` lines, so this costs the container
+/// nothing.
+fn intercepted_resolv(marker: &str) -> String {
+    format!(
+        "nameserver {INTERCEPT_DNS_NAMESERVER}\noptions {INTERCEPT_DNS_OPTION}\n{}\n",
+        resolv_marker(marker)
     )
-    .await?;
-    Ok(())
+}
+
+/// The line that says which attach installed a resolver.
+///
+/// Carries a nonce of its own, deliberately *not* the nft table's name. The
+/// resolver is written before the table is created, so whatever is in it is
+/// readable inside the container before the table exists -- and a name an
+/// actor in that namespace can read is a name it can create first, making
+/// outrig's `create table` fail and its rollback delete a table it never made.
+/// Two independent nonces mean publishing one tells nobody anything about the
+/// other. Resolver files ignore `#` lines, so this costs the container
+/// nothing.
+fn resolv_marker(marker: &str) -> String {
+    format!("# {marker}")
+}
+
+/// Reads the probe's verdict and refuses every resolver state this could not
+/// faithfully put back.
+///
+/// Refusing here is the whole point. Each of these describes a container whose
+/// resolver an undo could not restore, and discovering that after the resolver
+/// had already been replaced would leave exactly the state this task exists to
+/// prevent: loopback DNS with nothing listening and no way back.
+fn checked_resolv_snapshot(container: &str, snapshot: Vec<u8>) -> Result<Vec<u8>> {
+    let refuse = |why: String| {
+        Err(OutrigError::Configuration(format!(
+            "container {container:?} cannot be network-intercepted: {why}"
+        )))
+    };
+    match snapshot.split_first() {
+        Some((&RESOLV_DANGLING, _)) => refuse(
+            "/etc/resolv.conf is a symbolic link to a file that does not exist. \
+             Installing would follow the link and create its target, and undoing \
+             that would remove the link itself"
+                .to_string(),
+        ),
+        Some((&RESOLV_PRESENT, original)) if original.contains(&0) => refuse(
+            "/etc/resolv.conf contains a NUL byte, which cannot be carried in the \
+             argument a restore would put it back with"
+                .to_string(),
+        ),
+        Some((&RESOLV_PRESENT, original)) if original.len() > MAX_RESOLV_SNAPSHOT => {
+            refuse(format!(
+                "/etc/resolv.conf is {} bytes, past the {MAX_RESOLV_SNAPSHOT} a \
+                 restore can carry in one argument",
+                original.len()
+            ))
+        }
+        Some((&RESOLV_PRESENT, _)) => Ok(snapshot),
+        Some((_, _)) => Ok(snapshot),
+        None => refuse("reading /etc/resolv.conf produced no verdict".to_string()),
+    }
+}
+
+/// Puts `content` back, but only if the resolver still holds what this attach
+/// installed.
+///
+/// The guard is what keeps a delayed undo honest. These commands name a
+/// namespace by pid, and the kernel hands pids out again: an undo that runs
+/// after its container exited -- because the command before it in the chain
+/// was slow, or because a destructor fired late -- would otherwise write one
+/// container's resolver into whatever holds that pid now. Checking the content
+/// first also means an undo will not clobber a resolver that something else
+/// legitimately changed after interception was installed.
+fn write_resolv_conf(pid: u32, marker: &str, content: Vec<u8>) -> Cmd {
+    let installed = intercepted_resolv(marker);
+    let bytes = installed.len().to_string();
+    nsenter_sh(pid)
+        .args([RESTORE_RESOLV_SCRIPT, "_"])
+        .arg(OsString::from_vec(content))
+        .arg(installed)
+        .arg(bytes)
+}
+
+/// A shell inside the container's user and mount namespaces, run as a process
+/// this host owns.
+///
+/// Deliberately not `podman exec`. That starts the shell under conmon, so
+/// killing the client -- which is all a dropped future can do -- leaves the
+/// writer running: measured against podman 4.9.3, a `podman exec` whose client
+/// was killed went on to complete its write two seconds later, and a rollback
+/// racing that loses. `nsenter` execs the shell directly, so it *is* the
+/// process this owns, and killing it kills the writer -- which is what carries
+/// [`crate::process::Owned`]'s guarantee across the container boundary.
+fn nsenter_sh(pid: u32) -> Cmd {
+    Cmd::new("nsenter")
+        .arg("-t")
+        .arg(pid.to_string())
+        .args(["-U", "-m", "--", "sh", "-c"])
 }
 
 fn require_tool(name: &str) -> Result<()> {
@@ -1357,18 +2842,82 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
     );
 }
 
-async fn apply_nft_rules(cleanup: &Cleanup, tcp_port: u16, dns_port: u16) -> Result<()> {
-    let mut file = tempfile::NamedTempFile::new()?;
-    file.write_all(nft_rules(&cleanup.table, tcp_port, dns_port).as_bytes())?;
-    file.as_file_mut().sync_all()?;
+fn delete_nft_table(pid: u32, table: &str) -> Cmd {
+    nsenter_nft(pid)
+        .args(["delete", "table", "inet"])
+        .arg(table)
+}
 
-    process::run_capture_logged(
-        nsenter_nft(cleanup.pid).arg("-f").arg(file.path()),
-        "network",
-        cleanup.transcript.as_ref(),
-    )
-    .await?;
-    Ok(())
+/// Delete the table the kernel gave `handle` to, and nothing else.
+///
+/// One selector, because the handle is exact where it is used: nftables draws
+/// table handles from a counter per network namespace and never hands one out
+/// twice, so within a namespace a handle names the table that transaction
+/// created or it names nothing. Measured against nft 1.0.9 -- create, delete
+/// and create again gives 1, 2, 3, and a `flush ruleset` in between does not
+/// send it back to 1 -- so a table deleted and recreated under this attach's
+/// name does not answer to the handle its predecessor had.
+///
+/// "Within a namespace" is [`Rollback::same_namespace`]'s job, checked before
+/// this is issued. Pairing this with a name check instead -- `list table inet
+/// <name> ; delete table inet handle <h>`, which is what this used to do --
+/// only looks like it binds the two: the list is a separate command whose
+/// success says the name resolves *somewhere* in the namespace, not that it
+/// resolves to the table being deleted. In a namespace that was not this
+/// attach's, both could resolve to different tables and the delete would take
+/// the wrong one.
+fn delete_nft_table_by_handle(pid: u32, netns: u64, handle: u64) -> Cmd {
+    // Checked from *inside*, against the namespace this process actually
+    // landed in, because a check made before entering is a different question
+    // from the one that matters. `nsenter -t <pid>` resolves the pid when it
+    // runs, and a pid checked and then handed to another container between
+    // the check and the exec would carry this undo into a namespace where the
+    // handle names a stranger's table. A process cannot be moved between
+    // namespaces by anyone else, so what `/proc/self/ns/net` reads back here
+    // is what the `nft` that follows it will act in: the check and the action
+    // are bound by being in the same process, which no ordering of the two
+    // commands could achieve.
+    //
+    // The shell, `readlink` and `nft` are the *host's*: only the user and
+    // network namespaces are entered, not the mount namespace, so this asks
+    // nothing of the container's image.
+    Cmd::new("nsenter")
+        .arg("-t")
+        .arg(pid.to_string())
+        .args(["-U", "-n", "--", "sh", "-c"])
+        .arg(NFT_DELETE_IN_NAMESPACE)
+        .arg("_")
+        .arg(format!("net:[{netns}]"))
+        .arg(handle.to_string())
+}
+
+/// Delete the table at `$2`, but only while the namespace this landed in is
+/// the one named by `$1`. Exits zero without acting when it is not: a
+/// namespace that is not the one the undo was armed against owes it nothing,
+/// and acting there is worse than not acting at all.
+///
+/// Run as `sh -c <script> _ <namespace> <handle>`, so `_` is `$0` and the two
+/// arguments are `$1` and `$2`.
+const NFT_DELETE_IN_NAMESPACE: &str = "[ \"$(readlink /proc/self/ns/net)\" = \"$1\" ] || exit 0; \
+     exec nft delete table inet handle \"$2\"";
+
+/// The handle nft reports for `table`, from either the echo of the transaction
+/// that created it (`create table inet <name> # handle 3`) or a later listing
+/// of it (`table inet <name> { # handle 3`).
+///
+/// Matched on the name as a whole token, so a table whose name merely starts
+/// the same is not mistaken for this one.
+fn table_handle_in(output: &[u8], table: &str) -> Option<u64> {
+    let output = std::str::from_utf8(output).ok()?;
+    output.lines().find_map(|line| {
+        let (named, handle) = line.split_once("# handle ")?;
+        let tokens: Vec<&str> = named.split_whitespace().collect();
+        tokens
+            .windows(3)
+            .any(|w| w == ["table", "inet", table])
+            .then(|| handle.split_whitespace().next()?.parse().ok())
+            .flatten()
+    })
 }
 
 fn nsenter_nft(pid: u32) -> Cmd {
@@ -1378,6 +2927,26 @@ fn nsenter_nft(pid: u32) -> Cmd {
         .args(["-U", "-n", "nft"])
 }
 
+/// A value for one attach that nothing else can have chosen.
+fn attach_nonce() -> String {
+    let mut nonce = [0u8; 8];
+    rand::rng().fill_bytes(&mut nonce);
+    format!("outrig_{:016x}", u64::from_ne_bytes(nonce))
+}
+
+/// The redirect table's name, unique to one attach.
+///
+/// The session-derived part keeps it recognizable -- a sweeper, an operator,
+/// and the e2e tests all look for the `outrig_` prefix -- and the random tail
+/// is what makes deleting it safe. A deterministic name is a name something
+/// else can hold: a stale table left by a crashed run of the same session, an
+/// operator's own, or one another actor creates in the same namespace between
+/// a check and an apply. Each turns the undo into a command that destroys
+/// state this attach never made, and no preflight check closes the last case,
+/// because the window is exactly between the check and the create.
+///
+/// A name nothing else could have chosen removes the question rather than
+/// narrowing it: a table by this name is one this attach created.
 fn nft_table_name(session_id: &str) -> String {
     let suffix: String = session_id
         .chars()
@@ -1389,13 +2958,16 @@ fn nft_table_name(session_id: &str) -> String {
             }
         })
         .collect();
-    format!("outrig_{suffix}")
+    let mut nonce = [0u8; 8];
+    rand::rng().fill_bytes(&mut nonce);
+    let nonce = u64::from_ne_bytes(nonce);
+    format!("outrig_{suffix}_{nonce:016x}")
 }
 
 fn nft_rules(table: &str, tcp_port: u16, dns_port: u16) -> String {
     format!(
         "\
-table inet {table} {{
+create table inet {table} {{
   chain output {{
     type nat hook output priority dstnat; policy accept;
     ip daddr 127.0.0.0/8 return
@@ -1850,6 +3422,7 @@ fn dns_label(bytes: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt as _;
 
     fn compiled(policy: NetworkPolicy) -> CompiledNetworkPolicy {
         CompiledNetworkPolicy::new(policy).expect("compile policy")
@@ -2017,10 +3590,2458 @@ mod tests {
         format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
     }
 
+    /// The resolver the fake container is holding before attach touches it.
+    /// The apostrophe is load-bearing: it is the one byte that can end a
+    /// single-quoted shell string, so a restore that mishandles it is a
+    /// restore that does not put the file back.
+    const ORIGINAL_RESOLV: &str = "nameserver 10.0.2.3\nsearch it's.test\n";
+
+    /// The handle [`FakeRunner`] says nft assigned the table it created.
+    const FAKE_HANDLE: u64 = 7;
+
+    /// The `run` seam under test: records every command it is handed and does
+    /// whatever the injected plan says that command should do. This is what
+    /// lets the ordering, an nft apply that fails, and a cancellation landing
+    /// mid-mutation all be exercised with no container, no root and no
+    /// `podman` anywhere.
+    #[derive(Default)]
+    struct FakeRunner {
+        ran: Mutex<Vec<String>>,
+        /// Fragment of a rendered command that should fail instead of run.
+        fail_on: Option<&'static str>,
+        /// Fragment of a rendered command that should never complete, which
+        /// is how a cancellation is aimed at one mutation in particular.
+        hang_on: Option<&'static str>,
+        /// What nft answers an apply with, in place of the well-formed echo.
+        /// For the outputs an attach cannot read a handle out of.
+        echo: Option<Vec<u8>>,
+    }
+
+    impl FakeRunner {
+        async fn run(&self, cmd: Cmd) -> Result<Vec<u8>> {
+            let rendered = cmd.render();
+            self.ran
+                .lock()
+                .expect("fake runner log")
+                .push(rendered.clone());
+            if self.hang_on.is_some_and(|needle| rendered.contains(needle)) {
+                std::future::pending::<()>().await;
+            }
+            if self.fail_on.is_some_and(|needle| rendered.contains(needle)) {
+                return Err(OutrigError::Configuration(format!(
+                    "injected failure: {rendered}"
+                )));
+            }
+            // nft answers an `--echo --handle` apply with what it committed;
+            // every other command here is a resolver read, whose answer is the
+            // snapshot. Without this the tests would exercise only the
+            // unnarrowed undo, which is the fallback rather than the rule.
+            if rendered.contains("--echo --handle") {
+                return Ok(self.echo.clone().unwrap_or_else(|| {
+                    format!(
+                        "create table inet {} # handle {FAKE_HANDLE}\n",
+                        target().table
+                    )
+                    .into_bytes()
+                }));
+            }
+            Ok(present_snapshot())
+        }
+
+        fn ran(&self) -> Vec<String> {
+            self.ran.lock().expect("fake runner log").clone()
+        }
+    }
+
+    /// What [`read_resolv_conf`] answers for a container holding
+    /// [`ORIGINAL_RESOLV`].
+    fn present_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![RESOLV_PRESENT];
+        snapshot.extend_from_slice(ORIGINAL_RESOLV.as_bytes());
+        snapshot
+    }
+
+    /// A target whose pid is this test process: `Rollback` asks whether the
+    /// container is still alive before undoing anything, and this one is.
+    fn target() -> Target {
+        Target {
+            name: "outrig-test".to_string(),
+            pid: std::process::id(),
+            table: "outrig_test".to_string(),
+            marker: "outrig_marker".to_string(),
+            dns_preconfigured: false,
+        }
+    }
+
+    /// R5's mechanism, on the real command path. Every other teardown test
+    /// injects failure at the runner, which means none of them would notice
+    /// `run_step` losing its exit-status check -- and a teardown that quietly
+    /// failed is the thing this reports.
+    #[tokio::test]
+    async fn a_non_zero_undo_reaches_the_caller() {
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 3"));
+
+        let run = |cmd: Cmd| run_step(cmd, None);
+        let failures = rollback.undo_now(&run).await;
+
+        assert_eq!(failures.len(), 1, "a non-zero undo is a failure");
+        assert!(
+            matches!(
+                failures[0],
+                OutrigError::Process {
+                    exit_code: Some(3),
+                    ..
+                }
+            ),
+            "and it arrives typed, carrying the status: {:?}",
+            failures[0]
+        );
+    }
+
+    /// The obligations are independent, so one failing is no reason to skip
+    /// the rest -- and what failed has to reach the caller naming its
+    /// container, not a log line.
+    #[tokio::test]
+    async fn every_undo_runs_after_one_fails_and_the_failures_are_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reached = dir.path().join("reached");
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        // Armed first, so it is discharged last: reaching it at all is the
+        // claim.
+        rollback.arm(touch(&reached));
+        rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 1"));
+
+        let run = |cmd: Cmd| run_step(cmd, None);
+        let failures = rollback.undo_now(&run).await;
+
+        assert!(reached.exists(), "a failed undo must not cancel the rest");
+        assert_eq!(failures.len(), 1);
+
+        let err = teardown_result(
+            failures
+                .into_iter()
+                .map(|source| NetworkTeardownCause {
+                    container: "outrig-a".to_string(),
+                    source: Box::new(source),
+                })
+                .collect(),
+        )
+        .expect_err("a failed undo has to reach the caller");
+        assert!(
+            err.to_string().contains("outrig-a"),
+            "named by the container it belongs to: {err}"
+        );
+    }
+
+    /// The restore script reproduces whatever that container happened to have.
+    /// The bytes travel as `$1` so no quoting rule stands between them and the
+    /// file, but the script still has to be right: `printf '%s'` and not
+    /// `echo`, no newline of its own, and the redirect where it belongs.
+    #[tokio::test]
+    async fn the_restore_script_reproduces_arbitrary_bytes() {
+        const NASTY: &[u8] =
+            b"nameserver 10.0.0.1 # ' \"$(touch pwned)\" `id` \\ '' \n%s%d\noptions x";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        // The guard has to pass for the write to happen at all, so the file
+        // starts out holding what an install would have put there.
+        std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
+
+        // The production script, with only its redirect retargeted.
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+        run_step(
+            Cmd::new("/bin/sh")
+                .args(["-c"])
+                .arg(script)
+                .arg("_")
+                .arg(OsString::from_vec(NASTY.to_vec()))
+                .arg(intercepted_resolv("outrig_test"))
+                .arg(intercepted_resolv("outrig_test").len().to_string()),
+            None,
+        )
+        .await
+        .expect("the restore script must run");
+
+        assert_eq!(std::fs::read(&target).expect("restored").as_slice(), NASTY);
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "the snapshot is data, and must never be evaluated"
+        );
+    }
+
+    /// A command whose only effect is a file a test can wait for.
+    fn touch(path: &Path) -> Cmd {
+        Cmd::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("touch {}", path.display()))
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} should have been created by a detached undo",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Attach mutates, and detach undoes, in opposite orders: the redirect
+    /// table goes before the resolver that was pointed at it.
+    #[tokio::test]
+    async fn interception_is_undone_in_the_reverse_of_the_order_it_was_installed() {
+        let fake = FakeRunner::default();
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+
+        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect("install interception");
+        let failures = rollback.undo_now(&run).await;
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        let ran = fake.ran();
+        assert_eq!(ran.len(), 5, "{ran:#?}");
+        assert!(ran[0].contains("cat /etc/resolv.conf"), "{ran:#?}");
+        assert!(ran[1].contains("nameserver 127.0.0.1"), "{ran:#?}");
+        assert!(ran[2].contains("nft --echo --handle -f"), "{ran:#?}");
+        assert!(
+            ran[3].contains("delete table inet handle") && ran[3].contains("nsenter"),
+            "{ran:#?}"
+        );
+        assert!(
+            ran[3].contains(&FAKE_HANDLE.to_string()),
+            "the handle travels as an argument: {ran:#?}"
+        );
+        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
+        assert!(rollback.armed().is_empty(), "{:#?}", rollback.armed());
+    }
+
+    /// One connection's worth of audit input, for the tests that care about
+    /// whether the write landed rather than what it said.
+    fn audit_event() -> AuditEvent {
+        AuditEvent {
+            opened: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            duration: Duration::from_millis(1),
+            orig: addr("10.0.2.100:50123"),
+            dst: addr("93.184.216.34:443"),
+            resolved: ResolvedNames::default(),
+            assertion: ClientAssertion::default(),
+            service: "-",
+            bytes_tx: 0,
+            bytes_rx: 0,
+            decision: PolicyDecision::allow_default(),
+        }
+    }
+
+    /// A record the sink promised and could not write. Joining a connection's
+    /// task is what `detach` treats as proof its record landed, so a write
+    /// that failed has to be kept rather than logged -- otherwise `detach`
+    /// returns `Ok(())` with the record simply missing.
+    #[tokio::test]
+    async fn an_audit_record_that_could_not_be_written_is_reported() {
+        // `/dev/full` opens like any file and fails every write with ENOSPC,
+        // which is the shape of the audit file's storage filling up after the
+        // sink was opened.
+        let sink = AuditSink::open(PathBuf::from("/dev/full"), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let container = sink.for_container("outrig-a");
+
+        write_audit(&container, audit_event()).await;
+
+        let kept = container.take_unwritten();
+        assert_eq!(kept.len(), 1, "the failed write must be kept: {kept:#?}");
+        assert!(
+            matches!(
+                kept[0],
+                OutrigError::NetworkAuditUnwritten { records: 1, .. }
+            ),
+            "{kept:#?}"
+        );
+        assert!(container.take_unwritten().is_empty(), "and taken only once");
+        assert!(
+            sink.take_unwritten().is_empty(),
+            "and attributed to the container whose record it was"
+        );
+    }
+
+    /// A record is whole or absent, never half. Teardown aborts a connection
+    /// that outstays its grace, and an abort lands at an await point -- so a
+    /// record written through async I/O can be cut between chunks, leaving a
+    /// partial line that makes every record after it unparseable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_writer_does_not_leave_half_a_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NETWORK_LOG);
+        let sink = AuditSink::open(path.clone(), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let container = sink.for_container("outrig-a");
+
+        // A record far larger than any single write buffer, so a cancellable
+        // write would have to be more than one chunk.
+        let mut event = audit_event();
+        event.resolved = (0..4096)
+            .map(|n| format!("name{n}.example.test"))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect();
+
+        let mut writing = JoinSet::new();
+        writing.spawn(async move {
+            write_audit(&container, event).await;
+        });
+        tokio::task::yield_now().await;
+        writing.abort_all();
+        while writing.join_next().await.is_some() {}
+
+        // A second record, written normally. Without it the assertion below
+        // could pass on an empty file, since the abort may land before the
+        // write is ever reached; with it there is always a record that a torn
+        // prefix ahead of it would make unparseable.
+        write_audit(&sink.for_container("outrig-b"), audit_event()).await;
+
+        let text = std::fs::read_to_string(&path).expect("read audit log");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(!lines.is_empty(), "the second record should be on disk");
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("every line in the audit log must be a whole record");
+        }
+    }
+
+    /// A `stat` that failed is not an answer, and must not be read as one.
+    /// Treating it like a device -- which is what "not a regular file" would
+    /// mean -- spawns a writer that truncates with nothing claiming the file,
+    /// which is the pairing the claim exists to prevent.
+    #[test]
+    fn a_file_this_cannot_identify_is_not_taken_for_a_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NETWORK_LOG);
+        std::fs::write(&path, b"").expect("create");
+
+        assert!(
+            claims_exclusively(std::fs::metadata(&path)).expect("a readable file"),
+            "a regular file is claimed"
+        );
+        assert!(
+            !claims_exclusively(std::fs::metadata("/dev/full")).expect("a readable device"),
+            "and a device is not: there is no truncation to protect"
+        );
+        assert!(
+            claims_exclusively(Err(io::Error::from(io::ErrorKind::PermissionDenied))).is_err(),
+            "and a file this could not identify is neither"
+        );
+    }
+
+    /// One writer owns the log, and a second is refused rather than allowed to
+    /// destroy the first's records. The writer's rollback truncates the file
+    /// back to where a failed record began, and `ftruncate` acts on the inode:
+    /// a second writer's fully written, already-acknowledged record sitting
+    /// past that mark goes with it, and its owner reports a clean teardown.
+    #[tokio::test]
+    async fn a_second_writer_for_one_log_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NETWORK_LOG);
+
+        let mut first = AuditSink::open(path.clone(), "sid-1".to_string())
+            .await
+            .expect("the first owns it");
+
+        let refused = AuditSink::open(path.clone(), "sid-2".to_string())
+            .await
+            .expect_err("a second writer for the same file is refused");
+        assert!(
+            refused.to_string().contains("already owned"),
+            "and says why: {refused}"
+        );
+
+        // Released with the writer, so the next session gets it. Waited for
+        // rather than asserted at once: `tokio::fs::File` hands its close to
+        // the blocking pool, so the descriptor -- and the lock the kernel ties
+        // to it -- goes a moment after the task holding it has ended.
+        first.close().await;
+        drop(first);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            match AuditSink::open(path.clone(), "sid-3".to_string()).await {
+                Ok(_) => break,
+                Err(e) => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the lock has to go with the writer that held it: {e}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A connection outliving the abort is reported as itself, not as the
+    /// abort. The two say different things -- "the loops had to be stopped"
+    /// and "a bridge is still running after that" -- and both windows can
+    /// expire in one teardown, which put the same variant in the causes twice
+    /// and left the worse of the two unreadable.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_outlives_the_abort_is_reported_as_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Held for the whole teardown, which is what a connection still
+        // running looks like from the attachment's side.
+        let (live, idle) = mpsc::channel(1);
+
+        let causes = teardown_attachment(
+            "outrig-test",
+            Attachment {
+                cancel: CancellationToken::new(),
+                // Nothing to stop: what is under test is the wait *after*
+                // that, so the abort window must not be the one that expires.
+                tasks: JoinSet::new(),
+                idle,
+                rollback: Rollback::new(std::process::id()).expect("a namespace"),
+                transcript: None,
+                audit: audit_sink(dir.path()).await,
+            },
+        )
+        .await;
+
+        let reported: Vec<String> = causes.iter().map(|c| c.source.to_string()).collect();
+        let unfinished = reported
+            .iter()
+            .find(|r| r.contains("still running"))
+            .unwrap_or_else(|| {
+                panic!("a connection outliving the abort has to be said: {reported:#?}")
+            });
+        // Read end to end, not by a fragment: a message assembled across
+        // source lines carries the gap between them, and an assertion that
+        // stops before the gap passes over it.
+        assert!(
+            unfinished.starts_with("connections were still running")
+                && unfinished.ends_with("after this attachment's tasks were stopped"),
+            "the whole message has to read as one: {unfinished:?}"
+        );
+        assert!(
+            !unfinished.contains("  "),
+            "and reach a reader without the source's indentation in it: {unfinished:?}"
+        );
+        assert!(
+            !reported.iter().any(|r| r.contains("were aborted")),
+            "and not as the abort, which did not happen here: {reported:#?}"
+        );
+        drop(live);
+    }
+
+    /// Teardown waits the connections out even when the accept loop had to be
+    /// aborted. Aborting drops the set it kept them in, and dropping a
+    /// `JoinSet` asks for an abort without waiting for it -- so a connection
+    /// being polled elsewhere outlived the `detach` that had declared it over
+    /// and could still queue a record behind the drain marker.
+    #[tokio::test]
+    async fn a_connection_outliving_an_aborted_accept_loop_is_still_waited_out() {
+        // Stands in for the carrier the accept loop owns: the loop is the
+        // thing that gets aborted, and what it held goes with it.
+        let (live, mut idle) = mpsc::channel::<()>(1);
+        let held = live.clone();
+        drop(live);
+        let connection = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+
+        // The receiver answers when the last clone is gone, and not before.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), idle.recv())
+                .await
+                .is_err(),
+            "a connection still running is not an idle attachment"
+        );
+        assert!(
+            tokio::time::timeout(SHUTDOWN_GRACE, idle.recv())
+                .await
+                .is_ok_and(|last| last.is_none()),
+            "and the wait ends when it finishes"
+        );
+        connection.await.expect("the connection ends");
+    }
+
+    /// A drain has to come back even when the writer is stuck and the queue
+    /// behind it is full. Timing only the acknowledgement leaves `detach`
+    /// parked on getting the marker *into* a queue with no free slot, so it
+    /// never reports the timeout and never reaches the resolver and nft undos
+    /// queued behind it.
+    #[tokio::test]
+    async fn a_drain_gives_up_on_a_stalled_writer_with_a_full_queue() {
+        // A sink whose writer never runs: the receiver is held here and never
+        // read, which is what a stalled writer looks like from this side with
+        // none of the timing a real stall would need.
+        let (records, _stalled) = mpsc::channel(AUDIT_QUEUE);
+        let sink = AuditSink {
+            writer: Arc::new(Mutex::new(None)),
+            records: Some(records),
+            session_id: "sid-1".to_string(),
+            container: "outrig-a".to_string(),
+            generation: 1,
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        for _ in 0..AUDIT_QUEUE {
+            let (done, _) = tokio::sync::oneshot::channel();
+            sink.records
+                .as_ref()
+                .expect("open")
+                .send(AuditJob::Record {
+                    who: (1, "outrig-a".to_string()),
+                    line: b"{}\n".to_vec(),
+                    done,
+                })
+                .await
+                .expect("fill the queue");
+        }
+        assert_eq!(
+            sink.records.as_ref().expect("open").capacity(),
+            0,
+            "the queue has to be full"
+        );
+
+        // Bounded, so an implementation that only times the acknowledgement
+        // fails here as an assertion rather than hanging the suite.
+        let drained = tokio::time::timeout(SHUTDOWN_GRACE * 3, sink.drain())
+            .await
+            .expect("the drain has to give up on its own deadline");
+
+        assert!(drained.is_err(), "a stalled writer must not drain cleanly");
+    }
+
+    /// What broke the append and what stopped it being undone are different
+    /// facts, and a reader needs both: the first says which record was lost,
+    /// the second says whether the file can still be trusted.
+    #[tokio::test]
+    async fn an_audit_loss_carries_both_its_cause_and_its_integrity() {
+        let sink = AuditSink::open(PathBuf::from("/dev/full"), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let container = sink.for_attachment("outrig-a", 1);
+
+        write_audit(&container, audit_event()).await;
+
+        let kept = container.take_unwritten();
+        assert_eq!(kept.len(), 1, "{kept:#?}");
+        let OutrigError::NetworkAuditUnwritten {
+            source, integrity, ..
+        } = &kept[0]
+        else {
+            panic!("expected an audit loss, got {kept:#?}");
+        };
+        assert!(
+            integrity.is_some(),
+            "a rollback that could not be proved has to be reported: {kept:#?}"
+        );
+        assert!(
+            source.to_string().contains("space") || source.to_string().contains("full"),
+            "and not in place of what broke the append: {source}"
+        );
+    }
+
+    /// Nothing may record a loss after the sweep that reports them. An
+    /// attachment whose drain timed out leaves the writer still holding
+    /// records, so the writer has to be ended and waited for first.
+    #[tokio::test]
+    async fn closing_the_sink_lets_nothing_record_after_the_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NETWORK_LOG);
+        let mut sink = AuditSink::open(path.clone(), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let attached = sink.for_attachment("outrig-a", 1);
+
+        write_audit(&attached, audit_event()).await;
+        // Mirrors `shutdown`, which takes the attachments before it closes:
+        // the writer ends when the last handle is gone, and this is it.
+        drop(attached);
+
+        let closed = sink.close().await;
+        assert!(closed.is_none(), "the writer has to finish: {closed:?}");
+
+        // Finished means its queue is on disk, so there is nothing left that
+        // could record a loss behind the sweep that follows.
+        let text = std::fs::read_to_string(&path).expect("read audit log");
+        assert_eq!(
+            text.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "closing waits the writer out rather than abandoning what it holds"
+        );
+        // And closed means closed: a record offered afterwards is refused
+        // rather than quietly dropped.
+        assert!(
+            sink.write(&AuditRecord::new("sid-1", "outrig-a", audit_event()))
+                .await
+                .is_err(),
+            "a closed sink must refuse"
+        );
+        // A record the writer answered for is not one it was holding. Were it
+        // left counted, a clean close would report a loss that never happened
+        // -- and a refused record must not be counted either, since nothing
+        // ever took it.
+        assert!(
+            sink.take_every_unwritten().is_empty(),
+            "a writer that finished its queue lost nothing"
+        );
+    }
+
+    /// A producer cancelled while waiting for room in the queue is charged
+    /// for nothing. The queue is bounded, so offering a record can wait, and
+    /// counting before that wait charged an owner for a record the writer
+    /// never saw: reported as lost if the writer was later stopped, and
+    /// dropped without a word if it closed cleanly -- a connection record
+    /// missing from the log with nothing to say so.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_cancelled_before_it_is_queued_is_charged_to_nobody() {
+        let (records, _queue) = mpsc::channel(AUDIT_QUEUE);
+        let pending: AuditPending = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut sink = AuditSink {
+            writer: Arc::new(Mutex::new(Some(tokio::spawn(std::future::pending())))),
+            records: Some(records),
+            session_id: "sid-1".to_string(),
+            container: String::new(),
+            generation: 0,
+            pending: pending.clone(),
+            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+
+        // Filled past the sink, so nothing here is counted and the next
+        // producer has to wait for room that is never going to come.
+        for _ in 0..AUDIT_QUEUE {
+            let (done, _) = tokio::sync::oneshot::channel();
+            sink.records
+                .as_ref()
+                .expect("open")
+                .send(AuditJob::Record {
+                    who: (9, "outrig-filler".to_string()),
+                    line: b"{}\n".to_vec(),
+                    done,
+                })
+                .await
+                .expect("fill the queue");
+        }
+        assert!(pending.lock().expect("pending").is_empty());
+
+        let handle = sink.for_attachment("outrig-a", 1);
+        let blocked = tokio::spawn(async move { write_audit(&handle, audit_event()).await });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            pending.lock().expect("pending").is_empty(),
+            "a record still waiting for room is not one the writer is holding"
+        );
+
+        blocked.abort();
+        let _ = blocked.await;
+
+        assert!(
+            pending.lock().expect("pending").is_empty(),
+            "and a producer that was cancelled there leaves nothing behind"
+        );
+        // Which is what the accounting is for: stopping the writer now
+        // reports the records it actually took, and not this one.
+        assert!(sink.close().await.is_some(), "the writer will not stop");
+        assert!(
+            sink.take_every_unwritten().is_empty(),
+            "a record that never reached the queue is not the writer's loss"
+        );
+    }
+
+    /// A writer that will not stop is aborted, and aborting ends the task
+    /// rather than the syscall it submitted: bytes may still land and the
+    /// rollback that would have undone them is gone with the task. What it was
+    /// holding is lost with it, and who lost what is knowable -- every record
+    /// it took was queued by an attachment that is still counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_that_had_to_be_aborted_reports_what_it_was_holding() {
+        // A writer that never takes anything off its queue, which is what a
+        // wedged one looks like from this side with none of the timing.
+        let (records, _queue) = mpsc::channel(AUDIT_QUEUE);
+        let pending: AuditPending = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut sink = AuditSink {
+            writer: Arc::new(Mutex::new(Some(tokio::spawn(std::future::pending())))),
+            records: Some(records),
+            session_id: "sid-1".to_string(),
+            container: String::new(),
+            generation: 0,
+            pending: pending.clone(),
+            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+
+        // Two attachments, three records: each producer queues one and then
+        // waits to be told it landed, which is where a record the writer is
+        // holding leaves its producer.
+        for (container, generation) in [("outrig-a", 1), ("outrig-a", 1), ("outrig-b", 2)] {
+            let handle = sink.for_attachment(container, generation);
+            tokio::spawn(async move { write_audit(&handle, audit_event()).await });
+        }
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pending.lock().expect("pending").len(),
+            2,
+            "both attachments have to have queued before the close"
+        );
+
+        let closed = sink.close().await;
+        assert!(
+            closed
+                .expect("a writer that will not stop is reported")
+                .to_string()
+                .contains("unaccounted"),
+            "and says what it left behind"
+        );
+
+        let swept = sink.take_every_unwritten();
+        let counted: Vec<(String, u64, bool)> = swept
+            .iter()
+            .map(|loss| {
+                let OutrigError::NetworkAuditUnwritten {
+                    container,
+                    records,
+                    integrity,
+                    ..
+                } = loss
+                else {
+                    panic!("expected an audit loss, got {loss:#?}");
+                };
+                (container.clone(), *records, integrity.is_some())
+            })
+            .collect();
+        assert_eq!(
+            counted,
+            vec![
+                ("outrig-a".to_string(), 2, true),
+                ("outrig-b".to_string(), 1, true),
+            ],
+            "each attachment is told how many of *its* records were lost, and \
+             that the file may be short a rollback: {swept:#?}"
+        );
+    }
+
+    /// A writer stopped while holding nothing lost nothing. Reporting a
+    /// record anyway -- under a name no attachment has, which is what a
+    /// synthetic entry amounts to -- is an invented loss, and one a reader
+    /// cannot act on. The record written first is the other half of it: one
+    /// the writer answered for is not one it was still holding.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_stopped_holding_nothing_invents_no_loss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut sink = AuditSink::open(dir.path().join(NETWORK_LOG), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let attached = sink.for_attachment("outrig-a", 1);
+        write_audit(&attached, audit_event()).await;
+        drop(attached);
+
+        // A writer that will not stop, in place of the one that just finished
+        // its queue: `close` takes the abort path with nothing outstanding.
+        *sink.writer.lock().expect("writer slot") =
+            Some(tokio::spawn(std::future::pending::<()>()));
+
+        let closed = sink.close().await;
+        assert!(
+            closed.is_some(),
+            "a writer that would not stop is still worth reporting"
+        );
+        assert!(
+            sink.take_every_unwritten().is_empty(),
+            "but nothing was outstanding, so nothing is claimed lost"
+        );
+    }
+
+    /// A drain that gave up leaves its losses on the books rather than taking
+    /// an account it knows is short. Something has to collect them afterwards,
+    /// or the concrete loss is never reported at all.
+    #[tokio::test]
+    async fn losses_left_by_a_timed_out_drain_are_swept_at_shutdown() {
+        let sink = AuditSink::open(PathBuf::from("/dev/full"), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        write_audit(&sink.for_attachment("outrig-a", 1), audit_event()).await;
+        write_audit(&sink.for_attachment("outrig-b", 2), audit_event()).await;
+
+        // Neither attachment collected its own -- which is what a timed-out
+        // drain leaves behind.
+        let swept = sink.take_every_unwritten();
+        assert_eq!(swept.len(), 2, "{swept:#?}");
+        assert!(
+            sink.take_every_unwritten().is_empty(),
+            "and the sweep takes them only once"
+        );
+    }
+
+    /// One attachment's audit loss is not another's, even when they share a
+    /// container name. A drain that gave up leaves the writer still holding a
+    /// record; the failure that follows must not land in the slot the *next*
+    /// attachment of that name is reading.
+    #[tokio::test]
+    async fn an_audit_loss_belongs_to_the_attachment_that_incurred_it() {
+        let sink = AuditSink::open(PathBuf::from("/dev/full"), "sid-1".to_string())
+            .await
+            .expect("open sink");
+
+        // The same container name, attached twice.
+        let first = sink.for_attachment("outrig-a", 1);
+        let second = sink.for_attachment("outrig-a", 2);
+
+        write_audit(&first, audit_event()).await;
+
+        assert_eq!(
+            second.take_unwritten().len(),
+            0,
+            "a later attachment must not inherit the earlier one's loss"
+        );
+        assert_eq!(
+            first.take_unwritten().len(),
+            1,
+            "and the attachment that incurred it still gets told"
+        );
+    }
+
+    /// Teardown drains the writer rather than assuming a joined connection
+    /// means its record reached the disk, and reports rather than waiting
+    /// forever when it cannot.
+    #[tokio::test]
+    async fn a_drain_answers_only_once_what_was_queued_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(NETWORK_LOG);
+        let sink = audit_sink(dir.path()).await;
+
+        write_audit(&sink.for_container("outrig-a"), audit_event()).await;
+        sink.drain().await.expect("the writer drains");
+
+        let text = std::fs::read_to_string(&path).expect("read audit log");
+        assert_eq!(
+            text.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "everything queued before the drain is on disk when it answers"
+        );
+    }
+
+    /// A sink that keeps failing is a container's to drive: it can open
+    /// connections as fast as it likes, and every one of them writes. What is
+    /// retained has to be bounded by the number of containers, not by the
+    /// number of records lost, or an outage grows host memory for as long as
+    /// it lasts and hands teardown an error as long as the outage.
+    #[tokio::test]
+    async fn a_sink_that_keeps_failing_retains_a_bounded_amount() {
+        let sink = AuditSink::open(PathBuf::from("/dev/full"), "sid-1".to_string())
+            .await
+            .expect("open sink");
+        let container = sink.for_container("outrig-a");
+
+        for _ in 0..10_000 {
+            write_audit(&container, audit_event()).await;
+        }
+
+        assert_eq!(
+            sink.unwritten.lock().expect("unwritten").len(),
+            1,
+            "one entry per container, whatever the record count"
+        );
+        let kept = container.take_unwritten();
+        assert_eq!(kept.len(), 1, "{kept:#?}");
+        assert!(
+            matches!(
+                kept[0],
+                OutrigError::NetworkAuditUnwritten {
+                    records: 10_000,
+                    ..
+                }
+            ),
+            "and the count says how much was lost: {kept:#?}"
+        );
+        assert_eq!(
+            std::fs::metadata("/dev/full").map(|m| m.len()).unwrap_or(0),
+            0,
+            "a failed write leaves nothing behind to corrupt the next record"
+        );
+    }
+
+    /// The resolver is written before the table exists, so its marker is
+    /// readable inside the container first. If the marker *were* the table's
+    /// name, that would hand an actor in the namespace the one thing it needs
+    /// to create the table ahead of outrig -- making the `create` fail and the
+    /// rollback delete a table this attach never made.
+    #[test]
+    fn a_resolver_marker_never_names_the_table_it_was_attached_with() {
+        for _ in 0..64 {
+            let target = Target::for_attach("outrig-a", 1, "sid-1", false);
+            assert_ne!(
+                target.marker, target.table,
+                "publishing the marker must tell nobody the table's name"
+            );
+            assert!(
+                !target.marker.contains(&target.table) && !target.table.contains(&target.marker),
+                "nor any part of it: {target:?}"
+            );
+        }
+    }
+
+    /// A writer that will not stop is stopped. Moving the handle into a
+    /// timeout and letting it drop *detaches* the task -- which would go on
+    /// appending and recording losses after the sweep meant to be the last
+    /// word on both, which is the defect this whole task started from, one
+    /// level down.
+    #[tokio::test]
+    async fn closing_a_stuck_writer_ends_it_rather_than_detaching_it() {
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ended.clone();
+        let stuck = tokio::spawn(async move {
+            struct Ends(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Ends {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _ends = Ends(flag);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let (records, _queue) = mpsc::channel(1);
+        let mut sink = AuditSink {
+            writer: Arc::new(Mutex::new(Some(stuck))),
+            records: Some(records),
+            session_id: "sid-1".to_string(),
+            container: String::new(),
+            generation: 0,
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+
+        let closed = sink.close().await;
+
+        assert!(closed.is_some(), "a writer that would not stop is reported");
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "and is actually gone, not merely unwatched"
+        );
+    }
+
+    /// The undo deletes a table by name, so the name has to be one nothing
+    /// else could be holding. A deterministic one can be held by a stale table
+    /// from a crashed run of the same session, by an operator's own, or by
+    /// another actor creating it between a check and an apply -- and that last
+    /// window is why this is an identity rather than a preflight check.
+    #[test]
+    fn every_attach_gets_a_table_name_of_its_own() {
+        let names: std::collections::BTreeSet<String> =
+            (0..256).map(|_| nft_table_name("sid-1")).collect();
+        assert_eq!(
+            names.len(),
+            256,
+            "a repeated name is a name something else can hold"
+        );
+        for name in &names {
+            assert!(
+                name.starts_with("outrig_sid_1_"),
+                "still recognizable as outrig's: {name}"
+            );
+        }
+        assert_ne!(
+            nft_table_name("sid-1"),
+            nft_table_name("sid-1"),
+            "two attaches in one session must not share a table"
+        );
+    }
+
+    /// Cancelled with an undo in flight. The command has to still be armed,
+    /// or the destructor has nothing to reissue and the container keeps
+    /// whatever that undo was going to take back.
+    #[tokio::test]
+    async fn a_cancelled_undo_is_still_armed_for_the_destructor() {
+        let fake = FakeRunner {
+            hang_on: Some("delete table"),
+            ..FakeRunner::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect("install interception");
+        assert_eq!(rollback.armed().len(), 2);
+
+        {
+            let mut undoing = Box::pin(rollback.undo_now(&run));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        _ = &mut undoing => panic!("the delete is held"),
+                        () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    }
+                    if fake.ran().iter().any(|cmd| cmd.contains("delete table")) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the undo never started");
+        }
+
+        assert_eq!(
+            rollback.armed().len(),
+            2,
+            "a cancelled undo gives up nothing the rollback was holding: {:#?}",
+            rollback.armed()
+        );
+    }
+
+    /// What survives a partial undo survives in arming order, because `Drop`
+    /// reverses it. Retained newest-first it would be reversed a second time
+    /// and put the resolver back before removing the redirect aimed at it.
+    #[tokio::test]
+    async fn a_partly_discharged_rollback_keeps_its_arming_order() {
+        let installing = FakeRunner::default();
+        let run = |cmd: Cmd| installing.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect("install interception");
+
+        let undoing = FakeRunner {
+            fail_on: Some("nsenter"),
+            ..FakeRunner::default()
+        };
+        let undo = |cmd: Cmd| undoing.run(cmd);
+        let failures = rollback.undo_now(&undo).await;
+        assert_eq!(failures.len(), 2, "{failures:#?}");
+
+        let armed = rollback.armed();
+        assert_eq!(armed.len(), 2, "{armed:#?}");
+        assert!(
+            armed[0].contains("nameserver 10.0.2.3"),
+            "the resolver restore was armed first and must stay first: {armed:#?}"
+        );
+        assert!(
+            armed[1].contains("delete table"),
+            "and the nft delete, armed second, must stay second: {armed:#?}"
+        );
+    }
+
+    /// The undo that fails is not discharged. It stays armed so the destructor
+    /// reissues it, which is the difference between reporting a failure and
+    /// forgetting an obligation.
+    #[tokio::test]
+    async fn an_undo_that_fails_stays_armed_for_the_destructor() {
+        let installing = FakeRunner::default();
+        let run = |cmd: Cmd| installing.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect("install interception");
+
+        let undoing = FakeRunner {
+            fail_on: Some("nameserver 10.0.2.3"),
+            ..FakeRunner::default()
+        };
+        let undo = |cmd: Cmd| undoing.run(cmd);
+        let residue = rollback.undo_now(&undo).await;
+
+        assert_eq!(residue.len(), 1, "{residue:#?}");
+        assert_eq!(
+            rollback.armed().len(),
+            1,
+            "the failed restore must still be armed: {:#?}",
+            rollback.armed()
+        );
+    }
+
+    /// An apply that fails and an inverse that fails with it. "The attach
+    /// failed" and "the container is not back the way it was" are different
+    /// things to be told, and only the second means it cannot be retried, so
+    /// the caller is owed both.
+    #[tokio::test]
+    async fn an_attach_whose_rollback_also_fails_reports_both() {
+        let fake = FakeRunner {
+            fail_on: Some("--echo --handle"),
+            ..FakeRunner::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+
+        let cause = install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect_err("the apply was injected to fail");
+
+        let failing_undo = FakeRunner {
+            fail_on: Some("nameserver 10.0.2.3"),
+            ..FakeRunner::default()
+        };
+        let undo = |cmd: Cmd| failing_undo.run(cmd);
+        let residue = rollback.undo_now(&undo).await;
+        assert!(!residue.is_empty(), "the restore was injected to fail");
+
+        let reported = OutrigError::NetworkAttachNotUndone(Box::new(NetworkAttachFailure {
+            container: "outrig-test".to_string(),
+            source: Box::new(cause),
+            residue,
+        }));
+        let text = reported.to_string();
+        assert!(text.contains("outrig-test"), "{text}");
+        assert!(text.contains("could not be fully undone"), "{text}");
+        assert!(
+            text.contains("nameserver 10.0.2.3"),
+            "the residue is named, not just counted: {text}"
+        );
+    }
+
+    /// A resolver that is a link to nothing. `[ -e ]` calls it absent, but
+    /// installing would follow the link and create its target, and the undo
+    /// for an absent resolver is `rm -f` -- which would take the link and
+    /// leave the file. Refused before anything is written.
+    #[tokio::test]
+    async fn a_dangling_resolver_link_refuses_the_attach() {
+        let err = checked_resolv_snapshot("outrig-test", vec![RESOLV_DANGLING])
+            .expect_err("a dangling link cannot be put back");
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+    }
+
+    /// The bytes ride back as one `execve` argument, which is binary-safe
+    /// except for the two things an argument cannot be. Both are refused
+    /// before the resolver is touched, because the alternative is finding out
+    /// afterwards -- with loopback DNS installed and no way to undo it.
+    #[tokio::test]
+    async fn a_resolver_no_argument_could_carry_refuses_the_attach() {
+        let mut with_nul = vec![RESOLV_PRESENT];
+        with_nul.extend_from_slice(b"nameserver 10.0.0.1\0\n");
+        let err = checked_resolv_snapshot("outrig-test", with_nul.clone())
+            .expect_err("a NUL cannot be carried in an argument");
+        assert!(err.to_string().contains("NUL"), "{err}");
+
+        let mut oversized = vec![RESOLV_PRESENT];
+        oversized.resize(MAX_RESOLV_SNAPSHOT + 2, b'x');
+        let err = checked_resolv_snapshot("outrig-test", oversized)
+            .expect_err("an oversized resolver cannot be carried in an argument");
+        assert!(err.to_string().contains("past the"), "{err}");
+
+        // The refusal is not theoretical: the command such a snapshot would
+        // build cannot be spawned at all, which is why the check has to come
+        // before the mutation rather than after it.
+        let doomed = write_resolv_conf(std::process::id(), "outrig_test", with_nul[1..].to_vec());
+        assert!(
+            doomed.to_tokio_command().spawn().is_err(),
+            "a NUL in argv is refused by the kernel interface itself"
+        );
+    }
+
+    /// The undo only fires if the resolver still holds what this attach put
+    /// there. These commands name a namespace by pid and the kernel reuses
+    /// pids, so an undo delayed past its container's exit -- by a slow command
+    /// ahead of it in the chain, or a destructor firing late -- would
+    /// otherwise write one container's resolver into whatever holds that pid
+    /// now. The real script is run here, not a paraphrase of it.
+    #[tokio::test]
+    async fn a_restore_leaves_a_resolver_it_did_not_install_alone() {
+        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\nsearch example.test\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+        let restore = |content: &[u8]| {
+            Cmd::new("/bin/sh")
+                .args(["-c"])
+                .arg(script.clone())
+                .arg("_")
+                .arg(OsString::from_vec(content.to_vec()))
+                .arg(intercepted_resolv("outrig_test"))
+                .arg(intercepted_resolv("outrig_test").len().to_string())
+        };
+
+        // Holding what the install wrote: the undo fires.
+        std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
+        run_step(restore(ORIGINAL), None)
+            .await
+            .expect("the restore must run");
+        assert_eq!(std::fs::read(&target).expect("restored"), ORIGINAL);
+
+        // Holding something else -- a replacement container behind a reused
+        // pid, or a resolver something changed after interception: left alone.
+        std::fs::write(&target, b"nameserver 9.9.9.9\n").expect("third party");
+        run_step(restore(ORIGINAL), None)
+            .await
+            .expect("the guard makes this a no-op, not a failure");
+        assert_eq!(
+            std::fs::read(&target).expect("untouched"),
+            b"nameserver 9.9.9.9\n",
+            "an undo must not clobber a resolver it did not install"
+        );
+    }
+
+    /// A terminal newline added or removed is byte-distinct state, and taking
+    /// it back would overwrite it. Command substitution strips trailing
+    /// newlines, so without a sentinel inside it the two compare equal.
+    #[tokio::test]
+    async fn a_restore_sees_a_trailing_newline_added_or_removed() {
+        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+
+        for changed in [
+            format!("{}\n", intercepted_resolv("outrig_test")),
+            intercepted_resolv("outrig_test")
+                .trim_end_matches('\n')
+                .to_string(),
+        ] {
+            std::fs::write(&target, &changed).expect("write");
+            run_step(
+                Cmd::new("/bin/sh")
+                    .args(["-c"])
+                    .arg(script.clone())
+                    .arg("_")
+                    .arg(OsString::from_vec(ORIGINAL.to_vec()))
+                    .arg(intercepted_resolv("outrig_test"))
+                    .arg(intercepted_resolv("outrig_test").len().to_string()),
+                None,
+            )
+            .await
+            .expect("the guard makes this a no-op, not a failure");
+
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("untouched"),
+                changed,
+                "a file differing only in its terminal newline is still a \
+                 different file: {changed:?}"
+            );
+        }
+    }
+
+    /// A byte the shell cannot carry is still a byte in the file. Shells
+    /// differ on what command substitution does with an embedded NUL, so the
+    /// guard checks the file's own byte count as well as its text.
+    #[tokio::test]
+    async fn a_restore_sees_a_nul_added_after_it_installed() {
+        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+
+        // What the install wrote, with a NUL inserted into it.
+        let mut tampered = intercepted_resolv("outrig_test").into_bytes();
+        tampered.insert(0, 0);
+        std::fs::write(&target, &tampered).expect("tamper");
+
+        run_step(
+            Cmd::new("/bin/sh")
+                .args(["-c"])
+                .arg(script)
+                .arg("_")
+                .arg(OsString::from_vec(ORIGINAL.to_vec()))
+                .arg(intercepted_resolv("outrig_test"))
+                .arg(intercepted_resolv("outrig_test").len().to_string()),
+            None,
+        )
+        .await
+        .expect("the guard makes this a no-op, not a failure");
+
+        assert_eq!(
+            std::fs::read(&target).expect("untouched"),
+            tampered,
+            "a resolver carrying bytes the install never wrote is not this attach's"
+        );
+    }
+
+    /// A resolver that cannot be read is not a resolver that belongs to
+    /// someone else. Discarding the read's status made the two look alike, so
+    /// the undo exited zero, teardown struck it off, and `detach` reported
+    /// success over a container still pointing at a stopped listener.
+    #[tokio::test]
+    async fn an_unreadable_resolver_fails_the_undo_rather_than_skipping_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if nix::unistd::Uid::effective().is_root() {
+            // Root reads it regardless, so there is nothing to observe.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+
+        for script in [RESTORE_RESOLV_SCRIPT, REMOVE_RESOLV_SCRIPT] {
+            std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000))
+                .expect("make unreadable");
+            let script =
+                script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+
+            let outcome = run_step(
+                Cmd::new("/bin/sh")
+                    .args(["-c"])
+                    .arg(script)
+                    .arg("_")
+                    .arg("nameserver 10.0.2.3\n")
+                    .arg(intercepted_resolv("outrig_test"))
+                    .arg(intercepted_resolv("outrig_test").len().to_string()),
+                None,
+            )
+            .await;
+
+            assert!(
+                outcome.is_err(),
+                "an unreadable resolver has to fail the undo, not retire it"
+            );
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+                .expect("restore permissions");
+        }
+    }
+
+    /// An absent resolver owes nothing, and must not be confused with one that
+    /// is there and could not be read.
+    #[tokio::test]
+    async fn an_absent_resolver_retires_the_undo_quietly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+
+        run_step(
+            Cmd::new("/bin/sh")
+                .args(["-c"])
+                .arg(script)
+                .arg("_")
+                .arg("nameserver 10.0.2.3\n")
+                .arg(intercepted_resolv("outrig_test"))
+                .arg(intercepted_resolv("outrig_test").len().to_string()),
+            None,
+        )
+        .await
+        .expect("an absent resolver is not a failure");
+        assert!(!target.exists(), "and nothing is written in its place");
+    }
+
+    /// Neither undo may depend on a utility a container is not required to
+    /// have. The obvious spelling used `cmp`, which a minimal image need not
+    /// ship: a missing one exits 127, `|| exit 0` reads that as "not ours",
+    /// and the undo skips while `detach` reports success -- the resolver left
+    /// pointing at a listener that has stopped.
+    #[tokio::test]
+    async fn neither_undo_needs_anything_beyond_a_shell_and_cat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        // A PATH holding only what the undos actually declare: `cat`, which
+        // the snapshot already needs, and `rm`, which the absent-resolver undo
+        // is. `wc` and `cmp` are not declared, and an undo that quietly
+        // retires itself because one of them is missing is the failure this
+        // is for.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        for tool in ["cat", "rm"] {
+            let real = ["/bin", "/usr/bin"]
+                .into_iter()
+                .map(|d| PathBuf::from(d).join(tool))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("no {tool} to link"));
+            std::os::unix::fs::symlink(&real, bin.join(tool)).expect("link tool");
+        }
+
+        for (script, expected) in [
+            (RESTORE_RESOLV_SCRIPT, b"nameserver 10.0.2.3\n".to_vec()),
+            (REMOVE_RESOLV_SCRIPT, Vec::new()),
+        ] {
+            std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
+            let script =
+                script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+            // Only what the snapshot already needs is on PATH: no `cmp`, no
+            // `wc`. An undo that quietly retires itself because a utility is
+            // missing is the failure this is for.
+            let pared = format!("PATH={}; {script}", bin.display());
+            run_step(
+                Cmd::new("/bin/sh")
+                    .args(["-c"])
+                    .arg(pared)
+                    .arg("_")
+                    .arg(OsString::from_vec(b"nameserver 10.0.2.3\n".to_vec()))
+                    .arg(intercepted_resolv("outrig_test"))
+                    .arg(intercepted_resolv("outrig_test").len().to_string()),
+                None,
+            )
+            .await
+            .expect("the undo must run");
+
+            if expected.is_empty() {
+                assert!(!target.exists(), "the remove must have happened");
+            } else {
+                assert_eq!(std::fs::read(&target).expect("restored"), expected);
+            }
+        }
+    }
+
+    /// A resolver something has legitimately changed since is no longer the
+    /// one this attach installed, and taking it back would discard that
+    /// change. The marker says who installed it; the rest of the text says
+    /// whether it is still what was installed, and both have to hold.
+    #[tokio::test]
+    async fn a_restore_keeps_a_change_made_after_it_was_installed() {
+        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+
+        for changed in [
+            // A resolver manager pointing somewhere else, marker untouched.
+            intercepted_resolv("outrig_test").replace("127.0.0.1", "9.9.9.9"),
+            // An option added, marker untouched.
+            format!("{}search added.test\n", intercepted_resolv("outrig_test")),
+        ] {
+            std::fs::write(&target, &changed).expect("write");
+            run_step(
+                Cmd::new("/bin/sh")
+                    .args(["-c"])
+                    .arg(script.clone())
+                    .arg("_")
+                    .arg(OsString::from_vec(ORIGINAL.to_vec()))
+                    .arg(intercepted_resolv("outrig_test"))
+                    .arg(intercepted_resolv("outrig_test").len().to_string()),
+                None,
+            )
+            .await
+            .expect("the guard makes this a no-op, not a failure");
+
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("untouched"),
+                changed,
+                "an undo must not discard a change made after it installed: {changed:?}"
+            );
+        }
+    }
+
+    /// A pid reused by *another outrig-attached container* is the case a
+    /// shared sentinel cannot see: every attachment installs the same resolver
+    /// text, so the guard would pass and write the first container's resolver
+    /// into the second. The sentinel carries the attach's own table name,
+    /// which is unique to it.
+    #[tokio::test]
+    async fn a_restore_leaves_another_outrig_containers_resolver_alone() {
+        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+
+        // The file holds what a *different* attachment installed.
+        std::fs::write(&target, intercepted_resolv("outrig_other")).expect("other install");
+        run_step(
+            Cmd::new("/bin/sh")
+                .args(["-c"])
+                .arg(script)
+                .arg("_")
+                .arg(OsString::from_vec(ORIGINAL.to_vec()))
+                .arg(intercepted_resolv("outrig_test"))
+                .arg(intercepted_resolv("outrig_test").len().to_string()),
+            None,
+        )
+        .await
+        .expect("the guard makes this a no-op, not a failure");
+
+        assert_eq!(
+            std::fs::read(&target).expect("untouched"),
+            intercepted_resolv("outrig_other").into_bytes(),
+            "one attachment's undo must not reach another's container"
+        );
+    }
+
+    /// The resolver a restore writes is the bytes the snapshot read, with
+    /// nothing in between: they travel as an argument, so no quoting rule has
+    /// to hold for the file to come back exactly as it was.
+    #[test]
+    fn a_restore_carries_the_original_resolver_bytes_verbatim() {
+        let restore = restore_resolv_conf(std::process::id(), "outrig_test", present_snapshot());
+        assert!(
+            restore
+                .args
+                .iter()
+                .any(|arg| arg.as_os_str().as_bytes() == ORIGINAL_RESOLV.as_bytes()),
+            "the snapshot travels as its own argument, whole: {:#?}",
+            restore.args
+        );
+    }
+
+    /// Having no resolver file at all is a state too, and the one a bare `cat`
+    /// could neither report nor put back: the restore for it removes the file
+    /// the install created rather than leaving an empty one behind.
+    #[test]
+    fn a_container_with_no_resolver_file_is_restored_to_having_none() {
+        let restore = restore_resolv_conf(std::process::id(), "outrig_test", b"0".to_vec());
+        let rendered = restore.render();
+        assert!(rendered.contains("rm -f /etc/resolv.conf"), "{rendered}");
+    }
+
+    /// A failed nft apply is a failed attach, and the resolver mutation that
+    /// preceded it is still undone: the container gets its own file back even
+    /// though the table never landed.
+    #[tokio::test]
+    async fn a_failed_nft_apply_still_restores_the_resolver() {
+        let fake = FakeRunner {
+            fail_on: Some("--echo --handle"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+
+        let installed = install_interception(&run, &mut rollback, &target(), 4001, 4002).await;
+        assert!(installed.is_err(), "the nft apply was injected to fail");
+        rollback.undo_now(&run).await;
+
+        let ran = fake.ran();
+        assert_eq!(ran.len(), 5, "{ran:#?}");
+        assert!(ran[3].contains("delete table inet outrig_test"), "{ran:#?}");
+        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
+    }
+
+    /// Cancelled with the resolver install in flight. The undo log belongs to
+    /// the caller, not to the dropped future, so the restore is still armed
+    /// afterwards -- armed before the install ran, precisely so that a
+    /// cancellation landing inside it cannot slip between the two.
+    #[tokio::test]
+    async fn cancelling_the_resolver_install_leaves_the_restore_armed() {
+        // Only the write matches: the snapshot `printf`s too, but nothing
+        // redirects into the file except the install this aims at.
+        let fake = FakeRunner {
+            hang_on: Some("> /etc/resolv.conf"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let target = target();
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        {
+            let mut installing = Box::pin(install_interception(
+                &run,
+                &mut rollback,
+                &target,
+                4001,
+                4002,
+            ));
+            assert!(
+                futures_util::poll!(&mut installing).is_pending(),
+                "the injected install never completes"
+            );
+        }
+
+        let armed = rollback.armed();
+        assert_eq!(armed.len(), 1, "{armed:#?}");
+        assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
+    }
+
+    /// Cancelled with the nft apply in flight: both mutations are armed, so
+    /// the table is deleted whether or not the transaction landed and the
+    /// resolver goes back either way.
+    #[tokio::test]
+    async fn cancelling_the_nft_apply_leaves_both_undos_armed() {
+        let fake = FakeRunner {
+            hang_on: Some("--echo --handle"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let target = target();
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        {
+            let mut installing = Box::pin(install_interception(
+                &run,
+                &mut rollback,
+                &target,
+                4001,
+                4002,
+            ));
+            assert!(
+                futures_util::poll!(&mut installing).is_pending(),
+                "the injected nft apply never completes"
+            );
+        }
+
+        let armed = rollback.armed();
+        assert_eq!(armed.len(), 2, "{armed:#?}");
+        assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
+        assert!(
+            armed[1].contains("delete table inet outrig_test"),
+            "{armed:#?}"
+        );
+    }
+
+    /// A container whose resolver was baked in at create time is neither read
+    /// nor written, so there is nothing about it to put back.
+    #[tokio::test]
+    async fn a_dns_preconfigured_container_has_no_resolver_to_restore() {
+        let fake = FakeRunner::default();
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let target = Target {
+            dns_preconfigured: true,
+            ..target()
+        };
+
+        install_interception(&run, &mut rollback, &target, 4001, 4002)
+            .await
+            .expect("install interception");
+
+        let ran = fake.ran();
+        assert_eq!(ran.len(), 1, "{ran:#?}");
+        assert!(ran[0].contains("nft --echo --handle -f"), "{ran:#?}");
+        assert_eq!(rollback.armed().len(), 1, "{:#?}", rollback.armed());
+    }
+
+    /// The undo armed before the apply names the table, because there is no
+    /// handle to name until the kernel has made it -- and the undo left armed
+    /// afterwards names the handle, which is what a table recreated under this
+    /// name by someone else in the namespace does not answer to.
+    #[tokio::test]
+    async fn the_table_undo_is_narrowed_to_the_handle_the_kernel_assigned() {
+        let fake = FakeRunner::default();
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect("install interception");
+
+        let armed = rollback.armed();
+        let undo = armed
+            .iter()
+            .find(|cmd| cmd.contains("delete table"))
+            .unwrap_or_else(|| panic!("the table undo must stay armed: {armed:#?}"));
+        assert!(
+            undo.contains("delete table inet handle") && undo.contains(&FAKE_HANDLE.to_string()),
+            "the undo must name the handle the create reported: {undo}"
+        );
+        assert!(
+            !undo.contains("outrig_test"),
+            "and by the handle *alone*: a name beside it is a second command \
+             whose success says the name resolves somewhere, not that it \
+             resolves to the table being deleted: {undo}"
+        );
+        // And it takes the namespace with it rather than trusting a check made
+        // before `nsenter` resolved the pid.
+        let NamespaceAnswer::Is(expected) = namespace_id(std::process::id()) else {
+            panic!("this process has a namespace");
+        };
+        assert!(
+            undo.contains("readlink /proc/self/ns/net")
+                && undo.contains(&format!("net:[{}]", expected.1)),
+            "the undo must check the namespace it lands in: {undo}"
+        );
+    }
+
+    /// Cancelled *in* the apply, the undo is the name and nothing more --
+    /// deliberately, and this is the one window in which that is so.
+    ///
+    /// The handle exists only in the output of the transaction that assigned
+    /// it, so a cancellation that never sees that output has nothing narrower
+    /// to arm. The alternatives are worse than the race they would close: arm
+    /// nothing, and a container is left with a redirect to a listener that has
+    /// stopped and nothing coming to remove it; or resolve the identity at
+    /// removal time, which is the check-then-act this was built to avoid. The
+    /// exposure is an actor holding `NET_ADMIN` in the container's own network
+    /// namespace -- not granted by default -- who can also delete and recreate
+    /// the table inside the interval between nft's commit and this undo being
+    /// issued.
+    #[tokio::test]
+    async fn a_cancelled_apply_leaves_the_name_alone_armed_and_nothing_narrower() {
+        let fake = FakeRunner {
+            hang_on: Some("--echo --handle"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
+        let target = target();
+        {
+            let installing = install_interception(&run, &mut rollback, &target, 4001, 4002);
+            let cancelled = tokio::time::timeout(Duration::from_millis(50), installing).await;
+            assert!(cancelled.is_err(), "the apply was injected to hang");
+        }
+
+        let armed = rollback.armed();
+        assert!(
+            armed
+                .iter()
+                .any(|cmd| cmd.contains("delete table inet outrig_test")),
+            "what the apply may have committed is still owed a removal: {armed:#?}"
+        );
+        assert!(
+            !armed.iter().any(|cmd| cmd.contains("handle")),
+            "and there is no handle to have narrowed it with: {armed:#?}"
+        );
+    }
+
+    /// Ownership comes from the transaction that made the table and from
+    /// nowhere else, and with no ownership there is no removal -- not later,
+    /// and not on the way out either. A delete that can only name its target
+    /// is not this attach's to issue once the transaction has committed and
+    /// made that name visible: a table put there in between is the one it
+    /// would reach. What was made is reported as left behind instead, which is
+    /// what makes it recoverable by hand.
+    #[tokio::test]
+    async fn a_table_no_handle_can_be_had_for_is_left_and_reported_rather_than_removed() {
+        for echo in [
+            // An nft too old for `--echo`, or one that stopped echoing.
+            Vec::new(),
+            // Echoed, but with no handle in it.
+            b"create table inet outrig_test\n".to_vec(),
+            // A handle, but for a table this attach did not create.
+            b"create table inet someone_else # handle 4\n".to_vec(),
+            // Not text at all.
+            vec![0xff, 0xfe, 0x00],
+        ] {
+            let fake = FakeRunner {
+                echo: Some(echo.clone()),
+                ..Default::default()
+            };
+            let run = |cmd: Cmd| fake.run(cmd);
+            let mut rollback =
+                Rollback::new(std::process::id()).expect("this process has a namespace");
+
+            let failed = install_interception(&run, &mut rollback, &target(), 4001, 4002)
+                .await
+                .expect_err("a table nothing can name exactly fails the attach");
+            assert!(
+                failed.to_string().contains("no handle"),
+                "and says why: {failed} ({echo:?})"
+            );
+
+            assert!(
+                !fake.ran().iter().any(|cmd| cmd.contains("delete table")),
+                "no removal is issued by name at all: {:#?}",
+                fake.ran()
+            );
+            let armed = rollback.armed();
+            assert!(
+                !armed.iter().any(|cmd| cmd.contains("delete table")),
+                "and none is left armed for later: {armed:#?}"
+            );
+
+            // What it made is what the caller is told about.
+            let residue = rollback.undo_now(&run).await;
+            assert!(
+                residue
+                    .iter()
+                    .any(|e| e.to_string().contains("still in the container")),
+                "the table left behind has to reach the caller: {residue:#?}"
+            );
+        }
+    }
+
+    /// The handle is read from the echo of the transaction that created the
+    /// table, and only for the table this attach made. Anything else, and the
+    /// undo would be narrowed to something this attach does not own.
+    #[test]
+    fn a_handle_is_taken_only_from_this_attachs_own_create() {
+        let echo = b"create table inet outrig_test # handle 4\n\
+                     # new generation 2 by process 111 (nft)\n";
+        assert_eq!(table_handle_in(echo, "outrig_test"), Some(4));
+
+        // Another table in the same echo is not this one.
+        assert_eq!(table_handle_in(echo, "outrig_other"), None);
+        // An echo that says nothing about handles -- an nft too old for
+        // `--echo`, or one whose output moved -- leaves the undo unnarrowed
+        // rather than guessing.
+        assert_eq!(
+            table_handle_in(b"create table inet outrig_test\n", "outrig_test"),
+            None
+        );
+        assert_eq!(table_handle_in(b"", "outrig_test"), None);
+    }
+
+    /// A `Rollback` that is dropped rather than discharged still runs what it
+    /// is holding. There is no runtime here on purpose: this is the path a
+    /// destructor takes, and a rollback that needed a task to spawn on would
+    /// not survive the runtime it was cancelled with.
+    #[test]
+    fn a_dropped_rollback_still_issues_its_undo_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolver = dir.path().join("resolver");
+        let table = dir.path().join("table");
+
+        {
+            let mut rollback =
+                Rollback::new(std::process::id()).expect("this process has a namespace");
+            rollback.arm(touch(&resolver));
+            rollback.arm(touch(&table));
+        }
+
+        wait_for(&resolver);
+        wait_for(&table);
+    }
+
+    /// Detaching a container that has already exited is a success: its
+    /// namespace went with it, so there is no table left to delete and no
+    /// resolv.conf left worth restoring.
+    ///
+    /// The same check is what stops an undo entering a *different* container's
+    /// namespace. The pid is only how `nsenter` gets there; what is compared
+    /// is the namespace instance the undos were armed against, so a pid handed
+    /// on to something else reads the same as a pid whose process is gone --
+    /// which is the answer that matters, because acting there is worse than
+    /// not acting at all.
+    #[tokio::test]
+    async fn an_undo_whose_namespace_is_not_the_one_it_was_armed_against_does_nothing() {
+        let fake = FakeRunner {
+            fail_on: Some("podman"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        // A live pid -- this process -- recorded against a namespace that is
+        // not the one behind it. No nsfs entry is device 0 inode 0, so this is
+        // "the namespace these undos are for is not the one at that pid now",
+        // whether it exited or was handed on.
+        let mut rollback = Rollback {
+            pid: std::process::id(),
+            netns: (0, 0),
+            undo: Vec::new(),
+            left_behind: Vec::new(),
+        };
+        rollback.arm(write_resolv_conf(
+            std::process::id(),
+            "outrig_test",
+            ORIGINAL_RESOLV.as_bytes().to_vec(),
+        ));
+
+        let failures = rollback.undo_now(&run).await;
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        assert!(fake.ran().is_empty(), "{:#?}", fake.ran());
+    }
+
+    /// An answer the kernel would not give is not "the namespace is gone".
+    /// Reading it that way discharged every armed undo -- the redirect table
+    /// stays installed, `detach` returns `Ok(())`, and the container keeps
+    /// sending through a rule aimed at a listener that has stopped. Only a
+    /// namespace that is provably absent ends an obligation.
+    #[test]
+    fn only_a_namespace_that_is_gone_ends_an_obligation() {
+        let still_there = || false;
+        assert!(matches!(
+            classify_namespace(Ok((5, 4_026_531_833)), still_there),
+            NamespaceAnswer::Is((5, 4_026_531_833))
+        ));
+        // The two ways the kernel says the task went: the link is absent, or
+        // the lookup behind it lost the race with an exit.
+        assert!(matches!(
+            classify_namespace(Err(io::Error::from(io::ErrorKind::NotFound)), still_there),
+            NamespaceAnswer::Gone
+        ));
+        assert!(matches!(
+            classify_namespace(Err(io::Error::from_raw_os_error(libc::ESRCH)), still_there),
+            NamespaceAnswer::Gone
+        ));
+        // Refused permission is whichever the pid's own directory says: gone
+        // if the task went while being looked at, unknown if it is simply not
+        // ours to look at.
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            classify_namespace(Err(denied()), || true),
+            NamespaceAnswer::Gone
+        ));
+        assert!(matches!(
+            classify_namespace(Err(denied()), || false),
+            NamespaceAnswer::Unknown
+        ));
+        // Everything else: the question was not answered, which is not the
+        // same as answered "no".
+        for kind in [
+            io::ErrorKind::OutOfMemory,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::Other,
+        ] {
+            assert!(
+                matches!(
+                    classify_namespace(Err(io::Error::from(kind)), || true),
+                    NamespaceAnswer::Unknown
+                ),
+                "{kind:?} says nothing about whether the namespace is there"
+            );
+        }
+    }
+
+    /// The destructor asks the same question as the awaited path. A detached
+    /// undo is the one that runs latest and so the one most likely to find the
+    /// pid moved on, and it is also the one nothing is left to report from.
+    #[test]
+    fn a_dropped_rollback_whose_namespace_moved_on_issues_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("issued");
+        {
+            let mut rollback = Rollback {
+                pid: std::process::id(),
+                netns: (0, 0),
+                undo: Vec::new(),
+                left_behind: Vec::new(),
+            };
+            rollback.arm(touch(&marker));
+        }
+        // Long enough that a detached command would have run: the reaper
+        // starts it as soon as it is handed over.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "a destructor must not carry an undo into a namespace that is not \
+             the one it was armed against"
+        );
+    }
+
+    /// A namespace that cannot be identified is a refusal to arm anything,
+    /// asked before the first mutation: an undo that could not later tell its
+    /// namespace from a stranger's is one that must not run, and the moment to
+    /// discover that is while there is still nothing to undo.
+    #[test]
+    fn a_rollback_refuses_a_namespace_it_cannot_identify() {
+        // No process can hold pid 0, so nothing names a namespace here.
+        let refused = Rollback::new(0).expect_err("pid 0 has no namespace");
+        assert!(
+            refused.to_string().contains("could not be identified"),
+            "{refused}"
+        );
+    }
+
+    // -- Ending the connections a detach owes (R3) and holding no state for
+    // -- the ones it does not (R4). These drive `handle_tcp` and `dns_loop`
+    // -- over real loopback sockets: no container, no root, no nft.
+
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    fn allow_all_policy() -> Arc<CompiledNetworkPolicy> {
+        Arc::new(compiled(NetworkPolicy::allow_all()))
+    }
+
+    /// Denies everything. `SO_ORIGINAL_DST` on a connection nothing redirected
+    /// reports the accepting listener's own address, so an allowed connection
+    /// through a loop bound to that listener is bridged straight back into it
+    /// -- each one accepted, bridged, and accepted again.
+    fn deny_all_policy() -> Arc<CompiledNetworkPolicy> {
+        Arc::new(compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .deny_host("*")
+                .build()
+                .expect("policy"),
+        ))
+    }
+
+    fn empty_bindings() -> Bindings {
+        Arc::new(Mutex::new(NameBindings::default()))
+    }
+
+    async fn audit_sink(dir: &Path) -> AuditSink {
+        AuditSink::open(dir.join(NETWORK_LOG), "sid-test".to_string())
+            .await
+            .expect("open audit sink")
+            .for_container("outrig-test")
+    }
+
+    /// The one record `dir`'s audit log holds, read as it is the instant it is
+    /// asked for -- no polling, no retry, so a record written late is a
+    /// failure rather than a slow pass.
+    fn only_audit_record(dir: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(NETWORK_LOG)).expect("read audit log");
+        let mut lines = text.lines();
+        let record = lines
+            .next()
+            .expect("an audit record for the cut connection");
+        assert_eq!(lines.next(), None, "exactly one connection was made");
+        serde_json::from_str(record).expect("audit record json")
+    }
+
+    /// One accepted connection, wired the way the accept loop wires one: the
+    /// client end stays with the test, the other end is what `handle_tcp` is
+    /// handed.
+    async fn accepted_connection() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let (intercepted, orig) = listener.accept().await.expect("accept");
+        (client, intercepted, orig)
+    }
+
+    /// A destination that accepts one connection and hands the server end
+    /// back, standing in for whatever the redirect displaced.
+    async fn upstream_once() -> (SocketAddr, tokio::task::JoinHandle<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("upstream addr");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        (addr, accepted)
+    }
+
+    /// A live bridged connection and the tasks holding it: the client end, the
+    /// upstream server end, and the connection's own `JoinSet`, which is what
+    /// a detach ends it through.
+    struct LiveConnection {
+        client: TcpStream,
+        upstream: TcpStream,
+        tasks: JoinSet<()>,
+        cancel: CancellationToken,
+    }
+
+    /// Brings up one connection through `handle_tcp` and returns once bytes
+    /// have demonstrably crossed it in both directions, so a test that then
+    /// cancels is cancelling something that was working.
+    async fn live_connection(dir: &Path) -> LiveConnection {
+        let (mut client, intercepted, orig) = accepted_connection().await;
+        let (dst, upstream) = upstream_once().await;
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            audit_sink(dir).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+        ));
+
+        // Written before the upstream is accepted: this is the client's
+        // opening burst, which the sniff reads and the bridge forwards.
+        client.write_all(b"before\n").await.expect("write before");
+        let mut upstream = upstream.await.expect("upstream accepted");
+        let mut sent = [0u8; 7];
+        upstream
+            .read_exact(&mut sent)
+            .await
+            .expect("the bridge should carry the opening bytes");
+        assert_eq!(&sent, b"before\n");
+
+        // And back the other way, so both byte counters have something on
+        // them by the time anything cancels this.
+        upstream.write_all(b"down!\n").await.expect("write down");
+        let mut received = [0u8; 6];
+        client
+            .read_exact(&mut received)
+            .await
+            .expect("the bridge should carry the upstream's bytes");
+        assert_eq!(&received, b"down!\n");
+
+        LiveConnection {
+            client,
+            upstream,
+            tasks,
+            cancel,
+        }
+    }
+
+    /// Cancelling an attachment cuts the connections it accepted, and it is
+    /// cut by the time the call that ends them returns -- not eventually.
+    #[tokio::test]
+    async fn a_bridged_connection_stops_carrying_bytes_once_its_attachment_is_cancelled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LiveConnection {
+            mut client,
+            mut upstream,
+            mut tasks,
+            cancel,
+        } = live_connection(dir.path()).await;
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        // Asked after the call that ended it returned, rather than waited for:
+        // nothing written now can reach upstream, because nothing is left to
+        // carry it and the socket that would have went with the task.
+        let _ = client.write_all(b"after\n").await;
+        let mut after = [0u8; 6];
+        let crossed = tokio::time::timeout(Duration::from_secs(2), upstream.read(&mut after)).await;
+        assert!(
+            matches!(crossed, Ok(Ok(0)) | Ok(Err(_))),
+            "no bytes may cross a cut connection, got {crossed:?}"
+        );
+    }
+
+    /// A cut connection still owes its audit record, and owes it *before* its
+    /// task joins -- a detach that returned first would be reporting a
+    /// connection whose record had not been written.
+    #[tokio::test]
+    async fn a_cut_connection_has_its_audit_record_by_the_time_its_task_joins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LiveConnection {
+            mut tasks, cancel, ..
+        } = live_connection(dir.path()).await;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.container"], "outrig-test");
+        // The bytes that had already crossed are in the record, both
+        // directions: they are credited as they move, so the cut cannot erase
+        // them.
+        assert_eq!(record["orig_bytes"], 7);
+        assert_eq!(record["resp_bytes"], 6);
+    }
+
+    /// A connection cut before its client ever spoke is recorded as what its
+    /// address alone earned, with no bytes and no asserted identity. Nothing
+    /// it might have claimed was ever read, and nothing was ever forwarded,
+    /// so that is the whole truth about it.
+    #[tokio::test]
+    async fn a_connection_cut_before_its_client_spoke_is_recorded_by_address_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_client, intercepted, orig) = accepted_connection().await;
+        let (dst, _upstream) = upstream_once().await;
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+        ));
+        // The client says nothing, so the connection is parked in the sniff
+        // read with no evidence yet gathered.
+        tokio::task::yield_now().await;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "default");
+        assert_eq!(record["outrig.host"], serde_json::Value::Null);
+        assert_eq!(record["orig_bytes"], 0);
+        assert_eq!(record["resp_bytes"], 0);
+        assert_eq!(record["conn_state"], "S0");
+    }
+
+    /// A connection parked with nothing to wake it -- neither peer speaks,
+    /// neither closes -- is *terminated* by the cancel, not left running
+    /// unwatched. The client's read returning EOF the moment the stop call
+    /// returns is the proof: the socket went with the task's frame, which
+    /// only happens if the task is gone.
+    #[tokio::test]
+    async fn a_connection_parked_with_nothing_to_wake_it_is_terminated_not_detached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LiveConnection {
+            mut client,
+            upstream,
+            mut tasks,
+            cancel,
+        } = live_connection(dir.path()).await;
+        // Held open and silent for the rest of the test: the bridge has
+        // nothing to copy and no timer to expire.
+        let _upstream = upstream;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let mut buf = [0u8; 1];
+        let eof = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(
+            matches!(eof, Ok(Ok(0)) | Ok(Err(_))),
+            "the interceptor's end of a cut connection must be gone, got {eof:?}"
+        );
+        assert!(tasks.is_empty());
+    }
+
+    /// The backstop for a task that never looks at its token: it is aborted
+    /// *and joined*, so a detach can say the connections are gone rather than
+    /// merely unwatched. A `JoinHandle` dropped after a timeout would detach
+    /// its task instead, which is the bug this shape exists to avoid.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_that_ignores_cancellation_is_aborted_and_joined() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            // Only dropped when this task's frame is destroyed.
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let failures = stop_tasks(&mut tasks).await;
+
+        assert!(
+            matches!(
+                failures.as_slice(),
+                [OutrigError::NetworkTasksAborted { .. }]
+            ),
+            "{failures:#?}"
+        );
+        assert!(tasks.is_empty());
+        // Bounded so an implementation that detached rather than aborted
+        // fails here as an assertion instead of hanging the suite: the
+        // receiver of a sender still held by a live task simply never wakes.
+        let ended = tokio::time::timeout(Duration::from_secs(5), released)
+            .await
+            .expect("an aborted task's frame must be destroyed, not left running");
+        assert!(
+            ended.is_err(),
+            "the task must be gone, not merely unwatched"
+        );
+    }
+
+    /// A forward waits out `DNS_TIMEOUT` per resolver, well past the grace a
+    /// detach allows. The loop has to abandon one in flight, or every detach
+    /// racing a lookup would abort the task and report the abort.
+    #[tokio::test]
+    async fn the_dns_loop_does_not_outlast_a_cancellation_during_a_forward() {
+        // Receives the query and never answers it.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let resolver = blackhole.local_addr().expect("blackhole addr");
+
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind dns listener");
+        let listener_addr = socket.local_addr().expect("dns addr");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_loop(
+            socket,
+            vec![resolver],
+            empty_bindings(),
+            cancel.clone(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        client
+            .send_to(
+                &dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]),
+                listener_addr,
+            )
+            .await
+            .expect("send query");
+
+        // The forward is demonstrably in flight once the resolver has it.
+        let mut forwarded = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(5), blackhole.recv_from(&mut forwarded))
+            .await
+            .expect("the query should reach the resolver")
+            .expect("receive the forwarded query");
+
+        cancel.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "a cancelled dns loop must not wait out {DNS_TIMEOUT:?}"
+        );
+    }
+
+    /// Connections that have finished do not stay in the set the accept loop
+    /// keeps them in. A set only ever spawned into holds one handle per
+    /// connection the attachment has ever served.
+    #[tokio::test]
+    async fn finished_connections_do_not_pile_up_in_the_accept_loop_set() {
+        let mut conns = JoinSet::new();
+        for _ in 0..64 {
+            conns.spawn(async {});
+        }
+
+        // Bounded, so a reap that reaps nothing fails the assertion below
+        // rather than spinning here.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            reap_finished(&mut conns);
+            if conns.is_empty() {
+                break;
+            }
+        }
+
+        assert!(
+            conns.is_empty(),
+            "{} finished connections still held",
+            conns.len()
+        );
+    }
+
+    /// The same claim against the loop rather than the helper: it is the loop
+    /// that has to keep taking finished connections back out, and a test that
+    /// calls `reap_finished` itself cannot tell whether the loop still does.
+    #[tokio::test]
+    async fn the_accept_loop_keeps_taking_finished_connections_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        // Held here rather than by the loop, which is the whole reason the
+        // accepting half takes it by reference.
+        let mut conns = JoinSet::new();
+
+        let token = cancel.clone();
+        let clients = tokio::spawn(async move {
+            for _ in 0..64 {
+                // Closed at once, so each connection finishes on its own and
+                // leaves its handle behind for the loop to take back.
+                drop(TcpStream::connect(addr).await.expect("connect"));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            token.cancel();
+        });
+
+        let (live, _idle) = mpsc::channel(1);
+        accept_into(
+            &listener,
+            &audit,
+            &empty_bindings(),
+            &deny_all_policy(),
+            &cancel,
+            &conn_cancel,
+            &mut conns,
+            &live,
+        )
+        .await;
+        clients.await.expect("clients");
+
+        // Not zero: whichever connection finishes after the loop's last reap
+        // is still held, and the drain that follows `accept_into` in
+        // production is what collects it. The claim is that the carrier does
+        // not grow with the number of connections served -- without the reap
+        // all 64 are still here.
+        assert!(
+            conns.len() < 8,
+            "{} of 64 finished connections were never taken back out of the carrier",
+            conns.len()
+        );
+    }
+
+    /// One attachment serving many connections leaves nothing alive for the
+    /// ones it has already closed.
+    #[tokio::test]
+    async fn many_closed_connections_leave_no_tasks_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let sink = TcpListener::bind("127.0.0.1:0").await.expect("bind sink");
+        let dst = sink.local_addr().expect("sink addr");
+        let draining = tokio::spawn(async move {
+            while let Ok((stream, _)) = sink.accept().await {
+                drop(stream);
+            }
+        });
+        let baseline = alive_tasks();
+
+        let cancel = CancellationToken::new();
+        let mut conns = JoinSet::new();
+        for _ in 0..32 {
+            let (client, intercepted, orig) = accepted_connection().await;
+            // Closed at once, so the connection runs to its natural end.
+            drop(client);
+            conns.spawn(handle_tcp(
+                intercepted,
+                orig,
+                dst,
+                audit.clone(),
+                empty_bindings(),
+                allow_all_policy(),
+                cancel.clone(),
+            ));
+        }
+        while conns.join_next().await.is_some() {}
+
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "32 closed connections left tasks behind"
+        );
+        draining.abort();
+    }
+
+    /// The accept loop does not return until the connections it started
+    /// have. Their audit records are the proof: a loop that returned early
+    /// would drop the set holding them, and an aborted connection writes
+    /// nothing at all.
+    #[tokio::test]
+    async fn the_accept_loop_waits_for_the_connections_it_started() {
+        const HELD: usize = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+            mpsc::channel(1).0,
+        ));
+
+        // Silent clients, so every connection parks in the sniff read and is
+        // still live -- and still unrecorded -- when the cancel lands. The
+        // settle is a small fraction of `SNIFF_TIMEOUT`, which is the window
+        // they are all parked in.
+        let mut clients = Vec::new();
+        for _ in 0..HELD {
+            clients.push(TcpStream::connect(addr).await.expect("connect"));
+        }
+        tokio::time::sleep(SNIFF_TIMEOUT / 5).await;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let text = std::fs::read_to_string(dir.path().join(NETWORK_LOG)).expect("read audit log");
+        let records = text.lines().filter(|line| !line.trim().is_empty()).count();
+        assert_eq!(
+            records, HELD,
+            "every connection the loop started owes a record before it returns"
+        );
+    }
+
+    /// Repeated attach/detach cycles leave nothing behind: what a detach ends,
+    /// it ends for good, so a long session does not accumulate one set of
+    /// loops per attachment it ever had.
+    #[tokio::test]
+    async fn repeated_attach_detach_cycles_leave_no_tasks_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let baseline = alive_tasks();
+
+        for _ in 0..8 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let dns = UdpSocket::bind("127.0.0.1:0").await.expect("bind dns");
+            let cancel = CancellationToken::new();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(tcp_accept_loop(
+                listener,
+                audit.clone(),
+                empty_bindings(),
+                allow_all_policy(),
+                cancel.clone(),
+                mpsc::channel(1).0,
+            ));
+            tasks.spawn(dns_loop(dns, Vec::new(), empty_bindings(), cancel.clone()));
+
+            cancel.cancel();
+            let failures = stop_tasks(&mut tasks).await;
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "eight attach/detach cycles left tasks behind"
+        );
+    }
+
     #[test]
     fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
         let rules = nft_rules("outrig_test", 44123, 44124);
-        assert!(rules.contains("table inet outrig_test"));
+        assert!(
+            rules.contains("create table inet outrig_test"),
+            "`create` rather than `add`: it fails on a table that already \
+             exists, which is what makes deleting one afterwards safe"
+        );
         assert!(rules.contains("ip daddr 127.0.0.0/8 return"));
         assert!(rules.contains("ip6 daddr ::1 return"));
         assert!(rules.contains("meta l4proto tcp redirect to :44123"));

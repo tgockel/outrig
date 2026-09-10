@@ -25,7 +25,7 @@ use crate::container::{
     enter,
     sidecar::{self, Placement, SessionMcpPlan},
 };
-use crate::error::{IoPathExt, OutrigError, Result};
+use crate::error::{IoPathExt, OutrigError, Result, SidecarUnwindFailure};
 use crate::image::{self, ImageTag};
 use crate::mcp::{McpClient, McpToolResult};
 use crate::network::NetworkInterceptor;
@@ -726,6 +726,14 @@ pub struct ToolHandle {
 /// without `shutdown` still removes every container via a detached
 /// `podman rm -f` (plus the panic-hook sweeper if the host installed it).
 pub struct Outrig {
+    /// Containers this session still owns for cleanup only.
+    ///
+    /// A sidecar that failed to start *and* failed to stop is still running,
+    /// so the handle is kept -- but it is not part of the session: it was
+    /// never added to `sidecars`, nothing looks for it there, and nothing
+    /// places work in it. `shutdown` tries it again, which is the difference
+    /// between an orderly retry and `Drop`'s detached best effort.
+    abandoned: Vec<Container>,
     // Declared before `container` so field-order `Drop` reaps sidecars
     // before the primary, mirroring orderly shutdown.
     sidecars: BTreeMap<String, Container>,
@@ -861,6 +869,7 @@ impl Outrig {
         }
 
         let mut outrig = Self {
+            abandoned: Vec::new(),
             sidecars: BTreeMap::new(),
             container,
             clients,
@@ -967,16 +976,33 @@ impl Outrig {
             spec.workspace,
             !spec.mounts.is_empty(),
         );
+        // Every failure from here on has a live container behind it, so every
+        // one reports what stopping it could not do. A sidecar that was
+        // created and could not be stopped was never added to the session map
+        // and has no orderly owner left, which is not a detail to fold into
+        // the error that started it.
         if needs_bootstrap && let Err(e) = container.bootstrap_user().await {
-            let _ = container.stop(SHUTDOWN_GRACE).await;
-            return Err(e);
+            return Err(unwind_sidecar(
+                &spec.name,
+                e,
+                container,
+                SHUTDOWN_GRACE,
+                &mut self.abandoned,
+            )
+            .await);
         }
 
         if let Some(network) = &mut self.network
             && let Err(e) = network.attach(&container).await
         {
-            let _ = container.stop(SHUTDOWN_GRACE).await;
-            return Err(e);
+            return Err(unwind_sidecar(
+                &spec.name,
+                e,
+                container,
+                SHUTDOWN_GRACE,
+                &mut self.abandoned,
+            )
+            .await);
         }
 
         match connect_sidecar_servers(&container, &spec, &self.log_dir).await {
@@ -988,11 +1014,27 @@ impl Outrig {
                 Ok(tools)
             }
             Err(e) => {
-                if let Some(network) = &mut self.network {
-                    let _ = network.detach(container.name()).await;
+                // Both compensations are attempted, and what either of them
+                // could not do travels with the failure rather than being
+                // dropped. A detach that failed means the sidecar is still
+                // carrying interception no attachment owns, and there is no
+                // later retry path once this returns -- so the caller has to
+                // be told, not just the reason its servers would not start.
+                let mut residue = Vec::new();
+                if let Some(network) = &mut self.network
+                    && let Err(detached) = network.detach(container.name()).await
+                {
+                    residue.push(detached);
                 }
-                let _ = container.stop(SHUTDOWN_GRACE).await;
-                Err(e)
+                Err(unwound(
+                    &spec.name,
+                    e,
+                    residue,
+                    container,
+                    SHUTDOWN_GRACE,
+                    &mut self.abandoned,
+                )
+                .await)
             }
         }
     }
@@ -1119,12 +1161,13 @@ impl Outrig {
 
     /// Shut down every MCP server (close-stdin -> 2 s grace -> SIGKILL),
     /// then detach the network interceptor from every container, stop the
-    /// sidecars, and finally stop the primary. Errors during MCP and sidecar
-    /// shutdown are logged and swallowed so a single misbehaving server or
-    /// sidecar can't strand the rest; the primary `stop` error, if any,
-    /// propagates.
+    /// sidecars, and finally stop the primary. Errors during MCP, network
+    /// and sidecar shutdown are logged and swallowed so a single misbehaving
+    /// server or sidecar can't strand the rest; the primary `stop` error, if
+    /// any, propagates.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
+            abandoned,
             sidecars,
             container,
             clients,
@@ -1144,13 +1187,26 @@ impl Outrig {
                 Err(_) => {
                     tracing::warn!(
                         target: "outrig::outrig",
-                        "mcp client {name:?} still has outstanding refs at shutdown; relying on Drop"
+                        "mcp client {name:?} still has outstanding refs at \
+                         shutdown; relying on Drop"
                     );
                 }
             }
         }
-        if let Some(network) = network {
-            network.shutdown().await;
+        if let Some(network) = network
+            && let Err(e) = network.shutdown().await
+        {
+            tracing::warn!(target: "outrig::outrig", "network shutdown: {e}");
+        }
+        // Cleanup-only containers first: they are the ones already known not
+        // to have stopped, and this is the orderly retry they were kept for.
+        for abandoned in abandoned {
+            if let Err(e) = abandoned.stop(SHUTDOWN_GRACE).await {
+                tracing::warn!(
+                    target: "outrig::outrig",
+                    "abandoned sidecar stop failed: {e}"
+                );
+            }
         }
         for (name, sidecar) in sidecars {
             if let Err(e) = sidecar.stop(SHUTDOWN_GRACE).await {
@@ -1243,6 +1299,66 @@ fn validate_sidecar_spec<C, S>(
     Ok(())
 }
 
+/// Stop `container` and report `source` with whatever stopping it could not
+/// do. The pre-connect shape of [`unwound`], where there is no attachment to
+/// detach yet.
+async fn unwind_sidecar(
+    sidecar: &str,
+    source: OutrigError,
+    container: Container,
+    grace: Duration,
+    abandoned: &mut Vec<Container>,
+) -> OutrigError {
+    unwound(sidecar, source, Vec::new(), container, grace, abandoned).await
+}
+
+/// Stop `container`, add that to `residue`, and report the lot.
+///
+/// A clean unwind returns the failure that started it and nothing else: the
+/// machine is as it was, and the call can be tried again. Anything left over
+/// is a different thing to be told, because the sidecar is running and no
+/// longer has an owner.
+async fn unwound(
+    sidecar: &str,
+    source: OutrigError,
+    mut residue: Vec<OutrigError>,
+    container: Container,
+    grace: Duration,
+    abandoned: &mut Vec<Container>,
+) -> OutrigError {
+    // The handle comes back if it did not stop: a sidecar left running with
+    // nothing holding it has only `Drop`'s detached removal, which reports
+    // nothing and which `shutdown` cannot retry.
+    let Some((stopped, kept)) = container.stop_or_keep(grace).await else {
+        // Stopping it worked, so the container is gone and its namespaces with
+        // it -- including the interception a failed detach could not undo, and
+        // the rules and resolver it would have undone. `SidecarNotUnwound` is
+        // a claim that something is still running and unowned, and nothing is;
+        // the failure that started the unwind is the whole story. What detach
+        // could not do is logged rather than reported, because it no longer
+        // describes anything a caller could act on.
+        for superseded in residue {
+            tracing::warn!(
+                target: "outrig::outrig",
+                sidecar,
+                "unwinding {sidecar:?} left this ({superseded}); stopping the \
+                 container afterwards worked, so nothing is left behind"
+            );
+        }
+        // The same rule one level in: if what started the unwind was itself an
+        // attach that could not be undone, the container it was worried about
+        // is the one just confirmed gone.
+        return crate::error::superseded_by_a_confirmed_stop(source, sidecar);
+    };
+    residue.push(stopped);
+    abandoned.push(kept);
+    OutrigError::SidecarNotUnwound(Box::new(SidecarUnwindFailure {
+        sidecar: sidecar.to_string(),
+        source: Box::new(source),
+        residue,
+    }))
+}
+
 /// Connect every server in `spec` against the started sidecar and index its
 /// tools. On failure every client connected so far (including the failing
 /// one, when it got that far) is shut down before the error propagates.
@@ -1331,6 +1447,135 @@ mod tests {
 
     fn log_dir() -> PathBuf {
         PathBuf::from("logs")
+    }
+
+    /// A sidecar that could not be unwound is reported as such *and* its
+    /// container is kept. Reporting alone leaves a running sidecar with
+    /// nothing holding it, so `shutdown` has nothing to retry and the caller
+    /// is told about a container no one can do anything about.
+    #[tokio::test]
+    async fn a_sidecar_that_would_not_stop_is_kept_for_teardown() {
+        let mut abandoned = Vec::new();
+
+        let reported = unwind_sidecar(
+            "tools",
+            OutrigError::Configuration("the sidecar never came up".to_string()),
+            Container::unstoppable(),
+            Duration::from_secs(1),
+            &mut abandoned,
+        )
+        .await;
+
+        assert_eq!(
+            abandoned.len(),
+            1,
+            "a container that would not stop has to stay owned: {reported}"
+        );
+        let OutrigError::SidecarNotUnwound(failure) = &reported else {
+            panic!("a stop that failed is not a clean unwind: {reported:#?}");
+        };
+        assert_eq!(failure.sidecar, "tools");
+        assert_eq!(
+            failure.residue.len(),
+            1,
+            "and what stopping could not do is reported: {failure:#?}"
+        );
+        assert!(
+            failure.source.to_string().contains("never came up"),
+            "alongside the failure that started the unwind: {failure:#?}"
+        );
+    }
+
+    /// A stop that worked settles the question a failed detach left open. The
+    /// container is gone and its namespaces with it, so the interception the
+    /// detach could not undo is gone too -- reporting residue would send a
+    /// caller looking for something that no longer exists.
+    #[tokio::test]
+    async fn a_stop_that_worked_supersedes_a_detach_that_did_not() {
+        let mut abandoned = Vec::new();
+
+        let reported = unwound(
+            "tools",
+            OutrigError::Configuration("the servers never connected".to_string()),
+            vec![OutrigError::Configuration(
+                "detaching the interceptor failed".to_string(),
+            )],
+            // A borrowed container: stopping it is a no-op that cannot fail.
+            Container::stops_cleanly(),
+            Duration::from_secs(1),
+            &mut abandoned,
+        )
+        .await;
+
+        assert!(abandoned.is_empty(), "nothing was left to own");
+        assert!(
+            matches!(
+                reported,
+                OutrigError::Configuration(ref why) if why.contains("never connected")
+            ),
+            "a container that is gone is not residue: {reported:#?}"
+        );
+    }
+
+    /// A confirmed stop settles what the *attach* left open too. An
+    /// `attach` that could not be fully undone says the container may still
+    /// be carrying interception nothing owns -- true until the container is
+    /// gone, and handing it to a caller afterwards reports obligations
+    /// against something that no longer exists, next to "session unaffected".
+    #[tokio::test]
+    async fn a_confirmed_stop_supersedes_an_attach_that_could_not_be_undone() {
+        let mut abandoned = Vec::new();
+
+        let reported = unwind_sidecar(
+            "tools",
+            OutrigError::NetworkAttachNotUndone(Box::new(crate::error::NetworkAttachFailure {
+                container: "outrig-tools".to_string(),
+                source: Box::new(OutrigError::Configuration(
+                    "the nft apply failed".to_string(),
+                )),
+                residue: vec![OutrigError::Configuration(
+                    "and the resolver did not go back".to_string(),
+                )],
+            })),
+            Container::stops_cleanly(),
+            Duration::from_secs(1),
+            &mut abandoned,
+        )
+        .await;
+
+        assert!(abandoned.is_empty());
+        assert!(
+            matches!(reported, OutrigError::Configuration(ref why) if why.contains("nft apply")),
+            "what stopped the attach is what is left to tell: {reported:#?}"
+        );
+        assert!(
+            !reported.to_string().contains("obligation"),
+            "and not obligations against a container that is gone: {reported}"
+        );
+    }
+
+    /// The other half of the same rule: an unwind that worked reports only
+    /// what started it, and keeps nothing. A caller branches on this to say
+    /// the session is unaffected.
+    #[tokio::test]
+    async fn an_unwind_that_worked_keeps_nothing() {
+        let mut abandoned = Vec::new();
+        let reported = unwind_sidecar(
+            "tools",
+            OutrigError::Configuration("the sidecar never came up".to_string()),
+            // Nothing to stop: a borrowed container is one outrig never
+            // started, and stopping it is a no-op that cannot fail.
+            Container::stops_cleanly(),
+            Duration::from_secs(1),
+            &mut abandoned,
+        )
+        .await;
+
+        assert!(abandoned.is_empty(), "nothing was left to own");
+        assert!(
+            matches!(reported, OutrigError::Configuration(_)),
+            "a clean unwind reports what started it and nothing else: {reported:#?}"
+        );
     }
 
     #[test]

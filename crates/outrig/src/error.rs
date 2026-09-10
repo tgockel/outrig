@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -154,7 +155,11 @@ pub enum OutrigError {
         source: Box<EmbeddedImageConfigError>,
     },
 
-    #[error("{0}")]
+    // Transparent for the same reason as the network pair below: its payload
+    // carries the failure that actually stopped the server, and that is the
+    // link a consumer wants. Left inconsistent with them for a while, which
+    // is the only reason it is mentioned here.
+    #[error(transparent)]
     McpStartupFailed(Box<McpStartupFailure>),
 
     #[error("mcp server {name:?} tools/list failed: {source}")]
@@ -168,6 +173,85 @@ pub enum OutrigError {
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
     #[non_exhaustive]
     McpArgsNotObject { kind: &'static str },
+
+    /// Obligations a network detach or shutdown could not discharge. Every
+    /// obligation it owes is attempted; this carries the ones that failed, so
+    /// a container left holding the interceptor's resolver -- or a stray nft
+    /// table in its namespace -- reaches the caller rather than a log line.
+    // Transparent, and so `source()` is `None` -- deliberately. An aggregate
+    // has no single lower-level cause to point at, and its `Display` already
+    // renders every one of them with the container it belongs to, so a chain
+    // walker that stops here has still printed the whole story. Naming the
+    // boxed field as the source instead would make the same text appear twice
+    // in every rendered chain, and hand a downcaster a `Box<_>` to guess at;
+    // the structured route is matching this variant, which is why it is public
+    // and why the payload's fields are.
+    #[error(transparent)]
+    NetworkTeardown(Box<NetworkTeardownFailure>),
+
+    #[error(transparent)]
+    NetworkAttachNotUndone(Box<NetworkAttachFailure>),
+
+    #[error(transparent)]
+    SidecarNotUnwound(Box<SidecarUnwindFailure>),
+
+    #[error(
+        "{records} audit record(s) for container {container:?} could not be written; \
+         the first failed with: {source}{}",
+        match integrity {
+            Some(why) => format!(
+                "\n  and the log may hold a partial record that could not be removed: {why}"
+            ),
+            None => String::new(),
+        }
+    )]
+    #[non_exhaustive]
+    NetworkAuditUnwritten {
+        container: String,
+        /// Set when the log may hold a partial record: what stopped the writer
+        /// proving it had been removed. Kept alongside the failure that broke
+        /// the append rather than in place of it, because they are different
+        /// facts and only together do they say what state the file is in.
+        integrity: Option<Box<OutrigError>>,
+        /// How many records were lost, saturating. A container that can open
+        /// connections can make this fail as often as it likes, so what is
+        /// kept is one representative error and a count rather than one entry
+        /// apiece.
+        records: u64,
+        #[source]
+        source: Box<OutrigError>,
+    },
+
+    /// The interceptor's tasks for one container did not stop within the
+    /// grace its detach gave them and were aborted. The connections they held
+    /// are gone either way; what this reports is that they did not go on
+    /// their own, which is the symptom of one wedged somewhere it does not
+    /// watch its cancellation token.
+    #[error("network tasks did not stop within {grace:?} and were aborted")]
+    #[non_exhaustive]
+    NetworkTasksAborted { grace: Duration },
+
+    /// The connections an attachment had accepted were still running after
+    /// its tasks had been aborted.
+    ///
+    /// A different and worse thing than [`Self::NetworkTasksAborted`], which
+    /// is why it is a variant of its own: that one says the accept and DNS
+    /// loops had to be stopped, and this one says a *bridge* outlived them --
+    /// a connection possibly still moving bytes for a container the caller has
+    /// been told is detached, and possibly still owing an audit record. Both
+    /// windows can expire in one teardown, and reporting them with the same
+    /// variant left the more serious of the two unreadable.
+    #[error("connections were still running {grace:?} after this attachment's tasks were stopped")]
+    #[non_exhaustive]
+    NetworkConnectionsUnfinished { grace: Duration },
+
+    /// A network interceptor task ended in a panic.
+    #[error("a network interceptor task panicked: {source}")]
+    #[non_exhaustive]
+    NetworkTaskPanicked {
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
 impl From<tempfile::PersistError> for OutrigError {
@@ -204,6 +288,150 @@ pub struct McpStartupFailure {
     pub stderr_tail: String,
     #[source]
     pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// One obligation a network teardown owed and did not discharge, named to the
+/// container it was owed to. The obligation itself is whatever failed --
+/// [`OutrigError::Process`] names the exact argv of a resolver restore or an
+/// nft delete that exited non-zero -- so a caller can match on the cause
+/// rather than read it.
+#[derive(Debug, Error)]
+#[error("container {container:?}: {source}")]
+#[non_exhaustive]
+pub struct NetworkTeardownCause {
+    pub container: String,
+    #[source]
+    pub source: Box<OutrigError>,
+}
+
+/// Boxed payload for [`OutrigError::NetworkTeardown`], behind a `Box` for the
+/// same reason as [`McpStartupFailure`]: the variant must not bloat
+/// `OutrigError`.
+///
+/// A teardown owes obligations of unlike kinds -- a resolver restore, an nft
+/// delete, the tasks holding a container's connections -- and attempts every
+/// one of them whatever the others do, so there is rarely exactly one thing
+/// to report. `shutdown` pools every attachment's into one of these.
+#[derive(Debug, Error)]
+#[error(
+    "network teardown left {} obligation(s) undischarged:\n  {}",
+    causes.len(),
+    render_teardown_causes(causes)
+)]
+#[non_exhaustive]
+pub struct NetworkTeardownFailure {
+    pub causes: Vec<NetworkTeardownCause>,
+}
+
+/// What is left of `failed` once the container it names has been confirmed
+/// gone, with whatever it said was left behind logged under `what`.
+///
+/// A `NetworkAttachNotUndone` says an attach could not be fully undone and the
+/// container may still be carrying interception nothing owns. Stopping that
+/// container takes its namespaces and everything in them, so the claim stops
+/// being true the moment the stop is confirmed -- and a caller handed it
+/// anyway reads "could not be fully undone, N obligation(s) left" about
+/// something that no longer exists. What started the attach failure is what
+/// remains worth telling them.
+pub fn superseded_by_a_confirmed_stop(failed: OutrigError, what: &str) -> OutrigError {
+    let OutrigError::NetworkAttachNotUndone(attach) = failed else {
+        return failed;
+    };
+    let NetworkAttachFailure {
+        container,
+        source,
+        residue,
+        ..
+    } = *attach;
+    for obligation in residue {
+        tracing::warn!(
+            target: "outrig::error",
+            container,
+            "attaching {container:?} for {what} left this undone ({obligation}); \
+             stopping the container afterwards worked, so nothing is left behind"
+        );
+    }
+    *source
+}
+
+/// Boxed payload for [`OutrigError::NetworkAttachNotUndone`].
+///
+/// An attach that fails and is fully undone reports the failure that stopped
+/// it and nothing else: the container is as it was, and the call can simply be
+/// tried again. This is the other case -- the attach failed *and* putting the
+/// container back did not fully succeed -- and it is a different thing to be
+/// told, because the container may still be carrying interception that no
+/// attachment owns. `residue` is what could not be undone; each entry is still
+/// armed for the destructor to reissue, so this is a report rather than the
+/// last word.
+#[derive(Debug, Error)]
+#[error(
+    "attaching container {container:?} failed and could not be fully undone: {source}\n  \
+     {} obligation(s) left:\n  {}",
+    residue.len(),
+    render_errors(residue)
+)]
+#[non_exhaustive]
+pub struct NetworkAttachFailure {
+    pub container: String,
+    /// The failure that stopped the attach.
+    #[source]
+    pub source: Box<OutrigError>,
+    /// What undoing it could not put back.
+    pub residue: Vec<OutrigError>,
+}
+
+/// Boxed payload for [`OutrigError::SidecarNotUnwound`].
+///
+/// A sidecar that fails to come up is torn down again: detached from the
+/// interceptor, then stopped. When that teardown also fails the caller is
+/// owed both halves -- the reason the sidecar was abandoned, and the fact that
+/// a live container is still carrying whatever was done to it, with no
+/// attachment left to try again through.
+#[derive(Debug, Error)]
+#[error(
+    "sidecar {sidecar:?} failed to start and could not be fully unwound: {source}\n  \
+     {} obligation(s) left:\n  {}",
+    residue.len(),
+    render_errors(residue)
+)]
+#[non_exhaustive]
+pub struct SidecarUnwindFailure {
+    pub sidecar: String,
+    /// Why the sidecar was being torn down.
+    #[source]
+    pub source: Box<OutrigError>,
+    /// What tearing it down could not finish.
+    pub residue: Vec<OutrigError>,
+}
+
+impl SidecarUnwindFailure {
+    /// Report that `sidecar` could not be fully unwound. The type is
+    /// `#[non_exhaustive]`, so this is how anything outside the crate -- the
+    /// CLI, which starts sidecars of its own -- builds one.
+    pub fn new(sidecar: impl Into<String>, source: OutrigError, residue: Vec<OutrigError>) -> Self {
+        Self {
+            sidecar: sidecar.into(),
+            source: Box::new(source),
+            residue,
+        }
+    }
+}
+
+fn render_errors(errors: &[OutrigError]) -> String {
+    errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+fn render_teardown_causes(causes: &[NetworkTeardownCause]) -> String {
+    causes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n  ")
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;
@@ -270,6 +498,72 @@ mod tests {
     use std::io::ErrorKind;
 
     use super::*;
+
+    /// A consumer walking `source()` reaches what actually went wrong. These
+    /// carry their payload in a box, and a box named only by `{0}` in the
+    /// format string is a `Display` detail -- `source()` stopped there, so the
+    /// cause the payload carries was reachable only by matching the variant.
+    #[test]
+    fn a_boxed_failure_does_not_end_the_source_chain() {
+        use std::error::Error;
+
+        let cause = || OutrigError::Configuration("the table would not go".to_string());
+        let unwound = OutrigError::SidecarNotUnwound(Box::new(SidecarUnwindFailure::new(
+            "tools",
+            cause(),
+            vec![cause()],
+        )));
+        let source = unwound
+            .source()
+            .unwrap_or_else(|| panic!("a boxed failure has a cause: {unwound}"));
+        assert!(
+            source.to_string().contains("the table would not go"),
+            "and it is the failure that started the unwind: {source}"
+        );
+
+        let attach = OutrigError::NetworkAttachNotUndone(Box::new(NetworkAttachFailure {
+            container: "outrig-a".to_string(),
+            source: Box::new(cause()),
+            residue: vec![cause()],
+        }));
+        assert!(
+            attach
+                .source()
+                .is_some_and(|e| e.to_string().contains("would not go")),
+            "{attach}"
+        );
+
+        // The aggregate is the other shape. It has no single lower-level
+        // cause, so there is nothing for `source()` to point at -- what makes
+        // that acceptable is that its own rendering carries every cause, so a
+        // chain that stops here has still said all of it.
+        let teardown = OutrigError::NetworkTeardown(Box::new(NetworkTeardownFailure {
+            causes: vec![
+                NetworkTeardownCause {
+                    container: "outrig-a".to_string(),
+                    source: Box::new(cause()),
+                },
+                NetworkTeardownCause {
+                    container: "outrig-b".to_string(),
+                    source: Box::new(OutrigError::Configuration(
+                        "nor would the resolver".to_string(),
+                    )),
+                },
+            ],
+        }));
+        let rendered = teardown.to_string();
+        for named in [
+            "outrig-a",
+            "the table would not go",
+            "outrig-b",
+            "nor would the resolver",
+        ] {
+            assert!(
+                rendered.contains(named),
+                "every cause has to be in the rendering, missing {named:?}: {rendered}"
+            );
+        }
+    }
 
     fn spawn_err(kind: ErrorKind) -> OutrigError {
         OutrigError::Spawn {
