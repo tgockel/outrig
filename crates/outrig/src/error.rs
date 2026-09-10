@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -168,6 +169,30 @@ pub enum OutrigError {
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
     #[non_exhaustive]
     McpArgsNotObject { kind: &'static str },
+
+    /// Obligations a network detach or shutdown could not discharge. Every
+    /// obligation it owes is attempted; this carries the ones that failed, so
+    /// a container left holding the interceptor's resolver -- or a stray nft
+    /// table in its namespace -- reaches the caller rather than a log line.
+    #[error("{0}")]
+    NetworkTeardown(Box<NetworkTeardownFailure>),
+
+    /// The interceptor's tasks for one container did not stop within the
+    /// grace its detach gave them and were aborted. The connections they held
+    /// are gone either way; what this reports is that they did not go on
+    /// their own, which is the symptom of one wedged somewhere it does not
+    /// watch its cancellation token.
+    #[error("network tasks did not stop within {grace:?} and were aborted")]
+    #[non_exhaustive]
+    NetworkTasksAborted { grace: Duration },
+
+    /// A network interceptor task ended in a panic.
+    #[error("a network interceptor task panicked: {source}")]
+    #[non_exhaustive]
+    NetworkTaskPanicked {
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
 impl From<tempfile::PersistError> for OutrigError {
@@ -204,6 +229,47 @@ pub struct McpStartupFailure {
     pub stderr_tail: String,
     #[source]
     pub source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// One obligation a network teardown owed and did not discharge, named to the
+/// container it was owed to. The obligation itself is whatever failed --
+/// [`OutrigError::Process`] names the exact argv of a resolver restore or an
+/// nft delete that exited non-zero -- so a caller can match on the cause
+/// rather than read it.
+#[derive(Debug, Error)]
+#[error("container {container:?}: {source}")]
+#[non_exhaustive]
+pub struct NetworkTeardownCause {
+    pub container: String,
+    #[source]
+    pub source: Box<OutrigError>,
+}
+
+/// Boxed payload for [`OutrigError::NetworkTeardown`], behind a `Box` for the
+/// same reason as [`McpStartupFailure`]: the variant must not bloat
+/// `OutrigError`.
+///
+/// A teardown owes obligations of unlike kinds -- a resolver restore, an nft
+/// delete, the tasks holding a container's connections -- and attempts every
+/// one of them whatever the others do, so there is rarely exactly one thing
+/// to report. `shutdown` pools every attachment's into one of these.
+#[derive(Debug, Error)]
+#[error(
+    "network teardown left {} obligation(s) undischarged:\n  {}",
+    causes.len(),
+    render_teardown_causes(causes)
+)]
+#[non_exhaustive]
+pub struct NetworkTeardownFailure {
+    pub causes: Vec<NetworkTeardownCause>,
+}
+
+fn render_teardown_causes(causes: &[NetworkTeardownCause]) -> String {
+    causes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n  ")
 }
 
 pub type Result<T> = std::result::Result<T, OutrigError>;

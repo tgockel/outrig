@@ -170,7 +170,10 @@ fn curl_cmd(container: &Container, extra_args: &[&str], url: &str) -> Command {
 /// container's netns, and stops the containers.
 async fn shutdown_and_stop(interceptor: NetworkInterceptor, containers: [Container; 2]) {
     let pids = containers.each_ref().map(container_root_pid);
-    interceptor.shutdown().await;
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
     for pid in pids {
         assert!(
             !netns_has_outrig_table(pid),
@@ -219,6 +222,146 @@ fn start_http_fixture() -> (SocketAddr, std::thread::JoinHandle<()>) {
         }
     });
     (addr, handle)
+}
+
+/// A fixture that accepts one connection and then holds it open, silent, so a
+/// request made through the interceptor stays live -- and unrecorded -- until
+/// something cuts it. The channel reports the accept, so a test can be sure it
+/// is cutting a connection that exists.
+fn start_silent_fixture() -> (
+    SocketAddr,
+    std::sync::mpsc::Receiver<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind silent fixture");
+    let addr = listener.local_addr().expect("silent fixture addr");
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let _ = accepted_tx.send(());
+            // Never answers. The connection ends when the interceptor cuts it
+            // or when this fixture gives up, whichever comes first.
+            std::thread::sleep(Duration::from_secs(15));
+            drop(stream);
+        }
+    });
+    (addr, accepted_rx, handle)
+}
+
+fn read_resolv_conf(container: &Container) -> Vec<u8> {
+    run_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["cat", "/etc/resolv.conf"]),
+    )
+    .stdout
+}
+
+/// The inverse-pair property against a real container: what `attach` changed,
+/// `detach` changes back, and the connections `attach`'s listeners accepted
+/// are cut *and recorded* by the time `detach` returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detach_restores_the_resolver_and_cuts_what_it_accepted() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let context = dir.path().join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    write_curl_image_context(&context);
+    let image = ensure_curl_image(&context).await;
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    let log_dir = dir.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, &workspace).await;
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor =
+        NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+            .await
+            .expect("start interceptor");
+
+    let during = read_resolv_conf(&container);
+    assert_ne!(
+        during, before,
+        "attach should have installed its own resolver"
+    );
+    assert!(
+        String::from_utf8_lossy(&during).contains("nameserver 127.0.0.1"),
+        "resolver under interception: {}",
+        String::from_utf8_lossy(&during)
+    );
+
+    // A request nothing will ever answer, so the connection is still open --
+    // and still unrecorded -- when the detach lands on it.
+    let (fixture, accepted, fixture_thread) = start_silent_fixture();
+    let host = container_host_ipv4(&container);
+    let mut held = Command::new("podman")
+        .arg("exec")
+        .arg(container.name())
+        .args(["curl", "-sS", "--max-time", "60"])
+        .arg(format!("http://{host}:{}/held", fixture.port()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the held request");
+    accepted
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the container's request should reach the fixture");
+
+    interceptor
+        .detach(container.name())
+        .await
+        .expect("detach the container");
+
+    // Read the instant `detach` returned, with no polling: the record for a
+    // connection detach cut is an obligation it discharges before returning,
+    // not one it leaves in flight behind it.
+    let log = std::fs::read_to_string(log_dir.join("network.jsonl")).expect("read audit log");
+    assert!(
+        log.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid audit JSON"))
+            .any(|record| record["id.resp_p"] == fixture.port()),
+        "the cut connection should already be recorded, log was: {log}"
+    );
+
+    let status = held.wait().expect("wait for the held request");
+    assert!(
+        !status.success(),
+        "the held request should have been cut, not completed"
+    );
+
+    // "Recorded by the time detach returned" and "nothing is written after
+    // it" are different claims, and only the first is checked above. A
+    // connection that was merely unwatched rather than ended would still be
+    // holding a record it had not written yet.
+    let settled = log.lines().filter(|line| !line.trim().is_empty()).count();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after = std::fs::read_to_string(log_dir.join("network.jsonl")).expect("re-read audit log");
+    assert_eq!(
+        after.lines().filter(|line| !line.trim().is_empty()).count(),
+        settled,
+        "no further records may be written after detach returned, log was: {after}"
+    );
+
+    let after = read_resolv_conf(&container);
+    assert_eq!(
+        after, before,
+        "detach should restore the resolver byte for byte"
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+    let _ = fixture_thread.join();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -310,7 +453,10 @@ async fn curl_http_host_writes_allow_audit_record() {
         "audit record should include duration: {record:#?}"
     );
 
-    interceptor.shutdown().await;
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
@@ -401,7 +547,10 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     assert_eq!(record.get("orig_bytes").and_then(Value::as_u64), Some(0));
     assert_eq!(record.get("resp_bytes").and_then(Value::as_u64), Some(0));
 
-    interceptor.shutdown().await;
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
     container
         .stop(Duration::from_secs(2))
         .await
@@ -637,7 +786,10 @@ async fn a_resolved_name_grants_a_hostname_allow() {
         Some("allow[0]")
     );
 
-    interceptor.shutdown().await;
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
     container
         .stop(Duration::from_secs(2))
         .await
@@ -710,7 +862,10 @@ async fn a_forged_sni_does_not_grant_a_hostname_allow() {
     );
     assert_eq!(record.get("orig_bytes").and_then(Value::as_u64), Some(0));
 
-    interceptor.shutdown().await;
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
     container
         .stop(Duration::from_secs(2))
         .await
