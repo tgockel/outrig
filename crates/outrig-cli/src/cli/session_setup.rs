@@ -1389,8 +1389,10 @@ pub async fn teardown(
             }
         }
     }
-    if let Some(network) = network {
-        network.shutdown().await;
+    if let Some(network) = network
+        && let Err(e) = network.shutdown().await
+    {
+        tracing::warn!(target: "outrig::cli::session_setup", "network shutdown: {e}");
     }
     let SessionContainers { sidecars, primary } = containers;
     for (name, container) in sidecars {

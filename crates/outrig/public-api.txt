@@ -837,6 +837,11 @@ pub outrig::error::OutrigError::McpStartupFailed(alloc::boxed::Box<outrig::error
 #[non_exhaustive] pub outrig::error::OutrigError::McpToolsListFailed
 pub outrig::error::OutrigError::McpToolsListFailed::name: alloc::string::String
 pub outrig::error::OutrigError::McpToolsListFailed::source: alloc::boxed::Box<rmcp::service::ServiceError>
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkTaskPanicked
+pub outrig::error::OutrigError::NetworkTaskPanicked::source: tokio::runtime::task::error::JoinError
+#[non_exhaustive] pub outrig::error::OutrigError::NetworkTasksAborted
+pub outrig::error::OutrigError::NetworkTasksAborted::grace: core::time::Duration
+pub outrig::error::OutrigError::NetworkTeardown(alloc::boxed::Box<outrig::error::NetworkTeardownFailure>)
 pub outrig::error::OutrigError::NoRepoConfig
 #[non_exhaustive] pub outrig::error::OutrigError::Path
 pub outrig::error::OutrigError::Path::op: &'static str
@@ -863,6 +868,11 @@ pub outrig::error::McpStartupFailure::name: alloc::string::String
 pub outrig::error::McpStartupFailure::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
 pub outrig::error::McpStartupFailure::stderr_path: std::path::PathBuf
 pub outrig::error::McpStartupFailure::stderr_tail: alloc::string::String
+#[non_exhaustive] pub struct outrig::error::NetworkTeardownCause
+pub outrig::error::NetworkTeardownCause::container: alloc::string::String
+pub outrig::error::NetworkTeardownCause::source: alloc::boxed::Box<outrig::error::OutrigError>
+#[non_exhaustive] pub struct outrig::error::NetworkTeardownFailure
+pub outrig::error::NetworkTeardownFailure::causes: alloc::vec::Vec<outrig::error::NetworkTeardownCause>
 pub trait outrig::error::IoPathExt<T>
 pub fn outrig::error::IoPathExt::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
 impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, std::io::error::Error>
@@ -931,7 +941,7 @@ impl outrig::network::NetworkInterceptor
 pub async fn outrig::network::NetworkInterceptor::attach(&mut self, &outrig::container::Container) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::detach(&mut self, &str) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::new(&std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
-pub async fn outrig::network::NetworkInterceptor::shutdown(self)
+pub async fn outrig::network::NetworkInterceptor::shutdown(self) -> outrig::error::Result<()>
 pub async fn outrig::network::NetworkInterceptor::start(&outrig::container::Container, &std::path::Path, &str) -> outrig::error::Result<Self>
 pub async fn outrig::network::NetworkInterceptor::start_with_policy(&outrig::container::Container, &std::path::Path, &str, outrig::config::NetworkPolicy) -> outrig::error::Result<Self>
 impl core::ops::drop::Drop for outrig::network::NetworkInterceptor

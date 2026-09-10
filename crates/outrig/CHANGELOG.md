@@ -20,6 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   badly) and from `Spawn` (it never started). Receiving it means the child is already dead
   *and* already reaped -- the cooperative path waits for that before it returns.
 
+- **`OutrigError::NetworkTeardown`**, carrying a `NetworkTeardownFailure` of
+  `NetworkTeardownCause`s -- one per obligation a detach could not discharge, each naming its
+  container and boxing the error that stopped it. Detaching runs several independent
+  obligations, and one failing is no reason to skip the others, so teardown collects rather
+  than short-circuits. `NetworkTasksAborted` and `NetworkTaskPanicked` carry what used to be
+  prose: a task that had to be aborted after its grace, and one that panicked.
+
 - **`Config::validate_as_repo`**, the rules that apply to a repo config file rather than to a
   merged one. Today there is one: `[network]`'s `default`, `allow`, and `deny` describe the
   machine's egress and belong to the operator, so a repo config may declare `mode` and
@@ -37,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were its only users.
 
 ### Changed
+
+- **`NetworkInterceptor::shutdown` returns `Result<()>`.** It previously returned `()` and
+  reached `tracing::warn!` with everything that went wrong, so a session could report a clean
+  shutdown having failed to remove a container's redirect rules. `detach` kept its signature
+  and gained the same honesty: it used to return `Ok(())` unconditionally. The CLI and
+  `Outrig::shutdown` log the failure and carry on stopping containers, which is what they
+  already did for a sidecar that would not stop.
 
 - **A dropped future no longer leaves its subprocess running.** Every process outrig spawns
   is now owned: dropping the future that holds it -- which is what `tokio::time::timeout`
@@ -131,6 +145,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction rather than by a check that has to run. The signature stays infallible.
 
 ### Fixed
+
+- **A failed or interrupted `NetworkInterceptor::attach` leaves the container as it found it.**
+  `attach` rewrote the container's `/etc/resolv.conf` to point at its DNS listener and only
+  then applied the nft redirect table, so a failure in between left a *running* container
+  resolving to a loopback port with nothing behind it -- DNS dead, silently, and an error
+  returned that said nothing about it. Cancellation was worse: dropping the future anywhere
+  between the first rewrite and the `attachments` insert left both the resolver and the table
+  owned by nothing at all, since nothing had yet recorded that either was owed.
+
+  The resolver is read before it is written, and every change is armed for undo before it is
+  made. The undo list is one value that *moves*: built on `attach`'s own stack, moved into the
+  `Attachment` on success, moved on into teardown. There is no release step and so no window
+  between "the change is made" and "something owns its inverse" -- a move cannot be interrupted
+  by a cancellation, which is what makes the property structural rather than a rule about where
+  an `.await` may go. On any awaited path the undos run awaited and their failures are
+  reported; on any unawaited one, `Drop` hands each to `supervise::detach_cleanup`, which is
+  synchronous and runtime-free and therefore still completes when the runtime the caller was
+  running on is being torn down underneath it -- the case an embedder, which owns that runtime,
+  is most likely to produce.
+
+  `nft -f` commits a file as one kernel transaction, so the table a failed apply would have
+  created never exists, and the undo for it is idempotent besides. A container that has already
+  exited is asked about through `/proc/<pid>/ns/net`: it took its namespace, its table and its
+  `/etc` with it, so nothing is owed and nothing is reported.
+
+- **`detach` ends every connection it started, and says so.** The accept loop spawned each
+  bridged connection and dropped the handle, and no cancellation token reached it, so `detach`
+  cancelled two loops, deleted the nft table and returned while connections went on moving
+  bytes and appending audit records for a container the interceptor had declared detached.
+  Connections are now held in a `JoinSet` the accept loop owns and does not return without
+  draining, and the whole of each one runs under its attachment's token -- so the sniff read, a
+  stalled upstream connect, the replayed opening bytes and a mid-stream copy are all covered by
+  the same cancellation. A connection that is cut is still recorded, before `detach` returns
+  rather than after. The DNS loop's forwarding await is cancellable for the same reason; it
+  could previously hold that loop for `DNS_TIMEOUT` per resolver, well past the grace teardown
+  allows, so a detach racing an in-flight lookup reported a failure that had not happened.
+
+  Termination is cancel, a grace, abort, then an unconditional join. It previously wrapped each
+  `JoinHandle` in a `tokio::time::timeout` and dropped the expired result, which *detaches* a
+  task rather than ending it -- so a wedged loop was reported as joined -- and spent the whole
+  grace per task rather than across them. Finished connections are taken back out of the
+  carrier as they complete, so an attachment that serves a long session does not accumulate one
+  handle per connection it has ever served.
+
+- **`detach` restores the resolver it replaced**, so attach and detach are a genuine inverse
+  pair rather than a one-way door. The bytes ride back as the restoring command's own argument
+  rather than quoted into a shell script, so a resolver containing anything at all comes back
+  exactly. A container with no resolver file gets none back, which is a state to restore and
+  not an error, and one whose resolver was baked in at `podman create --dns` is the deliberate
+  exception: nothing was rewritten, so nothing is restored.
+
+- **A non-zero `nft delete` is no longer read as success.** The teardown path used
+  `try_capture_logged`, which does not check exit status.
 
 - **A repo `[network].mode` set programmatically or by direct serde is now honored.** Only
   `Config::load_from_str` could mark a `[network]` block as declared -- it re-parsed the

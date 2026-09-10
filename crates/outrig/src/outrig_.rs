@@ -1119,10 +1119,10 @@ impl Outrig {
 
     /// Shut down every MCP server (close-stdin -> 2 s grace -> SIGKILL),
     /// then detach the network interceptor from every container, stop the
-    /// sidecars, and finally stop the primary. Errors during MCP and sidecar
-    /// shutdown are logged and swallowed so a single misbehaving server or
-    /// sidecar can't strand the rest; the primary `stop` error, if any,
-    /// propagates.
+    /// sidecars, and finally stop the primary. Errors during MCP, network
+    /// and sidecar shutdown are logged and swallowed so a single misbehaving
+    /// server or sidecar can't strand the rest; the primary `stop` error, if
+    /// any, propagates.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
             sidecars,
@@ -1149,8 +1149,10 @@ impl Outrig {
                 }
             }
         }
-        if let Some(network) = network {
-            network.shutdown().await;
+        if let Some(network) = network
+            && let Err(e) = network.shutdown().await
+        {
+            tracing::warn!(target: "outrig::outrig", "network shutdown: {e}");
         }
         for (name, sidecar) in sidecars {
             if let Err(e) = sidecar.stop(SHUTDOWN_GRACE).await {

@@ -11,15 +11,9 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 `0117`-`0130` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The
 ordering below is that report's recommended sequencing: security semantics first (`0114`-`0115`,
-both landed), then lifecycle (`0116` landed, `0117` next), then the public-surface changes that
+both landed), then lifecycle (`0116` and `0117` landed), then the public-surface changes that
 have to happen before the freeze, then release engineering. Each task carries its own evidence;
 the report is not in the tree.
-
-**Process and attachment lifecycle**
-
-| Task   | What it settles                                                     |
-| ------ | ------------------------------------------------------------------- |
-| `0117` | Interceptor attach rolls back; detach ends every bridge it started  |
 
 **Public surface, before the freeze**
 

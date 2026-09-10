@@ -175,6 +175,21 @@ metadata is namespaced under `outrig.*`, including `outrig.action`, `outrig.rule
 `outrig.host` is one the interceptor validated for that address and `asserted` when the
 container merely claimed it -- only a resolved name can have granted a hostname allow rule.
 
+Interception ends with the session, and ending it is the exact inverse of starting it. Every
+connection still open through the interceptor is cut, and each one is recorded before teardown
+returns, so the last line of `network.jsonl` is written by the time the session is down rather
+than after it. The container's `/etc/resolv.conf`, which interception rewrote to point at the
+per-container DNS listener, is restored byte for byte, and the container's redirect rules are
+removed. The same applies to one sidecar detached mid-session: it goes back to resolving and
+routing the way it did before it was attached. A container whose resolver was supplied at
+creation is the one exception -- nothing was rewritten, so nothing is restored.
+
+If any part of that fails -- the resolver cannot be written back, the rules cannot be removed,
+a task does not end -- the failure is reported rather than logged and swallowed, and the
+remaining parts still run. Attaching has the same property from the other side: a failed or
+interrupted attach leaves the container exactly as it found it, so a container never ends up
+resolving to a listener that is not there.
+
 ## `outrig discard`
 
 Delete a session's entire on-disk record (including logs):

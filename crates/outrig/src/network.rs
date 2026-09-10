@@ -17,10 +17,13 @@
 //! that name.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::File as StdFile;
+use std::future::Future;
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,23 +35,24 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
     NetworkAction, NetworkEntry, NetworkHostPattern, NetworkPolicy, parse_network_host_pattern,
 };
 use crate::container::Container;
-use crate::error::{IoPathExt, OutrigError, Result};
+use crate::error::{IoPathExt, NetworkTeardownCause, NetworkTeardownFailure, OutrigError, Result};
 use crate::nsfork;
 use crate::process::{self, Cmd, Transcript};
+use crate::supervise::{Reissue, detach_cleanup};
 
 const NETWORK_LOG: &str = "network.jsonl";
 
 /// Resolver the interceptor requires inside every attached container: DNS to
 /// the loopback listener, `ndots:0` so bare names resolve without
 /// search-domain expansion. Installed by `podman exec` on running containers
-/// ([`install_audit_resolv_conf`]) and baked in via `podman create --dns` for
+/// ([`install_resolv_conf`]) and baked in via `podman create --dns` for
 /// entrypoint-stdio containers, which cannot be exec'd before start.
 pub(crate) const INTERCEPT_DNS_NAMESERVER: &str = "127.0.0.1";
 pub(crate) const INTERCEPT_DNS_OPTION: &str = "ndots:0";
@@ -60,6 +64,9 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Leading byte [`read_resolv_conf`] answers with when the container has a
+/// resolver file; anything else means it has none.
+const RESOLV_PRESENT: u8 = b'1';
 
 /// Bounds on how long one validated answer keeps authorizing an address. The
 /// floor keeps a TTL-0 answer usable by the connection that prompted it; the
@@ -404,14 +411,19 @@ pub struct NetworkInterceptor {
     attachments: BTreeMap<String, Attachment>,
 }
 
-/// Per-container interception state: the container's accept loops and the
-/// handle that deletes its nft table. Sockets live inside the container's
+/// Per-container interception state: the container's loops, the undo log for
+/// everything [`NetworkInterceptor::attach`] changed about it, and the
+/// transcript that undo is logged to. Sockets live inside the container's
 /// namespaces, so every attachment owns its own listeners and loops.
 #[derive(Debug)]
 struct Attachment {
     cancel: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
-    cleanup: Cleanup,
+    /// The accept and DNS loops. A `JoinSet` rather than handles because
+    /// dropping one aborts what it holds: an interceptor that is dropped
+    /// rather than shut down leaves nothing behind still moving bytes.
+    tasks: JoinSet<()>,
+    rollback: Rollback,
+    transcript: Option<Transcript>,
 }
 
 impl NetworkInterceptor {
@@ -482,89 +494,159 @@ impl NetworkInterceptor {
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
 
-        let cleanup = Cleanup {
+        let target = Target {
+            name: name.to_string(),
             pid,
             table: self.table.clone(),
-            transcript: container.transcript(),
+            dns_preconfigured: container.dns_preconfigured(),
         };
+        let transcript = container.transcript();
+        let run = |cmd: Cmd| run_step(cmd, transcript.clone());
 
-        // A dns-preconfigured container had the loopback resolver baked in
-        // via `podman create --dns` (`podman exec` cannot reach it before
-        // start); everything else gets the exec-based install.
-        if !container.dns_preconfigured() {
-            install_audit_resolv_conf(container).await?;
+        // The undo log is this frame's, so a caller that drops this future
+        // while a command is in flight drops it too, and its destructor puts
+        // the container back without needing a runtime to do it.
+        let mut rollback = Rollback::new(pid);
+        if let Err(e) = install_interception(&run, &mut rollback, &target, tcp_port, dns_port).await
+        {
+            for failure in rollback.undo_now(&run).await {
+                tracing::warn!(target: "outrig::network", "rolling back attach: {failure}");
+            }
+            return Err(e);
         }
-        apply_nft_rules(&cleanup, tcp_port, dns_port).await?;
 
         let bindings: Bindings = Arc::new(Mutex::new(NameBindings::default()));
         let cancel = self.cancel.child_token();
-        let tasks = vec![
-            tokio::spawn(tcp_accept_loop(
-                sockets.tcp,
-                self.audit.for_container(name),
-                bindings.clone(),
-                self.policy.clone(),
-                cancel.clone(),
-            )),
-            tokio::spawn(dns_loop(sockets.dns, bindings, cancel.clone())),
-        ];
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            sockets.tcp,
+            self.audit.for_container(name),
+            bindings.clone(),
+            self.policy.clone(),
+            cancel.clone(),
+        ));
+        tasks.spawn(dns_loop(
+            sockets.dns,
+            host_resolvers(),
+            bindings,
+            cancel.clone(),
+        ));
 
         self.attachments.insert(
             name.to_string(),
             Attachment {
                 cancel,
                 tasks,
-                cleanup,
+                rollback,
+                transcript,
             },
         );
         Ok(())
     }
 
-    /// Detaches one container: cancels its loops and deletes its nft table
-    /// without disturbing other attachments. Takes the container name rather
-    /// than a [`Container`] so an already-dead container can still be
-    /// detached (the nft delete against its defunct pid fails harmlessly).
-    /// The container's `/etc/resolv.conf` is left pointing at the loopback
-    /// listener; detach is intended to run just before the container stops.
+    /// Detaches one container, undoing exactly what [`attach`](Self::attach)
+    /// did to it: its connections are ended, its `/etc/resolv.conf` is put
+    /// back to the bytes attach found there, and its nft table is deleted.
+    /// Other attachments are undisturbed.
+    ///
+    /// Takes the container name rather than a [`Container`] so an
+    /// already-dead container can still be detached; that case is a success,
+    /// since a container that has exited took both the namespace holding the
+    /// table and the resolver worth restoring with it.
+    ///
+    /// Every obligation is attempted, and the ones that failed are reported
+    /// together as [`OutrigError::NetworkTeardown`].
     pub async fn detach(&mut self, container: &str) -> Result<()> {
         let attachment = self.attachments.remove(container).ok_or_else(|| {
             OutrigError::Configuration(format!(
                 "container {container:?} is not attached to the network interceptor"
             ))
         })?;
-        teardown_attachment(attachment).await;
-        Ok(())
+        teardown_result(teardown_attachment(container, attachment).await)
     }
 
-    pub async fn shutdown(mut self) {
+    /// Detaches every attachment, reporting what none of them could
+    /// discharge. One container's failure does not skip another's teardown.
+    pub async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
-        // Attachments live in disjoint namespaces, so their grace periods and
-        // nft deletes can overlap.
-        futures_util::future::join_all(
-            std::mem::take(&mut self.attachments)
-                .into_values()
-                .map(teardown_attachment),
-        )
-        .await;
+        // Attachments live in disjoint namespaces, so their grace periods,
+        // resolver restores and nft deletes can overlap.
+        let failures =
+            futures_util::future::join_all(std::mem::take(&mut self.attachments).into_iter().map(
+                |(name, attachment)| async move { teardown_attachment(&name, attachment).await },
+            ))
+            .await;
+        teardown_result(failures.into_iter().flatten().collect())
     }
 }
 
 impl Drop for NetworkInterceptor {
     fn drop(&mut self) {
+        // The attachments go with `self`: each one's `JoinSet` aborts its
+        // tasks and each one's `Rollback` detaches its undo commands, which
+        // is everything a destructor can do about either.
         self.cancel.cancel();
-        for attachment in self.attachments.values() {
-            attachment.cleanup.spawn_detached_delete();
-        }
     }
 }
 
-async fn teardown_attachment(attachment: Attachment) {
-    attachment.cancel.cancel();
-    for task in attachment.tasks {
-        let _ = tokio::time::timeout(SHUTDOWN_GRACE, task).await;
+/// Ends one attachment and undoes everything [`NetworkInterceptor::attach`]
+/// did to its container, returning one rendering per obligation it could not
+/// discharge.
+async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkTeardownCause> {
+    let Attachment {
+        cancel,
+        mut tasks,
+        mut rollback,
+        transcript,
+    } = attachment;
+    cancel.cancel();
+    let mut failures = stop_tasks(&mut tasks).await;
+    let run = |cmd: Cmd| run_step(cmd, transcript.clone());
+    failures.extend(rollback.undo_now(&run).await);
+    failures
+        .into_iter()
+        .map(|source| NetworkTeardownCause {
+            container: name.to_string(),
+            source: Box::new(source),
+        })
+        .collect()
+}
+
+/// Ends `tasks`, which have already been cancelled: each gets
+/// [`SHUTDOWN_GRACE`] to stop on its own, and whatever is left is aborted and
+/// then joined. The join is the point -- a handle that is merely dropped
+/// after a timeout *detaches* its task, leaving it running past the detach
+/// that was supposed to have ended it.
+async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
+    let mut failures = Vec::new();
+    let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while let Some(joined) = tasks.join_next().await {
+            // Nothing has been aborted yet, so the only way a join fails
+            // inside the grace is a task that panicked.
+            if let Err(source) = joined {
+                failures.push(OutrigError::NetworkTaskPanicked { source });
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        failures.push(OutrigError::NetworkTasksAborted {
+            grace: SHUTDOWN_GRACE,
+        });
+        tasks.shutdown().await;
     }
-    if let Err(e) = attachment.cleanup.delete_table().await {
-        tracing::warn!(target: "outrig::network", "network cleanup failed: {e}");
+    failures
+}
+
+/// One error carrying every obligation a teardown could not discharge, or
+/// `Ok(())` when it discharged them all.
+fn teardown_result(causes: Vec<NetworkTeardownCause>) -> Result<()> {
+    if causes.is_empty() {
+        Ok(())
+    } else {
+        Err(OutrigError::NetworkTeardown(Box::new(
+            NetworkTeardownFailure { causes },
+        )))
     }
 }
 
@@ -574,40 +656,155 @@ struct InterceptorSockets {
     dns: UdpSocket,
 }
 
+/// Everything the commands that install and remove interception are keyed to.
 #[derive(Debug, Clone)]
-struct Cleanup {
+struct Target {
+    name: String,
     pid: u32,
     table: String,
-    transcript: Option<Transcript>,
+    /// A container whose resolver was baked in by `podman create --dns` has
+    /// no resolv.conf to snapshot and none to put back.
+    dns_preconfigured: bool,
 }
 
-impl Cleanup {
-    async fn delete_table(&self) -> Result<()> {
-        let _ = process::try_capture_logged(
-            nsenter_nft(self.pid)
-                .args(["delete", "table", "inet"])
-                .arg(&self.table),
-            "network",
-            self.transcript.as_ref(),
-        )
-        .await?;
-        Ok(())
+/// The undo log for one container's interception.
+///
+/// Every mutation is armed here *before* it is made, so no instant exists at
+/// which the container is changed with nothing responsible for changing it
+/// back. The ordinary paths discharge it awaited and report what failed
+/// ([`Self::undo_now`]); a destructor cannot await, so `Drop` hands the same
+/// commands to [`crate::supervise`], which runs them as detached processes
+/// that survive this runtime being torn down.
+#[derive(Debug)]
+struct Rollback {
+    /// The container's init pid, used only to ask whether the namespace these
+    /// commands would enter still exists.
+    pid: u32,
+    /// Undo commands in the order their mutations were made, discharged in
+    /// reverse.
+    undo: Vec<Cmd>,
+}
+
+impl Rollback {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            undo: Vec::new(),
+        }
     }
 
-    /// The `Drop` form of [`Self::delete_table`]: a destructor cannot await an
-    /// `nsenter`, so the command is detached and its reap handed to
-    /// [`crate::supervise`].
-    fn spawn_detached_delete(&self) {
-        // Issued once: this selects a namespace by pid, and a pid is reused.
-        // A retry landing after the container exited would enter whatever
-        // holds that pid now and delete a table belonging to it.
-        crate::supervise::detach_cleanup(
-            nsenter_nft(self.pid)
-                .args(["delete", "table", "inet"])
-                .arg(&self.table),
-            crate::supervise::Reissue::Once,
-        );
+    /// Take responsibility for `undo`, before the mutation it reverses runs.
+    /// Every undo here is idempotent, so arming one that turns out never to
+    /// have been needed costs nothing -- while arming afterwards would lose
+    /// whichever mutation a cancellation landed in the middle of.
+    fn arm(&mut self, undo: Cmd) {
+        self.undo.push(undo);
     }
+
+    /// Discharges every armed undo, most recent first, returning one
+    /// rendering per command that failed. A command stays armed until it has
+    /// returned, so a cancellation mid-command leaves it to `Drop` rather
+    /// than dropping it on the floor.
+    async fn undo_now<F, Fut>(&mut self, run: &F) -> Vec<OutrigError>
+    where
+        F: Fn(Cmd) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>>>,
+    {
+        if !container_alive(self.pid) {
+            self.undo.clear();
+            return Vec::new();
+        }
+        let mut failures = Vec::new();
+        while let Some(cmd) = self.undo.last().cloned() {
+            let outcome = run(cmd).await;
+            self.undo.pop();
+            if let Err(e) = outcome {
+                failures.push(e);
+            }
+        }
+        failures
+    }
+
+    #[cfg(test)]
+    fn armed(&self) -> Vec<String> {
+        self.undo.iter().map(Cmd::render).collect()
+    }
+}
+
+impl Drop for Rollback {
+    fn drop(&mut self) {
+        if !container_alive(self.pid) {
+            return;
+        }
+        for cmd in self.undo.drain(..).rev() {
+            // Issued once: these select a container by name and a namespace
+            // by pid, and both identities are reusable. A retry landing after
+            // the container exited would rewrite some other container's file,
+            // or delete a table in some other namespace.
+            detach_cleanup(cmd, Reissue::Once);
+        }
+    }
+}
+
+/// Whether the container the undo commands target still exists. One that has
+/// exited took its namespace -- and with it the nft table, and any point in
+/// restoring its resolv.conf -- along with it, so there is nothing left to
+/// undo and nothing to report.
+fn container_alive(pid: u32) -> bool {
+    // The network namespace, not the pid. A pid entry outlives what these
+    // commands need it for -- a zombie init still has one -- and the namespace
+    // is the thing `nsenter` enters and the thing the container's `/etc` lives
+    // beside, so its absence is what actually means "there is nothing left to
+    // undo".
+    Path::new(&format!("/proc/{pid}/ns/net")).exists()
+}
+
+/// How the real interceptor runs one interception command: exit status
+/// checked -- a teardown that quietly failed is the thing this reports --
+/// output teed to the container's transcript, stdout handed back.
+async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
+    process::run_capture_logged(cmd, "network", transcript.as_ref())
+        .await
+        .map(|output| output.stdout)
+}
+
+/// The container-mutating half of [`NetworkInterceptor::attach`]: snapshot the
+/// resolver and point it at the DNS listener, then install the redirect
+/// table. Split from the socket and task plumbing, and parameterized over how
+/// a command runs, so the ordering and the rollback are exercisable without a
+/// container.
+///
+/// All-or-nothing rests on `rollback` belonging to the caller: a failure
+/// returns with the undos armed, and a caller who drops this future
+/// mid-command drops it holding them.
+async fn install_interception<F, Fut>(
+    run: &F,
+    rollback: &mut Rollback,
+    target: &Target,
+    tcp_port: u16,
+    dns_port: u16,
+) -> Result<()>
+where
+    F: Fn(Cmd) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>>>,
+{
+    // A dns-preconfigured container had the loopback resolver baked in via
+    // `podman create --dns` (`podman exec` cannot reach it before start), so
+    // there is nothing here to change and nothing to change back.
+    if !target.dns_preconfigured {
+        let snapshot = run(read_resolv_conf(&target.name)).await?;
+        rollback.arm(restore_resolv_conf(&target.name, snapshot));
+        run(install_resolv_conf(&target.name)).await?;
+    }
+
+    let mut rules = tempfile::NamedTempFile::new()?;
+    rules.write_all(nft_rules(&target.table, tcp_port, dns_port).as_bytes())?;
+    rules.as_file_mut().sync_all()?;
+    // `nft -f` applies as one kernel transaction, so the table this deletes
+    // either exists whole or was never created.
+    rollback.arm(delete_nft_table(target.pid, &target.table));
+    run(nsenter_nft(target.pid).arg("-f").arg(rules.path())).await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -781,6 +978,10 @@ fn zeek_uid() -> String {
     )
 }
 
+/// Accepts redirected connections and owns the ones it accepted. Holding them
+/// in a `JoinSet` rather than detaching them is what lets a detach end them:
+/// this task is joined, and it does not return until every connection it
+/// started has.
 async fn tcp_accept_loop(
     listener: TcpListener,
     audit: AuditSink,
@@ -788,28 +989,96 @@ async fn tcp_accept_loop(
     policy: Arc<CompiledNetworkPolicy>,
     cancel: CancellationToken,
 ) {
+    // A child of the attachment's token. Connections are still cancelled when
+    // the attachment is, but the accept-failure path below can end them
+    // without reaching the DNS listener, which is a separate socket in a
+    // separate task and is still working.
+    let conn_cancel = cancel.child_token();
+    let mut conns = JoinSet::new();
+    accept_into(
+        &listener,
+        &audit,
+        &bindings,
+        &policy,
+        &cancel,
+        &conn_cancel,
+        &mut conns,
+    )
+    .await;
+    // Every connection watches `conn_cancel`, which by here has been cancelled
+    // either way -- directly on the accept-failure path, and through its
+    // parent on the detach path -- so their records are all written before
+    // this task, and therefore the detach joining it, returns.
+    conn_cancel.cancel();
+    while conns.join_next().await.is_some() {}
+}
+
+/// The accepting half, with its carrier passed in.
+///
+/// Split out for one reason: the claim that finished connections are taken
+/// back out of the set as they complete is only observable in the set itself,
+/// and a test cannot see one the loop owns privately. Removing the
+/// `reap_finished` call below otherwise fails nothing -- a finished task is
+/// not an alive task, so no task count notices the handles piling up.
+#[allow(clippy::too_many_arguments)]
+async fn accept_into(
+    listener: &TcpListener,
+    audit: &AuditSink,
+    bindings: &Bindings,
+    policy: &Arc<CompiledNetworkPolicy>,
+    cancel: &CancellationToken,
+    conn_cancel: &CancellationToken,
+    conns: &mut JoinSet<()>,
+) {
     loop {
+        reap_finished(conns);
         tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, peer)) => {
-                        tokio::spawn(handle_tcp(
-                            stream,
-                            peer,
-                            audit.clone(),
-                            bindings.clone(),
-                            policy.clone(),
-                        ));
-                    }
+                    Ok((stream, peer)) => match original_dst(&stream) {
+                        Ok(dst) => {
+                            conns.spawn(handle_tcp(
+                                stream,
+                                peer,
+                                dst,
+                                audit.clone(),
+                                bindings.clone(),
+                                policy.clone(),
+                                conn_cancel.clone(),
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "outrig::network",
+                                "SO_ORIGINAL_DST failed: {e}"
+                            );
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(target: "outrig::network", "tcp accept failed: {e}");
+                        // The listener is gone, so this attachment is over.
+                        // Cancelling ends the connections it already has the
+                        // same cooperative way a detach would -- each still
+                        // writes its audit record -- rather than parking this
+                        // task on connections nothing is coming to end. The
+                        // child token, so a TCP listener failing does not take
+                        // this attachment's DNS interception down with it.
+                        conn_cancel.cancel();
                         break;
                     }
                 }
             }
         }
     }
+}
+
+/// Takes the handles of connections that have already finished out of
+/// `conns`. Without this a `JoinSet` only ever spawned into keeps one handle
+/// per connection the attachment has ever served, which is exactly the state
+/// a long-lived attachment must not accumulate.
+fn reap_finished(conns: &mut JoinSet<()>) {
+    while conns.try_join_next().is_some() {}
 }
 
 /// Whether the server on `port` is expected to write first. Sniffing such a
@@ -859,53 +1128,70 @@ struct ConnOutcome {
     bytes_rx: u64,
 }
 
+/// Bridges one accepted connection to `dst` and records it. `dst` is the
+/// original destination the redirect displaced, read from the socket by the
+/// accept loop.
 async fn handle_tcp(
     mut client: TcpStream,
     orig: SocketAddr,
+    dst: SocketAddr,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
+    cancel: CancellationToken,
 ) {
     let opened = SystemTime::now();
     let started = Instant::now();
-    let dst = match original_dst(&client) {
-        Ok(dst) => dst,
-        Err(e) => {
-            tracing::warn!(target: "outrig::network", "SO_ORIGINAL_DST failed: {e}");
-            return;
-        }
-    };
 
-    let sniffed = if server_speaks_first(dst.port()) {
-        Sniffed::default()
-    } else {
-        sniff_client_stream(&mut client).await
-    };
-    // Read after the sniff, not before: the window is up to `SNIFF_TIMEOUT`
-    // long, and a lookup the container completes inside it is evidence this
-    // connection is entitled to have weighed.
-    let resolved = resolved_names(&bindings, dst.ip());
-
+    // Seeded with what this destination earns on no evidence at all. A
+    // connection cut before its client ever spoke is recorded as exactly
+    // that: the decision its address alone earned, and no bytes -- which is
+    // the truth about it, since nothing it might have claimed was ever read
+    // and nothing was ever forwarded.
+    let mut resolved = ResolvedNames::default();
     let mut outcome = ConnOutcome {
-        decision: policy.decide(dst, &resolved, &sniffed.assertion),
-        service: sniffed.assertion.service(),
-        assertion: sniffed.assertion,
+        decision: policy.decide(dst, &resolved, &ClientAssertion::default()),
+        service: "-",
+        assertion: ClientAssertion::default(),
         bytes_tx: 0,
         bytes_rx: 0,
     };
-    if outcome.decision.action == NetworkAction::Deny {
-        let _ = client.shutdown().await;
-    } else {
-        proxy(
-            &mut client,
-            dst,
-            &sniffed.initial,
-            &resolved,
-            &policy,
-            &mut outcome,
-        )
+
+    // Cancellation cuts the connection wherever it is parked -- the sniff
+    // read, the upstream connect, the copy -- and falls through to the audit
+    // write below. That write is deliberately outside the cancelled region:
+    // a connection detach cut still owes a record of what it moved.
+    let _ = cancel
+        .run_until_cancelled(async {
+            let sniffed = if server_speaks_first(dst.port()) {
+                Sniffed::default()
+            } else {
+                sniff_client_stream(&mut client).await
+            };
+            // Read after the sniff, not before: the window is up to
+            // `SNIFF_TIMEOUT` long, and a lookup the container completes
+            // inside it is evidence this connection is entitled to have
+            // weighed.
+            resolved = resolved_names(&bindings, dst.ip());
+
+            outcome.decision = policy.decide(dst, &resolved, &sniffed.assertion);
+            outcome.service = sniffed.assertion.service();
+            outcome.assertion = sniffed.assertion;
+            if outcome.decision.action == NetworkAction::Deny {
+                let _ = client.shutdown().await;
+            } else {
+                proxy(
+                    &mut client,
+                    dst,
+                    &sniffed.initial,
+                    &resolved,
+                    &policy,
+                    &mut outcome,
+                )
+                .await;
+            }
+        })
         .await;
-    }
 
     write_audit(
         &audit,
@@ -994,23 +1280,30 @@ async fn bridge(
 ) {
     let (mut client_rx, mut client_tx) = client.split();
     let (mut upstream_rx, mut upstream_tx) = upstream.split();
-    let mut late = None;
 
-    // Counted as they move rather than at the end. `try_join!` cancels the
-    // sibling direction when one fails -- which the late-deny path does on
-    // purpose -- and a returned total dies with it, so bytes the container
-    // already sent or received would vanish from the audit record.
-    let mut bytes_tx = 0u64;
-    let mut bytes_rx = 0u64;
+    // Written through to the outcome as they happen rather than applied at
+    // the end. Three things end this copy without returning: `try_join!`
+    // cancelling the sibling direction when one fails (which the late-deny
+    // path does on purpose), one direction erroring, and a detach dropping
+    // this whole future -- and anything only applied on a clean return would
+    // erase from the record every byte the container had already moved, and
+    // the identity it turned out to be talking to.
+    let ConnOutcome {
+        assertion,
+        service,
+        decision,
+        bytes_tx,
+        bytes_rx,
+    } = outcome;
     let bridged = {
         let downstream = async {
-            copy_counting(&mut upstream_rx, &mut client_tx, &mut bytes_rx).await?;
+            copy_counting(&mut upstream_rx, &mut client_tx, bytes_rx).await?;
             let _ = client_tx.shutdown().await;
             io::Result::Ok(())
         };
         let upward = async {
             if !initial.is_empty() {
-                write_counting(&mut upstream_tx, initial, &mut bytes_tx).await?;
+                write_counting(&mut upstream_tx, initial, bytes_tx).await?;
             }
             if let Some(recheck) = recheck {
                 // Scoped so the sniff buffer is not held for the life of the
@@ -1018,16 +1311,19 @@ async fn bridge(
                 let mut buf = vec![0; SNIFF_BUFFER];
                 let n = client_rx.read(&mut buf).await?;
                 if n > 0 {
-                    let assertion = sniff_client_bytes(&buf[..n]).unwrap_or_default();
-                    let decision = recheck
-                        .policy
-                        .decide(recheck.dst, recheck.resolved, &assertion);
                     // `recheck` is only set when the sniff window closed with
                     // no assertion, so an empty one here re-derives the
                     // decision already taken and has nothing to record.
-                    if !assertion.is_empty() {
-                        let denied = decision.action == NetworkAction::Deny;
-                        late = Some((assertion, decision));
+                    let claimed = sniff_client_bytes(&buf[..n]).unwrap_or_default();
+                    if !claimed.is_empty() {
+                        let verdict =
+                            recheck
+                                .policy
+                                .decide(recheck.dst, recheck.resolved, &claimed);
+                        let denied = verdict.action == NetworkAction::Deny;
+                        *service = claimed.service();
+                        *assertion = claimed;
+                        *decision = verdict;
                         if denied {
                             return Err(io::Error::new(
                                 io::ErrorKind::PermissionDenied,
@@ -1035,25 +1331,18 @@ async fn bridge(
                             ));
                         }
                     }
-                    write_counting(&mut upstream_tx, &buf[..n], &mut bytes_tx).await?;
+                    write_counting(&mut upstream_tx, &buf[..n], bytes_tx).await?;
                 }
             }
-            copy_counting(&mut client_rx, &mut upstream_tx, &mut bytes_tx).await?;
+            copy_counting(&mut client_rx, &mut upstream_tx, bytes_tx).await?;
             let _ = upstream_tx.shutdown().await;
             io::Result::Ok(())
         };
         tokio::try_join!(downstream, upward)
     };
 
-    outcome.bytes_tx += bytes_tx;
-    outcome.bytes_rx += bytes_rx;
     if let Err(e) = bridged {
         tracing::debug!(target: "outrig::network", "tcp bridge ended with error: {e}");
-    }
-    if let Some((assertion, decision)) = late {
-        outcome.service = assertion.service();
-        outcome.assertion = assertion;
-        outcome.decision = decision;
     }
 }
 
@@ -1102,8 +1391,15 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
     }
 }
 
-async fn dns_loop(socket: UdpSocket, bindings: Bindings, cancel: CancellationToken) {
-    let resolvers = host_resolvers();
+/// Answers the container's lookups from the host's resolvers, recording what
+/// each name validly resolved to. `resolvers` is passed in rather than read
+/// here so a caller -- and a test -- decides who this forwards to.
+async fn dns_loop(
+    socket: UdpSocket,
+    resolvers: Vec<SocketAddr>,
+    bindings: Bindings,
+    cancel: CancellationToken,
+) {
     let mut buf = vec![0u8; 4096];
     loop {
         tokio::select! {
@@ -1120,7 +1416,18 @@ async fn dns_loop(socket: UdpSocket, bindings: Bindings, cancel: CancellationTok
                     query.as_ref().map(|query| &query.question.name)
                 );
                 let socket_ref = &socket;
-                match forward_dns(&raw, query.as_ref(), &resolvers).await {
+                // A forward waits out `DNS_TIMEOUT` per resolver, which
+                // outlasts the grace a detach gives this task. Awaited bare,
+                // a detach landing mid-query would abort this task and report
+                // the abort -- a routine detach returning an error for
+                // nothing having gone wrong.
+                let Some(forwarded) = cancel
+                    .run_until_cancelled(forward_dns(&raw, query.as_ref(), &resolvers))
+                    .await
+                else {
+                    break;
+                };
+                match forwarded {
                     Ok(response) => {
                         if let Some(query) = &query
                             && dns_response_is_bindable(&response)
@@ -1269,21 +1576,69 @@ fn select_host_resolvers(
     }
 }
 
-async fn install_audit_resolv_conf(container: &Container) -> Result<()> {
-    process::run_capture_logged(
-        Cmd::new("podman")
-            .args(["exec", "--user=0:0"])
-            .arg(container.name())
-            .args(["sh", "-c"])
-            .arg(format!(
-                "printf 'nameserver {INTERCEPT_DNS_NAMESERVER}\noptions \
-                 {INTERCEPT_DNS_OPTION}\n' > /etc/resolv.conf"
-            )),
-        "podman",
-        container.transcript().as_ref(),
+/// Reads the container's current resolver, so the undo armed against the
+/// install can put exactly that state back.
+///
+/// Answers with [`RESOLV_PRESENT`] followed by the file's bytes, or with `0`
+/// and nothing else when the container has no resolver file at all. A bare
+/// `cat` could report neither: it cannot tell an absent file from an empty
+/// one, and it fails on the absent one, which would make a container that
+/// never had a resolver impossible to attach to rather than a state to put
+/// back.
+fn read_resolv_conf(container: &str) -> Cmd {
+    Cmd::new("podman")
+        .args(["exec", "--user=0:0"])
+        .arg(container)
+        .args([
+            "sh",
+            "-c",
+            "if [ -e /etc/resolv.conf ]; then printf 1; cat /etc/resolv.conf; \
+             else printf 0; fi",
+        ])
+}
+
+/// The command that puts back whatever [`read_resolv_conf`] found: the file
+/// with exactly its old bytes, or its absence.
+fn restore_resolv_conf(container: &str, snapshot: Vec<u8>) -> Cmd {
+    match snapshot.split_first() {
+        Some((&RESOLV_PRESENT, original)) => write_resolv_conf(container, original.to_vec()),
+        _ => remove_resolv_conf(container),
+    }
+}
+
+fn remove_resolv_conf(container: &str) -> Cmd {
+    Cmd::new("podman")
+        .args(["exec", "--user=0:0"])
+        .arg(container)
+        .args(["rm", "-f", "/etc/resolv.conf"])
+}
+
+fn install_resolv_conf(container: &str) -> Cmd {
+    write_resolv_conf(
+        container,
+        format!("nameserver {INTERCEPT_DNS_NAMESERVER}\noptions {INTERCEPT_DNS_OPTION}\n").into(),
     )
-    .await?;
-    Ok(())
+}
+
+/// Writes `content` as the container's resolver.
+///
+/// `content` rides in as `sh`'s `$1` rather than being interpolated into the
+/// script, so the bytes a restore puts back -- arbitrary, since they are
+/// whatever that container happened to have -- never pass through quoting or
+/// escaping at all. `printf '%s'` completes it: no escape processing, and no
+/// newline of its own.
+/// Writes the bytes handed in as `$1` to the resolver file. A `const` so a
+/// test can run this exact script rather than a paraphrase of it -- the claim
+/// is that it reproduces arbitrary bytes, and a copy of the script proves that
+/// about the copy.
+const RESTORE_RESOLV_SCRIPT: &str = "printf '%s' \"$1\" > /etc/resolv.conf";
+
+fn write_resolv_conf(container: &str, content: Vec<u8>) -> Cmd {
+    Cmd::new("podman")
+        .args(["exec", "--user=0:0"])
+        .arg(container)
+        .args(["sh", "-c", RESTORE_RESOLV_SCRIPT, "_"])
+        .arg(OsString::from_vec(content))
 }
 
 fn require_tool(name: &str) -> Result<()> {
@@ -1357,18 +1712,10 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
     );
 }
 
-async fn apply_nft_rules(cleanup: &Cleanup, tcp_port: u16, dns_port: u16) -> Result<()> {
-    let mut file = tempfile::NamedTempFile::new()?;
-    file.write_all(nft_rules(&cleanup.table, tcp_port, dns_port).as_bytes())?;
-    file.as_file_mut().sync_all()?;
-
-    process::run_capture_logged(
-        nsenter_nft(cleanup.pid).arg("-f").arg(file.path()),
-        "network",
-        cleanup.transcript.as_ref(),
-    )
-    .await?;
-    Ok(())
+fn delete_nft_table(pid: u32, table: &str) -> Cmd {
+    nsenter_nft(pid)
+        .args(["delete", "table", "inet"])
+        .arg(table)
 }
 
 fn nsenter_nft(pid: u32) -> Cmd {
@@ -2015,6 +2362,915 @@ mod tests {
 
     fn http_request(host: &str) -> Vec<u8> {
         format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+    }
+
+    /// The resolver the fake container is holding before attach touches it.
+    /// The apostrophe is load-bearing: it is the one byte that can end a
+    /// single-quoted shell string, so a restore that mishandles it is a
+    /// restore that does not put the file back.
+    const ORIGINAL_RESOLV: &str = "nameserver 10.0.2.3\nsearch it's.test\n";
+
+    /// The `run` seam under test: records every command it is handed and does
+    /// whatever the injected plan says that command should do. This is what
+    /// lets the ordering, an nft apply that fails, and a cancellation landing
+    /// mid-mutation all be exercised with no container, no root and no
+    /// `podman` anywhere.
+    #[derive(Default)]
+    struct FakeRunner {
+        ran: Mutex<Vec<String>>,
+        /// Fragment of a rendered command that should fail instead of run.
+        fail_on: Option<&'static str>,
+        /// Fragment of a rendered command that should never complete, which
+        /// is how a cancellation is aimed at one mutation in particular.
+        hang_on: Option<&'static str>,
+    }
+
+    impl FakeRunner {
+        async fn run(&self, cmd: Cmd) -> Result<Vec<u8>> {
+            let rendered = cmd.render();
+            self.ran
+                .lock()
+                .expect("fake runner log")
+                .push(rendered.clone());
+            if self.hang_on.is_some_and(|needle| rendered.contains(needle)) {
+                std::future::pending::<()>().await;
+            }
+            if self.fail_on.is_some_and(|needle| rendered.contains(needle)) {
+                return Err(OutrigError::Configuration(format!(
+                    "injected failure: {rendered}"
+                )));
+            }
+            Ok(present_snapshot())
+        }
+
+        fn ran(&self) -> Vec<String> {
+            self.ran.lock().expect("fake runner log").clone()
+        }
+    }
+
+    /// What [`read_resolv_conf`] answers for a container holding
+    /// [`ORIGINAL_RESOLV`].
+    fn present_snapshot() -> Vec<u8> {
+        let mut snapshot = vec![RESOLV_PRESENT];
+        snapshot.extend_from_slice(ORIGINAL_RESOLV.as_bytes());
+        snapshot
+    }
+
+    /// A target whose pid is this test process: `Rollback` asks whether the
+    /// container is still alive before undoing anything, and this one is.
+    fn target() -> Target {
+        Target {
+            name: "outrig-test".to_string(),
+            pid: std::process::id(),
+            table: "outrig_test".to_string(),
+            dns_preconfigured: false,
+        }
+    }
+
+    /// R5's mechanism, on the real command path. Every other teardown test
+    /// injects failure at the runner, which means none of them would notice
+    /// `run_step` losing its exit-status check -- and a teardown that quietly
+    /// failed is the thing this reports.
+    #[tokio::test]
+    async fn a_non_zero_undo_reaches_the_caller() {
+        let mut rollback = Rollback::new(std::process::id());
+        rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 3"));
+
+        let run = |cmd: Cmd| run_step(cmd, None);
+        let failures = rollback.undo_now(&run).await;
+
+        assert_eq!(failures.len(), 1, "a non-zero undo is a failure");
+        assert!(
+            matches!(
+                failures[0],
+                OutrigError::Process {
+                    exit_code: Some(3),
+                    ..
+                }
+            ),
+            "and it arrives typed, carrying the status: {:?}",
+            failures[0]
+        );
+    }
+
+    /// The obligations are independent, so one failing is no reason to skip
+    /// the rest -- and what failed has to reach the caller naming its
+    /// container, not a log line.
+    #[tokio::test]
+    async fn every_undo_runs_after_one_fails_and_the_failures_are_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reached = dir.path().join("reached");
+        let mut rollback = Rollback::new(std::process::id());
+        // Armed first, so it is discharged last: reaching it at all is the
+        // claim.
+        rollback.arm(touch(&reached));
+        rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 1"));
+
+        let run = |cmd: Cmd| run_step(cmd, None);
+        let failures = rollback.undo_now(&run).await;
+
+        assert!(reached.exists(), "a failed undo must not cancel the rest");
+        assert_eq!(failures.len(), 1);
+
+        let err = teardown_result(
+            failures
+                .into_iter()
+                .map(|source| NetworkTeardownCause {
+                    container: "outrig-a".to_string(),
+                    source: Box::new(source),
+                })
+                .collect(),
+        )
+        .expect_err("a failed undo has to reach the caller");
+        assert!(
+            err.to_string().contains("outrig-a"),
+            "named by the container it belongs to: {err}"
+        );
+    }
+
+    /// The restore script reproduces whatever that container happened to have.
+    /// The bytes travel as `$1` so no quoting rule stands between them and the
+    /// file, but the script still has to be right: `printf '%s'` and not
+    /// `echo`, no newline of its own, and the redirect where it belongs.
+    #[tokio::test]
+    async fn the_restore_script_reproduces_arbitrary_bytes() {
+        const NASTY: &[u8] =
+            b"nameserver 10.0.0.1 # ' \"$(touch pwned)\" `id` \\ '' \n%s%d\noptions x";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("resolv.conf");
+
+        // The production script, with only its redirect retargeted.
+        let script = RESTORE_RESOLV_SCRIPT
+            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
+        run_step(
+            Cmd::new("/bin/sh")
+                .args(["-c"])
+                .arg(script)
+                .arg("_")
+                .arg(OsString::from_vec(NASTY.to_vec())),
+            None,
+        )
+        .await
+        .expect("the restore script must run");
+
+        assert_eq!(std::fs::read(&target).expect("restored").as_slice(), NASTY);
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "the snapshot is data, and must never be evaluated"
+        );
+    }
+
+    /// A command whose only effect is a file a test can wait for.
+    fn touch(path: &Path) -> Cmd {
+        Cmd::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("touch {}", path.display()))
+    }
+
+    fn wait_for(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "{} should have been created by a detached undo",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Attach mutates, and detach undoes, in opposite orders: the redirect
+    /// table goes before the resolver that was pointed at it.
+    #[tokio::test]
+    async fn interception_is_undone_in_the_reverse_of_the_order_it_was_installed() {
+        let fake = FakeRunner::default();
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id());
+
+        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            .await
+            .expect("install interception");
+        let failures = rollback.undo_now(&run).await;
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        let ran = fake.ran();
+        assert_eq!(ran.len(), 5, "{ran:#?}");
+        assert!(ran[0].contains("cat /etc/resolv.conf"), "{ran:#?}");
+        assert!(ran[1].contains("nameserver 127.0.0.1"), "{ran:#?}");
+        assert!(ran[2].contains("nft -f"), "{ran:#?}");
+        assert!(ran[3].contains("delete table inet outrig_test"), "{ran:#?}");
+        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
+        assert!(rollback.armed().is_empty(), "{:#?}", rollback.armed());
+    }
+
+    /// The resolver a restore writes is the bytes the snapshot read, with
+    /// nothing in between: they travel as an argument, so no quoting rule has
+    /// to hold for the file to come back exactly as it was.
+    #[test]
+    fn a_restore_carries_the_original_resolver_bytes_verbatim() {
+        let restore = restore_resolv_conf("outrig-test", present_snapshot());
+        assert_eq!(
+            restore.args.last().expect("resolver content"),
+            ORIGINAL_RESOLV
+        );
+    }
+
+    /// Having no resolver file at all is a state too, and the one a bare `cat`
+    /// could neither report nor put back: the restore for it removes the file
+    /// the install created rather than leaving an empty one behind.
+    #[test]
+    fn a_container_with_no_resolver_file_is_restored_to_having_none() {
+        let restore = restore_resolv_conf("outrig-test", b"0".to_vec());
+        let rendered = restore.render();
+        assert!(rendered.contains("rm -f /etc/resolv.conf"), "{rendered}");
+    }
+
+    /// A failed nft apply is a failed attach, and the resolver mutation that
+    /// preceded it is still undone: the container gets its own file back even
+    /// though the table never landed.
+    #[tokio::test]
+    async fn a_failed_nft_apply_still_restores_the_resolver() {
+        let fake = FakeRunner {
+            fail_on: Some("nft -f"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id());
+
+        let installed = install_interception(&run, &mut rollback, &target(), 4001, 4002).await;
+        assert!(installed.is_err(), "the nft apply was injected to fail");
+        rollback.undo_now(&run).await;
+
+        let ran = fake.ran();
+        assert_eq!(ran.len(), 5, "{ran:#?}");
+        assert!(ran[3].contains("delete table inet outrig_test"), "{ran:#?}");
+        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
+    }
+
+    /// Cancelled with the resolver install in flight. The undo log belongs to
+    /// the caller, not to the dropped future, so the restore is still armed
+    /// afterwards -- armed before the install ran, precisely so that a
+    /// cancellation landing inside it cannot slip between the two.
+    #[tokio::test]
+    async fn cancelling_the_resolver_install_leaves_the_restore_armed() {
+        // Only the write matches: the snapshot `printf`s too, but nothing
+        // redirects into the file except the install this aims at.
+        let fake = FakeRunner {
+            hang_on: Some("> /etc/resolv.conf"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let target = target();
+        let mut rollback = Rollback::new(std::process::id());
+        {
+            let mut installing = Box::pin(install_interception(
+                &run,
+                &mut rollback,
+                &target,
+                4001,
+                4002,
+            ));
+            assert!(
+                futures_util::poll!(&mut installing).is_pending(),
+                "the injected install never completes"
+            );
+        }
+
+        let armed = rollback.armed();
+        assert_eq!(armed.len(), 1, "{armed:#?}");
+        assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
+    }
+
+    /// Cancelled with the nft apply in flight: both mutations are armed, so
+    /// the table is deleted whether or not the transaction landed and the
+    /// resolver goes back either way.
+    #[tokio::test]
+    async fn cancelling_the_nft_apply_leaves_both_undos_armed() {
+        let fake = FakeRunner {
+            hang_on: Some("nft -f"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        let target = target();
+        let mut rollback = Rollback::new(std::process::id());
+        {
+            let mut installing = Box::pin(install_interception(
+                &run,
+                &mut rollback,
+                &target,
+                4001,
+                4002,
+            ));
+            assert!(
+                futures_util::poll!(&mut installing).is_pending(),
+                "the injected nft apply never completes"
+            );
+        }
+
+        let armed = rollback.armed();
+        assert_eq!(armed.len(), 2, "{armed:#?}");
+        assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
+        assert!(
+            armed[1].contains("delete table inet outrig_test"),
+            "{armed:#?}"
+        );
+    }
+
+    /// A container whose resolver was baked in at create time is neither read
+    /// nor written, so there is nothing about it to put back.
+    #[tokio::test]
+    async fn a_dns_preconfigured_container_has_no_resolver_to_restore() {
+        let fake = FakeRunner::default();
+        let run = |cmd: Cmd| fake.run(cmd);
+        let mut rollback = Rollback::new(std::process::id());
+        let target = Target {
+            dns_preconfigured: true,
+            ..target()
+        };
+
+        install_interception(&run, &mut rollback, &target, 4001, 4002)
+            .await
+            .expect("install interception");
+
+        let ran = fake.ran();
+        assert_eq!(ran.len(), 1, "{ran:#?}");
+        assert!(ran[0].contains("nft -f"), "{ran:#?}");
+        assert_eq!(rollback.armed().len(), 1, "{:#?}", rollback.armed());
+    }
+
+    /// A `Rollback` that is dropped rather than discharged still runs what it
+    /// is holding. There is no runtime here on purpose: this is the path a
+    /// destructor takes, and a rollback that needed a task to spawn on would
+    /// not survive the runtime it was cancelled with.
+    #[test]
+    fn a_dropped_rollback_still_issues_its_undo_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolver = dir.path().join("resolver");
+        let table = dir.path().join("table");
+
+        {
+            let mut rollback = Rollback::new(std::process::id());
+            rollback.arm(touch(&resolver));
+            rollback.arm(touch(&table));
+        }
+
+        wait_for(&resolver);
+        wait_for(&table);
+    }
+
+    /// Detaching a container that has already exited is a success: its
+    /// namespace went with it, so there is no table left to delete and no
+    /// resolv.conf left worth restoring.
+    #[tokio::test]
+    async fn an_exited_container_has_nothing_left_to_undo() {
+        let fake = FakeRunner {
+            fail_on: Some("podman"),
+            ..Default::default()
+        };
+        let run = |cmd: Cmd| fake.run(cmd);
+        // No process can hold pid 0, so this stands in for a container whose
+        // init is gone.
+        let mut rollback = Rollback::new(0);
+        rollback.arm(write_resolv_conf(
+            "outrig-test",
+            ORIGINAL_RESOLV.as_bytes().to_vec(),
+        ));
+
+        let failures = rollback.undo_now(&run).await;
+
+        assert!(failures.is_empty(), "{failures:#?}");
+        assert!(fake.ran().is_empty(), "{:#?}", fake.ran());
+    }
+
+    // -- Ending the connections a detach owes (R3) and holding no state for
+    // -- the ones it does not (R4). These drive `handle_tcp` and `dns_loop`
+    // -- over real loopback sockets: no container, no root, no nft.
+
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    fn allow_all_policy() -> Arc<CompiledNetworkPolicy> {
+        Arc::new(compiled(NetworkPolicy::allow_all()))
+    }
+
+    /// Denies everything. `SO_ORIGINAL_DST` on a connection nothing redirected
+    /// reports the accepting listener's own address, so an allowed connection
+    /// through a loop bound to that listener is bridged straight back into it
+    /// -- each one accepted, bridged, and accepted again.
+    fn deny_all_policy() -> Arc<CompiledNetworkPolicy> {
+        Arc::new(compiled(
+            NetworkPolicy::builder()
+                .default_action(NetworkAction::Deny)
+                .deny_host("*")
+                .build()
+                .expect("policy"),
+        ))
+    }
+
+    fn empty_bindings() -> Bindings {
+        Arc::new(Mutex::new(NameBindings::default()))
+    }
+
+    async fn audit_sink(dir: &Path) -> AuditSink {
+        AuditSink::open(dir.join(NETWORK_LOG), "sid-test".to_string())
+            .await
+            .expect("open audit sink")
+            .for_container("outrig-test")
+    }
+
+    /// The one record `dir`'s audit log holds, read as it is the instant it is
+    /// asked for -- no polling, no retry, so a record written late is a
+    /// failure rather than a slow pass.
+    fn only_audit_record(dir: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(NETWORK_LOG)).expect("read audit log");
+        let mut lines = text.lines();
+        let record = lines
+            .next()
+            .expect("an audit record for the cut connection");
+        assert_eq!(lines.next(), None, "exactly one connection was made");
+        serde_json::from_str(record).expect("audit record json")
+    }
+
+    /// One accepted connection, wired the way the accept loop wires one: the
+    /// client end stays with the test, the other end is what `handle_tcp` is
+    /// handed.
+    async fn accepted_connection() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let (intercepted, orig) = listener.accept().await.expect("accept");
+        (client, intercepted, orig)
+    }
+
+    /// A destination that accepts one connection and hands the server end
+    /// back, standing in for whatever the redirect displaced.
+    async fn upstream_once() -> (SocketAddr, tokio::task::JoinHandle<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("upstream addr");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        (addr, accepted)
+    }
+
+    /// A live bridged connection and the tasks holding it: the client end, the
+    /// upstream server end, and the connection's own `JoinSet`, which is what
+    /// a detach ends it through.
+    struct LiveConnection {
+        client: TcpStream,
+        upstream: TcpStream,
+        tasks: JoinSet<()>,
+        cancel: CancellationToken,
+    }
+
+    /// Brings up one connection through `handle_tcp` and returns once bytes
+    /// have demonstrably crossed it in both directions, so a test that then
+    /// cancels is cancelling something that was working.
+    async fn live_connection(dir: &Path) -> LiveConnection {
+        let (mut client, intercepted, orig) = accepted_connection().await;
+        let (dst, upstream) = upstream_once().await;
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            audit_sink(dir).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+        ));
+
+        // Written before the upstream is accepted: this is the client's
+        // opening burst, which the sniff reads and the bridge forwards.
+        client.write_all(b"before\n").await.expect("write before");
+        let mut upstream = upstream.await.expect("upstream accepted");
+        let mut sent = [0u8; 7];
+        upstream
+            .read_exact(&mut sent)
+            .await
+            .expect("the bridge should carry the opening bytes");
+        assert_eq!(&sent, b"before\n");
+
+        // And back the other way, so both byte counters have something on
+        // them by the time anything cancels this.
+        upstream.write_all(b"down!\n").await.expect("write down");
+        let mut received = [0u8; 6];
+        client
+            .read_exact(&mut received)
+            .await
+            .expect("the bridge should carry the upstream's bytes");
+        assert_eq!(&received, b"down!\n");
+
+        LiveConnection {
+            client,
+            upstream,
+            tasks,
+            cancel,
+        }
+    }
+
+    /// Cancelling an attachment cuts the connections it accepted, and it is
+    /// cut by the time the call that ends them returns -- not eventually.
+    #[tokio::test]
+    async fn a_bridged_connection_stops_carrying_bytes_once_its_attachment_is_cancelled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LiveConnection {
+            mut client,
+            mut upstream,
+            mut tasks,
+            cancel,
+        } = live_connection(dir.path()).await;
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+
+        // Asked after the call that ended it returned, rather than waited for:
+        // nothing written now can reach upstream, because nothing is left to
+        // carry it and the socket that would have went with the task.
+        let _ = client.write_all(b"after\n").await;
+        let mut after = [0u8; 6];
+        let crossed = tokio::time::timeout(Duration::from_secs(2), upstream.read(&mut after)).await;
+        assert!(
+            matches!(crossed, Ok(Ok(0)) | Ok(Err(_))),
+            "no bytes may cross a cut connection, got {crossed:?}"
+        );
+    }
+
+    /// A cut connection still owes its audit record, and owes it *before* its
+    /// task joins -- a detach that returned first would be reporting a
+    /// connection whose record had not been written.
+    #[tokio::test]
+    async fn a_cut_connection_has_its_audit_record_by_the_time_its_task_joins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LiveConnection {
+            mut tasks, cancel, ..
+        } = live_connection(dir.path()).await;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.container"], "outrig-test");
+        // The bytes that had already crossed are in the record, both
+        // directions: they are credited as they move, so the cut cannot erase
+        // them.
+        assert_eq!(record["orig_bytes"], 7);
+        assert_eq!(record["resp_bytes"], 6);
+    }
+
+    /// A connection cut before its client ever spoke is recorded as what its
+    /// address alone earned, with no bytes and no asserted identity. Nothing
+    /// it might have claimed was ever read, and nothing was ever forwarded,
+    /// so that is the whole truth about it.
+    #[tokio::test]
+    async fn a_connection_cut_before_its_client_spoke_is_recorded_by_address_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_client, intercepted, orig) = accepted_connection().await;
+        let (dst, _upstream) = upstream_once().await;
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(handle_tcp(
+            intercepted,
+            orig,
+            dst,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+        ));
+        // The client says nothing, so the connection is parked in the sniff
+        // read with no evidence yet gathered.
+        tokio::task::yield_now().await;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["outrig.action"], "allow");
+        assert_eq!(record["outrig.rule"], "default");
+        assert_eq!(record["outrig.host"], serde_json::Value::Null);
+        assert_eq!(record["orig_bytes"], 0);
+        assert_eq!(record["resp_bytes"], 0);
+        assert_eq!(record["conn_state"], "S0");
+    }
+
+    /// A connection parked with nothing to wake it -- neither peer speaks,
+    /// neither closes -- is *terminated* by the cancel, not left running
+    /// unwatched. The client's read returning EOF the moment the stop call
+    /// returns is the proof: the socket went with the task's frame, which
+    /// only happens if the task is gone.
+    #[tokio::test]
+    async fn a_connection_parked_with_nothing_to_wake_it_is_terminated_not_detached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let LiveConnection {
+            mut client,
+            upstream,
+            mut tasks,
+            cancel,
+        } = live_connection(dir.path()).await;
+        // Held open and silent for the rest of the test: the bridge has
+        // nothing to copy and no timer to expire.
+        let _upstream = upstream;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let mut buf = [0u8; 1];
+        let eof = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(
+            matches!(eof, Ok(Ok(0)) | Ok(Err(_))),
+            "the interceptor's end of a cut connection must be gone, got {eof:?}"
+        );
+        assert!(tasks.is_empty());
+    }
+
+    /// The backstop for a task that never looks at its token: it is aborted
+    /// *and joined*, so a detach can say the connections are gone rather than
+    /// merely unwatched. A `JoinHandle` dropped after a timeout would detach
+    /// its task instead, which is the bug this shape exists to avoid.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_that_ignores_cancellation_is_aborted_and_joined() {
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            // Only dropped when this task's frame is destroyed.
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let failures = stop_tasks(&mut tasks).await;
+
+        assert!(
+            matches!(
+                failures.as_slice(),
+                [OutrigError::NetworkTasksAborted { .. }]
+            ),
+            "{failures:#?}"
+        );
+        assert!(tasks.is_empty());
+        // Bounded so an implementation that detached rather than aborted
+        // fails here as an assertion instead of hanging the suite: the
+        // receiver of a sender still held by a live task simply never wakes.
+        let ended = tokio::time::timeout(Duration::from_secs(5), released)
+            .await
+            .expect("an aborted task's frame must be destroyed, not left running");
+        assert!(
+            ended.is_err(),
+            "the task must be gone, not merely unwatched"
+        );
+    }
+
+    /// A forward waits out `DNS_TIMEOUT` per resolver, well past the grace a
+    /// detach allows. The loop has to abandon one in flight, or every detach
+    /// racing a lookup would abort the task and report the abort.
+    #[tokio::test]
+    async fn the_dns_loop_does_not_outlast_a_cancellation_during_a_forward() {
+        // Receives the query and never answers it.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let resolver = blackhole.local_addr().expect("blackhole addr");
+
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind dns listener");
+        let listener_addr = socket.local_addr().expect("dns addr");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_loop(
+            socket,
+            vec![resolver],
+            empty_bindings(),
+            cancel.clone(),
+        ));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        client
+            .send_to(
+                &dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]),
+                listener_addr,
+            )
+            .await
+            .expect("send query");
+
+        // The forward is demonstrably in flight once the resolver has it.
+        let mut forwarded = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(5), blackhole.recv_from(&mut forwarded))
+            .await
+            .expect("the query should reach the resolver")
+            .expect("receive the forwarded query");
+
+        cancel.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "a cancelled dns loop must not wait out {DNS_TIMEOUT:?}"
+        );
+    }
+
+    /// Connections that have finished do not stay in the set the accept loop
+    /// keeps them in. A set only ever spawned into holds one handle per
+    /// connection the attachment has ever served.
+    #[tokio::test]
+    async fn finished_connections_do_not_pile_up_in_the_accept_loop_set() {
+        let mut conns = JoinSet::new();
+        for _ in 0..64 {
+            conns.spawn(async {});
+        }
+
+        // Bounded, so a reap that reaps nothing fails the assertion below
+        // rather than spinning here.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            reap_finished(&mut conns);
+            if conns.is_empty() {
+                break;
+            }
+        }
+
+        assert!(
+            conns.is_empty(),
+            "{} finished connections still held",
+            conns.len()
+        );
+    }
+
+    /// The same claim against the loop rather than the helper: it is the loop
+    /// that has to keep taking finished connections back out, and a test that
+    /// calls `reap_finished` itself cannot tell whether the loop still does.
+    #[tokio::test]
+    async fn the_accept_loop_keeps_taking_finished_connections_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let cancel = CancellationToken::new();
+        let conn_cancel = cancel.child_token();
+        // Held here rather than by the loop, which is the whole reason the
+        // accepting half takes it by reference.
+        let mut conns = JoinSet::new();
+
+        let token = cancel.clone();
+        let clients = tokio::spawn(async move {
+            for _ in 0..64 {
+                // Closed at once, so each connection finishes on its own and
+                // leaves its handle behind for the loop to take back.
+                drop(TcpStream::connect(addr).await.expect("connect"));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            token.cancel();
+        });
+
+        accept_into(
+            &listener,
+            &audit,
+            &empty_bindings(),
+            &deny_all_policy(),
+            &cancel,
+            &conn_cancel,
+            &mut conns,
+        )
+        .await;
+        clients.await.expect("clients");
+
+        // Not zero: whichever connection finishes after the loop's last reap
+        // is still held, and the drain that follows `accept_into` in
+        // production is what collects it. The claim is that the carrier does
+        // not grow with the number of connections served -- without the reap
+        // all 64 are still here.
+        assert!(
+            conns.len() < 8,
+            "{} of 64 finished connections were never taken back out of the carrier",
+            conns.len()
+        );
+    }
+
+    /// One attachment serving many connections leaves nothing alive for the
+    /// ones it has already closed.
+    #[tokio::test]
+    async fn many_closed_connections_leave_no_tasks_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let sink = TcpListener::bind("127.0.0.1:0").await.expect("bind sink");
+        let dst = sink.local_addr().expect("sink addr");
+        let draining = tokio::spawn(async move {
+            while let Ok((stream, _)) = sink.accept().await {
+                drop(stream);
+            }
+        });
+        let baseline = alive_tasks();
+
+        let cancel = CancellationToken::new();
+        let mut conns = JoinSet::new();
+        for _ in 0..32 {
+            let (client, intercepted, orig) = accepted_connection().await;
+            // Closed at once, so the connection runs to its natural end.
+            drop(client);
+            conns.spawn(handle_tcp(
+                intercepted,
+                orig,
+                dst,
+                audit.clone(),
+                empty_bindings(),
+                allow_all_policy(),
+                cancel.clone(),
+            ));
+        }
+        while conns.join_next().await.is_some() {}
+
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "32 closed connections left tasks behind"
+        );
+        draining.abort();
+    }
+
+    /// The accept loop does not return until the connections it started
+    /// have. Their audit records are the proof: a loop that returned early
+    /// would drop the set holding them, and an aborted connection writes
+    /// nothing at all.
+    #[tokio::test]
+    async fn the_accept_loop_waits_for_the_connections_it_started() {
+        const HELD: usize = 4;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+        ));
+
+        // Silent clients, so every connection parks in the sniff read and is
+        // still live -- and still unrecorded -- when the cancel lands. The
+        // settle is a small fraction of `SNIFF_TIMEOUT`, which is the window
+        // they are all parked in.
+        let mut clients = Vec::new();
+        for _ in 0..HELD {
+            clients.push(TcpStream::connect(addr).await.expect("connect"));
+        }
+        tokio::time::sleep(SNIFF_TIMEOUT / 5).await;
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let text = std::fs::read_to_string(dir.path().join(NETWORK_LOG)).expect("read audit log");
+        let records = text.lines().filter(|line| !line.trim().is_empty()).count();
+        assert_eq!(
+            records, HELD,
+            "every connection the loop started owes a record before it returns"
+        );
+    }
+
+    /// Repeated attach/detach cycles leave nothing behind: what a detach ends,
+    /// it ends for good, so a long session does not accumulate one set of
+    /// loops per attachment it ever had.
+    #[tokio::test]
+    async fn repeated_attach_detach_cycles_leave_no_tasks_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit = audit_sink(dir.path()).await;
+        let baseline = alive_tasks();
+
+        for _ in 0..8 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let dns = UdpSocket::bind("127.0.0.1:0").await.expect("bind dns");
+            let cancel = CancellationToken::new();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(tcp_accept_loop(
+                listener,
+                audit.clone(),
+                empty_bindings(),
+                allow_all_policy(),
+                cancel.clone(),
+            ));
+            tasks.spawn(dns_loop(dns, Vec::new(), empty_bindings(), cancel.clone()));
+
+            cancel.cancel();
+            let failures = stop_tasks(&mut tasks).await;
+            assert!(failures.is_empty(), "{failures:#?}");
+        }
+
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "eight attach/detach cycles left tasks behind"
+        );
     }
 
     #[test]
