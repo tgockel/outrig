@@ -8,7 +8,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Queue
 
-`0117`-`0130` are what is left of the 0.2.0 release gate, derived from an external
+`0117`-`0131` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The
 ordering below is that report's recommended sequencing: security semantics first (`0114`-`0115`,
 both landed), then lifecycle (`0116` landed, `0117` next), then the public-surface changes that
@@ -40,9 +40,10 @@ the report is not in the tree.
 | `0125` | The public-API snapshots are gated, not trusted                     |
 | `0126` | Documentation contracts, and a drafted 0.1 -> 0.2 migration guide   |
 | `0127` | A cancelled build owns the working containers buildah made for it   |
-| `0128` | A fresh RC, and a packaging check that can catch a reused version   |
-| `0129` | The e2e suite runs for real, on both architectures                  |
-| `0130` | 0.2.0 ships, once rc.3's exit criteria are met                      |
+| `0128` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read   |
+| `0129` | A fresh RC, and a packaging check that can catch a reused version   |
+| `0130` | The e2e suite runs for real, on both architectures                  |
+| `0131` | 0.2.0 ships, once rc.3's exit criteria are met                      |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -52,14 +53,14 @@ Cross-cutting notes the individual tasks carry rather than this file:
   their own decouple the rmcp types in `OutrigError`.
 - `0119`'s fork 3 and `0123`'s fork 2 both decide whether `Model` gains path provenance.
 - `0125` regenerates both `public-api.txt` files, so it wants to follow `0118`-`0124`.
-- `0126` writes only what is false *now*; `0130` writes the version-bearing docs, because those
-  can be written only once. `0128` -> `0130` is a loop: another RC returns to `0128`.
-- `0128` records the soak parameters before rc.3 ships; `0130` checks that record rather than
+- `0126` writes only what is false *now*; `0131` writes the version-bearing docs, because those
+  can be written only once. `0129` -> `0131` is a loop: another RC returns to `0129`.
+- `0129` records the soak parameters before rc.3 ships; `0131` checks that record rather than
   composing one after the fact.
 - `0127` is lifecycle work sitting inside the release block because it was found after the
   ordering was set: `0116` closed a process leak and opened a smaller engine-resource one, which
-  `0128` should ship rather than describe. Its acceptance needs a live engine, so it shares a
-  fixture with `0129` and runs in that harness if `0129` lands first.
+  `0129` should ship rather than describe. Its acceptance needs a live engine, so it shares a
+  fixture with `0130` and runs in that harness if `0130` lands first.
 - Gate item 17 ships **partially met**: `0125` enforces the API snapshots, and the downstream
   runtime-core surface test (`plan/next/container-surface-test.md`) is a deliberate, recorded
   exception rather than an omission.

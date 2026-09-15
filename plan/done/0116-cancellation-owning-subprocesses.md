@@ -128,7 +128,7 @@ the future is merely dropped. Ownership is structural, not a thing each call sit
   responsibility for it leaves nothing behind.
 - **Engine state, not only PIDs.** After a canceled create, `podman ps -a` lists no container
   with the reserved name; after a canceled build, no buildah working container and no temporary
-  tag survive. These belong with the live-podman work in 0129; the PID-level cases run against
+  tag survive. These belong with the live-podman work in 0130; the PID-level cases run against
   fakes and stay in the ordinary suite.
 - No zombies on the cooperative path, asserted after the awaited reap. On the drop path, no
   zombie **within the bound** -- the supervisor is what makes that assertable at all.
@@ -285,7 +285,7 @@ its Context.
   `spawn_stdio` and nothing else, and both have their own drop tests. Reaching them through
   the public API needs `bootstrap_user` first, which does real `setns` work against a live
   container that a shell-script podman cannot provide. The live-engine exec case belongs
-  with 0129. `try_capture` got a drop test of its own rather than being taken on faith,
+  with 0130. `try_capture` got a drop test of its own rather than being taken on faith,
   since "it delegates to the same abstraction" is a claim about the source, not a test.
 
 - **The fake-runtime tests mutate `PATH`, and the synchronization is `OnceLock`, not a
@@ -368,7 +368,7 @@ its Context.
 
 - **Not done here: engine-state assertions.** `podman ps -a` showing no container under the
   reserved name, and no surviving buildah working container or temporary tag, need a real
-  engine and are 0129's, as the task directs. The fakes prove outrig issues the removal;
+  engine and are 0130's, as the task directs. The fakes prove outrig issues the removal;
   only a live podman proves the engine honored it.
 
 - **Review found the guard could delete a container it never created, which is worse than the
@@ -665,8 +665,8 @@ its Context.
   would have to become a stop signal threaded through the build's callers, which is a call
   shape, not a patch. Queued with the measurement as
   `plan/todo/0127-a-canceled-build-owns-what-buildah-made.md` -- numbered rather than
-  buffered, since it has to ship in rc.3 (0128) rather than be described by it, and the
-  tasks behind it moved back one. Its live-engine assertion shares 0129's fixture, where
+  buffered, since it has to ship in rc.3 (0129) rather than be described by it, and the
+  tasks behind it moved back one. Its live-engine assertion shares 0130's fixture, where
   every other engine-state check already sits.
   `plan/next/image-cleanup-releases-its-guard-on-failure.md` records the adjacent
   pre-existing defect review raised: the cleanup helpers discard their outcome and their

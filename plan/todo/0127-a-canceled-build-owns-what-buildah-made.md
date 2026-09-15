@@ -70,9 +70,9 @@ A cancelled build leaves the engine as it found it, and what it removes is prova
 
 - **After 0116** (landed), which built `CleanupGuard`, `supervise::detach_cleanup`, and the
   per-attempt label pattern this reuses.
-- **Before 0128**, which cuts rc.3: this changes cancellation behavior, and the RC should ship it
+- **Before 0129**, which cuts rc.3: this changes cancellation behavior, and the RC should ship it
   rather than describe it.
-- **Shares a fixture with 0129**, which stands up the live-podman e2e row. If 0129 lands first,
+- **Shares a fixture with 0130**, which stands up the live-podman e2e row. If 0130 lands first,
   this task's acceptance runs in that harness rather than building its own.
 
 ## See also

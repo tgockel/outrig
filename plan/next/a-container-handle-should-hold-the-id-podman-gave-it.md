@@ -31,9 +31,9 @@ Three things to settle while doing it:
 - **`force_remove_detached`** is public and takes a name, because its caller (the session
   watcher) has no handle. It stays by-name, and stays `Reissue::Once` for that reason.
 
-## Worth doing with 0127 or 0129
+## Worth doing with 0127 or 0130
 
-0127 already reopens engine-resource ownership, and 0129 stands up the live-podman harness this
+0127 already reopens engine-resource ownership, and 0130 stands up the live-podman harness this
 needs: proving it means creating a container, letting `--rm` free its name, taking that name
 with a second container, and requiring the stale handle's `stop()` to leave the second one
 running. That is a live-engine test, not a fake one.
