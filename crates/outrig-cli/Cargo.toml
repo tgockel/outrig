@@ -14,11 +14,13 @@ repository.workspace    = true
 keywords.workspace      = true
 categories.workspace    = true
 # `public-api.txt` is a generated record of the published API, for review.
-# `tests/` must be excluded, not just skipped: Cargo strips a path-only
-# dev-dependency when publishing, so the self-dependency that exposes
-# `internal-test-api` does not survive into the `.crate`, and a shipped
-# `tests/` would fail to compile for anyone who ran it.
-exclude                 = ["public-api.txt", "tests/"]
+# `tests/` and `examples/` must be excluded, not just skipped: Cargo strips a
+# path-only dev-dependency when publishing, so the self-dependency that exposes
+# `internal-test-api` does not survive into the `.crate`, and either directory
+# would fail to compile for anyone who ran it. `examples/` is the sharper case:
+# `cargo package` builds examples during verification, so a shipped one breaks
+# the publish itself rather than only a downstream `cargo test`.
+exclude                 = ["public-api.txt", "tests/", "examples/"]
 
 [features]
 default   = []
@@ -58,11 +60,17 @@ hf-hub             = { workspace = true, optional = true }
 indexmap           = { workspace = true, default-features = true, optional = true }
 jiff               = { workspace = true, default-features = true }
 mistralrs-core     = { workspace = true, optional = true }
+nix                = { workspace = true, features = ["term"] }
 rand               = { workspace = true, default-features = true }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }
 rig                = { workspace = true, features = ["reqwest", "rustls"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
+# `buffer-redux` is not optional polish: without it rustyline drops the read-ahead
+# buffer between `readline` calls, so a paste that arrives in one read loses every
+# line after the first. The `cfg(not(buffer-redux))` fallback compiles -- it just
+# eats input. Verified by removing the feature and pasting three lines.
+rustyline          = { workspace = true, features = ["buffer-redux"] }
 schemars           = { workspace = true, default-features = true }
 serde              = { workspace = true, default-features = true, features = ["derive"] }
 serde_json         = { workspace = true, default-features = true }
