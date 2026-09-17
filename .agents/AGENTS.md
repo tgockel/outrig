@@ -23,9 +23,12 @@ the environment the agent gets to play in, leaving the agents free to work quick
 - `plan/next/` -- buffer for follow-up work discovered mid-execution (no leading
   `PPPP-NN-`). Drop entries here so the current task stays focused; the queue is folded
   into `plan/todo/` periodically.
-- `src/` -- Rust source. Single-crate layout for v0; convert to a `crates/` workspace
-  later if/when subsystems want their own published crates.
-- `tests/` -- integration tests, including e2e tests gated behind `--features e2e`.
+- `crates/` -- the Rust workspace: `outrig`, the library, and `outrig-cli`, the binary.
+  Each carries its own `src/`, `tests/`, `README.md`, `CHANGELOG.md`, and
+  `public-api.txt` snapshot.
+- `crates/*/tests/` -- integration tests. The e2e ones need a real podman and are gated
+  behind each crate's `e2e` feature (`--features outrig/e2e,outrig-cli/e2e`); CI compiles
+  them without running them.
 - `scripts/` -- repo-local tooling (doc-style audit, mdbook assets).
 - `book.toml` -- mdbook config; output goes to `target/book/`.
 
