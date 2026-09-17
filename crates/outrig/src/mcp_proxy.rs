@@ -261,7 +261,7 @@ impl<C: BackingClient> ProxyServer<C> {
     }
 
     /// Iterate the public (namespaced) names this proxy exposes, in the
-    /// order they were registered. `0040` consumes this for the startup
+    /// order they were registered. `0001-40` consumes this for the startup
     /// banner.
     pub fn iter_public_names(&self) -> impl Iterator<Item = &str> {
         self.inner.tools.iter().map(|t| t.public_name.as_str())

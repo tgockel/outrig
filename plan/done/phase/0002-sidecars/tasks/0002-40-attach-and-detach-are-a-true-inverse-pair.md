@@ -134,7 +134,7 @@ report what failed.
 
 ## Dependencies
 
-- **Hard: 0116.** The cancellation half needs a child that dies with its future; otherwise a
+- **Hard: 0002-39.** The cancellation half needs a child that dies with its future; otherwise a
   canceled `attach` still leaves the `podman exec` that rewrote `resolv.conf` running. 0002-39 is
   necessary and not sufficient -- see Context.
 

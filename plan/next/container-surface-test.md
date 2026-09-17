@@ -44,7 +44,7 @@ breaking change to them fails a test rather than a downstream build.
 
 ## Notes
 
-Originally written to land before 0095. It did not, so the churn 0002-18 introduced is already in
+Originally written to land before 0002-18. It did not, so the churn 0002-18 introduced is already in
 the tree and this test gets written against the post-0095 shape -- which is the shape `0.2.0`
 freezes, and so the better target anyway.
 

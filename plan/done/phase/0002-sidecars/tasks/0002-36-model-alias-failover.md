@@ -43,7 +43,7 @@ re-executing any container tool call the turn has already run.
 - **`ResolvedAgent` carries the chain**, via a new `ResolvedCandidate`. See Shape.
 - **`build_agent` gains a fourth construction path** and `RigAgent` a `Failover` variant.
 - **A chain-scoped retry deadline**, which is the blocker 0002-33 named and the reason this entry
-  depends on 0112. `RetryPolicy` loses `Copy`. See The shared budget.
+  depends on 0002-35. `RetryPolicy` loses `Copy`. See The shared budget.
 - **`handle_prompt_error`'s wording changes for a multi-candidate chain**, because the sentence it
   prints today is a claim about one endpoint and would become false. See The move rule.
 - **Docs**: `doc/concepts/llm-providers.md` (whose transient-failures section 0002-35 also edits,

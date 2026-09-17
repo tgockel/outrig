@@ -1,6 +1,6 @@
 //! End-to-end smoke for MCP sidecar containers. Gated behind `--features e2e`.
 //!
-//! Exercises task 0079's acceptance criteria against real podman:
+//! Exercises task 0002-02's acceptance criteria against real podman:
 //!
 //! - A declared sidecar hosts servers visible over `outrig mcp` stdio, with
 //!   read-only workspace access, session/sidecar labels, and a session record
@@ -13,7 +13,7 @@
 //! - `--network audit` attaches interception to the sidecar (loopback
 //!   resolver installed), not just the primary.
 //!
-//! And task 0080's entrypoint-stdio criteria:
+//! And task 0002-03's entrypoint-stdio criteria:
 //!
 //! - An off-the-shelf image whose ENTRYPOINT is the server serves tools with
 //!   env baked in at create; the `--rm` container reaps on clean EOF.
@@ -23,7 +23,7 @@
 //! - Stopping the entrypoint container mid-session degrades its tools to
 //!   errors while the session and primary-hosted tools survive.
 //!
-//! And task 0088's argument criterion:
+//! And task 0002-11's argument criterion:
 //!
 //! - A named block whose mcp entry omits `command` is an entrypoint host: its
 //!   `args` reach the ENTRYPOINT (the fixture exits 64 on an empty argv, and
@@ -1049,7 +1049,7 @@ async fn network_audit_attaches_interceptor_to_sidecar() {
     let sidecar = format!("outrig-{sid}-tools");
 
     // The interceptor's audit resolver must be installed in the *sidecar*,
-    // proving per-container attachment (0078 covers the mechanics; this
+    // proving per-container attachment (0002-01 covers the mechanics; this
     // covers the session wiring).
     let resolv = Command::new("podman")
         .args(["exec", &sidecar, "cat", "/etc/resolv.conf"])

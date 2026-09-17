@@ -53,7 +53,7 @@ SIGINT, panic, and last-resort `Drop` all leave no leaked containers.
 ## Notes
 
 - Don't drop into `--cap-drop=ALL` in v0; the docs explain why.
-- The bootstrap step (matching user UID/GID inside the container) is task 0009. This task only
+- The bootstrap step (matching user UID/GID inside the container) is task 0001-09. This task only
   starts and stops the container; the container is not yet useful for MCP.
 
 ## Decisions
@@ -76,7 +76,7 @@ SIGINT, panic, and last-resort `Drop` all leave no leaked containers.
 - **Panic hook chains rather than replaces.** `take_hook()` + delegate-after-cleanup so we
   don't clobber `tracing-subscriber`'s or any future library's hook. Idempotent via a
   `OnceLock<()>` so multiple `main`s / test setups can call `install_panic_hook()` safely.
-- **SIGINT plumbing deferred to 0019.** The deliverable bullet "A SIGINT cancellation
+- **SIGINT plumbing deferred to 0001-19.** The deliverable bullet "A SIGINT cancellation
   token plumbed into the calling code (run subcommand)" pre-supposes a `run` subcommand
   that doesn't exist yet. The ingredients (async `Container::stop`, `tokio::signal::ctrl_c`,
   `tokio::select!`) are all available; the actual `select!` lives with the caller and lands

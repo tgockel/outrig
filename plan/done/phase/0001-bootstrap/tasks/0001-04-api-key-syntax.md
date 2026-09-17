@@ -50,7 +50,7 @@ they never end up in committed config files.
   visible in the file paid off when wiring the error type. Custom `Serialize` writes
   `${VAR}` back so the existing round-trip test in `tests/config_schema.rs` stays green.
 - **`ApiKeyError` lives in `src/config/api_key.rs`, surfaced through `OutrigError::ApiKey`
-  via `#[from]`.** Mirrors the `Config(#[from] toml::de::Error)` pattern from 0003. Avoids
+  via `#[from]`.** Mirrors the `Config(#[from] toml::de::Error)` pattern from 0001-03. Avoids
   inflating `error.rs` with three extra variants for a feature that's contained to one
   module.
 - **Path context comes from `toml`, not from us.** Inside the custom `Deserialize`,

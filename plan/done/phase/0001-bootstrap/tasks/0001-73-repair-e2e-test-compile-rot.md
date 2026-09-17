@@ -4,7 +4,7 @@
 
 The `--features e2e` test suite does not compile (it is not run in CI, so it has
 drifted). This is independent of any single feature task; discovered while
-migrating the embedded-image e2e suites in 0072.
+migrating the embedded-image e2e suites in 0001-72.
 
 Known breakages (audit for more -- `cargo test --features e2e --no-run` stops at
 the first crate):

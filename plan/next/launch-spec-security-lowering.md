@@ -4,7 +4,7 @@
 > `[network]` block that `LaunchSpec::from_config` does not lower at all. This entry is the
 > ergonomic half for `[security]`: four hand-copied lowering sites, any of which can be forgotten.
 > A single conversion targeting `ContainerLaunchSpec` would close both, so read this before
-> taking 0118.
+> taking 0002-41.
 
 ## Problem
 

@@ -42,7 +42,7 @@ outrig's job is the adapter glue + name sanitization.
   - Cover the error path (missing file -> `ToolError::ToolCallError`).
   - **Why no `Agent`:** the LLM stack lands in tasks 0001-12 through 0001-16. `ToolDyn::call`
     is the same code path an `Agent` invokes, just without the LLM in front of it.
-    An Agent-shaped test belongs in 0019.
+    An Agent-shaped test belongs in 0001-19.
 
 ## Acceptance
 

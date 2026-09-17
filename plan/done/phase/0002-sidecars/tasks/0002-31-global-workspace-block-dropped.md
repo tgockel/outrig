@@ -79,8 +79,8 @@ Make the global `[workspace]` block either work or fail loudly, and make the doc
 
 ## Dependencies
 
-- **Soft: 0097.** Already landed. If fork 1 chooses per-key precedence, this task consumes 0002-20's
-  `ConfigSource` for `Workspace`; the two are otherwise independent.
+- **Soft: 0002-20.** Already landed. If fork 1 chooses per-key precedence, this task consumes
+  0002-20's `ConfigSource` for `Workspace`; the two are otherwise independent.
 
 ## See also
 

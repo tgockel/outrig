@@ -196,4 +196,4 @@ No new entry needed -- `doc/usage/ai-assisted-design.md` was added by
 - **Hard: 0001-55** (`outrig mcp self`). Reuses the doc bundle from
   `src/mcp_self/docs.rs`; the `--print-mcp-config` snippets reference
   the `outrig mcp self` subcommand; the doc page filled in here was
-  created in 0055.
+  created in 0001-55.

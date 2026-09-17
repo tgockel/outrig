@@ -51,7 +51,7 @@ None.
 - The `agent_flag: Option<&str>` parameter is the seam that makes this reusable: `None`
   signals "no agent resolution -- container falls back only to `default-container`,
   not to `agent.container`." `outrig run` always passes `Some(...)`; the failure-mode
-  string for `outrig mcp` is documented in 0040.
+  string for `outrig mcp` is documented in 0001-40.
 - This task touches the public API of `src/cli` only as far as adding the new module;
   external surface (binary CLI, config TOML, on-disk session format) is unchanged.
 - Cross-references to the master spec sections "Module layout" and the `SessionSetup`

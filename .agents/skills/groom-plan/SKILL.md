@@ -6,14 +6,15 @@ description: Maintain the invariants of plan/todo/ -- re-evaluate dependency ord
 # groom-plan
 
 Maintain the invariants of `plan/todo/`: every task depends only on smaller-numbered
-predecessors, and `plan/next/` items get folded in with sensible sequence numbers.
+predecessors within the same `(phase, sequence)` ordering, and `plan/next/` items get folded
+in with sensible sequence numbers.
 
 ## When to use
 
 - **After editing existing tasks in `plan/todo/`** -- a change to a task's
   `## Dependencies` may now reference a higher-numbered task, violating the ordering rule.
-- **When pulling work from `plan/next/` into `plan/todo/`** -- new tasks need a sequence
-  number and may slot between existing tasks, causing renumbering.
+- **When pulling work from `plan/next/` into `plan/todo/`** -- new tasks need a phase and a
+  sequence number, and may slot between existing tasks, causing renumbering.
 
 ## Preflight
 
@@ -33,21 +34,32 @@ Validate the current `plan/todo/` ordering:
 ```bash
 python3 - <<'PY'
 import re, os, glob
+PAIR = re.compile(r'^(\d{4})-(\d{2})-')
+DEP_PAIR = re.compile(r'\b(\d{4})-(\d{2})\b')
 violations = []
-for path in sorted(glob.glob('plan/todo/[0-9]*.md')):
+for path in sorted(glob.glob('plan/todo/[0-9][0-9][0-9][0-9]-[0-9][0-9]-*.md')):
     fname = os.path.basename(path)
-    seq = int(fname[:4])
-    text = open(path).read()
-    m = re.search(r'## Dependencies\s*\n(.*?)(?=\n##|\Z)', text, re.DOTALL)
+    m = PAIR.match(fname)
     if not m:
         continue
-    deps = m.group(1)
-    for dm in re.finditer(r'(?:^|\s)(\d{4})\b', deps):
-        if int(dm.group(1)) >= seq:
-            violations.append(f"{fname}: depends on {dm.group(1)} not < {seq:04d}")
+    self_p, self_s = int(m.group(1)), int(m.group(2))
+    text = open(path).read()
+    dep = re.search(r'## Dependencies\s*\n(.*?)(?=\n##|\Z)', text, re.DOTALL)
+    if not dep:
+        continue
+    for dp, ds in DEP_PAIR.findall(dep.group(1)):
+        if (int(dp), int(ds)) >= (self_p, self_s):
+            violations.append(
+                f"{fname}: depends on {dp}-{ds} not < {self_p:04d}-{self_s:02d}"
+            )
 print("\n".join(violations) if violations else "OK")
 PY
 ```
+
+The check reads `PPPP-NN` tuples out of `## Dependencies` and compares them as pairs, so a
+dependency in an earlier phase always satisfies a later one. Everything else in that section
+is free prose. A task may cite another repository's ids in the same shape -- keep those out
+of `## Dependencies`, or the check will read them as local.
 
 List anything in `plan/next/`:
 
@@ -66,7 +78,9 @@ Together with the user, decide:
   dependencies).
 - Which `plan/next/` entries to pull in, and where they should slot.
 
-For each move or pull-in, identify the new sequence number that satisfies:
+Phase numbers are never reassigned. A task keeps the phase it was filed under; only its
+sequence number moves. For each move or pull-in, identify the new sequence number that
+satisfies:
 
 - greater than every dependency the task has,
 - smaller than every task that already depends on it.
@@ -82,9 +96,9 @@ to the plan file before executing.
 For each renumber or pull-in:
 
 - Rename the file via `git mv plan/<old-path> plan/<new-path>`. For `plan/next/` entries
-  this also adds the `NNNN-` prefix to the filename.
-- Update the file's title heading (the `# NNNN - short-name` line at the top) to the new
-  number.
+  this also adds the `PPPP-NN-` prefix to the filename.
+- Update the file's title heading (the `# PPPP-NN -- short title` line at the top) to the
+  new number.
 - Update the `## Dependencies` section of every other `plan/todo/` file that references
   the old number, replacing it with the new number.
 - For pulled-in `plan/next/` entries, ensure the file has the four standard sections
@@ -107,7 +121,7 @@ If `plan/todo/README.md` was edited, verify it still satisfies the line-width ru
 python3 scripts/audit-doc-style.py --width-only plan/todo/README.md
 ```
 
-The script prints `Width: OK` when clean and exits non-zero on any line over 120
+The script prints `Width: OK` when clean and exits non-zero on any line over 100
 code points.
 
 ## 6. Confirm
@@ -145,9 +159,9 @@ Do not push -- the user merges or pushes when ready.
 - This skill does NOT modify task content beyond title headings and dependency
   references. Goal / Deliverables / Acceptance are owned by the task author and are
   preserved verbatim.
-- This skill does NOT touch `plan/done/`. Done tasks have stable historical numbers; if
-  a done task is referenced by a still-todo task and the todo task is renumbered, only
-  the todo task's title changes.
+- This skill does NOT touch `plan/done/phase/*/tasks/`. A finished task's phase and
+  sequence are frozen; if a done task is referenced by a still-todo task and the todo task
+  is renumbered, only the todo task's title changes.
 - A `plan/next/` entry that depends on another `plan/next/` entry must be pulled in
   alongside its dependency, with consistent ordering.
 - This is a maintenance operation, not a planning operation -- the *content* of tasks

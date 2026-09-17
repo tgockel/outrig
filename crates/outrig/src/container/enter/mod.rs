@@ -8,7 +8,7 @@
 //! it for `<arch>-unknown-linux-musl` and drops the result in `OUT_DIR`, which
 //! is embedded below.
 //!
-//! This module owns the bytes and the write; task 0090 owns the read-only
+//! This module owns the bytes and the write; task 0002-13 owns the read-only
 //! bind-mount that makes [`materialize`]'s output the sidecar's entrypoint.
 //!
 //! When the build machine lacks the musl target the embedded artifact is empty
@@ -42,7 +42,7 @@ pub fn is_available() -> bool {
 }
 
 /// Write the launcher into `session_dir` as `outrig-enter`, mode `0755`, and
-/// return its path. Task 0090 bind-mounts it read-only as the sidecar's
+/// return its path. Task 0002-13 bind-mounts it read-only as the sidecar's
 /// entrypoint. Fails when the launcher was not built into this binary.
 pub fn materialize(session_dir: &Path) -> Result<PathBuf> {
     if !is_available() {

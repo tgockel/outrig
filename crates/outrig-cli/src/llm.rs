@@ -1307,8 +1307,9 @@ async fn build_candidate(
 /// reports and moves past like any other.
 ///
 /// The first-use wait is announced by the load path itself, which is the
-/// mitigation `plan/done/0101-subagent-model-selection.md`'s decision 7 already
-/// built for exactly this surprise.
+/// mitigation that decision 7 of
+/// `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md`
+/// already built for exactly this surprise.
 #[cfg(feature = "local-llm")]
 struct LazyLocalCandidate {
     registry: Arc<LlmRegistry>,

@@ -25,7 +25,7 @@ agent, hand to REPL, run until EOF, clean up.
 - Slash command wiring:
   - `/tools` lists every registered tool with description and source server.
   - `/reset` clears the conversation history (`history.clear()`); container + MCPs stay up.
-  - `/help`, `/quit` from 0018.
+  - `/help`, `/quit` from 0001-18.
 - Iteration cap: if Rig's chat loop exceeds 50 tool calls in one turn, print
   `[outrig] tool-call iteration cap (50) reached; ending turn` on stderr and yield to user.
   (If rig-core has its own cap, this is a safety net.)
@@ -106,6 +106,6 @@ agent, hand to REPL, run until EOF, clean up.
   banner / tool-call trace / canned reply / no orphan-this-run-container.
 - **`tokio::runtime::Builder::new_current_thread()` in the binary.** Lets
   the orchestrator use `Rc<RefCell<...>>` without `Send` bounds.
-- **Sessions / per-MCP stderr persistence deferred to 0020.** This task
+- **Sessions / per-MCP stderr persistence deferred to 0001-20.** This task
   writes MCP stderr into a tempdir keyed on session id, but doesn't
   materialize a `session.json` or surface it to `outrig ls`/`logs`/`discard`.

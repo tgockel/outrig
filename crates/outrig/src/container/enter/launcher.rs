@@ -12,7 +12,7 @@
 //! the handful of libc symbols and syscall numbers it needs itself, so the
 //! embedding `build.rs` can compile it with a single `rustc` invocation.
 //!
-//! Expected launch (0090 arranges it): `--userns=container:<target>` (so we are
+//! Expected launch (0002-13 arranges it): `--userns=container:<target>` (so we are
 //! already in the user namespace that owns the target's mount namespace),
 //! `--cap-add=SYS_ADMIN` (setns is gated on it) and `--cap-add=SYS_PTRACE`
 //! (to open the target's nsfs file).

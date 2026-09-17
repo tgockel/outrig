@@ -8,7 +8,7 @@ says "Regenerate after any intentional surface change and review the diff"; 0002
 deliberately added no CI job, on the grounds that rustdoc's JSON format shifts between nightlies and
 would break CI on tool churn rather than on real changes.
 
-The cost showed up in 0095. Regenerating the snapshot dropped 87 lines that were never a surface
+The cost showed up in 0002-18. Regenerating the snapshot dropped 87 lines that were never a surface
 change: 0002-17 had left the whole `#[non_exhaustive]` block in the file twice -- once as a leading
 block above the `pub mod outrig` header, once in its sorted position. It survived a full task and
 was noticed only because a later task happened to regenerate the file.

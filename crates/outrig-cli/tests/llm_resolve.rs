@@ -1,6 +1,7 @@
-//! Integration tests for `resolve_agent` and `build_agent`. Covers
-//! every failure mode listed in `plan/done/0012-llm-resolver.md`'s test
-//! plan plus the two happy-path resolutions.
+//! Integration tests for `resolve_agent` and `build_agent`. Covers every
+//! failure mode listed in the test plan of
+//! `plan/done/phase/0001-bootstrap/tasks/0001-12-llm-resolver.md`, plus the
+//! two happy-path resolutions.
 
 #[cfg(not(feature = "local-llm"))]
 use std::path::Path;
@@ -1003,7 +1004,7 @@ preamble = "hi"
 }
 
 // ---------------------------------------------------------------------------
-// Model aliases (task 0110): one name for a model, or for an ordered set of
+// Model aliases (task 0002-33): one name for a model, or for an ordered set of
 // provider-equivalent rows. The config-layer half -- flattening order and the
 // five validation rules -- lives in `outrig/tests/config_model_alias.rs`.
 // ---------------------------------------------------------------------------

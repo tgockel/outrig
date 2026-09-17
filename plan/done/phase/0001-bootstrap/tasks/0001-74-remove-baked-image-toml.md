@@ -23,7 +23,7 @@ readers, and the documentation that describes the file model.
   `README.md` remain, with the README explaining that `outrig image build` stamps labels.
 - Remove the now-dead lib surface: `EMBEDDED_IMAGE_CONFIG_PATH`, the `podman exec cat` file
   readers (`read_embedded_image_config` and the file form of `read_standalone_image_toml`), and
-  `is_missing_embedded_image_config`. Keep the label codec/readers from 0072.
+  `is_missing_embedded_image_config`. Keep the label codec/readers from 0001-72.
 - Remove `COPY image.toml` lines from test fixtures (`embedded_image.rs`, `image_build.rs`, and
   any fixture Dockerfiles).
 - Update `outrig mcp self`: `ConfigPaths` no longer advertises an `image_config` file path --

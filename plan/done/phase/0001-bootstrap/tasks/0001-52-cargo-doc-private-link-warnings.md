@@ -37,7 +37,7 @@ afterwards.
 
 ## Notes
 
-- Discovered while landing 0038. The warnings are independent of any rmcp
+- Discovered while landing 0001-38. The warnings are independent of any rmcp
   feature change.
 - Touching `MAX_NAME_LEN` should not change `tool_name::sanitize` behaviour --
   it is a documentation-only edit.

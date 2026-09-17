@@ -154,4 +154,4 @@ Rejected alternatives, in order of how often they're likely to be re-proposed:
   transitive dep of `mistralrs-core`. When 0001-15 lands, check for overlap
   with the existing `rmcp` MCP wiring in `Cargo.toml` -- there's a non-zero
   chance `mistralrs-mcp` exposes a client we'd rather use than `rmcp` for
-  the in-process LLM's tool-call surface. Out of scope for 0014.
+  the in-process LLM's tool-call surface. Out of scope for 0001-14.

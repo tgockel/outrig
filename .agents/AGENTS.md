@@ -7,14 +7,21 @@ the environment the agent gets to play in, leaving the agents free to work quick
 ## Tree
 
 - `doc/` -- design-first documentation. Start at `doc/README.md`.
-- `plan/todo/` -- ordered implementation tasks (`NNNN-short-name.md`). The
+- `plan/todo/` -- ordered implementation tasks (`PPPP-NN-short-name.md`, where `PPPP`
+  is the 4-digit phase number and `NN` the 2-digit sequence within that phase). The
   [`plan/todo/README.md`](../plan/todo/README.md) index lists every step with its phase.
   Each task has Goal, Deliverables, Acceptance, and Dependencies; a task depends only
-  on lower-numbered predecessors.
-- `plan/done/` -- completed tasks. Each file's `## Decisions` section is the
-  authoritative record of design calls made during that task.
+  on lower-numbered predecessors in the same ordering.
+- `plan/done/` -- completed tasks, bucketed by phase as
+  `plan/done/phase/<PPPP>-<name>/tasks/PPPP-NN-short-name.md`. A task lands there as soon
+  as it is finished, so the folder appears while its phase is still open. Each file's
+  `## Decisions` section is the authoritative record of design calls made during that task.
+- `plan/phase/` -- open phase definitions as `<PPPP>-<name>/README.md` (Goal, user-visible
+  deliverables, exit criteria, linked subsystems, tasks, out of scope). When a phase closes
+  its README moves into `plan/done/phase/<PPPP>-<name>/`, beside the `tasks/` folder already
+  there. Multiple phases may be open at once; a task belongs to one via its `PPPP-` prefix.
 - `plan/next/` -- buffer for follow-up work discovered mid-execution (no leading
-  `NNNN-`). Drop entries here so the current task stays focused; the queue is folded
+  `PPPP-NN-`). Drop entries here so the current task stays focused; the queue is folded
   into `plan/todo/` periodically.
 - `src/` -- Rust source. Single-crate layout for v0; convert to a `crates/` workspace
   later if/when subsystems want their own published crates.

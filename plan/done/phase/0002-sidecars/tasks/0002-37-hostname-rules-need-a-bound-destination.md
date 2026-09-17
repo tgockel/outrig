@@ -174,7 +174,7 @@ rule that will be dropped during implementation:
 ## Dependencies
 
 None. Independent of every other queued task, which is why it leads. Its live-interceptor tier
-is exercised by 0130.
+is exercised by 0002-53.
 
 ## See also
 

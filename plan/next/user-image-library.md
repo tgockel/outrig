@@ -153,7 +153,7 @@ seconds. Editing a widely-attached library Dockerfile is therefore a slow next-s
 Each item leads with its status: **Resolved** (committed here), **Recommended** (a lean a
 prototype should confirm), or **Open** (deferred).
 
-1. **Build path for library projects -- Resolved: content-hash tags, revisiting 0071.**
+1. **Build path for library projects -- Resolved: content-hash tags, revisiting 0001-71.**
    `plan/done/phase/0001-bootstrap/tasks/0001-71-standalone-image-build.md` decided a standalone
    build has no project-level cache: it tags a stable caller-named ref, so `--no-cache` only
    forwards to buildah. That was right for a one-off `outrig image build <dir>` where the user is

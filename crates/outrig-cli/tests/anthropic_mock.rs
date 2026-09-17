@@ -727,7 +727,7 @@ async fn a_retry_mid_turn_does_not_re_run_the_tool_calls_before_it() {
 /// Failing over around `agent.prompt(..)` instead would re-execute the tool --
 /// harmless for this echo, a repeat for a container tool call that wrote
 /// something. `llm/failover.rs`'s module doc cites this test by name for that
-/// argument, and 0113 asked for it as a test rather than a comment.
+/// argument, and 0002-36 asked for it as a test rather than a comment.
 ///
 /// It carries the head's `503` case too: the first candidate fails past its
 /// bounds -- zero, here -- and the turn completes on the second.

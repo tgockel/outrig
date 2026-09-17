@@ -8,7 +8,7 @@ the only exclusion list is whatever `NO_PROXY` supplies. So a client built by
 `remote_http_client` (`crates/outrig-cli/src/llm.rs:538`) sends even `http://127.0.0.1:...`
 requests to `HTTP_PROXY` / `ALL_PROXY` when one is set and `NO_PROXY` does not cover loopback.
 
-Demonstrated while landing 0109. With `HTTP_PROXY=http://127.0.0.1:9
+Demonstrated while landing 0002-32. With `HTTP_PROXY=http://127.0.0.1:9
 ALL_PROXY=http://127.0.0.1:9`, `full_in_flight_tool_tree_shuts_down_within_the_grace` -- which
 points a provider at a loopback mock -- had **0 of 72** requests reach the mock and failed after
 its 30 s setup timeout instead of measuring anything.

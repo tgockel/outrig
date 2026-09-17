@@ -62,7 +62,7 @@ it. Filtering is enabled only with `mode = "filter"`.
 
 Deny entries are evaluated before allow entries. If neither list matches,
 `default` applies. The matcher uses DNS cache entries, HTTP `Host` headers,
-HTTPS SNI, IP address, and port as available from 0059.
+HTTPS SNI, IP address, and port as available from 0001-59.
 
 A denied connection sees a socket-level rejection, such as TCP RST or immediate
 close on CONNECT. Outrig does not print a REPL message for the denial; the user

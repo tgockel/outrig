@@ -285,7 +285,7 @@ its Context.
   `spawn_stdio` and nothing else, and both have their own drop tests. Reaching them through
   the public API needs `bootstrap_user` first, which does real `setns` work against a live
   container that a shell-script podman cannot provide. The live-engine exec case belongs
-  with 0130. `try_capture` got a drop test of its own rather than being taken on faith,
+  with 0002-53. `try_capture` got a drop test of its own rather than being taken on faith,
   since "it delegates to the same abstraction" is a claim about the source, not a test.
 
 - **The fake-runtime tests mutate `PATH`, and the synchronization is `OnceLock`, not a

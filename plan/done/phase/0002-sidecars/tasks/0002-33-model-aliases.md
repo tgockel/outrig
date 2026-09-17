@@ -644,7 +644,7 @@ should confirm), or **Open** (deferred).
   finding: `selectability` predicts two later stages (the api-key resolution here, the
   `local-llm` check in `build_agent`) and nothing links them, so a precondition added to either
   goes stale silently. The fix reshapes `build_agent`, which `plan/todo/0113` also rewrites.
-  Documented at the definition instead; worth folding into 0113.
+  Documented at the definition instead; worth folding into 0002-36.
 
 ### Review follow-ups
 

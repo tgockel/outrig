@@ -199,9 +199,9 @@ None.
   with a `rustup target add` hint. `build.rs` emits `rerun-if-changed` for the target's sysroot
   lib dir (named by `rustc --print target-libdir` even when absent), so a later `rustup target
   add` auto-triggers a rebuild -- verified by removing and re-adding the target.
-- **Container-level acceptance is manual / exercised by 0090.** 0002-12 alone cannot launch a
+- **Container-level acceptance is manual / exercised by 0002-13.** 0002-12 alone cannot launch a
   sidecar, so the setns/graft/MCP-handshake and the SYS_ADMIN/SYS_PTRACE negative cases are run
   by hand against a live session (per the prototype's `21-`/`22-` scripts). Automated coverage:
   static-ELF embedding + `0755` materialization + the ELF/shebang parser.
 - **No `doc/` changes:** the helper is internal; the user-facing `view = "primary"` surface lands
-  with 0090.
+  with 0002-13.

@@ -1,4 +1,4 @@
-//! Schema tests for the `LlmProvider` tagged-enum (task 0013). Exercises
+//! Schema tests for the `LlmProvider` tagged-enum (task 0001-13). Exercises
 //! parse + validate paths the existing `config_schema` and `config_merge`
 //! tests don't cover -- the mistralrs variant invariants, the typo error
 //! message, and `model-cache-root` validation.

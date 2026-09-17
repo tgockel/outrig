@@ -18,7 +18,7 @@ outrig-enter: open node: No such file or directory (os error 2)
 This is exactly `docker.io/mcp/filesystem:latest`, which is the image the quickstart
 one-liner in `doc/concepts/mcp-servers.md` uses, and the image
 `crates/outrig-cli/tests/primary_view_e2e.rs` runs. **That e2e fails on trunk today** --
-verified against an unmodified `43dea081` worktree, so it predates 0096.
+verified against an unmodified `43dea081` worktree, so it predates 0002-19.
 
 0002-19 fixed the *other* half of this: `build_primary_view_argv` was graft-prefixing the
 payload program as well, while the launcher already re-prefixes it itself when handing the

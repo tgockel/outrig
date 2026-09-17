@@ -24,7 +24,7 @@ Converting positional params to an options struct, sealing a trait, and privatiz
 each a break. Doing them now is the whole point; doing any of them in `0.2.1` is a second break
 for the same benefit.
 
-**Items 1 and 2 are conditional on 0093.** If that task demotes `container` and `mcp_proxy` out
+**Items 1 and 2 are conditional on 0002-16.** If that task demotes `container` and `mcp_proxy` out
 of the public surface, `create_initialized`'s param list and `BackingClient`'s implementability
 stop being SemVer commitments and both items evaporate -- an even better outcome than fixing
 them. Check 0002-16's decision before starting; this task may reduce to item 3 alone.
@@ -98,8 +98,8 @@ in-repo `.0` use site.
 
 ## Dependencies
 
-- **0093.** Determines whether items 1 and 2 exist at all.
-- **0094.** The options struct introduced here must follow the same `#[non_exhaustive]`
+- **0002-16.** Determines whether items 1 and 2 exist at all.
+- **0002-17.** The options struct introduced here must follow the same `#[non_exhaustive]`
   conventions the sweep establishes, rather than inventing a second style.
 
 ## See also
@@ -160,7 +160,7 @@ in-repo `.0` use site.
 
 7. **The API snapshot lost 87 lines that were never a surface change.**
    `crates/outrig/public-api.txt` had the whole `#[non_exhaustive]` block committed twice --
-   once as a leading block, once in its sorted position -- from 0094. Regenerating with the
+   once as a leading block, once in its sorted position -- from 0002-17. Regenerating with the
    pinned `cargo-public-api` 0.52.0 dropped the duplicate. The real diff is this task's three
    items and nothing else.
 

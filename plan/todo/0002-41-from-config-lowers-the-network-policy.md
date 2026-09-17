@@ -66,7 +66,7 @@ so a `LaunchSpec` built from a config enforces what that config declared.
 
 ## Dependencies
 
-- **Hard: after 0115.** That task may reshape `NetworkConfig` -- an optional declared mode with
+- **Hard: after 0002-38.** That task may reshape `NetworkConfig` -- an optional declared mode with
   an effective accessor is its recommended shape -- and this task lowers exactly that field.
   Lowering the old shape first means writing the lowering twice, and the second write is the one
   that would be done in a hurry.

@@ -99,7 +99,7 @@ runtime and at build-validation time, replacing the `podman exec cat` file read.
    schema-version branching. No inverse metadata decoder either (description/version/tags are
    write-only here) -- add it when a remote-ref / `image inspect` task needs to read them back.
 
-5. **Doc split with 0073.** Read-mechanism statements were flipped to OCI labels now; the init
+5. **Doc split with 0001-73.** Read-mechanism statements were flipped to OCI labels now; the init
    scaffold's Dockerfile `COPY` (still emitted this task) and its doc/README mentions are left
    for 0001-73, which removes the baked file.
 

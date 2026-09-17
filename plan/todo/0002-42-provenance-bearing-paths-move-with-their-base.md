@@ -117,7 +117,7 @@ One rule for every provenance-bearing path field: the value and its base directo
 ## Dependencies
 
 - **Hard: before the 0.2.0 freeze**, which is what puts it in this queue rather than the buffer.
-  Coordinate fork 3 with 0123.
+  Coordinate fork 3 with 0002-46.
   Making a public field private is a break `#[non_exhaustive]` does not cover, same as 0002-31's
   field-type change. After the freeze this costs a major version and is probably not worth it.
 - Land before 0002-48 regenerates the API snapshot.

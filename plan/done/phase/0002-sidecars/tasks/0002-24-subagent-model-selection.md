@@ -383,17 +383,17 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **0093.** The deliverable list above leaves open whether to add a `known` field to
+- **0002-16.** The deliverable list above leaves open whether to add a `known` field to
   `LlmResolveError::UnknownModel` or to compose the enumeration at the tool boundary. If 0002-16
   de-publishes the `outrig-cli` internals, `LlmResolveError` stops being a public commitment and
   the question becomes a free internal choice rather than a SemVer decision.
-- **0098.** That task adds a third provider style and a third `RigAgent` variant, and already
+- **0002-21.** That task adds a third provider style and a third `RigAgent` variant, and already
   lists auditing the provider matches in `subagent/mod.rs` among its deliverables. The two
   compose without conflict -- a third arm on a runtime-dispatched enum is still no new dispatch
   for this feature -- but whichever lands second inherits the other's match arms. Landing the
   provider work first also makes the payoff here larger, since a cheap-model subagent under an
   expensive parent is most compelling across providers.
-- **0100.** The containment half of the same concern: model choice makes wide fan-out more
+- **0002-23.** The containment half of the same concern: model choice makes wide fan-out more
   expensive rather than merely slower, so the cap should already be in place.
 - **Soft: the `--model` override path.** `resolve_agent_with_overrides` and its
   `llm_resolve.rs` coverage are the machinery reused here.

@@ -2,7 +2,7 @@
 //!
 //! Container-level behavior (setns, graft, MCP handshake, the SYS_ADMIN /
 //! SYS_PTRACE negative cases) needs a running OutRig session and podman, so it
-//! is exercised by task 0090 and by hand against a live session -- see the
+//! is exercised by task 0002-13 and by hand against a live session -- see the
 //! prototype's `21-sidecar-setns.sh` / `22-sidecar-mcp-demo.sh`.
 
 use std::os::unix::fs::PermissionsExt;

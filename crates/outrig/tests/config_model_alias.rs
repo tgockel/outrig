@@ -1,4 +1,4 @@
-//! Config-layer tests for `[models.<name>].alias` (task 0110): the flattening
+//! Config-layer tests for `[models.<name>].alias` (task 0002-33): the flattening
 //! walk's ordering and cycle rules, and the five validation rules that guard
 //! the two model shapes.
 //!

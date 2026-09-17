@@ -16,7 +16,7 @@ on these helpers.
 - `src/repo.rs::global_config_path(override: Option<&Path>) -> PathBuf` -- resolution order:
   `override` flag value > `$XDG_CONFIG_HOME/outrig/config.toml` (via
   `directories::ProjectDirs::from`) > `~/.outrig/config.toml`.
-- Wire `--config` and `--global-config` global flags into the clap `Cli` struct from 0001.
+- Wire `--config` and `--global-config` global flags into the clap `Cli` struct from 0001-01.
 - `tests/repo_paths.rs` covering:
   - No `.agents/outrig/` anywhere up the tree -> well-formed error.
   - Nested cwd finds the parent's config.

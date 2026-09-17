@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     /// The two bounds are distinct fields, not one field that means different
-    /// things depending on state -- 0113 reads the short one directly.
+    /// things depending on state -- 0002-36 reads the short one directly.
     #[test]
     fn the_two_bounds_are_separately_named_and_differently_sized() {
         let policy = RetryPolicy::default();

@@ -48,7 +48,7 @@ Let a mount diagnostic name its declaring file, the way an image diagnostic alre
   already has `global_mount_is_not_satisfied_by_a_repo_path` -- the exact case whose message is
   currently misleading.
 - Regenerate `crates/outrig/public-api.txt` and add a `### Changed` CHANGELOG entry; this is a
-  breaking change to a public enum, unlike 0097.
+  breaking change to a public enum, unlike 0002-20.
 
 ## Acceptance
 

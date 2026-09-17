@@ -67,7 +67,7 @@ exactly this class (`McpServerSpec::Full` gaining `args`, `SidecarConfig` gainin
 fields) -- direct evidence that this surface grows along precisely the axes the insulation
 patterns would protect.
 
-The obvious response is to annotate everything. That is 0002-17 and 0095. This task comes first
+The obvious response is to annotate everything. That is 0002-17 and 0002-18. This task comes first
 because **reducing reach strictly dominates annotating**: a type nobody can name has no SemVer
 hazard at all, needs no attribute, and costs nothing to change later. Settling reach first deletes
 roughly a dozen rows from 0002-17's table and can make 0002-18's `create_initialized` options struct
@@ -133,7 +133,7 @@ applies only to types that are deliberately public.
 
 ## Dependencies
 
-- **0092.** `crates/outrig/tests/library_surface.rs` is `required-features = ["e2e"]`
+- **0002-15.** `crates/outrig/tests/library_surface.rs` is `required-features = ["e2e"]`
   (`crates/outrig/Cargo.toml:20-22`) and the e2e suite does not compile today. That test is both
   the evidence for the reach decision and the acceptance criterion for it, so it has to build
   first.

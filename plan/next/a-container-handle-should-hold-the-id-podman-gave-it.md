@@ -2,7 +2,7 @@
 
 Pre-existing, and the half of the name-versus-identity problem that 0002-39 did not reach.
 
-> **Partly done in 0117.** `Container` now captures the id from the `create`/`run` that made it
+> **Partly done in 0002-40.** `Container` now captures the id from the `create`/`run` that made it
 > and `stop` addresses by it; a creation that will not report an id fails while the attempt-label
 > guard is still armed. What is left is the rest of this entry: `exec_*`, `pid` and `inspect`
 > still address by name, and the live-engine test below was never written.

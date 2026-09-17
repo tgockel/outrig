@@ -12,8 +12,8 @@
 //!
 //! The test exercises the same code path an `Agent` would run: it calls
 //! `<McpToolAdapter as ToolDyn>::call(adapter, args_string).await` directly
-//! rather than spinning up an LLM. The LLM stack lands in tasks 0012-0016;
-//! once it's available, an Agent-shaped test can be added in 0019.
+//! rather than spinning up an LLM. The LLM stack lands in tasks 0001-12 through 0001-16;
+//! once it's available, an Agent-shaped test can be added in 0001-19.
 
 #![cfg(feature = "e2e")]
 

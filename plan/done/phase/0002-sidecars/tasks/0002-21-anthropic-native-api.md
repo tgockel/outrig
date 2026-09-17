@@ -367,7 +367,7 @@ container environments.
 
 ## Dependencies
 
-- **0094.** Adding an `Anthropic` variant to `LlmProvider` is a breaking change while the enum
+- **0002-17.** Adding an `Anthropic` variant to `LlmProvider` is a breaking change while the enum
   is exhaustive, which it is today. 0002-17's sweep marks it `#[non_exhaustive]` -- citing this task
   as the reason -- so landing that first makes this variant purely additive.
 - **Hard: `rig-core = 0.40.0` Anthropic provider.** The implementation must confirm builder and

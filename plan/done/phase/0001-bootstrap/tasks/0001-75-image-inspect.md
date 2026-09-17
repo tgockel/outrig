@@ -10,7 +10,7 @@ This is a true inspect: it reads image labels via `podman image inspect`, which 
 and never pulls. It does **not** start the declared MCP servers. Starting servers and calling
 `tools/list` is a *test*, and that concept already lives in `outrig image build` (run by
 default, skippable with `--no-test`); `inspect` does not duplicate it. (A future task may add a
-standalone test verb; remote inspection follows in 0077.)
+standalone test verb; remote inspection follows in 0001-77.)
 
 ## Goal
 

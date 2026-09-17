@@ -120,7 +120,7 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **0094.** This task adds a `#[serde(skip)]` field to `ImageConfig` and changes the shape of
+- **0002-17.** This task adds a `#[serde(skip)]` field to `ImageConfig` and changes the shape of
   `DockerfileMissing` / `ContextMissing`. Both are breaking changes today and both are insulated
   once 0002-17's `#[non_exhaustive]` sweep has landed, so the sweep goes first and this becomes
   additive.

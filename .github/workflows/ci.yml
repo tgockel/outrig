@@ -46,7 +46,7 @@ jobs:
           # natively embedded helper. It still never *execs* that helper, so
           # the AArch64 syscall numbers in `launcher.rs` remain unverified by
           # CI -- the graft is a manual check against a live session, as
-          # `plan/done/0089-outrig-enter-helper.md` describes.
+          # `plan/done/phase/0002-sidecars/tasks/0002-12-outrig-enter-helper.md` describes.
           - { name: default,   runner: ubuntu-latest,    cargo_args: "", test_args: "" }
           - { name: local-llm, runner: ubuntu-latest,    cargo_args: "--features outrig-cli/local-llm", test_args: "" }
           - { name: e2e,       runner: ubuntu-latest,    cargo_args: "--features outrig/e2e,outrig-cli/e2e", test_args: "--no-run" }

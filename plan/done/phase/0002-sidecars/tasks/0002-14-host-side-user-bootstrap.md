@@ -191,7 +191,7 @@ None. Independent of 0002-11 through 0002-13, which run the technique in the oth
   container's own user namespace the process is uid 1000 with no capabilities and cannot write a
   root-owned `/etc/passwd`". That is wrong. `setns(CLONE_NEWUSER)` grants `CAP_FULL_SET` in the
   namespace it joins, regardless of the caller's uid -- which is precisely why the `setuid(0)` at
-  `network.rs:1003` has worked for every intercepted session since 0060. Joining the container's
+  `network.rs:1003` has worked for every intercepted session since 0001-60. Joining the container's
   namespace and then becoming its root reaches the same place with no pause-pid discovery, no
   `XDG_RUNTIME_DIR` dependency, no `podman info` to materialize a missing pause process, and no
   staleness hazard (a regenerated pause process owns a *sibling* namespace of the container's,

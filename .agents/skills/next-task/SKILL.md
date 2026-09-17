@@ -12,13 +12,17 @@ Walk one task end-to-end: pick the next file from `plan/todo/`, plan, execute, v
 Find the lowest-numbered file in `plan/todo/` (skip `README.md`):
 
 ```bash
-ls plan/todo/[0-9]*.md | sort | head -1
+ls plan/todo/[0-9][0-9][0-9][0-9]-[0-9][0-9]-*.md | sort | head -1
 ```
+
+Task files are `PPPP-NN-short-name.md`: `PPPP` is the phase, `NN` the sequence within it.
+Both are zero-padded, so a lexicographic sort is the queue order. Several phases may be
+open at once, and their tasks interleave in `plan/todo/` by `PPPP` prefix.
 
 Read the task file. Extract its `## Dependencies` list.
 
-Verify every dependency is in `plan/done/` (not in `plan/todo/`). If any dep is unmet,
-**abort** and tell the user which task needs to be completed first.
+Verify every dependency is under `plan/done/phase/*/tasks/` (not in `plan/todo/`). If any
+dep is unmet, **abort** and tell the user which task needs to be completed first.
 
 Verify the working tree is clean:
 
@@ -30,8 +34,8 @@ If the output is non-empty, **abort** and tell the user to commit or stash first
 
 ## 2. Branch
 
-Create a branch named for the task's short-name (e.g. `0001-cargo-skeleton.md` becomes
-branch `0001-cargo-skeleton`). One task per branch:
+Create a branch named for the task's filename stem (e.g. `0002-41-from-config.md` becomes
+branch `0002-41-from-config`). One task per branch:
 
 ```bash
 git checkout -b "<short-name>"
@@ -60,7 +64,7 @@ section in the task's plan file (still in `plan/todo/` at this point). The secti
 becomes part of the historical record once the task moves to `plan/done/`.
 
 If you discover follow-up work outside this task's scope, file it as
-`plan/next/<short-name>.md` (no leading `NNNN-`). The user folds these into the numbered
+`plan/next/<short-name>.md` (no leading `PPPP-NN-`). The user folds these into the numbered
 queue periodically.
 
 ## 6. Verify
@@ -112,11 +116,18 @@ confirmation.)
 
 ## 8. Land
 
-Move the task file from `plan/todo/` to `plan/done/`:
+Move the task file into its phase's `tasks/` folder under `plan/done/`, creating that
+folder if this is the phase's first finished task:
 
 ```bash
-git mv plan/todo/<NNNN-short-name>.md plan/done/<NNNN-short-name>.md
+mkdir -p plan/done/phase/<PPPP>-<phase-name>/tasks
+git mv plan/todo/<PPPP-NN-short-name>.md \
+       plan/done/phase/<PPPP>-<phase-name>/tasks/<PPPP-NN-short-name>.md
 ```
+
+The filename does not change on the move. The phase directory appears under `plan/done/`
+while the phase is still open; its `README.md` joins it only when the phase closes, and
+until then that README lives in `plan/phase/<PPPP>-<phase-name>/`.
 
 Update `plan/todo/README.md` -- remove the task's row from the per-step index table.
 
@@ -166,8 +177,8 @@ soft rule you can exceed when necessary for readability, but count the actual
 message lines before committing if there is any doubt.
 
 **Do not include the task number in the commit message.** The connection between commit
-and task is via the file in `plan/done/`. `git log` plus `plan/done/` searches are
-sufficient for archaeology.
+and task is via the moved file. `git log` plus `plan/done/` searches are sufficient for
+archaeology.
 
 **Do not include a co-authored-by trailer.**
 
@@ -175,6 +186,6 @@ Do not push -- the user merges / pushes when ready.
 
 ## After
 
-The task is complete. The branch holds one commit; `plan/todo/` has shrunk by one,
-`plan/done/` has grown by one. The user can run `/next-task` again to pick up the next
-file in the queue (after merging this branch back to the trunk).
+The task is complete. The branch holds one commit; `plan/todo/` has shrunk by one, and the
+phase's `tasks/` folder under `plan/done/` has grown by one. The user can run `/next-task`
+again to pick up the next file in the queue (after merging this branch back to the trunk).

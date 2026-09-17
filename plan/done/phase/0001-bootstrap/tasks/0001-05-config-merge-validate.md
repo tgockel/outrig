@@ -75,7 +75,7 @@ documented in `doc/reference/config.md`'s "Validation rules" section.
   `Config`.** The method form is what callers and tests use (`cfg.validate(repo_root)`);
   the free function is a `pub(super)` implementation detail. `ConfigValidationError` is
   re-exported through `config::ConfigValidationError` and integrated into `OutrigError`
-  via `#[from]`, mirroring the `ApiKey(#[from] ApiKeyError)` pattern from 0004.
+  via `#[from]`, mirroring the `ApiKey(#[from] ApiKeyError)` pattern from 0001-04.
 - **`merge::merge` signature consumes both inputs.** `merge(global: Config, repo: Config)
   -> Config` matches the task spec verbatim. `BTreeMap::extend` runs in linear time over
   the repo (the smaller side typically), so the move-and-extend pattern is efficient.

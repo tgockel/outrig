@@ -1,10 +1,10 @@
-//! End-to-end for `view = "primary"` sidecars (task 0090). Gated behind
+//! End-to-end for `view = "primary"` sidecars (task 0002-13). Gated behind
 //! `--features e2e`; needs real podman and network to pull images.
 //!
 //! Drives an unmodified `docker.io/mcp/filesystem` (Alpine/musl) against a
 //! Debian/glibc primary that carries a real `cargo`, from config alone -- no
 //! Dockerfile change, no `podman exec`, no bind mount of the workspace into the
-//! sidecar. It asserts task 0090's container-level acceptance:
+//! sidecar. It asserts task 0002-13's container-level acceptance:
 //!
 //! - The sidecar completes an MCP handshake and lists the primary's workspace.
 //! - It sees `/usr/local/cargo/bin/cargo`, a path only the primary image
@@ -14,11 +14,11 @@
 //!   /mnt` is empty.
 //! - Killing the primary reaps its `view = "primary"` sidecar.
 //!
-//! Plus task 0102's: what the payload writes into the workspace belongs to the
+//! Plus task 0002-25's: what the payload writes into the workspace belongs to the
 //! invoking user, and a root-owned path in the primary is refused -- the
 //! launcher drops its capabilities with the uid once the graft is in place.
 //!
-//! Plus task 0104's two: the payload's `/proc` is its own rather than the
+//! Plus task 0002-27's two: the payload's `/proc` is its own rather than the
 //! target's, and its `HOME` is the primary user's rather than the sidecar
 //! image's. Both are things a payload needs to be *running* to notice.
 //!

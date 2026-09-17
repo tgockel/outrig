@@ -12,7 +12,7 @@
 0002-15 existed because a whole feature-gated test suite had rotted unnoticed: `e2e` was declared
 on both crates, and no CI job ever compiled it. 0002-15 fixed that one instance by adding a matrix
 row. It did not fix the *class* -- there is still no mechanism that notices a declared
-configuration nobody builds. Several more are uncovered today, found while reviewing 0092.
+configuration nobody builds. Several more are uncovered today, found while reviewing 0002-15.
 
 ## The generalizing fix
 

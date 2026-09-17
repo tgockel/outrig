@@ -3,7 +3,7 @@
 ## Goal
 
 Enable the rmcp Cargo features needed by `ProxyServer` (0001-39) and the stdio
-transport binding in 0040. No code changes -- this is a one-line manifest update
+transport binding in 0001-40. No code changes -- this is a one-line manifest update
 verified by a clean build.
 
 ## Deliverables

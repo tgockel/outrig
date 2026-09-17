@@ -2,7 +2,7 @@
 
 ## Goal
 
-Implement the three session-management subcommands using the `SessionStore` from 0020.
+Implement the three session-management subcommands using the `SessionStore` from 0001-20.
 
 ## Deliverables
 

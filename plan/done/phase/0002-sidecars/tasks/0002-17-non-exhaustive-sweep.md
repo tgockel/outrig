@@ -185,7 +185,8 @@ positional-param creep. `resolve_mcp_env` and `load_project` are the two to watc
 grows past its current arity, give it an options struct rather than another parameter, following
 0002-18's pattern.
 
-All `container::*` rows here are contingent on 0093. If that task demotes the module, delete them.
+All `container::*` rows here are contingent on 0002-16. If that task demotes the module, delete
+them.
 
 If 0002-16 chose `#[doc(hidden)]` over a cfg boundary for `outrig-cli`, its `CliError`,
 `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`, `MistralrsWeights`, and `RigAgent` remain
@@ -211,7 +212,7 @@ as much as the tables above, because the failure mode of a sweep is over-applica
 - **`NetworkInterceptor`** (`network.rs:211`) -- opaque, private fields. Safe.
 - **`ApiKeyRef(String)`** (`config/api_key.rs:31`) -- the tuple field is **private**
   (`pub struct ApiKeyRef(String)`, not `pub String`). Correctly sealed. Note the contrast with
-  `ImageTag(pub String)`, which is not -- that is 0095.
+  `ImageTag(pub String)`, which is not -- that is 0002-18.
 - **Hand-written `Default` impls** on `SecuritySpec`, `ContainerSecurity`, `ContainerLaunchSpec`,
   `Workspace`, `NetworkPolicy`, `NetworkConfig` are correct and *complement* `#[non_exhaustive]`:
   they keep the crate's own construction working after external literal construction is sealed.
@@ -279,8 +280,8 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
 
 ## Dependencies
 
-- **0093.** Its outcome determines which rows above still exist. Annotating a type that 0002-16 then
-  de-publishes is wasted work, and the `container::*` and `outrig-cli` rows are explicitly
+- **0002-16.** Its outcome determines which rows above still exist. Annotating a type that 0002-16
+  then de-publishes is wasted work, and the `container::*` and `outrig-cli` rows are explicitly
   conditional on it.
 
 ## See also

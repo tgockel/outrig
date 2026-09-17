@@ -3,7 +3,7 @@
 //! while still allowing optional mdBook anchors in the rendered URL.
 //!
 //! Field discovery is a manual `&[&Field]` slice. Each task that adds a
-//! `Field` constant (0023 / 0024 / 0026) appends it to `ALL_FIELDS` below.
+//! `Field` constant (0001-23 / 0001-24 / 0001-26) appends it to `ALL_FIELDS` below.
 //! Today there are no caller-side fields yet, so the slice is seeded with
 //! `EXAMPLE_FIELD` to exercise the validation path.
 

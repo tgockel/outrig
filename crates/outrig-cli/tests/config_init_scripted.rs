@@ -2,7 +2,7 @@
 //!
 //! Drive `config::init::run_with` through scripted stdin (via `tokio::io::duplex`)
 //! against a tempdir-rooted target path. Each test verifies the resulting file
-//! parses + validates with the 0005 loader.
+//! parses + validates with the 0001-05 loader.
 
 mod common;
 
