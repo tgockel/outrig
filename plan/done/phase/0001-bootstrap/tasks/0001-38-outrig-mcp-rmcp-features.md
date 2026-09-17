@@ -1,8 +1,8 @@
-# 0038 -- Add rmcp `server` + `transport-io` features
+# 0001-38 -- Add rmcp `server` + `transport-io` features
 
 ## Goal
 
-Enable the rmcp Cargo features needed by `ProxyServer` (0039) and the stdio
+Enable the rmcp Cargo features needed by `ProxyServer` (0001-39) and the stdio
 transport binding in 0040. No code changes -- this is a one-line manifest update
 verified by a clean build.
 
@@ -40,7 +40,7 @@ None.
 
 ## Notes
 
-- This is intentionally a separate task to keep the `ProxyServer` PR (0039) focused
+- This is intentionally a separate task to keep the `ProxyServer` PR (0001-39) focused
   on code rather than mixing in a Cargo.toml change.
 - If the rmcp version pins drift (a `0.2` upgrade etc.) before this task is picked
   up, re-verify the feature names against the new release; they are stable through

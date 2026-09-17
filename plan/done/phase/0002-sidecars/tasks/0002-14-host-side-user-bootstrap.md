@@ -1,4 +1,4 @@
-# 0091 -- Bootstrap the container user from the host, without `useradd`
+# 0002-14 -- Bootstrap the container user from the host, without `useradd`
 
 ## Context
 
@@ -21,7 +21,7 @@ host process can join the container's mount namespace and nothing else, and then
 the files. Its check #5 is the relevant one: a host process writing into the container's
 filesystem lands as uid/gid 1000 on both sides, with no `chown`.
 
-This is the same technique as 0089/0090 pointed the other way -- outside-in rather than
+This is the same technique as 0002-12/0090 pointed the other way -- outside-in rather than
 sidecar-in -- and it needs no helper binary, no new capabilities, and no config surface.
 
 ### What this consumes
@@ -29,7 +29,7 @@ sidecar-in -- and it needs no helper binary, no new capabilities, and no config 
 `plan/next/sidecar-primary-bootstrap-overlap.md` proposed reclaiming the time this chain costs.
 (It was already deleted in `8560c3a0`, when this task was written; recover it from git history if
 this task is abandoned.)
-Its own summary: 0086 made sidecar bring-up concurrent across sidecars but left Phase-A
+Its own summary: 0002-09 made sidecar bring-up concurrent across sidecars but left Phase-A
 image-ensure starting only *after* the primary is started and `bootstrap_user`'d, though the two
 are independent. It scoped its own win as bounded -- "`bootstrap_user` is a short chain of
 `podman exec` round-trips (~100ms), so overlapping it with sidecar ensure saves at most ~that,
@@ -51,7 +51,7 @@ works, whether or not it ships `shadow`, `passwd`, or `getent`.
 
 - A namespace-entry primitive in `crates/outrig/src/container/`: given a container, run a fixed
   step sequence inside its mount namespace in a forked child and hand the result back. The PID
-  lookup already exists -- 0090 promoted it to `Container::pid` (`mod.rs:382`) -- and the
+  lookup already exists -- 0002-13 promoted it to `Container::pid` (`mod.rs:382`) -- and the
   fork / `setns` / `SCM_RIGHTS` plumbing already exists inside `network.rs`; promote both rather
   than writing a second copy.
 - `Container::bootstrap_user` reimplemented on top of it, preserving its current contract
@@ -110,10 +110,11 @@ Four consequences to get right:
 - **Names go into a colon-delimited file unchecked.** `useradd` rejected a host user name
   containing `:` or a newline; a direct write would corrupt the file. Sanitize before writing.
 
-Keep the existing probe-first structure. `plan/done/0009-runtime-user-bootstrap.md` records that
-modern podman auto-injects the host UID/GID into `/etc/passwd` and `/etc/group` under keep-id, so
-on podman 5.x both entries frequently exist already and the write is skipped entirely. Reading
-the files directly makes that check cheaper and removes the `getent` dependency at the same time.
+Keep the existing probe-first structure.
+`plan/done/phase/0001-bootstrap/tasks/0001-09-runtime-user-bootstrap.md` records that modern podman
+auto-injects the host UID/GID into `/etc/passwd` and `/etc/group` under keep-id, so on podman 5.x
+both entries frequently exist already and the write is skipped entirely. Reading the files directly
+makes that check cheaper and removes the `getent` dependency at the same time.
 
 Sidecars use the same path. `bootstrap_needed`
 (`crates/outrig/src/container/sidecar.rs:219-231`) already decides which sidecars want a
@@ -162,9 +163,9 @@ half-applied direct bootstrap re-run over `podman exec` would report a misleadin
 - **How long to keep the fallback.** It is cheap to keep and removes all regression risk for
   exotic podman setups, but it is a second implementation of the same contract. Keep it for one
   release, then decide with real reports rather than now.
-- **Whether the primitive should also handle exec.** 0089's launcher does `execveat` into a
+- **Whether the primitive should also handle exec.** 0002-12's launcher does `execveat` into a
   payload; this task only needs file descriptors handed back out. Keep the primitive at the
-  fixed-step level and let 0089's binary stay separate -- they run in different places and share
+  fixed-step level and let 0002-12's binary stay separate -- they run in different places and share
   no code path, only a technique.
 - **`/etc/shadow`.** The current `useradd` writes one; the direct path does not. Nothing in
   OutRig authenticates as this user, `getpwnam` never consults shadow, and the entry `useradd`
@@ -173,14 +174,14 @@ half-applied direct bootstrap re-run over `podman exec` would report a misleadin
 
 ## Dependencies
 
-None. Independent of 0088-0090, which run the technique in the other direction.
+None. Independent of 0002-11 through 0002-13, which run the technique in the other direction.
 
 ## See also
 
 - <https://github.com/tgockel/prototype-podman-shared-fs> -- `enterfs.py` is the host-side
   reference; the README's "Ordering is forced" section is the part that matters here.
-- `plan/done/0009-runtime-user-bootstrap.md` -- the contract this preserves, and the podman-5.x
-  auto-injection hazard.
+- `plan/done/phase/0001-bootstrap/tasks/0001-09-runtime-user-bootstrap.md` -- the contract this
+  preserves, and the podman-5.x auto-injection hazard.
 - `doc/concepts/containers.md` -- the image requirements this removes.
 
 ## Decisions

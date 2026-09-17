@@ -1,4 +1,4 @@
-# 0031 -- `outrig container add`
+# 0001-31 -- `outrig container add`
 
 ## Goal
 
@@ -14,7 +14,7 @@ repo `config.toml` while preserving the surrounding TOML.
 
 - `src/container/add.rs::run(name: Option<String>, force: bool) -> Result<()>` matching the
   flow in `doc/usage/container.md`.
-- Prompts (using 0022's `ask_*`):
+- Prompts (using 0001-22's `ask_*`):
   - Container-config name (default from arg or `coding`).
   - Base image (select from preset list: `debian:bookworm-slim`, `ubuntu:24.04`,
     `alpine:latest`, `node:20-bookworm-slim`, `python:3.12-slim`).
@@ -46,8 +46,8 @@ repo `config.toml` while preserving the surrounding TOML.
 
 ## Dependencies
 
-- 0007-image-build
-- 0022-prompt-ux
+- 0001-07-image-build
+- 0001-22-prompt-ux
 
 ## Notes
 
@@ -88,9 +88,9 @@ repo `config.toml` while preserving the surrounding TOML.
 - **`Cmd::InitContainer` removed**, replaced by `Cmd::Container(ContainerArgs)`
   with `ContainerCmd::Add { name, force }` (mirroring `Cmd::Config`). The old
   variant was a `NotImplemented` stub.
-- **`toml_edit` Document mutation** preserves comments and surrounding tables on
-  `--force` replacement. `tests/container_add_scripted.rs::force_preserves_unrelated_blocks_and_comments`
-  is the explicit gate.
+- **`toml_edit` Document mutation** preserves comments and surrounding tables on `--force`
+  replacement. `tests/container_add_scripted.rs::force_preserves_unrelated_blocks_and_comments` is
+  the explicit gate.
 - **Shared `tests/common::scripted_prompt`**. The `tokio::io::duplex` helper used
   by `container_add_scripted.rs` was identical to one in `config_init_scripted.rs`;
   hoisted to `tests/common/mod.rs` and both call sites updated.

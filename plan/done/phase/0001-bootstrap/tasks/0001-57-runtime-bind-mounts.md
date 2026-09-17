@@ -1,4 +1,4 @@
-# 0057 -- Runtime bind mounts
+# 0001-57 -- Runtime bind mounts
 
 ## Context
 
@@ -211,10 +211,10 @@ cargo test --no-default-features --features e2e --test library_surface -- --noca
 
 ## See also
 
-- `0058-capability-profiles.md` -- kernel capability controls for the same container
-  launch path.
-- `0059-network-interceptor-plumbing.md` -- network egress controls; deliberately separate from
-  filesystem mount policy.
+- `plan/done/phase/0001-bootstrap/tasks/0001-58-capability-profiles.md` -- kernel capability
+  controls for the same container launch path.
+- `plan/done/phase/0001-bootstrap/tasks/0001-59-network-interceptor-plumbing.md` -- network egress
+  controls; deliberately separate from filesystem mount policy.
 
 ## Dependencies
 

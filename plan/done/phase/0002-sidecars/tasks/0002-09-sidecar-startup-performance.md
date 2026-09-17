@@ -1,8 +1,8 @@
-# 0086 -- Sidecar startup and clean-sweep performance follow-ups
+# 0002-09 -- Sidecar startup and clean-sweep performance follow-ups
 
 ## Goal
 
-Land the deferred efficiency items from task 0079's review pass; none block correctness.
+Land the deferred efficiency items from task 0002-02's review pass; none block correctness.
 
 ## Deliverables
 
@@ -35,7 +35,7 @@ Land the deferred efficiency items from task 0079's review pass; none block corr
 
 ## Dependencies
 
-None (follows up on completed task 0079; sequenced after 0085 since both touch
+None (follows up on completed task 0002-02; sequenced after 0002-08 since both touch
 `setup_sidecars_and_network`).
 
 ## Decisions

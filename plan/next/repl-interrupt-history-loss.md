@@ -9,7 +9,7 @@ the writeback line runs. The taken vec (all prior turns plus the partial
 turn) is dropped, and the shared slot is left holding the empty vec that
 `mem::take` put there. The next prompt silently starts from blank history.
 
-Pre-existing behavior, observed during the 0084 dispatcher refactor and
+Pre-existing behavior, observed during the 0002-07 dispatcher refactor and
 deliberately preserved there.
 
 ## Sketch

@@ -30,11 +30,12 @@ Worth deciding at the same time whether CI and the image should share one source
 versions rather than repeating them -- a small script, or a `[workspace.metadata]` block the
 Dockerfile and workflow both read.
 
-This is the same class as the unpinned `npm install`/`pip install` layer 0104 removed from this
+This is the same class as the unpinned `npm install`/`pip install` layer 0002-27 removed from this
 image, and the reason is the same: a rebuild months from now should produce the image the
 Dockerfile describes.
 
 ## See also
 
-- `plan/done/0104-dogfood-sidecar-mcp-config.md` -- pinned the MCP sidecar images for this reason,
-  including an SDK pin that was load-bearing within a day of being written.
+- `plan/done/phase/0002-sidecars/tasks/0002-27-dogfood-sidecar-mcp-config.md` -- pinned the MCP
+  sidecar images for this reason, including an SDK pin that was load-bearing within a day of being
+  written.

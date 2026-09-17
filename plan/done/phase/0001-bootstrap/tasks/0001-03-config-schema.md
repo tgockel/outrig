@@ -1,4 +1,4 @@
-# 0003 -- Config schema
+# 0001-03 -- Config schema
 
 ## Goal
 
@@ -13,7 +13,7 @@ Type the config schema as Rust structs, with serde round-trip against the exampl
     `session-root`, `[providers]`, `[models]`, `[agents]`, `[workspace]`, `[containers]`.
     The maps are `BTreeMap<String, ...>` keyed on entry name.
   - `LlmProvider { style: String, base_url: String, api_key: String, request_timeout_secs:
-    Option<u64> }` (api_key stays a `String` here; 0004 swaps it for `ApiKeyRef`).
+    Option<u64> }` (api_key stays a `String` here; 0001-04 swaps it for `ApiKeyRef`).
   - `Model { provider: String, identifier: String }`.
   - `Agent { model: Option<String>, container: Option<String>, preamble: Option<String>,
     temperature: Option<f32>, max_tokens: Option<u32> }`.
@@ -49,7 +49,7 @@ Type the config schema as Rust structs, with serde round-trip against the exampl
 
 ## Dependencies
 
-- 0001-cargo-skeleton
+- 0001-01-cargo-skeleton
 
 ## Notes
 

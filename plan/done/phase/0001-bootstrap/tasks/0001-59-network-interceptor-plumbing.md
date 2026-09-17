@@ -1,4 +1,4 @@
-# 0059 -- Network interceptor plumbing
+# 0001-59 -- Network interceptor plumbing
 
 ## Context
 
@@ -89,7 +89,7 @@ Each record is single-line Zeek `conn.log`-style JSON with these fields:
 | `outrig.container`  | string | Podman container name.                                  |
 
 MITM fields such as `url`, `method`, `status`, request body, and response body
-are deliberately deferred to `0064`.
+are deliberately deferred to `0001-64`.
 
 ## Open Sub-Decisions
 
@@ -142,8 +142,8 @@ None.
 
 ## See also
 
-- `0060-network-interceptor-enforcement.md` -- policy enforcement on top of this
-  traffic plumbing.
-- `0064-network-interceptor-mitm.md` -- URL/body-aware HTTPS inspection after
+- `plan/done/phase/0001-bootstrap/tasks/0001-60-network-interceptor-enforcement.md` -- policy
+  enforcement on top of this traffic plumbing.
+- `plan/next/network-interceptor-mitm.md` -- URL/body-aware HTTPS inspection after
   host:port policy exists.
 - `doc/concepts/workspace.md` -- the v0 deferred-network stance this replaces.

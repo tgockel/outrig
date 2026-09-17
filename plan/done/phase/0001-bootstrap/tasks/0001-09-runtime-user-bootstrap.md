@@ -1,4 +1,4 @@
-# 0009 -- Runtime user-mapping bootstrap
+# 0001-09 -- Runtime user-mapping bootstrap
 
 ## Goal
 
@@ -58,7 +58,7 @@ UID/GID. Pattern follows
 
 ## Dependencies
 
-- 0008-container-lifecycle
+- 0001-08-container-lifecycle
 
 ## Notes
 
@@ -76,7 +76,7 @@ UID/GID. Pattern follows
   carry the synchronization cost forward.
 - **`--user=0:0` on bootstrap exec calls, not "no `--user` flag".** The deliverable's pseudocode
   said the bootstrap runs as in-container root via an unscoped `podman exec`. Under
-  `--userns=keep-id` (set by 0008's `Container::start`), an unscoped exec defaults to the
+  `--userns=keep-id` (set by 0001-08's `Container::start`), an unscoped exec defaults to the
   *host* user instead, which can't `apk add shadow` / `useradd` / `groupadd` / write to
   `/home`. Forcing `--user=0:0` explicitly puts us at in-container UID 0, which is what the
   spec actually wanted. The doc comment on `bootstrap_user` and the helper `podman_exec_root`

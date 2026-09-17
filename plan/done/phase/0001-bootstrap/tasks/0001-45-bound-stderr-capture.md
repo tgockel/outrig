@@ -1,9 +1,9 @@
-# 0045 -- Bound stderr capture in `run_capture`
+# 0001-45 -- Bound stderr capture in `run_capture`
 
 ## Goal
 
 Replace the unbounded `Command::output()` body of `src/process.rs::run_capture`
-(added in task 0006) with a streaming reader that writes into a fixed-size
+(added in task 0001-06) with a streaming reader that writes into a fixed-size
 ring buffer, so peak memory use is bounded by `STDERR_TAIL_LIMIT` regardless
 of how much the child writes. Today a child that emits 10 GB of stderr would
 OOM the host process before `tail_string` ever truncated it. Real callers are
@@ -85,4 +85,4 @@ None.
   routinely emit hundreds of MB, so the v0 stance was "no observed pain yet."
 - Keep the change scoped: don't expand the `Cmd` API or the `Process` error
   variant. This is a behind-the-back robustness improvement.
-- Single self-contained task. No dependencies beyond 0006 (which is `done/`).
+- Single self-contained task. No dependencies beyond 0001-06 (which is `done/`).

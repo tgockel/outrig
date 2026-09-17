@@ -1,4 +1,4 @@
-# 0019 -- Agent loop (`outrig run`)
+# 0001-19 -- Agent loop (`outrig run`)
 
 ## Goal
 
@@ -9,16 +9,16 @@ agent, hand to REPL, run until EOF, clean up.
 ## Deliverables
 
 - `src/cli/run.rs::execute(args: RunArgs) -> Result<i32>` orchestrating the flow:
-  1. Resolve repo + global config paths (0002).
-  2. Load + merge + validate (0005).
-  3. Resolve agent (0012).
+  1. Resolve repo + global config paths (0001-02).
+  2. Load + merge + validate (0001-05).
+  3. Resolve agent (0001-12).
   4. Resolve container-config (CLI flag > agent's `container` > `default-container`).
-  5. Ensure image (0007).
-  6. Start container (0008).
-  7. Bootstrap user (0009).
-  8. Connect every MCP server in `[containers.<n>.mcp]` (0010); collect their `McpClient`s.
-  9. List tools per server, build `McpToolAdapter`s with sanitized names (0011).
-  10. Build the Rig agent (0012).
+  5. Ensure image (0001-07).
+  6. Start container (0001-08).
+  7. Bootstrap user (0001-09).
+  8. Connect every MCP server in `[containers.<n>.mcp]` (0001-10); collect their `McpClient`s.
+  9. List tools per server, build `McpToolAdapter`s with sanitized names (0001-11).
+  10. Build the Rig agent (0001-12).
   11. Print the banner exactly as `doc/usage/run.md`'s "REPL banner" example.
   12. Run REPL with the prompt callback that calls `agent.chat(line, &mut history).await`.
   13. On exit: shut down each MCP client, stop container, return appropriate exit code.
@@ -29,7 +29,7 @@ agent, hand to REPL, run until EOF, clean up.
 - Iteration cap: if Rig's chat loop exceeds 50 tool calls in one turn, print
   `[outrig] tool-call iteration cap (50) reached; ending turn` on stderr and yield to user.
   (If rig-core has its own cap, this is a safety net.)
-- Replace the "not implemented" stub from 0001 with this real implementation.
+- Replace the "not implemented" stub from 0001-01 with this real implementation.
 - `tests/run_smoke.rs` (`#[cfg(feature = "e2e")]`): scripted prompt -> assert tool call landed
   + a stdout reply was printed.
 
@@ -44,17 +44,17 @@ agent, hand to REPL, run until EOF, clean up.
 
 ## Dependencies
 
-- 0007-image-build
-- 0009-runtime-user-bootstrap
-- 0011-rig-tool-adapter
-- 0012-llm-resolver
-- 0018-repl-skeleton
+- 0001-07-image-build
+- 0001-09-runtime-user-bootstrap
+- 0001-11-rig-tool-adapter
+- 0001-12-llm-resolver
+- 0001-18-repl-skeleton
 
 ## Notes
 
-- This task doesn't include sessions. Running this without 0020 means no `session.json` is
+- This task doesn't include sessions. Running this without 0001-20 means no `session.json` is
   written and no per-MCP stderr is captured to disk. That's fine for the v0 of `outrig run`
-  -- 0020 layers session persistence on top.
+  -- 0001-20 layers session persistence on top.
 - Container cleanup is critical. Test by `^C`-ing manually mid-turn and verifying
   `podman ps -a --filter name=outrig-` is empty.
 - The banner text must match `doc/usage/run.md` verbatim (modulo concrete IDs/timestamps).

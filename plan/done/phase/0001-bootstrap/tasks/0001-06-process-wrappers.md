@@ -1,4 +1,4 @@
-# 0006 -- Subprocess wrappers
+# 0001-06 -- Subprocess wrappers
 
 ## Goal
 
@@ -32,7 +32,7 @@ stderr capture, and tracing are consistent.
 
 ## Dependencies
 
-- 0001-cargo-skeleton
+- 0001-01-cargo-skeleton
 
 ## Notes
 

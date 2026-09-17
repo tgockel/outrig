@@ -1,4 +1,4 @@
-# 0063 -- GPU / non-CPU device support for the in-process mistralrs path
+# 0001-63 -- GPU / non-CPU device support for the in-process mistralrs path
 
 ## Context
 
@@ -7,7 +7,7 @@
 `Pipeline::load_model_from_hf`. Every in-process model -- regardless of
 size or quant -- runs entirely on CPU.
 
-The performance ceiling is brutal. Real numbers measured during 0029
+The performance ceiling is brutal. Real numbers measured during 0001-29
 follow-up work on a modern AMD desktop with AVX2+FMA, no AVX-512:
 
 - 1.5B Q4_K_M, CPU: ~15 tok/s. Borderline usable for chat.
@@ -164,6 +164,6 @@ the in-process backend on CUDA or Metal builds without changing CPU-only default
 
 ## Dependencies
 
-- **Hard: 0062**. Streaming is needed first so GPU-class decode speed is visible
+- **Hard: 0001-62**. Streaming is needed first so GPU-class decode speed is visible
   during normal `outrig run` usage and the GPU acceptance path can verify token
   output incrementally.

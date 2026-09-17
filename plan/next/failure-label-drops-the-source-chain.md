@@ -9,8 +9,8 @@ part a user needs (`tcp connect error: Connection refused`, `dns error: failed t
 information`, a TLS mismatch) in the `source()` chain, which nothing walks.
 
 So the two lines a user sees for a typo'd `base-url` and for a provider that dropped a live
-connection are near-identical, and neither says which happened. 0112 made that gap matter more: it
-gave the two cases *different budgets*, so the retry line now counts down against a bound whose
+connection are near-identical, and neither says which happened. 0002-35 made that gap matter more:
+it gave the two cases *different budgets*, so the retry line now counts down against a bound whose
 choice the message does not explain.
 
 ## Sketch
@@ -22,14 +22,14 @@ outer message already contains it. One helper beside `failure_label`, used by bo
 Bound the output: a chain is arbitrarily long and this is a status line, so take the innermost
 link rather than joining all of them.
 
-## Why not in 0112
+## Why not in 0002-35
 
-0112 is a change to how long the loop waits, and it did not touch the classification or the
+0002-35 is a change to how long the loop waits, and it did not touch the classification or the
 message. Rewriting what every transport failure prints -- including read timeouts, which are the
 common case -- is a separate change with its own before/after to look at.
 
 ## See also
 
 - `crates/outrig-cli/src/llm/retry.rs` -- `failure_label`, `exhausted_transient_label`.
-- `plan/done/0112-connect-failures-are-not-really-transient.md` -- the split that made the
-  distinction visible in the wait but not in the words.
+- `plan/done/phase/0002-sidecars/tasks/0002-35-connect-failures-are-not-really-transient.md` -- the
+  split that made the distinction visible in the wait but not in the words.

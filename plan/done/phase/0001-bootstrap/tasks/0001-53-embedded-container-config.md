@@ -1,4 +1,4 @@
-# 0053 -- Embedded `container.toml` -- image-side MCP config
+# 0001-53 -- Embedded `container.toml` -- image-side MCP config
 
 ## Context
 
@@ -129,7 +129,7 @@ for (mcp_name, spec) in &merged {
 shape; the merge produces a freshly-allocated `BTreeMap<String,
 McpServerSpec>` for the loop to consume.
 
-`outrig mcp` (`plan/done/0040-outrig-mcp-wire-subcommand.md`, shipped)
+`outrig mcp` (`plan/done/phase/0001-bootstrap/tasks/0001-40-outrig-mcp-wire-subcommand.md`, shipped)
 inherits the same merge automatically because it uses the same MCP startup
 path. This task threads the read+merge into the `outrig mcp` startup as
 well as `outrig run`.
@@ -232,8 +232,7 @@ well as `outrig run`.
 
 ## Dependencies
 
-- None hard. `plan/done/0040-outrig-mcp-wire-subcommand.md` has shipped,
-  so this task threads the read+merge through both `outrig run` and
-  `outrig mcp`. `plan/todo/0054-outrig-mcp-attach.md` will inherit the
-  merged behavior automatically when it lands, because it reuses the same
-  MCP startup path.
+- None hard. `plan/done/phase/0001-bootstrap/tasks/0001-40-outrig-mcp-wire-subcommand.md` has
+  shipped, so this task threads the read+merge through both `outrig run` and `outrig mcp`.
+  `plan/done/phase/0001-bootstrap/tasks/0001-54-outrig-mcp-attach.md` will inherit the merged
+  behavior automatically when it lands, because it reuses the same MCP startup path.

@@ -1,4 +1,4 @@
-# 0100 -- Capping how many subagents run at once
+# 0002-23 -- Capping how many subagents run at once
 
 ## Context
 
@@ -198,7 +198,7 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- None. **0099** landed, so `release` already resolves before it mutates; this task adds a check
+- None. **0002-22** landed, so `release` already resolves before it mutates; this task adds a check
   to `launch`'s two lock sites, in the same file but not the same function.
 
 Model selection (see also) is queued immediately after this task, deliberately: it makes wide
@@ -210,4 +210,5 @@ fan-out more expensive rather than merely slower, so the containment half belong
   fork 4 would bend.
 - `doc/reference/config.md` -- `subagent-depth-max`, whose config, merge, and validation shape
   this key mirrors.
-- `plan/todo/0101-subagent-model-selection.md` -- launching a subagent under a different model.
+- `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md` -- launching a subagent
+  under a different model.

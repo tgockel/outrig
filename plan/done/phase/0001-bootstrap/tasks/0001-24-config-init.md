@@ -1,10 +1,10 @@
-# 0024 -- `outrig config init`
+# 0001-24 -- `outrig config init`
 
 ## Goal
 
 Interactive write of the global config at `~/.outrig/config.toml` (providers, models,
 default-model). This is the global-only half of the original all-in-one `outrig init`; the
-new `outrig init` (0026) calls `config init` automatically when no global config is found.
+new `outrig init` (0001-26) calls `config init` automatically when no global config is found.
 
 `outrig config` is a new top-level command group; v0 ships only the `init` subcommand
 (`config get`, `config set`, etc., are reserved for later).
@@ -12,7 +12,7 @@ new `outrig init` (0026) calls `config init` automatically when no global config
 ## Deliverables
 
 - `src/config/init.rs::run(force: bool) -> Result<()>` matching `doc/usage/config.md`.
-- Prompts (using 0022's `ask_*`):
+- Prompts (using 0001-22's `ask_*`):
   - Provider style (default `openai`).
   - Provider name (default same as style; used as the key in `[providers.<name>]`).
   - Base URL (default by style -- `https://api.openai.com/v1` for `openai`).
@@ -28,7 +28,7 @@ new `outrig init` (0026) calls `config init` automatically when no global config
 - Refuses to clobber an existing global config without `--force`.
 - `tests/config_init_scripted.rs`: drive `config::init::run` against a scripted stdin in a
   tempdir (with `HOME` redirected); assert the resulting config parses + validates via
-  0005's loader.
+  0001-05's loader.
 
 ## Acceptance
 
@@ -39,8 +39,8 @@ new `outrig init` (0026) calls `config init` automatically when no global config
 
 ## Dependencies
 
-- 0005-config-merge-validate
-- 0022-prompt-ux
+- 0001-05-config-merge-validate
+- 0001-22-prompt-ux
 
 ## Notes
 
@@ -49,7 +49,7 @@ new `outrig init` (0026) calls `config init` automatically when no global config
   `~/.outrig/config.toml`.
 - Atomic writes via `tempfile::NamedTempFile::persist` so an interrupted prompt never
   leaves a half-written config.
-- The repo-config phase and the chain into container scaffolding live in 0026
+- The repo-config phase and the chain into container scaffolding live in 0001-26
   (`outrig init`), not here.
 
 ## Decisions
@@ -93,7 +93,7 @@ new `outrig init` (0026) calls `config init` automatically when no global config
   `config::init::write_atomic` and the existing `session::write_session_json_atomic`
   were unwrapping `e.error` by hand; the impl drops the awkward `.map_err`
   call at both sites.
-- **Field constants exported as `pub const DOC_SYNC_FIELDS`.** Per 0022's
+- **Field constants exported as `pub const DOC_SYNC_FIELDS`.** Per 0001-22's
   manual-slice convention, `tests/prompt_doc_sync.rs` extends its
   `EXAMPLE_FIELD` baseline with this slice instead of importing each Field
   individually.

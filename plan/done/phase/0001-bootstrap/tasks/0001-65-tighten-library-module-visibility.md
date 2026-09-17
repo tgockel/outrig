@@ -1,9 +1,9 @@
-# 0065 -- Tighten library module visibility after split
+# 0001-65 -- Tighten library module visibility after split
 
 ## Context
 
 Several modules in `crates/outrig/src/lib.rs` are `pub` only because the
-old in-tree binary used to reach into them directly. After 0064 settles
+old in-tree binary used to reach into them directly. After 0001-64 settles
 the per-item surface, this task picks the right module-level visibility
 so the library exposes a curated set of modules rather than its full
 internal layout.
@@ -36,7 +36,7 @@ that nothing outside the library needs.
 
 ## Dependencies
 
-- Soft on 0064 (per-item surface should be settled before drawing the
+- Soft on 0001-64 (per-item surface should be settled before drawing the
   module boundary).
 
 ## Decisions

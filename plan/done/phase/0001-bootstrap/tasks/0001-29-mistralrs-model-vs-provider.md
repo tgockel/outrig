@@ -1,4 +1,4 @@
-# 0029 -- mistralrs weight-source fields belong on the model
+# 0001-29 -- mistralrs weight-source fields belong on the model
 
 ## Goal
 
@@ -87,12 +87,12 @@ probably simpler than a tagged enum, but the implementer should pick.
 
 ## Dependencies
 
-- 0005-config-merge-validate
-- 0024-config-init
+- 0001-05-config-merge-validate
+- 0001-24-config-init
 
 ## Notes
 
-- Surfaced during 0024 implementation: prompting for `model-id` while inside
+- Surfaced during 0001-24 implementation: prompting for `model-id` while inside
   the provider loop felt wrong because the field is per-model. The current
   prompt UX faithfully reflects the as-shipped schema; this task fixes the
   schema and the prompts together.
@@ -152,7 +152,7 @@ probably simpler than a tagged enum, but the implementer should pick.
   prompts move into the model loop, dispatched on the chosen provider's
   style.** `prompt_mistralrs_provider` is gone. `prompt_models` switches on
   the provider's style after asking for `provider`. `model-file` stays
-  unprompted (per 0024's decision, multi-file repos hand-edit).
+  unprompted (per 0001-24's decision, multi-file repos hand-edit).
 - **`tests/config_init_scripted.rs` answers `ask_select` by value, not
   index.** First scripted attempt sent `"1"`; the prompt parses values and
   re-prompted, eating an extra line. Switched to `"mistralrs"`.

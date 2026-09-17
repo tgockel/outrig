@@ -1,4 +1,4 @@
-# 0007 -- Image build with cache
+# 0001-07 -- Image build with cache
 
 ## Goal
 
@@ -39,8 +39,8 @@ unchanged inputs cache-hit instantly.
 
 ## Dependencies
 
-- 0005-config-merge-validate
-- 0006-process-wrappers
+- 0001-05-config-merge-validate
+- 0001-06-process-wrappers
 
 ## Notes
 
@@ -83,7 +83,7 @@ unchanged inputs cache-hit instantly.
   doesn't error on non-zero exit. Two callers in this task want exit code as
   information (git-repo detection via `git rev-parse --git-dir`; the
   `buildah images --quiet` cache probe), and the same shape will return in
-  0008+. `run_capture` now delegates to `try_capture` to avoid duplicating
+  0001-08+. `run_capture` now delegates to `try_capture` to avoid duplicating
   the spawn path.
 - **`ensure_image` joins paths against `repo_root` without `canonicalize`** --
   preserves user-intentional symlinks. `src/config/validate.rs` does the same
@@ -99,4 +99,4 @@ unchanged inputs cache-hit instantly.
 - **No doc TODO markers dropped this task.** The image-cache section
   `doc/concepts/containers.md:132-140` has no per-section marker; the
   file-level `> TODO: Incomplete` correctly stays since runtime container
-  behavior arrives in 0008+.
+  behavior arrives in 0001-08+.

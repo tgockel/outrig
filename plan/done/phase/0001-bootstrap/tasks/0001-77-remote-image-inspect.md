@@ -1,9 +1,9 @@
-# 0077 -- Remote `outrig image inspect` (no-pull, via labels)
+# 0001-77 -- Remote `outrig image inspect` (no-pull, via labels)
 
 ## Context
 
-Once a standalone image's config is carried as OCI labels (0072) and `outrig image
-inspect <ref>` reads them locally (0075), the same labels can be read from a *remote*
+Once a standalone image's config is carried as OCI labels (0001-72) and `outrig image
+inspect <ref>` reads them locally (0001-75), the same labels can be read from a *remote*
 ref **without pulling layers** -- the payoff that motivated moving from a baked file
 to labels. A baked file could never support this: you cannot read a file out of a
 remote image without pulling it.
@@ -25,27 +25,27 @@ Add remote, no-layer-pull inspection of standalone image labels to `outrig image
   Either way this is a **new dependency** and the first network-reaching read in the
   tool, so it warrants its own task (auth, registry config, error handling, and a
   feature/dependency decision).
-- Reuse the 0072 label codec to parse the fetched labels into the same
+- Reuse the 0001-72 label codec to parse the fetched labels into the same
   metadata + `[mcp]` view that local inspect prints.
 
 ## Acceptance
 
 - `outrig image inspect` can report metadata and declared MCP servers from a remote image
   ref without pulling image layers.
-- The remote path reuses the local inspect rendering and the 0072 label codec.
+- The remote path reuses the local inspect rendering and the 0001-72 label codec.
 - Remote images with no OutRig labels match local inspect by printing the image ref and any
   metadata labels, then omitting `mcp:`. Registry/auth failures and unsupported refs return clear
   errors.
-- Local inspect behavior from 0075 is unchanged.
+- Local inspect behavior from 0001-75 is unchanged.
 
 ## Dependencies
 
-- **Hard: 0075**. Remote inspection extends the local label inspect command and rendering.
+- **Hard: 0001-75**. Remote inspection extends the local label inspect command and rendering.
 
 ## Decisions
 
 1. Remote inspection is explicit: `outrig image inspect --remote <ref>`.
-   Local inspect keeps the 0075 local-only/no-pull behavior and does not
+   Local inspect keeps the 0001-75 local-only/no-pull behavior and does not
    fall back to the network for missing local refs.
 2. The remote reader shells out to `skopeo inspect --no-tags docker://<ref>`.
    This keeps registry auth and transport behavior aligned with the existing

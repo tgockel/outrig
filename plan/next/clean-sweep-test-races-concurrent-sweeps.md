@@ -1,6 +1,6 @@
 # The e2e suite assumes it is the only outrig on the machine
 
-`crates/outrig-cli/tests/mcp_sidecar_smoke.rs:489` failed once during the 0116
+`crates/outrig-cli/tests/mcp_sidecar_smoke.rs:489` failed once during the 0002-39
 work, then passed three consecutive isolated runs and two full-suite runs with no
 change to it. The assertion that failed was:
 
@@ -21,7 +21,7 @@ report and the assertion fails. The failure surfaced while running the e2e suite
 three times back to back with unrelated outrig sessions live on the machine,
 which is exactly that interleaving.
 
-Nothing about the planting or the sweeping goes through code 0116 changed: the
+Nothing about the planting or the sweeping goes through code 0002-39 changed: the
 stray is created with a raw `podman run`, stopped with a raw `podman stop`, and
 `crates/outrig-cli/src/cli/clean.rs` is untouched by that task.
 

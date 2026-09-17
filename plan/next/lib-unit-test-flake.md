@@ -55,7 +55,7 @@ usually fails only one -- which reads as "one row is broken and the others are f
 than as a flake. The job exits 101 with the panic above; a reviewer looking at row names
 rather than at the panic text has nothing to connect it to.
 
-Sighted again while landing 0116, as an unexplained `cargo (local-llm)` failure on a head
+Sighted again while landing 0002-39, as an unexplained `cargo (local-llm)` failure on a head
 whose other seven checks passed. Re-measured there on the compiled binary: 1 failure in 80
 runs and 1 in 120, always this test, on a tree that had added seven new subscriber-less
 callers of the same two callsites. So the rate moves with machine and load rather than with

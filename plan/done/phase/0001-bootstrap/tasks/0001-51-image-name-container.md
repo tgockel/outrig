@@ -1,4 +1,4 @@
-# 0051 -- `image-name` field on `[containers.<name>]`
+# 0001-51 -- `image-name` field on `[containers.<name>]`
 
 ## Context
 

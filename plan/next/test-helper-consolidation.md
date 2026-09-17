@@ -4,7 +4,7 @@
 
 Both crates have a `tests/common/mod.rs` for shared test helpers, but a large number of test
 binaries carry private byte-identical copies of helpers that already live there. Surfaced while
-landing 0092, which removed exactly one such duplicate (`rig_tool_dispatch.rs`'s private
+landing 0002-15, which removed exactly one such duplicate (`rig_tool_dispatch.rs`'s private
 `init_tracing`) because it was touching that file anyway. The rest was left alone to keep a
 bit-rot repair from turning into a test-suite refactor.
 
@@ -65,15 +65,15 @@ delete the ten attributes.
 
 `crates/outrig/tests/library_surface.rs` has no `mod common;` at all despite duplicating
 `init_tracing`, `dockerfile_escape`, and `label_line`. It is `required-features = ["e2e"]`, so
-it now sits inside the CI compile gate 0092 added.
+it now sits inside the CI compile gate 0002-15 added.
 
 ## Constraint
 
 `tests/common/` is per-crate; neither crate exports test utilities to the other, so genuinely
 cross-crate helpers stay duplicated once unless a `test-util` feature on `outrig` is introduced.
-That is a public-surface decision and should not be made here -- see 0093-0095.
+That is a public-surface decision and should not be made here -- see 0002-16 through 0002-18.
 
 ## Sequencing
 
 Cheap and mechanical, but touches most test files, so it will conflict with anything else in
-flight. Land it in a quiet window, ideally after the 0093-0095 surface work settles.
+flight. Land it in a quiet window, ideally after the 0002-16 through 0002-18 surface work settles.

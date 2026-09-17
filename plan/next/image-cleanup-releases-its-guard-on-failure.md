@@ -1,6 +1,6 @@
 # A failed image cleanup still disarms its retry guard
 
-Pre-existing, and unchanged by 0116: `cleanup_builder` and `cleanup_temp_image`
+Pre-existing, and unchanged by 0002-39: `cleanup_builder` and `cleanup_temp_image`
 (`crates/outrig/src/image.rs`) both discard the removal's outcome --
 
 ```rust

@@ -1,11 +1,12 @@
-# 0105 -- Mount validation errors cannot name the file that declared the path
+# 0002-28 -- Mount validation errors cannot name the file that declared the path
 
 ## Context
 
-`plan/done/0097-config-path-provenance.md` gave `ConfigValidationError::DockerfileMissing` and
-`ContextMissing` a `declared_in` field, so an image path that fails an existence check names the
-config file to go edit. Mount errors did not get the same treatment, and the asymmetry is
-visible: a global `[[workspace.mounts]]` whose `host-path` is missing still reports
+`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` gave
+`ConfigValidationError::DockerfileMissing` and `ContextMissing` a `declared_in` field, so an image
+path that fails an existence check names the config file to go edit. Mount errors did not get the
+same treatment, and the asymmetry is visible: a global `[[workspace.mounts]]` whose `host-path` is
+missing still reports
 
 ```
 workspace mount host-path "shared" does not exist
@@ -17,18 +18,18 @@ where it matters most: global and repo mount lists are *concatenated*
 (`crates/outrig/src/config/merge.rs`), so a single failing list can hold entries from two files.
 
 The reason it was skipped is mechanical, not principled. The two image variants already carried
-`#[non_exhaustive]` from `plan/done/0094-non-exhaustive-sweep.md`, so adding a field was
-additive. The mount errors do not:
+`#[non_exhaustive]` from `plan/done/phase/0002-sidecars/tasks/0002-17-non-exhaustive-sweep.md`, so
+adding a field was additive. The mount errors do not:
 
 - `MountRuleViolation` (`crates/outrig/src/config/validate.rs`) is a plain **tuple** enum --
   `HostMissing(PathBuf)`, `HostNotDirectory(PathBuf)`, `ContainerNotAbsolute(PathBuf)`,
   `ContainerRoot`, `ContainerDuplicate(PathBuf)`. Every variant would change shape.
 - `ConfigValidationError::WorkspaceMountHostMissing`, `WorkspaceMountHostNotDirectory`,
   `WorkspaceMountContainerNotAbsolute`, `WorkspaceMountContainerDuplicate` are struct variants
-  **without** `#[non_exhaustive]` -- 0094 Decision 5 sealed variants only where a field addition
+  **without** `#[non_exhaustive]` -- 0002-17 Decision 5 sealed variants only where a field addition
   was already proven, and these were not on that list.
 
-Both are breaking changes, and 0097 was required to be additive.
+Both are breaking changes, and 0002-20 was required to be additive.
 
 ## Goal
 
@@ -71,8 +72,8 @@ Let a mount diagnostic name its declaring file, the way an image diagnostic alre
    nothing extra and is what the rest of `ConfigValidationError` already looks like.
 
 2. **Seal the variants while breaking them -- Recommended: yes.** If these variants are being
-   reshaped once, they should carry `#[non_exhaustive]` afterwards for the same reason 0094 gave
-   the image variants theirs, so the next field is additive. 0094 Decision 6's warning does not
+   reshaped once, they should carry `#[non_exhaustive]` afterwards for the same reason 0002-17 gave
+   the image variants theirs, so the next field is additive. 0002-17 Decision 6's warning does not
    apply: these are return-only error variants that no downstream caller constructs.
 
 3. **Whether `ContainerNotAbsolute` / `ContainerRoot` / `ContainerDuplicate` also gain it --
@@ -89,7 +90,7 @@ already reshapes this very enum: `SidecarNameInvalid`, `SidecarImageEmpty`, `Sid
 removed outright. The breaking window for `ConfigValidationError` is open now, so this is one
 more bullet in a `### Changed` section rather than a `0.3.0` item.
 
-0097 was additive because *it* was required to be, not because the enum was frozen. The real
+0002-20 was additive because *it* was required to be, not because the enum was frozen. The real
 cost of deferring past `0.2.0` is that the window closes and this waits for the next one.
 
 ## Decisions
@@ -100,7 +101,7 @@ cost of deferring past `0.2.0` is that the window closes and this waits for the 
    the reader nothing to go on. The variants changed shape either way.
 
 2. **Fork 2 -- sealed, as recommended.** Every reshaped variant carries `#[non_exhaustive]`.
-   0094 Decision 6's warning does not apply: these are return-only error variants, so sealing
+   0002-17 Decision 6's warning does not apply: these are return-only error variants, so sealing
    removes no construction path that anyone had.
 
 3. **Fork 3 -- resolved *yes*: every mount rule gets `declared_in`, not just the two host-path
@@ -123,7 +124,7 @@ cost of deferring past `0.2.0` is that the window closes and this waits for the 
 5. **`ConfigValidationError::SidecarMount` is unchanged and deliberately still unsealed.** It
    wraps the violation whole, so the clause arrives through the violation's own `Display` with
    no code change at the wrapping boundary -- which is why that path needed a test rather than
-   an edit. Sealing it too would have been a gratuitous break: 0094 Decision 5 seals a variant
+   an edit. Sealing it too would have been a gratuitous break: 0002-17 Decision 5 seals a variant
    only where a field addition is proven, and none is proven here.
 
 6. **The `WorkspaceMount*` variants were not collapsed into a single wrapping variant.** The
@@ -132,7 +133,7 @@ cost of deferring past `0.2.0` is that the window closes and this waits for the 
    {violation}")]` would have rendered byte-identically while deleting ~40 lines. Rejected on
    three grounds -- it *deletes* public variants rather than reshaping them, which is a strictly
    larger break for a crate with downstream integration consumers; the task's acceptance names
-   these variants as reshaped-and-sealed; and 0094 Decision 5's principle that the enum *is* the
+   these variants as reshaped-and-sealed; and 0002-17 Decision 5's principle that the enum *is* the
    validation documentation favors a flat list that reads as one line per rule.
 
 7. **`declared_in` has no repo-config fallback**, matching `ImageConfig::declared_in` rather
@@ -142,7 +143,7 @@ cost of deferring past `0.2.0` is that the window closes and this waits for the 
    `MountConfig` reports `None` and renders no clause -- asserted directly, in six
    `mod config_validate` tests that build their configs with `parse`.
 
-8. **Verification that the tests test something,** per 0097 Decision 12. With
+8. **Verification that the tests test something,** per 0002-20 Decision 12. With
    `MountConfig::declared_in` stubbed to return `None`, all five new/extended provenance tests
    fail and the other 132 pass. Run before trusting a green suite.
 
@@ -162,6 +163,7 @@ cost of deferring past `0.2.0` is that the window closes and this waits for the 
 
 - `crates/outrig/src/config/validate.rs` -- `MountRuleViolation`, `check_mount_list`,
   `validate_workspace_mounts`, `validate_sidecar`.
-- `plan/done/0097-config-path-provenance.md` -- `declared_in` on the image errors, and the
-  decision recording why mounts were left out.
-- `plan/done/0094-non-exhaustive-sweep.md` -- Decisions 5 and 6, the sealing rules this follows.
+- `plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` -- `declared_in` on the
+  image errors, and the decision recording why mounts were left out.
+- `plan/done/phase/0002-sidecars/tasks/0002-17-non-exhaustive-sweep.md` -- Decisions 5 and 6, the
+  sealing rules this follows.

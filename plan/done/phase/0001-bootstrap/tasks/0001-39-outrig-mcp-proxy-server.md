@@ -1,11 +1,11 @@
-# 0039 -- Land `ProxyServer`
+# 0001-39 -- Land `ProxyServer`
 
 ## Goal
 
 A new module `src/mcp_proxy.rs` that implements `rmcp::ServerHandler` over a pool
 of `Arc<McpClient>`s -- exposing the union of every backing server's tools to a
-single MCP client, namespaced with `tool_name::sanitize` (0037). No CLI surface
-yet; 0040 wires it up.
+single MCP client, namespaced with `tool_name::sanitize` (0001-37). No CLI surface
+yet; 0001-40 wires it up.
 
 ## Deliverables
 
@@ -56,7 +56,7 @@ yet; 0040 wires it up.
   collisions across servers; if `tool_name::sanitize`'s blake3 suffix scheme ever
   regresses, fail loudly rather than silently routing to the wrong backend.
 - `src/lib.rs` -- add `mod mcp_proxy;` (or `pub mod` per the eventual decision in
-  0042).
+  0001-42).
 - `tests/mcp_proxy_dispatch.rs` -- unit test using a small `BackingClient` trait
   (or test double) so the proxy can be exercised against in-process fakes without
   spinning up real MCP children:
@@ -78,8 +78,8 @@ yet; 0040 wires it up.
 
 ## Dependencies
 
-- 0037-outrig-mcp-tool-name-extract
-- 0038-outrig-mcp-rmcp-features
+- 0001-37-outrig-mcp-tool-name-extract
+- 0001-38-outrig-mcp-rmcp-features
 
 ## Notes
 
@@ -90,7 +90,7 @@ yet; 0040 wires it up.
   lives.
 - `ServerInfo` defaults: `name = "outrig"`, `version = env!("CARGO_PKG_VERSION")`,
   one-line `instructions` mentioning the `<server>__<tool>` namespace prefix scheme
-  so an LLM client sees it. Final wording can land in 0040 alongside the banner.
+  so an LLM client sees it. Final wording can land in 0001-40 alongside the banner.
 
 ## Decisions
 
@@ -104,7 +104,7 @@ yet; 0040 wires it up.
 
 - **`BackingClient` is `pub`.** The integration test in
   `tests/mcp_proxy_dispatch.rs` is the only out-of-crate consumer for now;
-  gating to `pub(crate)` would force the test inline. `0042` revisits
+  gating to `pub(crate)` would force the test inline. `0001-42` revisits
   library-surface visibility for the whole crate at once.
 
 - **Dispatch extracted to `list_tools_inner` / `dispatch_call`.** The

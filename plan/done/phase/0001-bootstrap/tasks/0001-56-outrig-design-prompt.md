@@ -1,8 +1,8 @@
-# 0056 -- `outrig design prompt` -- one-shot prompt printer
+# 0001-56 -- `outrig design prompt` -- one-shot prompt printer
 
 ## Context
 
-`plan/todo/0055-outrig-mcp-self.md` ships the MCP-server side of
+`plan/done/phase/0001-bootstrap/tasks/0001-55-outrig-mcp-self.md` ships the MCP-server side of
 self-description -- the closed-loop, validate-as-you-iterate path for
 AI tools that speak MCP. Not every user has an MCP-capable tool, and
 some workflows (one-off ChatGPT chat, paste-into-a-form) don't fit the
@@ -14,8 +14,8 @@ vends + a few worked examples. The user pipes that into any chat UI
 and gets a usable answer in one round-trip, without iterative
 validation.
 
-Both this task and 0055 share the same doc bundle, so they have to
-ship in order. 0055 lands first; this task pulls in the same
+Both this task and 0001-55 share the same doc bundle, so they have to
+ship in order. 0001-55 lands first; this task pulls in the same
 `include_str!` set and adds the prompt-construction wrapper around it.
 
 ## Goal
@@ -84,7 +84,7 @@ src/
 ```
 
 The composer reuses the doc bundle from `src/mcp_self/docs.rs` (added
-in 0055) -- it's already a `&'static [(&'static str, &'static str)]`
+in 0001-55) -- it's already a `&'static [(&'static str, &'static str)]`
 of (key, contents) tuples. The composer concatenates them in a
 deterministic order, prepends the system message, and appends the
 worked examples.
@@ -97,8 +97,8 @@ them: Rust, Node, multi-MCP. Each labelled with what it demonstrates.
 
 ```
 outrig design prompt              # this task
-outrig mcp self                   # 0055 (sibling)
-outrig mcp run [...]              # plan/done/0035-0041
+outrig mcp self                   # 0001-55 (sibling)
+outrig mcp run [...]              # 0001-35 through 0001-41
 ```
 
 `outrig design` is the top-level subcommand; `prompt` is its only
@@ -111,24 +111,24 @@ Documentation lands with the feature.
 
 ### Fill in `doc/usage/ai-assisted-design.md`
 
-0055 created the page with a placeholder "Without MCP" section. This
+0001-55 created the page with a placeholder "Without MCP" section. This
 task fills it in:
 
 - `outrig design prompt | pbcopy` (or `| xclip -selection clipboard`)
   on Linux. Paste into ChatGPT, Claude.ai web, or any chat UI.
 - `outrig design prompt > prompt.txt` for users who want to inspect
   the prompt before sending it.
-- Note that the MCP path (0055) is preferred when available because it
+- Note that the MCP path (0001-55) is preferred when available because it
   closes the validation loop; the prompt path is a one-shot fallback.
 
-The "Per-tool setup" section already added in 0055 gets a footnote
+The "Per-tool setup" section already added in 0001-55 gets a footnote
 pointing at `outrig design prompt --print-mcp-config <tool>` as the
 way to regenerate the snippets if they drift.
 
 ### `doc/SUMMARY.md`
 
 No new entry needed -- `doc/usage/ai-assisted-design.md` was added by
-0055; this task only fills in a section.
+0001-55; this task only fills in a section.
 
 ## Deliverables
 
@@ -182,7 +182,7 @@ No new entry needed -- `doc/usage/ai-assisted-design.md` was added by
 
 ## Decisions
 
-- Reuse the 0055 doc bundle by making `src/mcp_self/docs.rs`
+- Reuse the 0001-55 doc bundle by making `src/mcp_self/docs.rs`
   crate-visible instead of duplicating the `include_str!` list in the
   design-prompt module.
 - Emit Codex setup as TOML, matching the existing
@@ -193,7 +193,7 @@ No new entry needed -- `doc/usage/ai-assisted-design.md` was added by
 
 ## Dependencies
 
-- **Hard: 0055** (`outrig mcp self`). Reuses the doc bundle from
+- **Hard: 0001-55** (`outrig mcp self`). Reuses the doc bundle from
   `src/mcp_self/docs.rs`; the `--print-mcp-config` snippets reference
   the `outrig mcp self` subcommand; the doc page filled in here was
   created in 0055.

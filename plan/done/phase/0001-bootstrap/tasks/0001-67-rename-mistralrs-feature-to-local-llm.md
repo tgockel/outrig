@@ -1,4 +1,4 @@
-# 0067 -- Rename `mistralrs` Cargo feature to `local-llm`
+# 0001-67 -- Rename `mistralrs` Cargo feature to `local-llm`
 
 ## Context
 

@@ -1,4 +1,4 @@
-# 0049 -- Configurable per-tool-result truncation
+# 0001-49 -- Configurable per-tool-result truncation
 
 ## Context
 

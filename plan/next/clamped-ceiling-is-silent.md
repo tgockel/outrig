@@ -58,5 +58,6 @@ not judge, which narrows what the warning is for and may shrink it to nothing.
 
 - `crates/outrig-cli/src/llm.rs` -- the clamp arm in `build_agent`, and `warn_fallback_ceiling`
   directly below it, whose doc comment is the argument this would extend.
-- `crates/outrig-cli/tests/anthropic_mock.rs` -- `a_configured_ceiling_is_capped_at_the_published_one`
-  pins the clamp itself; a warning wants stderr capture, which that harness does not do today.
+- `crates/outrig-cli/tests/anthropic_mock.rs` --
+  `a_configured_ceiling_is_capped_at_the_published_one` pins the clamp itself; a warning wants
+  stderr capture, which that harness does not do today.

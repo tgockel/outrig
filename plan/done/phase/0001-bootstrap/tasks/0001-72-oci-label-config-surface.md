@@ -1,8 +1,8 @@
-# 0072 -- OCI labels for standalone image config (stamp + read)
+# 0001-72 -- OCI labels for standalone image config (stamp + read)
 
 ## Context
 
-0069/0070/0071 gave standalone images a baked config file: `outrig image init` writes
+0001-69/0070/0071 gave standalone images a baked config file: `outrig image init` writes
 `image.toml`, the Dockerfile copies it to `/etc/outrig/image.toml`, `outrig image build`
 validates the baked copy, and runtime reads it back with `podman exec cat`.
 
@@ -14,7 +14,7 @@ This is a pre-0.1 foundation fix, so we change the mechanism now rather than car
 
 This task introduces labels and makes them **authoritative** for stamping, runtime read, and
 build validation. To avoid a broken intermediate, the Dockerfile still copies the baked file
-(it is simply no longer read); 0073 removes the now-dead file and its `COPY`.
+(it is simply no longer read); 0001-73 removes the now-dead file and its `COPY`.
 
 Authoring is unchanged: humans still write `image.toml` (TOML on disk) for a standalone
 project. The build validates it and serializes its contents into labels.
@@ -70,8 +70,8 @@ runtime and at build-validation time, replacing the `podman exec cat` file read.
 
 ## Dependencies
 
-- **Hard: 0069**. Serializes the standalone schema/validation introduced there into labels.
-- **Hard: 0071**. Extends the standalone build path and its build-validation read.
+- **Hard: 0001-69**. Serializes the standalone schema/validation introduced there into labels.
+- **Hard: 0001-71**. Extends the standalone build path and its build-validation read.
 
 ## Decisions
 
@@ -101,7 +101,7 @@ runtime and at build-validation time, replacing the `podman exec cat` file read.
 
 5. **Doc split with 0073.** Read-mechanism statements were flipped to OCI labels now; the init
    scaffold's Dockerfile `COPY` (still emitted this task) and its doc/README mentions are left
-   for 0073, which removes the baked file.
+   for 0001-73, which removes the baked file.
 
 6. **Pre-existing e2e compile rot (out of scope, filed).** The `--features e2e` suite does not
    compile, predating this task (e2e is not in CI): `crates/outrig/tests/embedded_image.rs`'s

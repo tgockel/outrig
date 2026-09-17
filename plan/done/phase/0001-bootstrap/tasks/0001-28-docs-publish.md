@@ -1,4 +1,4 @@
-# 0028 -- Publish docs to GitHub Pages via CI
+# 0001-28 -- Publish docs to GitHub Pages via CI
 
 ## Goal
 

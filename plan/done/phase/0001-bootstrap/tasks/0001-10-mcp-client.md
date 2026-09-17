@@ -1,4 +1,4 @@
-# 0010 -- MCP client
+# 0001-10 -- MCP client
 
 ## Goal
 
@@ -46,7 +46,7 @@ file under the session dir.
 
 ## Dependencies
 
-- 0009-runtime-user-bootstrap
+- 0001-09-runtime-user-bootstrap
 
 ## Notes
 
@@ -54,7 +54,7 @@ file under the session dir.
   docs, verify the trait names and `serve_client` signature. If rmcp's public API doesn't fit
   cleanly, isolate the breakage inside `mcp.rs` -- callers should only see our facade.
 - Per-server stderr in `<log_dir>/<name>.stderr` matches `doc/usage/sessions.md`'s layout. The
-  `log_dir` here is the per-session `logs/` subdir; the caller (run subcommand, task 0019)
+  `log_dir` here is the per-session `logs/` subdir; the caller (run subcommand, task 0001-19)
   passes it in.
 
 ## Decisions

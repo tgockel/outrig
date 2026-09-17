@@ -5,9 +5,9 @@ per-provider override on the `OpenAi` / `Anthropic` variants, merged
 repo-over-global in `merge.rs`. Its sibling `request-timeout-secs` exists only on
 the provider variants -- `Config` has no field and `merge` has no line for one.
 
-Noticed while implementing 0106, whose Acceptance criteria as queued asked for
+Noticed while implementing 0002-29, whose Acceptance criteria as queued asked for
 the range check "at the top level and per provider" on the assumption that the
-two keys were shaped alike. They are not; 0106's criteria were corrected to the
+two keys were shaped alike. They are not; 0002-29's criteria were corrected to the
 one path that exists, and this is the other half.
 
 The asymmetry is a papercut rather than a bug. A user with three remote
@@ -28,14 +28,14 @@ missing half read as an oversight.
 - Validate the new path with the existing `validate_request_timeout_secs`, under
   a `"top-level request-timeout-secs"` path string.
 - `doc/reference/config.md`: a top-level table row, and extend the validation
-  rule 0106 added to name both paths.
+  rule 0002-29 added to name both paths.
 
 ## Notes
 
 Purely additive: a new `Option` field on a `#[non_exhaustive]` struct, defaulting
 to today's behavior when unset. It does **not** need the pre-0.2.0-final window,
-which is why 0106 left it out rather than folding it in -- adding it later breaks
-nothing, whereas 0106's *bound* had to land before the release froze the set of
+which is why 0002-29 left it out rather than folding it in -- adding it later breaks
+nothing, whereas 0002-29's *bound* had to land before the release froze the set of
 accepted configs.
 
 Regenerate `crates/outrig/public-api.txt`.
@@ -49,4 +49,4 @@ Regenerate `crates/outrig/public-api.txt`.
 
 ## Dependencies
 
-0106 (the range check and `REQUEST_TIMEOUT_SECS_CEILING` it introduces).
+0002-29 (the range check and `REQUEST_TIMEOUT_SECS_CEILING` it introduces).

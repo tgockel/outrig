@@ -1,9 +1,9 @@
-# 0114 -- A hostname rule grants only when the destination is bound to it
+# 0002-37 -- A hostname rule grants only when the destination is bound to it
 
 ## Context
 
-`[network] mode = "filter"` is the enforcement half of the interceptor arc: 0059 gave outrig
-audited egress, 0060 made host:port policy enforceable, and `SECURITY.md` names failure to
+`[network] mode = "filter"` is the enforcement half of the interceptor arc: 0001-59 gave outrig
+audited egress, 0001-60 made host:port policy enforceable, and `SECURITY.md` names failure to
 enforce a host:port allow/deny policy as in scope. The policy evaluator does not hold that
 property today.
 
@@ -131,7 +131,7 @@ rule that will be dropped during implementation:
 - The same for a late cleartext `Host:` header. It reaches the same window through a different
   parser, and testing only the TLS side leaves half the bypass unproven.
 
-**Live interceptor** -- against a real attachment, gated with the other e2e work (0130):
+**Live interceptor** -- against a real attachment, gated with the other e2e work (0002-53):
 
 - A container that resolves `allowed.example` through the interceptor's own DNS and then connects
   is allowed. This is the test that fails if the fix is "delete the sniff disjunct" and stops.
@@ -182,7 +182,8 @@ is exercised by 0130.
   `cached_host` (1223), `cache_dns_response` (1227), `dns_answer_ips` (1247), `forward_dns`
   (844), `dns_loop` (805), `handle_tcp` (624), `SNIFF_TIMEOUT` (50).
 - `plan/next/network-interceptor-mitm.md` -- the adjacent entry this task is *not*.
-- `plan/done/0060-network-interceptor-enforcement.md` -- where host:port enforcement was built.
+- `plan/done/phase/0001-bootstrap/tasks/0001-60-network-interceptor-enforcement.md` -- where
+  host:port enforcement was built.
 
 ## Decisions
 

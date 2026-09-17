@@ -1,4 +1,4 @@
-# 0062 -- Streaming output for the in-process mistralrs path
+# 0001-62 -- Streaming output for the in-process mistralrs path
 
 ## Context
 
@@ -112,14 +112,14 @@ Today `MistralrsModel::completion` collects them all then returns once
 - Tool calls happen at `[outrig] tool call: ...` boundaries today;
   stream-aware printing must flush text *before* the call line.
 - This task is independent of GPU support
-  (`0063-mistralrs-gpu-device.md`) but combined they make the in-process
-  path actually pleasant to use; a 7B Q4_K_M on a CUDA GPU streams at
-  100+ tok/s and the user sees output instantly.
+  (`plan/done/phase/0001-bootstrap/tasks/0001-63-mistralrs-gpu-device.md`) but combined they make
+  the in-process path actually pleasant to use; a 7B Q4_K_M on a CUDA GPU streams at 100+ tok/s and
+  the user sees output instantly.
 
 ## Dependencies
 
 None hard. Builds on the shipped mistralrs shim and registry work in
-`plan/done/0015-0017`.
+`0001-15` through `0001-17`.
 
 ## Decisions
 

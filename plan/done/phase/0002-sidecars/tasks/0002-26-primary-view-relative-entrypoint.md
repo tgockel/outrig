@@ -1,4 +1,4 @@
-# 0103 -- `view = "primary"` cannot run an image whose ENTRYPOINT is a bare program name
+# 0002-26 -- `view = "primary"` cannot run an image whose ENTRYPOINT is a bare program name
 
 ## Context
 
@@ -20,7 +20,7 @@ one-liner in `doc/concepts/mcp-servers.md` uses, and the image
 `crates/outrig-cli/tests/primary_view_e2e.rs` runs. **That e2e fails on trunk today** --
 verified against an unmodified `43dea081` worktree, so it predates 0096.
 
-0096 fixed the *other* half of this: `build_primary_view_argv` was graft-prefixing the
+0002-19 fixed the *other* half of this: `build_primary_view_argv` was graft-prefixing the
 payload program as well, while the launcher already re-prefixes it itself when handing the
 path to the loader (`launcher.rs:302`), so an absolute ENTRYPOINT became
 `<graft><graft>/...` and failed the same way. With that fixed, an image whose ENTRYPOINT is
@@ -28,8 +28,9 @@ an *absolute* path works end to end (`primary_view_sidecar_from_library_sees_the
 in `crates/outrig/tests/library_surface.rs` proves it, against a
 `docker.io/mcp/filesystem:latest` derivative that restates the ENTRYPOINT absolutely).
 
-The relative case is what remains, and it is what stands between this repo's own config and
-using a published MCP image unmodified -- see `plan/todo/0104-dogfood-sidecar-mcp-config.md`.
+The relative case is what remains, and it is what stands between this repo's own config and using a
+published MCP image unmodified -- see
+`plan/done/phase/0002-sidecars/tasks/0002-27-dogfood-sidecar-mcp-config.md`.
 
 ## Goal
 
@@ -62,7 +63,7 @@ documented quickstart -- starts and serves, and `primary_view_e2e.rs` passes unm
 
 ## Dependencies
 
-- **0102**. Both edit `main()` in `crates/outrig/src/container/enter/launcher.rs`, and 0102
+- **0002-25**. Both edit `main()` in `crates/outrig/src/container/enter/launcher.rs`, and 0002-25
   moves the exec paths this task's resolved program flows into. Landing the privilege drop
   first keeps the two reviewable apart.
 
@@ -113,7 +114,7 @@ documented quickstart -- starts and serves, and `primary_view_e2e.rs` passes unm
 Worth doing before `0.2.0` is cut: the quickstart in the published book does not currently
 work, and `view = "primary"` is the feature it is selling.
 
-Related: `plan/done/0089-outrig-enter-helper.md` (the launcher),
-`plan/done/0090-primary-view-sidecars.md` (the graft-prefix rule and the e2e),
-`plan/done/0096-library-sidecar-parity.md` (the double-graft half of the fix, and the
-absolute-ENTRYPOINT e2e).
+Related: `plan/done/phase/0002-sidecars/tasks/0002-12-outrig-enter-helper.md` (the launcher),
+`plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md` (the graft-prefix rule and
+the e2e), `plan/done/phase/0002-sidecars/tasks/0002-19-library-sidecar-parity.md` (the double-graft
+half of the fix, and the absolute-ENTRYPOINT e2e).

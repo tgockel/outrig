@@ -1,4 +1,4 @@
-# 0069 -- Embedded `image.toml` for standalone images
+# 0001-69 -- Embedded `image.toml` for standalone images
 
 ## Context
 
@@ -75,11 +75,11 @@ and standalone image projects use the same `image.toml` file shape.
 
 ## Dependencies
 
-- **Hard: 0051**. The later standalone workflow depends on repo configs being
+- **Hard: 0001-51**. The later standalone workflow depends on repo configs being
   able to reference published images by `image-name`.
-- **Hard: 0053**. This task renames and extends the embedded image-config
+- **Hard: 0001-53**. This task renames and extends the embedded image-config
   support introduced there.
-- **Hard: 0055**. The new validator is exposed through `outrig mcp self`.
+- **Hard: 0001-55**. The new validator is exposed through `outrig mcp self`.
 
 ## Decisions
 

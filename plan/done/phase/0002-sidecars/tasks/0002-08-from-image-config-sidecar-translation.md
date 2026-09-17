@@ -1,11 +1,11 @@
-# 0085 -- from_image_config sidecar translation
+# 0002-08 -- from_image_config sidecar translation
 
 ## Goal
 
-`LaunchSpec::from_image_config` copies `[images.<name>.mcp]` wholesale, so placement-bearing
-entries (`sidecar = "<sc>"`, inline `image = "..."`) survive into the spec and
-`Outrig::launch` rejects them with a pointer at `LaunchSpec::with_sidecar` /
-`Outrig::add_sidecar` (decision recorded in `plan/done/0081-sidecar-dynamic-add.md`).
+`LaunchSpec::from_image_config` copies `[images.<name>.mcp]` wholesale, so placement-bearing entries
+(`sidecar = "<sc>"`, inline `image = "..."`) survive into the spec and `Outrig::launch` rejects them
+with a pointer at `LaunchSpec::with_sidecar` / `Outrig::add_sidecar` (decision recorded in
+`plan/done/phase/0002-sidecars/tasks/0002-04-sidecar-dynamic-add.md`).
 
 Make the translation faithful instead: `from_image_config` (or a sibling constructor taking
 the whole `Config`) turns `[sidecars.*]` blocks and placement-bearing MCP entries into
@@ -34,7 +34,7 @@ A faithful translation, with these scope notes:
 
 ## Dependencies
 
-None (follows up on completed task 0081).
+None (follows up on completed task 0002-04).
 
 ## Decisions
 
@@ -47,11 +47,12 @@ User-confirmed during planning (2026-07-13):
    so removal was free. The primary image is config-name-only (raw primary refs remain
    `LaunchSpec::from_image`'s job).
 2. **Sidecar images are resolved eagerly in the constructor**, mirroring the CLI's
-   `ensure_sidecar_image` (sibling `[images.<name>]` -> `compute_tag_for` + `ensure_tagged_image_for`;
-   else a raw local ref via `ensure_local_image`, no pull). The resolved tag is stored verbatim in
-   `SidecarSpec.image`, preserving 0081 decision 1 (the library `SidecarSpec` image is a raw ref).
-   The primary image stays lazy (built at `launch`) -- an accepted asymmetry, since `LaunchSource`
-   already carries an unbuilt Build/Image source while `SidecarSpec` does not.
+   `ensure_sidecar_image` (sibling `[images.<name>]` -> `compute_tag_for` +
+   `ensure_tagged_image_for`; else a raw local ref via `ensure_local_image`, no pull). The resolved
+   tag is stored verbatim in `SidecarSpec.image`, preserving 0002-04 decision 1 (the library
+   `SidecarSpec` image is a raw ref). The primary image stays lazy (built at `launch`) -- an
+   accepted asymmetry, since `LaunchSource` already carries an unbuilt Build/Image source while
+   `SidecarSpec` does not.
 3. **Entrypoint-stdio placements are rejected** with a specific `Configuration` error naming the
    server. The facade is exec-stdio only (`SidecarServerSpec.command` is non-optional); growing an
    entrypoint-stdio form would duplicate the CLI's create->init->attach->start machinery for a

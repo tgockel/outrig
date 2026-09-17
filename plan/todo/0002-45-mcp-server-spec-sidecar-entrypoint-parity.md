@@ -1,4 +1,4 @@
-# 0122 -- `McpServerSpec` can build the named-sidecar entrypoint shape
+# 0002-45 -- `McpServerSpec` can build the named-sidecar entrypoint shape
 
 ## Context
 
@@ -15,10 +15,11 @@ constructors both set a field that rules the shape out:
 rejects as `McpPlacementConflict` (`crates/outrig/src/config/validate.rs:702-707`). There is no
 path to `{ command: None, image: None, sidecar: Some(..) }`.
 
-This is the same class of gap `plan/done/0096-library-sidecar-parity.md` closed for
+This is the same class of gap
+`plan/done/phase/0002-sidecars/tasks/0002-19-library-sidecar-parity.md` closed for
 `SidecarServerSpec`: a placement the TOML supports and an embedder cannot reach. The 0.2.0 audit
-found it independently and put it on the pre-freeze list, since config/library parity is the kind
-of promise a release is read as making.
+found it independently and put it on the pre-freeze list, since config/library parity is the kind of
+promise a release is read as making.
 
 ## Why it did not block the built-in default image
 
@@ -44,7 +45,7 @@ Add one function beside `entrypoint` (`config/mod.rs:1536-1541`), routing throug
 pub fn entrypoint_in_sidecar(sidecar: impl Into<String>) -> Self
 ```
 
-Additive on a `#[non_exhaustive]` enum's impl, in the spirit of the 0094 constructor sweep
+Additive on a `#[non_exhaustive]` enum's impl, in the spirit of the 0002-17 constructor sweep
 (`crates/outrig/CHANGELOG.md:219-235`).
 
 ## Acceptance
@@ -71,8 +72,8 @@ None. Small and additive; it can land at any point in this phase.
 
 ## See also
 
-- `plan/done/0096-library-sidecar-parity.md` -- the precedent, and the reason this counts as a
-  hole rather than a missing convenience.
+- `plan/done/phase/0002-sidecars/tasks/0002-19-library-sidecar-parity.md` -- the precedent, and the
+  reason this counts as a hole rather than a missing convenience.
 - `crates/outrig/tests/config_merge.rs`, `config_provider_enum.rs` -- ungated out-of-crate config
   tests, the right home; `library_surface.rs` is `e2e`-gated and is not.
 - `crates/outrig-cli/src/builtin_image/default.toml` -- the shape in question, in TOML.

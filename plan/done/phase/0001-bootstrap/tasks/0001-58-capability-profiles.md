@@ -1,4 +1,4 @@
-# 0058 -- Capability profiles
+# 0001-58 -- Capability profiles
 
 ## Context
 
@@ -187,14 +187,14 @@ cargo test --no-default-features --features e2e --test library_surface -- --noca
 
 ## See also
 
-- `0057-runtime-bind-mounts.md` -- host filesystem exposure controls for the same container
-  launch path.
-- `0059-network-interceptor-plumbing.md` -- network egress controls; deliberately separate from
-  kernel capability policy.
+- `plan/done/phase/0001-bootstrap/tasks/0001-57-runtime-bind-mounts.md` -- host filesystem exposure
+  controls for the same container launch path.
+- `plan/done/phase/0001-bootstrap/tasks/0001-59-network-interceptor-plumbing.md` -- network egress
+  controls; deliberately separate from kernel capability policy.
 
 ## Dependencies
 
-- **Hard: 0057**. Reuses the podman-run argument builder extracted for runtime bind
+- **Hard: 0001-57**. Reuses the podman-run argument builder extracted for runtime bind
   mounts so capability rendering has unit coverage without needing podman.
 
 ## Decisions

@@ -1,16 +1,16 @@
 # Close the remaining "declared but never compiled" gaps in CI
 
 > **Partly queued.** The live-e2e and AArch64 coverage moved to
-> `plan/todo/0130-live-podman-e2e-and-a-green-aarch64-row.md`, and the `cargo publish --dry-run`
-> item to `plan/todo/0129-cut-0.2.0-rc.3.md`. What stays here: the generalizing
+> `plan/todo/0002-53-live-podman-e2e-and-a-green-aarch64-row.md`, and the `cargo publish --dry-run`
+> item to `plan/todo/0002-52-cut-0.2.0-rc.3.md`. What stays here: the generalizing
 > `cargo hack --each-feature` job, the MSRV check, and the cache-bucket and sccache cleanups. The
 > `macos-latest` x `local-llm,metal` item is contingent on
-> `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md` and may evaporate entirely.
+> `plan/todo/0002-46-deprecated-local-llm-behavior-for-0.2.0.md` and may evaporate entirely.
 
 ## Context
 
-0092 existed because a whole feature-gated test suite had rotted unnoticed: `e2e` was declared
-on both crates, and no CI job ever compiled it. 0092 fixed that one instance by adding a matrix
+0002-15 existed because a whole feature-gated test suite had rotted unnoticed: `e2e` was declared
+on both crates, and no CI job ever compiled it. 0002-15 fixed that one instance by adding a matrix
 row. It did not fix the *class* -- there is still no mechanism that notices a declared
 configuration nobody builds. Several more are uncovered today, found while reviewing 0092.
 

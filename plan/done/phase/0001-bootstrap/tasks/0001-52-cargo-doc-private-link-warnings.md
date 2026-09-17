@@ -1,4 +1,4 @@
-# 0052 -- Clean up `cargo doc --no-deps` private-link warnings
+# 0001-52 -- Clean up `cargo doc --no-deps` private-link warnings
 
 ## Goal
 
@@ -50,5 +50,5 @@ afterwards.
 
 ## Dependencies
 
-None. Independent of any in-flight task; mentioned during 0038 but not
+None. Independent of any in-flight task; mentioned during 0001-38 but not
 blocked on anything in `plan/todo/`.

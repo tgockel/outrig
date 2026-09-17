@@ -1,4 +1,4 @@
-# 0021 -- Session CLI (`ls`, `logs`, `discard`)
+# 0001-21 -- Session CLI (`ls`, `logs`, `discard`)
 
 ## Goal
 
@@ -40,7 +40,7 @@ Implement the three session-management subcommands using the `SessionStore` from
 
 ## Dependencies
 
-- 0020-session-store
+- 0001-20-session-store
 
 ## Notes
 
@@ -64,7 +64,7 @@ Implement the three session-management subcommands using the `SessionStore` from
   config (silently skipping `NoRepoConfig`), then the global config, then the XDG default
   -- and skips full validation since we only need the `session-root` key.
 - **Substring `<session>` resolution lives in `src/cli/mod.rs`, not on `SessionStore`.**
-  CLI ergonomics policy, not a store invariant. Keeps the 0020-locked store surface
+  CLI ergonomics policy, not a store invariant. Keeps the 0001-20-locked store surface
   minimal; if a non-CLI consumer ever appears, it gets exact-match by default.
 - **`SessionStore::symlink_path(&id)` instead of a leaky `root()` accessor.**
   `discard` needs the `<root>/<sid>` path for the user-facing "removed ... (symlink)"

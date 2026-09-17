@@ -1,19 +1,19 @@
 # `outrig clean` can report a stray it did not remove
 
-Task 0086 coalesced the stray sweep's per-container `podman rm -f` calls into a single
+Task 0002-09 coalesced the stray sweep's per-container `podman rm -f` calls into a single
 batched invocation (`podman_remove_force_batch` in `crates/outrig-cli/src/cli/clean.rs`).
 `execute_with` awaits that one call, then prints `[outrig] removed container <name>` for
 every stray in the batch. The per-container line is therefore a claim about the batch's
 exit status, not about that container.
 
 Observed 2026-07-24 while cutting 0.2.0-rc.1, in a full parallel e2e run
-(`clean_sweeps_stopped_recordless_labeled_containers`, `crates/outrig-cli/tests/mcp_sidecar_smoke.rs`):
-`podman rm -f` exited 0 -- the "removed container" lines printed for all five names, and
-`podman_remove_force_batch` returned `Ok` -- yet two of the five were still in the store
-afterward (`outrig-straytest-1ba64594` exited, `outrig-20260722T172711-93c3` created). A
-direct `podman rm -f <name>` removed each instantly. The batch had swept up three live
-containers belonging to concurrently-running tests, so podman was being asked to remove
-containers another process was tearing down at the same moment.
+(`clean_sweeps_stopped_recordless_labeled_containers`,
+`crates/outrig-cli/tests/mcp_sidecar_smoke.rs`): `podman rm -f` exited 0 -- the "removed container"
+lines printed for all five names, and `podman_remove_force_batch` returned `Ok` -- yet two of the
+five were still in the store afterward (`outrig-straytest-1ba64594` exited,
+`outrig-20260722T172711-93c3` created). A direct `podman rm -f <name>` removed each instantly. The
+batch had swept up three live containers belonging to concurrently-running tests, so podman was
+being asked to remove containers another process was tearing down at the same moment.
 
 The test passes in isolation, so the trigger is concurrent mutation of the same containers,
 not the batching alone. But the batching is what makes the failure silent: one `rm` per
@@ -34,7 +34,7 @@ whole podman store, so any `outrig clean` test necessarily collides with other e
 running in parallel. Scoping the sweep test's assertions to its own container name (it
 already does) is not enough -- the batch it triggers still touches other tests' containers.
 
-Seen again 2026-07-28 during 0095, and it is worse than "flaky": it is self-perpetuating.
+Seen again 2026-07-28 during 0002-18, and it is worse than "flaky": it is self-perpetuating.
 Once one run leaves an `outrig-straytest-*` container behind, every subsequent full-file run
 fails the same way, because the leftover joins the batch that then skips names. Three
 consecutive runs failed; the same file passed on the first run of the day and passes when

@@ -1,15 +1,15 @@
-# 0113 -- Model alias failover: move to the next candidate when one fails mid-turn
+# 0002-36 -- Model alias failover: move to the next candidate when one fails mid-turn
 
 ## Context
 
-`plan/done/0110-model-aliases.md` divides aliases into a **static half** -- select one candidate at
-resolve time from what this build is credentialed for -- and a **runtime half**, which moves to the
-next candidate when one fails mid-session. 0110 ships only the static half, and says so twice:
-under Deliverables ("**Not in the first pass**: the runtime half") and under Design forks §2, whose
-whole argument is that the split is safe *because* "the config surface is identical for both, so
-the second half is additive to the first."
+`plan/done/phase/0002-sidecars/tasks/0002-33-model-aliases.md` divides aliases into a **static
+half** -- select one candidate at resolve time from what this build is credentialed for -- and a
+**runtime half**, which moves to the next candidate when one fails mid-session. 0002-33 ships only
+the static half, and says so twice: under Deliverables ("**Not in the first pass**: the runtime
+half") and under Design forks §2, whose whole argument is that the split is safe *because* "the
+config surface is identical for both, so the second half is additive to the first."
 
-This is that second half. It is the one the phrase "failover" actually describes, and 0110 is
+This is that second half. It is the one the phrase "failover" actually describes, and 0002-33 is
 emphatic that the static half must not be mistaken for it:
 
 > Building a remote client does no network I/O [...] so static selection is deliberately blind to
@@ -17,16 +17,16 @@ emphatic that the static half must not be mistaken for it:
 > and the docs must say so, or the failover use case will be assumed to be covered when it is
 > half-covered.
 
-The gap the static half leaves is exactly the one 0110's Context named as the second trigger:
+The gap the static half leaves is exactly the one 0002-33's Context named as the second trigger:
 **which vendor is up right now?** A rate-limit window on one endpoint ends the turn
 (`handle_prompt_error`, `crates/outrig-cli/src/llm.rs:1113`) even though two other endpoints serve
 the same weights, and the static half cannot help, because it made its choice before the window
 opened.
 
 Nothing in this entry changes the config surface. `alias = ["opus-5-bedrock", "opus-5-anthropic",
-"opus-5-azure"]` already means an ordered list of provider-equivalent rows; 0110 committed to that
-meaning holding for both halves, and this entry is what makes the ordering matter at runtime rather
-than only at startup.
+"opus-5-azure"]` already means an ordered list of provider-equivalent rows; 0002-33 committed to
+that meaning holding for both halves, and this entry is what makes the ordering matter at runtime
+rather than only at startup.
 
 ## Goal
 
@@ -42,13 +42,13 @@ re-executing any container tool call the turn has already run.
 - **An object-safe candidate shim**, because `CompletionModel` is not object-safe.
 - **`ResolvedAgent` carries the chain**, via a new `ResolvedCandidate`. See Shape.
 - **`build_agent` gains a fourth construction path** and `RigAgent` a `Failover` variant.
-- **A chain-scoped retry deadline**, which is the blocker 0110 named and the reason this entry
+- **A chain-scoped retry deadline**, which is the blocker 0002-33 named and the reason this entry
   depends on 0112. `RetryPolicy` loses `Copy`. See The shared budget.
 - **`handle_prompt_error`'s wording changes for a multi-candidate chain**, because the sentence it
   prints today is a claim about one endpoint and would become false. See The move rule.
-- **Docs**: `doc/concepts/llm-providers.md` (whose transient-failures section 0112 also edits, and
-  which is where 0110 was required to state that static selection does *not* cover failover -- that
-  sentence needs its counterpart here), and `doc/reference/config.md` (a **symlink** into
+- **Docs**: `doc/concepts/llm-providers.md` (whose transient-failures section 0002-35 also edits,
+  and which is where 0002-33 was required to state that static selection does *not* cover failover
+  -- that sentence needs its counterpart here), and `doc/reference/config.md` (a **symlink** into
   `crates/outrig-cli/src/mcp_self/docs/` -- edit the target) wherever `alias` describes what an
   ordered list buys.
 - **Not required**: any change to `crates/outrig`. Nothing in the public surface moves; see
@@ -80,7 +80,7 @@ row (`llm.rs:193-219`). Under failover those five travel *per candidate*. Introd
 `ResolvedCandidate` holding them and have `ResolvedAgent` hold a `Vec<ResolvedCandidate>`, with the
 first element being what every existing reader already means.
 
-`model_name` keeps the meaning 0110's Risks pinned it to -- the *concrete* row, because
+`model_name` keeps the meaning 0002-33's Risks pinned it to -- the *concrete* row, because
 `LlmRegistry` is keyed on it (`llm/registry.rs:27`) and an alias name reaching it loads the same
 GGUF twice. With a chain, that reasoning applies per candidate: the key is the candidate's concrete
 name, never the alias's.
@@ -96,7 +96,7 @@ Erasing `Response` to `()` is sound because nothing in outrig ever *reads*
 `CompletionResponse::raw_response`. Note this is a property of outrig, not of rig, so it wants a
 comment at the erasure site: the only production construction is `llm/mistralrs.rs:591` and it is
 never consumed, and the two remote arms' `Response` types are rig's own, which outrig never
-touches. (0110 also cites `llm.rs:1719` for this; that line is now `llm.rs:1745` and is a test
+touches. (0002-33 also cites `llm.rs:1719` for this; that line is now `llm.rs:1745` and is a test
 fixture inside `mod tests`, so it is not evidence either way.)
 
 **`type Client = ()` and an unreachable `make`.** `RetryingModel::make` faces the same situation
@@ -118,7 +118,7 @@ the same weights on three vendors) pays nothing for it.
 
 ### What gets rewritten per candidate -- Resolved
 
-0110 says the wrapper retargets `request.model` because `anthropic.claude-opus-5-v1:0` is not
+0002-33 says the wrapper retargets `request.model` because `anthropic.claude-opus-5-v1:0` is not
 `claude-opus-5`. Checked against rig 0.40, that is true but not load-bearing, and the distinction
 matters for what the shim must store:
 
@@ -129,7 +129,7 @@ matters for what the shim must store:
   an override when one is present (`providers/anthropic/completion.rs:2456-2459`,
   `providers/openai/completion/mod.rs:1853`), so setting it is correct and costs nothing -- but it
   is belt-and-braces against a future rig that populates the field, not the mechanism.
-- **`request.max_tokens` is the rewrite that matters**, and 0110's Design fork §4 is why. The
+- **`request.max_tokens` is the rewrite that matters**, and 0002-33's Design fork §4 is why. The
   ceiling is folded into the agent at resolve time (`resolve_agent_with_overrides`, `llm.rs:413`),
   and the Anthropic arm additionally caps it against what the identifier publishes
   (`llm.rs:633-636`) before `finish_agent` bakes it into the `Agent`. So the value reaching
@@ -137,7 +137,7 @@ matters for what the shim must store:
   would stay candidate one's while the identifier moved. Each candidate's build-time ceiling must
   therefore be stored on the shim and written into the request on a move.
 
-**This resolves 0110's Design fork §4** as: yes, `FailoverModel` rewrites `max_tokens` per
+**This resolves 0002-33's Design fork §4** as: yes, `FailoverModel` rewrites `max_tokens` per
 candidate, from a value `build_agent` computes per candidate through exactly the precedence the
 single-candidate path uses today.
 
@@ -148,7 +148,7 @@ up -- that is, on any `Err`, including ones that are terminal *for that candidat
 retryable and must keep ending the process today; in a chain it is a reason to try the next
 candidate, whose key may be fine. What must not happen is a failure disappearing: the chain records
 why each candidate was abandoned and, on exhaustion, reports all of them together, in the
-per-candidate shape 0110 already specifies for the static half's no-selectable-candidate error.
+per-candidate shape 0002-33 already specifies for the static half's no-selectable-candidate error.
 
 This touches a soundness claim that is currently written down, and rewriting it is part of the
 work. `exhausted_transient_label`'s doc comment (retry.rs:486-490) says:
@@ -165,7 +165,7 @@ path must keep the exact text it has today.
 
 ### The shared budget -- Resolved: a chain-scoped deadline
 
-This is the blocker 0110 names, and the reason 0112 comes first:
+This is the blocker 0002-33 names, and the reason 0002-35 comes first:
 
 > Three candidates at the default `retry-budget-secs = 600` is a thirty-minute turn against a total
 > outage. Worse, most of that is spent retrying endpoints already known to be down. [...] without
@@ -186,14 +186,14 @@ per-attempt bounds. Two consequences to state plainly rather than discover:
   the policy by value into a `'static` future (retry.rs:283-290), which becomes an `Arc` clone.
 - **A chain of one behaves exactly as today.** Arming a deadline for a single candidate reproduces
   the bound the per-attempt budget already gives, so the no-alias path is byte-for-byte unchanged
-  -- the property 0110 required of the static half and this entry inherits.
+  -- the property 0002-33 required of the static half and this entry inherits.
 
 Rejected: a static `budget / N` split at build time. It needs no plumbing and keeps `Copy`, but it
 shrinks the budget in the case that matters most -- candidate one instantly dead, candidate two
 deserving the whole thing.
 
-0112's short pre-first-byte bound is what makes the chain *fast* rather than merely *bounded*: the
-deadline caps the worst case at one budget, and the short bound is what stops each dead endpoint
+0002-35's short pre-first-byte bound is what makes the chain *fast* rather than merely *bounded*:
+the deadline caps the worst case at one budget, and the short bound is what stops each dead endpoint
 from eating it.
 
 ### Exclusions -- Resolved
@@ -211,15 +211,15 @@ from eating it.
   whose type surgery bought nothing, and an error is the honest encoding. Matches
   `RetryingModel::stream` (retry.rs:262-270) and the precedent in
   `plan/next/streaming-path-has-no-http-retry.md`.
-- **Mistralrs candidates** stay permitted in a chain -- 0110's Design fork §6 allows an alias to
+- **Mistralrs candidates** stay permitted in a chain -- 0002-33's Design fork §6 allows an alias to
   name one -- ~~but a cold multi-gigabyte load happens in `build_agent`, before the first turn,
   not on a move.~~ **It happens on first use** -- decision 16. Loading in `build_agent` let a
-  fallback with missing weights take down a session whose primary was healthy. 0101's decision 7
+  fallback with missing weights take down a session whose primary was healthy. 0002-24's decision 7
   is still the right reference, but for the reason it gives rather than the placement: it answers
   a cold in-process load by *announcing* it, which is what decision 20 does at the moment the
   chain reaches the candidate.
 - **The static half's selection rule stays.** A candidate this build cannot reach at all -- no
-  provider, wrong feature, unset api-key -- is still dropped at resolve time by 0110's rule. The
+  provider, wrong feature, unset api-key -- is still dropped at resolve time by 0002-33's rule. The
   chain holds only candidates that were selectable; failover is about which of *those* is working.
 
 ## Acceptance
@@ -251,11 +251,11 @@ from eating it.
    retry.rs's own and applies unchanged.
 2. **Shared budget mechanism -- Resolved: a chain-scoped deadline in `RetryPolicy`, at the cost of
    `Copy`.** See The shared budget for the rejected alternative.
-3. **`request.max_tokens` per candidate -- Resolved**, which closes 0110's Design fork §4.
+3. **`request.max_tokens` per candidate -- Resolved**, which closes 0002-33's Design fork §4.
 4. **Does a move print -- Recommended: yes, once per move, on stderr beside the retry lines.**
-   0110's Risks argues an alias widens what a config typo can silently do, and a chain that moves
+   0002-33's Risks argues an alias widens what a config typo can silently do, and a chain that moves
    mid-turn means one session can span two models. That is a stronger version of the same hazard
-   and the same mitigation applies: 0110's Attribution section prints the alias hop at startup;
+   and the same mitigation applies: 0002-33's Attribution section prints the alias hop at startup;
    this prints the move when it happens. The retry loop already prints a progress line per attempt
    (retry.rs:349-360), so there is a precedent for the volume and the format.
 5. **`warn_fallback_ceiling` under a chain -- Open.** See Risks. Small enough to decide during
@@ -271,14 +271,14 @@ from eating it.
    of the list.** The list is a preference order, and the whole point of the first entry is that it
    is preferred; sticking to candidate two for the rest of a long session because of one rate-limit
    window silently downgrades the user's choice. The cost is one wasted attempt against a
-   still-dead endpoint per call, which 0112's short bound makes cheap -- another way this entry
+   still-dead endpoint per call, which 0002-35's short bound makes cheap -- another way this entry
    depends on that one.
 
 ## Risks
 
-- **`warn_fallback_ceiling` fires once per process** (`llm.rs:703`), keyed on the resolved model.
-  A turn that moves to a candidate with a different published ceiling has already spent the warning
-  on the first. 0110 flags this and hands it here. Options: key the `Once` per candidate, or accept
+- **`warn_fallback_ceiling` fires once per process** (`llm.rs:703`), keyed on the resolved model. A
+  turn that moves to a candidate with a different published ceiling has already spent the warning on
+  the first. 0002-33 flags this and hands it here. Options: key the `Once` per candidate, or accept
   the gap and note it. The warning exists so a reply cut off at an invented ceiling reads as a
   config gap rather than a bad model, and that reasoning does not weaken under a chain.
 - **A third retry layer is a claim about the other two.** `exhausted_transient_label` and
@@ -299,34 +299,36 @@ from eating it.
 
 ## Dependencies
 
-- **Landed: `plan/done/0110-model-aliases.md`.** The config surface, the flattening walk, and the
-  static half's selectability rule. This entry is 0110's deferred second half and nothing here is
-  meaningful without it. Three things it left on the table, all in its `## Decisions`:
-  `selectability` (`llm.rs`) predicts `build_agent`'s `local-llm` check without being linked to
-  it, so a precondition added to either goes stale silently -- this entry reshapes `build_agent`
-  and is the natural place to unify them; a single-target alias deliberately bypasses candidate
-  selection, so a chain of one must keep doing so; and `Unselectable` carries `LlmResolveError`
-  values rather than restating their text, which is the shape `FailoverModel`'s per-candidate
-  exhaustion report should reuse.
-- **Hard: `plan/todo/0112-connect-failures-are-not-really-transient.md`.** 0110 calls this
-  dependency "close to hard"; with the chain deadline resolved it is hard. The deadline bounds the
-  chain's worst case at one budget, but only the short pre-first-byte bound stops each dead
-  endpoint from consuming it -- and it is also the signal Design fork §7's reset-to-head rule needs
-  to be cheap.
+- **Landed: `plan/done/phase/0002-sidecars/tasks/0002-33-model-aliases.md`.** The config surface,
+  the flattening walk, and the static half's selectability rule. This entry is 0002-33's deferred
+  second half and nothing here is meaningful without it. Three things it left on the table, all in
+  its `## Decisions`: `selectability` (`llm.rs`) predicts `build_agent`'s `local-llm` check without
+  being linked to it, so a precondition added to either goes stale silently -- this entry reshapes
+  `build_agent` and is the natural place to unify them; a single-target alias deliberately bypasses
+  candidate selection, so a chain of one must keep doing so; and `Unselectable` carries
+  `LlmResolveError` values rather than restating their text, which is the shape `FailoverModel`'s
+  per-candidate exhaustion report should reuse.
+- **Hard:
+  `plan/done/phase/0002-sidecars/tasks/0002-35-connect-failures-are-not-really-transient.md`.**
+  0002-33 calls this dependency "close to hard"; with the chain deadline resolved it is hard. The
+  deadline bounds the chain's worst case at one budget, but only the short pre-first-byte bound
+  stops each dead endpoint from consuming it -- and it is also the signal Design fork §7's
+  reset-to-head rule needs to be cheap.
 - **Soft: `plan/next/partial-turn-history-on-failed-model-call.md`.** See the last Risk.
-- **Soft: `plan/next/subagent-model-allowlist.md`.** 0110's Design fork §8 settles pre- vs
+- **Soft: `plan/next/subagent-model-allowlist.md`.** 0002-33's Design fork §8 settles pre- vs
   post-resolution matching; a chain does not change that answer, but it does mean "the model this
   subagent ran on" is no longer a single value for audit purposes.
 - **Scheduling: after 0.2.0 final, and unconstrained by it.** Everything here is in `outrig-cli`,
-  whose internals 0093 made private, so no `crates/outrig` public surface moves, no
-  `public-api.txt` regeneration, and no CHANGELOG entry. That is the reason this sits after 0111
+  whose internals 0002-16 made private, so no `crates/outrig` public surface moves, no
+  `public-api.txt` regeneration, and no CHANGELOG entry. That is the reason this sits after 0002-34
   rather than inside the pre-freeze block.
 
 ## See also
 
-- `plan/done/0110-model-aliases.md` -- the static half. Its Runtime behavior section
-  ("Selecting a candidate: the runtime half") is the specification this entry executes; its Design
-  forks §2 and §4 and its `warn_fallback_ceiling` risk are the loose ends it inherits.
+- `plan/done/phase/0002-sidecars/tasks/0002-33-model-aliases.md` -- the static half. Its Runtime
+  behavior section ("Selecting a candidate: the runtime half") is the specification this entry
+  executes; its Design forks §2 and §4 and its `warn_fallback_ceiling` risk are the loose ends it
+  inherits.
 - `crates/outrig-cli/src/llm/retry.rs` -- the module doc (8-13) that places this layer,
   `RetryPolicy` (73-76) and the `Copy` comment, `RetryingModel::make` (209), `::stream` (262),
   `composes_native_output_with_tools` (276), `send_with_retry` (283), `next_delay` (437), and
@@ -339,7 +341,8 @@ from eating it.
 - `rig-core-0.40.0/src/agent/completion.rs:555-559` -- the request builder that leaves
   `request.model` unset and `max_tokens` set, which is what makes the second the load-bearing
   rewrite.
-- `plan/done/0101-subagent-model-selection.md` -- decision 7's cold-load announcement.
+- `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md` -- decision 7's
+  cold-load announcement.
 
 ## Decisions
 
@@ -434,7 +437,7 @@ from eating it.
     with no test of its own (the mock-chain test is Anthropic at both ends, and every
     single-candidate session short-circuits to `build_single`).
 
-11. **Not done: the `selectability` / `build_agent` unification** 0110 left on the table and this
+11. **Not done: the `selectability` / `build_agent` unification** 0002-33 left on the table and this
     entry called "the natural place". `build_agent` no longer has a `local-llm` precondition to
     unify -- the check reached is `MistralrsFeatureDisabled` in the per-candidate builder, which
     `selectability` already predicts by the same `cfg!`. Left as is rather than adding indirection
@@ -486,7 +489,7 @@ from eating it.
     fallback at all, making a second model a new way to fail to start rather than a way to
     survive an outage. `LazyLocalCandidate` defers the load to the moment the chain reaches the
     candidate, where a failure becomes that candidate's failure and the chain moves past it.
-    The mid-turn-surprise objection is answered the way 0101's decision 7 already answered it,
+    The mid-turn-surprise objection is answered the way 0002-24's decision 7 already answered it,
     by announcing the wait rather than by moving it -- though that announcement was *claimed*
     here before it was written, and only exists after the correction in decision 20. Two
     consequences: `build_agent` and friends

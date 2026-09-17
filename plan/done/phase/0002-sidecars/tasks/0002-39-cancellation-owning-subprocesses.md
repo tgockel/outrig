@@ -1,4 +1,4 @@
-# 0116 -- An internally owned subprocess dies when its future is dropped
+# 0002-39 -- An internally owned subprocess dies when its future is dropped
 
 ## Context
 
@@ -128,7 +128,7 @@ the future is merely dropped. Ownership is structural, not a thing each call sit
   responsibility for it leaves nothing behind.
 - **Engine state, not only PIDs.** After a canceled create, `podman ps -a` lists no container
   with the reserved name; after a canceled build, no buildah working container and no temporary
-  tag survive. These belong with the live-podman work in 0130; the PID-level cases run against
+  tag survive. These belong with the live-podman work in 0002-53; the PID-level cases run against
   fakes and stay in the ordinary suite.
 - No zombies on the cooperative path, asserted after the awaited reap. On the drop path, no
   zombie **within the bound** -- the supervisor is what makes that assertable at all.
@@ -154,8 +154,8 @@ the future is merely dropped. Ownership is structural, not a thing each call sit
 
 ## Dependencies
 
-None. It is a prerequisite for 0117, whose rollback must survive cancellation and therefore needs
-a child that does the same -- though note 0117 needs strictly more than this task provides; see
+None. It is a prerequisite for 0002-40, whose rollback must survive cancellation and therefore needs
+a child that does the same -- though note 0002-40 needs strictly more than this task provides; see
 its Context.
 
 ## See also
@@ -185,13 +185,13 @@ its Context.
 
   - The 43 existing call sites do not move, and there is no shared never-firing token to
     allocate or reason about.
-  - A caller supplies whatever it already has: `CancellationToken::cancelled()` for 0117,
+  - A caller supplies whatever it already has: `CancellationToken::cancelled()` for 0002-40,
     `tokio::time::sleep(budget)` for a caller with a deadline, and -- as the tests do -- an
     arbitrary condition. A `CancellationToken` parameter would have forced the deadline
     callers to build a token and a timer task to fire it.
   - No `tokio_util` type enters the public API before the 0.2.0 freeze. Library callers get
     the documented drop-path bound, which is what wrapping a call in `timeout` already gave
-    them; 0124 is not handed a second frozen tokio type beside `exec_stdio`'s `Child`.
+    them; 0002-47 is not handed a second frozen tokio type beside `exec_stdio`'s `Child`.
 
   Exactly one twin exists -- `try_capture_logged_until` -- because exactly one has a caller.
   See the `/simplify` note below for why the first cut had four.
@@ -268,10 +268,10 @@ its Context.
   reading once.
 
   The margin is reported rather than asserted, following
-  `plan/done/0109-subagent-tree-shutdown-grace.md`: measured 3-6 ms against a 5 s ceiling.
-  The first draft of those tests polled with `std::thread::sleep` and failed -- blocking the
-  runtime thread prevents the very reap being waited for. Worth recording because it is the
-  same mistake a caller can make in production, and it is now stated in the module doc.
+  `plan/done/phase/0002-sidecars/tasks/0002-32-subagent-tree-shutdown-grace.md`: measured 3-6 ms
+  against a 5 s ceiling. The first draft of those tests polled with `std::thread::sleep` and failed
+  -- blocking the runtime thread prevents the very reap being waited for. Worth recording because it
+  is the same mistake a caller can make in production, and it is now stated in the module doc.
 
 - **`try_capture`'s two `Command::output()` quirks are preserved deliberately.** tokio's
   `output()` -- unlike `std`'s -- does not redirect stdin, so children of `try_capture` have
@@ -368,7 +368,7 @@ its Context.
 
 - **Not done here: engine-state assertions.** `podman ps -a` showing no container under the
   reserved name, and no surviving buildah working container or temporary tag, need a real
-  engine and are 0130's, as the task directs. The fakes prove outrig issues the removal;
+  engine and are 0002-53's, as the task directs. The fakes prove outrig issues the removal;
   only a live podman proves the engine honored it.
 
 - **Review found the guard could delete a container it never created, which is worse than the
@@ -664,9 +664,9 @@ its Context.
   suggested cooperative shutdown cannot run in `Drop`, which has no runtime to await on; it
   would have to become a stop signal threaded through the build's callers, which is a call
   shape, not a patch. Queued with the measurement as
-  `plan/todo/0127-a-canceled-build-owns-what-buildah-made.md` -- numbered rather than
-  buffered, since it has to ship in rc.3 (0129) rather than be described by it, and the
-  tasks behind it moved back one. Its live-engine assertion shares 0130's fixture, where
+  `plan/todo/0002-50-a-canceled-build-owns-what-buildah-made.md` -- numbered rather than
+  buffered, since it has to ship in rc.3 (0002-52) rather than be described by it, and the
+  tasks behind it moved back one. Its live-engine assertion shares 0002-53's fixture, where
   every other engine-state check already sits.
   `plan/next/image-cleanup-releases-its-guard-on-failure.md` records the adjacent
   pre-existing defect review raised: the cleanup helpers discard their outcome and their

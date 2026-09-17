@@ -1,4 +1,4 @@
-# 0073 -- Repair pre-existing e2e test compile rot
+# 0001-73 -- Repair pre-existing e2e test compile rot
 
 ## Context
 
@@ -42,7 +42,7 @@ Repair the pre-existing e2e compile drift so later image tasks can rely on the f
 
 ## Dependencies
 
-- **Hard: 0072**. The drift was found while migrating the embedded-image e2e suites in
+- **Hard: 0001-72**. The drift was found while migrating the embedded-image e2e suites in
   the OCI-label task.
 
 ## Decisions

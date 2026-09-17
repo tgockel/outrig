@@ -49,13 +49,13 @@ user everything that is wrong with the image.
   Keep the single-failure rendering close to today's, so the common case does not get noisier
   to serve the rare one.
 
-- **Decide what a partial success means, and say so.** Today a failure is total: `launch`
-  returns `Err` and no session exists. Collecting failures does not by itself change that, and
-  it should not change it silently. The default stays fail-the-launch. Whether an opt-in
-  "start with a reduced tool set" mode is worth having is a separate question -- `on-failure =
-  "warn"` already exists for *sidecars* (`plan/done/0079-sidecar-core-exec-stdio.md`), so if
-  primary-hosted servers ever gain the same knob it should reuse that vocabulary rather than
-  invent one.
+- **Decide what a partial success means, and say so.** Today a failure is total: `launch` returns
+  `Err` and no session exists. Collecting failures does not by itself change that, and it should not
+  change it silently. The default stays fail-the-launch. Whether an opt-in "start with a reduced
+  tool set" mode is worth having is a separate question -- `on-failure = "warn"` already exists for
+  *sidecars* (`plan/done/phase/0002-sidecars/tasks/0002-02-sidecar-core-exec-stdio.md`), so if
+  primary-hosted servers ever gain the same knob it should reuse that vocabulary rather than invent
+  one.
 
 - **Sidecar bring-up is already batched differently.** Check whether the sidecar path
   (`Outrig::add_sidecar`, `crates/outrig/src/outrig_.rs:873-896`) has the same

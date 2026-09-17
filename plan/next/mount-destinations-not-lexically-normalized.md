@@ -20,7 +20,7 @@ passes and podman fails at launch instead -- after the image is built and the se
 is created. The same textual comparison backs the `container_path == "/"` root check, which
 `/a/..` also evades.
 
-Pre-existing; found while reviewing 0108, which touched `validate.rs:1027` and `:1076` only to
+Pre-existing; found while reviewing 0002-31, which touched `validate.rs:1027` and `:1076` only to
 move from a field read to an accessor. Not caused or worsened by that change.
 
 ## Goal

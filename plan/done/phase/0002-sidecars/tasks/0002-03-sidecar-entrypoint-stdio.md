@@ -1,8 +1,8 @@
-# 0080 -- Sidecar entrypoint-stdio transport
+# 0002-03 -- Sidecar entrypoint-stdio transport
 
 ## Context
 
-With sidecar core landed (0079), the inline `{ image = "..." }` form with no `command` gains
+With sidecar core landed (0002-02), the inline `{ image = "..." }` form with no `command` gains
 meaning: the image's ENTRYPOINT *is* the MCP server, enabling off-the-shelf MCP images (the
 Docker MCP catalog pattern) with zero repo-side command knowledge. See
 [`mcp-sidecars-spec.md`](mcp-sidecars-spec.md), "Transports" (entrypoint-stdio). The hard part
@@ -23,7 +23,7 @@ lifetime and network policy applied from the first packet.
   `podman start --attach --interactive` for the stdio pipes.
 - Lifetime-equals-server semantics: server exit surfaces exactly like a mid-session sidecar
   death (logged, tools error, session survives).
-- Validation already specified in 0079 holds: an entry with `image` and no `command` may carry
+- Validation already specified in 0002-02 holds: an entry with `image` and no `command` may carry
   `env` but nothing else.
 - Docs updated alongside the code (`concepts/mcp-servers.md`, `usage/mcp.md`,
   `reference/config.md`).
@@ -36,7 +36,7 @@ lifetime and network policy applied from the first packet.
 
 ## Dependencies
 
-- **Hard: 0079**. Extends the sidecar container machinery with a second transport.
+- **Hard: 0002-02**. Extends the sidecar container machinery with a second transport.
 
 ## Decisions
 

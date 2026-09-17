@@ -1,4 +1,4 @@
-# 0081 -- Dynamic sidecar addition
+# 0002-04 -- Dynamic sidecar addition
 
 ## Context
 
@@ -39,8 +39,8 @@ session stays healthy.
 
 ## Dependencies
 
-- **Hard: 0079**. Builds on sidecar start/bootstrap/connect machinery and interceptor attach;
-  exec-stdio only, so 0080 is not required.
+- **Hard: 0002-02**. Builds on sidecar start/bootstrap/connect machinery and interceptor attach;
+  exec-stdio only, so 0002-03 is not required.
 
 ## Decisions
 

@@ -16,12 +16,12 @@ collaborator who has no `~/.outrig/images/git-tools/` gets a startup failure fro
 never edited. It also scales badly -- a personal tool has to be named in every image-config of
 every repo where it is wanted.
 
-Two structural facts shape the fix. MCP servers are declared per image-config
-(`[images.<n>].mcp`), so there is no scope in which a server can be declared once and applied
-broadly. And sidecar blocks are already top-level and name-referenced, with instantiation
-following reference -- `plan/done/0088-entrypoint-stdio-args.md` made that an explicit rule
-precisely because "declaring is instantiating" cannot survive a global config, where a toolbox
-block would otherwise start in every repo.
+Two structural facts shape the fix. MCP servers are declared per image-config (`[images.<n>].mcp`),
+so there is no scope in which a server can be declared once and applied broadly. And sidecar blocks
+are already top-level and name-referenced, with instantiation following reference --
+`plan/done/phase/0002-sidecars/tasks/0002-11-entrypoint-stdio-args.md` made that an explicit rule
+precisely because "declaring is instantiating" cannot survive a global config, where a toolbox block
+would otherwise start in every repo.
 
 So the missing piece is a *named library of MCP server declarations* with an explicit opt-in
 switch, at both scopes.
@@ -169,10 +169,10 @@ prototype should confirm), or **Open** (deferred).
    contents and would leave three names for one concept.
 
 4. **Mid-session attach -- Open.** The REPL has `/sidecar add` for `start = "manual"` blocks, and
-   `plan/done/0081-sidecar-dynamic-add.md` deliberately gave the agent no invocable surface for
-   it. A `/mcp attach <name>` over the `[mcp]` library is a natural extension but inherits that
-   entry's toolset-refresh machinery and its trust decision; it belongs with whatever revisits
-   `/sidecar`.
+   `plan/done/phase/0002-sidecars/tasks/0002-04-sidecar-dynamic-add.md` deliberately gave the agent
+   no invocable surface for it. A `/mcp attach <name>` over the `[mcp]` library is a natural
+   extension but inherits that entry's toolset-refresh machinery and its trust decision; it belongs
+   with whatever revisits `/sidecar`.
 
 5. **Ordering within a scope -- Open.** Servers connect in `BTreeMap` name order and tools are
    prefixed `<server>__<tool>`, so ordering is observable only in startup output and log naming.
@@ -180,8 +180,9 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **Hard: 0097** (`plan/todo/0097-config-path-provenance.md`), transitively -- a `[mcp]` entry
-  that references a library image is only useful once library images resolve.
+- **Hard: 0002-20** (`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md`),
+  transitively -- a `[mcp]` entry that references a library image is only useful once library images
+  resolve.
 - **Soft: `plan/next/user-image-library.md`.** The `[mcp]` library is independently useful over
   existing `[sidecars.<sc>]` blocks and raw image refs, but the motivating case is a user-library
   tool. Landing the library first makes the acceptance criteria here demonstrable end to end.
@@ -198,10 +199,10 @@ prototype should confirm), or **Open** (deferred).
   `McpDeclarationSource`, which gains variants for the new scopes.
 - `crates/outrig-cli/src/cli/session_setup.rs` -- the `--attach` rejection at 358-367, and the
   three-phase sidecar bring-up that selection feeds.
-- `plan/done/0088-entrypoint-stdio-args.md` -- why instantiation follows reference, the rule
-  `auto-attach` has to opt out of explicitly.
-- `plan/done/0079-sidecar-core-exec-stdio.md` -- the `--attach` + sidecars error and the
-  `on-failure` semantics fork 2 borrows.
-- `plan/done/0081-sidecar-dynamic-add.md` -- the deliberate absence of an agent-invocable add
-  (fork 4).
+- `plan/done/phase/0002-sidecars/tasks/0002-11-entrypoint-stdio-args.md` -- why instantiation
+  follows reference, the rule `auto-attach` has to opt out of explicitly.
+- `plan/done/phase/0002-sidecars/tasks/0002-02-sidecar-core-exec-stdio.md` -- the `--attach` +
+  sidecars error and the `on-failure` semantics fork 2 borrows.
+- `plan/done/phase/0002-sidecars/tasks/0002-04-sidecar-dynamic-add.md` -- the deliberate absence of
+  an agent-invocable add (fork 4).
 - `plan/next/user-image-library.md` -- where the images these entries reference come from.

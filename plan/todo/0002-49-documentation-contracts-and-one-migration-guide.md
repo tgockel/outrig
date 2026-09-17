@@ -1,4 +1,4 @@
-# 0126 -- Correct the documentation contracts and draft the 0.1 -> 0.2 migration guide
+# 0002-49 -- Correct the documentation contracts and draft the 0.1 -> 0.2 migration guide
 
 ## Context
 
@@ -8,16 +8,16 @@ design-first and `doc/reference/config.md` ships inside the binary via `include_
 false sentence is a defect with the same standing as a wrong branch.
 
 This task fixes what is **false now** and drafts the migration material. Cutting the final
-`[0.2.0]` headings, dates, links, version prose, and support table is **0131**'s job: those can
+`[0.2.0]` headings, dates, links, version prose, and support table is **0002-54**'s job: those can
 only be written once, at the version that ships, and this task runs before an RC. Splitting them
-is what keeps `0126` from having to be redone after rc.3.
+is what keeps `0002-49` from having to be redone after rc.3.
 
 ### Wrong today
 
 Each was checked against the tree while this task was written.
 
 1. **The CLI changelog says aliases do not fail over.** `crates/outrig-cli/CHANGELOG.md`'s
-   `[Unreleased]` describes model aliases as they behaved when `e912388` landed. 0113 reversed
+   `[Unreleased]` describes model aliases as they behaved when `e912388` landed. 0002-36 reversed
    it: `FailoverModel` moves a turn to the next candidate from inside one `completion()` call.
    The section still says selection "answers 'am I configured for this' rather than 'is this
    endpoint up'" and that an alias "does **not** fail over when a vendor rate-limits
@@ -54,7 +54,7 @@ Each was checked against the tree while this task was written.
 ## Goal
 
 Every documented claim about behavior is true at rc.3, and the migration material a 0.1 consumer
-needs exists in draft, ready for 0131 to date and publish.
+needs exists in draft, ready for 0002-54 to date and publish.
 
 ## Deliverables
 
@@ -64,20 +64,20 @@ needs exists in draft, ready for 0131 to date and publish.
   real and coherent -- a real 0.1-era consumer compiles on 0.1, fails on trunk for the documented
   reasons, and compiles again once migrated -- so there is a known-good shape to describe. The
   list must cover, at minimum: MSRV and platform expectations; the **rmcp 1.x -> 3.1** bump and
-  whatever 0124 decided about the exposure it created; `#[non_exhaustive]` construction *and*
+  whatever 0002-47 decided about the exposure it created; `#[non_exhaustive]` construction *and*
   matching, including that downstream matches now need wildcard arms; sealed `BackingClient`;
   opaque `ImageTag`; the `OpenAiOptions` / `AnthropicOptions` construction change and the retry
   configuration that moved onto them; `Model::provider` becoming optional and `Model::source()`
   as the accessor; `ExecOptions`; `Workspace`'s declared-versus-effective accessors; the mount
   error reshapes; the removed bootstrap helper; **referenced-sidecars-only** semantics for
-  top-level sidecars; the removed implicit preamble; alias failover; and 0123's local-LLM
-  decision. Whatever 0115 and 0119-0124 settle joins it.
+  top-level sidecars; the removed implicit preamble; alias failover; and 0002-46's local-LLM
+  decision. Whatever 0002-38 and 0002-42 through 0002-47 settle joins it.
 - **State that there is no stable binary ABI.** The crate produces ordinary `rlib`/metadata
   artifacts and exposes no `cdylib`, no stable `extern "C"`, no `#[repr(C)]` FFI contract, and no
   fixed symbol layer; public layouts changed and downstream crates rebuild, as Cargo normally
   does. Say it explicitly and do not claim ABI compatibility anywhere.
 - **Not in this task:** dated `[0.2.0]` headings, tag links, the quickstart version sample, and
-  `SECURITY.md`'s supported-version table. Those are 0131's, because they are only writable once.
+  `SECURITY.md`'s supported-version table. Those are 0002-54's, because they are only writable once.
 
 ## Acceptance
 
@@ -94,16 +94,17 @@ needs exists in draft, ready for 0131 to date and publish.
 
 ## Dependencies
 
-- **Soft: after 0114-0124.** Those change documented behavior -- 0114 changes what a hostname
-  rule permits, 0115 changes how `[network]` precedence is expressed, 0119-0124 change public
-  API, and 0123 decides what `style = "mistralrs"` does. Writing the checklist before them means
-  writing it twice.
-- Must precede 0129, which cuts the RC these notes describe.
+- **Soft: after 0002-37 through 0002-47.** Those change documented behavior -- 0002-37 changes what
+  a hostname rule permits, 0002-38 changes how `[network]` precedence is expressed, 0002-42 through
+  0002-47 change public API, and 0002-46 decides what `style = "mistralrs"` does. Writing the
+  checklist before them means writing it twice.
+- Must precede 0002-52, which cuts the RC these notes describe.
 
 ## See also
 
-- `plan/done/0113-model-alias-failover.md` -- the behavior item 1 misdescribes.
+- `plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md` -- the behavior item 1
+  misdescribes.
 - `plan/next/startup-banner-has-no-tests.md` -- item 8's buffered entry.
 - `doc/usage/mcp.md`, `doc/usage/run.md`, `doc/reference/cli.md`, `crates/outrig-cli/README.md`,
   both `CHANGELOG.md` files.
-- `plan/todo/0131-release-0.2.0.md` -- takes the final-only half of this work.
+- `plan/todo/0002-54-release-0.2.0.md` -- takes the final-only half of this work.

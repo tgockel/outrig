@@ -1,8 +1,8 @@
-# 0075 -- `outrig image inspect <ref>` (local, read-only)
+# 0001-75 -- `outrig image inspect <ref>` (local, read-only)
 
 ## Context
 
-With config now carried as OCI labels (0072/0074), users need a quick, read-only way to see
+With config now carried as OCI labels (0001-72/0074), users need a quick, read-only way to see
 what a local image declares -- its metadata and its declared MCP servers -- without starting a
 container or any MCP servers.
 
@@ -44,7 +44,7 @@ labels.
 
 ## Dependencies
 
-- **Hard: 0072**. Inspect reads the labels and uses the codec introduced there.
+- **Hard: 0001-72**. Inspect reads the labels and uses the codec introduced there.
 
 ## Decisions
 

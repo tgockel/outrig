@@ -1,4 +1,4 @@
-# 0121 -- Every lossy tool-name sanitization is collision-resistant
+# 0002-44 -- Every lossy tool-name sanitization is collision-resistant
 
 ## Context
 
@@ -110,7 +110,7 @@ a residual collision is caught rather than served.
 
 ## Dependencies
 
-None hard. Land before 0125 regenerates the snapshot.
+None hard. Land before 0002-48 regenerates the snapshot.
 
 ## See also
 

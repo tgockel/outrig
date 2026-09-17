@@ -1,4 +1,4 @@
-# 0104 -- This repo's own image embeds the MCP servers it should be attaching
+# 0002-27 -- This repo's own image embeds the MCP servers it should be attaching
 
 ## Context
 
@@ -19,11 +19,11 @@ It is also the only place the feature gets exercised outside the gated e2e suite
 day-to-day use of this repo touches `[sidecars]`, `view = "primary"`, entrypoint-stdio, or the
 `image-name` pull path -- so nothing catches a regression in them until a release does.
 
-`shell` is what made this hard, and 0102 is what makes it possible. Its `ALLOW_COMMANDS` list
+`shell` is what made this hard, and 0002-25 is what makes it possible. Its `ALLOW_COMMANDS` list
 is the *primary's* toolchain (`cargo`, `mdbook`, `mdbook-mermaid`, `lychee`, `rg`), so the only
-sidecar shape that reaches it is `view = "primary"` -- which until 0102 ran its payload as root
+sidecar shape that reaches it is `view = "primary"` -- which until 0002-25 ran its payload as root
 in the primary's user namespace, meaning every `target/` directory it wrote would have been
-owned by a host subuid. With 0102 landed the payload runs as the session user, and with 0103
+owned by a host subuid. With 0002-25 landed the payload runs as the session user, and with 0002-26
 landed a published image's bare `ENTRYPOINT` resolves, so `fs` can use a stock image unmodified.
 
 ## Goal
@@ -107,7 +107,7 @@ as `view = "primary"` sidecars, and working in this repo exercises that path eve
   all three.
 - Driven through the agent: `fs` lists `/workspace`; `git` reports status on the real repo;
   `shell` runs `cargo --version` and `cargo fmt --check`.
-- Files the sidecars write into the workspace are owned by the invoking user. This is 0102's
+- Files the sidecars write into the workspace are owned by the invoking user. This is 0002-25's
   payoff and the thing that would silently regress without it -- assert it explicitly rather
   than trusting that the servers appeared to work.
 - `outrig mcp show-merged` renders all three with their sidecar placement.
@@ -117,16 +117,16 @@ as `view = "primary"` sidecars, and working in this repo exercises that path eve
 
 All three servers land on `view = "primary"` rather than the lower-privilege mix of
 `workspace = "rw"` exec-stdio sidecars for `fs`/`git` and `view = "primary"` only for `shell`.
-Once 0102 removes the capability and ownership asymmetry, `view = "primary"` is not the more
+Once 0002-25 removes the capability and ownership asymmetry, `view = "primary"` is not the more
 privileged option -- it is the one that needs no bind mount, cannot disagree with the primary
 about paths, and reads the same tree the agent's shell sees. Uniformity is also the point: one
 shape, exercised three times a session, in the repo that ships the feature.
 
 ## Dependencies
 
-- **0102**, for the payload to run as the session user; without it every file these servers
+- **0002-25**, for the payload to run as the session user; without it every file these servers
   write is subuid-owned.
-- **0103**, for `docker.io/mcp/filesystem`'s bare `ENTRYPOINT` to resolve; without it `fs`
+- **0002-26**, for `docker.io/mcp/filesystem`'s bare `ENTRYPOINT` to resolve; without it `fs`
   needs a locally built image instead of the published one.
 
 ## Decisions
@@ -167,7 +167,7 @@ shape, exercised three times a session, in the repo that ships the feature.
   when a graft was needed) and mounts a fresh `proc` over the inherited one. Verified both ways --
   with the mount, `cargo --version` and `cargo fmt --check` succeed through the shell server;
   without it, `/proc/self` does not exist. `--pid=container:<primary>` also fixes it and was
-  tested, but 0090 rejected exactly that flag for isolation, and `SECURITY.md` ships the
+  tested, but 0002-13 rejected exactly that flag for isolation, and `SECURITY.md` ships the
   promise that only the mount namespace is joined. The mount keeps that promise -- and in fact
   closes the other half of the gap, since the inherited procfs let the payload read the
   primary's process list while being unable to see itself.
@@ -179,7 +179,7 @@ shape, exercised three times a session, in the repo that ships the feature.
   the deliverable exists -- `rust:1-bookworm` is multi-arch, and the wrong target installs
   silently.
 - **And a fourth defect, found by an agent running inside this changeset.**
-  `plan/next/primary-view-payload-home.md` predicted it after 0102 and closed with "not urgent:
+  `plan/next/primary-view-payload-home.md` predicted it after 0002-25 and closed with "not urgent:
   no server OutRig ships or documents in this placement writes to `$HOME`" -- and then this task
   shipped three. The payload keeps the
   sidecar image's `HOME`, which for `node:22-slim` is `/root`, mode `0700`, owned by a user the

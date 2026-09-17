@@ -1,8 +1,8 @@
-# 0095 -- Options structs, trait sealing, and `ImageTag` privatization
+# 0002-18 -- Options structs, trait sealing, and `ImageTag` privatization
 
 ## Context
 
-0094 insulates public types with `#[non_exhaustive]`, which is a pure addition -- the attribute
+0002-17 insulates public types with `#[non_exhaustive]`, which is a pure addition -- the attribute
 can go on at any time. This task collects the three hardening changes that are **themselves
 breaking**, and therefore have to land inside `0.2.0` or not at all:
 
@@ -27,7 +27,7 @@ for the same benefit.
 **Items 1 and 2 are conditional on 0093.** If that task demotes `container` and `mcp_proxy` out
 of the public surface, `create_initialized`'s param list and `BackingClient`'s implementability
 stop being SemVer commitments and both items evaporate -- an even better outcome than fixing
-them. Check 0093's decision before starting; this task may reduce to item 3 alone.
+them. Check 0002-16's decision before starting; this task may reduce to item 3 alone.
 
 ## Goal
 
@@ -43,7 +43,7 @@ Replace the 7 positional params (`image`, `launch`, `name`, `transcript`, `env`,
 or `Default`-plus-update construction, or the problem has only moved: adding a field to a
 `pub`-field options struct is exactly the same break as adding a positional param.
 
-Skip entirely if 0093 made `container` crate-internal.
+Skip entirely if 0002-16 made `container` crate-internal.
 
 ### Seal `BackingClient`
 
@@ -54,7 +54,7 @@ implement it, and it can then gain methods freely.
 implements `BackingClient` for it. Integration tests are separate crates, so sealing breaks that
 fake. Three ways out, in order of preference:
 
-- 0093 de-publishes `mcp_proxy` entirely, and the trait needs no sealing at all.
+- 0002-16 de-publishes `mcp_proxy` entirely, and the trait needs no sealing at all.
 - Export the sealed supertrait as `#[doc(hidden)] pub` so the in-repo test can still implement it
   while downstream crates are warned off.
 - Move the fake into a `#[cfg(test)]` unit-test module inside the crate.
@@ -77,7 +77,7 @@ in-repo `.0` use site.
   by whichever of the three routes above was chosen, and the choice is recorded in the task's
   Decisions section.
 - No `.0` access to `ImageTag` remains anywhere in either crate.
-- Any item skipped because 0093 removed its reachability is recorded as skipped, with the reason
+- Any item skipped because 0002-16 removed its reachability is recorded as skipped, with the reason
   -- not silently dropped.
 - The changelog records all three as breaking changes landed within `0.2.0`.
 
@@ -93,7 +93,7 @@ in-repo `.0` use site.
   deprecation window inside a single release. `Display` already covers the common read path, so
   the practical blast radius is small.
 - **Do not touch the already-correct types.** `ApiKeyRef` is the model this task copies, not a
-  target; `ProxyServer`, `Container`, and `NetworkInterceptor` are already opaque. 0094 carries
+  target; `ProxyServer`, `Container`, and `NetworkInterceptor` are already opaque. 0002-17 carries
   the full do-not-touch list.
 
 ## Dependencies
@@ -114,9 +114,9 @@ in-repo `.0` use site.
 
 ## Decisions
 
-1. **Nothing was skipped: 0093 left all three items live.** The task's opening caveat made items
-   1 and 2 conditional on 0093 demoting `container` and `mcp_proxy`. It did the opposite --
-   0093's Decision 1 records a live downstream consumer and ratifies all six `pub mod`s as
+1. **Nothing was skipped: 0002-16 left all three items live.** The task's opening caveat made items
+   1 and 2 conditional on 0002-16 demoting `container` and `mcp_proxy`. It did the opposite --
+   0002-16's Decision 1 records a live downstream consumer and ratifies all six `pub mod`s as
    supported API, and its Decision 4 names `create_initialized` as still needing this treatment.
    So all three landed, and the acceptance list's "record what was skipped" has nothing to
    record.
@@ -124,7 +124,7 @@ in-repo `.0` use site.
 2. **All seven parameters moved into `ContainerCreateOptions`; the function takes one argument.**
    The alternative -- keeping `image` and `launch` positional for parity with `start_named` --
    would have left two of three parameters able to grow, which is the problem the task exists to
-   end. Construction follows 0094's convention exactly: `new(image, launch, name)` names the
+   end. Construction follows 0002-17's convention exactly: `new(image, launch, name)` names the
    required three, and `with_transcript` / `with_env` / `with_intercept_dns` / `with_args`
    supply the rest. The struct is `#[non_exhaustive]`, so the next knob is an addition.
 
@@ -146,7 +146,7 @@ in-repo `.0` use site.
    All 10 tests run under a plain `cargo test`.
 
 5. **`ProxyServer::list_tools_inner` and `dispatch_call` stay public.** Both documented
-   themselves as exposed for the external test, which the move dissolves -- but 0093 recorded
+   themselves as exposed for the external test, which the move dissolves -- but 0002-16 recorded
    that the five removed label helpers are "the only reachability `0.2.0` removes", and these
    two are the `RequestContext`-free half of the dispatch path, exactly what a caller driving
    the proxy outside an rmcp server needs. Their doc comments were rewritten to justify them by
@@ -174,7 +174,7 @@ in-repo `.0` use site.
    effect.
 
 9. **`with_transcript` takes `Option<Transcript>`, not `Transcript`.** The bare-value form matched
-   the `with_workspace`-style convention 0094 established, but every producer of a transcript has
+   the `with_workspace`-style convention 0002-17 established, but every producer of a transcript has
    an `Option` -- `Container::start_named`'s own parameter is `Option<Transcript>` -- so the bare
    form forced the single call site to unwrap an `Option` purely to let the setter rewrap it. The
    convention exists to make call sites read well, and here it did the opposite.
@@ -186,7 +186,7 @@ in-repo `.0` use site.
 
 11. **`ContainerCreateOptions` keeps both `pub` fields and `with_*` setters.** Flagged as two ways
     to do one thing, and `ContainerLaunchSpec` in the same module offers only the field-assignment
-    form. Kept anyway: that is exactly the shape 0094 shipped for `LaunchSpec` and `SidecarSpec`,
+    form. Kept anyway: that is exactly the shape 0002-17 shipped for `LaunchSpec` and `SidecarSpec`,
     the CHANGELOG documents the `with_*` path as the migration, and `#[non_exhaustive]` means the
     fields alone cannot construct the value from outside.
 

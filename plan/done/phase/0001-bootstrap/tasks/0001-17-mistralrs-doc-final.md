@@ -1,12 +1,11 @@
-# 0017 -- In-process LLM documentation: drop `TODO: Incomplete` markers
+# 0001-17 -- In-process LLM documentation: drop `TODO: Incomplete` markers
 
 ## Goal
 
-The user-facing pages for the in-process LLM landed ahead of implementation as
-design-first docs and carry `> **TODO: Incomplete**` markers throughout. With 0013-0016
-done, the surface those pages describe is real. Drop the markers; tighten any wording
-that still hedges with "intended" or "planned"; verify the audit + mdbook build are
-clean.
+The user-facing pages for the in-process LLM landed ahead of implementation as design-first docs and
+carry `> **TODO: Incomplete**` markers throughout. With 0001-13 through 0001-16 done, the surface
+those pages describe is real. Drop the markers; tighten any wording that still hedges with
+"intended" or "planned"; verify the audit + mdbook build are clean.
 
 ## Deliverables
 
@@ -45,7 +44,7 @@ clean.
 
 ## Dependencies
 
-- 0016-llm-registry
+- 0001-16-llm-registry
 
 ## Notes
 
@@ -72,5 +71,5 @@ clean.
   own title and prose ("will share", "before any of it ships") already signal it's
   forward-looking, so dropping the marker doesn't mislead readers.
 - **`doc/concepts/llm-providers.md` no-op.** The marker the deliverables call for
-  was already dropped during 0014 (commit `44d1c6d`); no change needed in this
+  was already dropped during 0001-14 (commit `44d1c6d`); no change needed in this
   task.

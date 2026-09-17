@@ -1,15 +1,15 @@
-# 0125 -- Gate the public-API snapshots instead of trusting the honor system
+# 0002-48 -- Gate the public-API snapshots instead of trusting the honor system
 
 ## Context
 
 `crates/outrig/public-api.txt` and `crates/outrig-cli/public-api.txt` are the artifact the whole
-0093-0095 hardening arc is measured against, and nothing enforces them. Their header says
-"Regenerate after any intentional surface change and review the diff"; 0093's Decision 14
-deliberately added no CI job, on the grounds that rustdoc's JSON format shifts between nightlies
-and would break CI on tool churn rather than on real changes.
+0002-16 through 0002-18 hardening arc is measured against, and nothing enforces them. Their header
+says "Regenerate after any intentional surface change and review the diff"; 0002-16's Decision 14
+deliberately added no CI job, on the grounds that rustdoc's JSON format shifts between nightlies and
+would break CI on tool churn rather than on real changes.
 
 The cost showed up in 0095. Regenerating the snapshot dropped 87 lines that were never a surface
-change: 0094 had left the whole `#[non_exhaustive]` block in the file twice -- once as a leading
+change: 0002-17 had left the whole `#[non_exhaustive]` block in the file twice -- once as a leading
 block above the `pub mod outrig` header, once in its sorted position. It survived a full task and
 was noticed only because a later task happened to regenerate the file.
 
@@ -45,8 +45,8 @@ every time nightly's rustdoc JSON moves.
   be true at the moment a version is cut even if CI already checked it.
 - **Regenerate both snapshots as part of this task**, on the newly pinned toolchain, so the
   checked-in files are the pinned tool's output rather than an older one's. Review the diff: the
-  surface moves from 0118-0124 land in it, and the six rendering differences should disappear as
-  noise rather than be committed as changes.
+  surface moves from 0002-41 through 0002-47 land in it, and the six rendering differences should
+  disappear as noise rather than be committed as changes.
 
 ## Acceptance
 
@@ -67,7 +67,7 @@ every time nightly's rustdoc JSON moves.
 1. **Pinned PR job versus enforced release job -- Open, but one of them must exist.** A PR job
    catches the omission at the moment it is made and costs a nightly toolchain install on every
    run; because the nightly is pinned to a date, it breaks only when someone bumps that date
-   deliberately, which is the churn 0093's Decision 14 was worried about and is no longer
+   deliberately, which is the churn 0002-16's Decision 14 was worried about and is no longer
    accidental. A release-workflow job is cheaper and lets a wrong snapshot live on `trunk`
    between releases. What is not on the table is a script nothing invokes.
 
@@ -85,33 +85,35 @@ surface tests. This task owns the first. The second is
 downstream build.
 
 **Decided: deferred, as an accepted release exception.** 0.2.0 ships snapshot enforcement without
-the runtime-core surface test. The rationale is that the surface is not untested, only untested
-*as a whole*: 0118, 0119, and 0122 each add external, out-of-crate tests against the parts they
-change, and 0124's sealing test pins the trait boundary. What is genuinely uncovered is the
-composed path -- acquire an image, start a container from a spec, exec a server over it,
-aggregate through `ProxyServer`, tear down -- driven the way a downstream crate drives it. A
-snapshot proves that shape did not move; it does not prove the shape is still usable, and 0095's
-churn is already in the tree waiting for something to exercise it.
+the runtime-core surface test. The rationale is that the surface is not untested, only untested *as
+a whole*: 0002-41, 0002-42, and 0002-45 each add external, out-of-crate tests against the parts they
+change, and 0002-47's sealing test pins the trait boundary. What is genuinely uncovered is the
+composed path -- acquire an image, start a container from a spec, exec a server over it, aggregate
+through `ProxyServer`, tear down -- driven the way a downstream crate drives it. A snapshot proves
+that shape did not move; it does not prove the shape is still usable, and 0002-18's churn is already
+in the tree waiting for something to exercise it.
 
 That is a real gap and it is being accepted, not closed. Two consequences follow, and both are
 obligations on this task rather than notes:
 
 - **This task records the exception in its `## Decisions`**, with the reasoning above, so the
   waiver is recoverable later.
-- **0131's release record says gate item 17 was *partially* met**, not met. If the final notes
+- **0002-54's release record says gate item 17 was *partially* met**, not met. If the final notes
   claim the release gate was completed in full, this decision has been quietly reversed.
 
 ## Dependencies
 
-- **Soft: after 0118-0124.** Regenerating before the pre-freeze surface changes land means doing
-  it twice. If this task is taken earlier, the regeneration step moves to whichever surface task
-  lands last.
+- **Soft: after 0002-41 through 0002-47.** Regenerating before the pre-freeze surface changes land
+  means doing it twice. If this task is taken earlier, the regeneration step moves to whichever
+  surface task lands last.
 
 ## See also
 
 - `crates/outrig/public-api.txt`, `crates/outrig-cli/public-api.txt` -- the artifacts and their
   headers.
-- `plan/done/0093-shrink-reachable-surface.md` (Decision 14, the no-CI-job call this revisits),
-  `plan/done/0094-non-exhaustive-sweep.md` (where the duplicate block came from),
-  `plan/done/0095-options-structs-and-sealing.md` (where it was found).
+- `plan/done/phase/0002-sidecars/tasks/0002-16-shrink-reachable-surface.md` (Decision 14, the
+  no-CI-job call this revisits),
+  `plan/done/phase/0002-sidecars/tasks/0002-17-non-exhaustive-sweep.md` (where the duplicate block
+  came from), `plan/done/phase/0002-sidecars/tasks/0002-18-options-structs-and-sealing.md` (where it
+  was found).
 - `scripts/audit-doc-style.py` -- the shape a `scripts/` entry would follow.

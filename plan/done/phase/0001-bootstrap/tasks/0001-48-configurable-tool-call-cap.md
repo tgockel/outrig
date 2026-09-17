@@ -1,4 +1,4 @@
-# 0048 -- Configurable + resumable tool-call cap
+# 0001-48 -- Configurable + resumable tool-call cap
 
 ## Context
 

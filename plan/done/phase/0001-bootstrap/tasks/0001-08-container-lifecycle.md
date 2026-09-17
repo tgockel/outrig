@@ -1,4 +1,4 @@
-# 0008 -- Container lifecycle
+# 0001-08 -- Container lifecycle
 
 ## Goal
 
@@ -43,12 +43,12 @@ SIGINT, panic, and last-resort `Drop` all leave no leaked containers.
 ## Acceptance
 
 - `cargo test --features e2e container_lifecycle` passes.
-- Hitting Ctrl-C during a manual `outrig run` (once 0019 lands) leaves no orphan containers.
+- Hitting Ctrl-C during a manual `outrig run` (once 0001-19 lands) leaves no orphan containers.
 - `podman ps -a --filter name=outrig-` is empty after every test invocation.
 
 ## Dependencies
 
-- 0006-process-wrappers
+- 0001-06-process-wrappers
 
 ## Notes
 

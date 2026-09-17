@@ -1,4 +1,4 @@
-# 0035 -- Refactor: extract `SessionSetup` from `cli/run.rs`
+# 0001-35 -- Refactor: extract `SessionSetup` from `cli/run.rs`
 
 ## Goal
 
@@ -55,7 +55,7 @@ None.
 - This task touches the public API of `src/cli` only as far as adding the new module;
   external surface (binary CLI, config TOML, on-disk session format) is unchanged.
 - Cross-references to the master spec sections "Module layout" and the `SessionSetup`
-  Rust sketch (in the original `outrig-mcp.md`, now split across 0035-0041).
+  Rust sketch (in the original `outrig-mcp.md`, now split across 0001-35 through 0001-41).
 
 ## Decisions
 
@@ -63,9 +63,9 @@ None.
    `cfg.default_agent` are `None`, `setup` errors with `"no --agent and no
    default-agent configured"` -- exactly today's run.rs message, and emitted
    *before* any container work, matching today's error ordering bit-for-bit.
-   The spec's "`None` for `outrig mcp` later" gloss is deferred to 0040: the
+   The spec's "`None` for `outrig mcp` later" gloss is deferred to 0001-40: the
    future caller will need either a different code path or a relaxed check
-   here. A `// FIXME(0040)` comment marks the spot.
+   here. A `// FIXME(0001-40)` comment marks the spot.
 2. **`SessionSetup` does not carry the resolved agent.** Matches the
    deliverable spec literally. `run.rs` re-resolves via `llm::resolve_agent`
    for the `build_agent` + banner step. The duplicate call is cheap (config

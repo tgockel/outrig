@@ -1,4 +1,4 @@
-# 0106 -- `request-timeout-secs` has no range check
+# 0002-29 -- `request-timeout-secs` has no range check
 
 `retry-budget-secs` validates against `RETRY_BUDGET_SECS_CEILING` (3600) at both
 the top level and per provider. Its sibling `request-timeout-secs`, which has

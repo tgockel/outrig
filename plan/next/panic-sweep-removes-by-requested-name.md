@@ -10,7 +10,7 @@ it with `podman rm -f <name>`. Two defects follow, both pre-existing:
 - **A panic during a colliding start deletes someone else's container.** A name
   is a request, not a claim: `podman run --name N` fails when N is already in
   use, and the sweep cannot tell "the container I made" from "the container that
-  was already there". This is exactly the defect 0116 fixed for the cancellation
+  was already there". This is exactly the defect 0002-39 fixed for the cancellation
   path, where the guard now removes by a per-attempt `org.outrig.attempt` label
   instead. The panic hook did not move because it is a different trigger and the
   task had already grown; the mechanism it needs now exists.

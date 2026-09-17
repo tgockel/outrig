@@ -1,4 +1,4 @@
-# 0071 -- `outrig image build` for standalone image projects
+# 0001-71 -- `outrig image build` for standalone image projects
 
 ## Context
 
@@ -53,9 +53,9 @@ builds and default live MCP testing.
 
 ## Dependencies
 
-- **Hard: 0069**. Build validation uses the standalone `image.toml` parser and
+- **Hard: 0001-69**. Build validation uses the standalone `image.toml` parser and
   embedded image path.
-- **Hard: 0070**. The init scaffold is the canonical build fixture and the
+- **Hard: 0001-70**. The init scaffold is the canonical build fixture and the
   first user-facing input to this command.
 
 ## Decisions

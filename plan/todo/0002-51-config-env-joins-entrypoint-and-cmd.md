@@ -1,4 +1,4 @@
-# 0128 -- `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read
+# 0002-51 -- `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read
 
 ## Context
 
@@ -18,11 +18,11 @@ The only existing `Config.Env` read anywhere in this repo is an ad hoc one in a 
 (`crates/outrig-cli/tests/mcp_sidecar_smoke.rs:710-719`), and it inspects a *running container's*
 env via `podman inspect`, not an image's -- a different target this task doesn't touch.
 
-`plan/done/0103-primary-view-relative-entrypoint.md` weighed and rejected a host-side `Config.Env`
-read once before, but for a different job: resolving a relative `ENTRYPOINT` against `PATH` needs
-the image's env *and* a filesystem probe per candidate, which needs a container -- the thing that
-task's launcher exists to avoid. A plain accessor that only returns the declared env, with no
-probing, doesn't hit that objection.
+`plan/done/phase/0002-sidecars/tasks/0002-26-primary-view-relative-entrypoint.md` weighed and
+rejected a host-side `Config.Env` read once before, but for a different job: resolving a relative
+`ENTRYPOINT` against `PATH` needs the image's env *and* a filesystem probe per candidate, which
+needs a container -- the thing that task's launcher exists to avoid. A plain accessor that only
+returns the declared env, with no probing, doesn't hit that objection.
 
 CocoClaw is the motivating consumer: it wants to stop shelling out to `podman` itself, and this is
 the one call standing in the way. Its own follow-up spec sits in its own tree at
@@ -48,7 +48,7 @@ An embedder can read an image's `Config.Env` through OutRig, the same way it alr
   (CocoClaw's row-env-wins forwarding) wants a map, not a `Vec<String>` it has to re-split itself.
 - The `KEY=value` split and the null/empty handling live in a small private pure function (e.g.
   `fn parse_env_json(text: &str) -> Result<BTreeMap<String, String>>`), separate from the `podman`
-  invocation -- the same separation `0103` made between candidate generation and the syscall loop
+  invocation -- the same separation `0002-26` made between candidate generation and the syscall loop
   around it. An entry with no `=` is skipped, not guessed at.
 - Confirm empirically whether podman ever prints `Config.Env` as `null` (as it does for
   `Config.Labels`, which is why `read_image_labels` special-cases it at `image.rs:593-595`) or
@@ -79,8 +79,8 @@ None hard.
 
 ## See also
 
-- `plan/done/0103-primary-view-relative-entrypoint.md` -- the related, distinct, prior decision
-  about host-side `Config.Env` reads.
+- `plan/done/phase/0002-sidecars/tasks/0002-26-primary-view-relative-entrypoint.md` -- the related,
+  distinct, prior decision about host-side `Config.Env` reads.
 - CocoClaw's `plan/next/outrig-image-env-accessor.md` -- the consumer side. Not touched by this
   task and not a hard dependency, the same relationship `plan/done/0087` has to CocoClaw's own
   nested-podman entry.

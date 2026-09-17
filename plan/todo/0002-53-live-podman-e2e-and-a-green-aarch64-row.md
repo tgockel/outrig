@@ -1,9 +1,9 @@
-# 0130 -- Run the e2e suite for real, on both architectures
+# 0002-53 -- Run the e2e suite for real, on both architectures
 
 ## Context
 
-0092 existed because a whole feature-gated test suite had rotted unnoticed: `e2e` was declared on
-both crates and no CI job compiled it. 0092 added a matrix row, and that row runs `cargo test
+0002-15 existed because a whole feature-gated test suite had rotted unnoticed: `e2e` was declared on
+both crates and no CI job compiled it. 0002-15 added a matrix row, and that row runs `cargo test
 --no-run`. So the suite compiles and links; it has never been executed against a live podman in
 CI.
 
@@ -12,9 +12,9 @@ claim: live podman e2e execution (compiled only, as in CI), sanitizer and Miri c
 native AArch64 runtime and syscall behavior, and CUDA/Metal runtime coverage.
 
 That matters more for this release than usual, because the queue ahead of it changes exactly the
-code a compile-only suite cannot exercise: 0116 changes subprocess ownership and kill semantics,
-0117 changes namespace-entering rollback and nft teardown, and 0114 changes what the interceptor
-lets through. Every one of those is a runtime property. `--no-run` proves none of them.
+code a compile-only suite cannot exercise: 0002-39 changes subprocess ownership and kill semantics,
+0002-40 changes namespace-entering rollback and nft teardown, and 0002-37 changes what the
+interceptor lets through. Every one of those is a runtime property. `--no-run` proves none of them.
 
 AArch64 is the second half. outrig's container work is syscall- and namespace-heavy -- `nsfork`,
 `container/enter`, the nft rules -- and none of it has a green native run on ARM. Claiming both
@@ -52,7 +52,7 @@ ready on either architecture.
   Until then they should not imply both.
 - **Do not fold in the rest of `plan/next/ci-configuration-coverage.md`.** Its `cargo hack
   --each-feature` job, its cache-bucket and sccache cleanups, and its MSRV check are independent
-  and stay in the buffer; its `macos-latest` x `local-llm,metal` item is contingent on 0123's
+  and stay in the buffer; its `macos-latest` x `local-llm,metal` item is contingent on 0002-46's
   decision and may evaporate. Cross-reference both ways so neither is done twice.
 
 ## Acceptance
@@ -62,11 +62,11 @@ ready on either architecture.
   in the live invocation is a failure of this task, and so is an ARM row that only compiles.
 - Both architectures ran the exact invocation above and produce the same evidence shape, per
   fork 1's choice.
-- **The lifecycle regressions from 0116 and 0117 run under live podman**, not only against fakes.
-  Fakes prove the ownership logic; podman proves the container actually went away, that no
-  buildah working container or temporary tag survived a canceled build, and that a `detach`
-  really ended its bridges.
-- **0114's live tier runs here too**: a forged `Host`/SNI connection is denied against a real
+- **The lifecycle regressions from 0002-39 and 0002-40 run under live podman**, not only against
+  fakes. Fakes prove the ownership logic; podman proves the container actually went away, that no
+  buildah working container or temporary tag survived a canceled build, and that a `detach` really
+  ended its bridges.
+- **0002-37's live tier runs here too**: a forged `Host`/SNI connection is denied against a real
   interceptor, and a container that resolved the name through outrig's own DNS is allowed. Those
   are the two halves of the security fix that policy-level tests cannot reach, and omitting them
   would leave the release's headline blocker verified only in unit tests.
@@ -83,12 +83,12 @@ ready on either architecture.
    because ARM was harder.
 2. **Whether the live job gates every PR -- Recommended: no.** Live podman is slow and flaky in
    shared CI. A scheduled run plus a release-time run gets the coverage without the per-PR tax,
-   matching 0125's posture on the snapshot gate.
+   matching 0002-48's posture on the snapshot gate.
 
 ## Dependencies
 
-- **Soft: after 0116 and 0117**, whose regressions this is meant to exercise for real.
-- Independent of 0129; it can run against the rc.3 tree or before it, but the release should not
+- **Soft: after 0002-39 and 0002-40**, whose regressions this is meant to exercise for real.
+- Independent of 0002-52; it can run against the rc.3 tree or before it, but the release should not
   be described as ready on an architecture until this lands.
 
 ## See also
@@ -98,7 +98,7 @@ ready on either architecture.
   to exercise, and which `--no-run` proves nothing about.
 - `crates/outrig/tests/library_surface.rs`, `crates/outrig-cli/tests/e2e_quickstart.rs`,
   `crates/outrig-cli/tests/primary_view_e2e.rs` -- the `e2e`-gated suites that have never run.
-- `plan/done/0092-e2e-imageconfig-sidecars-bitrot.md` -- where the `--no-run` row came from, and
-  why the class of gap it left is still open.
+- `plan/done/phase/0002-sidecars/tasks/0002-15-e2e-imageconfig-sidecars-bitrot.md` -- where the
+  `--no-run` row came from, and why the class of gap it left is still open.
 - `plan/next/ci-configuration-coverage.md` -- the sibling entry, deliberately not absorbed.
 - `.github/workflows/ci.yml` -- the matrix this extends.

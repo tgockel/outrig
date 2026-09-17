@@ -1,4 +1,4 @@
-# 0102 -- A `view = "primary"` payload runs as root, not as the session user
+# 0002-25 -- A `view = "primary"` payload runs as root, not as the session user
 
 ## Context
 
@@ -22,9 +22,10 @@ and cannot `chown` back without `podman unshare`. And because the payload is uid
 caps in its bounding set, every process it spawns inherits `CAP_SYS_ADMIN` too: an MCP server
 that shells out hands the capability to whatever it runs.
 
-Today this is latent -- the shipped `view = "primary"` examples are read-only filesystem
-servers. It stops being latent the moment a server that writes, or that spawns commands, is
-placed this way, which is exactly what `plan/todo/0104-dogfood-sidecar-mcp-config.md` does.
+Today this is latent -- the shipped `view = "primary"` examples are read-only filesystem servers. It
+stops being latent the moment a server that writes, or that spawns commands, is placed this way,
+which is exactly what `plan/done/phase/0002-sidecars/tasks/0002-27-dogfood-sidecar-mcp-config.md`
+does.
 
 The fix belongs in the launcher. `outrig-enter` holds those privileges *by necessity*, but only
 until the graft is in place. Nothing after `chdir` needs them.
@@ -125,12 +126,13 @@ such key today; add one when something needs it.
   whose group list we could not clear.
 - **The e2e proof lives in two places, for one reason each.** The runnable one is in
   `crates/outrig/tests/library_surface.rs`, whose `view = "primary"` test uses the
-  absolute-`ENTRYPOINT` derivative and therefore passes today; it was confirmed to fail without
-  the drop (the written file came back owned by `100000:100000`, the subuid) and to pass with it.
-  The same two assertions are also in `crates/outrig-cli/tests/primary_view_e2e.rs`, as this
-  task's Acceptance asks -- but that binary is red on trunk and stays red until
-  `plan/todo/0103-primary-view-relative-entrypoint.md` lands, because the stock image's bare
-  `node` `ENTRYPOINT` does not resolve. Those assertions ship written and unexecuted.
+  absolute-`ENTRYPOINT` derivative and therefore passes today; it was confirmed to fail without the
+  drop (the written file came back owned by `100000:100000`, the subuid) and to pass with it. The
+  same two assertions are also in `crates/outrig-cli/tests/primary_view_e2e.rs`, as this task's
+  Acceptance asks -- but that binary is red on trunk and stays red until
+  `plan/done/phase/0002-sidecars/tasks/0002-26-primary-view-relative-entrypoint.md` lands, because
+  the stock image's bare `node` `ENTRYPOINT` does not resolve. Those assertions ship written and
+  unexecuted.
 - **The privileged-operation proof is a write to `/etc` through the server**, not a synthetic
   probe. The served root is `/`, so the server's own policy permits the path and only the kernel
   refuses -- which is what makes it evidence that the capabilities are gone rather than unused.
@@ -173,7 +175,7 @@ such key today; add one when something needs it.
 
 ## Dependencies
 
-- **0096**, which fixed the double-graft half of the argv contract and added the
+- **0002-19**, which fixed the double-graft half of the argv contract and added the
   absolute-ENTRYPOINT coverage in `crates/outrig/tests/library_surface.rs` that this task's
   changes have to keep passing.
 
@@ -181,8 +183,9 @@ such key today; add one when something needs it.
 
 - `crates/outrig/src/container/enter/launcher.rs` -- `main`, and the argv contract in the header.
 - `crates/outrig/src/container/sidecar.rs` -- `build_primary_view_argv`, `entrypoint_create_args`.
-- `plan/done/0089-outrig-enter-helper.md`, `plan/done/0090-primary-view-sidecars.md`,
-  `plan/done/0091-host-side-user-bootstrap.md` -- the bootstrap this task brings entrypoint
-  hosts into line with.
-- `plan/todo/0103-primary-view-relative-entrypoint.md` -- the other launcher change, queued
-  next; both edit `main()`.
+- `plan/done/phase/0002-sidecars/tasks/0002-12-outrig-enter-helper.md`,
+  `plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md`,
+  `plan/done/phase/0002-sidecars/tasks/0002-14-host-side-user-bootstrap.md` -- the bootstrap this
+  task brings entrypoint hosts into line with.
+- `plan/done/phase/0002-sidecars/tasks/0002-26-primary-view-relative-entrypoint.md` -- the other
+  launcher change, queued next; both edit `main()`.

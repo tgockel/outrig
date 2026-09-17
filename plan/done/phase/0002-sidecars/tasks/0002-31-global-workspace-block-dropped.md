@@ -1,4 +1,4 @@
-# 0108 -- Global `[workspace]` primary fields are silently discarded
+# 0002-31 -- Global `[workspace]` primary fields are silently discarded
 
 ## Context
 
@@ -30,8 +30,8 @@ documented behavior and the implemented behavior differ precisely when the repo 
 is the case a user setting a machine-wide `container-path` would expect to work.
 
 Found while establishing that `Workspace` needs no `ConfigSource` in
-`plan/done/0097-config-path-provenance.md` -- the absence of a base-directory problem here is a
-consequence of this bug, not of a design decision.
+`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` -- the absence of a
+base-directory problem here is a consequence of this bug, not of a design decision.
 
 ## Goal
 
@@ -45,8 +45,8 @@ Make the global `[workspace]` block either work or fail loudly, and make the doc
 - Tests in `crates/outrig/tests/config_merge.rs`'s `mod config_merge`: a global-only
   `[workspace]`, and a both-declare case pinning repo precedence.
 - If the accepted rule is per-key precedence, `Workspace` gains a `ConfigSource` after all, since
-  a global `host-path` would then be relative to `~/.outrig/` -- the 0097 rule applied to a key
-  0097 could correctly skip. `Workspace::resolved_host_path`
+  a global `host-path` would then be relative to `~/.outrig/` -- the 0002-20 rule applied to a key
+  0002-20 could correctly skip. `Workspace::resolved_host_path`
   (`crates/outrig/src/config/mod.rs`) is the one call site to change.
 
 ## Acceptance
@@ -74,20 +74,20 @@ Make the global `[workspace]` block either work or fail loudly, and make the doc
    fixing the doc is the cheapest and the least satisfying.
 
 2. **Whether `mounts` stays asymmetric -- Resolved: yes.** Concatenating extra mounts while
-   replacing the primary pair is deliberate and documented, and 0097 made the concatenated case
+   replacing the primary pair is deliberate and documented, and 0002-20 made the concatenated case
    correct. Nothing here changes it.
 
 ## Dependencies
 
-- **Soft: 0097.** Already landed. If fork 1 chooses per-key precedence, this task consumes 0097's
+- **Soft: 0097.** Already landed. If fork 1 chooses per-key precedence, this task consumes 0002-20's
   `ConfigSource` for `Workspace`; the two are otherwise independent.
 
 ## See also
 
 - `crates/outrig/src/config/merge.rs:41-45` -- the three lines in question.
 - `crates/outrig/src/config/mod.rs` -- `Workspace`, its `Default`, and `resolved_host_path`.
-- `plan/done/0097-config-path-provenance.md` -- where this was found, and why `Workspace` was
-  left out of the provenance sweep.
+- `plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` -- where this was found,
+  and why `Workspace` was left out of the provenance sweep.
 
 ## Decisions
 
@@ -102,7 +102,7 @@ Make the global `[workspace]` block either work or fail loudly, and make the doc
   This reverses the call made mid-task. The first cut kept the public `PathBuf` fields and hid
   declaration in two private booleans, on the grounds that a field-type change is a public break.
   It is, but `#[non_exhaustive]` does not cover field types and the queue is pre-freeze work for
-  `0.2.0`, so the break is free now and a major version later; sibling task 0110 takes the same
+  `0.2.0`, so the break is free now and a major version later; sibling task 0002-33 takes the same
   class of break on purpose. The bespoke encoding would have outlived the window that made it
   avoidable.
 
@@ -128,7 +128,7 @@ Make the global `[workspace]` block either work or fail loudly, and make the doc
   Resolving after the read would have left a narrower version of the same bug: two consultations
   of a process-global working directory, so a change in between could load one file and stamp
   another's origin. `std::path::absolute` is lexical, so no symlink is resolved and no I/O is
-  done. Pre-existing since 0097 for images and mounts; this task widened its blast radius to the
+  done. Pre-existing since 0002-20 for images and mounts; this task widened its blast radius to the
   read-write primary mount, so it is fixed here.
 - An unresolvable global path is an error, not an empty config. A *missing* file still loads as
   empty -- that contract is unchanged and tested -- but a path that cannot be given a meaning at

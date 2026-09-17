@@ -1,4 +1,4 @@
-# 0088 -- Arguments for entrypoint-stdio MCP servers
+# 0002-11 -- Arguments for entrypoint-stdio MCP servers
 
 ## Context
 
@@ -29,7 +29,7 @@ exec-stdio entry, which requires knowing the image's internal layout
 (`/usr/local/bin/node /app/dist/index.js`) -- exactly the coupling the entrypoint form exists to
 avoid.
 
-The gap stands on its own, but it also blocks 0090: the `view = "primary"` demo is an unmodified
+The gap stands on its own, but it also blocks 0002-13: the `view = "primary"` demo is an unmodified
 third-party MCP image served from config alone, and that image needs an argument.
 
 ## Goal
@@ -56,7 +56,7 @@ enough to run it.
   `merge_sidecar_labels`' spec rewrite (`crates/outrig/src/container/sidecar.rs:223-238`) so
   `show-merged` reports what will actually run.
 - The library facade: `McpServerSpec` reaches `Outrig` callers, so whatever `outrig_.rs` and
-  `crates/outrig-cli/src/cli/session_setup.rs` pass to the create path carries `args` too. 0087
+  `crates/outrig-cli/src/cli/session_setup.rs` pass to the create path carries `args` too. 0002-10
   recorded that the CLI bypasses `SecuritySpec` and reads `ImageConfig` directly at both launch
   sites; check for the same shape here rather than assuming the facade covers it.
 - Docs in the same commit: `doc/reference/config.md` (the `[images.<name>.mcp]` table and the
@@ -150,7 +150,7 @@ Calls made during execution (2026-07-24):
   only through the inline `image` form, because a named block launches as `<image> sleep
   infinity` (`build_podman_run_cmd`) and `sidecar` without `command` was rejected. That leaves
   no way to give an entrypoint server a workspace view, mounts, or its own security policy --
-  and 0090 needs exactly that, since `view` lives on the block. So **entrypoint mode is now
+  and 0002-13 needs exactly that, since `view` lives on the block. So **entrypoint mode is now
   decided by the absence of `command`**, extending the rule that already governed the inline
   form: `is_entrypoint_stdio` became `!has_command() && (image().is_some() ||
   sidecar().is_some())`. It is the single transport classifier, so placement planning, MCP
@@ -197,6 +197,7 @@ Calls made during execution (2026-07-24):
 ## See also
 
 - `doc/concepts/mcp-servers.md` -- placement forms and the entrypoint-stdio contract.
-- `plan/done/0080-sidecar-entrypoint-stdio.md` -- where the entrypoint form landed, and why
-  container lifetime equals server lifetime.
-- `plan/todo/0090-primary-view-sidecars.md` -- the consumer that needs this to demo.
+- `plan/done/phase/0002-sidecars/tasks/0002-03-sidecar-entrypoint-stdio.md` -- where the entrypoint
+  form landed, and why container lifetime equals server lifetime.
+- `plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md` -- the consumer that needs
+  this to demo.

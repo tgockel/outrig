@@ -1,10 +1,10 @@
-# 0124 -- Narrow or explicitly freeze the rmcp-coupled and low-level surfaces
+# 0002-47 -- Narrow or explicitly freeze the rmcp-coupled and low-level surfaces
 
 ## Context
 
-0093 settled that `container`, `image`, `mcp_proxy`, and `network` are supported public API
+0002-16 settled that `container`, `image`, `mcp_proxy`, and `network` are supported public API
 rather than leaked internals, because a downstream crate drives them directly instead of going
-through the `Outrig` facade. 0094 and 0095 then hardened them with `#[non_exhaustive]`,
+through the `Outrig` facade. 0002-17 and 0002-18 then hardened them with `#[non_exhaustive]`,
 constructors, options structs, and sealing.
 
 Three surfaces came through that arc without an explicit verdict, and 0.2.0 is where a verdict
@@ -24,11 +24,11 @@ carries sixteen rmcp-typed lines:
 - **`SUPPORTED_PROTOCOL_VERSIONS: &[rmcp::model::ProtocolVersion]`** (`public-api.txt:914`), which
   is a public constant whose *type* is an rmcp type.
 
-So an rmcp major upgrade is an OutRig public-API event on all three, and the neutral content
-types 0120 may introduce decouple none of them -- 0120 is about `McpTool`/`McpToolResult`, which
-are already outrig-owned. This is not speculative: the rmcp 1.x -> 3.x break is the
-demonstration, and `plan/next/rmcp-list-result-spec-gaps.md` documents how the 2.2 -> 3.1 bump
-moved outrig onto a protocol revision it did not satisfy, with no outrig source change.
+So an rmcp major upgrade is an OutRig public-API event on all three, and the neutral content types
+0002-43 may introduce decouple none of them -- 0002-43 is about `McpTool`/`McpToolResult`, which are
+already outrig-owned. This is not speculative: the rmcp 1.x -> 3.x break is the demonstration, and
+`plan/next/rmcp-list-result-spec-gaps.md` documents how the 2.2 -> 3.1 bump moved outrig onto a
+protocol revision it did not satisfy, with no outrig source change.
 
 **`container::enter` exposes exactly two functions.** The public surface is
 `enter::is_available()` and `enter::materialize(&Path)` (`public-api.txt:664-666`); the launcher
@@ -40,7 +40,7 @@ embedder need either function, and do they need the same answer?
 **`IoPathExt` is an unsealed public extension trait.** It lives in `crates/outrig/src/error.rs`
 and is used from five modules (`process.rs`, `mcp.rs`, `network.rs`, `image.rs`,
 `container/enter/mod.rs`). Unsealed means an external type may implement it, which means adding a
-required method later breaks those implementors -- the exact hazard 0095 sealed `BackingClient`
+required method later breaks those implementors -- the exact hazard 0002-18 sealed `BackingClient`
 against.
 
 ## Goal
@@ -85,9 +85,9 @@ and the verdict is somewhere a consumer will read it.
 
 ## Design forks
 
-1. **The rmcp coupling -- Decided in 0120, applied here.** 0120's fork 2 records the boundary
+1. **The rmcp coupling -- Decided in 0002-43, applied here.** 0002-43's fork 2 records the boundary
    principle, because it is the first task that has to commit to one and the queue cannot run two
-   tasks jointly. This task inherits that answer and applies it to what 0120 does not touch: the
+   tasks jointly. This task inherits that answer and applies it to what 0002-43 does not touch: the
    three `OutrigError` variants, the `From` impl, and `SUPPORTED_PROTOCOL_VERSIONS`. If applying
    it here shows the principle was wrong, that is a reopened decision recorded in both places --
    not a second, quieter answer.
@@ -95,7 +95,7 @@ and the verdict is somewhere a consumer will read it.
 2. **`is_available` versus `materialize` -- Open, and they are separable.** `is_available` is a
    cheap predicate with no ownership implications and is plausibly useful to an embedder.
    `materialize` writes a helper binary to a path and is the one that constrains future
-   implementation. Decide them separately rather than treating `enter` as one surface; 0093's
+   implementation. Decide them separately rather than treating `enter` as one surface; 0002-16's
    method was to ask what a real downstream crate drives.
 
 3. **Whether sealing `IoPathExt` is worth a break -- Recommended: yes, and it is barely a break.**
@@ -104,15 +104,16 @@ and the verdict is somewhere a consumer will read it.
 
 ## Dependencies
 
-- **Hard: 0120**, which records the rmcp boundary decision this task applies.
+- **Hard: 0002-43**, which records the rmcp boundary decision this task applies.
 
-Must precede 0125's snapshot regeneration and 0126's migration guide.
+Must precede 0002-48's snapshot regeneration and 0002-49's migration guide.
 
 ## See also
 
 - `crates/outrig/src/mcp_proxy.rs` -- `ProxyServer` and its rmcp trait impls.
 - `crates/outrig/src/error.rs` -- `IoPathExt`; `crates/outrig/src/container/enter/` and
   `crates/outrig/build.rs` -- the launcher plumbing.
-- `plan/done/0093-shrink-reachable-surface.md`, `plan/done/0095-options-structs-and-sealing.md`
-  -- the sealing precedent and the method for deciding what is supported.
+- `plan/done/phase/0002-sidecars/tasks/0002-16-shrink-reachable-surface.md`,
+  `plan/done/phase/0002-sidecars/tasks/0002-18-options-structs-and-sealing.md` -- the sealing
+  precedent and the method for deciding what is supported.
 - `plan/next/rmcp-list-result-spec-gaps.md` -- concrete evidence of what an rmcp bump costs.

@@ -1,4 +1,4 @@
-# 0098 -- Native Anthropic Messages API provider
+# 0002-21 -- Native Anthropic Messages API provider
 
 ## Context
 
@@ -285,7 +285,7 @@ container environments.
    `agent.max_tokens.or(model.max_tokens)` in `resolve_agent_with_overrides`.
 
    This is also the truer home: Anthropic's ceiling is a property of the model, so one
-   declaration covers every agent pointed at it, and 0101's per-subagent model selection gets
+   declaration covers every agent pointed at it, and 0002-24's per-subagent model selection gets
    the right ceiling for free. The key is provider-neutral -- `finish_agent` applies it to every
    style, and mistralrs consumes it as `sampling_params.max_len` -- so validation does not
    restrict it to remote models.
@@ -368,7 +368,7 @@ container environments.
 ## Dependencies
 
 - **0094.** Adding an `Anthropic` variant to `LlmProvider` is a breaking change while the enum
-  is exhaustive, which it is today. 0094's sweep marks it `#[non_exhaustive]` -- citing this task
+  is exhaustive, which it is today. 0002-17's sweep marks it `#[non_exhaustive]` -- citing this task
   as the reason -- so landing that first makes this variant purely additive.
 - **Hard: `rig-core = 0.40.0` Anthropic provider.** The implementation must confirm builder and
   concrete model type signatures against the locked version rather than newer online docs.

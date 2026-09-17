@@ -1,4 +1,4 @@
-# 0016 -- `LlmRegistry` (lazy-load + sharing for in-process models)
+# 0001-16 -- `LlmRegistry` (lazy-load + sharing for in-process models)
 
 ## Goal
 
@@ -30,10 +30,10 @@ keyed by provider name, value is a lazily-loaded `Arc<MistralrsModel>`.
   }
   ```
   All under `#[cfg(feature = "mistralrs")]`. The non-feature build doesn't have a
-  registry -- the resolver short-circuits with the 0014 error before reaching one.
+  registry -- the resolver short-circuits with the 0001-14 error before reaching one.
 - The registry lives **in the host outrig process**, not the container. Construct it
   once per `outrig run` invocation; pass it into the resolver alongside `Config`.
-- `resolve_agent` (0012/0015) takes the registry as a parameter; the `Mistralrs` arm
+- `resolve_agent` (0001-12/0015) takes the registry as a parameter; the `Mistralrs` arm
   calls `registry.get_or_load(...)` instead of `MistralrsModel::load(...)` directly.
   Two `resolve_agent` calls against the same provider now share one `Arc`.
 - `tests/llm_registry.rs` (`#[cfg(feature = "mistralrs")]`):
@@ -50,14 +50,14 @@ keyed by provider name, value is a lazily-loaded `Arc<MistralrsModel>`.
 - `cargo test --features mistralrs llm_registry` passes.
 - Two agents in a fixture config that point at the same `mistralrs` provider load the
   model once.
-- `resolve_agent` on a non-feature build is unchanged from 0015's behavior (still errors
-  on `Mistralrs` with the 0014 message).
+- `resolve_agent` on a non-feature build is unchanged from 0001-15's behavior (still errors
+  on `Mistralrs` with the 0001-14 message).
 - Drop the `> TODO: Incomplete` marker on `doc/concepts/llm-providers.md` for the
-  in-process providers section if 0015 left it in place.
+  in-process providers section if 0001-15 left it in place.
 
 ## Dependencies
 
-- 0015-mistralrs-shim
+- 0001-15-mistralrs-shim
 
 ## Notes
 
@@ -102,7 +102,7 @@ keyed by provider name, value is a lazily-loaded `Arc<MistralrsModel>`.
   `cache_root` inside the registry closure.
 - **No doc change for the `> TODO: Incomplete` marker.** The marker on
   `doc/concepts/llm-providers.md` line 160 covers "Other Rig provider styles"
-  (anthropic, Cohere), not the in-process `mistralrs` section. 0015 already cleared
+  (anthropic, Cohere), not the in-process `mistralrs` section. 0001-15 already cleared
   the in-process marker. The acceptance criterion is a no-op.
 - **A fourth test: `loader_failure_leaves_slot_empty`.** Not in the spec, but the
   module doc explicitly promises retry-on-failure semantics, and an untested promise

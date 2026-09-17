@@ -1,8 +1,8 @@
-# 0074 -- Remove the baked `/etc/outrig/image.toml`
+# 0001-74 -- Remove the baked `/etc/outrig/image.toml`
 
 ## Context
 
-After 0072, standalone images carry their config as OCI labels, and OutRig stamps, reads, and
+After 0001-72, standalone images carry their config as OCI labels, and OutRig stamps, reads, and
 validates via labels. The baked `/etc/outrig/image.toml` is still copied into the image by the
 `image init` scaffold but is no longer read by anything. This task deletes that dead path so
 labels are the sole image-side config surface.
@@ -44,7 +44,7 @@ readers, and the documentation that describes the file model.
 
 ## Dependencies
 
-- **Hard: 0072**. Labels must be authoritative before the file path is removed.
+- **Hard: 0001-72**. Labels must be authoritative before the file path is removed.
 
 ## Decisions
 

@@ -1,4 +1,4 @@
-# 0089 -- `outrig-enter`, the static in-sidecar launcher
+# 0002-12 -- `outrig-enter`, the static in-sidecar launcher
 
 ## Context
 
@@ -16,7 +16,7 @@ statically linked, and it must depend on nothing in the image.
 
 The prototype's `sidecar-enter.c` is the proven version -- 203 lines, syscalls only, verified
 against a real `docker.io/mcp/filesystem` (Alpine/musl node 22) serving a Debian/glibc target.
-This task ports it to Rust and decides how OutRig ships it. 0090 consumes it; nothing else does.
+This task ports it to Rust and decides how OutRig ships it. 0002-13 consumes it; nothing else does.
 
 ## Goal
 
@@ -37,7 +37,7 @@ payload -- with no new prerequisite for a default `cargo build` or `cargo instal
 - Embedding: the built artifact reaches the CLI through `crates/outrig-cli/build.rs`, which
   already exists (it warns on `cuda`/`metal` without `local-llm`).
 - Materialization: written into the session directory mode `0755` at sidecar start and
-  bind-mounted read-only. 0090 owns the mount; this task owns the bytes and the write.
+  bind-mounted read-only. 0002-13 owns the mount; this task owns the bytes and the write.
 - No panic-unwinding dependency on the target image: the binary must run correctly with an empty
   environment and an unreadable `/proc`.
 
@@ -49,7 +49,7 @@ Ordering is forced, and getting it wrong fails in ways that read like permission
    *before* leaving its mount namespace. After the `setns` this fd is the only way back to the
    payload's interpreter and libraries.
 2. `setns(ns_fd, CLONE_NEWNS)` -- join the target's mount namespace. No user-namespace work
-   here: 0090 launches the sidecar with `--userns=container:<primary>`, so the process is
+   here: 0002-13 launches the sidecar with `--userns=container:<primary>`, so the process is
    already in the namespace that owns the target's mount namespace.
 3. `unshare(CLONE_NEWNS)` -- take a private copy, so the graft is invisible to the primary.
 4. `mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL)` -- stop propagation before grafting.
@@ -115,7 +115,7 @@ the runtime "built without the helper" path as the `cargo install` story.
 ## Security
 
 The launcher runs with `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` inside the rootless user namespace
-(0090 grants them). It should hold them for as little as possible: it does no privileged work
+(0002-13 grants them). It should hold them for as little as possible: it does no privileged work
 after step 6, and exec into the payload is the last thing it does. It must not read, log, or
 copy anything from the namespaces it joins -- it is a shim, not a tool.
 
@@ -149,7 +149,7 @@ conventionally present and empty; fail with that explanation rather than calling
 - **`--host-bind` equivalent.** The prototype needs it because Debian's `node` loads runtime
   assets by absolute path and silently picks up the *target's* copy after the graft. A
   self-contained runtime avoids it. Leave the flag out until a real image needs it, but keep the
-  hazard in mind when writing 0090's docs -- silently loading the wrong JavaScript is worse than
+  hazard in mind when writing 0002-13's docs -- silently loading the wrong JavaScript is worse than
   failing.
 - **Whether to vendor the prototype's C alongside the Rust port** as a reference for review. It
   would go stale. Cite the URL instead.
@@ -162,7 +162,7 @@ None.
 
 - <https://github.com/tgockel/prototype-podman-shared-fs> -- `sidecar-enter.c` is the reference
   implementation; the README's "Gotchas found the hard way" is the list of things that cost time.
-- `plan/todo/0090-primary-view-sidecars.md` -- the only consumer.
+- `plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md` -- the only consumer.
 
 ## Decisions
 
@@ -177,10 +177,11 @@ None.
   nested-cargo fragility the plan flagged). Spike + the acceptance test confirm this yields a
   `static-pie` musl binary with no `PT_INTERP`.
 - **Lives in the `outrig` library crate, not `outrig-cli`.** The plan said `outrig-cli/build.rs`,
-  but the only consumer -- 0090's sidecar wiring -- is in `crates/outrig/src/container/sidecar.rs`,
-  so the bytes + `materialize` belong beside it under `crates/outrig/src/container/enter/`. A new
-  `crates/outrig/build.rs` hosts the compile+embed (`include_bytes!` must be in the crate that
-  owns the `build.rs`). `outrig` is also published, so the crates.io story holds.
+  but the only consumer -- 0002-13's sidecar wiring -- is in
+  `crates/outrig/src/container/sidecar.rs`, so the bytes + `materialize` belong beside it under
+  `crates/outrig/src/container/enter/`. A new `crates/outrig/build.rs` hosts the compile+embed
+  (`include_bytes!` must be in the crate that owns the `build.rs`). `outrig` is also published, so
+  the crates.io story holds.
 - **The launcher depends on nothing.** It self-declares the `extern "C"` musl symbols
   (`setns`/`unshare`/`mount`/...) and the arch-specific syscall numbers (`SYS_execveat` 322 on
   x86_64 / 281 on aarch64; `open_tree`/`move_mount` 428/429 shared), so no `libc` crate and no
@@ -198,7 +199,7 @@ None.
   with a `rustup target add` hint. `build.rs` emits `rerun-if-changed` for the target's sysroot
   lib dir (named by `rustc --print target-libdir` even when absent), so a later `rustup target
   add` auto-triggers a rebuild -- verified by removing and re-adding the target.
-- **Container-level acceptance is manual / exercised by 0090.** 0089 alone cannot launch a
+- **Container-level acceptance is manual / exercised by 0090.** 0002-12 alone cannot launch a
   sidecar, so the setns/graft/MCP-handshake and the SYS_ADMIN/SYS_PTRACE negative cases are run
   by hand against a live session (per the prototype's `21-`/`22-` scripts). Automated coverage:
   static-ELF embedding + `0755` materialization + the ELF/shebang parser.

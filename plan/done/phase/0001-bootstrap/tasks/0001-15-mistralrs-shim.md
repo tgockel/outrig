@@ -1,4 +1,4 @@
-# 0015 -- Rig `CompletionModel` shim for `mistralrs` (with HF download)
+# 0001-15 -- Rig `CompletionModel` shim for `mistralrs` (with HF download)
 
 ## Goal
 
@@ -42,7 +42,7 @@ install can resolve a `model-id` config without any user pre-staging. After this
   `Mistralrs` arm calls `MistralrsModel::load` and wraps the returned handle in whatever
   shape `build_agent` expects.
 - Without `--features mistralrs`, the resolver's `Mistralrs` arm returns the error pinned
-  in 0014 (`feature 'mistralrs' is not enabled in this build...`).
+  in 0001-14 (`feature 'mistralrs' is not enabled in this build...`).
 - `tests/mistralrs_smoke.rs` (`#[cfg(feature = "mistralrs")]`):
   - **Offline path test**, gated behind `OUTRIG_MISTRALRS_TEST_MODEL=/path/to/file.gguf`.
     Skips with a `println!` notice if the env var isn't set. Loads the model via
@@ -58,14 +58,14 @@ install can resolve a `model-id` config without any user pre-staging. After this
 - `cargo test --features mistralrs` passes the unit suite. The smoke tests skip cleanly
   when env vars are unset, and pass when set against a small public GGUF repo.
 - `resolve_agent` against a `Mistralrs` provider on a non-feature build still produces
-  the 0014 error message verbatim.
+  the 0001-14 error message verbatim.
 - Drop the `> TODO: Incomplete` marker on `doc/concepts/llm-providers.md` for the
   in-process providers section -- only that section, not the whole page (the page
-  itself is still TODO until 0017).
+  itself is still TODO until 0001-17).
 
 ## Dependencies
 
-- 0014-mistralrs-feature
+- 0001-14-mistralrs-feature
 
 ## Notes
 

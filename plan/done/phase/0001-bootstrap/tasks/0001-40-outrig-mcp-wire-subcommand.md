@@ -1,9 +1,9 @@
-# 0040 -- Wire `outrig mcp` subcommand
+# 0001-40 -- Wire `outrig mcp` subcommand
 
 ## Goal
 
-Land the user-visible `outrig mcp` command. Reuses `SessionSetup` (0035) for
-container bootstrap and `ProxyServer` (0039) for the MCP-server side, swapping
+Land the user-visible `outrig mcp` command. Reuses `SessionSetup` (0001-35) for
+container bootstrap and `ProxyServer` (0001-39) for the MCP-server side, swapping
 out `outrig run`'s REPL+agent loop for an rmcp stdio server. Stdio transport
 only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
 
@@ -53,7 +53,7 @@ only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
     `src/mcp_proxy.rs`.
   - Audit comment confirming binary's tracing-subscriber writes only to stderr
     (already true at `src/bin/outrig.rs:101-102`).
-  - Document the load-bearing invariant in 0041's doc page.
+  - Document the load-bearing invariant in 0001-41's doc page.
 - Edge cases handled:
   - Backing MCP crashes mid-session -> `CallToolResult { is_error: Some(true),
     content: [text("outrig: backing server `<name>` call failed: <error>")] }`
@@ -68,7 +68,7 @@ only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
   - Zero backing MCPs configured -> error: "outrig mcp with no
     `[containers.<name>.mcp]` entries has nothing to proxy."
 - Session row: written via the same `SessionStore`. `agent_name = None` (per
-  0036). All other fields identical to `outrig run`.
+  0001-36). All other fields identical to `outrig run`.
 - `tests/mcp_subcommand_smoke.rs` (`#[cfg(feature = "e2e")]`) -- spawn `outrig
   mcp`, drive it as an MCP client over its stdio (rmcp client side), list tools,
   call one tool, assert clean exit (stdin EOF triggers teardown).
@@ -94,9 +94,9 @@ only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
 
 ## Dependencies
 
-- 0035-outrig-mcp-session-setup
-- 0036-outrig-mcp-agent-name-option
-- 0039-outrig-mcp-proxy-server
+- 0001-35-outrig-mcp-session-setup
+- 0001-36-outrig-mcp-agent-name-option
+- 0001-39-outrig-mcp-proxy-server
 
 ## Notes
 
@@ -114,7 +114,7 @@ only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
   `default-agent` -- so a separate signal is the cleanest seam. `outrig run`
   passes `true` (today's behavior bit-for-bit); `outrig mcp` passes `false`,
   which also drops `agent_container` from the container fallback chain. The
-  `// FIXME(0040)` comment in `session_setup.rs` is gone.
+  `// FIXME(0001-40)` comment in `session_setup.rs` is gone.
 
 - **`tokio-util` becomes a direct dependency** so `cli/mcp.rs` can hold a
   `CancellationToken` alongside the consumed `RunningService`. The token is
@@ -125,7 +125,7 @@ only; HTTP/SSE and attach-mode are deferred follow-ups (still in `plan/next/`).
   `tokio::select!` and skips the explicit cancel.
 
 - **`ProxyServer::per_server_counts()` is the new banner-feeder.**
-  `iter_public_names` (added by 0039 specifically for the banner) is enough
+  `iter_public_names` (added by 0001-39 specifically for the banner) is enough
   for the `tools available:` line, but the per-server `(name, count)` lines
   needed an additional helper. Keeping it on `ProxyServer` avoids a second
   `list_tools` round-trip per server during banner construction.

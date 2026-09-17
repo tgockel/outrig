@@ -1,4 +1,4 @@
-# 0041 -- Docs for `outrig mcp`
+# 0001-41 -- Docs for `outrig mcp`
 
 ## Goal
 
@@ -15,7 +15,7 @@ the work is a new `doc/usage/mcp.md`, plus stitching it into `doc/SUMMARY.md`,
     `default-container` fallback semantics.
   - The transport (stdio) and the load-bearing invariant: stdout is JSON-RPC,
     stderr is everything else.
-  - The banner the user sees on startup (paste the sample from 0040).
+  - The banner the user sees on startup (paste the sample from 0001-40).
   - Tool-name namespacing (`<server>__<tool>`), with a worked example showing how
     `fs.read_file` becomes `fs__read_file`.
   - Lifecycle: stdin EOF, SIGINT, SIGTERM all teardown gracefully.
@@ -32,7 +32,7 @@ the work is a new `doc/usage/mcp.md`, plus stitching it into `doc/SUMMARY.md`,
   `[containers.<name>.mcp]` table is consumed by both `outrig run` and
   `outrig mcp`, with a forward-link to `doc/usage/mcp.md`.
 - `doc/usage/sessions.md` -- mention that `outrig mcp` sessions have no
-  `agent_name` and display as `-` (or whatever placeholder 0036 settled on).
+  `agent_name` and display as `-` (or whatever placeholder 0001-36 settled on).
 - All new and modified pages pass the doc-style audit:
   ```
   python3 scripts/audit-doc-style.py doc/usage/mcp.md doc/reference/cli.md \
@@ -51,7 +51,7 @@ the work is a new `doc/usage/mcp.md`, plus stitching it into `doc/SUMMARY.md`,
 
 ## Dependencies
 
-- 0040-outrig-mcp-wire-subcommand
+- 0001-40-outrig-mcp-wire-subcommand
 
 ## Notes
 

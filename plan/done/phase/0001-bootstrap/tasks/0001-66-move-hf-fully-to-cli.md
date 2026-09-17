@@ -1,4 +1,4 @@
-# 0066 -- Move `hf` module fully into `outrig-cli`
+# 0001-66 -- Move `hf` module fully into `outrig-cli`
 
 ## Context
 
@@ -34,7 +34,7 @@ doubles live entirely under `crates/outrig-cli/`.
 
 ## Dependencies
 
-- Soft on 0065 (run after the module-level surface settles so this
+- Soft on 0001-65 (run after the module-level surface settles so this
   relocation doesn't churn module visibility).
 
 ## Decisions

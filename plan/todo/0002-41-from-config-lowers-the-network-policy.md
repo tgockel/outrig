@@ -1,4 +1,4 @@
-# 0118 -- `LaunchSpec::from_config` lowers the network policy it was handed
+# 0002-41 -- `LaunchSpec::from_config` lowers the network policy it was handed
 
 ## Context
 
@@ -37,7 +37,7 @@ so a `LaunchSpec` built from a config enforces what that config declared.
 ## Deliverables
 
 - Lower all three `NetworkMode` values and, for `filter`, the `default`/`allow`/`deny` policy,
-  into `NetworkSpec` -- reading through whatever effective accessor 0115 settled on, not through
+  into `NetworkSpec` -- reading through whatever effective accessor 0002-38 settled on, not through
   a raw field. The conversion belongs beside the existing `From<&ContainerSecurity>`
   impls rather than open-coded in `from_config`, for the reason those impls exist: both types
   are `#[non_exhaustive]`, so a new network key can only be wired through inside this crate.
@@ -59,7 +59,7 @@ so a `LaunchSpec` built from a config enforces what that config declared.
   that the mode is right. A `NetworkSpec` that quietly holds rules in a non-filter mode arms
   itself the moment a caller flips the public mode field, which is a latent version of the bug
   this task exists to fix.
-- A config that reached `from_config` through `merge` lowers the *merged* policy, so 0115's
+- A config that reached `from_config` through `merge` lowers the *merged* policy, so 0002-38's
   mode-only trust rule is still intact at launch. A lowering that reads the repo block directly
   would undo it.
 - `crates/outrig/public-api.txt` regenerated if a conversion becomes public.
@@ -70,7 +70,7 @@ so a `LaunchSpec` built from a config enforces what that config declared.
   an effective accessor is its recommended shape -- and this task lowers exactly that field.
   Lowering the old shape first means writing the lowering twice, and the second write is the one
   that would be done in a hurry.
-- Soft: after 0114, if 0114 reshapes `NetworkSpec`. The two do not overlap in code.
+- Soft: after 0002-37, if 0002-37 reshapes `NetworkSpec`. The two do not overlap in code.
 
 ## See also
 

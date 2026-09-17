@@ -1,8 +1,8 @@
-# 0078 -- Interceptor multi-container generalization
+# 0002-01 -- Interceptor multi-container generalization
 
 ## Context
 
-The network interceptor (0059/0060) assumes exactly one container per session: sockets are
+The network interceptor (0001-59/0060) assumes exactly one container per session: sockets are
 bound in one namespace pair, the nft NAT table is applied once, and audit records are stamped
 with a single container identity. MCP sidecar containers (see
 [`mcp-sidecars-spec.md`](mcp-sidecars-spec.md), "Network parity") require `[network]` policy
@@ -37,7 +37,7 @@ the compiled policy and the shared `AuditSink`, with a per-container attach/deta
 
 ## Dependencies
 
-None queued. Builds on the landed interceptor work (0059/0060 lineage).
+None queued. Builds on the landed interceptor work (0001-59/0060 lineage).
 
 ## Decisions
 
@@ -46,7 +46,7 @@ None queued. Builds on the landed interceptor work (0059/0060 lineage).
   `session_setup.rs`) and the existing e2e tests are untouched; sidecar tasks will call
   `new`/`attach`/`detach` directly.
 - Attaching an already-attached container name and detaching an unknown name are both
-  `Configuration` errors rather than silent no-ops, so 0081's bookkeeping bugs surface
+  `Configuration` errors rather than silent no-ops, so 0002-04's bookkeeping bugs surface
   immediately.
 - `detach` takes the container *name*, not `&Container`, so a container that already died
   can still be detached; the nft delete against its defunct pid fails harmlessly
@@ -70,5 +70,7 @@ None queued. Builds on the landed interceptor work (0059/0060 lineage).
 ## See also
 
 - [`mcp-sidecars-spec.md`](mcp-sidecars-spec.md) -- "Network parity" section.
-- `plan/done/0059-network-interceptor-plumbing.md` -- traffic capture and audit logging.
-- `plan/done/0060-network-interceptor-enforcement.md` -- host:port policy enforcement.
+- `plan/done/phase/0001-bootstrap/tasks/0001-59-network-interceptor-plumbing.md` -- traffic capture
+  and audit logging.
+- `plan/done/phase/0001-bootstrap/tasks/0001-60-network-interceptor-enforcement.md` -- host:port
+  policy enforcement.

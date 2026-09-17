@@ -12,7 +12,7 @@ passes validation and reaches podman verbatim as `--device=/dev/fuse:/dev/fuse:r
 podman accepts. The documented restriction is therefore not a restriction; the colon form
 works, undocumented and untested.
 
-Noticed while adding `unmask` (`0114`), whose `validate_unmask_list` *does* reject `:` --
+Noticed while adding `unmask` (`0002-37`), whose `validate_unmask_list` *does* reject `:` --
 because podman splits an unmask value on it, so a colon-joined entry would silently expand
 back into several paths. That gives the two neighboring validators opposite treatments of the
 same character, for reasons that are genuinely different but nowhere written down together.

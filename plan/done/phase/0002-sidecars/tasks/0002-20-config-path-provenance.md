@@ -1,4 +1,4 @@
-# 0097 -- Config path provenance: resolve relative paths against the declaring file
+# 0002-20 -- Config path provenance: resolve relative paths against the declaring file
 
 ## Context
 
@@ -122,7 +122,7 @@ prototype should confirm), or **Open** (deferred).
 
 - **0094.** This task adds a `#[serde(skip)]` field to `ImageConfig` and changes the shape of
   `DockerfileMissing` / `ContextMissing`. Both are breaking changes today and both are insulated
-  once 0094's `#[non_exhaustive]` sweep has landed, so the sweep goes first and this becomes
+  once 0002-17's `#[non_exhaustive]` sweep has landed, so the sweep goes first and this becomes
   additive.
 
 Otherwise independent of everything in the queue, and a strict prerequisite for
@@ -137,8 +137,9 @@ Otherwise independent of everything in the queue, and a strict prerequisite for
   sites.
 - `crates/outrig/src/config/validate.rs` -- `validate_image_source`, `check_mount_list`.
 - `plan/next/user-image-library.md` -- the consumer that makes this load-bearing.
-- `plan/done/0007-image-build.md` -- why `ensure_image` joins against the root without
-  `canonicalize` (intentional symlinks are preserved); the same rule applies to any new base.
+- `plan/done/phase/0001-bootstrap/tasks/0001-07-image-build.md` -- why `ensure_image` joins against
+  the root without `canonicalize` (intentional symlinks are preserved); the same rule applies to any
+  new base.
 
 ## Decisions
 

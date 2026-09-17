@@ -6,7 +6,7 @@ Every duration in the config encodes its unit in the key: `retry-budget-secs`,
 anywhere in the tree -- no `humantime`, no `duration-str`.
 
 `request-timeout = "10m"` reads better than `request-timeout-secs = 600`, and
-`"1h"` beats `3600`. The gap is widest exactly where it matters: 0106 exists
+`"1h"` beats `3600`. The gap is widest exactly where it matters: 0002-29 exists
 because `request-timeout-secs = 86400` is an easy value to write without
 noticing it is a day. `request-timeout = "24h"` is self-evidently absurd on the
 page.
@@ -27,14 +27,14 @@ work is every duration key at once:
 - both provider tables and the validation rules in `doc/reference/config.md`
 - `crates/outrig/public-api.txt`
 
-0111 already landed the reshape this entry used to have to sequence around: the
+0002-34 already landed the reshape this entry used to have to sequence around: the
 `openai` / `anthropic` constructors are no longer positional and
 `LlmProvider::with_retry_budget_secs` is gone, so the duration values now enter
 through the two options types rather than through four signatures. That shrinks
 this entry -- the setters are where a `humantime` string would be accepted, and
 their arguments are already `u64` rather than `Option<u64>`, so the conversion
 is a type change on two methods per struct plus the fields behind them. See
-`plan/done/0111-provider-construction-options-struct.md`.
+`plan/done/phase/0002-sidecars/tasks/0002-34-provider-construction-options-struct.md`.
 
 ## Notes
 
@@ -43,7 +43,7 @@ window or a major. Accepting both spellings (string key alongside a deprecated
 integer one) is the non-breaking alternative, at the cost of a permanent second
 parse path and a deprecation to carry -- hard to justify for keys this young.
 
-`humantime` accepts `"0s"`, so it does **not** subsume 0106's zero check; that
+`humantime` accepts `"0s"`, so it does **not** subsume 0002-29's zero check; that
 validation stays either way. Worth confirming the crate's exact accepted grammar
 before committing to it in a published schema -- what it does with `"1h30m"`,
 bare `"600"`, and whether the error text is good enough to surface raw.
@@ -57,5 +57,5 @@ bare `"600"`, and whether the error text is good enough to surface raw.
 
 ## Dependencies
 
-None hard. 0111 was the sequencing constraint and has landed, so the signatures
+None hard. 0002-34 was the sequencing constraint and has landed, so the signatures
 this would rewrite are settled.

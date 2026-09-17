@@ -1,10 +1,10 @@
-# 0050 -- `--env` flags for `outrig run` and `outrig mcp`
+# 0001-50 -- `--env` flags for `outrig run` and `outrig mcp`
 
 ## Context
 
 The MCP `env` table in `config.toml` now accepts both literal strings and
 `${VAR}` host-env references (`feat/mcp-env-substitution`, on top of the
-api-key syntax in `plan/done/0004-api-key-syntax.md`). That covers env
+api-key syntax in `plan/done/phase/0001-bootstrap/tasks/0001-04-api-key-syntax.md`). That covers env
 vars that belong to the *repo's* config -- shared with collaborators,
 checked in.
 
@@ -19,9 +19,8 @@ editing `config.toml`. Common cases:
   machine).
 
 This applies equally to `outrig run` (today) and the planned `outrig mcp`
-(`plan/todo/0040-outrig-mcp-wire-subcommand.md`) -- both spawn the same
-MCP servers via `connect_via_podman_exec`, so the same flag should work
-on both subcommands.
+(`plan/done/phase/0001-bootstrap/tasks/0001-40-outrig-mcp-wire-subcommand.md`) -- both spawn the
+same MCP servers via `connect_via_podman_exec`, so the same flag should work on both subcommands.
 
 ## Goal
 
@@ -101,7 +100,7 @@ not in scope for this task (out of scope below).
 ### CLI parsing
 
 Add to `RunArgs` (`src/cli/run.rs`) and `McpArgs`
-(`src/cli/mcp.rs`, landing in 0040):
+(`src/cli/mcp.rs`, landing in 0001-40):
 
 ```rust
 /// Add or override env vars for MCP servers. Repeatable.
@@ -196,12 +195,12 @@ These are deliberately left for the task author who picks this up:
 - `src/cli/run.rs` -- `--env` flag added to `RunArgs`, parsed into
   `CliEnvEntries`, validated against the resolved container's MCP map,
   threaded into the connect-each-MCP loop.
-- `src/cli/mcp.rs` -- same wiring on the `outrig mcp` side once 0040
+- `src/cli/mcp.rs` -- same wiring on the `outrig mcp` side once 0001-40
   lands.
 - `src/mcp.rs::connect_via_podman_exec` -- takes a per-server overlay
   and merges it onto the config-file env before resolving.
 - `doc/reference/cli.md` (or wherever the `outrig run` flag table lives
-  -- check after 0041 lands `outrig mcp` docs) -- new `--env` row plus
+  -- check after 0001-41 lands `outrig mcp` docs) -- new `--env` row plus
   a brief precedence note pointing back to
   `doc/reference/config.md#mcp-env-value-syntax` for the value grammar.
 - `tests/cli_env.rs` -- unit tests on `CliEnvEntries::parse` (accept,
@@ -223,14 +222,14 @@ These are deliberately left for the task author who picks this up:
 - Backward compat: every existing `outrig run` invocation without
   `--env` behaves identically; config-file env continues to win when
   no CLI overlay touches that key.
-- `outrig mcp --env ...` accepts the same surface once 0040 lands.
+- `outrig mcp --env ...` accepts the same surface once 0001-40 lands.
 
 ## Dependencies
 
 - `feat/mcp-env-substitution` -- introduces `EnvValue`, the resolution
   plumbing, and the framed `McpEnvResolveFailed` error this work
   reuses.
-- `plan/todo/0040-outrig-mcp-wire-subcommand.md` -- defines `McpArgs`,
+- `plan/done/phase/0001-bootstrap/tasks/0001-40-outrig-mcp-wire-subcommand.md` -- defines `McpArgs`,
   which gains the same `--env` flag once it lands. (This task can ship
   for `outrig run` first and extend to `outrig mcp` in a follow-on if
   ordering matters.)

@@ -63,9 +63,10 @@ naming both architectures, before anything harder to read goes wrong.
 2. **Diagnose or support -- Open.** The cheap answer is to refuse. The expensive one is to make
    cross-arch sidecars work by embedding a launcher per architecture and selecting at
    materialization time. That doubles the embedded payload (463 KB stripped, per
-   `plan/done/0089-outrig-enter-helper.md`) and requires both musl targets installed to build,
-   which `CONTRIBUTING.md` currently asks for only one of. Refusing first is not a decision
-   against this; it is what makes the failure legible enough to judge whether anyone wants it.
+   `plan/done/phase/0002-sidecars/tasks/0002-12-outrig-enter-helper.md`) and requires both musl
+   targets installed to build, which `CONTRIBUTING.md` currently asks for only one of. Refusing
+   first is not a decision against this; it is what makes the failure legible enough to judge
+   whether anyone wants it.
 
 3. **Whether `--platform` should be passed at all -- Open.** Pinning it on `podman create` would
    make the mismatch impossible rather than merely diagnosed, but it also overrides a

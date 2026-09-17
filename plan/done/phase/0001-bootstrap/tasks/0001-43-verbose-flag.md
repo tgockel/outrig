@@ -1,4 +1,4 @@
-# 0043 -- Wire `--verbose` global flag
+# 0001-43 -- Wire `--verbose` global flag
 
 ## Goal
 
@@ -47,7 +47,7 @@ trace level.
 
 ## Dependencies
 
-- Tasks 0007 (image build) and 0008 (container lifecycle) shape where the
+- Tasks 0001-07 (image build) and 0001-08 (container lifecycle) shape where the
   buildah/podman invocations live. Both are done, so this task is unblocked.
 
 ## Notes

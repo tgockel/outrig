@@ -1,9 +1,9 @@
-# 0092 -- Fix e2e-gated test bit-rot and compile the e2e suite in CI
+# 0002-15 -- Fix e2e-gated test bit-rot and compile the e2e suite in CI
 
 ## Context
 
 `cargo test --features e2e` (and `cargo clippy --all-targets --features e2e`) fail to compile:
-three test-only `ImageConfig { .. }` literals still set a `sidecars` field, but 0088 moved
+three test-only `ImageConfig { .. }` literals still set a `sidecars` field, but 0002-11 moved
 sidecars to the top-level `Config.sidecars`. CI never compiles the `e2e` feature (only `default`
 and `local-llm`), so the rot went unnoticed.
 
@@ -13,15 +13,15 @@ Sites (all `E0560: struct ImageConfig has no field named sidecars`):
 - `crates/outrig/tests/embedded_image.rs:78`
 - `crates/outrig/tests/embedded_image.rs:292`
 
-Discovered while landing 0090, whose own gated e2e (`primary_view_e2e.rs`) compiles fine and is
+Discovered while landing 0002-13, whose own gated e2e (`primary_view_e2e.rs`) compiles fine and is
 runnable in isolation with `cargo test -p outrig-cli --features e2e --test primary_view_e2e`.
-Left out of 0090's commit to keep it scoped; the whole e2e suite only compiles again once these
+Left out of 0002-13's commit to keep it scoped; the whole e2e suite only compiles again once these
 three are fixed.
 
 This task gates more than it first appears. `crates/outrig/tests/library_surface.rs` is
-`required-features = ["e2e"]` (`crates/outrig/Cargo.toml:20-22`), and it is the definition of
-the library facade that 0093-0095 are built to preserve. Until the suite compiles, none of the
-0.2.0 hardening work has an acceptance test it can actually run.
+`required-features = ["e2e"]` (`crates/outrig/Cargo.toml:20-22`), and it is the definition of the
+library facade that 0002-16 through 0002-18 are built to preserve. Until the suite compiles, none of
+the 0.2.0 hardening work has an acceptance test it can actually run.
 
 ## Goal
 
@@ -65,9 +65,9 @@ None.
 
 ## See also
 
-- `plan/done/0088-entrypoint-stdio-args.md` -- the move of sidecars to `Config` that these
-  literals predate.
-- `plan/done/0090-primary-view-sidecars.md` -- where the rot was found.
+- `plan/done/phase/0002-sidecars/tasks/0002-11-entrypoint-stdio-args.md` -- the move of sidecars to
+  `Config` that these literals predate.
+- `plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md` -- where the rot was found.
 
 ## Decisions
 
@@ -86,9 +86,9 @@ batch, which stops once each crate's failing test targets are counted. The full 
 
 **Centralized rather than fixed in place.** Five of the seven were byte-identical build-source
 literals. They now call `common::fixture_build_config()`, added to each crate's existing
-`tests/common/mod.rs`. The trigger is 0094, which marks `ImageConfig` **P0** for
+`tests/common/mod.rs`. The trigger is 0002-17, which marks `ImageConfig` **P0** for
 `#[non_exhaustive]` -- that attribute forbids struct literals from `tests/`, which is external
-to the crate, so all seven sites would break again. Centralizing first leaves 0094 two call
+to the crate, so all seven sites would break again. Centralizing first leaves 0002-17 two call
 sites to touch instead of seven. The one-off image-ref literal at `embedded_image.rs:292`
 (`image_name: Some(tag)`, no dockerfile/context) has a single caller and stays inline; forcing
 it through a parameterized helper would cost more than it saves.

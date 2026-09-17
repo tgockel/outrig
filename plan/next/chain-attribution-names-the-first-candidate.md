@@ -2,10 +2,10 @@
 
 ## Context
 
-`plan/done/0113-model-alias-failover.md` made a session able to span two models: a chain moves
-candidates *inside* a `completion()` call, so a single turn -- even a single reply -- can be
-part one model's work and part another's. Every attribution surface still reports candidate
-one, because that is all it has.
+`plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md` made a session able to span
+two models: a chain moves candidates *inside* a `completion()` call, so a single turn -- even a
+single reply -- can be part one model's work and part another's. Every attribution surface still
+reports candidate one, because that is all it has.
 
 `ResolvedAgent`'s accessors (`llm.rs`, `model_name()` / `provider_name()` /
 `model_identifier()`) all delegate to `primary()`, which is the right call for the ~70
@@ -16,9 +16,9 @@ quietly answers a different question:
 - `ModelLabel::of` (`crates/outrig-cli/src/subagent/mod.rs`) builds the subagent transcript
   header and the tool-result name from `provider_name()` / `model_identifier()`.
 - `plan/next/subagent-model-allowlist.md` wants to audit "the model this subagent ran on",
-  which 0113's Dependencies section already notes is no longer a single value.
+  which 0002-36's Dependencies section already notes is no longer a single value.
 
-0113 mitigated this for the *interactive* user and said so: the banner lists the fallbacks up
+0002-36 mitigated this for the *interactive* user and said so: the banner lists the fallbacks up
 front and a move prints when it happens (its decision 8). Neither reaches a subagent transcript
 read afterwards, which is the surface where "which model wrote this" is actually asked.
 
@@ -46,6 +46,7 @@ mean "what this session is configured for".
 
 ## Dependencies
 
-- **Landed: `plan/done/0113-model-alias-failover.md`.** Its decision 2 introduced the
-  delegating accessors and its decision 8 the mitigations that cover the interactive case only.
+- **Landed: `plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md`.** Its decision 2
+  introduced the delegating accessors and its decision 8 the mitigations that cover the interactive
+  case only.
 - **Soft: `plan/next/subagent-model-allowlist.md`**, which wants the same value for audit.

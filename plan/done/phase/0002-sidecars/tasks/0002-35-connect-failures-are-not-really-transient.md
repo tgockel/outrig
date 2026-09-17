@@ -1,4 +1,4 @@
-# 0112 -- A connect failure is not the same kind of transient as a read timeout
+# 0002-35 -- A connect failure is not the same kind of transient as a read timeout
 
 ## Context
 
@@ -34,7 +34,7 @@ connection has produced a response, the full budget applies for the rest of that
 
 - **`RetryPolicy` carries both bounds.** The existing `budget` field keeps its meaning and its
   name; a second field bounds the pre-first-byte case, defaulting to roughly 30 seconds.
-  **Two distinct names, not one field that means different things depending on state** -- 0113
+  **Two distinct names, not one field that means different things depending on state** -- 0002-36
   reads the short one directly as its "move to the next candidate now" signal, and a field whose
   meaning depends on the caller's context is not a signal anything else can consume.
 - **`send_with_retry` (retry.rs:283) tracks whether any attempt has produced a response**, and
@@ -73,7 +73,7 @@ connection has produced a response, the full budget applies for the rest of that
   budget, not the short one -- the connection produced a response once.
 - Both discard-port fixtures drop `retry_budget_secs: Some(0)` and the suite stays fast.
 - `retry-budget-secs = 0` still performs exactly one attempt, with no wait, on both paths.
-- `RetryPolicy`'s two bounds are named distinctly enough that 0113 can read the short one without
+- `RetryPolicy`'s two bounds are named distinctly enough that 0002-36 can read the short one without
   knowing which request state produced it.
 
 ## Risks
@@ -89,11 +89,11 @@ connection has produced a response, the full budget applies for the rest of that
 
 ## Dependencies
 
-None hard. Post-0.2.0: this touches only `outrig-cli`, whose internals 0093 made private, so no
+None hard. Post-0.2.0: this touches only `outrig-cli`, whose internals 0002-16 made private, so no
 `crates/outrig` public surface moves and no CHANGELOG entry is required.
 
-**0113 depends on this**, and closely: without a short pre-first-byte bound, a failover chain of
-three candidates multiplies the full budget by three against a total outage. See 0113's
+**0002-36 depends on this**, and closely: without a short pre-first-byte bound, a failover chain of
+three candidates multiplies the full budget by three against a total outage. See 0002-36's
 Dependencies.
 
 ## See also
@@ -101,7 +101,8 @@ Dependencies.
 - `crates/outrig-cli/src/llm/retry.rs` -- the module doc's one-budget description (19-34),
   `RetryPolicy` (76), `send_with_retry` (283), `next_delay` (437), `is_transient` (473), and
   `exhausted_transient_label` (502) with the comment that points here.
-- `plan/todo/0113-model-alias-failover.md` -- the consumer of the short bound.
+- `plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md` -- the consumer of the short
+  bound.
 - `plan/next/streaming-path-has-no-http-retry.md` -- the other gap in the same layer, deliberately
   not folded in here.
 
@@ -112,7 +113,7 @@ Dependencies.
   downstream reader, `is_transient` included, sees only the box. So the connect/answered
   question is settled in the `Err(error)` arm *before* the box, and carried forward as a
   `bool`. `is_transient` is unchanged -- it still answers "was this retried", which stays
-  true of a connect failure, and 0112 was never about the classification.
+  true of a connect failure, and 0002-35 was never about the classification.
 
 - **`answered` latches rather than being recomputed per attempt.** The acceptance case of
   a request that connects, takes a `503`, then fails to reconnect requires the *history*
@@ -139,7 +140,7 @@ Dependencies.
   `retry_budget_secs: Some(0)` dropped, its rounds legitimately spent the full 30s connect
   budget before settling, turning a 1.5s test into a 30.3s one. It now sets
   `retry_budget_secs` off locally via a new `test_resolved_without_retries` fixture, which
-  names *why* in the test that measures something other than retry. The two fixtures 0112
+  names *why* in the test that measures something other than retry. The two fixtures 0002-35
   names are unchanged in intent: they run on the shared default and are fast because of the
   connect bound, not because of a crutch. Sibling
   `full_in_flight_tool_tree_shuts_down_within_the_grace` needed nothing -- it already points
@@ -153,7 +154,7 @@ Dependencies.
   The loop both *decides* against the bound and *prints* it, and a rule spelled out twice
   is a rule that can drift. It also closes a gap the field doc invites: a consumer reading
   `connect_budget` raw gets the wrong number whenever `budget` is smaller, so the `min`
-  belongs on the type where 0113 will find it.
+  belongs on the type where 0002-36 will find it.
 
 - **The two loop tests drive `send_with_retry` against a real socket**, because `answered`
   is a local of that loop and `next_delay` cannot see it: every `next_delay` test passes

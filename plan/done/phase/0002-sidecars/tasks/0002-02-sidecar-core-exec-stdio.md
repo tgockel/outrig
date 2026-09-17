@@ -1,4 +1,4 @@
-# 0079 -- Sidecar core + exec-stdio
+# 0002-02 -- Sidecar core + exec-stdio
 
 ## Context
 
@@ -48,7 +48,7 @@ lifecycle coupling, network-policy parity, and label-merge semantics.
 
 ## Dependencies
 
-- **Hard: 0078**. Sidecars must not become usable before network parity exists.
+- **Hard: 0002-01**. Sidecars must not become usable before network parity exists.
 
 ## Decisions
 
@@ -72,7 +72,7 @@ Drafting-level calls made during execution:
 
 - The entrypoint-stdio form (`{ image = "...", env }`, no `command`) parses -- `command`
   became `Option` on `McpServerSpec::Full` -- but validation rejects it with an
-  "arrives in a later release" error (`McpEntrypointStdioUnsupported`); 0080 deletes that
+  "arrives in a later release" error (`McpEntrypointStdioUnsupported`); 0002-03 deletes that
   rule. Parse-level rejection inside the untagged enum would have produced useless errors.
 - Placement keys are repo-config-only: `parse_mcp_table` (runtime label read) and
   `image.toml` parsing reject `sidecar`/`image` in `org.outrig.mcp`. Consequently, label
@@ -80,7 +80,7 @@ Drafting-level calls made during execution:
   (`primary_scoped_mcp`) -- a sidecar entry neither belongs in the primary image's label
   nor invalidates its cache.
 - Library facade: `Outrig::launch` errors on placement-bearing specs and library
-  containers carry no session label until 0081 adds the sidecar API, keeping `clean` from
+  containers carry no session label until 0002-04 adds the sidecar API, keeping `clean` from
   reasoning about containers that have no records by design.
 - `start = "manual"` sidecars are image-ensured and label-merged at session start (their
   servers reserve names in the flat namespace and appear in `show-merged` as
@@ -91,7 +91,7 @@ Drafting-level calls made during execution:
 - A `warn`-sidecar connect failure drops the whole sidecar: its already-connected clients
   shut down, the container stops, remaining servers are skipped. Its interceptor
   attachment is left for teardown's `shutdown` walk (detach against a stopped container
-  is tolerated per 0078).
+  is tolerated per 0002-01).
 - `ContainerWorkspace` gained an `access` field (sidecar `workspace = "ro"`) and
   `ContainerLaunchSpec` a `labels` map; `SessionContainers` declares `sidecars` before
   `primary` so field-order `Drop` mirrors teardown order.

@@ -1,4 +1,4 @@
-# 0046 -- Pick a license
+# 0001-46 -- Pick a license
 
 ## Goal
 
@@ -30,7 +30,7 @@ None. Can run any time.
 
 ## Notes
 
-- Tracked here because task 0034 dropped the README's "implementation in progress"
+- Tracked here because task 0001-34 dropped the README's "implementation in progress"
   disclaimer but explicitly left the License `Incomplete` row alone.
 
 ## Decisions

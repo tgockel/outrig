@@ -13,7 +13,7 @@ RUN pip install --break-system-packages mcp-server-git
 (`crates/outrig-cli/src/cli/design_prompt.rs:250-251`, `:284-285`, and the "Known MCP
 servers" list at `doc/usage/image.md:106-120`.)
 
-That is the shape 0104 removed from this repo's own config: it drags `nodejs`/`npm` or
+That is the shape 0002-27 removed from this repo's own config: it drags `nodejs`/`npm` or
 `python3-pip`/`python3-venv` into an image whose reason to exist is something else, and it
 installs unpinned. A generated image-config therefore starts life with the problem the
 sidecar placement feature exists to solve, while the repo that ships the feature does not.
@@ -30,7 +30,7 @@ image-name = "docker.io/mcp/filesystem:latest"
   fs = { image = "mcp-filesystem", view = "primary", args = ["/workspace"] }
 ```
 
-Points that 0104 settled and this work would inherit:
+Points that 0002-27 settled and this work would inherit:
 
 - A published image is usable directly only when its `ENTRYPOINT` program is an ELF binary.
   `docker.io/mcp/filesystem` qualifies (`node`); `docker.io/mcp/git` does not -- its
@@ -64,4 +64,4 @@ the grounds that its interpreter line would resolve inside the target namespace 
 dynamic path already solves that exact problem for `PT_INTERP` by naming the loader as
 `{graft}{interp}`. Teaching the launcher to read a shebang and graft-prefix it the same way
 would make `docker.io/mcp/git` usable unmodified, and would delete one of the two Dockerfiles
-0104 had to write. Worth costing before this task designs around the restriction.
+0002-27 had to write. Worth costing before this task designs around the restriction.

@@ -1,4 +1,4 @@
-# 0107 -- A working directory for `exec_stdio` and `exec_capture`
+# 0002-30 -- A working directory for `exec_stdio` and `exec_capture`
 
 ## Context
 
@@ -46,10 +46,10 @@ Let a caller set the working directory for an exec without wrapping the command 
 ## Deliverables
 
 - **The flag.** `build_exec_argv` emits `--workdir <path>` when a directory is supplied.
-- **The surface.** Both `Outrig` methods and both `Container` methods take the directory.
-  0095 established `ContainerCreateOptions` for exactly this kind of growth
-  (`plan/done/0095-options-structs-and-sealing.md`); prefer an options struct over a fifth
-  positional parameter, and prefer it over two more method variants.
+- **The surface.** Both `Outrig` methods and both `Container` methods take the directory. 0002-18
+  established `ContainerCreateOptions` for exactly this kind of growth
+  (`plan/done/phase/0002-sidecars/tasks/0002-18-options-structs-and-sealing.md`); prefer an options
+  struct over a fifth positional parameter, and prefer it over two more method variants.
 - **Absent means unchanged.** Omitting the directory keeps today's behavior -- the image's
   `WORKDIR` -- so every existing caller is unaffected.
 - **A missing directory is podman's error to report**, surfaced with the path in it rather than
@@ -76,7 +76,7 @@ prototype should confirm), or **Open** (deferred).
 
 1. **Options struct versus a parameter -- Recommended: an options struct.** `exec_*` has two
    parameters today and this is the second thing wanting to join them; a third and fourth
-   (a timeout, a tty flag) are foreseeable. 0095 already set the precedent and the
+   (a timeout, a tty flag) are foreseeable. 0002-18 already set the precedent and the
    `#[non_exhaustive]` sweep makes a struct additive. Confirm the ergonomics do not become
    worse than the two-parameter call for the common case of neither.
 
@@ -125,7 +125,7 @@ prototype should confirm), or **Open** (deferred).
 
    The cost is real: `public-api.txt` carries the type twice, so a future field edits two blocks.
 
-6. **`with_workdir` takes `impl Into<PathBuf>`, not `Option<PathBuf>`.** 0095 decision 9 chose
+6. **`with_workdir` takes `impl Into<PathBuf>`, not `Option<PathBuf>`.** 0002-18 decision 9 chose
    `Option` for `with_transcript` because every producer already held one; that is not true here,
    where callers hold a literal path.
 
@@ -173,7 +173,7 @@ prototype should confirm), or **Open** (deferred).
     exemption, so such a container may skip the runtime user bootstrap entirely. Stating the
     guarantee unconditionally would have had an operator assume mapped ids that server never
     receives. The section now names the exception, and the exception to it -- a `view = "primary"`
-    sidecar, whose launcher takes the session's ids explicitly and drops to them (0102).
+    sidecar, whose launcher takes the session's ids explicitly and drops to them (0002-25).
 
 13. **`public-api.txt` keeps its `std::io` renderings.** Regenerating against cargo-public-api
    0.52.0 also produced `std::io` -> `core::io` churn on eight unrelated lines, the drift

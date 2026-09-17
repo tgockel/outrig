@@ -2,7 +2,7 @@
 
 ## Context
 
-0093 made `outrig-cli`'s module tree crate-private behind an `internal-test-api` feature, which
+0002-16 made `outrig-cli`'s module tree crate-private behind an `internal-test-api` feature, which
 the integration tests enable through a dev-dependency on the crate itself. That closed the
 published surface, but it preserved the reason the tree was public in the first place rather than
 removing it.
@@ -36,8 +36,8 @@ than by what a separate test crate must reach.
 
 ## Notes
 
-Deliberately not folded into 0093: it is a ~4k-line test move with no bearing on what `0.2.0`
+Deliberately not folded into 0002-16: it is a ~4k-line test move with no bearing on what `0.2.0`
 freezes, and it should not gate a release. Nothing about it is urgent -- the boundary is already
 correct; this makes it cheaper.
 
-Related: `plan/done/0093-shrink-reachable-surface.md`.
+Related: `plan/done/phase/0002-sidecars/tasks/0002-16-shrink-reachable-surface.md`.

@@ -1,6 +1,6 @@
 # `style = "mistralrs"` accepts any key at all
 
-> **Queued as part of `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md`.** That task
+> **Queued as part of `plan/todo/0002-46-deprecated-local-llm-behavior-for-0.2.0.md`.** That task
 > makes the decision this entry is blocked on -- whether `style = "mistralrs"` keeps parsing in
 > 0.2.0 -- and executes this fix if it does. The analysis below is why; do not duplicate it there.
 
@@ -31,7 +31,7 @@ style          = "mistralrs"
 not-a-real-key = 1        # accepted, discarded
 ```
 
-Found while writing the `request-timeout-secs` range check (0106). That task
+Found while writing the `request-timeout-secs` range check (0002-29). That task
 rejects `request-timeout-secs = 0` on every remote provider, because reqwest
 reads `Duration::ZERO` as an immediate timeout. The identical line under
 `style = "mistralrs"` parses clean and validates clean -- not because `0` is
@@ -44,7 +44,7 @@ load-bearing everywhere else in this schema -- `doc/reference/config.md` opens
 by promising "Unknown keys are an error" -- so this is the one place the promise
 does not hold.
 
-0111 raised the stakes and corrected the record. Removing
+0002-34 raised the stakes and corrected the record. Removing
 `LlmProvider::with_retry_budget_secs` closed the Rust-side way to hand a retry
 budget to `Mistralrs` -- the options types are parameters to the two remote
 constructors, and a unit variant has no constructor to pass them to -- so this
@@ -52,7 +52,7 @@ is now the *only* surviving way to aim a remote-only setting at the in-process
 provider and have it vanish. The test that builder carried asserted the opposite
 in a comment: "the TOML path cannot express this at all -- `deny_unknown_fields`
 on the tagged enum rejects `retry-budget-secs` under `style = "mistralrs"`".
-Measured while landing 0111, `retry-budget-secs`, `request-timeout-secs`,
+Measured while landing 0002-34, `retry-budget-secs`, `request-timeout-secs`,
 `base-url`, and a pure typo are all accepted and discarded, while the same typo
 on an `openai` provider is a parse error. The comment is gone with the builder;
 the claim was wrong, and the reason to fix this is one path stronger than when

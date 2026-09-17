@@ -1,4 +1,4 @@
-# 0070 -- `outrig image init` for standalone image projects
+# 0001-70 -- `outrig image init` for standalone image projects
 
 ## Context
 
@@ -50,7 +50,7 @@ project with a Dockerfile, embedded `image.toml`, and a README.
 
 ## Dependencies
 
-- **Hard: 0069**. The scaffold writes the canonical standalone `image.toml`
+- **Hard: 0001-69**. The scaffold writes the canonical standalone `image.toml`
   shape and embeds it at `/etc/outrig/image.toml`.
 
 ## Decisions
@@ -80,5 +80,5 @@ project with a Dockerfile, embedded `image.toml`, and a README.
   `mod` to `pub(crate) mod` so init's in-crate unit tests call the real
   `validate_image_toml` / `validate_dockerfile` without widening the public API.
 - **The `outrig image build` forward reference is kept** in the generated README
-  and the stderr next-step hint: 0071 is the committed next task and its
+  and the stderr next-step hint: 0001-71 is the committed next task and its
   acceptance builds exactly this scaffold.

@@ -1,4 +1,4 @@
-# 0042 -- Curated `outrig::*` library API
+# 0001-42 -- Curated `outrig::*` library API
 
 ## Goal
 
@@ -55,7 +55,7 @@ pub fn load_project(dir: &Path, global: Option<&Path>) -> Result<(Config, PathBu
 #[cfg(feature = "internal")] pub mod llm;
 #[cfg(feature = "internal")] pub mod repl;
 #[cfg(feature = "internal")] pub mod rig_tool;
-#[cfg(feature = "internal")] pub mod tool_name;   // per 0037
+#[cfg(feature = "internal")] pub mod tool_name;   // per 0001-37
 ```
 
 (The new module is named `outrig_` internally to avoid the `mod outrig` /
@@ -188,7 +188,7 @@ the curated surface keeps working when `repo::*` goes private.
 - `src/mcp.rs` -- `McpClient` becomes `pub(crate)`; `McpTool` and
   `McpToolResult` stay public via re-export from `lib.rs`.
 - `src/image.rs` -- `ImageTag`, `ensure_image`, `CacheKey` become `pub(crate)`.
-- `src/tool_name.rs` (per 0037) -- decide whether it stays `pub` (for callers
+- `src/tool_name.rs` (per 0001-37) -- decide whether it stays `pub` (for callers
   who want to namespace upstream tool names themselves) or `pub(crate)`. Lean
   toward `pub` so the re-implementation isn't required by external users.
 
@@ -313,6 +313,6 @@ None.
   are imported only by `cli/run.rs` and `bin/outrig.rs`; the centerpiece path
   (`container`, `mcp`, `image`, `process`, `repo`) has zero dependency on the
   LLM-side modules. That's why deps = none.
-- Lands after the `outrig-mcp` phases (0035-0041) so the new `mcp_proxy` /
+- Lands after the `outrig-mcp` phases (0001-35 through 0001-41) so the new `mcp_proxy` /
   `cli/mcp` modules are part of the public-vs-private decision. Soft
   preference, not a formal dep.

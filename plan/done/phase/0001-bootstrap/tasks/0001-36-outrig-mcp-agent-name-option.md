@@ -1,4 +1,4 @@
-# 0036 -- Refactor: `Session::agent_name` -> `Option<String>`
+# 0001-36 -- Refactor: `Session::agent_name` -> `Option<String>`
 
 ## Goal
 
@@ -43,7 +43,7 @@ None.
 
 ## Notes
 
-- Independent of 0035 -- they touch different modules and can interleave. Numbered in
+- Independent of 0001-35 -- they touch different modules and can interleave. Numbered in
   this order purely because the master spec listed them sequentially.
 - Display formatting policy ("-" placeholder for `None`) is the recommended default;
   the task author may pick a different placeholder if it reads better in

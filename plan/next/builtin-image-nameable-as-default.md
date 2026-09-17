@@ -14,9 +14,9 @@ default-image = "outrig-default"    # error: does not match any [images.<name>]
 `outrig-cli` *after* load (`crates/outrig-cli/src/builtin_image::inject`). Validation
 therefore runs against a map that does not yet contain the name.
 
-Injecting earlier is not the fix. `Config::load*` is supported public API of the `outrig`
-crate, and an embedder calling it must get their file's contents, not the CLI's product
-opinion -- that is the reasoning `plan/done/0093-shrink-reachable-surface.md` established and
+Injecting earlier is not the fix. `Config::load*` is supported public API of the `outrig` crate, and
+an embedder calling it must get their file's contents, not the CLI's product opinion -- that is the
+reasoning `plan/done/phase/0002-sidecars/tasks/0002-16-shrink-reachable-surface.md` established and
 the built-in default work followed.
 
 ## Why it is only a wart today
@@ -54,4 +54,5 @@ the same shape and the same surprise.
 
 - `crates/outrig-cli/src/builtin_image/mod.rs` -- `RESERVED_IMAGES`, and `inject`'s placement
   in the call order.
-- `plan/done/0093-shrink-reachable-surface.md` -- why the injection is CLI-side.
+- `plan/done/phase/0002-sidecars/tasks/0002-16-shrink-reachable-surface.md` -- why the injection is
+  CLI-side.

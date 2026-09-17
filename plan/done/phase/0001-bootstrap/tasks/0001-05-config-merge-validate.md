@@ -1,4 +1,4 @@
-# 0005 -- Config merge and validate
+# 0001-05 -- Config merge and validate
 
 ## Goal
 
@@ -49,9 +49,9 @@ documented in `doc/reference/config.md`'s "Validation rules" section.
 
 ## Dependencies
 
-- 0002-repo-and-config-paths
-- 0003-config-schema
-- 0004-api-key-syntax
+- 0001-02-repo-and-config-paths
+- 0001-03-config-schema
+- 0001-04-api-key-syntax
 
 ## Notes
 
@@ -99,7 +99,7 @@ documented in `doc/reference/config.md`'s "Validation rules" section.
 - **`mcp_server_name_re()` is its own `OnceLock<Regex>` in `validate.rs`.** Mirrors
   the `api_key.rs` pattern rather than introducing a shared `regex.rs` helper module
   for two unrelated regexes (different anchored patterns, different validation domains).
-- **No shared `tests/common/` helper module.** Continues task 0003's decision:
+- **No shared `tests/common/` helper module.** Continues task 0001-03's decision:
   `tests/config_merge.rs` keeps its own `parse()` and `write_repo_cfg()`. Cross-file
   test deduplication is premature -- there are still only three integration test files,
   and their setup needs (tempdir vs inline TOML) diverge.

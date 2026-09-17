@@ -1,9 +1,9 @@
-# 0084 -- REPL slash-command dispatcher
+# 0002-07 -- REPL slash-command dispatcher
 
 ## Goal
 
 `Repl::run`/`run_with` carry one typed callback pair per slash command (`on_tools`,
-`on_reset`, `on_sidecar` since 0081). Adding `/sidecar` grew the generic signature by two
+`on_reset`, `on_sidecar` since 0002-04). Adding `/sidecar` grew the generic signature by two
 type params and touched every `run_with` call site in `tests/repl_io.rs`. Fold the
 per-command callbacks into a single caller-supplied dispatcher so adding a command no
 longer grows the signature.
@@ -14,7 +14,7 @@ longer grows the signature.
   with `None` meaning "unknown command" -- keeping only `/help` and `/quit` built in.
 - `HELP_TEXT`'s command lines move out of the transport layer, so one file owns each
   command's name, help line, and semantics.
-- Related altitude notes from the 0081 review, worth folding into the same pass if it
+- Related altitude notes from the 0002-04 review, worth folding into the same pass if it
   happens nearby:
   - An `llm::RebuildingAgent` wrapper (owns adapters + dirty flag + rebuild recipe,
     exposes `extend_tools` / `run_turn`) would replace the `Rc<RefCell<Rc<RigAgent>>>` +
@@ -32,11 +32,11 @@ longer grows the signature.
 
 ## Dependencies
 
-None (follows up on completed task 0081).
+None (follows up on completed task 0002-04).
 
 ## Decisions
 
-1. **Scope includes both 0081 altitude notes** (user-confirmed): `llm::RebuildingAgent` and
+1. **Scope includes both 0002-04 altitude notes** (user-confirmed): `llm::RebuildingAgent` and
    `SessionRuntime` land in this pass alongside the dispatcher.
 2. The dispatcher takes owned `(String, Vec<String>)` and returns `Option<String>` (`None` =
    unknown command). Owned params dodge the async-closure HRTB wall a borrowed `&str` would

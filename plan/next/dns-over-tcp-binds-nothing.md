@@ -6,7 +6,7 @@ resolves over TCP/53 -- a stub resolver falling back after a truncated answer, o
 configured for `use-vc` -- therefore gets answers the interceptor forwards as opaque bytes and
 never parses, so no name binding is created for them.
 
-Since 0114 that matters: a hostname `allow` entry grants only against a bound address, so a
+Since 0002-37 that matters: a hostname `allow` entry grants only against a bound address, so a
 container whose resolution went over TCP is not covered by its own allowlist.
 
 The shape is mostly benign today. Under `default = "deny"` the TCP/53 connection to the

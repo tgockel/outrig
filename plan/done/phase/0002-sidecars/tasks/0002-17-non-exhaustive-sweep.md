@@ -1,4 +1,4 @@
-# 0094 -- `#[non_exhaustive]` sweep on what stays public
+# 0002-17 -- `#[non_exhaustive]` sweep on what stays public
 
 ## Context
 
@@ -8,13 +8,13 @@ field to any of them, or a variant to any public enum, is a breaking change. The
 `0.2.0-rc.1 -> Unreleased` CHANGELOG already lists four breaks of exactly this class, so this is
 not a hypothetical growth axis -- it is the one the project is already on.
 
-0093 answers *which* types stay public. This task insulates them. See 0093's Context for the
+0002-16 answers *which* types stay public. This task insulates them. See 0002-16's Context for the
 reachability tiers and the two visibility consequences; they are not repeated here.
 
-**The row lists below are conditional on 0093's outcome.** If 0093 demotes `container`,
+**The row lists below are conditional on 0002-16's outcome.** If 0002-16 demotes `container`,
 `mcp_proxy`, `network`, or `image`, the corresponding rows disappear rather than needing an
 attribute -- that is the point of ordering the two tasks this way. Work from the surface diff
-0093 captures, not from these tables alone.
+0002-16 captures, not from these tables alone.
 
 ## Goal
 
@@ -40,10 +40,10 @@ the `Full` **variant**. The changelog proves it grows, and every downstream `mat
 
 **P0 -- `enum LlmProvider`** (`config/mod.rs:262`). Consumers `match`; an internally-tagged serde
 enum with an obvious growth axis. Fix: `#[non_exhaustive]` on the enum and on the `OpenAi`
-variant. A new provider variant is a break today, and 0097 adds exactly one.
+variant. A new provider variant is a break today, and 0002-20 adds exactly one.
 
 **P0 -- `struct ImageConfig`** (`config/mod.rs:896`). Public fields; consumers both build and
-read it. Fix: `#[non_exhaustive]`. New image knobs are frequent, and 0096 adds a `#[serde(skip)]`
+read it. Fix: `#[non_exhaustive]`. New image knobs are frequent, and 0002-19 adds a `#[serde(skip)]`
 source field.
 
 **P0 -- `struct SidecarConfig`** (`config/mod.rs:921`). Public fields; **just grew `args`**, a
@@ -61,7 +61,7 @@ hand-written `Default` already exists so internal construction is unaffected.
 `context_length`. Fix: `#[non_exhaustive]`. Same append pattern.
 
 **P1 -- `struct Agent`** (`config/mod.rs:359`). Public fields; grew `subagents` and
-`subagent_depth_max`. Fix: `#[non_exhaustive]`. 0099 adds `subagent_width_max` next.
+`subagent_depth_max`. Fix: `#[non_exhaustive]`. 0002-22 adds `subagent_width_max` next.
 
 **P1 -- the small config enums**: `NetworkMode` (430), `NetworkAction` (462),
 `CapabilityProfile` (868), `SidecarWorkspaceAccess` (952), `SidecarView` (977),
@@ -134,7 +134,7 @@ that naturally accretes fields, and return-only, so friction is minimal.
 `OutrigError::ConfigValidation`; consumers `match`. **Variants gained and lost fields this
 cycle** -- `SidecarNameInvalid` lost `image`. Fix: `#[non_exhaustive]` on the enum and on
 field-bearing variants. The changelog *just* changed this enum's variant fields, which is direct
-proof it churns, and 0096 changes `DockerfileMissing` / `ContextMissing` next.
+proof it churns, and 0002-19 changes `DockerfileMissing` / `ContextMissing` next.
 
 **P1 -- `enum MountRuleViolation`** (`config/validate.rs:891`). Reachable via
 `ConfigValidationError`. Fix: `#[non_exhaustive]`. Same class.
@@ -147,7 +147,7 @@ plausible.
 
 **P1 -- `EmbeddedImageConfigError` / `StandaloneImageTomlError`**
 (`container/embedded.rs:98/129`). Reachable via `OutrigError::EmbeddedImageConfigParse`. Fix:
-`#[non_exhaustive]` -- unless 0093 de-publishes `container::embedded`, in which case skip.
+`#[non_exhaustive]` -- unless 0002-16 de-publishes `container::embedded`, in which case skip.
 
 **P2 -- `struct MistralrsDeviceParseError`** (`config/mod.rs:312`). A reachable unit struct. Fix:
 `#[non_exhaustive]`, which gives it a private field. Trivial, low value.
@@ -171,25 +171,25 @@ value types.
 
 **P1 -- `sidecar::SessionMcpPlan` (102), `PlacedServer` (49), `SidecarPlan` (58),
 `enum Placement` (31)**, all in `container/sidecar.rs`. Fix: `#[non_exhaustive]`, **only if**
-0093 kept them public. These are pure planning internals and were most likely never meant to be
+0002-16 kept them public. These are pure planning internals and were most likely never meant to be
 a contract.
 
 **P1 -- `embedded::McpServerSpecWithSource` (52), `StandaloneImage*` (69/75),
 `enum McpDeclarationSource` (83)**, in `container/embedded.rs`. Public fields plus a `match`.
-Preferred fix is de-publication in 0093 -- the e2e test only needs `embedded::LABEL_MCP`, so the
+Preferred fix is de-publication in 0002-16 -- the e2e test only needs `embedded::LABEL_MCP`, so the
 structs need not be public at all. `#[non_exhaustive]` only as the fallback if they stay.
 
 **P2 -- the free functions re-exported from `lib.rs`**: `sanitize_tool_name`, `RESERVED_SERVER`,
 `resolve_mcp_env`, `load_project`. Signatures are stable-ish, so **leave as-is** -- but watch for
 positional-param creep. `resolve_mcp_env` and `load_project` are the two to watch; if either
 grows past its current arity, give it an options struct rather than another parameter, following
-0095's pattern.
+0002-18's pattern.
 
 All `container::*` rows here are contingent on 0093. If that task demotes the module, delete them.
 
-If 0093 chose `#[doc(hidden)]` over a cfg boundary for `outrig-cli`, its `CliError`,
+If 0002-16 chose `#[doc(hidden)]` over a cfg boundary for `outrig-cli`, its `CliError`,
 `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`, `MistralrsWeights`, and `RigAgent` remain
-nameable and should get `#[non_exhaustive]` as a fallback. If 0093 gated them behind a feature,
+nameable and should get `#[non_exhaustive]` as a fallback. If 0002-16 gated them behind a feature,
 skip them -- they are no longer a commitment.
 
 ## Already well-protected -- do NOT touch
@@ -207,7 +207,7 @@ as much as the tables above, because the failure mode of a sweep is over-applica
   methods. Adding internal state is already non-breaking. Leave as-is; just keep the field private.
 - **`Container`** (`container/mod.rs:118`) is opaque -- every field private, all access via
   methods. The struct is safe. The hazards around it are the `pub`-field spec types it consumes
-  and the `create_initialized` param list, which are 0095's problem, not `Container` itself.
+  and the `create_initialized` param list, which are 0002-18's problem, not `Container` itself.
 - **`NetworkInterceptor`** (`network.rs:211`) -- opaque, private fields. Safe.
 - **`ApiKeyRef(String)`** (`config/api_key.rs:31`) -- the tuple field is **private**
   (`pub struct ApiKeyRef(String)`, not `pub String`). Correctly sealed. Note the contrast with
@@ -272,25 +272,26 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
 - `crates/outrig/tests/library_surface.rs` compiles and passes. If a type it constructs as a
   literal was annotated, the test uses the new constructor -- and that constructor is part of this
   task's deliverable, not a follow-up.
-- Every P0 row is either annotated or recorded as deleted because 0093 de-published it.
+- Every P0 row is either annotated or recorded as deleted because 0002-16 de-published it.
 - No item on the do-not-touch list was modified.
-- A surface diff against 0093's captured baseline shows only added attributes and any new
+- A surface diff against 0002-16's captured baseline shows only added attributes and any new
   constructors -- no unintended reachability change.
 
 ## Dependencies
 
-- **0093.** Its outcome determines which rows above still exist. Annotating a type that 0093 then
+- **0093.** Its outcome determines which rows above still exist. Annotating a type that 0002-16 then
   de-publishes is wasted work, and the `container::*` and `outrig-cli` rows are explicitly
   conditional on it.
 
 ## See also
 
-- `plan/todo/0093-shrink-reachable-surface.md` -- the reachability tiers this task's Context
-  refers to, and the surface baseline it works from.
-- `plan/todo/0095-options-structs-and-sealing.md` -- the breaking changes that need replacement
-  APIs rather than an attribute.
-- `plan/todo/0096-config-path-provenance.md`, `plan/todo/0097-anthropic-native-api.md` -- the two
-  queued features whose changes become additive once this sweep lands.
+- `plan/done/phase/0002-sidecars/tasks/0002-16-shrink-reachable-surface.md` -- the reachability
+  tiers this task's Context refers to, and the surface baseline it works from.
+- `plan/done/phase/0002-sidecars/tasks/0002-18-options-structs-and-sealing.md` -- the breaking
+  changes that need replacement APIs rather than an attribute.
+- `plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md`,
+  `plan/done/phase/0002-sidecars/tasks/0002-21-anthropic-native-api.md` -- the two queued features
+  whose changes become additive once this sweep lands.
 
 ## Decisions
 
@@ -311,7 +312,7 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
 2. **Scope: the full P0+P1+P2 table.** Anything left exhaustive is a commitment for the whole
    `0.2.x` line, and the attribute is free inside the crate. 62 types and 17 variants.
 
-3. **`outrig-cli`'s rows were dropped, and no `container::*` row was.** 0093 kept all six
+3. **`outrig-cli`'s rows were dropped, and no `container::*` row was.** 0002-16 kept all six
    `pub mod`s, so every `container::*` row survived; it gated `outrig-cli`'s module tree behind
    `internal-test-api`, so `CliError`, `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`,
    `MistralrsWeights`, and `RigAgent` are no longer nameable and need nothing.
@@ -326,7 +327,7 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
 5. **Variant-level sealing is targeted, not uniform.** Every public enum is sealed; variants are
    sealed only where a field addition is proven or scheduled: `McpServerSpec::Full`,
    `LlmProvider::OpenAi`, `ImageSourceRef`'s two, all 11 field-bearing `OutrigError` variants,
-   and `ConfigValidationError::{DockerfileMissing, ContextMissing}` -- the two 0096 reshapes.
+   and `ConfigValidationError::{DockerfileMissing, ContextMissing}` -- the two 0002-19 reshapes.
    The other ~60 `ConfigValidationError` variants stay plain: the enum *is* the validation
    documentation, and 60 more attributes would bury it. The asymmetry is deliberate and is the
    one place this sweep accepts a future break rather than paying for insulation.
@@ -364,7 +365,7 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
    `Placement` logs a warning -- because the caller's `None` already means "sidecar was
    skipped", and an unhostable server must not disappear into that. Only `config_init`'s
    provider match has a real fallback: it was inverted so the *remote* case is the default arm,
-   which means 0097's Anthropic variant gets a working `outrig init` prompt for free.
+   which means 0002-20's Anthropic variant gets a working `outrig init` prompt for free.
 
 10. **Three matches were deleted rather than given an arm.** Where the CLI hand-matched a type
     the library owns, the answer belonged on the type: `SidecarView::as_str` (the wire name),
@@ -386,12 +387,12 @@ Applying `#[non_exhaustive]` is not free in this codebase. These are the concret
 
 13. **Not done, deliberately.** `ContainerLaunchSpec` still takes `default()` plus field
     assignment at both CLI sites rather than gaining a `launch_base` / `apply_security` helper:
-    0095 replaces its construction wholesale with an options struct, so a second construction
+    0002-18 replaces its construction wholesale with an options struct, so a second construction
     path now is churn. `spec_to_toml_value` also stays hand-rolled rather than delegating to the
     derived `Serialize`; that would be less code but changes a serialization path with
     round-trip tests, for no benefit this task needs.
 
-14. **Evidence.** The surface diff against 0093's baseline is exactly 86 items re-emitted with
+14. **Evidence.** The surface diff against 0002-16's baseline is exactly 86 items re-emitted with
     the attribute plus 47 new constructors and accessors -- no removals, no signature changes.
     `library_surface.rs` compiles through the new constructors and passes 9/9 against real
     podman, as do `container_lifecycle`, `container_security`, and `embedded_image`, whose

@@ -1,4 +1,4 @@
-# 0068 -- README and quickstart crate-name signposting
+# 0001-68 -- README and quickstart crate-name signposting
 
 ## Context
 
@@ -32,8 +32,8 @@ which crate to install (or depend on) for which use case.
 
 ## Dependencies
 
-- Soft on 0066 (so the README describes the final post-tidy-up shape
-  of both crates) and on 0067 (so `--features local-llm` is the
+- Soft on 0001-66 (so the README describes the final post-tidy-up shape
+  of both crates) and on 0001-67 (so `--features local-llm` is the
   spelling that ships in the install snippet).
 
 ## Decisions

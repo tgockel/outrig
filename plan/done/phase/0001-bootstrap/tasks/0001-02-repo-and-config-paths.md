@@ -1,4 +1,4 @@
-# 0002 -- Repo and config paths
+# 0001-02 -- Repo and config paths
 
 ## Goal
 
@@ -34,7 +34,7 @@ on these helpers.
 
 ## Dependencies
 
-- 0001-cargo-skeleton
+- 0001-01-cargo-skeleton
 
 ## Notes
 
@@ -63,7 +63,7 @@ on these helpers.
   Centralizes the `eprintln!("error: {e}")` call in one place.
 - **Override paths are taken verbatim.** `resolve_repo_config(Some(p), _)` does
   not check existence, canonicalize, or validate the filename. Validation is
-  task 0005's territory; resolution stays pure.
+  task 0001-05's territory; resolution stays pure.
 - **`OutrigError::Io` formats as `"{0}"`, not `"io error: {0}"`.** `main` adds the
   `"error: "` prefix; doubling it (e.g. `"error: io error: ..."`) provides no extra
   context since `std::io::Error` already self-describes ("No such file or

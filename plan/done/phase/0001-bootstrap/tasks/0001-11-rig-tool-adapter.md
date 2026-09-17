@@ -1,4 +1,4 @@
-# 0011 -- Rig tool adapter
+# 0001-11 -- Rig tool adapter
 
 ## Goal
 
@@ -40,7 +40,7 @@ outrig's job is the adapter glue + name sanitization.
   - Call `<McpToolAdapter as ToolDyn>::call(adapter, args_json_string).await` directly.
   - Verify the tool call landed inside the container (file read returns expected content).
   - Cover the error path (missing file -> `ToolError::ToolCallError`).
-  - **Why no `Agent`:** the LLM stack lands in tasks 0012-0016. `ToolDyn::call`
+  - **Why no `Agent`:** the LLM stack lands in tasks 0001-12 through 0001-16. `ToolDyn::call`
     is the same code path an `Agent` invokes, just without the LLM in front of it.
     An Agent-shaped test belongs in 0019.
 
@@ -52,11 +52,11 @@ outrig's job is the adapter glue + name sanitization.
 
 ## Dependencies
 
-- 0010-mcp-client
+- 0001-10-mcp-client
 
 ## Notes
 
-- rig-core is also a moving target. Same advice as 0010: implementer verifies the trait name
+- rig-core is also a moving target. Same advice as 0001-10: implementer verifies the trait name
   + signature against the locked version; isolate breakage inside `rig_tool.rs`.
 - The 64-char limit comes from OpenAI's tool-name regex constraints; other providers may be
   more liberal but the limit is a safe lowest common denominator.
@@ -66,10 +66,10 @@ outrig's job is the adapter glue + name sanitization.
 ## Decisions
 
 - **E2E test exercises `ToolDyn::call` directly, not an `Agent`.** The LLM
-  provider stack doesn't exist yet (tasks 0012-0016); spinning up a real
+  provider stack doesn't exist yet (tasks 0001-12 through 0001-16); spinning up a real
   `Agent` would need a mock provider invented just for this test. Calling
   `ToolDyn::call(adapter, args_string).await` runs every line of the dispatch
-  path an `Agent` would. The Agent-shaped variant belongs in 0019 once the
+  path an `Agent` would. The Agent-shaped variant belongs in 0001-19 once the
   loop infrastructure exists. Confirmed with the user before execution.
 - **Truncation hash is over the pre-sanitization `<server>__<tool>`.** Two
   originals that map to the same sanitized prefix (e.g. one with `/` in the
@@ -78,7 +78,7 @@ outrig's job is the adapter glue + name sanitization.
 - **`ToolRegistry` facade skipped.** `Vec<McpToolAdapter>` is enough for the
   caller (`AgentBuilder::dynamic_tools` accepts a list of dyn-tools), and the
   notes-section only flagged it as "may be useful." Adding the facade now
-  would be premature; if 0019 finds it useful, it lands then.
+  would be premature; if 0001-19 finds it useful, it lands then.
 - **`McpAdapterError(String)` is the bridge type into `ToolError`.** The
   natural shape -- `ToolError::ToolCallError(Box::new(self_err))` -- needs a
   `'static` `std::error::Error`. We can't directly box `OutrigError` because

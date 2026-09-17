@@ -1,13 +1,14 @@
-# 0064 -- Network interceptor MITM
+# Network interceptor MITM
 
-> **Not `plan/done/0114-hostname-rules-need-a-bound-destination.md`.** 0114 fixed a policy
-> bypass: a client-supplied `Host`/SNI could authorize an unrelated destination IP. It needed
+> **Not `plan/done/phase/0002-sidecars/tasks/0002-37-hostname-rules-need-a-bound-destination.md`.**
+> 0002-37 fixed a policy bypass: a client-supplied `Host`/SNI could authorize an unrelated
+> destination IP. It needed
 > no TLS termination and does not overlap this entry, which is the opt-in MITM work that makes
 > URLs and bodies visible to policy. This entry stays post-v0.
 
 ## Context
 
-Tasks 0059 and 0060 give outrig audited and enforceable host:port egress policy.
+Tasks 0001-59 and 0001-60 give outrig audited and enforceable host:port egress policy.
 They cannot see HTTPS URLs, methods, statuses, or bodies because TLS remains
 opaque. This final phase adds opt-in MITM TLS so policy and audit can apply at
 the URL/body level.
@@ -51,7 +52,7 @@ records may also include capped `request_body` and `response_body` fields.
 
 ## Acceptance
 
-- MITM mode is opt-in and leaves 0060 behavior unchanged when disabled.
+- MITM mode is opt-in and leaves 0001-60 behavior unchanged when disabled.
 - A session with MITM enabled can make HTTPS requests from inside the container
   without certificate validation failures for common system tools.
 - URL-aware allow/deny rules apply to HTTPS requests after TLS termination.
@@ -62,11 +63,13 @@ records may also include capped `request_body` and `response_body` fields.
 
 ## Dependencies
 
-- **Hard: 0060**. MITM builds on the host:port enforcement path and extends its
+- **Hard: 0001-60**. MITM builds on the host:port enforcement path and extends its
   rule matcher and audit record shape.
 
 ## See also
 
-- `0059-network-interceptor-plumbing.md` -- traffic capture and audit logging.
-- `0060-network-interceptor-enforcement.md` -- host:port policy enforcement.
+- `plan/done/phase/0001-bootstrap/tasks/0001-59-network-interceptor-plumbing.md` -- traffic capture
+  and audit logging.
+- `plan/done/phase/0001-bootstrap/tasks/0001-60-network-interceptor-enforcement.md` -- host:port
+  policy enforcement.
 - `doc/concepts/workspace.md` -- existing workspace/network concept page.

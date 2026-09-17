@@ -1,4 +1,4 @@
-# 0001 -- Cargo skeleton
+# 0001-01 -- Cargo skeleton
 
 ## Goal
 

@@ -1,4 +1,4 @@
-# 0110 -- Model aliases: one name for a model, or for an ordered set of equivalents
+# 0002-33 -- Model aliases: one name for a model, or for an ordered set of equivalents
 
 ## Context
 
@@ -84,10 +84,10 @@ between.
 - **`crates/outrig/CHANGELOG.md` and `crates/outrig/public-api.txt`**, the latter regenerated
   deliberately.
 - **Not in the first pass**: the runtime half. Specified under Runtime behavior because the config
-  surface has to be designed for it, but it is separable and much larger -- see Design forks §2.
-  It is now queued as `plan/todo/0113-model-alias-failover.md`, which executes that specification;
-  this entry stays its authority on the config surface and on the two loose ends it hands over
-  (Design forks §4 and the `warn_fallback_ceiling` risk).
+  surface has to be designed for it, but it is separable and much larger -- see Design forks §2. It
+  is now queued as `plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md`, which
+  executes that specification; this entry stays its authority on the config surface and on the two
+  loose ends it hands over (Design forks §4 and the `warn_fallback_ceiling` risk).
 
 ## Config surface
 
@@ -195,15 +195,15 @@ provider-shape rows only. The second pass is the current loop with its lookup fe
 
 ### Flattening
 
-An alias resolves to an ordered list of concrete model names by depth-first walk, splicing a
-nested alias's targets in at its position and keeping the first occurrence of a repeated name.
-`alias = ["smart", "haiku-5"]` above flattens to
-`[opus-5-bedrock, opus-5-anthropic, opus-5-azure, haiku-5]`. Order is the config's, so the list is
-stable across runs. That matters for the subagent tool schema:
-`plan/done/0101-subagent-model-selection.md` made the schema's model `enum` byte-stable across
-launches -- "it is a `BTreeMap`, so the enum is sorted and byte-stable" (0101, under *The enum
-lists only models that would work*) -- because an unstable tool schema churns the parent agent's
-context for no reason. A user reading a banner deserves the same stability.
+An alias resolves to an ordered list of concrete model names by depth-first walk, splicing a nested
+alias's targets in at its position and keeping the first occurrence of a repeated name. `alias =
+["smart", "haiku-5"]` above flattens to `[opus-5-bedrock, opus-5-anthropic, opus-5-azure, haiku-5]`.
+Order is the config's, so the list is stable across runs. That matters for the subagent tool schema:
+`plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md` made the schema's model
+`enum` byte-stable across launches -- "it is a `BTreeMap`, so the enum is sorted and byte-stable"
+(0002-24, under *The enum lists only models that would work*) -- because an unstable tool schema
+churns the parent agent's context for no reason. A user reading a banner deserves the same
+stability.
 
 Cycles are rejected at validation, not at resolution, because a cycle is a static property of the
 config and the earliest honest place to report it is the file that has it. The resolver still
@@ -251,9 +251,10 @@ no usable model for alias "smart"; tried:
 
 ### Selecting a candidate: the runtime half
 
-Not in the first pass; queued as `plan/todo/0113-model-alias-failover.md`. Specified here because
-it constrains the config surface above and because the layer it belongs at is not the obvious one.
-Where 0113 and this section disagree, 0113 is newer and says why.
+Not in the first pass; queued as
+`plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md`. Specified here because it
+constrains the config surface above and because the layer it belongs at is not the obvious one.
+Where 0002-36 and this section disagree, 0002-36 is newer and says why.
 
 The obvious placement -- try the whole turn against candidate 1, retry the turn against
 candidate 2 -- is wrong, and `crates/outrig-cli/src/llm/retry.rs`'s module doc already says why:
@@ -294,12 +295,13 @@ Two further constraints:
   outrig's remote turns are non-streaming, and the streaming arm is mistralrs-only, which is the
   one style with no endpoint to fail over from. `FailoverModel::stream` delegates to the first
   candidate, matching the precedent in `plan/next/streaming-path-has-no-http-retry.md`.
-- **The retry budget must be shared across the chain, not per candidate.** Three candidates at
-  the default `retry-budget-secs = 600` is a thirty-minute turn against a total outage. Worse,
-  most of that is spent retrying endpoints already known to be down. This is why the dependency on
-  `plan/todo/0112-connect-failures-are-not-really-transient.md` is close to hard: that entry's
-  pre-first-byte budget is exactly the signal "move to the next candidate now" as opposed to "keep
-  waiting on this one", and without it failover's worst case is worse than no failover at all.
+- **The retry budget must be shared across the chain, not per candidate.** Three candidates at the
+  default `retry-budget-secs = 600` is a thirty-minute turn against a total outage. Worse, most of
+  that is spent retrying endpoints already known to be down. This is why the dependency on
+  `plan/done/phase/0002-sidecars/tasks/0002-35-connect-failures-are-not-really-transient.md` is
+  close to hard: that entry's pre-first-byte budget is exactly the signal "move to the next
+  candidate now" as opposed to "keep waiting on this one", and without it failover's worst case is
+  worse than no failover at all.
 
 ### Everything downstream is unchanged
 
@@ -332,7 +334,7 @@ sounds. Three surfaces, all of them already printing a model name:
 
 In every case the arrow form appears only when an alias was actually involved. A direct model name
 prints exactly what it prints today, which keeps the default path byte-for-byte unchanged in the
-logs -- the property 0101 established for its own attribution and worth preserving.
+logs -- the property 0002-24 established for its own attribution and worth preserving.
 
 ### Subagents
 
@@ -349,10 +351,10 @@ acyclic) graph per name and reduce over "any leaf reachable". It is small but it
 tested, order-sensitive code, and it is the same predicate the static half's credential check
 wants, so the two should land as one function.
 
-Aliases are also what 0101 argued for without being able to build. Its design section noted that
+Aliases are also what 0002-24 argued for without being able to build. Its design section noted that
 the `model` argument gets intent-naming for free "where users want it", because names like `fast`
 and `smart` are user-chosen; aliases are what let a user have those names *without* duplicating a
-model row to get them. They also make 0101's decision 2 -- omit the `model` property from the
+model row to get them. They also make 0002-24's decision 2 -- omit the `model` property from the
 schema when only one model is usable -- fire less often, which is fine and worth a line in the
 tests that pin it.
 
@@ -403,14 +405,15 @@ should confirm), or **Open** (deferred).
    -- every field access becomes a match -- for no gain over the `Option`-fields form, which
    validation already has to check either way.
 
-2. **Static half vs. runtime half -- Resolved: static first, and they are separable.**
-   The credential-selection case is most of the value at a small fraction of the cost, needs no new
-   runtime types, and is what makes one committed config serve a laptop and a CI runner. The
-   runtime half needs an object-safe shim, a shared retry budget, and the connect-failure split
-   before it is a net improvement. The config surface is identical for both, so the second half is
-   additive to the first -- which is the property that makes splitting them safe rather than merely
-   convenient. The second half is `plan/todo/0113-model-alias-failover.md`, which resolves the
-   shared-budget question as a chain-scoped deadline and takes 0112 as a hard dependency.
+2. **Static half vs. runtime half -- Resolved: static first, and they are separable.** The
+   credential-selection case is most of the value at a small fraction of the cost, needs no new
+   runtime types, and is what makes one committed config serve a laptop and a CI runner. The runtime
+   half needs an object-safe shim, a shared retry budget, and the connect-failure split before it is
+   a net improvement. The config surface is identical for both, so the second half is additive to
+   the first -- which is the property that makes splitting them safe rather than merely convenient.
+   The second half is `plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md`, which
+   resolves the shared-budget question as a chain-scoped deadline and takes 0002-35 as a hard
+   dependency.
 
 3. **The key name -- Resolved: `alias`.** It reads correctly for the case that motivated the
    feature (`alias = "opus-5"`) and acceptably for the list, where the entry is a set of
@@ -440,7 +443,7 @@ should confirm), or **Open** (deferred).
    local model in a candidate list is the natural spelling of "use the local one if this build has
    it, otherwise the hosted one", and the "usable if any candidate is usable" rule already handles
    it. The cost is that `--device` gets refused for such an alias (above) and that a cold weight
-   load can be selected implicitly. Confirm the second against 0101's decision 7, which added a
+   load can be selected implicitly. Confirm the second against 0002-24's decision 7, which added a
    one-line announcement before a cold in-process load for exactly this surprise.
 
 7. **`Model::source()` on an unvalidated config -- Recommended: panic, as `ImageConfig::source()`
@@ -508,11 +511,11 @@ should confirm), or **Open** (deferred).
 - **Scheduling: before 0.2.0 final**, or the `Model::provider` change waits for the next major.
   See the first Risks item. Nothing else in this entry is order-sensitive.
 - **Not a dependency of this entry, but of its second half:
-  `plan/todo/0112-connect-failures-are-not-really-transient.md`.** Failover across three candidates
-  multiplies the retry budget by three unless connect failures are separated from transient ones.
-  That entry's short pre-first-byte budget is the signal failover needs to move on quickly; without
-  it, a total outage takes thirty minutes to report instead of ten. 0113 takes it as a hard
-  dependency; the static half here needs nothing from it.
+  `plan/done/phase/0002-sidecars/tasks/0002-35-connect-failures-are-not-really-transient.md`.**
+  Failover across three candidates multiplies the retry budget by three unless connect failures are
+  separated from transient ones. That entry's short pre-first-byte budget is the signal failover
+  needs to move on quickly; without it, a total outage takes thirty minutes to report instead of
+  ten. 0002-36 takes it as a hard dependency; the static half here needs nothing from it.
 - **Soft: `plan/next/subagent-model-allowlist.md`.** Design forks §8 -- the two compose cleanly but
   the second to land owns the pre- vs post-resolution matching rule.
 - **Soft: `plan/next/public-api-snapshot-gate.md`.** This change edits the public surface, and the
@@ -522,8 +525,9 @@ should confirm), or **Open** (deferred).
   gap -- an alias declared globally and a target declared in the repo report as bare names with no
   file. If both land, they should share the stamping and the reshape rather than touch `Model`
   twice.
-- **Landed: `plan/done/0101-subagent-model-selection.md`.** It added the `model` argument to
-  `outrig__subagent`, `usable_model_names`, and `ModelLabel` -- the three surfaces this extends.
+- **Landed: `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md`.** It added
+  the `model` argument to `outrig__subagent`, `usable_model_names`, and `ModelLabel` -- the three
+  surfaces this extends.
 
 ## See also
 
@@ -540,10 +544,11 @@ should confirm), or **Open** (deferred).
 - `crates/outrig-cli/src/llm/registry.rs` -- keyed by model name; see Risks.
 - `crates/outrig-cli/src/subagent/mod.rs` -- `usable_model_names` (557), `ModelLabel` (585),
   `unusable_model_message` (617), `resolve_launch_model` (636).
-- `plan/done/0101-subagent-model-selection.md` -- the subagent `model` argument, the schema-enum
-  stability rule flattening reuses, and the intent-naming argument aliases complete.
-- `plan/done/0094-non-exhaustive-sweep.md` -- why a field *type* change is not covered by the
-  sweep that makes field *additions* free.
+- `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md` -- the subagent `model`
+  argument, the schema-enum stability rule flattening reuses, and the intent-naming argument aliases
+  complete.
+- `plan/done/phase/0002-sidecars/tasks/0002-17-non-exhaustive-sweep.md` -- why a field *type* change
+  is not covered by the sweep that makes field *additions* free.
 - `doc/concepts/llm-providers.md` -- the provider/model/agent layering and the mermaid diagram,
   both of which assume one provider edge per model.
 
@@ -562,7 +567,7 @@ should confirm), or **Open** (deferred).
    local-llm* -- with a "no usable candidate" list of one. An alias over one target is
    renaming, not choosing, so it resolves its target exactly as if the user had typed it and
    keeps that target's own error *and remedy*. Selection filters only where there is a real
-   choice. This is narrower than 0110's original rule and is what the acceptance criterion
+   choice. This is narrower than 0002-33's original rule and is what the acceptance criterion
    "`--device` ... with a single-target mistralrs alias it applies" requires.
 
 3. **`ModelSourceRef` carries only the discriminant** -- `Provider { provider }` and

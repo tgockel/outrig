@@ -1,10 +1,10 @@
-# 0037 -- Refactor: factor `tool_name::sanitize` out of `rig_tool`
+# 0001-37 -- Refactor: factor `tool_name::sanitize` out of `rig_tool`
 
 ## Goal
 
 Move the `<server>__<tool>` namespacing logic out of `src/rig_tool.rs` into a
 small standalone module so both `rig_tool` (used by `outrig run`) and the
-forthcoming `mcp_proxy` (0039) share a single source of truth. No behavioral
+forthcoming `mcp_proxy` (0001-39) share a single source of truth. No behavioral
 change.
 
 ## Deliverables
@@ -14,7 +14,7 @@ change.
     currently at `src/rig_tool.rs:123-146`, including the blake3-suffix collision
     avoidance.
   - The supporting constants `MAX_NAME_LEN`, `HASH_HEX_LEN`, `SUFFIX_LEN`.
-- `src/lib.rs` -- add `pub mod tool_name;` (or `mod tool_name;` if 0042's library
+- `src/lib.rs` -- add `pub mod tool_name;` (or `mod tool_name;` if 0001-42's library
   surface revisits this; for now make it pub so internal callers can reach it).
 - `src/rig_tool.rs` -- delete the inline `sanitize` and the constants, replace with
   `use crate::tool_name::sanitize;` (or fully-qualified call sites).
@@ -38,8 +38,8 @@ None.
 
 ## Notes
 
-- This unblocks 0039 (`ProxyServer`) which needs to use the same sanitizer to
+- This unblocks 0001-39 (`ProxyServer`) which needs to use the same sanitizer to
   produce public tool names that match what `outrig run` already produces.
-- Keep the function signature stable -- 0042 (library surface) may decide whether
+- Keep the function signature stable -- 0001-42 (library surface) may decide whether
   `tool_name` is part of the public crate API or stays `pub(crate)`. Don't pre-empt
   that decision here.

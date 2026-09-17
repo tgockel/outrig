@@ -1,4 +1,4 @@
-# 0101 -- Launching a subagent under a different model
+# 0002-24 -- Launching a subagent under a different model
 
 ## Context
 
@@ -213,7 +213,7 @@ abstract.
 
 An unknown or unusable name is composed **at the tool boundary**, leaving
 `LlmResolveError::UnknownModel` and the `--model` CLI message untouched -- which also sidesteps the
-0093 SemVer question the Dependencies section raises. The message names the usable models, so a
+0002-16 SemVer question the Dependencies section raises. The message names the usable models, so a
 wrong guess is self-correcting on the next call:
 
 ```
@@ -313,7 +313,7 @@ prototype should confirm), or **Open** (deferred).
    it falls out of deciding what the agent should see.
 
 3. **The enumeration is composed at the tool boundary.** `LlmResolveError::UnknownModel` is left
-   alone, so the `--model` CLI message and its `llm_resolve.rs` coverage do not move and the 0093
+   alone, so the `--model` CLI message and its `llm_resolve.rs` coverage do not move and the 0002-16
    SemVer question in Dependencies never has to be answered. The usable set is a build-specific
    fact, which belongs at the boundary rather than in the resolver.
 
@@ -370,7 +370,7 @@ prototype should confirm), or **Open** (deferred).
   on the context is the obvious shape; the alternative -- pre-resolving every configured model at
   session start -- does needless work for models no subagent ever names, and would move in-process
   weight loading to startup.
-- **Fan-out times model choice is a spend multiplier.** Breadth is unbounded today (see 0100),
+- **Fan-out times model choice is a spend multiplier.** Breadth is unbounded today (see 0002-23),
   and model choice makes the worst case more expensive rather than merely slower. The two
   features compose badly, which is why the width cap is queued first as the containment half.
 - **Per-model failure behavior is not uniform.** In-flight work adds a repeat-failure breaker that
@@ -384,7 +384,7 @@ prototype should confirm), or **Open** (deferred).
 ## Dependencies
 
 - **0093.** The deliverable list above leaves open whether to add a `known` field to
-  `LlmResolveError::UnknownModel` or to compose the enumeration at the tool boundary. If 0093
+  `LlmResolveError::UnknownModel` or to compose the enumeration at the tool boundary. If 0002-16
   de-publishes the `outrig-cli` internals, `LlmResolveError` stops being a public commitment and
   the question becomes a free internal choice rather than a SemVer decision.
 - **0098.** That task adds a third provider style and a third `RigAgent` variant, and already
@@ -404,6 +404,7 @@ prototype should confirm), or **Open** (deferred).
 - `doc/concepts/llm-providers.md` -- the provider / model / agent layering the argument names.
 - `doc/concepts/in-process-llm.md` -- engine-per-model-name lifecycle and first-use download
   stalls, both of which a model-selecting subagent can now trigger.
-- `plan/done/0100-subagent-width-cap.md` -- bounding how many subagents run at once.
-- `plan/todo/0098-anthropic-native-api.md` -- the third provider style this feature would let a
-  subagent select independently of its parent.
+- `plan/done/phase/0002-sidecars/tasks/0002-23-subagent-width-cap.md` -- bounding how many subagents
+  run at once.
+- `plan/done/phase/0002-sidecars/tasks/0002-21-anthropic-native-api.md` -- the third provider style
+  this feature would let a subagent select independently of its parent.

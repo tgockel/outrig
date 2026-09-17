@@ -1,4 +1,4 @@
-# 0109 -- The subagent shutdown grace was never measured against a full tree
+# 0002-32 -- The subagent shutdown grace was never measured against a full tree
 
 ## Symptom
 
@@ -9,11 +9,11 @@ tree one `SHUTDOWN_GRACE` of five seconds to abort and join, bottom-up. Exceedin
 and proceeds with tasks still holding clones of the session's MCP tools -- which is the shape of the
 Ctrl-C hang that `shutdown_releases_the_tool_clones_subagents_hold` exists to pin.
 
-That budget was chosen when nothing bounded how many subagents could exist. 0100 added
+That budget was chosen when nothing bounded how many subagents could exist. 0002-23 added
 `subagent-width-max` and settled its default at `8`, which with the default `subagent-depth-max = 3`
 admits a tree of 8 + 64 = **72** live subagents: the session registry launches 8 at depth 2, each of
 those is below the depth limit so it gets its own registry and its own 8, and the depth-3 layer is
-leaves. 0100's own Risks section asked for that worst case to be timed before committing to the
+leaves. 0002-23's own Risks section asked for that worst case to be timed before committing to the
 default. It was not; the number is arithmetic, not a measurement.
 
 ## Goal
@@ -38,7 +38,7 @@ test to grow from; it already builds a grandchild and asserts the tool clones ar
 
 ## If it does not fit
 
-0100 settled the answer in advance, and it should be honored: **lower the default width, do not
+0002-23 settled the answer in advance, and it should be honored: **lower the default width, do not
 raise the grace.** The grace exists to bound a wedged subagent, not to absorb a large healthy one --
 stretching it to fit 72 tasks would make a genuinely hung subagent take proportionally longer to
 give up on, which is the case the timeout was written for.
@@ -58,13 +58,14 @@ give up on, which is the case the timeout was written for.
 
 ## Dependencies
 
-- **Landed: `plan/done/0100-subagent-width-cap.md`.** It set the width cap and its decision 5
-  deferred exactly this measurement; fork 2 there records why the default is `8`.
+- **Landed: `plan/done/phase/0002-sidecars/tasks/0002-23-subagent-width-cap.md`.** It set the width
+  cap and its decision 5 deferred exactly this measurement; fork 2 there records why the default is
+  `8`.
 
 ## See also
 
-- `plan/done/0100-subagent-width-cap.md` -- decision 5 records this as deliberately deferred, and
-  fork 2 records why the default is `8`.
+- `plan/done/phase/0002-sidecars/tasks/0002-23-subagent-width-cap.md` -- decision 5 records this as
+  deliberately deferred, and fork 2 records why the default is `8`.
 - `crates/outrig-cli/src/subagent/mod.rs` -- `SHUTDOWN_GRACE`, `shutdown`, and `shutdown_tree`.
 
 ## Decisions
@@ -127,4 +128,4 @@ give up on, which is the case the timeout was written for.
    tests cost ~3 s each to measure a ~5 ms quantity. It is production behavior on the launch path,
    not teardown, and it happens entirely before the clock starts, so the measurement is unaffected.
    Filed as `plan/next/http-client-rebuilt-per-agent-build.md` rather than fixed in a test-only
-   task; it needs sequencing against 0113, which also touches `RetryPolicy`.
+   task; it needs sequencing against 0002-36, which also touches `RetryPolicy`.

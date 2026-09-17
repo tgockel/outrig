@@ -1,4 +1,4 @@
-# 0064 -- Post-split library tidy-up: visibility, names, placement
+# 0001-64 -- Post-split library tidy-up: visibility, names, placement
 
 ## Context
 
@@ -9,8 +9,8 @@ of `outrig` reflects what external consumers actually need, and so items
 inside `outrig-cli` sit in the module that best fits the new shape.
 
 Module-level `pub` vs `pub(crate)`, the `hf` module relocation, and
-README/quickstart signposting are tracked separately as 0065, 0066, and
-0067 -- this task is intentionally scoped to per-item visibility, names,
+README/quickstart signposting are tracked separately as 0001-65, 0001-66, and
+0001-67 -- this task is intentionally scoped to per-item visibility, names,
 and intra-crate placement.
 
 ## Goal

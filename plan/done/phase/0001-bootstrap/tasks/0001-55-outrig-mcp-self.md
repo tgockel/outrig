@@ -1,4 +1,4 @@
-# 0055 -- `outrig mcp self` -- self-description MCP server
+# 0001-55 -- `outrig mcp self` -- self-description MCP server
 
 ## Context
 
@@ -25,7 +25,7 @@ The framing is **self-description**, not "design assistant". The MCP
 server vends what OutRig knows about itself; container-config design
 is the dominant *use case*, but the tools are general-purpose
 self-introspection. The paired one-shot prompt shipper (`outrig design
-prompt`) lives in a sibling task (0056).
+prompt`) lives in a sibling task (0001-56).
 
 Existing surfaces this builds on:
 
@@ -35,7 +35,7 @@ Existing surfaces this builds on:
   valid container-config".
 - `src/mcp.rs` -- the existing `rmcp` *client* integration; the server
   side ships with the same crate and was reused by `plan/done/0040`.
-- `plan/done/0035-0041` -- the session-MCP `outrig mcp` subcommand.
+- `0001-35` through `0001-41` -- the session-MCP `outrig mcp` subcommand.
   This task adds a new sibling `self` subsubcommand and reuses the
   same rmcp-server harness.
 - `doc/concepts/containers.md`, `doc/concepts/mcp-servers.md`,
@@ -75,7 +75,7 @@ exactly.
 
 | Tool                | Purpose                                                                              |
 |---------------------|--------------------------------------------------------------------------------------|
-| `get_config_schema` | Return JSON Schema for `ContainerConfig` and `McpServerSpec`, derived from the same `serde` types the loader parses (via `schemars`). The response also includes a `paths` block describing where each file lives: top-level `outrig.toml` (project root), per-container Dockerfile / context (`.agents/outrig/containers/<name>/`), and image-side `container.toml` once 0053 lands (`/etc/outrig/container.toml`). |
+| `get_config_schema` | Return JSON Schema for `ContainerConfig` and `McpServerSpec`, derived from the same `serde` types the loader parses (via `schemars`). The response also includes a `paths` block describing where each file lives: top-level `outrig.toml` (project root), per-container Dockerfile / context (`.agents/outrig/containers/<name>/`), and image-side `container.toml` once 0001-53 lands (`/etc/outrig/container.toml`). |
 
 A pure projection of the in-tree types. If the schema and the loader
 ever disagree, that's a bug in `schemars`/derive, not a sync problem.
@@ -204,12 +204,12 @@ graceful shutdown on stdin EOF, structured errors via `OutrigError`.
 
 ```
 outrig mcp self              # this task's stdio MCP server
-outrig mcp run [...]         # session MCP from plan/done/0035-0041
-outrig design prompt [...]   # paired one-shot prompt printer (0056)
+outrig mcp run [...]         # session MCP from 0001-35 through 0001-41
+outrig design prompt [...]   # paired one-shot prompt printer (0001-56)
 ```
 
 Picking `mcp self` (peer of `mcp run`) keeps stdio-MCP servers
-clustered under `outrig mcp`. `design prompt` (in 0056) sits at the
+clustered under `outrig mcp`. `design prompt` (in 0001-56) sits at the
 top level because it's not an MCP server -- it's a printer.
 
 ## Documentation deliverables
@@ -255,7 +255,7 @@ This task owns the `outrig mcp self` half:
   proposes, you install").
 - Cross-references to the new trust-model page so the LLM and the user
   both understand "configure MCPs liberally" is the intended posture.
-- A placeholder section "Without MCP" -- pointer left for 0056 to fill
+- A placeholder section "Without MCP" -- pointer left for 0001-56 to fill
   in when `outrig design prompt` lands.
 
 ### Cross-link updates
@@ -278,7 +278,7 @@ This task owns the `outrig mcp self` half:
 - `Cargo.toml` -- add `schemars` if not already a direct dep.
 - `doc/concepts/mcp-trust-model.md` -- new concept page.
 - `doc/usage/ai-assisted-design.md` -- new usage page (the
-  `outrig mcp self` half; 0056 fills in the no-MCP fallback section).
+  `outrig mcp self` half; 0001-56 fills in the no-MCP fallback section).
 - `doc/usage/container.md` -- new "what if the templates don't fit"
   cross-link section.
 - `doc/SUMMARY.md` -- new entries for both new pages.
@@ -356,7 +356,7 @@ This task owns the `outrig mcp self` half:
 
 ## Dependencies
 
-- Soft: `plan/done/0035-0041` -- the session-MCP `outrig mcp`
+- Soft: `0001-35` through `0001-41` -- the session-MCP `outrig mcp`
   subcommand shipped there. The new `self` subsubcommand reuses the
   rmcp-server harness introduced by `plan/done/0040`.
 - May add `schemars` as a direct dep depending on whether `rmcp`

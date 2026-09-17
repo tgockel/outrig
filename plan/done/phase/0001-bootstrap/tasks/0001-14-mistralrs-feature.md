@@ -1,11 +1,11 @@
-# 0014 -- `mistralrs` feature flag and CI matrix
+# 0001-14 -- `mistralrs` feature flag and CI matrix
 
 ## Goal
 
 Add a `mistralrs` Cargo feature, the optional crate dep behind it, an empty
 `#[cfg(feature = "mistralrs")]` module, and the CI matrix entry that exercises both
 configurations. This task adds **no runtime behavior** -- it's the build-system scaffolding
-that lets 0015 attach the actual shim. After this task, `cargo build` and `cargo build
+that lets 0001-15 attach the actual shim. After this task, `cargo build` and `cargo build
 --features mistralrs` both succeed; the latter just compiles a heavier dep tree.
 
 ## Deliverables
@@ -24,20 +24,20 @@ that lets 0015 attach the actual shim. After this task, `cargo build` and `cargo
   heavy enough that users running outrig only against an OpenAI-compatible HTTPS endpoint
   shouldn't pay for the dep tree they won't touch.
 - `src/llm.rs` (or `src/llm/mod.rs`) gains a `mistralrs` submodule under
-  `#[cfg(feature = "mistralrs")]`. Empty for now; 0015 fills it. The non-feature path
+  `#[cfg(feature = "mistralrs")]`. Empty for now; 0001-15 fills it. The non-feature path
   has no equivalent module -- the resolver handles the "not built with this feature" case
   uniformly.
-- A `feature_off_explains_clearly` smoke check: the resolver in 0012 already produces
+- A `feature_off_explains_clearly` smoke check: the resolver in 0001-12 already produces
   some error for `style = "mistralrs"` when feature is off; here, harden the message:
   `mistralrs provider 'name' requested but this build of outrig does not include the
   'mistralrs' feature; rebuild with --features mistralrs to enable`.
 - `.github/workflows/ci.yml`:
   - Existing job: `cargo test` (default features off, mistralrs absent) keeps passing.
   - New job: `cargo test --features mistralrs` -- builds the dep, runs the test suite.
-    Tests that need a real model file are gated behind an env var (set up in 0015), so
+    Tests that need a real model file are gated behind an env var (set up in 0001-15), so
     this job runs the unit suite only.
   - Factor `cargo fmt --all -- --check` into its own one-shot job so it doesn't run
-    twice across the matrix. (0026 deferred this factoring to whichever task added the
+    twice across the matrix. (0001-26 deferred this factoring to whichever task added the
     second matrix row.)
 
 ## Acceptance
@@ -50,7 +50,7 @@ that lets 0015 attach the actual shim. After this task, `cargo build` and `cargo
 
 ## Dependencies
 
-- 0013-llm-provider-enum
+- 0001-13-llm-provider-enum
 
 ## Notes
 
@@ -103,7 +103,7 @@ Rejected alternatives, in order of how often they're likely to be re-proposed:
   variants pulling the same sibling crates (`mistralrs-audio`, `-mcp`, `-quant`,
   `-vision`); the only deltas were `mistralrs-macros` and `mistralrs` itself,
   both small but clearly aimed at the server-binary use case. Going direct to
-  `-core` skips one layer that 0015's shim would otherwise have to import-around.
+  `-core` skips one layer that 0001-15's shim would otherwise have to import-around.
   The `default-features = false` + the optional flag together keep the heavy dep
   tree off the default build entirely.
 
@@ -115,9 +115,9 @@ Rejected alternatives, in order of how often they're likely to be re-proposed:
 
 - **Two error variants, not one cfg-gated message.** `MistralrsFeatureDisabled
   { name: String }` (feature off, names the provider) and
-  `MistralrsRuntimeUnavailable` (feature on, placeholder for 0015) live as
+  `MistralrsRuntimeUnavailable` (feature on, placeholder for 0001-15) live as
   distinct variants. Two reviewers independently flagged this -- the data
-  shapes differ (one carries the provider name; the other is empty), 0015's
+  shapes differ (one carries the provider name; the other is empty), 0001-15's
   cleanup is a one-symbol delete, and tests stay readable. The
   `MistralrsRuntimeUnavailable` variant is itself gated on
   `#[cfg(feature = "mistralrs")]` so feature-off builds don't expose a
@@ -150,8 +150,8 @@ Rejected alternatives, in order of how often they're likely to be re-proposed:
   `clippy` or the matrix. Trades one extra checkout (~10s) for not running
   fmt twice across the matrix.
 
-- **Crate variant note for 0015**: the `mistralrs-mcp` sibling crate is a
-  transitive dep of `mistralrs-core`. When 0015 lands, check for overlap
+- **Crate variant note for 0001-15**: the `mistralrs-mcp` sibling crate is a
+  transitive dep of `mistralrs-core`. When 0001-15 lands, check for overlap
   with the existing `rmcp` MCP wiring in `Cargo.toml` -- there's a non-zero
   chance `mistralrs-mcp` exposes a client we'd rather use than `rmcp` for
   the in-process LLM's tool-call surface. Out of scope for 0014.

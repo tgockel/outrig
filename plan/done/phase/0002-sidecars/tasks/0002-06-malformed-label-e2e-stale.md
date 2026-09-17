@@ -1,9 +1,9 @@
-# 0083 -- Fix stale `malformed_mcp_label_is_hard_error` e2e test
+# 0002-06 -- Fix stale `malformed_mcp_label_is_hard_error` e2e test
 
 ## Goal
 
 Repair the stale e2e test. `cargo test -p outrig --features e2e --test embedded_image
-malformed_mcp_label` fails on trunk (verified against a clean tree during task 0079): the
+malformed_mcp_label` fails on trunk (verified against a clean tree during task 0002-02): the
 test builds an image whose Dockerfile stamps a malformed `org.outrig.mcp` label and
 expects `ensure_image` to succeed so the *runtime* read (`embedded::merged_mcp`) can fail.
 Since the build path started re-merging inherited labels into the cache tag
@@ -26,7 +26,7 @@ runtime-read case using a raw (non-built) image ref if that path still needs cov
 
 ## Dependencies
 
-None (follows up on completed task 0079).
+None (follows up on completed task 0002-02).
 
 ## Decisions
 

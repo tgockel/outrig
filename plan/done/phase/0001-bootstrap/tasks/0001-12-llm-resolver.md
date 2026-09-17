@@ -1,4 +1,4 @@
-# 0012 -- LLM resolver
+# 0001-12 -- LLM resolver
 
 ## Goal
 
@@ -57,7 +57,7 @@ this point.
 
 ## Dependencies
 
-- 0005-config-merge-validate
+- 0001-05-config-merge-validate
 
 ## Notes
 

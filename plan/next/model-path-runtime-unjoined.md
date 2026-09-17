@@ -1,6 +1,6 @@
 # A relative `model-path` validates against one base and loads against another
 
-> **Queued as part of `plan/todo/0123-deprecated-local-llm-behavior-for-0.2.0.md`.** That task
+> **Queued as part of `plan/todo/0002-46-deprecated-local-llm-behavior-for-0.2.0.md`.** That task
 > decides whether the provider ships operational in 0.2.0 and, if it does, fixes this. The
 > analysis below is why; do not duplicate it there.
 
@@ -58,14 +58,14 @@ Make the path that is validated the path that is opened.
 ## Design forks
 
 1. **Repo root vs. declaring file -- Recommended: declaring file.**
-   `plan/done/0097-config-path-provenance.md` deliberately left `models` out of its provenance
-   sweep ("Design fork 3 -- Open. Only images and mounts have paths today ... Start narrow"),
-   which was right for that task but is exactly the situation fork 3 said to revisit once another
-   entry grew a path. A global `[models.<n>]` with a relative `model-path` has the same problem a
-   global `[images.<n>]` had, and the machinery now exists: stamp `Model` in
+   `plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` deliberately left
+   `models` out of its provenance sweep ("Design fork 3 -- Open. Only images and mounts have paths
+   today ... Start narrow"), which was right for that task but is exactly the situation fork 3 said
+   to revisit once another entry grew a path. A global `[models.<n>]` with a relative `model-path`
+   has the same problem a global `[images.<n>]` had, and the machinery now exists: stamp `Model` in
    `Config::stamp_source` and give it a `resolved_model_path(repo_root)` mirroring
-   `MountConfig::resolved_host_path`. Confirm before committing: if no one declares models
-   globally, repo-root-only is a smaller change and closes the validate/load split on its own.
+   `MountConfig::resolved_host_path`. Confirm before committing: if no one declares models globally,
+   repo-root-only is a smaller change and closes the validate/load split on its own.
 
 2. **Whether to reject relative `model-path` instead -- Open.** A multi-gigabyte weights file is
    rarely inside the repo, so relative paths here may be a misfeature rather than a convenience.
@@ -74,11 +74,12 @@ Make the path that is validated the path that is opened.
 
 ## Dependencies
 
-None hard. Shares machinery with 0097, which has landed.
+None hard. Shares machinery with 0002-20, which has landed.
 
 ## See also
 
 - `crates/outrig/src/config/validate.rs` -- `validate_mistralrs_model`, the validating half.
 - `crates/outrig-cli/src/llm.rs`, `crates/outrig-cli/src/llm/mistralrs.rs` -- the loading half.
-- `plan/done/0097-config-path-provenance.md` -- design fork 3, which deferred this deliberately.
+- `plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` -- design fork 3, which
+  deferred this deliberately.
 - `crates/outrig/tests/fixtures/config-full.toml` -- the only relative `model-path` in tree.

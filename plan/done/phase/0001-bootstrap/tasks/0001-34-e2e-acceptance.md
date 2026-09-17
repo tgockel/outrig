@@ -1,4 +1,4 @@
-# 0034 -- End-to-end acceptance
+# 0001-34 -- End-to-end acceptance
 
 ## Goal
 
@@ -36,10 +36,10 @@ that lists files via the filesystem MCP. This is the v0 ship gate.
 
 ## Dependencies
 
-- 0019-agent-loop
-- 0021-session-cli
-- 0032-build-subcommand
-- 0033-init
+- 0001-19-agent-loop
+- 0001-21-session-cli
+- 0001-32-build-subcommand
+- 0001-33-init
 
 ## Notes
 
@@ -60,11 +60,11 @@ that lists files via the filesystem MCP. This is the v0 ship gate.
   `OPENAI_API_KEY`, retries the run leg up to 2x against LLM non-determinism). The mock
   variant patches the init-generated `[providers.openai].base-url` to point at the local
   test server.
-- **`doc/` `Incomplete` -> `Deferred to post-v0` pass deferred.** The original spec asked
-  for a full sweep of `> TODO: Incomplete` markers in `doc/`, dropping the ones that ship
-  in v0 and converting the rest to `> TODO: Deferred to post-v0`. The user pushed back:
-  we're still in v0, so items that are pending should remain `Incomplete` rather than
-  being relabeled. The README's top-of-file "implementation in progress" disclaimer is
-  still dropped (v0 commands are real). The license `Incomplete` at `README.md:50` stays
-  put -- it's tracked separately in `0046-pick-a-license.md`. The doc-content sweep itself
+- **`doc/` `Incomplete` -> `Deferred to post-v0` pass deferred.** The original spec asked for a full
+  sweep of `> TODO: Incomplete` markers in `doc/`, dropping the ones that ship in v0 and converting
+  the rest to `> TODO: Deferred to post-v0`. The user pushed back: we're still in v0, so items that
+  are pending should remain `Incomplete` rather than being relabeled. The README's top-of-file
+  "implementation in progress" disclaimer is still dropped (v0 commands are real). The license
+  `Incomplete` at `README.md:50` stays put -- it's tracked separately in
+  `plan/done/phase/0001-bootstrap/tasks/0001-46-pick-a-license.md`. The doc-content sweep itself
   becomes a separate follow-up if/when v0 actually ships.

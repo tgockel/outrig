@@ -9,14 +9,14 @@ every repo-specific image, or keep a standalone project somewhere and remember i
 `outrig image build` takes a *directory argument*
 (`crates/outrig-cli/src/image_setup/build.rs`), so nothing is indexed and nothing is discoverable.
 
-The sidecar work (`plan/done/0079`-`0090`) already removed the need to install a tool into the
+The sidecar work (`plan/done/0079`-`0002-13`) already removed the need to install a tool into the
 primary image: an MCP server can run in its own container next to the primary. What is missing is
 a place to author those tool images once, per user.
 
 The unit already exists and is the right one. `outrig image init` writes a self-contained project
 -- `Dockerfile`, `image.toml` (`[image].ref`, optional `[build]`, required `[mcp]`), `README.md`
 -- and `outrig image build` stamps the `[mcp]` table into the image's `org.outrig.mcp` label so a
-consuming repo needs no MCP config of its own (`plan/done/0069`-`0072`). The only thing that
+consuming repo needs no MCP config of its own (`plan/done/0069`-`0001-72`). The only thing that
 project cannot be is *found*.
 
 Longer term a prebuilt catalog of common tools is wanted. Nothing like it exists today: the
@@ -38,11 +38,12 @@ repo-local image-config.
   `--global-config /p/x.toml` -> `/p/images/` all fall out of the one rule, reusing
   `global_config_path_with` (`crates/outrig-cli/src/paths.rs:125`). The `--global-config` case is
   what makes this testable without touching a real `$HOME`.
-- **Indexing** at config load: scan `<root>/*/image.toml`. The directory name is the
-  image-config name and must satisfy the existing `^[a-zA-Z][a-zA-Z0-9_-]*$` project-name check
-  (`plan/done/0070-standalone-image-init.md`) -- it has to be both a clean image-ref token and a
-  valid TOML bare key. Each hit synthesizes a build-shape `[images.<name>]` entry whose
-  `ConfigSource` is the project directory (`plan/todo/0097-config-path-provenance.md`).
+- **Indexing** at config load: scan `<root>/*/image.toml`. The directory name is the image-config
+  name and must satisfy the existing `^[a-zA-Z][a-zA-Z0-9_-]*$` project-name check
+  (`plan/done/phase/0001-bootstrap/tasks/0001-70-standalone-image-init.md`) -- it has to be both a
+  clean image-ref token and a valid TOML bare key. Each hit synthesizes a build-shape
+  `[images.<name>]` entry whose `ConfigSource` is the project directory
+  (`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md`).
 - **Precedence**, low to high: scanned library < global `[images.*]` < repo `[images.*]`. Same
   name-keyed, whole-entry, repo-wins rule as every other map in `merge.rs`.
 - **Shadow diagnostic**: when a higher layer overrides a library project, warn and name both
@@ -153,14 +154,14 @@ Each item leads with its status: **Resolved** (committed here), **Recommended** 
 prototype should confirm), or **Open** (deferred).
 
 1. **Build path for library projects -- Resolved: content-hash tags, revisiting 0071.**
-   `plan/done/0071-standalone-image-build.md` decided a standalone build has no project-level
-   cache: it tags a stable caller-named ref, so `--no-cache` only forwards to buildah. That was
-   right for a one-off `outrig image build <dir>` where the user is deciding when to build. It is
-   wrong for an image that is implicitly resolved by every session on the machine, where a stale
-   stable tag means an edit never takes effect and a rebuild-every-time means every session pays
-   a build. Tagging `<name>:<content-hash>` with the `image.toml`-derived labels reuses
-   `CacheKey::compute_with_labels` and `ensure_image_for` unchanged. `outrig image build <dir>`
-   keeps its existing stable-ref behavior; only the `--user` path is content-hashed.
+   `plan/done/phase/0001-bootstrap/tasks/0001-71-standalone-image-build.md` decided a standalone
+   build has no project-level cache: it tags a stable caller-named ref, so `--no-cache` only
+   forwards to buildah. That was right for a one-off `outrig image build <dir>` where the user is
+   deciding when to build. It is wrong for an image that is implicitly resolved by every session on
+   the machine, where a stale stable tag means an edit never takes effect and a rebuild-every-time
+   means every session pays a build. Tagging `<name>:<content-hash>` with the `image.toml`-derived
+   labels reuses `CacheKey::compute_with_labels` and `ensure_image_for` unchanged. `outrig image
+   build <dir>` keeps its existing stable-ref behavior; only the `--user` path is content-hashed.
 
 2. **Trust in a `[sidecar]` label -- Resolved, and load-bearing.** A `[sidecar]` block read from
    a locally-authored library `image.toml` is user-authored and honored in full: it is the same
@@ -169,14 +170,14 @@ prototype should confirm), or **Open** (deferred).
    `mounts`, `view`, and `security` from a label are reported by `outrig image inspect` as
    requests and never auto-applied.
 
-   The reason is not hypothetical. A label-declared `mounts = [{ host-path = "~/.ssh" }]` would
-   let a registry image name a host path for the host to bind in. `view = "primary"` grants
+   The reason is not hypothetical. A label-declared `mounts = [{ host-path = "~/.ssh" }]` would let
+   a registry image name a host path for the host to bind in. `view = "primary"` grants
    `CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace
-   (`plan/done/0090-primary-view-sidecars.md`) -- a real posture change that `SECURITY.md` and
-   `doc/concepts/mcp-trust-model.md` treat as an explicit user decision. Letting an image opt
-   itself in inverts that. This extends the discipline already in `embedded.rs:114-125`, where
-   `PlacementInLabel` and `ArgsInLabel` reject config-only keys in `org.outrig.mcp` for the same
-   class of reason.
+   (`plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md`) -- a real posture change
+   that `SECURITY.md` and `doc/concepts/mcp-trust-model.md` treat as an explicit user decision.
+   Letting an image opt itself in inverts that. This extends the discipline already in
+   `embedded.rs:114-125`, where `PlacementInLabel` and `ArgsInLabel` reject config-only keys in
+   `org.outrig.mcp` for the same class of reason.
 
    The stamping itself is unconditional -- `outrig image build` writes the whole `[sidecar]`
    block to the label so `image inspect` can show it. Provenance gates *honoring*, not
@@ -195,12 +196,12 @@ prototype should confirm), or **Open** (deferred).
    whether catalog entries are vendored projects, refs to registry images, or both; and how
    `SUGGESTIONS_NOTE`'s "not a registry" framing changes once one exists.
 
-5. **Image GC -- Open.** `outrig clean` sweeps session directories and stray labeled containers
-   and has never removed image tags (`plan/done/0086-sidecar-startup-performance.md`). Content-
-   hash tagging a library that is edited regularly accumulates `<name>:<hash>` tags that nothing
-   reaps. This is pre-existing for repo images; the library makes it easier to hit, because the
-   images are shared across every repo. Worth a `--images` mode on `outrig clean`, scoped
-   separately.
+5. **Image GC -- Open.** `outrig clean` sweeps session directories and stray labeled containers and
+   has never removed image tags
+   (`plan/done/phase/0002-sidecars/tasks/0002-09-sidecar-startup-performance.md`). Content- hash
+   tagging a library that is edited regularly accumulates `<name>:<hash>` tags that nothing reaps.
+   This is pre-existing for repo images; the library makes it easier to hit, because the images are
+   shared across every repo. Worth a `--images` mode on `outrig clean`, scoped separately.
 
 6. **Nested library layout -- Open.** Only `<root>/<name>/image.toml` is scanned; no recursion,
    no grouping. A namespaced layout (`<root>/<org>/<name>/`) would want a naming scheme, and the
@@ -209,11 +210,13 @@ prototype should confirm), or **Open** (deferred).
 
 ## Dependencies
 
-- **Hard: 0097** (`plan/todo/0097-config-path-provenance.md`). A library project's `dockerfile`
-  and `context` are relative to the project directory. Until an image-config carries its own base
-  directory, every path in the index resolves against the repo root.
-- **Soft: 0092** (`plan/todo/0092-e2e-imageconfig-sidecars-bitrot.md`). The e2e feature does not
-  compile today, so any end-to-end acceptance here needs that fix first.
+- **Hard: 0002-20** (`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md`). A
+  library project's `dockerfile` and `context` are relative to the project directory. Until an
+  image-config carries its own base directory, every path in the index resolves against the repo
+  root.
+- **Soft: 0002-15**
+  (`plan/done/phase/0002-sidecars/tasks/0002-15-e2e-imageconfig-sidecars-bitrot.md`). The e2e
+  feature does not compile today, so any end-to-end acceptance here needs that fix first.
 
 ## See also
 
@@ -225,10 +228,12 @@ prototype should confirm), or **Open** (deferred).
   the `PlacementInLabel` / `ArgsInLabel` precedent for fork 2.
 - `crates/outrig/src/image.rs` -- `CacheKey::compute_with_labels`, `ensure_image_for`,
   `build_standalone`.
-- `plan/done/0070-standalone-image-init.md`, `plan/done/0071-standalone-image-build.md`,
-  `plan/done/0072-oci-label-config-surface.md` -- the standalone-project decisions this builds on
-  and, in fork 1, revisits.
-- `plan/done/0090-primary-view-sidecars.md`, `doc/concepts/mcp-trust-model.md`, `SECURITY.md` --
-  why `view = "primary"` cannot be image-declared.
+- `plan/done/phase/0001-bootstrap/tasks/0001-70-standalone-image-init.md`,
+  `plan/done/phase/0001-bootstrap/tasks/0001-71-standalone-image-build.md`,
+  `plan/done/phase/0001-bootstrap/tasks/0001-72-oci-label-config-surface.md` -- the
+  standalone-project decisions this builds on and, in fork 1, revisits.
+- `plan/done/phase/0002-sidecars/tasks/0002-13-primary-view-sidecars.md`,
+  `doc/concepts/mcp-trust-model.md`, `SECURITY.md` -- why `view = "primary"` cannot be
+  image-declared.
 - `plan/next/user-toolsets.md` -- the attach mechanism that makes a library tool reach a session
   without repo config.

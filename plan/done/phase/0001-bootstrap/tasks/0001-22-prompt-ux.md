@@ -1,4 +1,4 @@
-# 0022 -- Prompt UX wrapper
+# 0001-22 -- Prompt UX wrapper
 
 ## Goal
 
@@ -54,7 +54,7 @@ without re-architecture. The trait pivot replaces the originally-filed
 - `Field` instances live as constants near where they're used (init.rs,
   init/container.rs in later tasks); the prompt module just exposes the
   type, the trait, and the impl. No `Field` constants are added in this
-  task -- they arrive with 0023/0024/0026.
+  task -- they arrive with 0001-23/0024/0026.
 - `tests/prompt_ux.rs` driving `TerminalPrompt` with `tokio::io::duplex` to
   simulate stdin:
   - Empty line returns default.
@@ -65,7 +65,7 @@ without re-architecture. The trait pivot replaces the originally-filed
   - EOF returns an `Io(UnexpectedEof)` error.
 - `tests/prompt_doc_sync.rs`: walks a manual `&[&Field]` slice (seeded with
   one example `Field` defined in-test) and asserts each `doc_link` resolves
-  to a real file under `doc/`. Tasks 0023/0024/0026 add their constants to
+  to a real file under `doc/`. Tasks 0001-23/0024/0026 add their constants to
   the slice.
 
 ## Acceptance
@@ -75,7 +75,7 @@ without re-architecture. The trait pivot replaces the originally-filed
 
 ## Dependencies
 
-- 0001-cargo-skeleton
+- 0001-01-cargo-skeleton
 
 ## Notes
 
@@ -85,7 +85,7 @@ without re-architecture. The trait pivot replaces the originally-filed
   `tokio::io::AsyncBufReadExt::lines`, with prompts written to stderr to
   match `Repl::run_with` (`src/repl.rs:118`).
 - Edition 2024 enables async-fn-in-trait directly, so the trait needs no
-  `#[async_trait]` macro. Callers downstream (0023/0024/0026) take
+  `#[async_trait]` macro. Callers downstream (0001-23/0024/0026) take
   `&mut impl PromptSource`.
 
 ## Decisions

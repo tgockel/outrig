@@ -1,8 +1,8 @@
-# 0119 -- A provenance-bearing path and its base directory move together
+# 0002-42 -- A provenance-bearing path and its base directory move together
 
 ## Context
 
-0097 gave `ImageConfig` and `MountConfig` a private `ConfigSource`, recorded at load, that their
+0002-20 gave `ImageConfig` and `MountConfig` a private `ConfigSource`, recorded at load, that their
 resolution methods use as the base directory for relative paths. Both types left the path field
 itself `pub`:
 
@@ -20,7 +20,7 @@ enforces it. A caller who does `mount.host_path = other` keeps the old source, a
 of the file that did not contain it. The result is a bind mount of the wrong host directory,
 read-write if the mount says so.
 
-0108 hit the same problem when it added provenance to `[workspace].host-path` and closed it there
+0002-31 hit the same problem when it added provenance to `[workspace].host-path` and closed it there
 by making the primary fields private behind accessors and a `set_host_path` that clears the
 source. That leaves the codebase answering the same question two ways.
 
@@ -108,23 +108,25 @@ One rule for every provenance-bearing path field: the value and its base directo
   answer to "what is this struct's source", which the atomic pair does not -- weigh that as part
   of the cost, not as a detail to settle during implementation.
 
-3. **Whether `Model` joins this sweep -- Deferred to 0123, deliberately.** 0097's fork 3 said to
-   revisit provenance for other path-bearing entries once one appeared, and `[models.<n>]`'s
-   `model-path` is one. It is on a deprecated surface, so 0123 owns the decision; if 0123 gives
-   `Model` provenance, it inherits this task's stale-public-field problem and must adopt the same
-   shape. Coordinate rather than letting two answers land.
+3. **Whether `Model` joins this sweep -- Deferred to 0002-46, deliberately.** 0002-20's fork 3 said
+   to revisit provenance for other path-bearing entries once one appeared, and `[models.<n>]`'s
+   `model-path` is one. It is on a deprecated surface, so 0002-46 owns the decision; if 0002-46
+   gives `Model` provenance, it inherits this task's stale-public-field problem and must adopt the
+   same shape. Coordinate rather than letting two answers land.
 
 ## Dependencies
 
 - **Hard: before the 0.2.0 freeze**, which is what puts it in this queue rather than the buffer.
   Coordinate fork 3 with 0123.
-  Making a public field private is a break `#[non_exhaustive]` does not cover, same as 0108's
+  Making a public field private is a break `#[non_exhaustive]` does not cover, same as 0002-31's
   field-type change. After the freeze this costs a major version and is probably not worth it.
-- Land before 0125 regenerates the API snapshot.
+- Land before 0002-48 regenerates the API snapshot.
 
 ## See also
 
 - `crates/outrig/src/config/mod.rs` -- `MountConfig`, `ImageConfig`, and `Workspace`'s accessors
   as the shape to copy.
-- `plan/done/0097-config-path-provenance.md` -- where the public-field choice was made.
-- `plan/done/0108-global-workspace-block-dropped.md` -- where it was reversed for one type.
+- `plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md` -- where the public-field
+  choice was made.
+- `plan/done/phase/0002-sidecars/tasks/0002-31-global-workspace-block-dropped.md` -- where it was
+  reversed for one type.

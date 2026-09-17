@@ -1,8 +1,8 @@
-# 0060 -- Network interceptor enforcement
+# 0001-60 -- Network interceptor enforcement
 
 ## Context
 
-Task 0059 makes every outbound session-container connection visible in
+Task 0001-59 makes every outbound session-container connection visible in
 `<session_dir>/logs/network.jsonl`, but it allows all traffic. This task adds
 host:port policy so users can grant legitimate network access without granting
 blanket egress.
@@ -54,7 +54,7 @@ deny    = ["*:22", { host = "169.254.169.254", port = 80 }]
 `"*.npmjs.org"`, `"*:22"`, `"10.0.0.0/8"`, and `"[2001:db8::1]:443"`.
 They also accept inline tables shaped as `{ host = "...", port = 443 }`.
 
-When `[network]` is absent, behavior matches 0059: normal sessions use
+When `[network]` is absent, behavior matches 0001-59: normal sessions use
 Podman's default networking, and audit mode allows every connection and logs
 it. Filtering is enabled only with `mode = "filter"`.
 
@@ -70,7 +70,7 @@ finds the reason in the audit log.
 
 ## Acceptance
 
-- With no `[network]` block, behavior is identical to 0059's allow-and-log mode.
+- With no `[network]` block, behavior is identical to 0001-59's allow-and-log mode.
 - `default = "deny"` blocks unmatched connections and records `"action": "deny"`.
 - A matching allow rule permits the connection and records the matching rule.
 - A matching deny rule closes the connection before upstream bytes are bridged.
@@ -80,13 +80,14 @@ finds the reason in the audit log.
 
 ## Dependencies
 
-- **Hard: 0059**. Enforcement depends on the interceptor, DNS cache, protocol
+- **Hard: 0001-59**. Enforcement depends on the interceptor, DNS cache, protocol
   sniffing, and audit-log plumbing from the first network phase.
 
 ## See also
 
-- `0059-network-interceptor-plumbing.md` -- traffic capture and audit logging.
-- `0064-network-interceptor-mitm.md` -- later URL/body-aware HTTPS policy.
+- `plan/done/phase/0001-bootstrap/tasks/0001-59-network-interceptor-plumbing.md` -- traffic capture
+  and audit logging.
+- `plan/next/network-interceptor-mitm.md` -- later URL/body-aware HTTPS policy.
 - `doc/reference/config.md` -- formatting model for the `[network]` schema.
 
 ## Decisions

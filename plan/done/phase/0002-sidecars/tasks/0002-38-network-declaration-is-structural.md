@@ -1,4 +1,4 @@
-# 0115 -- Whether a repo declared `[network]` is structural, not a hidden bit
+# 0002-38 -- Whether a repo declared `[network]` is structural, not a hidden bit
 
 ## Context
 
@@ -63,7 +63,7 @@ Pick one shape (fork 1) and carry it through:
   fork 2: public `merge` ignores repo policy fields, or becomes fallible and rejects them, or the
   security contract changes deliberately and is documented as changed.
 - Every reader of `config.network` moves to the effective accessor. The set is small: `merge.rs`,
-  `validate.rs`, `outrig_.rs`'s lowering (which 0118 rewrites), and the CLI's session setup.
+  `validate.rs`, `outrig_.rs`'s lowering (which 0002-41 rewrites), and the CLI's session setup.
 - `crates/outrig/public-api.txt` regenerated. `crates/outrig/CHANGELOG.md` records the reshape as
   a break, with the one-line migration.
 - `doc/reference/config.md` (a **symlink** into `crates/outrig-cli/src/mcp_self/docs/`) wherever
@@ -122,28 +122,27 @@ Trust boundary, which is the half the earlier version of this task missed:
 
 ## Dependencies
 
-None hard. **Sequenced before 0118**, which reads and lowers the very field this may reshape;
-doing them the other way means writing the lowering twice. Land before 0125 regenerates the API
-snapshot, and before 0126 writes the migration guide that has to describe this.
+None hard. **Sequenced before 0002-41**, which reads and lowers the very field this may reshape;
+doing them the other way means writing the lowering twice. Land before 0002-48 regenerates the API
+snapshot, and before 0002-49 writes the migration guide that has to describe this.
 
 ## See also
 
 - `crates/outrig/src/config/mod.rs:1558-1600` -- `NetworkConfig`, its `Default`, its `PartialEq`,
   and the two `pub(crate)` accessors; `reject_repo_network_policy` at 634, called from 318.
 - `crates/outrig/src/config/merge.rs:56-60` -- the branch that reads the bit.
-- `plan/done/0108-global-workspace-block-dropped.md` -- the same question for `[workspace]`,
-  answered with private fields and guarded setters.
+- `plan/done/phase/0002-sidecars/tasks/0002-31-global-workspace-block-dropped.md` -- the same
+  question for `[workspace]`, answered with private fields and guarded setters.
 
 ## Decisions
 
-- **Fork 1: `NetworkConfig` becomes four private fields, every one of them optional.**
-  `mode: Option<NetworkMode>`, `default: Option<NetworkAction>`, and
-  `allow`/`deny: Option<Vec<NetworkEntry>>`. `None` *is* "the config did not declare this
-  key", carried through serde like every other key, so no state exists that only the file
-  parser can reach. This is `plan/done/0108-global-workspace-block-dropped.md`'s answer for
-  `[workspace]`, applied to the block that motivated 0108's rejection of a declared
-  boolean in the first place -- 0108's Decisions name `NetworkConfig` as the shape it did
-  not want to copy.
+- **Fork 1: `NetworkConfig` becomes four private fields, every one of them optional.** `mode:
+  Option<NetworkMode>`, `default: Option<NetworkAction>`, and `allow`/`deny:
+  Option<Vec<NetworkEntry>>`. `None` *is* "the config did not declare this key", carried through
+  serde like every other key, so no state exists that only the file parser can reach. This is
+  `plan/done/phase/0002-sidecars/tasks/0002-31-global-workspace-block-dropped.md`'s answer for
+  `[workspace]`, applied to the block that motivated 0002-31's rejection of a declared boolean in
+  the first place -- 0002-31's Decisions name `NetworkConfig` as the shape it did not want to copy.
 
   Deleted with the reshape: the `declared` field, the hand-written `Default`, the
   hand-written `PartialEq` (and its `impl Eq`), `is_declared`, `set_declared`, and
@@ -209,7 +208,7 @@ snapshot, and before 0126 writes the migration guide that has to describe this.
   already the unit every consumer takes (`NetworkInterceptor::start_with_policy`,
   `NetworkSpec::policy`, `NetworkPolicy::validate`), so `policy()` is the one way to read
   the policy, `set_policy()` the one way to write it, and `has_policy_entries()` the cheap
-  emptiness check. A second spelling would widen the surface 0124 is about to freeze for no
+  emptiness check. A second spelling would widen the surface 0002-47 is about to freeze for no
   capability. `set_policy()` has no in-crate caller and is kept deliberately: with the
   fields private it is the only way an embedder can give a `Config` a filter policy at all,
   which the public fields used to provide.

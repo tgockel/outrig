@@ -1,4 +1,4 @@
-# 0013 -- `LlmProvider` tagged-enum refactor
+# 0001-13 -- `LlmProvider` tagged-enum refactor
 
 ## Goal
 
@@ -8,7 +8,7 @@ shape change has to land before any `mistralrs`-specific code can attach to the 
 task is pure refactor and contains no `mistralrs` runtime behavior.
 
 The Mistralrs variant is **always present in the enum**, regardless of the `mistralrs`
-Cargo feature (which doesn't exist yet -- it lands in 0014). The "feature off but config
+Cargo feature (which doesn't exist yet -- it lands in 0001-14). The "feature off but config
 mentions mistralrs" failure mode is handled at agent-resolve time, not at parse or
 validate. See `plan/next/in-process-llm.md` for the rationale.
 
@@ -57,7 +57,7 @@ validate. See `plan/next/in-process-llm.md` for the rationale.
     `ModelCacheRootNotAbsolute`.
 - `src/config/merge.rs` extension: merge handles the new top-level field by repo-overrides-
   global (same rule as `session_root`).
-- All call sites in 0012's resolver (and elsewhere) that match `provider.style == "openai"`
+- All call sites in 0001-12's resolver (and elsewhere) that match `provider.style == "openai"`
   switch to a `match` on the enum or a small accessor helper. The resolver's existing
   "unsupported style" error path is replaced by the enum exhaustiveness check.
 - `tests/config_provider_enum.rs` covering:
@@ -73,7 +73,7 @@ validate. See `plan/next/in-process-llm.md` for the rationale.
 
 ## Acceptance
 
-- `cargo test` passes; existing 0005 fixtures still round-trip.
+- `cargo test` passes; existing 0001-05 fixtures still round-trip.
 - `style = "mistralrs"` parses on a build without any `mistralrs` feature flag (which
   doesn't exist yet -- this task adds the schema only).
 - The unknown-style error message is pinned in a regression test.
@@ -82,8 +82,8 @@ validate. See `plan/next/in-process-llm.md` for the rationale.
 
 ## Dependencies
 
-- 0005-config-merge-validate
-- 0012-llm-resolver
+- 0001-05-config-merge-validate
+- 0001-12-llm-resolver
 
 ## Notes
 
@@ -94,11 +94,11 @@ validate. See `plan/next/in-process-llm.md` for the rationale.
 - Resist the urge to enforce "exactly one of model-id/model-path" at the serde layer
   (e.g. with an untagged sub-enum). The validate-phase check produces a much better error
   message than serde's default.
-- The mistralrs runtime doesn't exist yet (0014-0016 add it), so `resolve_agent` against
-  a `Mistralrs` provider should fail with a clear `feature 'mistralrs' is not enabled in
-  this build` -- but that error path lands in 0015, not here. For now, the resolver can
-  panic or return a placeholder error on `Mistralrs`; tests in this task only exercise
-  parse + validate, not resolve.
+- The mistralrs runtime doesn't exist yet (0001-14 through 0001-16 add it), so `resolve_agent`
+  against a `Mistralrs` provider should fail with a clear `feature 'mistralrs' is not enabled in
+  this build` -- but that error path lands in 0001-15, not here. For now, the resolver can panic or
+  return a placeholder error on `Mistralrs`; tests in this task only exercise parse + validate, not
+  resolve.
 
 ## Decisions
 
@@ -137,7 +137,7 @@ validate. See `plan/next/in-process-llm.md` for the rationale.
 
 - **Placeholder error variant for the Mistralrs runtime gap**:
   `LlmResolveError::MistralrsRuntimeUnavailable`. Replaced
-  `UnsupportedProviderStyle { style: String }`. Task 0015 will replace
+  `UnsupportedProviderStyle { style: String }`. Task 0001-15 will replace
   this placeholder with the feature-flag-aware variant.
 
 - **`tests/fixtures/config-full.toml`**: changed the existing

@@ -86,12 +86,13 @@ still needs, in rough order of how often it will bite:
   (`container/namespace.rs:186-195`); every failure is fatal, since `d79f837` deleted the
   `podman exec` fallback. `/home/<user>` must be creatable too.
 - **A shell, but only under `--network audit` / `--network filter`.** `install_audit_resolv_conf`
-  (`network.rs:915-929`) execs `sh -c 'printf ... > /etc/resolv.conf'` as uid 0.
-  Entrypoint-stdio containers already skip it (they get `--dns` at create time); the default
-  network mode never runs it. Making it argv-shaped, or reusing the namespace-write path the
-  user bootstrap already has, would remove the last shell dependency. Unfiled; note that
-  `plan/todo/0117-attach-and-detach-are-a-true-inverse-pair.md` snapshots and restores the same
-  file, so whoever touches this write path should read that task first.
+  (`network.rs:915-929`) execs `sh -c 'printf ... > /etc/resolv.conf'` as uid 0. Entrypoint-stdio
+  containers already skip it (they get `--dns` at create time); the default network mode never runs
+  it. Making it argv-shaped, or reusing the namespace-write path the user bootstrap already has,
+  would remove the last shell dependency. Unfiled; note that
+  `plan/done/phase/0002-sidecars/tasks/0002-40-attach-and-detach-are-a-true-inverse-pair.md`
+  snapshots and restores the same file, so whoever touches this write path should read that task
+  first.
 - **`/mnt` and `/proc`, for `view = "primary"` sidecars only.** The launcher's own error text
   asks for them by name.
 
@@ -130,5 +131,5 @@ reason but still inert.
   embed-and-place pattern to copy.
 - `crates/outrig/tests/library_surface.rs` -- `build_shell_less_image`, both a precedent for the
   test fixture and an existing statement that no `CMD` is needed.
-- `plan/todo/0117-attach-and-detach-are-a-true-inverse-pair.md` -- the other work on the
-  `resolv.conf` write; it absorbed the buffer entry this used to point at.
+- `plan/done/phase/0002-sidecars/tasks/0002-40-attach-and-detach-are-a-true-inverse-pair.md` -- the
+  other work on the `resolv.conf` write; it absorbed the buffer entry this used to point at.

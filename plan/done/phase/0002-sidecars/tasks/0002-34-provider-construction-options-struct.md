@@ -1,4 +1,4 @@
-# 0111 -- `LlmProvider` construction now speaks two idioms
+# 0002-34 -- `LlmProvider` construction now speaks two idioms
 
 `LlmProvider::openai(base_url, api_key, request_timeout_secs)` and
 `::anthropic(..)` take their three fields positionally. `retry-budget-secs`
@@ -26,7 +26,7 @@ waiting for the next major.
 
 ## Deliverables
 
-An options struct, matching the shape 0095 used for the session options:
+An options struct, matching the shape 0002-18 used for the session options:
 
 ```rust
 let provider = LlmProvider::openai(base_url, api_key, OpenAiOptions {
@@ -58,7 +58,7 @@ None hard. Queued last on purpose: rc.1 already shipped `with_retry_budget_secs`
 as the non-breaking workaround and the variants are `#[non_exhaustive]`, so
 downstream cannot construct them anyway. That makes this the one pre-final entry
 that is API shape rather than API correctness, and the first to cut if the
-window tightens. 0106 also touches `request-timeout-secs`; if both land, this one
+window tightens. 0002-29 also touches `request-timeout-secs`; if both land, this one
 moves the field into the options struct rather than reasoning about it twice.
 
 ## Decisions
@@ -71,7 +71,7 @@ moves the field into the options struct rather than reasoning about it twice.
    downstream. What is left without setters is
    `let mut o = OpenAiOptions::default(); o.request_timeout_secs = Some(600);`, and the three
    in-tree call sites that took that shape are the evidence for how it reads. `ExecOptions`
-   (0107) and `ContainerCreateOptions` (0095, Decisions 2 and 11) both answer this the same
+   (0002-30) and `ContainerCreateOptions` (0002-18, Decisions 2 and 11) both answer this the same
    way, so this is the settled convention rather than a new one.
 
 2. **Clippy does not catch the field-assignment shape, contrary to the working assumption.**
@@ -86,7 +86,7 @@ moves the field into the options struct rather than reasoning about it twice.
 3. **The setters take `u64`, not `Option<u64>`.** The removed `with_retry_budget_secs` took an
    `Option` because it was the only way to spell "unset" on a builder bolted onto a
    constructor. With an options struct, "unset" is spelled by not calling the setter, and
-   `ExecOptions::with_workdir` already takes its value bare. 0095 Decision 9 chose the `Option`
+   `ExecOptions::with_workdir` already takes its value bare. 0002-18 Decision 9 chose the `Option`
    form for `with_transcript` on the grounds that every producer already held one; the opposite
    is true here -- the CLI reads these values *off* the enum variant (`llm.rs`), it never feeds
    the constructor, so every caller has a literal.
@@ -95,7 +95,7 @@ moves the field into the options struct rather than reasoning about it twice.
    identical.** Collapsing them would reintroduce the defect this task exists to remove, one
    level up: a field meaningful to one provider and not the other would have to be ignored in
    silence on one path. Worth stating plainly that this is *weaker* than the precedent it
-   leans on. 0095 Decision 3 rejected the same sharing between `start_named` and
+   leans on. 0002-18 Decision 3 rejected the same sharing between `start_named` and
    `create_initialized` where the field sets already differed -- `podman run` accepts none of
    `env`, `intercept_dns`, `args` -- so a shared struct would have ignored real fields on a
    real path, present tense. Here the divergence is prospective, and the price is paid now: the
@@ -133,11 +133,11 @@ moves the field into the options struct rather than reasoning about it twice.
    that path the only one. No new test was written: `config_merge.rs`'s
    `mistralrs_provider_ignores_request_timeout_secs` already pins the swallow deliberately, and
    `plan/next/mistralrs-provider-swallows-keys.md` already proposes the fix. That entry now
-   records the corrected claim and the fact that 0111 left it holding the whole hazard.
+   records the corrected claim and the fact that 0002-34 left it holding the whole hazard.
 
 7. **`public-api.txt` took this task's eight lines and left the `std::io` renderings alone.**
    Regenerating with the pinned cargo-public-api 0.52.0 also rewrites seven `std::io::error`
-   paths to `core::io::error`, which is toolchain drift rather than a surface change -- 0107
+   paths to `core::io::error`, which is toolchain drift rather than a surface change -- 0002-30
    Decision 13 already declined it, and taking it here would bury this task's diff. The eight
    new lines were merged in by hand and the result diffed against a full regeneration to
    confirm nothing else moved.

@@ -1,11 +1,11 @@
-# 0096 -- Library parity for sidecar placements and primary exec
+# 0002-19 -- Library parity for sidecar placements and primary exec
 
 ## Context
 
-OutRig has two consumers: the CLI (`outrig run` / `outrig mcp`), which drives a `Config`
-parsed from TOML, and embedding programs, which build a `LaunchSpec` by hand. Since
-`plan/done/0079-sidecar-core-exec-stdio.md` and the entrypoint-stdio work that followed, the
-config path has grown three placements the library path never got:
+OutRig has two consumers: the CLI (`outrig run` / `outrig mcp`), which drives a `Config` parsed from
+TOML, and embedding programs, which build a `LaunchSpec` by hand. Since
+`plan/done/phase/0002-sidecars/tasks/0002-02-sidecar-core-exec-stdio.md` and the entrypoint-stdio
+work that followed, the config path has grown three placements the library path never got:
 
 - **entrypoint-stdio** -- an MCP entry with no `command`, where the container's `ENTRYPOINT`
   *is* the server. This is what makes off-the-shelf images like
@@ -179,14 +179,15 @@ prototype should confirm), or **Open** (deferred).
 - `crates/outrig/tests/library_surface.rs` -- `add_sidecar_extends_tools_and_serves_calls`
   (:204), `launch_with_sidecar_starts_it` (:276),
   `from_config_resolves_and_starts_a_config_sidecar` (:334): where the new cases belong.
-- `plan/done/0079-sidecar-core-exec-stdio.md` and `plan/done/0088-entrypoint-stdio-args.md` --
-  where the config-side placements came from.
+- `plan/done/phase/0002-sidecars/tasks/0002-02-sidecar-core-exec-stdio.md` and
+  `plan/done/phase/0002-sidecars/tasks/0002-11-entrypoint-stdio-args.md` -- where the config-side
+  placements came from.
 
 ## Decisions
 
 - **Fork 1 resolved as recommended: `SidecarServerSpec` is a two-variant enum**
   (`ExecStdio { command, env }` / `Entrypoint { args, env }`) with `view` on `SidecarSpec`,
-  mirroring `SidecarConfig`. Both variants are sealed per 0094 Decision 6, so they ship
+  mirroring `SidecarConfig`. Both variants are sealed per 0002-17 Decision 6, so they ship
   constructors (`exec` / `entrypoint`, renaming `new` for symmetry with `McpServerSpec`),
   `with_env`, and `command()` / `args()` / `env()` / `is_entrypoint()` accessors. The builder
   chain stays infallible and the two `with_*_server` families coexist; "an entrypoint host
@@ -249,7 +250,7 @@ prototype should confirm), or **Open** (deferred).
     image whose `ENTRYPOINT` is a bare `node` -- which is `docker.io/mcp/filesystem:latest`,
     the docs' quickstart -- still cannot start. `crates/outrig-cli/tests/primary_view_e2e.rs`
     consequently remains red, exactly as it is on trunk. Fixing it means changing the
-    standalone musl launcher, which is 0089's territory and well outside this task.
+    standalone musl launcher, which is 0002-12's territory and well outside this task.
   - The library's `view = "primary"` e2e therefore runs a `docker.io/mcp/filesystem:latest`
     derivative that restates the same program absolutely, which exercises the placement end to
     end without depending on the unfixed half. The plain entrypoint-stdio e2e uses the upstream
@@ -258,7 +259,7 @@ prototype should confirm), or **Open** (deferred).
 - **The entrypoint e2e uses the real image, not the `mcp-entrypoint` fixture.** "An unmodified
   off-the-shelf MCP image needs no repo-side command knowledge" is the claim, and a fixture with
   a hand-written ENTRYPOINT would not test it. The louder "the args did not arrive" signal that
-  fixture provides (0088 made its `entry.sh` exit 64 on empty argv) is already covered on the
+  fixture provides (0002-11 made its `entry.sh` exit 64 on empty argv) is already covered on the
   config path by `named_sidecar_entrypoint_host_serves_workspace_from_args`.
 
 ## Decisions from the `/simplify` pass

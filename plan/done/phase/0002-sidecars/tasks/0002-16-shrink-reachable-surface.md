@@ -1,4 +1,4 @@
-# 0093 -- Shrink the reachable public surface before 0.2.0 freezes it
+# 0002-16 -- Shrink the reachable public surface before 0.2.0 freezes it
 
 ## Context
 
@@ -33,7 +33,7 @@ modules).
 re-exported. `LaunchSource` (in `outrig_.rs`) is `pub(crate)` and never re-exported, so it is not
 a hazard. But `Outrig`, `LaunchSpec`, `SidecarSpec`, `WorkspaceSpec`, `MountSpec`, `SecuritySpec`,
 `CapabilitySpec`, `NetworkSpec`, `SidecarServerSpec`, `ToolHandle`, and `EmbeddedMcpPolicy` *are*
-re-exported, and their public fields **are** hazards. Those are 0094's problem.
+re-exported, and their public fields **are** hazards. Those are 0002-17's problem.
 
 **Consequence 2 -- the finding this task exists for:** because `container`, `config`, `image`,
 `network`, and `mcp_proxy` are `pub mod` rather than curated re-export lists, *every*
@@ -67,15 +67,15 @@ exactly this class (`McpServerSpec::Full` gaining `args`, `SidecarConfig` gainin
 fields) -- direct evidence that this surface grows along precisely the axes the insulation
 patterns would protect.
 
-The obvious response is to annotate everything. That is 0094 and 0095. This task comes first
+The obvious response is to annotate everything. That is 0002-17 and 0095. This task comes first
 because **reducing reach strictly dominates annotating**: a type nobody can name has no SemVer
 hazard at all, needs no attribute, and costs nothing to change later. Settling reach first deletes
-roughly a dozen rows from 0094's table and can make 0095's `create_initialized` options struct
+roughly a dozen rows from 0002-17's table and can make 0002-18's `create_initialized` options struct
 evaporate entirely. Annotating a type that is then de-published is wasted work.
 
 This also finishes a direction already on record -- see
-`plan/done/0064-audit-library-struct-visibility.md` and
-`plan/done/0065-tighten-library-module-visibility.md`.
+`plan/done/phase/0001-bootstrap/tasks/0001-64-audit-library-struct-visibility.md` and
+`plan/done/phase/0001-bootstrap/tasks/0001-65-tighten-library-module-visibility.md`.
 
 ## Goal
 
@@ -88,7 +88,7 @@ applies only to types that are deliberately public.
   `crates/outrig/src/lib.rs:5-15`. Either demote them to `pub(crate) mod`, or keep the module
   public with `pub(crate)` internals and re-export only the handful of types the facade genuinely
   needs. If a downstream crate is *supposed* to drive `Container` directly, keep it -- but then
-  the spec types and `create_initialized` must get 0095's treatment, and the task should say so
+  the spec types and `create_initialized` must get 0002-18's treatment, and the task should say so
   explicitly rather than leaving it implied.
 - **A boundary on `crates/outrig-cli/src/lib.rs`.** Gate the test-only surface behind
   `#[doc(hidden)]` or `#[cfg(any(test, feature = "internal-test-api"))]`, so the seven CLI types
@@ -112,13 +112,13 @@ applies only to types that are deliberately public.
   separate crates, so anything they reach has to stay reachable to them by whatever mechanism the
   boundary uses.
 - `cargo public-api` (or an equivalent surface diff) shows the intended surface and nothing more.
-  Capture the output; 0094 works from it.
+  Capture the output; 0002-17 works from it.
 
 ## Design forks
 
 1. **How much of `container` is public -- Open, and this task decides it.** The evidence is
    `library_surface.rs`: whatever it needs is public, whatever it does not need is a candidate for
-   demotion. That test does not compile today, which is why 0092 gates this task -- the decision
+   demotion. That test does not compile today, which is why 0002-15 gates this task -- the decision
    should be made against a suite that runs, not against a reading of the source.
 
 2. **De-publish versus `#[doc(hidden)]` for the CLI crate -- Recommended: a cfg feature.**
@@ -142,11 +142,13 @@ applies only to types that are deliberately public.
 
 - `crates/outrig/src/lib.rs` -- the `pub mod` / `pub use` set this task curates.
 - `crates/outrig-cli/src/lib.rs` -- the module doc that already states the intended boundary.
-- `plan/done/0064-audit-library-struct-visibility.md`,
-  `plan/done/0065-tighten-library-module-visibility.md` -- the same direction, earlier.
-- `plan/todo/0094-non-exhaustive-sweep.md` -- annotates whatever survives this task.
-- `plan/todo/0095-options-structs-and-sealing.md` -- the signature changes, several of which
-  evaporate depending on this task's outcome.
+- `plan/done/phase/0001-bootstrap/tasks/0001-64-audit-library-struct-visibility.md`,
+  `plan/done/phase/0001-bootstrap/tasks/0001-65-tighten-library-module-visibility.md` -- the same
+  direction, earlier.
+- `plan/done/phase/0002-sidecars/tasks/0002-17-non-exhaustive-sweep.md` -- annotates whatever
+  survives this task.
+- `plan/done/phase/0002-sidecars/tasks/0002-18-options-structs-and-sealing.md` -- the signature
+  changes, several of which evaporate depending on this task's outcome.
 
 ## Decisions
 
@@ -172,15 +174,15 @@ applies only to types that are deliberately public.
    runtime-core set to save one type would fragment the story, and a caller driving containers
    directly is the same caller who eventually wants policy over them.
 
-4. **Consequence for 0095, stated rather than implied** (the task asked for this explicitly):
+4. **Consequence for 0002-18, stated rather than implied** (the task asked for this explicitly):
    because `Container` is deliberately public, `ContainerLaunchSpec`, `ContainerWorkspace`,
    `ContainerMount`, `ContainerCapabilities`, `PrimaryView`, and `Container::create_initialized`
    all need the options-struct and sealing treatment. `image::ImageTag`'s public tuple field is
    load-bearing downstream (`ImageTag(name)`), so making it opaque requires shipping a
    constructor in the same change.
 
-5. **This task grows 0094/0095's scope instead of shrinking it.** The task expected to delete
-   roughly a dozen rows from 0094's table. It deletes five. Recorded so 0094 does not open
+5. **This task grows 0002-17/0095's scope instead of shrinking it.** The task expected to delete
+   roughly a dozen rows from 0002-17's table. It deletes five. Recorded so 0002-17 does not open
    expecting a smaller job.
 
 6. **Only five paths were removed from the library:**

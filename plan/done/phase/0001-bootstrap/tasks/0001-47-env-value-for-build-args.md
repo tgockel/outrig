@@ -1,12 +1,12 @@
-# 0047 -- `${VAR}` substitution for `build-args`
+# 0001-47 -- `${VAR}` substitution for `build-args`
 
 ## Context
 
 The MCP server `env` table grew `${VAR}` substitution alongside literals
-(`feat/mcp-env-substitution`, on top of `plan/done/0004-api-key-syntax.md`):
-each value is either a literal string or a host-env reference resolved at
-MCP-startup time, with the same `^\$\{[A-Z_][A-Z0-9_]*\}$` syntax as
-`api-key`.
+(`feat/mcp-env-substitution`, on top of
+`plan/done/phase/0001-bootstrap/tasks/0001-04-api-key-syntax.md`): each value is either a literal
+string or a host-env reference resolved at MCP-startup time, with the same
+`^\$\{[A-Z_][A-Z0-9_]*\}$` syntax as `api-key`.
 
 `ContainerConfig::build_args` (`src/config/mod.rs:163`) is the same shape
 -- `BTreeMap<String, String>` -- and the same logical use case. The

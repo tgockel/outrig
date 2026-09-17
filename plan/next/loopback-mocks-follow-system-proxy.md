@@ -13,14 +13,14 @@ ALL_PROXY=http://127.0.0.1:9`, `full_in_flight_tool_tree_shuts_down_within_the_g
 points a provider at a loopback mock -- had **0 of 72** requests reach the mock and failed after
 its 30 s setup timeout instead of measuring anything.
 
-0109 fixed that for the crate's own unit tests by gating `.no_proxy()` behind `#[cfg(test)]` in
+0002-32 fixed that for the crate's own unit tests by gating `.no_proxy()` behind `#[cfg(test)]` in
 `remote_http_client`. That gate does **not** cover the `tests/` binaries: they exercise outrig by
 spawning the built `outrig` binary, which is compiled without `cfg(test)`, so its clients still
 pick up the ambient proxy.
 
 ## Exposure
 
-An integration test in `tests/` links the library compiled *without* `cfg(test)`, so 0109's gate
+An integration test in `tests/` links the library compiled *without* `cfg(test)`, so 0002-32's gate
 does not reach any of them.
 
 **In the default suite** -- `crates/outrig-cli/tests/anthropic_mock.rs`. Explicitly not gated
@@ -57,7 +57,7 @@ Two candidates, roughly in order of preference:
 - Have the e2e harness set `NO_PROXY=127.0.0.1,localhost` for the child `outrig` process. It is
   the standard mechanism, needs no production change, and lives in the one place that spawns the
   binary. Note it must be set on the *child*, not the test process -- mutating the parent's
-  environment races other tests in the same binary, which is why 0109 did not take that route
+  environment races other tests in the same binary, which is why 0002-32 did not take that route
   for the unit tests.
 - Give the binary an explicit opt-out (an `OUTRIG_TEST_NO_PROXY`-style variable, or a hidden
   flag) that `remote_http_client` honors. More invasive, but it survives a harness that forgets.
@@ -68,6 +68,7 @@ proxy hits the same swallowing, and `NO_PROXY` is not obvious as the fix.
 
 ## See also
 
-- `plan/done/0109-subagent-tree-shutdown-grace.md` -- decision 6 records the unit-test fix.
+- `plan/done/phase/0002-sidecars/tasks/0002-32-subagent-tree-shutdown-grace.md` -- decision 6
+  records the unit-test fix.
 - `crates/outrig-cli/src/llm.rs:538` -- `remote_http_client` and the `#[cfg(test)]` gate.
 - `plan/next/http-client-rebuilt-per-agent-build.md` -- the other finding in the same function.

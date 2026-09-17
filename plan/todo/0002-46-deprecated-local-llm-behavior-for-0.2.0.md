@@ -1,4 +1,4 @@
-# 0123 -- Decide what the deprecated local-LLM surface does in 0.2.0
+# 0002-46 -- Decide what the deprecated local-LLM surface does in 0.2.0
 
 ## Context
 
@@ -90,11 +90,11 @@ Conditional on the decision:
    - **Repo root.** The minimal fix: open the same path validation already checks
      (`validate_mistralrs_model` joins to the repo root). No new machinery, no new public
      surface, and the docs already describe this base. Recommended for a deprecated surface.
-   - **Declaring-file provenance.** Consistent with what 0097 did for images and mounts, and with
+   - **Declaring-file provenance.** Consistent with what 0002-20 did for images and mounts, and with
      what a global `[models.<n>]` would want. But it gives `Model` a `ConfigSource`, which
-     immediately inherits 0119's stale-public-field problem -- `Model`'s path fields are public
-     -- so it must adopt 0119's chosen shape rather than inventing a second one. Coordinate with
-     0119 fork 3 or do not take this branch.
+     immediately inherits 0002-42's stale-public-field problem -- `Model`'s path fields are public
+     -- so it must adopt 0002-42's chosen shape rather than inventing a second one. Coordinate with
+     0002-42 fork 3 or do not take this branch.
    - **Reject relative paths.** Smallest possible change, most disruptive; the only in-tree
      relative `model-path` is `crates/outrig/tests/fixtures/config-full.toml`.
 
@@ -117,8 +117,8 @@ Conditional on the decision:
 
 ## Dependencies
 
-None hard. Must precede 0126, which writes the 0.1 -> 0.2 migration guide and has to state this
-behavior, and 0129, which cuts the release that ships it.
+None hard. Must precede 0002-49, which writes the 0.1 -> 0.2 migration guide and has to state this
+behavior, and 0002-52, which cuts the release that ships it.
 
 ## See also
 

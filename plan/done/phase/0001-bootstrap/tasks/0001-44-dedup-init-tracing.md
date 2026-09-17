@@ -1,4 +1,4 @@
-# 0044 -- Dedup `init_tracing` across e2e tests
+# 0001-44 -- Dedup `init_tracing` across e2e tests
 
 ## Goal
 

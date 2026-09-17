@@ -1,8 +1,8 @@
-# 0054 -- `outrig mcp --attach` to an existing container
+# 0001-54 -- `outrig mcp --attach` to an existing container
 
 ## Context
 
-`plan/done/0035-0041` shipped `outrig mcp` with one container per
+`0001-35` through `0001-41` shipped `outrig mcp` with one container per
 invocation. The killer feature it skips: pointing `outrig mcp` at a
 container *already* started by an `outrig run` session, so the human's IDE
 and the agent share live workspace state.
@@ -93,7 +93,7 @@ outrig mcp --attach <session-id-or-container-name> [--container <name>]
   stderr files don't collide.
 - Doc update: `doc/concepts/mcp-servers.md` (attach mode + the
   reentrant-safe MCP server expectation), and the existing
-  `outrig mcp` docs (`doc/usage/mcp.md` or wherever 0041 placed them)
+  `outrig mcp` docs (`doc/usage/mcp.md` or wherever 0001-41 placed them)
   pick up the `--attach` flag.
 - Tests: integration coverage for attach-by-session-id, attach-by-name,
   attach-when-host-stops-container (clean exit), and the
@@ -117,7 +117,7 @@ outrig mcp --attach <session-id-or-container-name> [--container <name>]
 ## Dependencies
 
 None hard. The session-MCP `outrig mcp` subcommand has shipped
-(`plan/done/0035-0041`); this task builds on it.
+(`0001-35` through `0001-41`); this task builds on it.
 
 ## Decisions
 
@@ -138,7 +138,7 @@ None hard. The session-MCP `outrig mcp` subcommand has shipped
 
 ## See also
 
-- `plan/done/0035-0041` -- the v0 fresh-container `outrig mcp` this
+- `0001-35` through `0001-41` -- the v0 fresh-container `outrig mcp` this
   builds on.
 - `src/container/mod.rs:288-296` -- the existing `Drop for Container`.
 - `src/cli/run.rs:155-174` -- the existing teardown order this respects.

@@ -1,8 +1,8 @@
-# 0117 -- Interceptor attach rolls back, and detach ends every bridge it started
+# 0002-40 -- Interceptor attach rolls back, and detach ends every bridge it started
 
 ## Context
 
-0078 made `NetworkInterceptor` multi-container: one `Attachment` per container, holding a
+0002-01 made `NetworkInterceptor` multi-container: one `Attachment` per container, holding a
 `CancellationToken`, a `Vec<JoinHandle<()>>`, and a `Cleanup`. Two defects follow from operation
 ordering and task ownership rather than from any race, so both reproduce deterministically.
 
@@ -36,10 +36,10 @@ grounds that every planned caller detaches immediately before stopping the conta
 finding is that the *attach failure* path reaches the same state with the container still
 running, so the invariant that entry relied on does not hold.
 
-### A scope guard is not sufficient, and 0116 does not cover this
+### A scope guard is not sufficient, and 0002-39 does not cover this
 
 An ordinary Rust scope guard cannot await. Restoring `/etc/resolv.conf` means running a `podman
-exec`; deleting an nft table means running `nsenter`. Neither is expressible in `Drop`. And 0116
+exec`; deleting an nft table means running `nsenter`. Neither is expressible in `Drop`. And 0002-39
 solves a different problem: it makes a *child process* die when its future is dropped. It runs no
 compensating action. A canceled `attach` that has already rewritten the resolver needs work to
 *happen*, not work to *stop*.
@@ -113,10 +113,10 @@ report what failed.
 
 ## Design forks
 
-1. **Abort versus graceful close for in-flight bridges -- Recommended: cancel, then abort on a
-   short grace.** Cutting a copy loop mid-stream is visible to the container as a truncated
-   connection, which is honest for a detach but not free. A grace bounded in the hundreds of
-   milliseconds matches `plan/done/0109-subagent-tree-shutdown-grace.md`'s posture.
+1. **Abort versus graceful close for in-flight bridges -- Recommended: cancel, then abort on a short
+   grace.** Cutting a copy loop mid-stream is visible to the container as a truncated connection,
+   which is honest for a detach but not free. A grace bounded in the hundreds of milliseconds
+   matches `plan/done/phase/0002-sidecars/tasks/0002-32-subagent-tree-shutdown-grace.md`'s posture.
 
 2. **Who owns the rollback -- Open between two shapes, both of which must survive an unawaited
    caller.** An independently spawned transaction task commits or rolls back regardless of who is
@@ -135,7 +135,7 @@ report what failed.
 ## Dependencies
 
 - **Hard: 0116.** The cancellation half needs a child that dies with its future; otherwise a
-  canceled `attach` still leaves the `podman exec` that rewrote `resolv.conf` running. 0116 is
+  canceled `attach` still leaves the `podman exec` that rewrote `resolv.conf` running. 0002-39 is
   necessary and not sufficient -- see Context.
 
 ## See also
@@ -144,8 +144,10 @@ report what failed.
   `apply_nft_rules` call (307), `Attachment` (224), `detach` (342), `shutdown` (352),
   `teardown_attachment` (374), `Cleanup::delete_table` (398), `tcp_accept_loop` spawn (606),
   `handle_tcp` (624), `dns_loop` (805).
-- `plan/done/0078-interceptor-multi-container.md` -- where per-container attachment was built.
-- `plan/done/0109-subagent-tree-shutdown-grace.md` -- the existing grace-period posture.
+- `plan/done/phase/0002-sidecars/tasks/0002-01-interceptor-multi-container.md` -- where
+  per-container attachment was built.
+- `plan/done/phase/0002-sidecars/tasks/0002-32-subagent-tree-shutdown-grace.md` -- the existing
+  grace-period posture.
 
 ## Decisions
 
@@ -173,7 +175,7 @@ report what failed.
    rollback survive a caller that is already gone -- including an embedder dropping the runtime
    the call was running on, which a rollback implemented as a spawned task would not survive.
    The Context's claim that "an ordinary Rust scope guard cannot await" is true and beside the
-   point; it predates 0116 landing `detach_cleanup`.
+   point; it predates 0002-39 landing `detach_cleanup`.
 
 2. **The pre-insert window is closed by the move, not by a rule.** The deliverables asked for
    cancellation to be injected immediately before `attachments.insert`. In the shipped design
@@ -311,7 +313,7 @@ checks contradicted what the code assumed.
     write undone. A byte-identical round trip through the real commands was confirmed against
     a live container.
 
-    This is what carries `process::Owned`'s guarantee across the container boundary. 0116 made
+    This is what carries `process::Owned`'s guarantee across the container boundary. 0002-39 made
     a dropped future kill its child; that only reaches the workload if the child *is* the
     workload.
 
@@ -821,17 +823,17 @@ Four of the five findings were defects in the previous round's fixes.
     moment at which removing by name is still safe.
 
 76. **The cancellation window between commit and narrowing stays open, deliberately.** The handle
-    exists only in the output of the transaction that assigned it, so a cancellation that never
-    sees that output has nothing narrower to arm. Closing it would mean one of two worse things:
-    arming nothing, which leaves a live container redirecting to a listener that has stopped with
-    nothing coming to remove it, or resolving the identity at removal time, which is the
-    check-then-act this was built to avoid. Spawning the apply so a dropped future still records
-    the handle was rejected for the reason decision 2 gives: a task does not survive the runtime
-    an embedder is tearing down, so it would not hold on the path that needs it. What is exposed
-    is an actor holding `NET_ADMIN` in the container's own network namespace -- not granted by
-    default -- who can also delete and recreate the table within the interval between nft's
-    commit and the undo being issued. `a_cancelled_apply_leaves_the_name_alone_armed_and_nothing_narrower`
-    pins the behavior so it stays a decision rather than becoming an accident.
+    exists only in the output of the transaction that assigned it, so a cancellation that never sees
+    that output has nothing narrower to arm. Closing it would mean one of two worse things: arming
+    nothing, which leaves a live container redirecting to a listener that has stopped with nothing
+    coming to remove it, or resolving the identity at removal time, which is the check-then-act this
+    was built to avoid. Spawning the apply so a dropped future still records the handle was rejected
+    for the reason decision 2 gives: a task does not survive the runtime an embedder is tearing
+    down, so it would not hold on the path that needs it. What is exposed is an actor holding
+    `NET_ADMIN` in the container's own network namespace -- not granted by default -- who can also
+    delete and recreate the table within the interval between nft's commit and the undo being
+    issued. `a_cancelled_apply_leaves_the_name_alone_armed_and_nothing_narrower` pins the behavior
+    so it stays a decision rather than becoming an accident.
 
 ## Decisions from the fourteenth review
 

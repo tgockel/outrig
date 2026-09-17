@@ -36,9 +36,10 @@ So the honest options, in ascending order of cost:
   stale, which is exactly the objection `doc/reference/config.md` already records against tier 2
   ("an identifier newer than that release lands in tier 3 even though it is current") -- now with
   outrig owning the staleness instead of rig.
-- **Nothing, and lean on the clamp plus a clear runtime error.** Defensible. `crates/outrig-cli/src/error.rs`
-  already rewrites rig's missing-`max_tokens` error into config language; the over-ceiling refusal
-  could get the same treatment, turning a provider 400 into "reduce `[models.haiku].max-tokens`".
+- **Nothing, and lean on the clamp plus a clear runtime error.** Defensible.
+  `crates/outrig-cli/src/error.rs` already rewrites rig's missing-`max_tokens` error into config
+  language; the over-ceiling refusal could get the same treatment, turning a provider 400 into
+  "reduce `[models.haiku].max-tokens`".
 
 The third is probably the best value and is not what the entry's title suggests, which is why this
 is filed as a question rather than a task.

@@ -1,4 +1,4 @@
-# 0020 -- Session store
+# 0001-20 -- Session store
 
 ## Goal
 
@@ -46,8 +46,8 @@ explicit ones so `outrig ls` keeps working uniformly.
     in root points at it, remove that too.
 - session-root resolver: `fn resolve_session_root(flag: Option<&Path>, cfg: &Config,
   default: &Path) -> PathBuf` -- flag > cfg.session_root > default.
-- Wire into `outrig run` (0019): pass `--session-dir` and resolved root to `SessionStore`,
-  capture per-MCP stderr to `<session_dir>/logs/<server>.stderr` (already done in 0010, but
+- Wire into `outrig run` (0001-19): pass `--session-dir` and resolved root to `SessionStore`,
+  capture per-MCP stderr to `<session_dir>/logs/<server>.stderr` (already done in 0001-10, but
   the `log_dir` argument now points into the session dir).
 - Atomic writes: `tempfile::NamedTempFile::persist` for session.json updates.
 - `tests/session_store.rs` covering:
@@ -69,8 +69,8 @@ explicit ones so `outrig ls` keeps working uniformly.
 
 ## Dependencies
 
-- 0005-config-merge-validate
-- 0019-agent-loop
+- 0001-05-config-merge-validate
+- 0001-19-agent-loop
 
 ## Notes
 
@@ -99,7 +99,7 @@ explicit ones so `outrig ls` keeps working uniformly.
 - **`--session-root` is a top-level global flag (`src/bin/outrig.rs`); `--session-dir` is
   per-`run`.** The doc frames `--session-root` as available on every session-touching
   subcommand (run/ls/logs/discard); making it `global = true` lets ls/logs/discard (task
-  0021) inherit it without per-subcommand duplication.
+  0001-21) inherit it without per-subcommand duplication.
 - **`outrig run --session-dir <path>` requires `<path>` to be an existing directory.**
   Auto-creating would mask typos; the user has explicitly opted in to a known location, so a
   missing dir is a configuration error. Future init-style commands can mkdir if their

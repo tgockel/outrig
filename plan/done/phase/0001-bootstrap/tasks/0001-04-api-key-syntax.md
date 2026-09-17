@@ -1,4 +1,4 @@
-# 0004 -- API-key syntax
+# 0001-04 -- API-key syntax
 
 ## Goal
 
@@ -22,7 +22,7 @@ they never end up in committed config files.
   on `NotPresent` or `NotUnicode`.
 - Custom serde `Deserialize` for `ApiKeyRef` so `providers.<name>.api-key` deserializes
   straight to the typed value.
-- Replace the `String` field on `LlmProvider::api_key` from 0003 with `ApiKeyRef`.
+- Replace the `String` field on `LlmProvider::api_key` from 0001-03 with `ApiKeyRef`.
 - `tests/api_key.rs` covering every accept/reject case from `doc/reference/config.md`'s
   "api-key syntax" section, plus resolve-when-set and resolve-when-unset.
 
@@ -35,7 +35,7 @@ they never end up in committed config files.
 
 ## Dependencies
 
-- 0003-config-schema
+- 0001-03-config-schema
 
 ## Notes
 

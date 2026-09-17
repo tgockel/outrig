@@ -1,4 +1,4 @@
-# 0120 -- MCP content is canonical data, or the reduced contract is written down
+# 0002-43 -- MCP content is canonical data, or the reduced contract is written down
 
 ## Context
 
@@ -53,7 +53,7 @@ a written contract that consumers can rely on deliberately rather than by defaul
 Under the recommended fork:
 
 - **`McpToolResult` carries ordered, protocol-neutral content blocks** plus structured content.
-  Neutral matters: the blocks must not be rmcp types, or this task hands 0124 a worse problem.
+  Neutral matters: the blocks must not be rmcp types, or this task hands 0002-47 a worse problem.
 - **`content_text` stops being a public mutable field.** Two sources of truth that can disagree
   is a worse API than one lossy one. It becomes a derived accessor or an explicit renderer; keep
   `McpToolResult::ok(text)` / `::error(text)` as convenience constructors that build a single
@@ -109,10 +109,10 @@ that richer fidelity is a future minor rather than an oversight.
    An outrig-owned `ContentBlock` enum is the honest shape and duplicates a chunk of the
    protocol. Re-exporting rmcp's is smaller and pulls rmcp deeper into the public surface.
 
-   The queue runs one task end to end at a time, so a prose instruction to "coordinate with 0124"
-   is not executable: 0120 would freeze a representation before 0124 ever reaches its verdict.
+   The queue runs one task end to end at a time, so a prose instruction to "coordinate with 0002-47"
+   is not executable: 0002-43 would freeze a representation before 0002-47 ever reaches its verdict.
    So the *boundary decision* lands here, in this task's `## Decisions` -- content blocks, and
-   the principle governing errors and protocol versions -- and 0124 takes it as a hard dependency
+   the principle governing errors and protocol versions -- and 0002-47 takes it as a hard dependency
    and applies it to the surfaces this task does not touch. This task must therefore look at
    `OutrigError`'s three rmcp variants and `SUPPORTED_PROTOCOL_VERSIONS` before deciding, even
    though it changes neither: a content-only answer that implies a different answer for those is
@@ -120,8 +120,8 @@ that richer fidelity is a future minor rather than an oversight.
 
 ## Dependencies
 
-None hard. Must land before 0125 regenerates the snapshot, and its fork-2 answer must be reached
-jointly with 0124's fork 1.
+None hard. Must land before 0002-48 regenerates the snapshot, and its fork-2 answer must be reached
+jointly with 0002-47's fork 1.
 
 ## See also
 

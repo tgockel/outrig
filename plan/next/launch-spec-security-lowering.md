@@ -1,6 +1,6 @@
 # A `[security]` key is lowered onto `ContainerLaunchSpec` by hand at four sites
 
-> **Adjacent to `plan/todo/0118-from-config-lowers-the-network-policy.md`**, which fixes a
+> **Adjacent to `plan/todo/0002-41-from-config-lowers-the-network-policy.md`**, which fixes a
 > `[network]` block that `LaunchSpec::from_config` does not lower at all. This entry is the
 > ergonomic half for `[security]`: four hand-copied lowering sites, any of which can be forgotten.
 > A single conversion targeting `ContainerLaunchSpec` would close both, so read this before
@@ -39,8 +39,9 @@ key is added. The container unit tests do not catch it either: they construct
 `ContainerLaunchSpec` directly, so they exercise the argv and never the config -> launch
 mapping.
 
-`plan/done/0087-nested-container-runtime.md` recorded the `session_setup.rs` sites as the trap
-its own plan missed. `0114`'s `unmask` hit the same four sites again.
+`plan/done/phase/0002-sidecars/tasks/0002-10-nested-container-runtime.md` recorded the
+`session_setup.rs` sites as the trap its own plan missed. `0002-37`'s `unmask` hit the same four
+sites again.
 
 ## Not the fix: routing the CLI through `SecuritySpec`
 

@@ -4,11 +4,11 @@
 
 None observed. This is a missing policy control, not a live defect.
 
-0101 gave `outrig__subagent` an optional `model` argument naming a `[models.<name>]`, and left the
-choice entirely with the launching agent: any model the running build can reach is offered in the
-tool schema's `enum` and accepted at launch. That was sequenced deliberately -- the feature is worth
-having before the policy schema is designed, and 0101's fork 1 records the omission as ordering
-rather than oversight -- but it leaves the operator with no say.
+0002-24 gave `outrig__subagent` an optional `model` argument naming a `[models.<name>]`, and left
+the choice entirely with the launching agent: any model the running build can reach is offered in
+the tool schema's `enum` and accepted at launch. That was sequenced deliberately -- the feature is
+worth having before the policy schema is designed, and 0002-24's fork 1 records the omission as
+ordering rather than oversight -- but it leaves the operator with no say.
 
 The cost asymmetry runs the wrong way. Delegating *down* is the use case the argument was built for
 and needs no guardrail. Delegating *up* is the one nobody asked for: an agent running on a cheap
@@ -20,7 +20,7 @@ altogether, which also removes it from `outrig run --model`.
 ## Shape
 
 An `[agents.<name>].subagent-models` allowlist, constraining the argument to a named set and
-refusing the rest. Points that follow from how 0101 landed:
+refusing the rest. Points that follow from how 0002-24 landed:
 
 - **Absent means unconstrained.** Adding the key later cannot break a config that never had one,
   which is what made deferring it safe in the first place.
@@ -41,8 +41,9 @@ refusing the rest. Points that follow from how 0101 landed:
 
 ## See also
 
-- `plan/done/0101-subagent-model-selection.md` -- fork 1 states the case for the allowlist and why
-  it was left out; decisions 1-3 cover the enum and the refusal text this would extend.
+- `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md` -- fork 1 states the
+  case for the allowlist and why it was left out; decisions 1-3 cover the enum and the refusal text
+  this would extend.
 - `crates/outrig-cli/src/subagent/mod.rs` -- `usable_model_names`, `resolve_launch_model`, and
   `unusable_model_message`.
 - `crates/outrig-cli/src/mcp_self/docs/reference/config.md` -- the `[agents.<name>]` table the key

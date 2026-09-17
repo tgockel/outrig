@@ -1,10 +1,9 @@
 # Private intra-doc links have crept back in
 
-`plan/done/0052-cargo-doc-private-link-warnings.md` demoted every public-item doc
-link that pointed at a private symbol to code-formatted text, on the grounds that
-the targets are implementation details rather than reader-facing anchors. Three
-have since reappeared. `cargo doc -p outrig` reports them as
-`rustdoc::private_intra_doc_links`:
+`plan/done/phase/0001-bootstrap/tasks/0001-52-cargo-doc-private-link-warnings.md` demoted every
+public-item doc link that pointed at a private symbol to code-formatted text, on the grounds that
+the targets are implementation details rather than reader-facing anchors. Three have since
+reappeared. `cargo doc -p outrig` reports them as `rustdoc::private_intra_doc_links`:
 
 - `crates/outrig/src/error.rs:85` -- `OutrigError::Spawn` links to
   `crate::process::Cmd::render`.
@@ -19,8 +18,8 @@ means to name files rather than items:
 - `crates/outrig/src/container/enter/mod.rs:7` -- `` [`launcher.rs`] `` and
   `` [`elf`] ``.
 
-Five one-line fixes, all the same shape 0052 already settled. Noticed while
-landing 0116, which added a sixth of the same kind and fixed only its own --
+Five one-line fixes, all the same shape 0001-52 already settled. Noticed while
+landing 0002-39, which added a sixth of the same kind and fixed only its own --
 touching the others would have put unrelated doc edits in a cancellation diff.
 
 Worth pairing with a CI guard, since a landed decision that nothing enforces is

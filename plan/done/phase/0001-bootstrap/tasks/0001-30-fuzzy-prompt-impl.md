@@ -1,8 +1,8 @@
-# 0030 -- Rich-TUI `PromptSource` impl (FuzzySelect, etc.)
+# 0001-30 -- Rich-TUI `PromptSource` impl (FuzzySelect, etc.)
 
 ## Context
 
-Task 0022 landed `init::prompt::PromptSource` (a trait) and `TerminalPrompt<R, W>`
+Task 0001-22 landed `init::prompt::PromptSource` (a trait) and `TerminalPrompt<R, W>`
 (a literal-input impl rendering to `AsyncWrite` so tests can drive it through
 `tokio::io::duplex`). For small finite lists ("openai" / "anthropic", `Y/n`,
 free-text path) the literal-input UX is fine: the user types the value or
@@ -46,7 +46,7 @@ abstraction already exists; this task adds a second impl alongside
 
 ## Approach sketch
 
-1. Add `dialoguer` back to `Cargo.toml` (it was dropped at the end of 0022
+1. Add `dialoguer` back to `Cargo.toml` (it was dropped at the end of 0001-22
    precisely because it had no caller without this task).
 2. New file `src/init/prompt/dialoguer.rs` with a `DialoguerPrompt` struct
    that impls `PromptSource`. Each method:
@@ -62,7 +62,7 @@ abstraction already exists; this task adds a second impl alongside
        Box::new(TerminalPrompt::from_real_io())
    }
    ```
-   Callsites in 0024/0031/0033 use `prompt::auto()` and stop caring which
+   Callsites in 0001-24/0031/0033 use `prompt::auto()` and stop caring which
    impl is live.
 4. **Tests:** the rich impl can't be driven through `tokio::io::duplex`
    (dialoguer needs a real TTY). Test the trait contract with the existing
@@ -92,11 +92,11 @@ abstraction already exists; this task adds a second impl alongside
 
 ## Dependencies
 
-- 0022-prompt-ux
+- 0001-22-prompt-ux
 
 ## Notes
 
-- The trait shape from 0022 is the integration surface; no changes to
+- The trait shape from 0001-22 is the integration surface; no changes to
   `Field` or to existing `TerminalPrompt` behavior should be needed.
 - An eventual `AiPrompt` impl (LLM produces structured answers) is a third
   variant in the same hierarchy, unrelated to this task but part of why
@@ -133,7 +133,7 @@ abstraction already exists; this task adds a second impl alongside
   available. Adds `fuzzy-matcher` and a few transitive deps -- acceptable
   for the UX win.
 - **`AutoPrompt` and `auto()` are wired into `config::init::run()`.** This
-  is the only live caller today; tasks 0031/0033 will use `auto()` the
+  is the only live caller today; tasks 0001-31/0033 will use `auto()` the
   same way without additional plumbing.
 - **No pty smoke tests added.** The trait contract is fully covered by
   `tests/prompt_ux.rs` against `TerminalPrompt`; `DialoguerPrompt` is a

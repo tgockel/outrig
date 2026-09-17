@@ -1,4 +1,4 @@
-# 0090 -- Sidecars that share the primary container's filesystem view
+# 0002-13 -- Sidecars that share the primary container's filesystem view
 
 ## Context
 
@@ -46,7 +46,7 @@ error until someone measures it.
 - A `view` key on `[images.<x>.sidecars.<sc>]` and on the inline anonymous form, carried through
   `SidecarPlan` (`crates/outrig/src/container/sidecar.rs:53-66`) and `SidecarSpec`.
 - Launch flags emitted from `append_launch_flags` (`crates/outrig/src/container/mod.rs:688-719`),
-  so `podman create` picks them up without separate plumbing -- the same place 0087 put
+  so `podman create` picks them up without separate plumbing -- the same place 0002-10 put
   `devices` and `no-new-privileges`, and for the same reason.
 - The primary's PID resolved by reusing `container_pid` (`crates/outrig/src/network.rs:909`),
   which already runs `podman inspect --format {{.State.Pid}}` to drive the interceptor's
@@ -106,7 +106,7 @@ Four details are load-bearing and each cost the prototype time:
 - **Bind the nsfs *directory*, not the file.** Podman always adds `MS_REC` to a `-v`, and nsfs
   rejects it. `-v /proc/<pid>/ns/mnt:...` fails with `invalid argument`; the directory works.
 - **`--userns=container:<primary>` replaces `--userns=keep-id`**, which is otherwise hard-coded
-  at `container/mod.rs:706`. 0087 deliberately left userns unparameterized -- "a caller wanting
+  at `container/mod.rs:706`. 0002-10 deliberately left userns unparameterized -- "a caller wanting
   `--userns=host` is a separate ask" -- and this is not that ask. It is a single derived value
   for one placement mode, not a user-facing knob, and it is required: the sidecar must be in the
   user namespace that *owns* the target mount namespace.
@@ -114,7 +114,7 @@ Four details are load-bearing and each cost the prototype time:
   enforcing (`container/mod.rs:748-764`). Relabeling `/proc/<pid>/ns` is wrong and will fail;
   the nsfs and helper mounts need to bypass that path.
 - **The primary must be running.** A `Created` container reports `State.Pid = 0` and has no
-  mount namespace. 0086 fanned sidecar bring-up out into ensure (Phase A), label merge (Phase
+  mount namespace. 0002-09 fanned sidecar bring-up out into ensure (Phase A), label merge (Phase
   B), and starts (Phase C); Phase C already runs after the primary is up, so the ordering holds
   -- but the PID read belongs in Phase C, not A, and that should be explicit rather than
   incidental.
@@ -133,9 +133,9 @@ The rule follows the declaration, not a guess about the string:
 
 - Elements that came from **the sidecar image** -- its ENTRYPOINT and CMD -- name files in the
   sidecar's own rootfs. Prefix absolute ones with `--graft`.
-- Elements the user wrote in config -- 0088's `args` -- name files in the primary. Pass bare.
+- Elements the user wrote in config -- 0002-11's `args` -- name files in the primary. Pass bare.
 
-That split is why 0088 is a prerequisite rather than a nicety: without a config-supplied `args`,
+That split is why 0002-11 is a prerequisite rather than a nicety: without a config-supplied `args`,
 there is no bare side of the asymmetry and no way to tell a server which directory to serve.
 `outrig-enter` itself rewrites only the program path, exactly as the prototype does; the rest of
 the prefixing is OutRig's, because OutRig is the one that knows which list an element came from.
@@ -212,25 +212,28 @@ trust boundary, not beside it.
 
 ## Dependencies
 
-- ~~0088~~ -- landed. It supplies `args`, the bare side of the argument asymmetry, and it also
+- ~~0002-11~~ -- landed. It supplies `args`, the bare side of the argument asymmetry, and it also
   made a named sidecar block able to be an entrypoint host, which is what gives `view` a place
   to live. See `plan/next/0090-config-surface-recheck.md`: the Config surface below is now
   legal as written, and the scope note wants re-deriving.
-- 0089 -- `outrig-enter`, the launcher this mounts and sets as the entrypoint. It landed in the
-  **`outrig` library crate** (not `outrig-cli`, as 0089's original text guessed): call
+- 0002-12 -- `outrig-enter`, the launcher this mounts and sets as the entrypoint. It landed in the
+  **`outrig` library crate** (not `outrig-cli`, as 0002-12's original text guessed): call
   `outrig::container::enter::materialize(&session_dir)` to write `<session-dir>/outrig-enter`
   (mode 0755) for the `:ro` bind above, gated on `outrig::container::enter::is_available()`. The
   "helper unavailable" row below surfaces as `OutrigError::FilesystemHelperUnavailable`. See
-  0089's `## Decisions` for why the packaging is a `build.rs` `rustc --target musl` compile.
+  0002-12's `## Decisions` for why the packaging is a `build.rs` `rustc --target musl` compile.
 
 ## See also
 
 - <https://github.com/tgockel/prototype-podman-shared-fs> -- `21-sidecar-setns.sh` pins each
   requirement with a negative test; `22-sidecar-mcp-demo.sh` is the command this task emits.
-- `plan/done/0080-sidecar-entrypoint-stdio.md` -- the create/start path this extends.
-- `plan/done/0086-sidecar-startup-performance.md` -- the Phase A/B/C bring-up structure.
-- `plan/done/0087-nested-container-runtime.md` -- the precedent for adding launch flags through
-  `append_launch_flags`, and for treating a security-relevant key as opt-in with docs.
+- `plan/done/phase/0002-sidecars/tasks/0002-03-sidecar-entrypoint-stdio.md` -- the create/start path
+  this extends.
+- `plan/done/phase/0002-sidecars/tasks/0002-09-sidecar-startup-performance.md` -- the Phase A/B/C
+  bring-up structure.
+- `plan/done/phase/0002-sidecars/tasks/0002-10-nested-container-runtime.md` -- the precedent for
+  adding launch flags through `append_launch_flags`, and for treating a security-relevant key as
+  opt-in with docs.
 
 ## Decisions
 
@@ -243,11 +246,11 @@ trust boundary, not beside it.
   servers, so it never reaches the view placement.
 - **`view` on both forms.** The named `[sidecars.<sc>]` block and the inline one-liner
   (`{ image = ..., view = "primary" }`) both carry `view`; the one-liner is the quickstart form.
-  `plan/next/0090-config-surface-recheck.md` folded in and removed (0088 already made the config
+  `plan/next/0090-config-surface-recheck.md` folded in and removed (0002-11 already made the config
   legal; the inline form is wanted).
 - **Launcher argv is a pure `build_primary_view_argv` in `sidecar.rs`**; the podman-level flags
   (`--userns=container:`, `--cap-add`, the nsfs/helper binds, `--entrypoint`) ride
-  `ContainerLaunchSpec.primary_view` through `append_launch_flags` -- the same seam 0087 used for
+  `ContainerLaunchSpec.primary_view` through `append_launch_flags` -- the same seam 0002-10 used for
   `devices`/`no-new-privileges`. The graft-prefix rule: image ENTRYPOINT/CMD elements are
   prefixed with `/mnt`, config `args` are passed bare (they name the primary's paths).
 - **nsfs + helper binds bypass `append_bind_mount`** to emit a plain `:ro`: podman's SELinux
@@ -257,10 +260,10 @@ trust boundary, not beside it.
   view sidecars, rather than a second copy.
 - **The launcher's flag-name contract (`--ns-file`/`--graft`/`--cwd`) is duplicated between
   `sidecar.rs` and `enter/launcher.rs` by necessity**: the launcher is a dependency-free static
-  binary (0089) that cannot import crate constants. The `/target-ns/mnt` `--ns-file` names the
+  binary (0002-12) that cannot import crate constants. The `/target-ns/mnt` `--ns-file` names the
   mount-ns file `mnt` inside the bound ns directory -- `PRIMARY_VIEW_NS_FILE`, deliberately
   distinct from the graft `/mnt` despite the coincidence.
-- **Stacked on unmerged 0089** (its `outrig::container::enter` is the consumer target).
+- **Stacked on unmerged 0002-12** (its `outrig::container::enter` is the consumer target).
 - **Container-level acceptance is a gated e2e** (`primary_view_e2e.rs`, `--features e2e`): it
   needs podman + image pulls, is not run in CI, and is run by hand. A new Debian/glibc primary
   fixture (`fixtures/primary-cargo`, `rust:1-slim`) supplies the `/usr/local/cargo/bin/cargo`

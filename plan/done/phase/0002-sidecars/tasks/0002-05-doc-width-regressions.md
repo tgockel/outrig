@@ -1,9 +1,9 @@
-# 0082 -- Fix pre-existing doc-style audit violations
+# 0002-05 -- Fix pre-existing doc-style audit violations
 
 ## Goal
 
 Make `python3 scripts/audit-doc-style.py` pass on trunk. It currently fails (exit 1) with
-two width violations that predate task 0079:
+two width violations that predate task 0002-02:
 
 - `doc/reference/cli.md:263` -- 109 code points (a table row in the `--image` flag table)
 - `doc/usage/run.md:310` -- 155 code points (an error-message sample line)

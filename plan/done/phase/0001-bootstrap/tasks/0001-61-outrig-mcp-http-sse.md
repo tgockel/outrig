@@ -1,8 +1,8 @@
-# 0061 -- `outrig mcp` HTTP / SSE transport
+# 0001-61 -- `outrig mcp` HTTP / SSE transport
 
 ## Context
 
-`plan/done/0040-0041` shipped `outrig mcp` with stdio transport only. Stdio
+`0001-40` through `0001-41` shipped `outrig mcp` with stdio transport only. Stdio
 suits IDEs that spawn the server as a subprocess (Claude Code's default model)
 but doesn't help when the user wants:
 
@@ -75,8 +75,10 @@ to expose it broadly should put a reverse proxy with auth in front.
 
 ## See also
 
-- `plan/done/0040-outrig-mcp-wire-subcommand.md` -- the v0 stdio version this builds on.
-- `plan/done/0041-outrig-mcp-docs.md` -- existing `outrig mcp` documentation.
+- `plan/done/phase/0001-bootstrap/tasks/0001-40-outrig-mcp-wire-subcommand.md` -- the v0 stdio
+  version this builds on.
+- `plan/done/phase/0001-bootstrap/tasks/0001-41-outrig-mcp-docs.md` -- existing `outrig mcp`
+  documentation.
 - `~/.cargo/registry/.../rmcp-0.1.5/src/transport/sse_server.rs` -- the axum
   integration point.
 
