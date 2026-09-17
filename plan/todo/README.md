@@ -1,24 +1,38 @@
-# Plan: v0 task queue
+# Plan: the task queue
 
-The per-step index of `plan/todo/`. Tasks land lowest-numbered first; every task depends only
-on smaller-numbered predecessors. Run `/next-task` to advance one task end-to-end on its own
-branch; run `/groom-plan` to maintain ordering after edits or `plan/next/` pulls.
+The per-step index of `plan/todo/`. A task is `PPPP-NN-short-name.md`: `PPPP` names a phase,
+`NN` is its sequence within that phase. Tasks land lowest-numbered first, and a task depends
+only on smaller-numbered predecessors in the same ordering. Run `/next-task` to advance one
+task end-to-end on its own branch; run `/groom-plan` to maintain ordering after edits or
+`plan/next/` pulls.
 
 See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
-## Queue
+## Active phases
 
-`0002-40`-`0002-54` are what is left of the 0.2.0 release gate, derived from an external
+- [0002 -- sidecars](../phase/0002-sidecars/README.md) -- tools move out of the agent's
+  primary image and into sidecar containers OutRig places, and the public surface of both
+  crates is narrowed, sealed, and frozen for 0.2.0.
+
+## Recently completed
+
+- [0001 -- bootstrap](../done/phase/0001-bootstrap/README.md) -- closed 2026-06-26.
+
+## Per-step index
+
+### Phase 0002 -- sidecars
+
+`0002-41` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
-below is that report's recommended sequencing: security semantics first (`0002-37`-`0002-38`, both
-landed), then lifecycle (`0002-39` and `0002-40` landed), then the public-surface changes that have
-to happen before the freeze, then release engineering. Each task carries its own evidence; the
-report is not in the tree.
+below is that report's recommended sequencing: security semantics first (`0002-37` and
+`0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
+public-surface changes that have to happen before the freeze, then release engineering. Each
+task carries its own evidence; the report is not in the tree.
 
 **Public surface, before the freeze**
 
-| Task   | What it settles                                                     |
-| ------ | ------------------------------------------------------------------- |
+| Task      | What it settles                                                     |
+| --------- | ------------------------------------------------------------------- |
 | `0002-41` | `LaunchSpec::from_config` lowers the network policy it was handed   |
 | `0002-42` | A provenance-bearing path and its base directory move together      |
 | `0002-43` | MCP content is canonical data, or the reduction is written down     |
@@ -29,15 +43,15 @@ report is not in the tree.
 
 **Release engineering**
 
-| Task   | What it settles                                                     |
-| ------ | ------------------------------------------------------------------- |
-| `0002-48` | The public-API snapshots are gated, not trusted                     |
-| `0002-49` | Documentation contracts, and a drafted 0.1 -> 0.2 migration guide   |
-| `0002-50` | A cancelled build owns the working containers buildah made for it   |
-| `0002-51` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read   |
-| `0002-52` | A fresh RC, and a packaging check that can catch a reused version   |
-| `0002-53` | The e2e suite runs for real, on both architectures                  |
-| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met                      |
+| Task      | What it settles                                                   |
+| --------- | ----------------------------------------------------------------- |
+| `0002-48` | The public-API snapshots are gated, not trusted                   |
+| `0002-49` | Documentation contracts, and a drafted 0.1 -> 0.2 migration guide |
+| `0002-50` | A cancelled build owns the working containers buildah made for it |
+| `0002-51` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read |
+| `0002-52` | A fresh RC, and a packaging check that can catch a reused version |
+| `0002-53` | The e2e suite runs for real, on both architectures                |
+| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met                    |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -46,7 +60,8 @@ Cross-cutting notes the individual tasks carry rather than this file:
   runs one task at a time and `0002-43` is the first that has to commit; neutral content types do
   not on their own decouple the rmcp types in `OutrigError`.
 - `0002-42`'s fork 3 and `0002-46`'s fork 2 both decide whether `Model` gains path provenance.
-- `0002-48` regenerates both `public-api.txt` files, so it wants to follow `0002-41`-`0002-47`.
+- `0002-48` regenerates both `public-api.txt` files, so it wants to follow `0002-41` through
+  `0002-47`.
 - `0002-49` writes only what is false *now*; `0002-54` writes the version-bearing docs, because
   those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
 - `0002-52` records the soak parameters before rc.3 ships; `0002-54` checks that record rather than
