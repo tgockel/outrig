@@ -1,0 +1,148 @@
+--- kernel.py
++++ kernel.py.patched
+@@ -21,6 +21,8 @@
+ import asyncio
+ import builtins
++import collections
+ import json
+ import os
++import signal
+ import sys
+ import threading
+@@ -31,4 +33,5 @@
+ 
+ OUTPUT_MAX = 16 * 1024  # aggregate captured bytes per execution
++BG_MAX = 2 * 1024  # bytes of between-execution background output, tail kept
+ REPR_MAX = 1000  # one echoed value, or one inventory entry
+ INVENTORY_MAX = 200  # global names listed
+@@ -57,8 +60,33 @@
+ _drained = threading.Event()
+ 
++# True only while a submitted execution is running. Output written outside that window came
++# from a background task between turns: it is attributed separately so it cannot evict the
++# result of the execution that happens to run next.
++_foreground = False
++_bg = collections.deque()
++_bg_len = 0
++_bg_total = 0
++
++
++def _stash_background(chunk):
++    """Keep the most recent BG_MAX bytes of between-execution output, and count the rest."""
++    global _bg_len, _bg_total
++    _bg_total += len(chunk)
++    _bg.append(chunk)
++    _bg_len += len(chunk)
++    while _bg_len - len(_bg[0]) >= BG_MAX:
++        _bg_len -= len(_bg.popleft())
++    if _bg_len > BG_MAX:
++        trim = _bg_len - BG_MAX
++        _bg[0] = _bg[0][trim:]
++        _bg_len -= trim
++
+ 
+ def _capture(chunk):
+     """Append up to the budget; read and discard the rest rather than growing a buffer."""
+     global _captured_len, _overflowed
++    if not _foreground:
++        _stash_background(chunk)
++        return
+     room = OUTPUT_MAX - _captured_len
+     if room <= 0:
+@@ -112,5 +140,25 @@
+     _captured_len = 0
+     _overflowed = False
+-    return text
++    return _take_background() + text
++
++
++def _take_background():
++    """Background output since the last execution, as a labelled preamble.
++
++    It is reported, because a background task's traceback is often the whole story -- but it is
++    reported *before* and *apart from* this execution's own output, and bounded separately, so
++    a chatty task can never push out the result the model actually asked for.
++    """
++    global _bg_len, _bg_total
++    if not _bg_total:
++        return ""
++    body = b"".join(_bg).decode("utf-8", "replace")
++    dropped = _bg_total - _bg_len
++    _bg.clear()
++    _bg_len = 0
++    _bg_total = 0
++    head = "[background output between executions"
++    head += f", earlier {dropped} bytes dropped]" if dropped else "]"
++    return f"{head}\n{body}\n[end background output]\n"
+ 
+ 
+@@ -282,6 +330,7 @@
+     output, and never picks out a particular `await`.
+     """
+-    global _running
++    global _running, _foreground
+     _running = True
++    _foreground = True
+     error = None
+     try:
+@@ -297,4 +346,5 @@
+         _running = False
+         output = _collect_output()
++        _foreground = False
+     _send(
+         {
+@@ -337,4 +387,27 @@
+         }
+     )
++
++
++# ---------------------------------------------------------------------------- interrupt
++
++_MAIN_THREAD_ID = threading.get_ident()
++
++
++def _interrupt():  # noqa: D401
++    """Raise KeyboardInterrupt in the thread running the execution.
++
++    Synchronous code that never yields -- `while True: pass`, a runaway comprehension -- blocks
++    the event loop, and with it every path that could report the problem or accept a fix. The
++    reader thread keeps running regardless, so this is called *directly from it* rather than
++    through `call_soon_threadsafe`, which is exactly the queue a wedged loop is not draining.
++
++    Pure-Python loops take the exception at the next bytecode boundary. A thread parked in a
++    long C call (`time.sleep`, a blocking read) does not, and nothing short of killing the
++    interpreter will free that; the host learns as much from the absence of a result.
++    """
++    if not _running:
++        # Nothing to interrupt; raising here would tear down the loop itself.
++        return
++    signal.raise_signal(signal.SIGINT)
+ 
+ 
+@@ -381,9 +454,26 @@
+         except ValueError:
+             continue
++        # Handled on this thread on purpose: a wedged loop cannot run callbacks, and this is
++        # the message whose whole job is to un-wedge it.
++        if message.get("t") == "interrupt":
++            _interrupt()
++            continue
+         loop.call_soon_threadsafe(_dispatch, message)
+     loop.call_soon_threadsafe(loop.stop)
+ 
+ 
++def _on_sigint(signum, frame):
++    """Turn a SIGINT into an exception inside the running execution, and nothing otherwise.
++
++    Installed from inside the loop because `asyncio.run` installs its own handler first; that
++    one defers the interrupt until the loop next runs a callback, which is precisely what a
++    wedged loop never does.
++    """
++    if _running:
++        raise KeyboardInterrupt
++
++
+ async def _main():
++    signal.signal(signal.SIGINT, _on_sigint)
+     threading.Thread(target=_drain_thread, daemon=True).start()
+     threading.Thread(

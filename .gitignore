@@ -2,3 +2,6 @@
 /.cargo
 /.claude/settings.local.json
 /.claude/worktrees/
+
+# Build detritus from a container run with CARGO_HOME inside the workspace.
+.cargo-home/

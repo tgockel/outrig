@@ -1169,7 +1169,11 @@ async fn build_single(
             let model = client.completion_model(&candidate.model_identifier);
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(
-                    retry::RetryingModel::new(model, policy),
+                    // `with_empty_as_stop`: this arm discards the provider's
+                    // finish reason, so an empty completion cannot be told from
+                    // a truncation. The Anthropic arm below reads `stop_reason`
+                    // itself and must keep retrying its empties.
+                    retry::RetryingModel::new(model, policy).with_empty_as_stop(),
                     resolved,
                     candidate.max_tokens,
                     tools,
@@ -1246,7 +1250,8 @@ async fn build_candidate(
             let client = openai_client(base_url, api_key, http)?;
             let model = client.completion_model(&candidate.model_identifier);
             Ok(Box::new(failover::ModelCandidate::new(
-                retry::RetryingModel::new(model, policy.clone()),
+                // Same reason as the OpenAI arm of `build_single`.
+                retry::RetryingModel::new(model, policy.clone()).with_empty_as_stop(),
                 &candidate.model_name,
                 &candidate.model_identifier,
                 candidate.max_tokens,
@@ -2241,6 +2246,27 @@ fn handle_prompt_error(
         );
     }
 
+    // The model stopped with nothing to add. Not a failure: on the native
+    // Anthropic arm rig reads `stop_reason` and hands back an empty text part
+    // for exactly this payload, and only the OpenAI arm -- which never reads a
+    // finish reason -- turns it into an error. Checked ahead of the general
+    // unusable-response arm below, which would otherwise claim it.
+    //
+    // This matters more here than it used to. The agent's own text is optional
+    // narration now that it speaks through the `user` channel, so a turn that
+    // sends and then stops is complete and correct.
+    if retry::is_model_stopped(&err) {
+        return Ok(TurnEnd {
+            reply: String::new(),
+            // `None` is the claim that the model finished on its own, which is
+            // what it did. It is also what keeps `is_silent` reachable, so a
+            // turn that showed the user nothing at all still says so.
+            stopped: None,
+            recovered: None,
+            already_displayed: false,
+        });
+    }
+
     // A response rig could not use, still unusable after `RetryingModel` spent
     // its attempts. Handled the same way and for the same reasons: nothing was
     // appended, and the prompt is what wants resending.
@@ -3034,6 +3060,63 @@ mod tests {
             String::from_utf8(sink).expect("sink utf-8"),
             "hello world\n",
             "the reply should still have been streamed exactly once"
+        );
+    }
+
+    /// A model that stopped with nothing to add ends the turn. Anthropic
+    /// documents this payload after a tool-result round trip and rig's native
+    /// arm hands back an empty text part for it; only the OpenAI arm, which
+    /// reads no finish reason, makes it an error.
+    #[test]
+    fn a_model_that_stopped_ends_the_turn_instead_of_failing_it() {
+        let mut history = Vec::new();
+        let end = handle_prompt_error(
+            rig::completion::PromptError::CompletionError(
+                rig::completion::CompletionError::ResponseError(
+                    // What the OpenAI arm's `RetryingModel` rewrites an empty
+                    // completion to; rig's own wording is ambiguous and stays a
+                    // failure, which the case below pins.
+                    "the model ended its turn with nothing to add".to_string(),
+                ),
+            ),
+            &mut history,
+            &OutrigPromptHook::new(50),
+        )
+        .expect("a model that stopped is not an error");
+
+        assert!(
+            end.stopped.is_none(),
+            "an ending is not a stop: {:?}",
+            end.stopped,
+        );
+        assert!(end.reply.is_empty(), "got: {:?}", end.reply);
+        // Reachable on purpose. A turn that spoke through the `user` channel
+        // has `already_displayed` set by the REPL before this is consulted; one
+        // that did nothing at all still reports itself.
+        assert!(end.is_silent(), "a turn that showed nothing must still say so");
+    }
+
+    /// The narrowing must not swallow what the retry exists for. rig's own
+    /// empty-completion wording reaches here unrewritten from the Anthropic
+    /// arm, where it means a truncation, and has to stay a failure.
+    #[test]
+    fn rigs_own_empty_wording_is_still_an_endpoint_failure() {
+        let mut history = Vec::new();
+        let end = handle_prompt_error(
+            rig::completion::PromptError::CompletionError(
+                rig::completion::CompletionError::ResponseError(
+                    "Response contained no message or tool call (empty)".to_string(),
+                ),
+            ),
+            &mut history,
+            &OutrigPromptHook::new(50),
+        )
+        .expect("an unusable body ends the turn rather than the process");
+
+        assert!(
+            matches!(end.stopped, Some(TurnStop::EndpointFailed(_))),
+            "got: {:?}",
+            end.stopped,
         );
     }
 

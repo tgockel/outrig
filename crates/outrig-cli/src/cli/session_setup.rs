@@ -39,8 +39,8 @@ use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
-    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
-    SidecarOnFailure, SidecarStart, SidecarView,
+    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountAccess, MountConfig,
+    NetworkMode, SidecarOnFailure, SidecarStart, SidecarView,
 };
 use outrig::container::{
     Container, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -466,6 +466,15 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let mut launch =
         ContainerLaunchSpec::workspace(host_workspace.clone(), container_workspace.clone());
     launch.mounts = container_mounts(&repo_root, &cfg.workspace.mounts);
+    // The agent acts by running Python, so the interpreter has to be in the container before
+    // it starts. Only an LLM session needs it -- `outrig mcp` has no agent to run any.
+    if args.llm_session {
+        launch.mounts.push(ContainerMount::new(
+            crate::python::payload_dir()?,
+            crate::python::PAYLOAD_MOUNT,
+            MountAccess::ReadOnly,
+        ));
+    }
     launch.capabilities = (&image_cfg.security).into();
     launch.devices = image_cfg.security.devices.clone();
     launch.no_new_privileges = image_cfg.security.no_new_privileges;

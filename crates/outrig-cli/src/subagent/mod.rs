@@ -28,6 +28,11 @@
 //! Coordination is on *results*, not run state: see [`state`] for the inbox
 //! and the readable predicate the parent blocks on.
 
+// The Python prototype gives the agent one tool -- `python_execute` -- so the MCP-shaped tool
+// surface in this module is built but never handed to a model. Kept rather than deleted: it is
+// what a Python equivalent has to replace, and deleting it would make the prototype branch
+// hard to reconcile.
+#![allow(dead_code)]
 pub mod injection;
 pub mod state;
 mod transcript;

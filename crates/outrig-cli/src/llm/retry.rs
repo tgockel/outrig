@@ -131,6 +131,38 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// unusable three times running is not a hiccup.
 const RESPONSE_RETRY_ATTEMPTS: u32 = 2;
 
+/// rig's wording for an assistant message that decoded to no content at all.
+///
+/// The same literal on both provider arms, which is the whole difficulty: it
+/// means two different things depending on which one produced it.
+///
+/// rig's native Anthropic arm reads `stop_reason` first
+/// (`providers/anthropic/completion.rs:227-236`), normalizes a documented empty
+/// `end_turn` into an empty text part, and reaches this error *only* for the
+/// rest -- a `max_tokens` truncation above all. There it is a real fault and
+/// resending is the right answer.
+///
+/// Its OpenAI arm never reads `finish_reason`
+/// (`providers/openai/completion/mod.rs:1181`), so a model that stopped with
+/// nothing to add and a response that was cut off arrive identically, with the
+/// reason discarded before outrig can see it.
+///
+/// So this is matched only where the caller has said the arm cannot tell the
+/// two apart -- see [`RetryingModel::with_empty_as_stop`].
+const EMPTY_COMPLETION: &str = "Response contained no message or tool call (empty)";
+
+/// outrig's own marker for an empty completion already classified as the model
+/// stopping. Deliberately not rig's wording: the turn layer must not confuse it
+/// with the same message arriving from an arm that *can* tell a stop from a
+/// truncation.
+const MODEL_STOPPED: &str = "the model ended its turn with nothing to add";
+
+/// Whether `err` is a model that stopped rather than a failure worth reporting.
+/// Only ever true for an arm built with [`RetryingModel::with_empty_as_stop`].
+pub fn is_model_stopped(err: &PromptError) -> bool {
+    unusable_response_label(err).is_some_and(|message| message == MODEL_STOPPED)
+}
+
 /// A deadline shared by every candidate in one failover chain.
 ///
 /// The chain's problem is that its bound cannot be a per-candidate one. Three
@@ -380,11 +412,36 @@ impl HttpClientExt for RetryingHttpClient {
 pub struct RetryingModel<M> {
     inner: M,
     policy: RetryPolicy,
+    /// Whether an empty completion from this arm should be read as the model
+    /// stopping. See [`EMPTY_COMPLETION`] for why only some arms can say yes.
+    empty_is_a_stop: bool,
 }
 
 impl<M> RetryingModel<M> {
     pub fn new(inner: M, policy: RetryPolicy) -> Self {
-        Self { inner, policy }
+        Self {
+            inner,
+            policy,
+            empty_is_a_stop: false,
+        }
+    }
+
+    /// Read an empty completion as the model stopping rather than as a fault.
+    ///
+    /// For arms that discard the provider's finish reason before outrig can see
+    /// it, which makes a clean stop and a truncation indistinguishable. Picking
+    /// "stopped" is a judgement about which is likelier: a turn that ends with
+    /// nothing to add is the ordinary shape of a session driven by tool calls,
+    /// and a truncation is separately guarded by the `max-tokens` the request
+    /// carries. The cost is that a genuine truncation on such an arm ends the
+    /// turn quietly instead of being retried and named.
+    ///
+    /// Not set for an arm that reads the reason itself -- there, an empty
+    /// completion has already been filtered down to real faults, and retrying
+    /// is right.
+    pub fn with_empty_as_stop(mut self) -> Self {
+        self.empty_is_a_stop = true;
+        self
     }
 }
 
@@ -457,6 +514,16 @@ impl<M: CompletionModel> RetryingModel<M> {
         let mut attempt = 0u32;
         loop {
             let message = match self.inner.completion(request.clone()).await {
+                // A model that stopped with nothing to add, on an arm that
+                // cannot prove it. Resending the same conversation only asks it
+                // to stop again, so this leaves immediately -- no backoff, no
+                // retry line, one model call -- carrying a message the turn
+                // layer reads as an ending rather than a failure.
+                Err(CompletionError::ResponseError(message))
+                    if self.empty_is_a_stop && message == EMPTY_COMPLETION =>
+                {
+                    return Err(CompletionError::ResponseError(MODEL_STOPPED.to_string()));
+                }
                 Err(CompletionError::ResponseError(message)) => message,
                 // A success, or a failure this layer cannot fix: one the HTTP
                 // client already retried, or a terminal one -- a bad key's
@@ -966,11 +1033,16 @@ mod tests {
         assert!(chain_label_of(CompletionError::ProviderError("nope".into())).is_none());
     }
 
-    /// A model that fails the way the bug does, every time, counting the calls
-    /// it took. The associated types are the trait's bare minimum: it never
-    /// returns a response and never streams.
+    /// A body rig could not decode, distinct from an empty completion -- the
+    /// two are the same `ResponseError` variant and only the message tells them
+    /// apart, so a test that means one must not spell the other.
+    const MALFORMED: &str = "Response did not contain a valid message or tool call";
+
+    /// A model that fails the same way every time, counting the calls it took.
+    /// The associated types are the trait's bare minimum: it never returns a
+    /// response and never streams.
     #[derive(Clone)]
-    struct AlwaysUnusableModel(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct AlwaysUnusableModel(std::sync::Arc<std::sync::atomic::AtomicUsize>, &'static str);
 
     impl CompletionModel for AlwaysUnusableModel {
         type Response = ();
@@ -978,7 +1050,7 @@ mod tests {
         type Client = ();
 
         fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-            Self(Default::default())
+            Self(Default::default(), MALFORMED)
         }
 
         async fn completion(
@@ -986,9 +1058,7 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(CompletionError::ResponseError(
-                "Response contained no message or tool call (empty)".into(),
-            ))
+            Err(CompletionError::ResponseError(self.1.into()))
         }
 
         async fn stream(
@@ -1008,7 +1078,7 @@ mod tests {
     async fn an_endlessly_unusable_response_gives_up_after_a_bounded_number_of_tries() {
         let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::clone(&calls)),
+            AlwaysUnusableModel(std::sync::Arc::clone(&calls), MALFORMED),
             RetryPolicy::default(),
         );
 
@@ -1025,13 +1095,100 @@ mod tests {
         );
     }
 
+    /// The exception to the bound above. An empty completion is a model that
+    /// stopped with nothing to add, not a body that came back wrong, so
+    /// resending the same conversation only asks it to stop again -- three
+    /// times over, with the user watching the backoff.
+    ///
+    /// Asserted as a call count rather than an error, because both cases return
+    /// the same `ResponseError` variant and the whole difference is how much
+    /// was spent reaching it.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_completion_is_not_retried_at_all() {
+        let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
+        let model = RetryingModel::new(
+            AlwaysUnusableModel(std::sync::Arc::clone(&calls), EMPTY_COMPLETION),
+            RetryPolicy::default(),
+        )
+        .with_empty_as_stop();
+
+        let err = model
+            .completion(model.completion_request("hi").build())
+            .await
+            .expect_err("it still reaches the turn layer as an error");
+
+        assert!(is_model_stopped(&PromptError::CompletionError(err)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a model that stopped was asked to stop again",
+        );
+    }
+
+    /// The guarantee the Anthropic arm depends on. rig reaches the *same*
+    /// error message there only after ruling out a clean `end_turn`, so what is
+    /// left is a real fault -- a `max_tokens` truncation above all -- and it has
+    /// to keep being retried and reported.
+    #[tokio::test(start_paused = true)]
+    async fn an_arm_that_reads_its_finish_reason_still_retries_an_empty_completion() {
+        let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
+        let model = RetryingModel::new(
+            AlwaysUnusableModel(std::sync::Arc::clone(&calls), EMPTY_COMPLETION),
+            RetryPolicy::default(),
+        );
+
+        let err = model
+            .completion(model.completion_request("hi").build())
+            .await
+            .expect_err("still a failure here");
+
+        assert!(
+            !is_model_stopped(&PromptError::CompletionError(err)),
+            "an arm that can tell a stop from a truncation must not have it guessed for it",
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1 + RESPONSE_RETRY_ATTEMPTS as usize,
+            "the bound is unchanged for an arm that did not opt in",
+        );
+    }
+
+    /// The predicate splits one `ResponseError` variant in two, so it is worth
+    /// pinning from both sides. It matches outrig's own marker, never rig's
+    /// wording -- that wording is ambiguous and is what the marker resolves.
+    #[test]
+    fn only_outrigs_own_marker_counts_as_a_model_that_stopped() {
+        let stopped = |message: &str| {
+            is_model_stopped(&PromptError::CompletionError(
+                CompletionError::ResponseError(message.to_string()),
+            ))
+        };
+        assert!(stopped(MODEL_STOPPED));
+        assert!(
+            !stopped(EMPTY_COMPLETION),
+            "rig's wording alone proves nothing: the Anthropic arm sends it for a truncation",
+        );
+        assert!(!stopped(MALFORMED));
+        assert!(!stopped(""));
+        // All three remain unusable responses; this is about how one is
+        // handled, not about reclassifying it out of the variant.
+        for message in [MODEL_STOPPED, EMPTY_COMPLETION, MALFORMED] {
+            assert!(
+                unusable_response_label(&PromptError::CompletionError(
+                    CompletionError::ResponseError(message.to_string()),
+                ))
+                .is_some()
+            );
+        }
+    }
+
     /// With retries off the wrapper is a pass-through: one call, no clone of
     /// the request, no wait.
     #[tokio::test]
     async fn a_zero_budget_makes_the_first_unusable_response_final() {
         let calls: std::sync::Arc<std::sync::atomic::AtomicUsize> = std::sync::Arc::default();
         let model = RetryingModel::new(
-            AlwaysUnusableModel(std::sync::Arc::clone(&calls)),
+            AlwaysUnusableModel(std::sync::Arc::clone(&calls), MALFORMED),
             RetryPolicy {
                 budget: Duration::ZERO,
                 ..RetryPolicy::default()

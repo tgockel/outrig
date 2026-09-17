@@ -14,6 +14,11 @@
 //!
 //! [`McpServerSpec`]: outrig::config::McpServerSpec
 
+// The Python prototype gives the agent one tool -- `python_execute` -- so the MCP-shaped tool
+// surface in this module is built but never handed to a model. Kept rather than deleted: it is
+// what a Python equivalent has to replace, and deleting it would make the prototype branch
+// hard to reconcile.
+#![allow(dead_code)]
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::{Value, json};

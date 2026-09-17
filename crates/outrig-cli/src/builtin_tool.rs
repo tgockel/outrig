@@ -14,6 +14,11 @@
 //! recursion is that the launch tools are withheld at the maximum depth,
 //! leaving that subagent with nothing to launch with.
 
+// The Python prototype gives the agent one tool -- `python_execute` -- so the MCP-shaped tool
+// surface in this module is built but never handed to a model. Kept rather than deleted: it is
+// what a Python equivalent has to replace, and deleting it would make the prototype branch
+// hard to reconcile.
+#![allow(dead_code)]
 use std::sync::Arc;
 
 use rig::tool::{ToolDyn, ToolError};

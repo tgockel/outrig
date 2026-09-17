@@ -13,13 +13,11 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use clap::{ArgAction, Parser};
 use rig::completion::Message;
 
-use crate::builtin_tool;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::session_setup::{
     self, ProgressSpan, STOP_GRACE, SessionRuntime, SessionSetup, SessionSetupArgs,
@@ -32,7 +30,6 @@ use crate::paths::model_cache_root;
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
-use crate::self_tool;
 use crate::session_tool::{self, SessionTool};
 use crate::subagent::{SubagentContext, SubagentRegistry};
 use outrig::McpClient;
@@ -264,6 +261,9 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         llm::resolve_agent_with_overrides(&cfg, agent_name, model_override, device_override)?;
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
+    // Overwritten, not merged: an agent's configured preamble describes MCP tools this session
+    // does not hand it.
+    resolved.preamble = Some(crate::python::PREAMBLE.to_string());
 
     let connected =
         session_setup::connect_mcp_clients(&mut runtime.containers, mcp_plan, log_dir, cli_env)
@@ -304,25 +304,19 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         #[cfg(feature = "local-llm")]
         registry: registry.clone(),
     }));
-    let mut agent_tools = all_tools;
-    // The primary gets the launch tools when its agent opts in *and* the depth
-    // limit leaves room for a first layer (root depth 1 < max). A
-    // `subagent-depth-max` of 1 disables subagents for everyone.
-    let subagents_enabled = agent_name
-        .and_then(|name| cfg.agents.get(name))
-        .is_none_or(outrig::config::Agent::subagents_enabled);
-    if subagents_enabled && resolved.subagent_depth_max > 1 {
-        agent_tools.extend(builtin_tool::parent_tools(
-            subagents.clone(),
-            resolved.tool_result_max_bytes,
-        ));
-    }
-    // A session running on the built-in default is by definition one the user
-    // has not configured, so outrig's own docs are the thing most likely to be
-    // asked for. A configured repo pays none of this prompt budget.
-    if used_builtin_default {
-        agent_tools.extend(self_tool::self_tools());
-    }
+    let span = ProgressSpan::start("starting python");
+    let kernel = crate::python::PythonKernel::start(&runtime.containers.primary).await?;
+    span.done("python ready");
+
+    // The agent's whole surface. MCP servers still run -- they are what the container's
+    // network policy and teardown are built around, and `/sidecar` still lists them -- but the
+    // model reaches the world by writing Python, not by calling them. Subagent and
+    // self-documentation tools go with them: both are MCP-shaped, and neither has a Python
+    // equivalent yet.
+    let agent_tools = vec![SessionTool::new(crate::python::PythonExecuteTool::new(
+        kernel.clone(),
+        resolved.tool_result_max_bytes,
+    ))];
 
     let span = ProgressSpan::start("building agent");
     let agent = llm::build_agent(
@@ -359,6 +353,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     let session = ReplSession {
         runtime: RefCell::new(runtime),
         agent: &agent,
+        kernel: kernel.clone(),
         store,
         sid,
         cfg: &cfg,
@@ -405,6 +400,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
 struct ReplSession<'a> {
     runtime: RefCell<&'a mut SessionRuntime>,
     agent: &'a llm::RebuildingAgent,
+    kernel: std::sync::Arc<crate::python::PythonKernel>,
     store: &'a SessionStore,
     sid: &'a SessionId,
     cfg: &'a Config,
@@ -423,10 +419,6 @@ const REPL_COMMANDS: &[HelpEntry] = &[
         description: "list registered tools",
     },
     HelpEntry {
-        syntax: "/reset",
-        description: "clear conversation history",
-    },
-    HelpEntry {
         syntax: "/sidecar add <name>",
         description: "start a config-declared manual sidecar",
     },
@@ -437,68 +429,66 @@ const REPL_COMMANDS: &[HelpEntry] = &[
 ];
 
 async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
-    // Single-task REPL: callbacks run sequentially. RefCell over the shared
-    // history avoids needing Send bounds via Arc<Mutex<_>>; the binary's
-    // tokio runtime is current-thread.
-    let history: Rc<RefCell<Vec<Message>>> = Rc::new(RefCell::new(Vec::new()));
-
     let agent = session.agent;
+    let kernel = session.kernel.clone();
 
-    let history_for_prompt = history.clone();
     let on_prompt = move |line: String| {
-        let history = history_for_prompt.clone();
+        let kernel = kernel.clone();
         async move {
-            // Move the vec out so the RefCell isn't borrowed across the
-            // await; restore it on completion. Prompt cancellation may add
-            // partial history to `h`, so it must always be written back.
-            let mut h = std::mem::take(&mut *history.borrow_mut());
-            let result = agent.run_turn(&line, &mut h).await;
-            *history.borrow_mut() = h;
+            // The line is not sent to the model. It is queued on the `user` channel, and the
+            // model has to go and receive it -- which is the point: input is one more thing
+            // Python awaits, not a privileged path into the prompt.
+            kernel.deliver_user(line)?;
+            let observation = kernel.observation().await?;
+            // Created here and dropped on return. The Python session is the only memory, so a
+            // turn leaves behind exactly what the model bound to a name.
+            let mut h: Vec<Message> = Vec::new();
+            // Read before the turn: anything Python sends while it runs is this turn speaking.
+            let spoken_before = kernel.console().messages_sent();
+            let mut end = agent.run_turn(&observation, &mut h).await?;
+            // A channel send is another way the reply reached the user, which is exactly what
+            // this flag records. Without it a turn that said everything through `send()` and
+            // returned no text of its own would be reported as having produced nothing.
+            end.already_displayed |= kernel.console().messages_sent() > spoken_before;
             // A turn that finished on its own and still has nothing to show is
             // reported here rather than returned as an empty reply the REPL
             // would print as nothing. Every *deliberate* stop already printed
             // its own reason on the way out, so `is_silent` is what separates
             // "outrig explained itself" from the one outcome that used to
             // reach the user as pure silence.
-            result.map(|end| {
-                if end.is_silent() {
-                    eprintln!("{}", end.silent_report());
-                    // Deliberately not the "history retained" advice the
-                    // truncation paths give. The turn *is* in outrig's history,
-                    // but on an OpenAI-compatible provider an assistant message
-                    // carrying only reasoning is dropped on the way back out,
-                    // so promising the model will see it would be false for the
-                    // arm this failure shows up on most.
-                    eprintln!(
-                        "[outrig] send another prompt (e.g. \"continue\") to keep going, \
-                         or \"/reset\" to start over -- but say what you need again \
-                         rather than referring back, as the model may not see this turn."
-                    );
-                    // Whitespace is exact-non-empty, so returning it would
-                    // put a stray blank line on stdout directly under the
-                    // report that just said the turn produced nothing. A turn
-                    // classified silent has been accounted for on stderr; it
-                    // has nothing left to print.
-                    return String::new();
-                }
-                end.reply
-            })
+            if end.is_silent() {
+                eprintln!("{}", end.silent_report());
+                // Deliberately not the "history retained" advice the
+                // truncation paths give. The turn *is* in outrig's history,
+                // but on an OpenAI-compatible provider an assistant message
+                // carrying only reasoning is dropped on the way back out,
+                // so promising the model will see it would be false for the
+                // arm this failure shows up on most.
+                eprintln!(
+                    "[outrig] send another prompt (e.g. \"continue\") to keep going -- but \
+                     say what you need again rather than referring back, as the model does \
+                     not see this turn."
+                );
+            } else {
+                // Printed here rather than handed back to the REPL, so that the console is the
+                // only thing writing stdout. A message Python sends can arrive mid-write
+                // otherwise, and split this reply from its own newline.
+                kernel.console().reply(&end.reply).await?;
+            }
+            // The REPL prints whatever comes back; everything this turn had to show has been
+            // shown already.
+            Ok(String::new())
         }
     };
 
     let session = &session;
     let on_command = move |cmd: String, args: Vec<String>| {
-        let history = history.clone();
         async move {
             match cmd.as_str() {
                 // Zero-arg commands with args fall through to None so the
                 // REPL reports e.g. `/tools foo` as unknown, as it always
                 // has.
                 "tools" if args.is_empty() => Some(build_tools_summary(&agent.tools())),
-                "reset" if args.is_empty() => {
-                    history.borrow_mut().clear();
-                    Some("[outrig] history cleared".to_string())
-                }
                 "sidecar" => Some(handle_sidecar_command(session, &args).await),
                 _ => None,
             }
@@ -959,9 +949,15 @@ fn print_banner(banner: StartupBanner<'_>) {
     let _ = writeln!(buf, "[outrig] image-config:  {container_name}{origin}");
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
+    // The servers still run -- their sidecars, network policy, and teardown are unchanged --
+    // but the model reaches the container by writing Python, so it is never handed their
+    // tools. Saying so here stops the next two lines from contradicting each other.
     for (name, count) in per_server_counts {
         let plural = if *count == 1 { "tool" } else { "tools" };
-        let _ = writeln!(buf, "[outrig] mcp {name}: initialized ({count} {plural})");
+        let _ = writeln!(
+            buf,
+            "[outrig] mcp {name}: initialized ({count} {plural}, not offered to the agent)"
+        );
     }
     let names: Vec<String> = all_tools.iter().map(ToolDyn::name).collect();
     let _ = writeln!(buf, "[outrig] tools available: {}", names.join(", "));
@@ -1074,14 +1070,16 @@ mod tests {
     /// Locks `/help` to the exact text the REPL printed when it owned the
     /// command list (pre-dispatcher `HELP_TEXT`).
     #[test]
-    fn repl_help_is_byte_identical_to_the_pre_dispatcher_text() {
+    /// `/reset` is gone: with the conversation history discarded every turn there is nothing
+    /// for it to clear, and the Python session -- the thing that does persist -- is the model's
+    /// to manage.
+    fn repl_help_lists_every_command_the_dispatcher_answers() {
         assert_eq!(
             crate::repl::compose_help(REPL_COMMANDS),
             "\
 [outrig] slash commands:
   /help                 show this help
   /tools                list registered tools
-  /reset                clear conversation history
   /sidecar add <name>   start a config-declared manual sidecar
   /sidecar list         show declared sidecars and their status
   /quit                 exit the session
@@ -1183,6 +1181,8 @@ mod tests {
                 ReplSession {
                     runtime: RefCell::new(&mut self.runtime),
                     agent: &self.agent,
+                    // These tests drive `/sidecar`, which never reaches Python.
+                    kernel: crate::python::kernel::PythonKernel::detached(),
                     store: &self.store,
                     sid: &self.sid,
                     cfg: &self.cfg,
