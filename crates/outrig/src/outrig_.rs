@@ -9,7 +9,7 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::process::Child;
 
 use crate::config::{
@@ -27,7 +27,8 @@ use crate::container::{
 };
 use crate::error::{IoPathExt, OutrigError, Result, SidecarUnwindFailure};
 use crate::image::{self, ImageTag};
-use crate::mcp::{McpClient, McpToolResult};
+use crate::mcp::McpClient;
+use crate::mcp_content::{McpIcon, McpTool, McpToolAnnotations, McpToolResult};
 use crate::network::NetworkInterceptor;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -743,14 +744,21 @@ async fn resolve_sidecar_image_tag(
 
 /// Description of a single tool exposed by one of the running MCP servers.
 /// `server` is the local config name (`spec.mcp` key) and `name` is the
-/// tool name as advertised by the server (un-namespaced).
+/// tool name as advertised by the server (un-namespaced). Everything from
+/// `title` down is the server's own descriptor, carried through unchanged.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ToolHandle {
     pub server: String,
     pub name: String,
+    /// The server's description, or empty if it declared none.
     pub description: String,
     pub input_schema: Value,
+    pub title: Option<String>,
+    pub output_schema: Option<Value>,
+    pub annotations: Option<McpToolAnnotations>,
+    pub icons: Option<Vec<McpIcon>>,
+    pub meta: Option<Map<String, Value>>,
 }
 
 /// A running container set (one primary plus any sidecars) with MCP servers
@@ -1462,7 +1470,7 @@ async fn shutdown_partial_clients(clients: BTreeMap<String, McpClient>) {
 }
 
 /// Index one server's advertised tools as [`ToolHandle`]s.
-fn tool_handles(server: &str, listed: Vec<crate::mcp::McpTool>) -> Vec<ToolHandle> {
+fn tool_handles(server: &str, listed: Vec<McpTool>) -> Vec<ToolHandle> {
     listed
         .into_iter()
         .map(|t| ToolHandle {
@@ -1470,6 +1478,11 @@ fn tool_handles(server: &str, listed: Vec<crate::mcp::McpTool>) -> Vec<ToolHandl
             name: t.name,
             description: t.description.unwrap_or_default(),
             input_schema: t.input_schema,
+            title: t.title,
+            output_schema: t.output_schema,
+            annotations: t.annotations,
+            icons: t.icons,
+            meta: t.meta,
         })
         .collect()
 }

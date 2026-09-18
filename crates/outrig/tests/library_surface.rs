@@ -249,9 +249,9 @@ async fn launch_lists_tools_calls_one_and_shuts_down() {
         "list_directory should not be an error: {result:?}"
     );
     assert!(
-        result.content_text.contains("MARKER.txt"),
+        result.render_text().contains("MARKER.txt"),
         "list_directory output should mention MARKER.txt, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -313,9 +313,9 @@ async fn add_sidecar_extends_tools_and_serves_calls() {
         .await
         .expect("call_tool via sidecar server");
     assert!(
-        result.content_text.contains("MARKER.txt"),
+        result.render_text().contains("MARKER.txt"),
         "sidecar list_directory should see the workspace, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -373,9 +373,9 @@ async fn launch_with_sidecar_starts_it() {
         .await
         .expect("call_tool via launch-time sidecar");
     assert!(
-        result.content_text.contains("MARKER.txt"),
+        result.render_text().contains("MARKER.txt"),
         "sidecar list_directory should see the workspace, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -439,9 +439,9 @@ async fn launch_with_entrypoint_sidecar_serves_tools() {
         .await
         .expect("call_tool via entrypoint-stdio server");
     assert!(
-        result.content_text.contains("MARKER.txt"),
+        result.render_text().contains("MARKER.txt"),
         "the served directory came from `args`, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -531,9 +531,9 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         .await
         .expect("list the primary's workspace through the view");
     assert!(
-        workspace.content_text.contains("MARKER.txt"),
+        workspace.render_text().contains("MARKER.txt"),
         "the view should show the primary's workspace, got: {}",
-        workspace.content_text,
+        workspace.render_text(),
     );
 
     let tmp = outrig
@@ -545,9 +545,9 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
         .await
         .expect("list the primary's own rootfs through the view");
     assert!(
-        tmp.content_text.contains("IN-PRIMARY.txt"),
+        tmp.render_text().contains("IN-PRIMARY.txt"),
         "the view should show a file only the primary container has, got: {}",
-        tmp.content_text,
+        tmp.render_text(),
     );
 
     // The launcher drops to the session's uid/gid once the graft is in place,
@@ -568,7 +568,7 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
     assert!(
         !written.is_error,
         "writing into the workspace through the view failed: {}",
-        written.content_text,
+        written.render_text(),
     );
     let host_file = host_ws.path().join("FROM-SIDECAR.txt");
     let meta = std::fs::metadata(&host_file).expect("stat the file the sidecar wrote");
@@ -595,7 +595,7 @@ async fn primary_view_sidecar_from_library_sees_the_primary_filesystem() {
     assert!(
         denied.is_error,
         "a root-owned path must be unwritable after the drop, got: {}",
-        denied.content_text,
+        denied.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -705,9 +705,9 @@ async fn primary_view_sidecar_on_glibc_runs_its_own_dynamic_loader() {
         .await
         .expect("list the primary's own rootfs through the view");
     assert!(
-        tmp.content_text.contains("IN-PRIMARY.txt"),
+        tmp.render_text().contains("IN-PRIMARY.txt"),
         "the view should show a file only the primary container has, got: {}",
-        tmp.content_text,
+        tmp.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -1019,9 +1019,9 @@ workspace = "ro"
         .await
         .expect("call_tool via config-declared sidecar server");
     assert!(
-        result.content_text.contains("MARKER.txt"),
+        result.render_text().contains("MARKER.txt"),
         "sidecar list_directory should see the workspace, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -1164,7 +1164,7 @@ async fn failed_add_sidecar_leaves_session_usable() {
         )
         .await
         .expect("primary server still serves calls");
-    assert!(result.content_text.contains("MARKER.txt"));
+    assert!(result.render_text().contains("MARKER.txt"));
 
     // Failed adds leave no containers behind.
     for name in ["badimg", "badsrv"] {
@@ -1305,9 +1305,9 @@ async fn from_image_launches_with_extra_read_only_mount() {
         .await
         .expect("call_tool list_directory");
     assert!(
-        result.content_text.contains("REFERENCE.txt"),
+        result.render_text().contains("REFERENCE.txt"),
         "list_directory output should mention REFERENCE.txt, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");
@@ -1388,9 +1388,9 @@ async fn from_image_can_ignore_embedded_mcp_label() {
         .await
         .expect("call_tool list_directory");
     assert!(
-        result.content_text.contains("MARKER.txt"),
+        result.render_text().contains("MARKER.txt"),
         "list_directory output should mention MARKER.txt, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     outrig.shutdown().await.expect("shutdown");

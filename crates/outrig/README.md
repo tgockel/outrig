@@ -38,7 +38,9 @@ for tool in outrig.tools() {
 let result = outrig
     .call_tool("fs", "list_directory", serde_json::json!({ "path": "/workspace" }))
     .await?;
-println!("{}", result.content_text);
+// `result.content` is the server's blocks in order; `render_text` is the
+// single-string view a language model is given.
+println!("{}", result.render_text());
 
 // Stop every server, then the container.
 outrig.shutdown().await?;

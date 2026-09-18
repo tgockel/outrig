@@ -12,67 +12,21 @@
 //! grace -> kill sequence the MCP spec calls for.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, ContentBlock, ResourceContents};
+use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use serde_json::Value;
 
 use crate::config::{EnvValue, McpServerSpec};
 use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, OutrigError, Result};
+use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 use crate::process::{Cmd, Owned, StdioSpec, Transcript};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct McpTool {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Value,
-}
-
-impl McpTool {
-    /// A tool named `name` taking `input_schema`. Assign `description` on the
-    /// result to add one.
-    pub fn new(name: impl Into<String>, input_schema: Value) -> Self {
-        Self {
-            name: name.into(),
-            description: None,
-            input_schema,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct McpToolResult {
-    pub content_text: String,
-    pub is_error: bool,
-}
-
-impl McpToolResult {
-    /// A successful call returning `content_text`.
-    pub fn ok(content_text: impl Into<String>) -> Self {
-        Self {
-            content_text: content_text.into(),
-            is_error: false,
-        }
-    }
-
-    /// A call the server itself reported as failed -- distinct from a
-    /// transport error, which surfaces as an `Err`.
-    pub fn error(content_text: impl Into<String>) -> Self {
-        Self {
-            content_text: content_text.into(),
-            is_error: true,
-        }
-    }
-}
 
 /// On `Drop` without an explicit [`McpClient::shutdown`], the child is owned by
 /// outrig's process layer: it is SIGKILLed synchronously and reaped by the
@@ -264,7 +218,7 @@ impl McpClient {
         &self.name
     }
 
-    /// Issue an MCP `tools/list` (paginating internally) and project the
+    /// Issue an MCP `tools/list` (paginating internally) and translate the
     /// results into our own [`McpTool`] type.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>> {
         let tools = self.service.list_all_tools().await.map_err(|source| {
@@ -273,25 +227,16 @@ impl McpClient {
                 source: Box::new(source),
             }
         })?;
-        Ok(tools
-            .into_iter()
-            .map(|t| {
-                let input_schema = t.schema_as_json_value();
-                let description = t.description.and_then(|description| {
-                    (!description.is_empty()).then(|| description.into_owned())
-                });
-                let mut tool = McpTool::new(t.name.into_owned(), input_schema);
-                tool.description = description;
-                tool
-            })
-            .collect())
+        Ok(tools.into_iter().map(tool_from_rmcp).collect())
     }
 
     /// Issue an MCP `tools/call`. `args` must be a JSON object (forwarded as
     /// the call's `arguments`) or `Value::Null` (no arguments). Other shapes
     /// are a programmer error and return [`OutrigError::McpArgsNotObject`].
-    /// Content blocks in the response are flattened into a single string;
-    /// `is_error` mirrors the server's flag.
+    ///
+    /// The response's content blocks, structured content, and `_meta` are
+    /// carried through intact; `is_error` mirrors the server's flag. See
+    /// [`McpToolResult::render_text`] for the single-string view.
     pub async fn call_tool(&self, name: &str, args: Value) -> Result<McpToolResult> {
         let arguments = match args {
             Value::Object(map) => Some(map),
@@ -307,55 +252,7 @@ impl McpClient {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        let result = self.service.call_tool(request).await?;
-
-        let mut content_text = String::new();
-        for (i, content) in result.content.iter().enumerate() {
-            if i > 0 {
-                content_text.push('\n');
-            }
-            match content {
-                ContentBlock::Text(t) => content_text.push_str(&t.text),
-                ContentBlock::Image(img) => {
-                    let _ = write!(
-                        content_text,
-                        "[image: {}, {} base64 bytes]",
-                        img.mime_type,
-                        img.data.len()
-                    );
-                }
-                ContentBlock::Resource(r) => match &r.resource {
-                    ResourceContents::TextResourceContents { text, .. } => {
-                        content_text.push_str(text)
-                    }
-                    ResourceContents::BlobResourceContents {
-                        mime_type, blob, ..
-                    } => {
-                        let mime = mime_type.as_deref().unwrap_or("application/octet-stream");
-                        let _ = write!(content_text, "[blob: {mime}, {} base64 bytes]", blob.len());
-                    }
-                    _ => content_text.push_str("[unsupported resource contents]"),
-                },
-                ContentBlock::Audio(audio) => {
-                    let _ = write!(
-                        content_text,
-                        "[audio: {}, {} base64 bytes]",
-                        audio.mime_type,
-                        audio.data.len()
-                    );
-                }
-                ContentBlock::ResourceLink(link) => {
-                    let _ = write!(content_text, "[resource link: {}]", link.uri);
-                }
-                _ => content_text.push_str("[unsupported content block]"),
-            }
-        }
-
-        Ok(if result.is_error.unwrap_or(false) {
-            McpToolResult::error(content_text)
-        } else {
-            McpToolResult::ok(content_text)
-        })
+        Ok(result_from_rmcp(self.service.call_tool(request).await?))
     }
 
     /// Cancel the rmcp service (which closes the child's stdin -- the MCP

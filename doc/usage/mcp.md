@@ -372,6 +372,50 @@ dispatches the call to the original `read_file` tool on the `fs` backing server.
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md#tool-name-prefixing) for the
 collision and sanitization rules.
 
+## Tool Results
+
+A `tools/call` answer is an ordered list of content blocks, and outrig forwards it whole:
+every block, in the order the backing server sent it, with its boundaries, payload,
+annotations, and `_meta` intact. `structuredContent` and result-level `_meta` come through
+beside the blocks. A client connected to `outrig mcp` therefore sees an image as an image.
+
+Two things are outrig's rather than the backing server's:
+
+- **The tool name.** `tools/list` re-advertises the upstream descriptor unchanged -- title,
+  description, both schemas, behavioral hints, icons, `_meta` -- under the namespaced name.
+- **`resultType`.** outrig answers `complete` for every dispatch. The other values promise
+  `tasks/*` follow-up methods the proxy does not implement, so relaying one would advertise
+  a surface that is not there.
+
+A block kind newer than outrig's MCP SDK never arrives: the SDK rejects it before outrig
+sees it. A kind the SDK knows and outrig does not is carried through as the JSON it
+arrived as, so the proxy is not the thing that drops it.
+
+### The rendered view
+
+A language model's tool-result channel is a string, so `outrig run` gives the model a
+rendering of the blocks rather than the blocks themselves. It is the library's
+`McpToolResult::render_text`, and it is what `tool-result-max` caps -- see
+[Reference -> Config](../reference/config.md). Blocks are joined with newlines:
+
+| Block                    | Rendering                                     |
+|--------------------------|-----------------------------------------------|
+| text                     | the text                                      |
+| embedded text resource   | the text                                      |
+| image                    | `[image: {mime}, {n} base64 bytes]`           |
+| audio                    | `[audio: {mime}, {n} base64 bytes]`           |
+| embedded binary resource | `[blob: {mime}, {n} base64 bytes]`            |
+| resource link            | `[resource link: {uri}]`                      |
+| anything else            | `[unsupported content block: {kind}]`         |
+
+`{n}` counts base64 characters, not decoded bytes -- it describes what arrived, not what
+it decodes to. `structuredContent` is not rendered; a server that wants a model to read it
+is required by the spec to also send it as text.
+
+So the two exits differ on purpose. An external client reaching outrig through
+`outrig mcp` gets the protocol's data; the agent loop inside `outrig run` gets the
+rendering, because that is the shape its tool channel has.
+
 ## Lifecycle
 
 `outrig mcp` has three graceful shutdown triggers:

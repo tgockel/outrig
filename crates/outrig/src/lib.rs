@@ -34,6 +34,7 @@ pub mod container;
 pub mod error;
 pub mod image;
 mod mcp;
+mod mcp_content;
 pub mod mcp_proxy;
 pub mod network;
 mod nsfork;
@@ -54,7 +55,11 @@ pub use config::{
 // convenience, not a rule: `Container` itself is named by
 // `McpClient::connect_via_podman_exec` and stays put.
 pub use container::ExecOptions;
-pub use mcp::{McpClient, McpTool, McpToolResult, resolve_mcp_env};
+pub use mcp::{McpClient, resolve_mcp_env};
+pub use mcp_content::{
+    McpAnnotations, McpContent, McpEmbeddedResource, McpIcon, McpMediaContent, McpResourceContents,
+    McpResourceLink, McpRole, McpTextContent, McpTool, McpToolAnnotations, McpToolResult,
+};
 pub use outrig_::{
     CapabilitySpec, EmbeddedMcpPolicy, LaunchSpec, MountSpec, NetworkSpec, Outrig, SecuritySpec,
     SidecarServerSpec, SidecarSpec, ToolHandle, WorkspaceSpec,

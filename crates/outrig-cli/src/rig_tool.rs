@@ -93,8 +93,13 @@ pub fn truncate_for_llm(result: &str, max: usize) -> String {
     }
 }
 
+/// Reduce a tool result to the single string `rig`'s tool interface carries.
+///
+/// The model sees the rendered view, not the blocks: an image block reaches a
+/// client connected to `outrig mcp`, but there is nowhere to put it here. The
+/// byte cap applies to that rendering.
 fn adapt_tool_result(result: McpToolResult, max: usize) -> std::result::Result<String, ToolError> {
-    let content_text = truncate_for_llm(&result.content_text, max);
+    let content_text = truncate_for_llm(&result.render_text(), max);
     if result.is_error {
         Err(ToolError::ToolCallError(Box::new(McpAdapterError(
             content_text,

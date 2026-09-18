@@ -95,9 +95,9 @@ async fn lists_tools_and_calls_list_directory() {
         result
     );
     assert!(
-        result.content_text.contains("HELLO.txt"),
+        result.render_text().contains("HELLO.txt"),
         "list_directory output should mention HELLO.txt, got: {}",
-        result.content_text,
+        result.render_text(),
     );
 
     let stderr_path = log_dir.join("fs.stderr");

@@ -96,7 +96,10 @@ config may set any value from `1024` through `16777216` bytes.
 `[agents.<name>].tool-result-max` overrides the top-level value for one agent, and
 `outrig run --max-tool-result-bytes <n>` overrides both for one invocation. Results larger than
 the max are truncated at a UTF-8 boundary and end with an `[outrig: tool result truncated]`
-marker that reports the original size and max.
+marker that reports the original size and max. The cap applies to the *rendered* text --
+the single string the model is given, which is what a non-text content block contributes a
+bracketed placeholder to -- not to the server's content blocks, which reach a client
+connected to `outrig mcp` whole.
 
 `subagent-depth-max` bounds how deeply subagents may nest. The primary agent you talk to is the
 root at depth 1; an agent at depth `D` may launch subagents (which live at depth `D+1`) only

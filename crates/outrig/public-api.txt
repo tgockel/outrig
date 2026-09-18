@@ -813,7 +813,7 @@ pub outrig::error::OutrigError::ApiKey(outrig::config::ApiKeyError)
 pub outrig::error::OutrigError::BootstrapExhausted::kind: &'static str
 #[non_exhaustive] pub outrig::error::OutrigError::BootstrapNamespace
 pub outrig::error::OutrigError::BootstrapNamespace::container: alloc::string::String
-pub outrig::error::OutrigError::BootstrapNamespace::source: std::io::error::Error
+pub outrig::error::OutrigError::BootstrapNamespace::source: core::io::error::Error
 pub outrig::error::OutrigError::BootstrapNamespace::step: alloc::string::String
 #[non_exhaustive] pub outrig::error::OutrigError::BuildArgResolveFailed
 pub outrig::error::OutrigError::BuildArgResolveFailed::image: alloc::string::String
@@ -831,7 +831,7 @@ pub outrig::error::OutrigError::Configuration(alloc::string::String)
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::image: alloc::string::String
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::source: alloc::boxed::Box<outrig::container::embedded::EmbeddedImageConfigError>
 pub outrig::error::OutrigError::FilesystemHelperUnavailable
-pub outrig::error::OutrigError::Io(std::io::error::Error)
+pub outrig::error::OutrigError::Io(core::io::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::McpArgsNotObject
 pub outrig::error::OutrigError::McpArgsNotObject::kind: &'static str
 #[non_exhaustive] pub outrig::error::OutrigError::McpEnvResolveFailed
@@ -861,7 +861,7 @@ pub outrig::error::OutrigError::NoRepoConfig
 #[non_exhaustive] pub outrig::error::OutrigError::Path
 pub outrig::error::OutrigError::Path::op: &'static str
 pub outrig::error::OutrigError::Path::path: std::path::PathBuf
-pub outrig::error::OutrigError::Path::source: std::io::error::Error
+pub outrig::error::OutrigError::Path::source: core::io::error::Error
 #[non_exhaustive] pub outrig::error::OutrigError::Process
 pub outrig::error::OutrigError::Process::argv: alloc::vec::Vec<std::ffi::os_str::OsString>
 pub outrig::error::OutrigError::Process::exit_code: core::option::Option<i32>
@@ -871,7 +871,7 @@ pub outrig::error::OutrigError::SidecarNotUnwound(alloc::boxed::Box<outrig::erro
 #[non_exhaustive] pub outrig::error::OutrigError::Spawn
 pub outrig::error::OutrigError::Spawn::command: alloc::string::String
 pub outrig::error::OutrigError::Spawn::program: &'static str
-pub outrig::error::OutrigError::Spawn::source: std::io::error::Error
+pub outrig::error::OutrigError::Spawn::source: core::io::error::Error
 impl core::convert::From<rmcp::service::server::ServerInitializeError> for outrig::error::OutrigError
 pub fn outrig::error::OutrigError::from(rmcp::service::server::ServerInitializeError) -> Self
 impl core::convert::From<tempfile::file::PersistError> for outrig::error::OutrigError
@@ -901,8 +901,8 @@ impl outrig::error::SidecarUnwindFailure
 pub fn outrig::error::SidecarUnwindFailure::new(impl core::convert::Into<alloc::string::String>, outrig::error::OutrigError, alloc::vec::Vec<outrig::error::OutrigError>) -> Self
 pub trait outrig::error::IoPathExt<T>
 pub fn outrig::error::IoPathExt::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
-impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, std::io::error::Error>
-pub fn core::result::Result<T, std::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
+impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, core::io::error::Error>
+pub fn core::result::Result<T, core::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
 pub fn outrig::error::superseded_by_a_confirmed_stop(outrig::error::OutrigError, &str) -> outrig::error::OutrigError
 pub type outrig::error::Result<T> = core::result::Result<T, outrig::error::OutrigError>
 pub mod outrig::image
@@ -980,6 +980,38 @@ pub outrig::CapabilityProfile::NoNetRaw
 #[non_exhaustive] pub enum outrig::EmbeddedMcpPolicy
 pub outrig::EmbeddedMcpPolicy::Ignore
 pub outrig::EmbeddedMcpPolicy::Merge
+#[non_exhaustive] pub enum outrig::McpContent
+pub outrig::McpContent::Audio(outrig::McpMediaContent)
+pub outrig::McpContent::Image(outrig::McpMediaContent)
+pub outrig::McpContent::Other
+pub outrig::McpContent::Other::kind: alloc::string::String
+pub outrig::McpContent::Other::raw: serde_json::value::Value
+pub outrig::McpContent::Resource(outrig::McpEmbeddedResource)
+pub outrig::McpContent::ResourceLink(outrig::McpResourceLink)
+pub outrig::McpContent::Text(outrig::McpTextContent)
+impl outrig::McpContent
+pub fn outrig::McpContent::audio(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::McpContent::image(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::McpContent::text(impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub enum outrig::McpResourceContents
+pub outrig::McpResourceContents::Blob
+pub outrig::McpResourceContents::Blob::blob: alloc::string::String
+pub outrig::McpResourceContents::Blob::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpResourceContents::Blob::mime_type: core::option::Option<alloc::string::String>
+pub outrig::McpResourceContents::Blob::uri: alloc::string::String
+pub outrig::McpResourceContents::Other
+pub outrig::McpResourceContents::Other::raw: serde_json::value::Value
+pub outrig::McpResourceContents::Text
+pub outrig::McpResourceContents::Text::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpResourceContents::Text::mime_type: core::option::Option<alloc::string::String>
+pub outrig::McpResourceContents::Text::text: alloc::string::String
+pub outrig::McpResourceContents::Text::uri: alloc::string::String
+impl outrig::McpResourceContents
+pub fn outrig::McpResourceContents::blob(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::McpResourceContents::text(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+pub enum outrig::McpRole
+pub outrig::McpRole::Assistant
+pub outrig::McpRole::User
 #[non_exhaustive] pub enum outrig::MountAccess
 pub outrig::MountAccess::ReadOnly
 pub outrig::MountAccess::ReadWrite
@@ -1064,6 +1096,10 @@ pub fn outrig::LaunchSpec::with_security(self, outrig::SecuritySpec) -> Self
 pub fn outrig::LaunchSpec::with_sidecar(self, outrig::SidecarSpec) -> Self
 pub fn outrig::LaunchSpec::with_workspace(self, outrig::WorkspaceSpec) -> Self
 pub fn outrig::LaunchSpec::without_workspace(self) -> Self
+#[non_exhaustive] pub struct outrig::McpAnnotations
+pub outrig::McpAnnotations::audience: core::option::Option<alloc::vec::Vec<outrig::McpRole>>
+pub outrig::McpAnnotations::last_modified: core::option::Option<alloc::string::String>
+pub outrig::McpAnnotations::priority: core::option::Option<f32>
 pub struct outrig::McpClient
 impl outrig::McpClient
 pub async fn outrig::McpClient::call_tool(&self, &str, serde_json::value::Value) -> outrig::error::Result<outrig::McpToolResult>
@@ -1077,18 +1113,71 @@ impl outrig::mcp_proxy::BackingClient for outrig::McpClient
 pub fn outrig::McpClient::call_tool(&self, &str, serde_json::value::Value) -> impl core::future::future::Future<Output = outrig::error::Result<outrig::McpToolResult>> + core::marker::Send
 pub fn outrig::McpClient::list_tools(&self) -> impl core::future::future::Future<Output = outrig::error::Result<alloc::vec::Vec<outrig::McpTool>>> + core::marker::Send
 pub fn outrig::McpClient::name(&self) -> &str
+#[non_exhaustive] pub struct outrig::McpEmbeddedResource
+pub outrig::McpEmbeddedResource::annotations: core::option::Option<outrig::McpAnnotations>
+pub outrig::McpEmbeddedResource::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpEmbeddedResource::resource: outrig::McpResourceContents
+impl outrig::McpEmbeddedResource
+pub fn outrig::McpEmbeddedResource::new(outrig::McpResourceContents) -> Self
+#[non_exhaustive] pub struct outrig::McpIcon
+pub outrig::McpIcon::mime_type: core::option::Option<alloc::string::String>
+pub outrig::McpIcon::sizes: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub outrig::McpIcon::src: alloc::string::String
+pub outrig::McpIcon::theme: core::option::Option<alloc::string::String>
+impl outrig::McpIcon
+pub fn outrig::McpIcon::new(impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct outrig::McpMediaContent
+pub outrig::McpMediaContent::annotations: core::option::Option<outrig::McpAnnotations>
+pub outrig::McpMediaContent::data: alloc::string::String
+pub outrig::McpMediaContent::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpMediaContent::mime_type: alloc::string::String
+impl outrig::McpMediaContent
+pub fn outrig::McpMediaContent::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct outrig::McpResourceLink
+pub outrig::McpResourceLink::annotations: core::option::Option<outrig::McpAnnotations>
+pub outrig::McpResourceLink::description: core::option::Option<alloc::string::String>
+pub outrig::McpResourceLink::icons: core::option::Option<alloc::vec::Vec<outrig::McpIcon>>
+pub outrig::McpResourceLink::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpResourceLink::mime_type: core::option::Option<alloc::string::String>
+pub outrig::McpResourceLink::name: alloc::string::String
+pub outrig::McpResourceLink::size: core::option::Option<u64>
+pub outrig::McpResourceLink::title: core::option::Option<alloc::string::String>
+pub outrig::McpResourceLink::uri: alloc::string::String
+impl outrig::McpResourceLink
+pub fn outrig::McpResourceLink::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+#[non_exhaustive] pub struct outrig::McpTextContent
+pub outrig::McpTextContent::annotations: core::option::Option<outrig::McpAnnotations>
+pub outrig::McpTextContent::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpTextContent::text: alloc::string::String
+impl outrig::McpTextContent
+pub fn outrig::McpTextContent::new(impl core::convert::Into<alloc::string::String>) -> Self
 #[non_exhaustive] pub struct outrig::McpTool
+pub outrig::McpTool::annotations: core::option::Option<outrig::McpToolAnnotations>
 pub outrig::McpTool::description: core::option::Option<alloc::string::String>
+pub outrig::McpTool::icons: core::option::Option<alloc::vec::Vec<outrig::McpIcon>>
 pub outrig::McpTool::input_schema: serde_json::value::Value
+pub outrig::McpTool::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
 pub outrig::McpTool::name: alloc::string::String
+pub outrig::McpTool::output_schema: core::option::Option<serde_json::value::Value>
+pub outrig::McpTool::title: core::option::Option<alloc::string::String>
 impl outrig::McpTool
 pub fn outrig::McpTool::new(impl core::convert::Into<alloc::string::String>, serde_json::value::Value) -> Self
+#[non_exhaustive] pub struct outrig::McpToolAnnotations
+pub outrig::McpToolAnnotations::destructive_hint: core::option::Option<bool>
+pub outrig::McpToolAnnotations::idempotent_hint: core::option::Option<bool>
+pub outrig::McpToolAnnotations::open_world_hint: core::option::Option<bool>
+pub outrig::McpToolAnnotations::read_only_hint: core::option::Option<bool>
+pub outrig::McpToolAnnotations::title: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub struct outrig::McpToolResult
-pub outrig::McpToolResult::content_text: alloc::string::String
+pub outrig::McpToolResult::content: alloc::vec::Vec<outrig::McpContent>
 pub outrig::McpToolResult::is_error: bool
+pub outrig::McpToolResult::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
+pub outrig::McpToolResult::structured_content: core::option::Option<serde_json::value::Value>
 impl outrig::McpToolResult
 pub fn outrig::McpToolResult::error(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::McpToolResult::from_content(alloc::vec::Vec<outrig::McpContent>) -> Self
 pub fn outrig::McpToolResult::ok(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::McpToolResult::render_text(&self) -> alloc::string::String
 #[non_exhaustive] pub struct outrig::MountSpec
 pub outrig::MountSpec::access: outrig::config::MountAccess
 pub outrig::MountSpec::container: std::path::PathBuf
@@ -1161,14 +1250,19 @@ pub fn outrig::SidecarSpec::with_server_spec(self, impl core::convert::Into<allo
 pub fn outrig::SidecarSpec::with_view(self, outrig::config::SidecarView) -> Self
 pub fn outrig::SidecarSpec::with_workspace_access(self, outrig::config::SidecarWorkspaceAccess) -> Self
 #[non_exhaustive] pub struct outrig::ToolHandle
+pub outrig::ToolHandle::annotations: core::option::Option<outrig::McpToolAnnotations>
 pub outrig::ToolHandle::description: alloc::string::String
+pub outrig::ToolHandle::icons: core::option::Option<alloc::vec::Vec<outrig::McpIcon>>
 pub outrig::ToolHandle::input_schema: serde_json::value::Value
+pub outrig::ToolHandle::meta: core::option::Option<serde_json::map::Map<alloc::string::String, serde_json::value::Value>>
 pub outrig::ToolHandle::name: alloc::string::String
+pub outrig::ToolHandle::output_schema: core::option::Option<serde_json::value::Value>
 pub outrig::ToolHandle::server: alloc::string::String
+pub outrig::ToolHandle::title: core::option::Option<alloc::string::String>
 pub struct outrig::Transcript
 impl outrig::Transcript
 pub async fn outrig::Transcript::create(&std::path::Path, bool) -> outrig::error::Result<Self>
-pub async fn outrig::Transcript::line(&self, &'static str, &str) -> std::io::error::Result<()>
+pub async fn outrig::Transcript::line(&self, &'static str, &str) -> core::io::error::Result<()>
 #[non_exhaustive] pub struct outrig::WorkspaceSpec
 pub outrig::WorkspaceSpec::container: std::path::PathBuf
 pub outrig::WorkspaceSpec::host: std::path::PathBuf

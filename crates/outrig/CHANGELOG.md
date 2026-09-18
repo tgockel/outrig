@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP tool results carry the protocol's data.** `McpToolResult` is an ordered
+  `Vec<McpContent>` -- text, images, audio, embedded resources, resource links -- beside
+  `structured_content` and result-level `_meta`, and `McpTool` carries the whole upstream
+  descriptor: `title`, `output_schema`, `annotations`, `icons`, `_meta`. `ToolHandle` grows the
+  same fields. A 0.2.x consumer may depend on a tool result reaching it, and reaching a client
+  connected to `outrig mcp`, with every block in order and nothing but `resultType` normalized.
+
+  **Breaking: `McpToolResult::content_text` the field is gone**, replaced by
+  `McpToolResult::render_text()`. It had been the only result model there was, so a consumer
+  who shipped against it would have built around a rendering; keeping both a stored string and
+  the blocks it was rendered from is two sources of truth that can disagree. The rendering
+  itself is unchanged -- same placeholders, same newline joins -- so a transcript recorded
+  against 0.1 reads the same. `McpToolResult::ok` and `::error` still build a single text
+  block; `McpToolResult::from_content` takes the list.
+
+  The types are outrig's, not the MCP SDK's. That is the boundary this crate holds to: SDK
+  types appear in the public API only where an item exists to participate in the SDK's own
+  machinery -- `ProxyServer`'s `ServerHandler` impl and the two `RequestContext`-free halves of
+  it, plus `SUPPORTED_PROTOCOL_VERSIONS`, which is returned from one. For those, an SDK major
+  is an outrig major. Anything outrig reports in its own right is outrig-typed, so an SDK
+  upgrade does not reach a caller who only ever handled a tool result.
+
+  A content kind the SDK knows and this build does not is kept as the JSON it arrived as and
+  forwarded unchanged, rather than being flattened to a placeholder. A kind the SDK itself does
+  not know never arrives: it fails to decode one layer below outrig.
+
+  `resultType` is deliberately not relayed: `ProxyServer` answers `complete`, because `task`
+  and `input_required` promise follow-up methods it does not implement.
+
 - **`mcp_proxy::SUPPORTED_PROTOCOL_VERSIONS`**, the ordered list of MCP protocol revisions
   outrig's servers are known to serve correctly, and
   `ProxyServer::supported_protocol_versions` returning it. Both exist so the ceiling on what

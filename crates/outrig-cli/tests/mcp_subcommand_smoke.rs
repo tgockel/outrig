@@ -711,7 +711,7 @@ async fn mcp_attach_by_session_id_reuses_container_and_writes_own_logs() {
         .await
         .expect("host MCP still answers after attach exits");
     assert!(
-        !host_result.is_error && host_result.content_text.contains("HELLO.txt"),
+        !host_result.is_error && host_result.render_text().contains("HELLO.txt"),
         "host MCP child should remain usable: {host_result:?}"
     );
 

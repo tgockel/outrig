@@ -129,3 +129,97 @@ jointly with 0002-47's fork 1.
   `call_tool` (288), the conversion (305-350).
 - `crates/outrig/src/mcp_proxy.rs` -- `list_tools_inner` (292), `dispatch_call` (318);
   `crates/outrig/src/mcp_proxy_dispatch_tests.rs` -- the tests whose fake cannot express the loss.
+
+## Decisions
+
+1. **Fork 1: lossless, as recommended.** `McpToolResult` carries `Vec<McpContent>`,
+   `structured_content`, and result-level `meta`; `McpTool` carries the whole descriptor. The
+   counter-argument was scope, and the task is indeed the largest of the pre-freeze set, but
+   the reduction was never a decision anyone made and freezing it would have made the repair
+   semantically disruptive rather than merely breaking.
+
+2. **Fork 2 -- the rmcp boundary. This is the answer 0002-47 inherits.**
+
+   > rmcp types are permitted on outrig's public surface **only where the item exists to
+   > participate in rmcp's own machinery** -- implementing an rmcp trait, or being handed
+   > straight back to rmcp. Wherever a value carries information outrig reports in its own
+   > right -- tool descriptors, tool results, errors -- the type is outrig's.
+
+   The test is *why the item exists*, not whether an rmcp type appears in it. Applied:
+
+   | Surface                                                     | Verdict                    |
+   |-------------------------------------------------------------|----------------------------|
+   | content blocks, tool descriptors                             | outrig-owned (done here)   |
+   | `ProxyServer`'s `ServerHandler` impl                         | rmcp, frozen               |
+   | `dispatch_call`, `list_tools_inner`                          | rmcp, frozen               |
+   | `SUPPORTED_PROTOCOL_VERSIONS`                                | rmcp, frozen               |
+   | `OutrigError`'s three rmcp variants, `From<ServerInitializeError>` | outrig-owned -- 0002-47 |
+
+   `dispatch_call` and `list_tools_inner` are the `RequestContext`-free halves of the server
+   impl and exist only to be its testable core, so they inherit its verdict. The version
+   constant exists to be returned from `supported_protocol_versions`; it is an argument to
+   rmcp, not a fact outrig reports. The error variants are the opposite: they are reachable
+   from every fallible call in the crate and are what a caller matches on, so the principle
+   says narrow them. Checking the principle against those three before committing to it was
+   the point of the fork; it gives a different answer for the error variants than for the
+   proxy, and that asymmetry is the principle working rather than failing.
+
+   The conversions are `pub(crate)` free functions rather than `From` impls, since a public
+   `From<CallToolResult>` would put rmcp straight back on the surface.
+
+3. **`content_text` becomes `render_text()`, not a same-named accessor.** A method spelled
+   like the old field would let a call site keep compiling while its meaning changed from "the
+   result" to "one view of the result". The rename makes every call site a compile error whose
+   fix is mechanical, and the rendering itself is byte-identical for text-only results, so no
+   transcript shifts.
+
+4. **Unknown block kinds round-trip opaquely, and are named in the rendering.** rmcp's
+   `ContentBlock` is `#[serde(tag = "type")]` with no catch-all, so a kind *rmcp* does not know
+   fails to decode a layer below outrig and never arrives. The reachable case is a kind rmcp
+   learns and outrig has not: captured as `McpContent::Other { kind, raw }` from the block's
+   own serialization and rebuilt with `from_value` on the way out, so the proxy is not what
+   drops it. If the rebuild fails it degrades to `[unsupported content block: {kind}]` as text
+   rather than erroring -- losing one block beats losing the result. `McpResourceContents::Other`
+   works the same way.
+
+5. **`_meta` and `structured_content` are preserved; `resultType` is not.** The first two are
+   carried in both directions, at result level and per block, asserted directly. `resultType`
+   is normalized to `complete`: `task` and `input_required` promise `tasks/*` and elicitation
+   follow-ups `ProxyServer` does not implement, and relaying the marker without the methods
+   advertises a surface that is not there. This is also what `CallToolResult::success`/`::error`
+   already did, so the change is that it is now a decision with a test rather than a default.
+
+6. **Foreign enums are mirrored by their declared stability.** `Role` is declared exhaustive by
+   both the spec and rmcp, so `McpRole` is a real two-variant enum a consumer can match without
+   a wildcard. `IconTheme` is `#[non_exhaustive]`, so `McpIcon::theme` is the wire `String`: a
+   mirror of a growable foreign enum needs an escape hatch anyway, and a string *is* the escape
+   hatch. A theme string rmcp cannot name is dropped on the outbound leg rather than guessed at.
+
+7. **`ToolHandle` is fixed here, outside the four legs.** It is the `Outrig` facade's own
+   flattened descriptor, and 0.2.0 freezes it too; leaving it would have frozen the identical
+   defect one tier up, for the sake of a scope line. It is built directly from `McpTool`, so
+   the change is the five fields and nothing else.
+
+8. **The two exits keep different fidelity, on purpose.** A client reaching outrig through
+   `outrig mcp` receives the blocks; the agent loop inside `outrig run` receives
+   `render_text()`, because `rig`'s `ToolDyn::call` returns `String`. Documented in
+   `doc/usage/mcp.md` rather than left to be discovered, and the remaining half is
+   `plan/next/rich-tool-results-for-the-agent-loop.md`.
+
+9. **The end-to-end compares the payload, not the envelope.** rmcp strips `resultType` when the
+   peer negotiated a revision that predates it (`handler/server.rs`'s
+   `strip_result_type_for_legacy_peer`), so a whole-value equality assertion across a real
+   client would be asserting rmcp's downgrade behavior rather than outrig's forwarding.
+
+10. **The advertised `Tool` is assembled once, at `ProxyServer::build`.** The first cut kept the
+    whole `McpTool` per entry and rebuilt the rmcp `Tool` on every `tools/list`, which deep-cloned
+    the output schema into a fresh `Arc` each time -- and left `ToolEntry` holding the input schema
+    twice, once as the `Value` inside `McpTool` and once as the validated `Arc<JsonObject>` beside
+    it. The table is frozen for the life of the proxy, so a listing is a clone of a finished
+    answer: `ToolEntry` is `{ listed: Tool, backend_tool, client_idx }` and nothing is derived per
+    request. The converters stay pure functions, so the per-leg tests are unaffected.
+
+    What that leaves is `ToolHandle` still flattening `McpTool` field by field, and
+    `McpTool::input_schema` still typed `Value` when the protocol requires an object. Both are
+    public-surface breaks on types this task did not set out to redesign, and both are
+    `plan/next/tool-descriptor-is-shaped-twice.md`.

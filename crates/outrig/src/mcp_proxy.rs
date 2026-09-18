@@ -21,7 +21,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    Implementation, JsonObject, ListPromptsRequestMethod, ListPromptsResult,
+    Implementation, ListPromptsRequestMethod, ListPromptsResult,
     ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
     ServerCapabilities, ServerInfo, Tool,
@@ -30,7 +30,8 @@ use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
 
 use crate::error::{OutrigError, Result};
-use crate::mcp::{self, McpClient, McpTool, McpToolResult};
+use crate::mcp::{self, McpClient};
+use crate::mcp_content::{McpTool, McpToolResult, result_to_rmcp, tool_to_rmcp};
 use crate::tool_name;
 
 /// Protocol revisions OutRig's MCP servers are known to serve correctly.
@@ -137,16 +138,18 @@ where
     }
 }
 
-/// One entry in the proxy's flattened tool table. Each entry remembers both
-/// the public namespaced name (what the LLM-side MCP client sees) and the
-/// upstream name (what we send back through the `client_idx`'th backing
-/// client when the LLM calls it).
+/// One entry in the proxy's flattened tool table.
 #[derive(Debug, Clone)]
 struct ToolEntry {
-    public_name: String,
+    /// The tool exactly as `tools/list` advertises it: the public namespaced
+    /// name, and the backing server's own title, description, schemas, hints,
+    /// icons, and `_meta`. Assembled once in [`ProxyServer::build`] rather
+    /// than per request, because the table is frozen for the life of the
+    /// proxy -- so a listing is a clone of a finished answer.
+    listed: Tool,
+    /// The upstream name, which is what a dispatch sends back through the
+    /// `client_idx`'th backing client.
     backend_tool: String,
-    description: String,
-    input_schema: Arc<JsonObject>,
     client_idx: usize,
 }
 
@@ -220,24 +223,23 @@ impl<C: BackingClient> ProxyServer<C> {
                     )));
                 }
 
-                let input_schema = match tool.input_schema {
-                    Value::Object(map) => Arc::new(map),
+                let input_schema = match &tool.input_schema {
+                    Value::Object(map) => Arc::new(map.clone()),
                     other => {
                         return Err(OutrigError::Configuration(format!(
                             "mcp_proxy: tool {server_name:?}::{tool_name:?} input_schema is \
                              not a JSON object (got {kind})",
                             tool_name = tool.name,
-                            kind = mcp::kind_of(&other),
+                            kind = mcp::kind_of(other),
                         )));
                     }
                 };
 
-                by_public_name.insert(public_name.clone(), tools.len());
+                let listed = tool_to_rmcp(public_name.clone(), &tool, input_schema);
+                by_public_name.insert(public_name, tools.len());
                 tools.push(ToolEntry {
-                    public_name,
+                    listed,
                     backend_tool: tool.name,
-                    description: tool.description.unwrap_or_default(),
-                    input_schema,
                     client_idx,
                 });
             }
@@ -264,7 +266,7 @@ impl<C: BackingClient> ProxyServer<C> {
     /// order they were registered. `0001-40` consumes this for the startup
     /// banner.
     pub fn iter_public_names(&self) -> impl Iterator<Item = &str> {
-        self.inner.tools.iter().map(|t| t.public_name.as_str())
+        self.inner.tools.iter().map(|t| t.listed.name.as_ref())
     }
 
     /// Per-backing-client tool counts, in client registration order.
@@ -289,18 +291,15 @@ impl<C: BackingClient> ProxyServer<C> {
     /// listing can be read without fabricating an rmcp [`RequestContext`] --
     /// what a caller driving the proxy outside an rmcp server needs, and what
     /// the crate's own dispatch tests use.
+    ///
+    /// Only the name is outrig's; title, description, both schemas, hints,
+    /// icons, and `_meta` are the upstream server's, unchanged.
     pub fn list_tools_inner(&self) -> ListToolsResult {
         let tools = self
             .inner
             .tools
             .iter()
-            .map(|entry| {
-                Tool::new(
-                    entry.public_name.clone(),
-                    entry.description.clone(),
-                    entry.input_schema.clone(),
-                )
-            })
+            .map(|entry| entry.listed.clone())
             .collect();
         // `Private`: the union depends on this session's config, image, and `--env`
         // overrides, so it is not shareable across users or intermediaries.
@@ -315,6 +314,10 @@ impl<C: BackingClient> ProxyServer<C> {
     /// rmcp protocol errors. Public for the same reason as
     /// [`Self::list_tools_inner`]: it is the [`RequestContext`]-free half of
     /// the dispatch path.
+    ///
+    /// A result the backing server produced is forwarded whole -- every block
+    /// in order, plus structured content and `_meta`. Only the two failures
+    /// outrig itself reports are synthesized here, and both are text.
     pub async fn dispatch_call(&self, request: CallToolRequestParams) -> CallToolResult {
         let public_name = request.name.as_ref();
         let Some(&idx) = self.inner.by_public_name.get(public_name) else {
@@ -327,10 +330,7 @@ impl<C: BackingClient> ProxyServer<C> {
 
         let client = &self.inner.clients[entry.client_idx];
         match client.call_tool(&entry.backend_tool, args).await {
-            Ok(result) if result.is_error => {
-                CallToolResult::error(vec![ContentBlock::text(result.content_text)])
-            }
-            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result.content_text)]),
+            Ok(result) => result_to_rmcp(result),
             Err(e) => {
                 let server = client.name();
                 tracing::warn!(

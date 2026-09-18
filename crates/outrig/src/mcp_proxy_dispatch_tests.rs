@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rmcp::ServerHandler;
-use rmcp::model::{CacheScope, CallToolRequestParams, ContentBlock, ProtocolVersion};
+use rmcp::model::{CacheScope, CallToolRequestParams, ProtocolVersion};
 use serde_json::{Value, json};
 
 use super::{BackingClient, ProxyServer, SUPPORTED_PROTOCOL_VERSIONS, TOOLS_TTL_MS, sealed};
 use crate::error::OutrigError;
-use crate::mcp::{McpTool, McpToolResult};
+use crate::mcp_content::mcp_content_tests::{MIXED_RENDERING, rmcp_mixed_result, rmcp_rich_tool};
+use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 
 /// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
 /// `Err` becomes the "backing client failed" path that surfaces as
@@ -56,6 +57,18 @@ impl FakeClient {
         self
     }
 
+    /// Register a tool whose descriptor is more than a name and a blurb.
+    fn with_mcp_tool(mut self, tool: McpTool) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    /// Register a canned response that is not reducible to one text block.
+    fn respond_with(mut self, tool_name: &str, result: McpToolResult) -> Self {
+        self.responses.insert(tool_name.to_string(), Ok(result));
+        self
+    }
+
     fn respond_err(mut self, tool_name: &str, msg: &str) -> Self {
         self.responses.insert(
             tool_name.to_string(),
@@ -89,17 +102,11 @@ impl BackingClient for FakeClient {
     }
 }
 
+/// Every block rendered the way [`McpToolResult::render_text`] renders it,
+/// recovered from the wire form -- what a client that only knows how to read
+/// text sees.
 fn text_body(result: &rmcp::model::CallToolResult) -> String {
-    let mut out = String::new();
-    for content in &result.content {
-        if let ContentBlock::Text(t) = content {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&t.text);
-        }
-    }
-    out
+    result_from_rmcp(result.clone()).render_text()
 }
 
 fn call(name: &str, args: Value) -> CallToolRequestParams {
@@ -352,4 +359,101 @@ async fn per_server_counts_preserves_registration_order() {
         proxy.per_server_counts(),
         vec![("fs", 2), ("git", 1), ("empty", 0)]
     );
+}
+
+/// A proxy fronting one server whose single tool returns [`rmcp_mixed_result`].
+async fn mixed_proxy() -> ProxyServer<Arc<FakeClient>> {
+    let fs = Arc::new(
+        FakeClient::new("fs")
+            .with_mcp_tool(tool_from_rmcp(rmcp_rich_tool()))
+            .respond_with("read_file", result_from_rmcp(rmcp_mixed_result())),
+    );
+    ProxyServer::build(vec![fs]).await.expect("build proxy")
+}
+
+#[tokio::test]
+async fn list_tools_readvertises_the_upstream_descriptor() {
+    let proxy = mixed_proxy().await;
+
+    let listed = proxy.list_tools_inner().tools;
+
+    assert_eq!(listed.len(), 1);
+    let tool = &listed[0];
+    // The name is outrig's -- it is the namespaced one. Everything else is
+    // the backing server's, unchanged.
+    assert_eq!(tool.name, "fs__read_file");
+    assert_eq!(tool.title.as_deref(), Some("Read File"));
+    assert_eq!(tool.description.as_deref(), Some("read one file"));
+    assert!(tool.output_schema.is_some(), "output schema must survive");
+    let annotations = tool.annotations.as_ref().expect("tool annotations");
+    assert_eq!(annotations.read_only_hint, Some(true));
+    assert_eq!(annotations.destructive_hint, Some(false));
+    assert_eq!(tool.icons.as_ref().expect("icons").len(), 1);
+    assert!(tool.meta.is_some(), "tool `_meta` must survive");
+}
+
+#[tokio::test]
+async fn dispatch_call_forwards_every_block_intact() {
+    let proxy = mixed_proxy().await;
+
+    let out = proxy.dispatch_call(call("fs__read_file", json!({}))).await;
+
+    assert_eq!(
+        serde_json::to_value(&out).unwrap(),
+        serde_json::to_value(rmcp_mixed_result()).unwrap(),
+        "what the backing server returned is what the proxy emits"
+    );
+    // And the reduced view a model would see still reads the way it did.
+    assert_eq!(text_body(&out), MIXED_RENDERING);
+}
+
+/// The whole path, spoken rather than inspected: a real rmcp client on one
+/// end of an in-memory pipe, [`ProxyServer`] on the other. Nothing here
+/// reaches inside the proxy, so a result that only survives because both
+/// sides share outrig's types would not pass.
+#[tokio::test]
+async fn a_client_sees_the_mixed_result_through_the_proxy() {
+    let proxy = mixed_proxy().await;
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let server = tokio::spawn(async move {
+        let running = rmcp::service::serve_server(proxy, server_io)
+            .await
+            .expect("serve the proxy");
+        running.waiting().await
+    });
+    let client = rmcp::service::serve_client((), client_io)
+        .await
+        .expect("connect to the proxy");
+
+    let listed = client.list_all_tools().await.expect("tools/list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "fs__read_file");
+    assert_eq!(listed[0].title.as_deref(), Some("Read File"));
+    assert!(listed[0].output_schema.is_some());
+
+    let result = client
+        .call_tool(call("fs__read_file", json!({})))
+        .await
+        .expect("tools/call");
+
+    // Compared field by field rather than whole: the SDK strips `resultType`
+    // from the envelope when the peer negotiated a revision that predates it,
+    // which is its business and not outrig's.
+    let expected = rmcp_mixed_result();
+    assert_eq!(
+        serde_json::to_value(&result.content).unwrap(),
+        serde_json::to_value(&expected.content).unwrap(),
+        "the blocks reach a client that speaks the protocol, not just the fake"
+    );
+    assert_eq!(result.structured_content, expected.structured_content);
+    assert_eq!(
+        result.meta.map(|m| m.0),
+        expected.meta.map(|m| m.0),
+        "result-level `_meta` survives the whole path"
+    );
+    assert_eq!(result.is_error, Some(false));
+
+    client.cancel().await.expect("client shutdown");
+    let _ = server.await;
 }
