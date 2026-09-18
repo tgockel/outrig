@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{CliError, Result};
+use crate::repl::notice;
 use outrig::container::{LABEL_SESSION, force_remove_detached};
 
 /// Watches a session's containers. Spawned only for sessions that declare
@@ -125,6 +126,9 @@ fn route_event(line: &str, primary: &str) -> EventRoute {
 }
 
 /// Read this session's `died` events until the primary dies or the stream ends.
+/// Its user-facing lines go through [`notice::print`] rather than `eprintln!`:
+/// they can land while the REPL is holding the terminal for a prompt being
+/// typed, and writing underneath the line editor corrupts what the user sees.
 /// Filtered by `event=died` + the session label, and replayed from `since` so a
 /// death during setup is caught. A sidecar-death line is emitted only for a
 /// name in the shared list: `--since` replays setup-time deaths of warn-path
@@ -181,11 +185,11 @@ async fn watch_events(
                     for name in &names {
                         force_remove_detached(name);
                     }
-                    eprintln!(
+                    notice::print(&format!(
                         "[outrig] primary container {primary} exited unexpectedly; \
                          reaping {} sidecar container(s)",
                         names.len()
-                    );
+                    ));
                     died.cancel();
                     // Stop reading: the reap generates further `died` events we
                     // do not want to log as spontaneous sidecar deaths.
@@ -197,10 +201,10 @@ async fn watch_events(
                         .expect("sidecar name list lock")
                         .contains(&name);
                     if known {
-                        eprintln!(
+                        notice::print(&format!(
                             "[outrig] sidecar container {name} exited; \
                              its MCP tools will return errors until the session ends"
-                        );
+                        ));
                         tracing::warn!(
                             target: "outrig::cli::watcher",
                             "sidecar container {name} exited mid-session"
@@ -240,9 +244,11 @@ pub fn primary_death_error(primary: &str) -> CliError {
 }
 
 /// After teardown: when the session ended because a monitored container went
-/// away, print the error and exit instead of returning. Tokio's blocking
-/// stdin read (MCP stdio transport, REPL) never returns while the peer holds
-/// the pipe open, so a graceful runtime shutdown would hang.
+/// away, print the error and exit instead of returning. Tokio's blocking stdin
+/// read never returns while the peer holds the pipe open, so a graceful runtime
+/// shutdown would hang. The MCP stdio transport always has one outstanding; the
+/// REPL does too on the path where it reads stdin rather than driving its line
+/// editor, whose reader is a detached thread tokio does not wait on.
 pub fn exit_if_monitor_stopped(outcome: &Result<i32>, final_exit: i32) {
     if let Err(e @ CliError::SessionMonitorStopped(_)) = outcome {
         eprintln!("error: {e}");

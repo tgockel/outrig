@@ -39,6 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The `outrig run` prompt is a line editor.** On an interactive terminal it has readline-style
+  editing -- `Ctrl-A`/`Ctrl-E`, `Ctrl-W`, `Ctrl-K`, word motion -- and `Up`/`Down` recall of the
+  prompts typed earlier in the session, with `Ctrl-R` to search them. Recall is in memory for the
+  length of the session: **outrig writes no history file**, so nothing typed at the prompt is
+  persisted. `/reset` still clears conversation history and does not touch prompt recall.
+
+  The prompt and the echo of what is typed now go to the controlling terminal rather than to
+  stderr. That is what keeps `outrig run > out.txt` capturing only the model's replies, and it
+  additionally means `outrig run 2> err.txt` no longer swallows the prompt.
+
+  Two behavior changes to know about. A multi-line paste now arrives as **one** prompt with the
+  line breaks intact, where it previously became one turn per line. And `Ctrl-C` at the prompt
+  discards the typed line rather than raising a signal; a second `Ctrl-C` with nothing entered in
+  between still exits, and `Ctrl-C` during a turn is unchanged.
+
+  Scripted use is unchanged: piped stdin, a redirected file, and `TERM` set to `dumb`, `cons25`,
+  or `emacs` all keep the previous line-at-a-time reader. See
+  [Line editing and history](../../doc/usage/run.md#line-editing-and-history).
+
 - **`[<...>.security]` accepts `unmask`**, so a session container can host a container runtime
   of its own. `outrig run` carries the key from the selected image-config onto the primary and
   from each `[sidecars.<sc>.security]` block onto that sidecar. Combined with

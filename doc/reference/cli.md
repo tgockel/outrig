@@ -233,7 +233,8 @@ session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
-when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C.
+when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C. An interactive run
+gets a line editor with in-session history; a piped or redirected one reads plain lines.
 
 With no repo config found and no `--config`, `run` and `mcp` use the current directory as the
 workspace root and take all config from the global file; `run` then needs its agent from the

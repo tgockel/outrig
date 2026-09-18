@@ -303,7 +303,13 @@ fn init_tracing(verbose: u8) {
     }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        // Not `std::io::stderr`: the default filter is `info`, so a background
+        // task's `warn!` reaches the terminal without anyone opting in, and a
+        // record written underneath the REPL's line editor corrupts the prompt
+        // exactly as a bare `eprintln!` would. The sink falls back to stderr
+        // whenever no editor owns the terminal, which is every non-REPL command
+        // and every REPL on a pipe.
+        .with_writer(crate::repl::notice::make_writer)
         .init();
     if verbose >= 2 {
         tracing::trace!(target: "outrig", "verbose tracing enabled");
