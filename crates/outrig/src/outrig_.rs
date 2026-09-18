@@ -14,9 +14,9 @@ use tokio::process::Child;
 
 use crate::config::{
     CapabilityProfile, Config, ContainerSecurity, EnvValue, ImageConfig, ImageSourceRef,
-    McpServerSpec, MountAccess, NetworkMode, NetworkPolicy, SidecarStart, SidecarView,
-    SidecarWorkspaceAccess, check_entrypoint_hosting, check_sidecar_image, check_sidecar_name,
-    check_view_exclusions, is_valid_mcp_server_name,
+    McpServerSpec, MountAccess, NetworkConfig, NetworkMode, NetworkPolicy, SidecarStart,
+    SidecarView, SidecarWorkspaceAccess, check_entrypoint_hosting, check_sidecar_image,
+    check_sidecar_name, check_view_exclusions, is_valid_mcp_server_name,
 };
 use crate::container::{
     Container, ContainerCapabilities, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount,
@@ -407,6 +407,30 @@ impl From<&ContainerSecurity> for ContainerCapabilities {
     }
 }
 
+/// The `[network]` block in the shape [`Outrig::launch`] consumes. Lives here
+/// for the same reason the `ContainerSecurity` conversions above do: both
+/// types are `#[non_exhaustive]`, so a new network key can only be wired
+/// through inside this crate, and a caller's own copy of this mapping would
+/// keep compiling while silently dropping it.
+///
+/// Only [`NetworkMode::Filter`] carries a policy. Audit mode gets an
+/// allow-everything policy from the interceptor itself, so copying the
+/// config's rules in would be dead weight that arms itself the moment a caller
+/// assigns to the public `mode` field. No wildcard arm, deliberately: a fourth
+/// mode must fail to compile here rather than quietly lower as "no policy".
+impl From<&NetworkConfig> for NetworkSpec {
+    fn from(network: &NetworkConfig) -> Self {
+        let mode = network.mode();
+        Self {
+            mode,
+            policy: match mode {
+                NetworkMode::Filter => Some(network.policy()),
+                NetworkMode::Default | NetworkMode::Audit => None,
+            },
+        }
+    }
+}
+
 /// Description of one container launch: image source, optional workspace
 /// mount, MCP servers to start inside, and the directory to land per-server
 /// stderr in.
@@ -491,7 +515,16 @@ impl LaunchSpec {
     /// and are **built/pulled eagerly here**; the primary image is still built
     /// lazily by `launch`.
     ///
+    /// The `[workspace]`, `[security]`, and `[network]` blocks are lowered
+    /// onto the spec. `[network]` contributes its effective mode, plus the
+    /// filter policy when that mode is `filter`; the policy is the merged
+    /// global one, since a repo config may choose the mode and never the
+    /// rules.
+    ///
     /// Scope of the library translation (the CLI path is a strict superset):
+    /// - There is no equivalent of the CLI's `--network` override: the mode is
+    ///   whatever the config declared. Call [`LaunchSpec::with_network_mode`]
+    ///   or [`LaunchSpec::with_network_filter`] on the result to change it.
     /// - `start = "manual"` sidecars are skipped -- neither started nor carried.
     ///   Rebuild a [`SidecarSpec`] and call [`Outrig::add_sidecar`] to start one
     ///   mid-session.
@@ -555,7 +588,7 @@ impl LaunchSpec {
             workspace: Some(ws),
             mounts,
             security: SecuritySpec::from(&cfg.security),
-            network: NetworkSpec::default(),
+            network: NetworkSpec::from(&config.network),
             embedded_mcp_policy: EmbeddedMcpPolicy::default(),
             mcp,
             sidecars,

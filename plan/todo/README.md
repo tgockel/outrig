@@ -22,18 +22,17 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-41` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-42` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
-public-surface changes that have to happen before the freeze, then release engineering. Each
-task carries its own evidence; the report is not in the tree.
+public-surface changes (`0002-41` landed) that have to happen before the freeze, then
+release engineering. Each task carries its own evidence; the report is not in the tree.
 
 **Public surface, before the freeze**
 
 | Task      | What it settles                                                     |
 | --------- | ------------------------------------------------------------------- |
-| `0002-41` | `LaunchSpec::from_config` lowers the network policy it was handed   |
 | `0002-42` | A provenance-bearing path and its base directory move together      |
 | `0002-43` | MCP content is canonical data, or the reduction is written down     |
 | `0002-44` | Every lossy tool-name sanitization is collision-resistant           |
@@ -60,8 +59,9 @@ Cross-cutting notes the individual tasks carry rather than this file:
   runs one task at a time and `0002-43` is the first that has to commit; neutral content types do
   not on their own decouple the rmcp types in `OutrigError`.
 - `0002-42`'s fork 3 and `0002-46`'s fork 2 both decide whether `Model` gains path provenance.
-- `0002-48` regenerates both `public-api.txt` files, so it wants to follow `0002-41` through
-  `0002-47`.
+- `0002-48` regenerates both `public-api.txt` files, so it wants to follow `0002-42` through
+  `0002-47`. It also has to absorb the `std::io::error` -> `core::io::error` compiler drift that
+  `0002-41` left out of its hand-edited snapshot.
 - `0002-49` writes only what is false *now*; `0002-54` writes the version-bearing docs, because
   those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
 - `0002-52` records the soak parameters before rc.3 ships; `0002-54` checks that record rather than
@@ -100,8 +100,9 @@ get, a `plan/next/` entry.
   Adjacent to `0002-39`'s cooperative-reap work; not folded in because it is a different owner.
 - Post-fork use of `std::net::*::bind` is a residual async-signal-safety risk in `nsfork`.
 - The four-site `[security]` lowering (`plan/next/launch-spec-security-lowering.md`) is the same
-  silent-drop class as `0002-41` and stays buffered: `0002-41` fixes a block that is not lowered at
-  all, which is the bug; the four sites are ergonomics.
+  silent-drop class as `0002-41` and stays buffered: `0002-41` fixed a block that was not lowered
+  at all, which was the bug; the four sites are ergonomics. It is *not* the same conversion --
+  `ContainerLaunchSpec` has no network field -- and its header was corrected to say so.
 - `Transcript` is a concrete public sink and therefore an extension-point commitment that `0002-47`
   does not cover.
 - Dynamic sidecar add has no removal or handle-lifecycle contract.

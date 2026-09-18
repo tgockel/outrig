@@ -522,6 +522,8 @@ pub fn outrig::config::NetworkConfig::mode(&self) -> outrig::config::NetworkMode
 pub fn outrig::config::NetworkConfig::policy(&self) -> outrig::config::NetworkPolicy
 pub fn outrig::config::NetworkConfig::set_mode(&mut self, outrig::config::NetworkMode)
 pub fn outrig::config::NetworkConfig::set_policy(&mut self, outrig::config::NetworkPolicy)
+impl core::convert::From<&outrig::config::NetworkConfig> for outrig::NetworkSpec
+pub fn outrig::NetworkSpec::from(&outrig::config::NetworkConfig) -> Self
 #[non_exhaustive] pub struct outrig::config::NetworkEntry
 pub outrig::config::NetworkEntry::host: alloc::string::String
 pub outrig::config::NetworkEntry::port: core::option::Option<u16>
@@ -1116,6 +1118,8 @@ pub fn outrig::config::NetworkPolicyBuilder::deny_host_port(self, impl core::con
 #[non_exhaustive] pub struct outrig::NetworkSpec
 pub outrig::NetworkSpec::mode: outrig::config::NetworkMode
 pub outrig::NetworkSpec::policy: core::option::Option<outrig::config::NetworkPolicy>
+impl core::convert::From<&outrig::config::NetworkConfig> for outrig::NetworkSpec
+pub fn outrig::NetworkSpec::from(&outrig::config::NetworkConfig) -> Self
 pub struct outrig::Outrig
 impl outrig::Outrig
 pub async fn outrig::Outrig::add_sidecar(&mut self, outrig::SidecarSpec) -> outrig::error::Result<alloc::vec::Vec<outrig::ToolHandle>>

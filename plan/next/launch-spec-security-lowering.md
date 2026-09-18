@@ -1,10 +1,16 @@
 # A `[security]` key is lowered onto `ContainerLaunchSpec` by hand at four sites
 
-> **Adjacent to `plan/todo/0002-41-from-config-lowers-the-network-policy.md`**, which fixes a
-> `[network]` block that `LaunchSpec::from_config` does not lower at all. This entry is the
+> **Adjacent to `0002-41`**, now landed under `plan/done/phase/0002-sidecars/tasks/`, which fixed
+> a `[network]` block that `LaunchSpec::from_config` did not lower at all. This entry is the
 > ergonomic half for `[security]`: four hand-copied lowering sites, any of which can be forgotten.
-> A single conversion targeting `ContainerLaunchSpec` would close both, so read this before
-> taking 0002-41.
+>
+> An earlier draft of this note claimed one conversion targeting `ContainerLaunchSpec` would close
+> both. It would not: `ContainerLaunchSpec` has no network field, because interception is applied
+> after the container starts (`NetworkInterceptor::attach`) rather than through podman's create
+> argv. Its only network-adjacent knob is the `intercept_dns` bool on `ContainerCreateOptions`.
+> The two are adjacent in *hazard class* -- a config key that parses, validates, documents cleanly,
+> and is silently ignored at launch -- and in nothing else. 0002-41 landed
+> `From<&NetworkConfig> for NetworkSpec` on its own; this entry is independent of it.
 
 ## Problem
 

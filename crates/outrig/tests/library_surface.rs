@@ -1032,6 +1032,78 @@ workspace = "ro"
     );
 }
 
+/// The other half of `tests/launch_spec_from_config.rs`: that file asserts
+/// `from_config` puts the config's `[network]` mode on the spec, this one
+/// asserts the spec reaches actual enforcement. A config declaring `audit`
+/// used to lower as `default`, so the session ran with no interceptor at all
+/// and nothing said so.
+#[tokio::test]
+async fn from_config_audit_mode_starts_the_interceptor() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let tag = format!(
+        "localhost/outrig-library-surface-from-config-audit-{}:latest",
+        std::process::id(),
+    );
+    build_fixture_image(&tag);
+
+    let host_ws = tempfile::tempdir().expect("tempdir host_ws");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let repo_root = tempfile::tempdir().expect("tempdir repo_root");
+
+    let config_toml = format!(
+        r#"
+[workspace]
+host-path = "{host_ws}"
+container-path = "/workspace"
+
+[network]
+mode = "audit"
+
+[images.primary]
+image-name = "{tag}"
+"#,
+        host_ws = host_ws.path().display(),
+    );
+    let config: Config = toml::from_str(&config_toml).expect("parse config");
+
+    let spec = LaunchSpec::from_config(
+        &config,
+        "primary",
+        repo_root.path(),
+        session_dir.path().join("logs"),
+    )
+    .await
+    .expect("from_config");
+    assert_eq!(
+        spec.network.mode,
+        NetworkMode::Audit,
+        "the config's mode must survive the lowering"
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    // The same marker `added_sidecar_egress_obeys_network_policy` uses for
+    // "interception is live": the container resolves through the interceptor
+    // rather than the host's resolver.
+    let resolv = outrig
+        .exec_capture(
+            &["cat".into(), "/etc/resolv.conf".into()],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("cat /etc/resolv.conf");
+    let text = String::from_utf8_lossy(&resolv.stdout);
+    assert!(
+        text.contains("nameserver 127.0.0.1"),
+        "a config-declared audit mode should have attached the interceptor, \
+         but resolv.conf points elsewhere: {text}",
+    );
+
+    outrig.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn failed_add_sidecar_leaves_session_usable() {
     let _guard = E2E_LOCK.lock().await;

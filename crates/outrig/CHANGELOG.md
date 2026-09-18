@@ -218,6 +218,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`LaunchSpec::from_config` now applies the `[network]` block it was handed.** It lowered
+  `[workspace]`, `[security]`, the image source, MCP placement, and sidecars, and then wrote
+  `NetworkSpec::default()` -- `config.network` was never read. A library caller whose config
+  declared `mode = "audit"` or `mode = "filter"` with an allow list got a session with no
+  interceptor attached, so the auditing or filtering they configured was not running and
+  nothing reported that. Anyone embedding outrig through `from_config` should assume a previous
+  build enforced nothing here, whatever their config said.
+
+  The lowering is `impl From<&NetworkConfig> for NetworkSpec`, beside the existing
+  `ContainerSecurity` conversions and for the same reason: both types are `#[non_exhaustive]`,
+  so a caller's own copy of the mapping would keep compiling while dropping a key added later.
+  It reads the effective mode, and carries the merged global policy only in `filter` mode --
+  a spec holding rules in `default` or `audit` would arm itself the moment a caller assigned to
+  the public `mode` field, and the interceptor supplies audit's own allow-everything policy
+  anyway. There is still no equivalent of the CLI's `--network` override; the builders
+  `with_network_mode` and `with_network_filter` remain the way to change the mode after
+  lowering.
+
 - **A failed or interrupted `NetworkInterceptor::attach` leaves the container as it found it.**
   `attach` rewrote the container's `/etc/resolv.conf` to point at its DNS listener and only
   then applied the nft redirect table, so a failure in between left a *running* container
