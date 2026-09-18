@@ -378,12 +378,36 @@ shell__exec
 build__cargo_check
 ```
 
-The separator is `__` (double underscore). The combined name is sanitized to fit OpenAI's
-`^[a-zA-Z0-9_-]{1,64}$` constraint -- non-matching characters become `_`, and over-long names get
-truncated with a stable hash suffix.
+The separator is `__` (double underscore). A combined name that already fits OpenAI's
+`^[a-zA-Z0-9_-]{1,64}$` constraint **and** splits back into its pair -- its first `__` is the
+separator -- is advertised exactly as written, which is the ordinary case. Any other name is
+lossy, in one of three ways: a character outside the set had to become `_`, the name was longer
+than 64 characters, or the separator was ambiguous because the server name itself ended in `_`
+or contained `__`. A lossy name is truncated to fit and tagged with a stable hash suffix over
+the `(server, tool)` pair, so two tools that would otherwise collapse onto one name stay
+distinct:
+
+| Server | Tool        | Advertised             | Why                     |
+| ------ | ----------- | ---------------------- | ----------------------- |
+| `fs`   | `read_file` | `fs__read_file`        | already well-formed     |
+| `fs`   | `read/file` | `fs__read_file_5d2270` | `/` had to be replaced  |
+| `fs`   | `read file` | `fs__read_file_4e31b7` | so did the space        |
+
+The suffix is derived from the server and tool names alone, so an uncontested name is the
+same in every session and a client may cache it across reconnects. Sixty-four characters
+cannot encode an unbounded pair of names, though, so two tools can still land on one name --
+two suffixes agreeing, or a tool whose own name already ends the way a suffix does. outrig
+detects that, widens one side's suffix until the two names differ, and logs both identities.
+
+Which side moves is decided by the two tools' identities, not by the order a server listed
+them in, so a restarted server that relists its tools differently cannot hand a name a client
+cached to a different tool. A widened name does depend on the rest of the session's tool set,
+so that one is not cacheable across a change to the servers in play.
 
 The LLM sees `fs__write_file` in its tool list and emits tool calls under that name. outrig's
-router strips the prefix and dispatches to the correct MCP client with the original tool name.
+router looks that name up in a table it built at startup and dispatches to the matching MCP
+client under the original tool name. It does not recover the pair by splitting the string, so a
+suffixed name routes like any other.
 
 You can list every tool currently registered with the agent from inside the REPL:
 

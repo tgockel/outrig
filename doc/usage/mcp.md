@@ -366,8 +366,22 @@ fs__read_file
 ```
 
 Some MCP clients display that relationship as `fs.read_file` in their UI. The actual
-tool name on the wire is still `fs__read_file`; outrig strips the `fs__` prefix and
-dispatches the call to the original `read_file` tool on the `fs` backing server.
+tool name on the wire is still `fs__read_file`; outrig looks that name up in a table it
+built at startup and dispatches the call to the original `read_file` tool on the `fs`
+backing server.
+
+A tool whose name outrig had to change to satisfy `^[a-zA-Z0-9_-]{1,64}$` -- one carrying
+a character outside that set, one too long to fit, or one on a server whose own name ends
+in `_` or contains `__` -- is advertised with a short hash suffix instead, as
+`fs__read_file_5d2270`. The suffix depends only on the server and tool names, so a client
+reconnecting to the same servers sees the names it saw before, whatever order those servers
+list their tools in.
+
+Sixty-four characters cannot encode every possible pair, so two tools can still want one
+name. outrig widens one side's suffix rather than dropping either, and picks which side
+moves from the two tools' identities rather than from listing order. A widened name does
+depend on the rest of the session's tool set, so it is the one kind of name worth re-reading
+instead of caching when the servers in play change.
 
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md#tool-name-prefixing) for the
 collision and sanitization rules.

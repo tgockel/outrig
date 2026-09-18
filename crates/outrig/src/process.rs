@@ -803,4 +803,4 @@ fn is_shell_safe_byte(b: u8) -> bool {
 
 #[cfg(test)]
 #[path = "process_tests.rs"]
-mod process_tests;
+pub(crate) mod process_tests;

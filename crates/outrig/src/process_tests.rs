@@ -293,8 +293,11 @@ async fn spawn_stdio_stdin_stdout_usable() {
     assert!(status.success());
 }
 
+/// A `tracing` writer that keeps what was written, so a test can assert on a
+/// diagnostic rather than on the state the diagnostic describes. Shared with
+/// `mcp_proxy_dispatch_tests`.
 #[derive(Clone, Default)]
-struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct CaptureWriter(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for CaptureWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

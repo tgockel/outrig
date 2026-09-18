@@ -4,6 +4,7 @@
 //! is sealed, so only this crate can supply the fake.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use rmcp::ServerHandler;
@@ -14,6 +15,7 @@ use super::{BackingClient, ProxyServer, SUPPORTED_PROTOCOL_VERSIONS, TOOLS_TTL_M
 use crate::error::OutrigError;
 use crate::mcp_content::mcp_content_tests::{MIXED_RENDERING, rmcp_mixed_result, rmcp_rich_tool};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
+use crate::process::process_tests::CaptureWriter;
 
 /// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
 /// `Err` becomes the "backing client failed" path that surfaces as
@@ -307,18 +309,243 @@ async fn duplicate_client_name_is_rejected() {
 }
 
 #[tokio::test]
-async fn public_name_collision_is_rejected() {
-    // Two distinct (server, tool) pairs that sanitize to the same public
-    // name. `sanitize_tool_name` replaces non-charset chars with `_`, so
-    // ("fs/", "bar") and ("fs", "_bar") both collapse to `fs___bar`.
-    let a = Arc::new(FakeClient::new("fs/").with_tool("bar"));
-    let b = Arc::new(FakeClient::new("fs").with_tool("_bar"));
+async fn lossily_and_faithfully_named_tools_coexist() {
+    // These two used to abort the whole proxy: ("fs/", "bar") and
+    // ("fs", "_bar") both collapsed to `fs___bar`, so one server's bad tool
+    // name cost the session every other server's tools too. Now only the
+    // first is lossy -- its `/` is replaced -- so only it carries a suffix,
+    // and both are advertised.
+    let a = Arc::new(FakeClient::new("fs/").with_tool("bar").respond_ok(
+        "bar",
+        "from the slashed server",
+        false,
+    ));
+    let b = Arc::new(FakeClient::new("fs").with_tool("_bar").respond_ok(
+        "_bar",
+        "from the plain server",
+        false,
+    ));
 
-    let err = build_err(ProxyServer::build(vec![a, b]).await);
-    let msg = err.to_string();
+    let proxy = ProxyServer::build(vec![a, b]).await.expect("build");
+    let names: Vec<&str> = proxy.iter_public_names().collect();
+    assert_eq!(names.len(), 2, "both tools must be advertised: {names:?}");
+    assert!(names[0].starts_with("fs___bar_"), "got {names:?}");
+    assert_eq!(names[1], "fs___bar");
+
+    assert_eq!(
+        text_body(&proxy.dispatch_call(call(names[0], json!({}))).await),
+        "from the slashed server"
+    );
+    assert_eq!(
+        text_body(&proxy.dispatch_call(call("fs___bar", json!({}))).await),
+        "from the plain server"
+    );
+}
+
+/// Two distinct lossy tool names on `server` whose width-1 advertised names
+/// agree. Every candidate is `x<c>y` for a character the sanitizer replaces,
+/// so they all share the body `x_y` and only the digest tells them apart;
+/// 29 such characters against 16 buckets makes a collision certain. Found
+/// rather than pinned, so the search survives a change to the digest.
+fn colliding_at_width_one(server: &str) -> (String, String) {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for c in ' '..='~' {
+        // `"` and `\` are left out only because the diagnostic renders tool
+        // names with `{:?}`, and a test asserting on it compares raw strings.
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '"' | '\\') {
+            continue;
+        }
+        let tool = format!("x{c}y");
+        let name = crate::tool_name::sanitize_at(server, &tool, 1);
+        if let Some(prev) = seen.insert(name, tool.clone()) {
+            return (prev, tool);
+        }
+    }
+    panic!("no width-1 digest collision within the scan");
+}
+
+/// Every advertised name, and the body each one dispatches to.
+async fn advertised(proxy: &ProxyServer<Arc<FakeClient>>) -> (Vec<String>, Vec<String>) {
+    let names: Vec<String> = proxy.iter_public_names().map(str::to_string).collect();
+    let mut bodies = Vec::new();
+    for name in &names {
+        bodies.push(text_body(&proxy.dispatch_call(call(name, json!({}))).await));
+    }
+    (names, bodies)
+}
+
+/// Run `body` with `tracing` captured, returning what it emitted. The
+/// subscriber is thread-local, so the runtime is current-thread and built
+/// here rather than by `#[tokio::test]` -- the same shape `process_tests`
+/// uses.
+fn with_captured_tracing<T>(body: impl Future<Output = T>) -> (T, String) {
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(CaptureWriter(buf.clone()))
+        .with_max_level(tracing::Level::ERROR)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current_thread runtime");
+    let out = rt.block_on(body);
+    let captured =
+        String::from_utf8(buf.lock().unwrap().clone()).expect("captured output must be UTF-8");
+    (out, captured)
+}
+
+#[test]
+fn residual_digest_collision_widens_the_loser() {
+    // 24 bits will not collide by accident, so the ladder is driven with a
+    // 4-bit digest instead. The first tool keeps the narrow name; the second
+    // is re-derived at 16 hex, and both stay reachable.
+    let (first, second) = colliding_at_width_one("fs");
+    let fs = Arc::new(
+        FakeClient::new("fs")
+            .with_tool(&first)
+            .with_tool(&second)
+            .respond_ok(&first, "from the first", false)
+            .respond_ok(&second, "from the second", false),
+    );
+
+    let ((names, bodies), captured) = with_captured_tracing(async move {
+        let proxy = ProxyServer::build_with_width(vec![fs], 1)
+            .await
+            .expect("a residual collision must not fail the build");
+        advertised(&proxy).await
+    });
+
+    assert_eq!(names.len(), 2, "nothing may be dropped: {names:?}");
+    assert_ne!(names[0], names[1], "the loser must be re-derived");
+    assert_eq!(bodies, ["from the first", "from the second"]);
+
+    // A collision report that names one tool tells an operator nothing.
     assert!(
-        msg.contains("public name") && msg.contains("fs___bar"),
-        "error was {msg:?}"
+        captured.contains(&first) && captured.contains(&second) && captured.contains(&names[1]),
+        "diagnostic must name both tools and the new name: {captured}"
+    );
+}
+
+#[test]
+fn a_faithful_name_can_claim_a_suffixed_one_and_is_still_widened() {
+    // No injected digest and no collision: `read/file` is lossy, so it is
+    // advertised as `fs__read_file_<hex>`, and a server that also exposes a
+    // tool literally called `read_file_<hex>` composes that same name
+    // faithfully. Widening has to force a suffix onto the faithful loser --
+    // re-deriving it as an ordinary name returns the name it must move off,
+    // and the tool is lost.
+    let lossy = crate::tool_name::sanitize("fs", "read/file");
+    let twin = lossy
+        .strip_prefix("fs__")
+        .expect("the lossy name keeps its server prefix")
+        .to_string();
+    let fs = Arc::new(
+        FakeClient::new("fs")
+            .with_tool("read/file")
+            .with_tool(&twin)
+            .respond_ok("read/file", "from the lossy tool", false)
+            .respond_ok(&twin, "from its twin", false),
+    );
+
+    let ((names, bodies), captured) = with_captured_tracing(async move {
+        let proxy = ProxyServer::build(vec![fs])
+            .await
+            .expect("a clash must not fail the build");
+        advertised(&proxy).await
+    });
+
+    assert_eq!(names.len(), 2, "the twin must keep a place: {names:?}");
+    assert_eq!(names[0], lossy, "the lossy tool keeps the contested name");
+    assert_ne!(names[1], lossy, "the twin must be moved off it");
+    assert_eq!(bodies, ["from the lossy tool", "from its twin"]);
+    assert!(
+        captured.contains("read/file") && captured.contains(&twin),
+        "diagnostic must name both tools: {captured}"
+    );
+}
+
+#[test]
+fn a_contested_name_is_awarded_by_identity_not_by_arrival() {
+    // `tools/list` promises no order, and a backing server that restarts may
+    // relist in a different one. If the contested name went to whichever tool
+    // arrived first, a rebuilt proxy would bind a name a client had cached to
+    // the *other* tool -- which then answers plausibly rather than failing,
+    // the worst way for this to go wrong.
+    let lossy = crate::tool_name::sanitize("fs", "read/file");
+    let twin = lossy
+        .strip_prefix("fs__")
+        .expect("the lossy name keeps its server prefix")
+        .to_string();
+
+    let mapping = |order: [&str; 2]| {
+        let fs = Arc::new(
+            FakeClient::new("fs")
+                .with_tool(order[0])
+                .with_tool(order[1])
+                .respond_ok("read/file", "from the lossy tool", false)
+                .respond_ok(&twin, "from its twin", false),
+        );
+        let ((names, bodies), _) = with_captured_tracing(async move {
+            let proxy = ProxyServer::build(vec![fs]).await.expect("build");
+            advertised(&proxy).await
+        });
+        let mut pairs: Vec<(String, String)> = names.into_iter().zip(bodies).collect();
+        pairs.sort();
+        pairs
+    };
+
+    let forward = mapping(["read/file", &twin]);
+    let reverse = mapping([&twin, "read/file"]);
+    assert_eq!(
+        forward.len(),
+        2,
+        "both tools must be advertised: {forward:?}"
+    );
+    assert_eq!(
+        forward, reverse,
+        "which tool answers to a name must not depend on listing order"
+    );
+}
+
+#[test]
+fn a_tool_no_width_can_separate_goes_unadvertised() {
+    // The terminal case. A pair hashes the same at every width, so an
+    // upstream `tools/list` naming one lossy tool twice cannot be widened
+    // apart; started at the widest suffix there is nothing else to try
+    // either. The first registrant keeps the name and the second is dropped,
+    // rather than two tools sharing one name.
+    let fs = Arc::new(
+        FakeClient::new("fs")
+            .with_tool("dup/1")
+            .with_tool("dup/1")
+            .respond_ok("dup/1", "the one backend", false),
+    );
+
+    let ((names, bodies), captured) = with_captured_tracing(async move {
+        let proxy = ProxyServer::build_with_width(vec![fs], crate::tool_name::MAX_HASH_HEX_LEN)
+            .await
+            .expect("an unadvertised tool must not fail the build");
+        advertised(&proxy).await
+    });
+
+    assert_eq!(names.len(), 1, "exactly one must survive: {names:?}");
+    assert_eq!(
+        bodies,
+        ["the one backend"],
+        "the surviving name must route to the first registrant"
+    );
+    assert_eq!(
+        captured.matches("\"dup/1\"").count(),
+        2,
+        "diagnostic must name both identities: {captured}"
+    );
+    assert!(
+        captured.contains("not advertised"),
+        "diagnostic must say the tool was dropped: {captured}"
     );
 }
 

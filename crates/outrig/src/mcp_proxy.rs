@@ -178,20 +178,106 @@ impl<C> Clone for ProxyServer<C> {
     }
 }
 
+/// Assign one advertised name per upstream tool, positionally: `None` means
+/// the tool is not advertised.
+///
+/// Names are handed out in a canonical order -- sorted by `(server, tool)`,
+/// not the order `tools/list` happened to return -- so the whole map is a
+/// function of the *set* of tools rather than of their arrival. Two tools
+/// contesting a name would otherwise settle it by position, and a backing
+/// server that relisted in a different order would bind that name to the
+/// other tool: a client replaying a cached name would reach a different
+/// backend and get a plausible answer instead of an error. Listing order is
+/// separate and stays the caller's.
+///
+/// Widening goes through [`tool_name::suffixed`] rather than
+/// [`tool_name::sanitize_at`] because a clash is not always a digest
+/// collision -- a tool whose own name ends in `_<hex>` can land on a name the
+/// suffix produced, and `sanitize_at` returns such a name unchanged at every
+/// width, handing back the very name it was asked to move off.
+fn assign_public_names<C: BackingClient>(
+    clients: &[C],
+    upstream: &[(usize, McpTool)],
+    hex_len: usize,
+) -> Vec<Option<String>> {
+    let identity = |i: usize| {
+        let (client_idx, tool) = &upstream[i];
+        (clients[*client_idx].name(), tool.name.as_str())
+    };
+
+    let mut order: Vec<usize> = (0..upstream.len()).collect();
+    order.sort_by(|&a, &b| identity(a).cmp(&identity(b)));
+
+    let mut names = vec![None; upstream.len()];
+    let mut taken: HashMap<String, usize> = HashMap::with_capacity(upstream.len());
+    for i in order {
+        let (server, tool) = identity(i);
+        let mut name = tool_name::sanitize_at(server, tool, hex_len);
+
+        if let Some(&prev) = taken.get(&name) {
+            let (prev_server, prev_tool) = identity(prev);
+            let clash = format!(
+                "mcp_proxy: advertised name {name:?} is claimed by both \
+                 ({prev_server:?}, {prev_tool:?}) and ({server:?}, {tool:?})"
+            );
+            // The first width nobody holds. The starting width is in the
+            // range because the clash may have been with a *faithful* name,
+            // in which case the suffixed form at that width is itself free.
+            let free = (hex_len..=tool_name::MAX_HASH_HEX_LEN)
+                .map(|width| tool_name::suffixed(server, tool, width))
+                .find(|candidate| !taken.contains_key(candidate));
+            match free {
+                Some(renamed) => {
+                    tracing::error!(
+                        target: "outrig::mcp_proxy",
+                        "{clash}; advertising the second as {renamed:?} instead"
+                    );
+                    name = renamed;
+                }
+                None => {
+                    tracing::error!(
+                        target: "outrig::mcp_proxy",
+                        "{clash}, and no wider suffix is free; the second is not advertised"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        taken.insert(name.clone(), i);
+        names[i] = Some(name);
+    }
+    names
+}
+
 impl<C: BackingClient> ProxyServer<C> {
     /// Connect every backing client's `tools/list` into a single namespaced
     /// surface. Order across clients matches the input `Vec`; order within a
     /// single client matches that client's `tools/list` response.
     ///
+    /// Two `(server, tool)` pairs landing on the same advertised name is not
+    /// an error. One of them keeps the name and the other is re-derived at a
+    /// wider hash suffix, so both stay reachable and one unlucky pair does
+    /// not cost the session every other tool. Which one moves is decided by
+    /// the pairs themselves rather than by listing order -- see
+    /// `assign_public_names`. Both that and the terminal case -- no width
+    /// left, so the tool goes unadvertised -- are logged at ERROR naming both
+    /// upstream identities.
+    ///
     /// Errors:
     /// - [`OutrigError::Configuration`] if two clients share a `name()`
-    ///   (every tool would collide).
-    /// - [`OutrigError::Configuration`] if two `(server, tool)` pairs
-    ///   sanitize to the same public name -- shouldn't happen with the
-    ///   blake3-suffix scheme, but failing loudly beats silently routing to
-    ///   the wrong backend.
+    ///   (every tool would collide, and no suffix distinguishes them).
+    /// - [`OutrigError::Configuration`] if a tool's `input_schema` is not a
+    ///   JSON object.
     /// - Any error from a backing client's `list_tools` propagates.
     pub async fn build(clients: Vec<C>) -> Result<Self> {
+        Self::build_with_width(clients, tool_name::HASH_HEX_LEN).await
+    }
+
+    /// [`Self::build`] with the starting suffix width spelled out, so a test
+    /// can drive a digest narrow enough to collide on purpose. Production
+    /// passes [`tool_name::HASH_HEX_LEN`].
+    pub(crate) async fn build_with_width(clients: Vec<C>, hex_len: usize) -> Result<Self> {
         let mut seen_names: HashMap<&str, usize> = HashMap::with_capacity(clients.len());
         for (idx, client) in clients.iter().enumerate() {
             let name = client.name();
@@ -203,46 +289,41 @@ impl<C: BackingClient> ProxyServer<C> {
             }
         }
 
+        let mut upstream: Vec<(usize, McpTool)> = Vec::new();
+        for (client_idx, client) in clients.iter().enumerate() {
+            for tool in client.list_tools().await? {
+                upstream.push((client_idx, tool));
+            }
+        }
+        let public_names = assign_public_names(&clients, &upstream, hex_len);
+
         let mut tools: Vec<ToolEntry> = Vec::new();
         let mut by_public_name: HashMap<String, usize> = HashMap::new();
+        for ((client_idx, tool), public_name) in upstream.into_iter().zip(public_names) {
+            let Some(public_name) = public_name else {
+                continue;
+            };
+            let server_name = clients[client_idx].name();
 
-        for (client_idx, client) in clients.iter().enumerate() {
-            let server_name = client.name().to_string();
-            let upstream = client.list_tools().await?;
-            for tool in upstream {
-                let public_name = tool_name::sanitize(&server_name, &tool.name);
-
-                if let Some(prev_idx) = by_public_name.get(&public_name) {
-                    let prev = &tools[*prev_idx];
-                    let prev_server = clients[prev.client_idx].name();
+            let input_schema = match &tool.input_schema {
+                Value::Object(map) => Arc::new(map.clone()),
+                other => {
                     return Err(OutrigError::Configuration(format!(
-                        "mcp_proxy: public name {public_name:?} produced by both \
-                         ({prev_server:?}, {prev_tool:?}) and ({server_name:?}, {tool_name:?})",
-                        prev_tool = prev.backend_tool,
+                        "mcp_proxy: tool {server_name:?}::{tool_name:?} input_schema is \
+                         not a JSON object (got {kind})",
                         tool_name = tool.name,
+                        kind = mcp::kind_of(other),
                     )));
                 }
+            };
 
-                let input_schema = match &tool.input_schema {
-                    Value::Object(map) => Arc::new(map.clone()),
-                    other => {
-                        return Err(OutrigError::Configuration(format!(
-                            "mcp_proxy: tool {server_name:?}::{tool_name:?} input_schema is \
-                             not a JSON object (got {kind})",
-                            tool_name = tool.name,
-                            kind = mcp::kind_of(other),
-                        )));
-                    }
-                };
-
-                let listed = tool_to_rmcp(public_name.clone(), &tool, input_schema);
-                by_public_name.insert(public_name, tools.len());
-                tools.push(ToolEntry {
-                    listed,
-                    backend_tool: tool.name,
-                    client_idx,
-                });
-            }
+            let listed = tool_to_rmcp(public_name.clone(), &tool, input_schema);
+            by_public_name.insert(public_name, tools.len());
+            tools.push(ToolEntry {
+                listed,
+                backend_tool: tool.name,
+                client_idx,
+            });
         }
 
         let server_info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())

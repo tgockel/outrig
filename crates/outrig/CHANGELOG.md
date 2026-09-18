@@ -146,6 +146,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: an advertised tool name carries a hash suffix whenever outrig had to change
+  it**, not only when it was too long. `sanitize_tool_name` used to apply its blake3 suffix on
+  the length path alone, so `("fs", "read/file")` and `("fs", "read file")` both became
+  `fs__read_file` and the second one took down `ProxyServer::build` -- and with it the
+  session's entire tool list. Both now get a suffix: `fs__read_file_5d2270` and
+  `fs__read_file_4e31b7`.
+
+  The rule is one rule: a composition is returned byte-identical when it satisfies
+  `^[a-zA-Z0-9_-]{1,64}$` *and* splits back into its pair, meaning its first `__` is the
+  separator. Everything else -- a replaced character, an over-long name, a server name that
+  itself ends in `_` or contains `__` -- is truncated to fit and suffixed.
+
+  The common case is untouched, so `fs__read_file` and `outrig__subagent` are byte-for-byte
+  what they were. Three classes do move, and anything holding a cached tool list should
+  refresh it: a tool whose upstream name was never in the character set; *every* tool on a
+  server whose own name ends in `_` or contains `__`, which `^[a-zA-Z][a-zA-Z0-9_-]*$` allows
+  and which now fails the separator test, so `fs___read_file` becomes `fs___read_file_76c554`
+  with no character replaced; and every name that was already truncated and suffixed, because
+  the new preimage re-keys it -- `("fs", "x" * 120)` moves from `..._2e60f8` to `..._780fcd`.
+
+  The suffix's preimage is now the length-delimited *pair* rather than `<server>__<tool>`.
+  That concatenation is not self-delimiting when either side may contain `_`, so `("a", "_b")`
+  and `("a_", "b")` shared a preimage and the suffix could not tell them apart.
+
+  What this can promise is collision *resistance*, not collision freedom: an unbounded pair of
+  Unicode strings does not inject into 64 characters. Two unsuffixed names never collide -- that
+  form is injective -- but two suffixed ones can, and a suffixed name can land on an unsuffixed
+  one with no collision involved at all, when a tool's own name already ends the way a suffix
+  does. `ProxyServer::build` no longer fails on either. It re-derives one side's name at a wider
+  suffix until it is free and logs both tools' identities, so a clash costs a longer name rather
+  than every tool in the session.
+
+  Which side moves is chosen from the two `(server, tool)` identities, not from the order
+  `tools/list` returned them in. `tools/list` promises no order, so awarding the contested name
+  by arrival would let a restarted backing server rebind it to the other tool -- and a client
+  replaying a cached name would then reach a different backend and get a plausible answer
+  instead of an error. Listing order is unchanged and still the caller's.
+
 - **Breaking: every config path that carries provenance is now private, behind an accessor
   pair.** `MountConfig::host_path` becomes `host_path()` / `set_host_path`, and
   `ImageConfig::dockerfile` and `context` become `dockerfile()` / `context()` and a single

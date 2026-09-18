@@ -1,10 +1,28 @@
 //! Build the LLM-facing `<server>__<tool>` name an MCP tool is exposed under.
 //!
 //! [`sanitize`] enforces OpenAI's `^[a-zA-Z0-9_-]{1,64}$` constraint on tool
-//! names. Over-long names are truncated and tagged with a stable 6-hex blake3
-//! suffix derived from the *pre-sanitization* `<server>__<tool>` so two tools
-//! that would otherwise collide after character replacement get distinct
-//! suffixes.
+//! names. A pair whose composition already satisfies it *faithfully* is
+//! returned byte-identical; every other pair is truncated to fit and tagged
+//! with a stable `_<hex>` suffix over a length-delimited blake3 of the pair.
+//!
+//! "Faithfully" is the whole rule, and it has three parts: the composition is
+//! already in the character set, it fits, and its first `__` is the separator.
+//! The third is what makes the encoding *decodable* -- cutting a faithful name
+//! at its first `__` recovers `(server, tool)` exactly -- and therefore
+//! injective, so two distinct faithful names can never collide. `("a", "_b")`
+//! composes to `a___b` whose first `__` starts at index 1, which is where
+//! `"a"` ends, so it is faithful; `("a_", "b")` composes to the same string
+//! but ends one byte later, so it is lossy and carries a suffix.
+//!
+//! What the suffix buys is collision *resistance*, not collision freedom. The
+//! input is an unbounded pair of Unicode strings and the output is 64
+//! characters over a 64-symbol alphabet, so no injection exists and no suffix
+//! width creates one. Two lossy names collide only through a blake3 collision;
+//! a lossy name can also land on a faithful one, which needs no collision at
+//! all -- a tool literally named `read_file_5d2270` reaches the same name as
+//! `read/file` does. [`mcp_proxy`](crate::mcp_proxy) handles either by
+//! re-deriving the later name through [`suffixed`] at a wider width, which is
+//! why that entry point exists.
 //!
 //! Both `outrig run` (through the companion `outrig-cli` crate) and the
 //! [`mcp_proxy`](crate::mcp_proxy) server share this so they advertise
@@ -20,127 +38,70 @@ pub const RESERVED_SERVER: &str = "outrig";
 /// liberal but this is the safe lower bound.
 const MAX_NAME_LEN: usize = 64;
 
-/// Width of the truncation suffix's hex portion. The full suffix is
-/// `_` + this many hex chars.
-const HASH_HEX_LEN: usize = 6;
-const SUFFIX_LEN: usize = 1 + HASH_HEX_LEN;
+/// Width of the hex a suffix carries. The full suffix is `_` plus this many
+/// hex characters.
+pub(crate) const HASH_HEX_LEN: usize = 6;
 
-/// Build the LLM-facing name from `<server>__<tool>`, replacing any character
-/// outside `[a-zA-Z0-9_-]` with `_` and truncating with a stable 6-hex blake3
-/// suffix when the result would exceed `MAX_NAME_LEN`.
-///
-/// The hash is over the *pre-sanitization* concatenation, so two distinct
-/// originals that would map to the same sanitized prefix get different
-/// suffixes.
+/// Widest hex a suffix can carry: `_` plus this many characters is exactly
+/// [`MAX_NAME_LEN`], leaving no room for a body. [`crate::mcp_proxy`] widens
+/// up to here when two tools land on one name.
+pub(crate) const MAX_HASH_HEX_LEN: usize = MAX_NAME_LEN - 1;
+
+/// Build the LLM-facing name for `(server, tool)`, returning the composition
+/// unchanged when it faithfully encodes the pair and otherwise truncating it
+/// to fit and appending a stable blake3 suffix.
 pub fn sanitize(server: &str, tool: &str) -> String {
-    let original = format!("{server}__{tool}");
+    sanitize_at(server, tool, HASH_HEX_LEN)
+}
 
-    let mut sanitized = String::with_capacity(original.len());
-    for c in original.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            sanitized.push(c);
-        } else {
-            sanitized.push('_');
-        }
+/// [`sanitize`] with the suffix width spelled out, so a test can drive a
+/// digest narrow enough to collide on purpose.
+pub(crate) fn sanitize_at(server: &str, tool: &str, hex_len: usize) -> String {
+    let composed = format!("{server}__{tool}");
+    if composed.len() <= MAX_NAME_LEN
+        && composed.find("__") == Some(server.len())
+        && composed.chars().all(in_charset)
+    {
+        return composed;
     }
+    suffixed(server, tool, hex_len)
+}
 
-    if sanitized.len() <= MAX_NAME_LEN {
-        return sanitized;
-    }
+/// The suffixed form, whether or not the pair needed one. [`crate::mcp_proxy`]
+/// calls this rather than [`sanitize_at`] when re-deriving a name that is
+/// already taken: a faithful pair ignores `hex_len`, so widening through
+/// `sanitize_at` would hand back the same name it was asked to move off.
+pub(crate) fn suffixed(server: &str, tool: &str, hex_len: usize) -> String {
+    let hex_len = hex_len.clamp(1, MAX_HASH_HEX_LEN);
 
-    let hash = blake3::hash(original.as_bytes());
-    let hex = hash.to_hex();
-    let suffix_hex = &hex.as_str()[..HASH_HEX_LEN];
-    sanitized.truncate(MAX_NAME_LEN - SUFFIX_LEN);
-    sanitized.push('_');
-    sanitized.push_str(suffix_hex);
-    sanitized
+    // The preimage is the *pair*, each side length-prefixed, rather than a
+    // concatenation whose separator can appear on either side: `("a", "_b")`
+    // and `("a_", "b")` share a concatenation but not a preimage.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(server.len() as u64).to_le_bytes());
+    hasher.update(server.as_bytes());
+    hasher.update(&(tool.len() as u64).to_le_bytes());
+    hasher.update(tool.as_bytes());
+    let hex = hasher.finalize().to_hex();
+
+    // Every replaced character becomes one ASCII `_`, so the body is pure
+    // ASCII however exotic the input was and truncating it by byte is
+    // char-safe. The truncation is a no-op when the body already leaves room,
+    // which is how it composes with the suffix rather than racing it.
+    let mut name: String = format!("{server}__{tool}")
+        .chars()
+        .map(|c| if in_charset(c) { c } else { '_' })
+        .collect();
+    name.truncate(MAX_NAME_LEN - 1 - hex_len);
+    name.push('_');
+    name.push_str(&hex.as_str()[..hex_len]);
+    name
+}
+
+fn in_charset(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_basic() {
-        assert_eq!(sanitize("fs", "read_file"), "fs__read_file");
-    }
-
-    #[test]
-    fn sanitize_replaces_invalid_chars() {
-        // `/`, ` `, `!` all get replaced with `_`. The `__` separator survives.
-        let got = sanitize("fs", "weird/name with spaces!");
-        assert_eq!(got, "fs__weird_name_with_spaces_");
-        assert!(got.starts_with("fs__"));
-        for c in got.chars() {
-            assert!(
-                c.is_ascii_alphanumeric() || c == '_' || c == '-',
-                "char {c:?} survived sanitization"
-            );
-        }
-    }
-
-    #[test]
-    fn sanitize_short_names_unchanged_after_replacement() {
-        // 9 + 2 + 9 = 20 chars, well under the 64-char limit. No truncation.
-        let got = sanitize("server-01", "do_a_thing");
-        assert_eq!(got, "server-01__do_a_thing");
-    }
-
-    #[test]
-    fn sanitize_truncates_with_stable_hash_suffix() {
-        let server = "fs";
-        let tool = "x".repeat(120);
-        let got = sanitize(server, &tool);
-        assert_eq!(got.len(), 64, "got: {got:?}");
-
-        // Stable: same inputs produce identical output.
-        let again = sanitize(server, &tool);
-        assert_eq!(got, again, "sanitize must be deterministic");
-    }
-
-    #[test]
-    fn sanitize_distinguishes_long_inputs_with_shared_prefix() {
-        // The hash suffix is over the *pre-sanitization* original, so two long
-        // names sharing a 100-char prefix but differing at the tail still produce
-        // different sanitized outputs.
-        let prefix = "p".repeat(100);
-        let a = sanitize("srv", &format!("{prefix}_aaaa"));
-        let b = sanitize("srv", &format!("{prefix}_bbbb"));
-        assert_ne!(
-            a, b,
-            "distinct originals must yield distinct sanitized names"
-        );
-        assert_eq!(a.len(), 64);
-        assert_eq!(b.len(), 64);
-
-        // The truncated prefix portion is identical -- only the hash suffix differs.
-        let a_prefix = &a[..a.len() - 7];
-        let b_prefix = &b[..b.len() - 7];
-        assert_eq!(
-            a_prefix, b_prefix,
-            "shared 100-char prefix should survive truncation identically"
-        );
-        assert_ne!(
-            &a[a.len() - 6..],
-            &b[b.len() - 6..],
-            "hash suffixes must differ"
-        );
-    }
-
-    #[test]
-    fn sanitize_truncated_output_still_charset_clean() {
-        // Pre-sanitization input contains `/` which becomes `_` *and* the result
-        // exceeds 64 chars. The hash suffix is hex (alphanumeric), so the final
-        // string remains within `[a-zA-Z0-9_-]`.
-        let tool = format!("{}{}{}", "a".repeat(50), "/", "b".repeat(50));
-        let got = sanitize("svr", &tool);
-        assert_eq!(got.len(), 64);
-        for c in got.chars() {
-            assert!(
-                c.is_ascii_alphanumeric() || c == '_' || c == '-',
-                "char {c:?} survived sanitization in truncated form"
-            );
-        }
-    }
-}
+#[path = "tool_name_tests.rs"]
+mod tool_name_tests;
