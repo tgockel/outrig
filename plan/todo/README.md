@@ -13,6 +13,9 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 - [0002 -- sidecars](../phase/0002-sidecars/README.md) -- tools move out of the agent's
   primary image and into sidecar containers OutRig places, and the public surface of both
   crates is narrowed, sealed, and frozen for 0.2.0.
+- [0003 -- python](../phase/0003-python/README.md) -- an agent acts by writing Python into a
+  persistent interpreter in its container rather than by calling MCP tools, and the agent loop
+  moves into `outrig`. Designed but not yet queued; the code lands on `version/0.3.x`.
 
 ## Recently completed
 
