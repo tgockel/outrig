@@ -1440,18 +1440,18 @@ fn check_mount_list(
         // Per entry, not per list: the list may be a concatenation of two files.
         let declared_in = mount.declared_in();
 
-        if !mount.container_path.is_absolute() {
+        if !mount.container_path().is_absolute() {
             return Err(MountRuleViolation::ContainerNotAbsolute {
-                path: mount.container_path.clone(),
+                path: mount.container_path().to_path_buf(),
                 declared_in,
             });
         }
-        if mount.container_path == Path::new("/") {
+        if mount.container_path() == Path::new("/") {
             return Err(MountRuleViolation::ContainerRoot { declared_in });
         }
-        if !reserved.insert(mount.container_path.clone()) {
+        if !reserved.insert(mount.container_path().to_path_buf()) {
             return Err(MountRuleViolation::ContainerDuplicate {
-                path: mount.container_path.clone(),
+                path: mount.container_path().to_path_buf(),
                 declared_in,
             });
         }
@@ -1460,13 +1460,13 @@ fn check_mount_list(
             let resolved = mount.resolved_host_path(root);
             if !resolved.exists() {
                 return Err(MountRuleViolation::HostMissing {
-                    path: mount.host_path.clone(),
+                    path: mount.host_path().to_path_buf(),
                     declared_in,
                 });
             }
             if !resolved.is_dir() {
                 return Err(MountRuleViolation::HostNotDirectory {
-                    path: mount.host_path.clone(),
+                    path: mount.host_path().to_path_buf(),
                     declared_in,
                 });
             }
@@ -1758,8 +1758,8 @@ fn validate_image_source(
     repo_root: Option<&Path>,
 ) -> Result<(), ConfigValidationError> {
     let has_image_name = image.image_name.is_some();
-    let has_dockerfile = image.dockerfile.is_some();
-    let has_context = image.context.is_some();
+    let has_dockerfile = image.dockerfile().is_some();
+    let has_context = image.context().is_some();
 
     if has_image_name {
         // image-name path: reject any build-path fields.
@@ -1821,14 +1821,14 @@ fn validate_image_source(
             if !df_path.exists() {
                 return Err(ConfigValidationError::DockerfileMissing {
                     image: image_name.to_string(),
-                    path: image.dockerfile.clone().unwrap(),
+                    path: image.dockerfile().expect("build path").to_path_buf(),
                     declared_in: image.declared_in(),
                 });
             }
             if !ctx_path.exists() {
                 return Err(ConfigValidationError::ContextMissing {
                     image: image_name.to_string(),
-                    path: image.context.clone().unwrap(),
+                    path: image.context().expect("build path").to_path_buf(),
                     declared_in: image.declared_in(),
                 });
             }

@@ -1835,15 +1835,15 @@ access         = "read-write"
         assert_eq!(merged.workspace.container_path(), Path::new("/workspace"));
         assert_eq!(merged.workspace.mounts.len(), 2);
         assert_eq!(
-            merged.workspace.mounts[0].container_path,
-            std::path::PathBuf::from("/resources/global-docs"),
+            merged.workspace.mounts[0].container_path(),
+            Path::new("/resources/global-docs"),
         );
-        assert_eq!(merged.workspace.mounts[0].access, MountAccess::ReadOnly);
+        assert_eq!(merged.workspace.mounts[0].access(), MountAccess::ReadOnly);
         assert_eq!(
-            merged.workspace.mounts[1].container_path,
-            std::path::PathBuf::from("/resources/repo-cache"),
+            merged.workspace.mounts[1].container_path(),
+            Path::new("/resources/repo-cache"),
         );
-        assert_eq!(merged.workspace.mounts[1].access, MountAccess::ReadWrite);
+        assert_eq!(merged.workspace.mounts[1].access(), MountAccess::ReadWrite);
     }
 
     /// The behavior the declaration state exists to protect: a repo that says
@@ -3482,6 +3482,22 @@ context    = "images/x"
         (repo, global, global_cfg)
     }
 
+    /// One global extra mount, relative, as four of the tests below need it.
+    const MOUNT_BODY: &str = r#"
+[[workspace.mounts]]
+host-path      = "shared"
+container-path = "/shared"
+"#;
+
+    /// The mount-side twin of [`global_image_project`]: a global config
+    /// declaring one relative extra mount, with the directory it names created
+    /// beside that config. Returns `(repo_tmp, global_tmp, global_config_path)`.
+    fn global_mount_project() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let (repo, global, global_cfg) = repo_and_global(MOUNT_BODY);
+        fs::create_dir_all(global.path().join("shared")).unwrap();
+        (repo, global, global_cfg)
+    }
+
     #[test]
     fn global_image_build_paths_resolve_against_global_dir() {
         let (repo, global, global_cfg) = global_image_project();
@@ -3976,6 +3992,181 @@ container-path = "/abs"
         assert_eq!(
             cfg.workspace.mounts[0].resolved_host_path(Path::new("")),
             abs,
+        );
+    }
+
+    /// The `MountConfig` mirror of `set_host_path_clears_inherited_global_
+    /// provenance`. An extra mount inherited from the global config resolves
+    /// beside that file; once a caller supplies its own value, the old base
+    /// directory has to go with the old value. The mount may be read-write, so
+    /// resolving against a directory it never named binds the wrong tree.
+    #[test]
+    fn mount_set_host_path_clears_inherited_global_provenance() {
+        let (repo, global, global_cfg) = global_mount_project();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        assert_eq!(
+            cfg.workspace.mounts[0].resolved_host_path(repo.path()),
+            global.path().join("shared"),
+            "the inherited value resolves beside the global file",
+        );
+
+        cfg.workspace.mounts[0].set_host_path("mine");
+        assert_eq!(
+            cfg.workspace.mounts[0].resolved_host_path(repo.path()),
+            repo.path().join("mine"),
+            "a caller-supplied value belongs to no config file",
+        );
+        assert!(
+            cfg.workspace.mounts[0].config_source().is_none(),
+            "the source goes with the value it described",
+        );
+    }
+
+    /// `container-path` and `access` carry no provenance, so replacing either
+    /// must leave `host-path` resolving exactly where it did. They are private
+    /// for uniformity, not because they are paired with anything.
+    #[test]
+    fn mount_provenance_free_setters_leave_the_base_alone() {
+        let (repo, global, global_cfg) = global_mount_project();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        cfg.workspace.mounts[0].set_container_path("/elsewhere");
+        cfg.workspace.mounts[0].set_access(MountAccess::ReadWrite);
+
+        assert_eq!(
+            cfg.workspace.mounts[0].container_path(),
+            Path::new("/elsewhere")
+        );
+        assert_eq!(cfg.workspace.mounts[0].access(), MountAccess::ReadWrite);
+        assert_eq!(
+            cfg.workspace.mounts[0].resolved_host_path(repo.path()),
+            global.path().join("shared"),
+            "neither key describes where a relative host path lives",
+        );
+    }
+
+    /// `set_build_paths` replaces the pair, so both resolved paths move to the
+    /// caller's base together. A per-path setter could not do this: clearing
+    /// the shared source for one path would silently rebase the other.
+    #[test]
+    fn image_set_build_paths_clears_inherited_provenance() {
+        let (repo, global, global_cfg) = global_image_project();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        assert_eq!(
+            cfg.images["x"].resolved_build_paths(repo.path()),
+            (
+                global.path().join("images/x/Dockerfile"),
+                global.path().join("images/x"),
+            ),
+        );
+
+        let image = cfg.images.get_mut("x").unwrap();
+        image.set_build_paths("build/Containerfile", "build");
+        assert_eq!(image.dockerfile(), Some(Path::new("build/Containerfile")));
+        assert_eq!(image.context(), Some(Path::new("build")));
+        assert!(
+            image.config_source().is_none(),
+            "the source backed both paths and neither survives",
+        );
+        assert_eq!(
+            image.resolved_build_paths(repo.path()),
+            (
+                repo.path().join("build/Containerfile"),
+                repo.path().join("build"),
+            ),
+            "both paths move to the caller's base, never one of each",
+        );
+    }
+
+    /// A diagnostic renders `declared_in` from the same provenance the
+    /// resolution uses, so a mutated entry must not name the file it no longer
+    /// came from. Without the clearing setter the error would send the reader
+    /// to a config that never mentioned this value.
+    #[test]
+    fn mutated_mount_error_does_not_name_the_old_file() {
+        let (repo, _global, global_cfg) = global_mount_project();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        cfg.workspace.mounts[0].set_host_path("absent");
+
+        let err = expect_load_validation_err(
+            cfg.validate(Some(repo.path()))
+                .expect_err("the replacement does not exist under the repo root"),
+        );
+        assert!(
+            !err.to_string().contains("declared in"),
+            "a hand-set value has no declaring file to name: {err}",
+        );
+        match err {
+            ConfigValidationError::WorkspaceMountHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("absent"));
+                assert_eq!(declared_in, None, "naming the global file would be a lie");
+            }
+            other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
+        }
+    }
+
+    /// The `ImageConfig` half of the same rule, through `DockerfileMissing`.
+    #[test]
+    fn mutated_image_error_does_not_name_the_old_file() {
+        let (repo, _global, global_cfg) = global_image_project();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        cfg.images
+            .get_mut("x")
+            .unwrap()
+            .set_build_paths("absent/Dockerfile", "absent");
+
+        let err = expect_load_validation_err(
+            cfg.validate(Some(repo.path()))
+                .expect_err("the replacement does not exist under the repo root"),
+        );
+        assert!(
+            !err.to_string().contains("declared in"),
+            "a hand-set pair has no declaring file to name: {err}",
+        );
+        match err {
+            ConfigValidationError::DockerfileMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("absent/Dockerfile"));
+                assert_eq!(declared_in, None);
+            }
+            other => panic!("expected DockerfileMissing, got: {other:?}"),
+        }
+    }
+
+    /// An absolute replacement ignores every base, so the setters' clearing is
+    /// invisible to it -- and a `clone` carries whatever provenance the
+    /// original holds, mutated or not, since `source` is an ordinary field.
+    #[test]
+    fn replacements_survive_absolute_paths_and_cloning() {
+        let (repo, global, global_cfg) = global_mount_project();
+
+        let cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        let loaded = cfg.workspace.mounts[0].clone();
+        assert_eq!(
+            loaded.config_source(),
+            cfg.workspace.mounts[0].config_source(),
+            "a clone of a loaded entry keeps its declaring file",
+        );
+
+        let abs = global.path().join("elsewhere");
+        let mut mutated = loaded.clone();
+        mutated.set_host_path(&abs);
+        assert_eq!(
+            mutated.resolved_host_path(repo.path()),
+            abs,
+            "an absolute value resolves to itself whatever the base",
+        );
+        assert_eq!(
+            mutated.clone().config_source(),
+            None,
+            "a clone of a mutated entry stays sourceless",
         );
     }
 }

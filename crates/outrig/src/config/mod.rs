@@ -1194,14 +1194,24 @@ impl Workspace {
     }
 }
 
+/// One `[[workspace.mounts]]` or `[[sidecars.<sc>.mounts]]` entry.
+///
+/// The fields are private because `host_path` is paired with the
+/// [`ConfigSource`] it is resolved against: a value replaced without clearing
+/// that pairing would be resolved against the directory of a file it never came
+/// from, and a mount may be read-write. Read them with
+/// [`host_path`](Self::host_path) / [`container_path`](Self::container_path) /
+/// [`access`](Self::access); write them with the setters, which keep the
+/// pairing honest. The other two carry no provenance and are private only so
+/// that one syntax reads the whole struct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct MountConfig {
-    pub host_path: PathBuf,
-    pub container_path: PathBuf,
+    host_path: PathBuf,
+    container_path: PathBuf,
     #[serde(default)]
-    pub access: MountAccess,
+    access: MountAccess,
     /// Set at load time, never deserialized. See [`ConfigSource`].
     #[serde(skip)]
     #[schemars(skip)]
@@ -1221,6 +1231,44 @@ impl MountConfig {
             access,
             source: None,
         }
+    }
+
+    /// `host-path` exactly as declared. Relative values are resolved by
+    /// [`resolved_host_path`](Self::resolved_host_path).
+    pub fn host_path(&self) -> &Path {
+        &self.host_path
+    }
+
+    /// The absolute in-container mount point.
+    pub fn container_path(&self) -> &Path {
+        &self.container_path
+    }
+
+    /// Whether the container may write through this mount.
+    pub fn access(&self) -> MountAccess {
+        self.access
+    }
+
+    /// Declare `host-path`, dropping any recorded [`ConfigSource`]: the new
+    /// value did not come from a config file, so it resolves against the
+    /// `repo_root` passed to
+    /// [`resolved_host_path`](Self::resolved_host_path) like any other
+    /// hand-built path. The same rule as
+    /// [`Workspace::set_host_path`](Workspace::set_host_path), one level down.
+    pub fn set_host_path(&mut self, host_path: impl Into<PathBuf>) {
+        self.host_path = host_path.into();
+        self.source = None;
+    }
+
+    /// Declare `container-path`. Carries no provenance -- a container path is
+    /// absolute and resolves against nothing.
+    pub fn set_container_path(&mut self, container_path: impl Into<PathBuf>) {
+        self.container_path = container_path.into();
+    }
+
+    /// Declare `access`.
+    pub fn set_access(&mut self, access: MountAccess) {
+        self.access = access;
     }
 
     /// The config file this mount was declared in, or `None` for a
@@ -1243,7 +1291,7 @@ impl MountConfig {
     pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
         resolve_against(
             source_base_dir(self.source.as_ref(), repo_root),
-            &self.host_path,
+            self.host_path(),
         )
     }
 
@@ -1799,6 +1847,14 @@ pub(crate) fn normalize_capability_name(name: &str) -> Option<String> {
     }
 }
 
+/// One `[images.<name>]` entry: either a build source (`dockerfile` plus
+/// `context`) or a pull source (`image_name`), never both.
+///
+/// The two build paths are private because a single [`ConfigSource`] is the
+/// base directory for both: either one replaced without clearing that pairing
+/// would be resolved against the directory of a file it never came from. Read
+/// them with [`dockerfile`](Self::dockerfile) / [`context`](Self::context),
+/// write them with [`set_build_paths`](Self::set_build_paths).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -1806,9 +1862,9 @@ pub struct ImageConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dockerfile: Option<PathBuf>,
+    dockerfile: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<PathBuf>,
+    context: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, EnvValue>,
     #[serde(default, skip_serializing_if = "ContainerSecurity::is_default")]
@@ -2003,6 +2059,34 @@ impl ImageConfig {
             source: None,
             mcp: BTreeMap::new(),
         }
+    }
+
+    /// `dockerfile` exactly as declared, or `None` on a pull-source config.
+    /// Relative values are resolved by
+    /// [`resolved_build_paths`](Self::resolved_build_paths).
+    pub fn dockerfile(&self) -> Option<&Path> {
+        self.dockerfile.as_deref()
+    }
+
+    /// `context` exactly as declared, or `None` on a pull-source config. See
+    /// [`dockerfile`](Self::dockerfile).
+    pub fn context(&self) -> Option<&Path> {
+        self.context.as_deref()
+    }
+
+    /// Declare both build paths, dropping any recorded [`ConfigSource`]: the
+    /// new values did not come from a config file, so they resolve against the
+    /// `repo_root` passed to
+    /// [`resolved_build_paths`](Self::resolved_build_paths).
+    ///
+    /// The pair is replaced together because one source backs both: a setter
+    /// for one path alone would clear the source its untouched sibling still
+    /// depends on. [`source`](Self::source) requires the two to be set together
+    /// in any case.
+    pub fn set_build_paths(&mut self, dockerfile: impl Into<PathBuf>, context: impl Into<PathBuf>) {
+        self.dockerfile = Some(dockerfile.into());
+        self.context = Some(context.into());
+        self.source = None;
     }
 
     /// The config file this image-config was declared in, or `None` for a

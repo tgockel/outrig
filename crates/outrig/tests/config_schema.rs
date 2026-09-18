@@ -2,7 +2,7 @@
 //! rejection, and MCP shape parity.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use outrig::config::{
     CapabilityProfile, Config, EnvValue, LlmProvider, McpServerSpec, MountAccess,
@@ -239,32 +239,32 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(cfg.workspace.container_path(), Path::new("/workspace"));
         assert_eq!(cfg.workspace.mounts.len(), 2);
         assert_eq!(
-            cfg.workspace.mounts[0].host_path,
-            PathBuf::from(".agents/outrig/resources/docs"),
+            cfg.workspace.mounts[0].host_path(),
+            Path::new(".agents/outrig/resources/docs"),
         );
         assert_eq!(
-            cfg.workspace.mounts[0].container_path,
-            PathBuf::from("/resources/docs"),
+            cfg.workspace.mounts[0].container_path(),
+            Path::new("/resources/docs"),
         );
-        assert_eq!(cfg.workspace.mounts[0].access, MountAccess::ReadOnly);
+        assert_eq!(cfg.workspace.mounts[0].access(), MountAccess::ReadOnly);
         assert_eq!(
-            cfg.workspace.mounts[1].host_path,
-            PathBuf::from(".agents/outrig/resources/cache"),
+            cfg.workspace.mounts[1].host_path(),
+            Path::new(".agents/outrig/resources/cache"),
         );
         assert_eq!(
-            cfg.workspace.mounts[1].container_path,
-            PathBuf::from("/resources/cache"),
+            cfg.workspace.mounts[1].container_path(),
+            Path::new("/resources/cache"),
         );
-        assert_eq!(cfg.workspace.mounts[1].access, MountAccess::ReadWrite);
+        assert_eq!(cfg.workspace.mounts[1].access(), MountAccess::ReadWrite);
 
         let coding_ctr = &cfg.images["coding"];
         assert_eq!(
-            coding_ctr.dockerfile,
-            Some(PathBuf::from(".agents/outrig/images/coding/Dockerfile")),
+            coding_ctr.dockerfile(),
+            Some(Path::new(".agents/outrig/images/coding/Dockerfile")),
         );
         assert_eq!(
-            coding_ctr.context,
-            Some(PathBuf::from(".agents/outrig/images/coding")),
+            coding_ctr.context(),
+            Some(Path::new(".agents/outrig/images/coding")),
         );
         // Inner map keys (build-args ARG names, mcp env-var names) keep user
         // casing -- they're not subject to the outer `rename_all = kebab-case`.

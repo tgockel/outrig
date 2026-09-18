@@ -475,17 +475,18 @@ impl core::default::Default for outrig::config::ContainerSecurity
 pub fn outrig::config::ContainerSecurity::default() -> Self
 #[non_exhaustive] pub struct outrig::config::ImageConfig
 pub outrig::config::ImageConfig::build_args: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
-pub outrig::config::ImageConfig::context: core::option::Option<std::path::PathBuf>
-pub outrig::config::ImageConfig::dockerfile: core::option::Option<std::path::PathBuf>
 pub outrig::config::ImageConfig::image_name: core::option::Option<alloc::string::String>
 pub outrig::config::ImageConfig::mcp: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::McpServerSpec>
 pub outrig::config::ImageConfig::security: outrig::config::ContainerSecurity
 impl outrig::config::ImageConfig
 pub fn outrig::config::ImageConfig::base_dir<'a>(&'a self, &'a std::path::Path) -> &'a std::path::Path
 pub fn outrig::config::ImageConfig::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
+pub fn outrig::config::ImageConfig::context(&self) -> core::option::Option<&std::path::Path>
+pub fn outrig::config::ImageConfig::dockerfile(&self) -> core::option::Option<&std::path::Path>
 pub fn outrig::config::ImageConfig::from_dockerfile(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn outrig::config::ImageConfig::from_image_name(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::ImageConfig::resolved_build_paths(&self, &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf)
+pub fn outrig::config::ImageConfig::set_build_paths(&mut self, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>)
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MistralrsDeviceParseError
 impl core::error::Error for outrig::config::MistralrsDeviceParseError
@@ -507,13 +508,16 @@ pub fn outrig::config::Model::alias<I, S>(I) -> Self where I: core::iter::traits
 pub fn outrig::config::Model::new(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::Model::source(&self) -> outrig::config::ModelSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MountConfig
-pub outrig::config::MountConfig::access: outrig::config::MountAccess
-pub outrig::config::MountConfig::container_path: std::path::PathBuf
-pub outrig::config::MountConfig::host_path: std::path::PathBuf
 impl outrig::config::MountConfig
+pub fn outrig::config::MountConfig::access(&self) -> outrig::config::MountAccess
 pub fn outrig::config::MountConfig::config_source(&self) -> core::option::Option<&outrig::config::ConfigSource>
+pub fn outrig::config::MountConfig::container_path(&self) -> &std::path::Path
+pub fn outrig::config::MountConfig::host_path(&self) -> &std::path::Path
 pub fn outrig::config::MountConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, outrig::config::MountAccess) -> Self
 pub fn outrig::config::MountConfig::resolved_host_path(&self, &std::path::Path) -> std::path::PathBuf
+pub fn outrig::config::MountConfig::set_access(&mut self, outrig::config::MountAccess)
+pub fn outrig::config::MountConfig::set_container_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
+pub fn outrig::config::MountConfig::set_host_path(&mut self, impl core::convert::Into<std::path::PathBuf>)
 #[non_exhaustive] pub struct outrig::config::NetworkConfig
 impl outrig::config::NetworkConfig
 pub fn outrig::config::NetworkConfig::declared_mode(&self) -> core::option::Option<outrig::config::NetworkMode>

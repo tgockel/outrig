@@ -105,14 +105,16 @@ async fn build_single(
             eprintln!("[outrig] image ready: {tag}");
             Ok(0)
         }
-        ImageSourceRef::Build { .. } => {
+        ImageSourceRef::Build {
+            dockerfile, context, ..
+        } => {
             let tag = image::compute_tag_for(name, cc, repo_root).await?;
             let cache_hit = !no_cache && image::probe_cached(&tag).await?;
             if cache_hit {
                 eprintln!("[outrig] image ready (cache hit: {tag})");
                 return Ok(0);
             }
-            print_build_header(name, cc, &tag);
+            print_build_header(name, dockerfile, context, &tag);
             image::build_image_for(name, cc, repo_root, &tag, no_cache).await?;
             eprintln!("[outrig] image ready: {tag}");
             Ok(0)
@@ -165,19 +167,15 @@ async fn build_all(cfg: &Config, repo_root: &Path, no_cache: bool) -> Result<i32
     Ok(0)
 }
 
-fn print_build_header(name: &str, cc: &ImageConfig, tag: &ImageTag) {
+/// Takes the two paths rather than the whole [`ImageConfig`] because the only
+/// caller has already destructured [`ImageSourceRef::Build`], which is where
+/// the build shape is established. Reaching back through the config would have
+/// to re-assert it.
+fn print_build_header(name: &str, dockerfile: &Path, context: &Path, tag: &ImageTag) {
     let mut buf = String::new();
     let _ = writeln!(buf, "[outrig] image-config: {name}");
-    let _ = writeln!(
-        buf,
-        "[outrig] dockerfile:       {}",
-        cc.dockerfile.as_ref().expect("build path").display()
-    );
-    let _ = writeln!(
-        buf,
-        "[outrig] context:          {}",
-        cc.context.as_ref().expect("build path").display()
-    );
+    let _ = writeln!(buf, "[outrig] dockerfile:       {}", dockerfile.display());
+    let _ = writeln!(buf, "[outrig] context:          {}", context.display());
     let _ = writeln!(buf, "[outrig] image tag:        {tag}");
     eprint!("{buf}");
 }

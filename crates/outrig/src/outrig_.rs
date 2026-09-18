@@ -558,8 +558,8 @@ impl LaunchSpec {
             .map(|mount| {
                 MountSpec::new(
                     mount.resolved_host_path(repo_root),
-                    mount.container_path.clone(),
-                    mount.access,
+                    mount.container_path().to_path_buf(),
+                    mount.access(),
                 )
             })
             .collect();
@@ -698,8 +698,8 @@ fn plan_to_launch_parts(
             .map(|mount| {
                 MountSpec::new(
                     mount.resolved_host_path(repo_root),
-                    mount.container_path.clone(),
-                    mount.access,
+                    mount.container_path().to_path_buf(),
+                    mount.access(),
                 )
             })
             .collect();

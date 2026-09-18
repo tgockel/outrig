@@ -130,3 +130,90 @@ One rule for every provenance-bearing path field: the value and its base directo
   choice was made.
 - `plan/done/phase/0002-sidecars/tasks/0002-31-global-workspace-block-dropped.md` -- where it was
   reversed for one type.
+
+## Decisions
+
+1. **Fork 2 resolved as the atomic pair, on a stronger ground than the entry gives.** The entry
+   argues from the shared `source`; the decisive fact is that `ImageConfig::source()` *panics*
+   unless `dockerfile` and `context` are both set or both absent, and `from_dockerfile` already
+   takes them together. A per-path setter would therefore let a caller build a state the type
+   already forbids -- it buys the ability to do something illegal. Per-path provenance also
+   forces a public answer to "what does `config_source()` mean when the two disagree", and that
+   accessor has two consumers: `declared_in`, which renders the `(declared in <file>)` clause,
+   and the `outrig image ls` source column 0002-20 was designed for. One source, one answer.
+
+   The `Sourced<PathBuf>` carrier was considered and rejected for this task. It would make the
+   pairing structural for all three types, but its field must still serialize as a bare TOML
+   string, which means hand-written `Serialize`/`Deserialize`/`JsonSchema` -- exactly the three
+   impls 0002-31 counted as a deletion. It is also per-path provenance underneath, so it inherits
+   the ambiguity above rather than resolving it.
+
+2. **All three `MountConfig` fields went private, not just `host_path`.** Only `host_path` is
+   paired with the source, so only it needed the break on hazard grounds. Taking the other two
+   costs six accessors instead of two and leaves the struct reading one way rather than mixing an
+   accessor-guarded field with two bare ones -- a reader no longer has to know which of three
+   fields is special to know which syntax to use. It is free now and a major version later, which
+   is the same argument that put the task in this queue. `Workspace::mounts` stays public because
+   it is a `Vec` whose elements each carry their own provenance, not a scalar paired with one.
+
+3. **No compile-fail test; `public-api.txt` records the absence instead.** The acceptance offers
+   a compile-fail test *or* an API-snapshot assertion. The repo has no `trybuild`, no `tests/ui/`,
+   and no dev-dependency that would give it one, so the first option means adding a proc-macro
+   test harness and a new dependency to assert that one function does not exist. The snapshot
+   already enumerates `ImageConfig`'s surface line by line, and 0002-48 turns it into an enforced
+   gate; a reviewer reading that block sees `set_build_paths` and no siblings.
+
+4. **`validate.rs` moved to the accessors even though it did not have to.** It is a child module
+   of `config`, so it can still see the private fields and compiled unchanged. Leaving it would
+   have made the getters the rule for everyone except the one file that reads these values most,
+   which is how a convention stops being one. The migration is `field.clone()` becoming
+   `accessor().to_path_buf()` -- the same allocation, since both sides needed an owned `PathBuf`
+   for the error variant.
+
+5. **`ImageConfig`'s two `.unwrap()`s became `.expect("build path")`.** `image.dockerfile()`
+   returns `Option<&Path>` rather than a clonable `Option<PathBuf>`, so the call had to be
+   rewritten anyway; it now carries the same message `resolved_build_paths` uses two lines above
+   for the identical invariant.
+
+6. **`config_accessors.rs` is a new file, not a module in `config_merge.rs`.** An integration test
+   already compiles against `outrig` as an external crate, so `config_merge.rs` would have proved
+   the same thing. A separate file says what it is: the migration a consumer performs, in one
+   place, with nothing else in it to read past. It also carries the schema assertions, which are
+   new coverage -- nothing tested `schema_for!` output before, and `get_config_schema` publishes
+   `schema_for!(ImageConfig)` to agents, so a key that silently moved would be advertised as
+   writable and then rejected on write.
+
+7. **The tests were checked against a disabled fix.** With `self.source = None` removed from both
+   setters, five of the six new `config_path_provenance` tests fail. The sixth,
+   `mount_provenance_free_setters_leave_the_base_alone`, correctly still passes: it asserts that
+   `set_container_path` and `set_access` leave the base *unchanged*. The four
+   `config_accessors.rs` tests also still pass, which is right -- they pin the surface and the
+   serde/schema keys, not the clearing.
+
+8. **`Workspace` gained nothing.** It already had this shape, and its `set_config_source` guard
+   (`if host_path.is_some()`) has a reason `MountConfig` and `ImageConfig` do not share: its
+   `host_path` has a built-in default (`.`) that belongs to no file, so stamping an undeclared
+   workspace would move it off the repo root. A mount or image entry only exists because a file
+   declared it, so there is nothing to guard against. The asymmetry is load-bearing, not drift.
+
+9. **`print_build_header` takes two `&Path`s instead of an `ImageConfig`.** The mechanical
+   migration had turned `cc.dockerfile.as_ref().expect("build path")` into
+   `cc.dockerfile().expect("build path")`, preserving an assertion its only caller had already
+   discharged: that caller is inside an `ImageSourceRef::Build { .. }` arm, where both paths are
+   bound as non-`Option` `&Path`. Binding them and passing them deletes both `expect`s rather
+   than relocating them. The equivalent cleanup in `validate_image_source` does *not* work the
+   same way -- that function is what proves the shape, so it cannot call `source()`, which panics
+   on the shapes it exists to reject -- and is filed as
+   `plan/next/validate-image-source-re-asserts-its-own-shape.md`.
+
+10. **`global_mount_project()` joins `global_image_project()`.** Four new tests opened with a
+    byte-identical global mount declaration plus `create_dir_all(global/shared)`. The image side
+    of the same feature already had that helper ten lines up; adding the mount-side mirror was
+    the shape the file was asking for, not a new abstraction.
+
+11. **Two hazards were seen and deliberately left.** `image_name` stays public, so a caller can
+    still reach the state `ImageConfig::source` panics on -- and `set_build_paths` on a
+    pull-source config now does so through a supported method rather than a field write. That is
+    a *shape* invariant rather than a provenance one, which is this task's subject, but it wants
+    the same pre-freeze window; filed as `plan/next/image-source-shape-is-a-whole.md` so the
+    decision to defer is a decision and not an oversight.

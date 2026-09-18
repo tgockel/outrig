@@ -117,6 +117,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: every config path that carries provenance is now private, behind an accessor
+  pair.** `MountConfig::host_path` becomes `host_path()` / `set_host_path`, and
+  `ImageConfig::dockerfile` and `context` become `dockerfile()` / `context()` and a single
+  `set_build_paths(dockerfile, context)`. `MountConfig::container_path` and `access` move to
+  `container_path()` / `set_container_path` and `access()` / `set_access` along with them, so
+  the struct reads one way rather than two. `MountConfig::new`, `ImageConfig::from_dockerfile`
+  and `ImageConfig::from_image_name` are unchanged.
+
+  These paths are each paired with a `ConfigSource` recorded at load -- the directory a
+  relative value resolves against. A public field let a caller replace the value and leave the
+  pairing behind, after which the new value resolved against the directory of a file that never
+  contained it: a bind mount of the wrong host tree, read-write if the mount says so. The
+  setters clear the source, because a hand-set value belongs to no config file and resolves
+  against the `repo_root` argument like any other. `Workspace::set_host_path` has worked this
+  way since the primary workspace gained provenance; this is the rest of the rule.
+
+  `set_build_paths` replaces the pair in one call rather than offering a setter per path,
+  because one source backs both: clearing it for `dockerfile` alone would rebase `context` from
+  the declaring file's directory to the repo root, which is the same bug one field over.
+  `ImageConfig::source` already requires the two to be set together.
+
+  The TOML and JSON Schema keys are unchanged -- `host-path`, `container-path`, `access`,
+  `dockerfile`, and `context` all still parse, serialize, and appear in the schema published
+  through `get_config_schema`. Privatization is a source break for Rust callers only.
+
 - **`NetworkInterceptor::shutdown` returns `Result<()>`.** It previously returned `()` and
   reached `tracing::warn!` with everything that went wrong, so a session could report a clean
   shutdown having failed to remove a container's redirect rules. `detach` kept its signature
