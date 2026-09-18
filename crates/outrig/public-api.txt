@@ -323,6 +323,7 @@ impl outrig::config::McpServerSpec
 pub fn outrig::config::McpServerSpec::args(&self) -> &[alloc::string::String]
 pub fn outrig::config::McpServerSpec::command(&self) -> core::option::Option<&[alloc::string::String]>
 pub fn outrig::config::McpServerSpec::entrypoint(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::McpServerSpec::entrypoint_in_sidecar(impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::env(&self) -> &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>
 pub fn outrig::config::McpServerSpec::exec(impl core::iter::traits::collect::IntoIterator<Item = impl core::convert::Into<alloc::string::String>>) -> Self
 pub fn outrig::config::McpServerSpec::has_command(&self) -> bool

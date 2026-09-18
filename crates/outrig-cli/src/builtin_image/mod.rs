@@ -264,6 +264,27 @@ mod tests {
         }
     }
 
+    /// `outrig`'s `tests/mcp_placement_parity.rs` proves the public API can
+    /// build *this* config, which is what makes "entrypoint-stdio in a named
+    /// sidecar is reachable" a claim about something outrig ships rather than
+    /// about a shape invented for a test. It works from a copy under its own
+    /// fixtures, because `outrig` is published with its `tests/` directory and
+    /// a path into this crate would not travel into the `.crate`. This is the
+    /// guard that the copy is still this file; without it a change here would
+    /// leave that test passing against config nothing ships.
+    ///
+    /// Reaching across crates is safe from here: the `include_str!` sits in a
+    /// `#[cfg(test)]` module, which `cargo package`'s verification build -- lib
+    /// and bin targets only -- never expands.
+    #[test]
+    fn the_parity_fixture_is_a_copy_of_this_config() {
+        assert_eq!(
+            DEFAULT_TOML,
+            include_str!("../../../outrig/tests/fixtures/builtin-default.toml"),
+            "copy this file over crates/outrig/tests/fixtures/builtin-default.toml",
+        );
+    }
+
     #[test]
     fn with_launcher_both_servers_run_against_the_primary_view() {
         let ctx = shell_context();

@@ -1,0 +1,33 @@
+# outrig's built-in default image-config, injected by `builtin_image::inject` when a session
+# resolves no image from `--image`, `agents.<n>.image`, or `default-image`. This is ordinary
+# config: it is parsed by the same `Config::load_from_str` a user's file goes through, and it
+# is quoted verbatim in `doc/reference/config.md`.
+#
+# Two entries are *not* here and are added in Rust, because both depend on run-time facts that
+# TOML cannot carry: `[images.outrig-default-shell]`, whose `dockerfile` and `context` are an
+# absolute cache path, and the launcher-absent degradation, which rewrites the `fs` sidecar's
+# placement and drops `shell` entirely. See `builtin_image::shape`.
+
+[images.outrig-default]
+# The smallest docker.io/library image that carries git, curl, ca-certificates, and
+# openssh-client while setting no ENTRYPOINT and baking no user -- both load-bearing, since
+# outrig appends `sleep infinity` as arguments and writes /etc/passwd at run time under
+# `--userns=keep-id`. A `view = "primary"` server runs in *this* rootfs, which is why the
+# primary is the container that needs git.
+image-name = "docker.io/library/buildpack-deps:bookworm-scm"
+
+  [images.outrig-default.mcp]
+  fs    = { sidecar = "outrig-default-fs" }
+  shell = { sidecar = "outrig-default-shell" }
+
+[images.outrig-default-fs]
+image-name = "docker.io/mcp/filesystem:latest"
+
+[sidecars.outrig-default-fs]
+image = "outrig-default-fs"
+view  = "primary"
+args  = ["/workspace"]
+
+[sidecars.outrig-default-shell]
+image = "outrig-default-shell"
+view  = "primary"

@@ -144,6 +144,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spellings the scan rejected. `outrig` no longer depends on `toml_edit`; the two text scans
   were its only users.
 
+- **`McpServerSpec::entrypoint_in_sidecar`**, the constructor for an entrypoint-stdio server
+  hosted by a sidecar declared under `[sidecars.<sc>]` -- no `command`, because that container's
+  own ENTRYPOINT is the server. The config path has always expressed it as
+  `fs = { sidecar = "tools" }`, and the library had no way to build it: `exec` always sets a
+  command, `entrypoint` always sets the *anonymous* sidecar's `image`, and stacking
+  `with_sidecar` on the latter is the `McpPlacementConflict` validation exists to reject. The
+  four placements the TOML can describe are now the four an embedder can construct.
+
+  It is the counterpart of `entrypoint`, which gives the server a dedicated anonymous sidecar
+  instead, and it is subject to the same rules the parsed form is -- `sidecar` must name a
+  declared block, `args` may be declared on the block or the entry but not both. Outrig's own
+  built-in default config is exactly this shape, so parity here is not hypothetical: it was
+  reached by parsing TOML because the library could not be asked.
+
 ### Changed
 
 - **Breaking: an advertised tool name carries a hash suffix whenever outrig had to change

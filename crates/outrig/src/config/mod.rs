@@ -2204,9 +2204,20 @@ impl McpServerSpec {
 
     /// Entrypoint-stdio server in a dedicated anonymous sidecar built from
     /// `image`: the image's own ENTRYPOINT is the server, so there is no
-    /// command to exec.
+    /// command to exec. For the same transport in a sidecar declared under
+    /// `[sidecars.<sc>]`, see
+    /// [`entrypoint_in_sidecar`](Self::entrypoint_in_sidecar).
     pub fn entrypoint(image: impl Into<String>) -> Self {
         Self::full(None, Some(image.into()))
+    }
+
+    /// Entrypoint-stdio server hosted by the sidecar declared under
+    /// `[sidecars.<sc>]`: that container's own ENTRYPOINT is the server, so
+    /// there is no command to exec. The named-block counterpart of
+    /// [`entrypoint`](Self::entrypoint), which gives the server a dedicated
+    /// anonymous sidecar instead.
+    pub fn entrypoint_in_sidecar(sidecar: impl Into<String>) -> Self {
+        Self::full(None, None).with_sidecar(sidecar)
     }
 
     /// Environment for the server process, resolved at spawn time.
@@ -2220,7 +2231,11 @@ impl McpServerSpec {
 
     /// Host this server in the sidecar declared under `[sidecars.<sc>]`.
     /// Mutually exclusive with the anonymous [`entrypoint`](Self::entrypoint)
-    /// form; validation rejects setting both.
+    /// form; validation rejects setting both. Pairs with
+    /// [`exec`](Self::exec) to run a command in that container; the
+    /// entrypoint-stdio shape is
+    /// [`entrypoint_in_sidecar`](Self::entrypoint_in_sidecar) rather than a
+    /// commandless spec built here.
     pub fn with_sidecar(self, sidecar: impl Into<String>) -> Self {
         self.map_full(|spec| {
             if let Self::Full { sidecar: slot, .. } = spec {
