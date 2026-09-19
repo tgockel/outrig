@@ -5538,6 +5538,24 @@ mod tests {
             .for_container("outrig-test")
     }
 
+    /// Waits until `dir`'s audit log holds `want` records, which is what says
+    /// that many connections have run far enough to write one. Counted by
+    /// newline, so a line the writer is still appending is not one of them.
+    async fn await_audit_records(dir: &Path, want: usize) {
+        let path = dir.join(NETWORK_LOG);
+        let waited = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let log = tokio::fs::read(&path).await.unwrap_or_default();
+                if log.iter().filter(|byte| **byte == b'\n').count() >= want {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "the audit log never reached {want} records");
+    }
+
     /// The one record `dir`'s audit log holds, read as it is the instant it is
     /// asked for -- no polling, no retry, so a record written late is a
     /// failure rather than a slow pass.
@@ -5867,6 +5885,7 @@ mod tests {
     /// calls `reap_finished` itself cannot tell whether the loop still does.
     #[tokio::test]
     async fn the_accept_loop_keeps_taking_finished_connections_back() {
+        const SERVED: usize = 64;
         let dir = tempfile::tempdir().expect("tempdir");
         let audit = audit_sink(dir.path()).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -5878,15 +5897,28 @@ mod tests {
         let mut conns = JoinSet::new();
 
         let token = cancel.clone();
+        let log = dir.path().to_path_buf();
         let clients = tokio::spawn(async move {
-            for _ in 0..64 {
+            // Cancels however this task ends, rather than only where it used
+            // to: the gate below gives up by panicking, and a connect can
+            // fail, and either would leave the loop parked in `accept` with
+            // nothing coming to end it -- the test would hang rather than
+            // report what went wrong, since the failure is not observable
+            // until `accept_into` returns.
+            let _ends_the_loop = token.drop_guard();
+            for served in 1..=SERVED {
                 // Closed at once, so each connection finishes on its own and
                 // leaves its handle behind for the loop to take back.
                 drop(TcpStream::connect(addr).await.expect("connect"));
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // Waited out by its own record rather than by the clock. A
+                // connection writes one before its task ends, and the audit
+                // writer is a queue of one on a runtime this test shares with
+                // it -- so a sleep here says nothing about how many
+                // connections are still in flight, and a machine slow enough
+                // to lag the writer would leave a whole burst of them for the
+                // assertion below to count.
+                await_audit_records(&log, served).await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            token.cancel();
         });
 
         let (live, _idle) = mpsc::channel(1);
@@ -5903,14 +5935,17 @@ mod tests {
         .await;
         clients.await.expect("clients");
 
-        // Not zero: whichever connection finishes after the loop's last reap
-        // is still held, and the drain that follows `accept_into` in
-        // production is what collects it. The claim is that the carrier does
-        // not grow with the number of connections served -- without the reap
-        // all 64 are still here.
+        // Not zero: the loop reaps on its way in to an accept, so the
+        // connection it served last is still held either way, and the drain
+        // that follows `accept_into` in production is what collects it. What
+        // the gate above buys is that only the last one or two can be --
+        // every earlier connection had a whole further connection's worth of
+        // the loop to be taken back in. The claim is that the carrier does
+        // not grow with the number of connections served: without the reap
+        // all SERVED of them are still here.
         assert!(
             conns.len() < 8,
-            "{} of 64 finished connections were never taken back out of the carrier",
+            "{} of {SERVED} finished connections were never taken back out of the carrier",
             conns.len()
         );
     }
