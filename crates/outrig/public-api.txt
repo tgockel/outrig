@@ -507,6 +507,7 @@ pub outrig::config::Model::revision: core::option::Option<alloc::string::String>
 impl outrig::config::Model
 pub fn outrig::config::Model::alias<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn outrig::config::Model::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn outrig::config::Model::resolved_model_path(&self, &std::path::Path) -> core::option::Option<std::path::PathBuf>
 pub fn outrig::config::Model::source(&self) -> outrig::config::ModelSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MountConfig
 impl outrig::config::MountConfig

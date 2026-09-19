@@ -212,6 +212,8 @@ pub enum ResolvedProvider {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MistralrsWeights {
     pub model_id: Option<String>,
+    /// Absolute: the config's text joined to the repo root at resolve time, so
+    /// nothing downstream has to know what a relative one would have meant.
     pub model_path: Option<PathBuf>,
     pub model_file: Option<Vec<String>>,
     pub revision: Option<String>,
@@ -462,7 +464,7 @@ pub(crate) fn selectability(
         }
         // Two compile-time decisions, not runtime ones. `cfg!` keeps one body
         // compiling in every build, so they cannot drift apart.
-        LlmProvider::Mistralrs => {
+        LlmProvider::Mistralrs { .. } => {
             if !cfg!(feature = "local-llm") {
                 return Err(Unselectable::AsResolved(
                     LlmResolveError::MistralrsFeatureDisabled {
@@ -590,22 +592,33 @@ pub(crate) fn render_candidate_reasons(rows: &[(&str, String)]) -> String {
 /// Each lookup is re-checked here -- the function does not assume
 /// `cfg.validate()` was called -- so errors carry the resolution context
 /// (which agent, which model) regardless.
+///
+/// `repo_root` is the base a relative `[models.<name>].model-path` is joined
+/// to, through [`Model::resolved_model_path`] -- the same call
+/// [`Config::validate`] checks it with. Resolution is where the config's text
+/// becomes a path the loader opens, so it is where the base has to arrive.
 #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
-pub fn resolve_agent(cfg: &Config, agent_name: Option<&str>) -> Result<ResolvedAgent> {
-    resolve_agent_with_overrides(cfg, agent_name, None, None)
+pub fn resolve_agent(
+    cfg: &Config,
+    repo_root: &Path,
+    agent_name: Option<&str>,
+) -> Result<ResolvedAgent> {
+    resolve_agent_with_overrides(cfg, repo_root, agent_name, None, None)
 }
 
 #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
 pub fn resolve_agent_with_device_override(
     cfg: &Config,
+    repo_root: &Path,
     agent_name: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
 ) -> Result<ResolvedAgent> {
-    resolve_agent_with_overrides(cfg, agent_name, None, device_override)
+    resolve_agent_with_overrides(cfg, repo_root, agent_name, None, device_override)
 }
 
 pub fn resolve_agent_with_overrides(
     cfg: &Config,
+    repo_root: &Path,
     agent_name: Option<&str>,
     model_override: Option<&str>,
     device_override: Option<MistralrsDeviceSpec>,
@@ -707,7 +720,13 @@ pub fn resolve_agent_with_overrides(
     // aliases existed -- the loop is the only new thing.
     let mut resolved = Vec::with_capacity(concrete.len());
     for name in concrete {
-        resolved.push(resolve_candidate(cfg, agent, name, device_override)?);
+        resolved.push(resolve_candidate(
+            cfg,
+            repo_root,
+            agent,
+            name,
+            device_override,
+        )?);
     }
 
     Ok(ResolvedAgent {
@@ -746,6 +765,7 @@ pub fn resolve_agent_with_overrides(
 /// `Unselectable` also exists to preserve.
 fn resolve_candidate(
     cfg: &Config,
+    repo_root: &Path,
     agent: &outrig::config::Agent,
     model_name: &str,
     device_override: Option<MistralrsDeviceSpec>,
@@ -779,7 +799,7 @@ fn resolve_candidate(
     // `--device` selects hardware for an in-process model, so it is a
     // mistralrs-only knob. Checking it once here rather than per remote arm
     // means a remote style added later cannot forget to reject it.
-    if device_override.is_some() && !matches!(provider, LlmProvider::Mistralrs) {
+    if device_override.is_some() && !matches!(provider, LlmProvider::Mistralrs { .. }) {
         return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
             model: model_name.to_string(),
             provider: provider_name.to_string(),
@@ -828,14 +848,14 @@ fn resolve_candidate(
             None,
             remote_identifier(),
         ),
-        LlmProvider::Mistralrs => {
+        LlmProvider::Mistralrs { .. } => {
             let device = match device_override {
                 Some(device) => validate_mistralrs_device(model_name, device)?,
                 None => parse_mistralrs_device(model_name, model.device.as_deref())?,
             };
             let weights = MistralrsWeights {
                 model_id: model.model_id.clone(),
-                model_path: model.model_path.clone(),
+                model_path: model.resolved_model_path(repo_root),
                 model_file: model.model_file.clone(),
                 revision: model.revision.clone(),
                 context_length: model.context_length,

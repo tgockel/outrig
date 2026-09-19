@@ -359,10 +359,10 @@ impl Config {
     /// last of those only when the file declared it, since the built-in `.`
     /// belongs to no file. Providers and agents have no path
     /// fields, so a base directory would buy them nothing. `models.<n>`
-    /// does have one -- `model-path` -- and is left out on purpose: it is
-    /// validated against a base the loader does not use, so giving it a
-    /// *better* validation base would only widen the disagreement. Both halves
-    /// get fixed together in `plan/next/model-path-runtime-unjoined.md`.
+    /// does have one -- `model-path` -- and is left out on purpose: both the
+    /// validator and the loader resolve it through
+    /// [`Model::resolved_model_path`], which is repo-root-relative by
+    /// decision, so there is no provenance for them to disagree about.
     fn stamp_source(&mut self, src: &ConfigSource) {
         for image in self.images.values_mut() {
             image.set_config_source(src.clone());
@@ -748,7 +748,17 @@ pub enum LlmProvider {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_budget_secs: Option<u64>,
     },
-    Mistralrs,
+    /// In-process weights. The provider row carries no settings of its own --
+    /// every knob lives on the `[models.<name>]` rows that reference it.
+    ///
+    /// Braced and empty rather than a unit variant, and deliberately without
+    /// `#[non_exhaustive]`. `deny_unknown_fields` has no field set to check a
+    /// unit variant against, so `style = "mistralrs"` used to accept and
+    /// discard any key at all -- the one place this schema's "unknown keys are
+    /// an error" rule did not hold. An empty field set is one serde *can*
+    /// check. `#[non_exhaustive]` would stop the variant being constructed
+    /// outside this crate, which no other spelling of this fix requires.
+    Mistralrs {},
 }
 
 impl LlmProvider {
@@ -760,7 +770,7 @@ impl LlmProvider {
         match self {
             Self::OpenAi { .. } => "openai",
             Self::Anthropic { .. } => "anthropic",
-            Self::Mistralrs => "mistralrs",
+            Self::Mistralrs { .. } => "mistralrs",
         }
     }
 
@@ -942,6 +952,24 @@ impl Model {
                  call Config::validate() first"
             ),
         }
+    }
+
+    /// [`model_path`](field@Self::model_path) made absolute against
+    /// `repo_root`, or `None` for a row that sets no path.
+    ///
+    /// The base is the repo root rather than the directory of the file that
+    /// declared the row, which makes `models.<n>` the one exception to the rule
+    /// [`ConfigSource`] states for every other config-declared path. The
+    /// consequence to know: a global `[models.<n>]` with a relative
+    /// `model-path` resolves it under whichever repo is current, so name an
+    /// absolute path there.
+    ///
+    /// Both [`Config::validate`] and the CLI's model resolution go through
+    /// here, which is the point: one place chooses the base.
+    pub fn resolved_model_path(&self, repo_root: &Path) -> Option<PathBuf> {
+        self.model_path
+            .as_deref()
+            .map(|path| resolve_against(repo_root, path))
     }
 }
 

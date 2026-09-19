@@ -4,8 +4,10 @@
 > `plan/todo/0002-53-live-podman-e2e-and-a-green-aarch64-row.md`, and the `cargo publish --dry-run`
 > item to `plan/todo/0002-52-cut-0.2.0-rc.3.md`. What stays here: the generalizing
 > `cargo hack --each-feature` job, the MSRV check, and the cache-bucket and sccache cleanups. The
-> `macos-latest` x `local-llm,metal` item is contingent on
-> `plan/todo/0002-46-deprecated-local-llm-behavior-for-0.2.0.md` and may evaporate entirely.
+> `macos-latest` x `local-llm,metal` item **survives**: 0002-46 decided that 0.2.0 ships
+> `style = "mistralrs"` operational, so the feature and its macOS dependency block are still
+> real for at least this release. It evaporates with
+> `plan/next/remove-deprecated-local-llm.md`, not before.
 
 ## Context
 

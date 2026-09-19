@@ -3,20 +3,110 @@
 //! `plan/done/phase/0001-bootstrap/tasks/0001-12-llm-resolver.md`, plus the
 //! two happy-path resolutions.
 
-#[cfg(not(feature = "local-llm"))]
 use std::path::Path;
 
 use outrig::config::{Config, MistralrsDeviceSpec};
-use outrig_cli::error::CliError;
+use outrig_cli::error::{CliError, Result};
 #[cfg(not(feature = "local-llm"))]
 use outrig_cli::llm::build_agent;
 use outrig_cli::llm::{
-    DEFAULT_TOOL_RESULT_MAX_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedProvider,
-    resolve_agent, resolve_agent_with_device_override, resolve_agent_with_overrides,
+    DEFAULT_TOOL_RESULT_MAX_BYTES, LlmResolveError, MAX_TOOL_CALLS, ResolvedAgent, ResolvedProvider,
 };
 
 fn parse(s: &str) -> Config {
     Config::load_from_str(s).expect("config parses")
+}
+
+/// A repo root for the three wrappers below, which shadow the library
+/// functions they forward to rather than have sixty-odd call sites grow an
+/// argument. Every config in this file sets no `model-path` or an absolute one,
+/// so the value is immaterial to all of them. The one test it matters to calls
+/// `outrig_cli::llm` directly, with a root of its own.
+const ANY_REPO_ROOT: &str = "/outrig-tests/no-relative-model-path-here";
+
+fn resolve_agent(cfg: &Config, agent_name: Option<&str>) -> Result<ResolvedAgent> {
+    outrig_cli::llm::resolve_agent(cfg, Path::new(ANY_REPO_ROOT), agent_name)
+}
+
+fn resolve_agent_with_device_override(
+    cfg: &Config,
+    agent_name: Option<&str>,
+    device_override: Option<MistralrsDeviceSpec>,
+) -> Result<ResolvedAgent> {
+    outrig_cli::llm::resolve_agent_with_device_override(
+        cfg,
+        Path::new(ANY_REPO_ROOT),
+        agent_name,
+        device_override,
+    )
+}
+
+fn resolve_agent_with_overrides(
+    cfg: &Config,
+    agent_name: Option<&str>,
+    model_override: Option<&str>,
+    device_override: Option<MistralrsDeviceSpec>,
+) -> Result<ResolvedAgent> {
+    outrig_cli::llm::resolve_agent_with_overrides(
+        cfg,
+        Path::new(ANY_REPO_ROOT),
+        agent_name,
+        model_override,
+        device_override,
+    )
+}
+
+/// A relative `model-path` is joined to the repo root when the config row
+/// becomes runtime weights, so the file the loader opens does not depend on
+/// where `outrig` was started.
+///
+/// The bug was invisible from the repo root, so the test has to run from
+/// somewhere else -- and it does so by naming a root the process's working
+/// directory is not, rather than by moving that directory, which is
+/// process-global and unguarded. The final assertion states that precondition
+/// instead of assuming it.
+#[test]
+fn mistralrs_relative_model_path_resolves_against_the_repo_root() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let repo_root = repo.path().canonicalize().expect("canonicalize");
+    let weights = repo_root.join("models/local.gguf");
+    std::fs::create_dir_all(weights.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&weights, b"\0").expect("write weights");
+
+    let cfg = parse(
+        r#"
+default-model = "local"
+
+[providers.local]
+style = "mistralrs"
+
+[models.local]
+provider   = "local"
+model-path = "models/local.gguf"
+"#,
+    );
+
+    // The validating half accepts the row against this root ...
+    cfg.validate(Some(&repo_root)).expect("validates");
+
+    // ... and the resolving half hands the loader that same file, absolute.
+    let resolved = outrig_cli::llm::resolve_agent(&cfg, &repo_root, None).expect("resolves");
+    assert_eq!(
+        resolved.candidates[0]
+            .model_weights
+            .as_ref()
+            .expect("a mistralrs candidate carries weights")
+            .model_path
+            .as_deref(),
+        Some(weights.as_path()),
+        "the resolved path must be the validated one, not the row's text",
+    );
+
+    assert_ne!(
+        std::env::current_dir().expect("cwd"),
+        repo_root,
+        "this test only catches the bug while it runs from outside the repo root",
+    );
 }
 
 // SAFETY: edition 2024 marks env::set_var unsafe due to multi-thread races.

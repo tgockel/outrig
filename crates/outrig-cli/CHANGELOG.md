@@ -7,13 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`style = "mistralrs"` rejects unknown keys**, closing the one hole in this schema's
+  "unknown keys are an error" rule. The provider was a serde *unit* variant, so
+  `deny_unknown_fields` had no field set to check against, and every key written on one of
+  these blocks -- `retry-budget-secs`, `request-timeout-secs`, `base-url`, an outright typo --
+  parsed clean and was discarded. Aiming a remote-only setting at an in-process provider
+  through TOML was the last surviving way to have one vanish rather than be refused; the
+  Rust-side spelling had already gone.
+
+  The provider table is unchanged -- `style` and nothing else -- so the only configs this stops
+  loading are ones that were carrying a key outrig never read.
+
+- **A relative `[models.<name>].model-path` is opened against the repo root**, which is the base
+  it has always been *validated* against. The resolver copied the row's text into the runtime
+  weights unjoined and the mistralrs loader opened it relative to the process's working
+  directory, so a config that validated clean named a different file -- usually no file --
+  whenever `outrig` was started from anywhere but the repo root. Both halves now go through one
+  library call, `Model::resolved_model_path`.
+
+  This stays the one path in the schema that is repo-relative rather than relative to the file
+  that declared it. A *global* `[models.<name>]` with a relative `model-path` therefore follows
+  whichever repo is current; give that one an absolute path.
+
 ### Deprecated
 
 - **The `local-llm` Cargo feature and the `style = "mistralrs"` provider**, along with the
   `cuda` and `metal` features that select a backend for them, the six `[models.<name>]` weight
   keys (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `device`), the
   top-level `model-cache-root`, and `outrig run --device`. They will be removed in a future
-  release.
+  release -- not this one. This release *carries* the deprecation: the style parses, validates
+  and runs as it always has, and the two defects it had been shipping are fixed rather than
+  left standing for a surface on its way out. The earliest a removal can land is the release
+  after the one that first puts this warning in users' hands.
 
   **Nothing changes today.** A build with `--features local-llm` still runs in-process models,
   every config still parses and validates, and no key changed spelling. What changed is that

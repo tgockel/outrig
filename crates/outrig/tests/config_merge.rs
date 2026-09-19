@@ -1415,28 +1415,37 @@ identifier = "gpt-4o-mini"
         }
     }
 
-    /// A `mistralrs` provider has no HTTP layer, so the `(None, None)` arm of
-    /// the validation match is what it takes -- there is no timeout to check.
+    /// A `mistralrs` provider has no HTTP layer, so a remote connection key
+    /// written on one is a mistake rather than a setting -- and it is refused
+    /// rather than swallowed. `config_provider_enum.rs`'s
+    /// `mistralrs_provider_rejects_unknown_keys` is where that rule is proven
+    /// in general; this pins the key it was found through.
     ///
-    /// It reaches that arm by *parsing*, not by rejection: `Mistralrs` is a
-    /// unit variant, and `deny_unknown_fields` cannot reject unknown keys for a
-    /// variant that has no fields, so the key is silently swallowed rather than
-    /// refused. That is a pre-existing serde-shape bug affecting every key on
-    /// this variant, filed as `plan/next/mistralrs-provider-swallows-keys.md`;
-    /// this test pins today's behavior so the fix has a failing assertion to
-    /// flip rather than a silent one to discover.
+    /// What is only here: a bare provider still reaches the `(None, None)` arm
+    /// of the validation match. There is no timeout to check, rather than a
+    /// timeout that checks out.
     #[test]
-    fn mistralrs_provider_ignores_request_timeout_secs() {
-        let cfg = parse(
+    fn mistralrs_provider_rejects_request_timeout_secs() {
+        let err = Config::load_from_str(
             r#"
 [providers.local]
 style                = "mistralrs"
 request-timeout-secs = 0
 "#,
+        )
+        .expect_err("a remote connection key is not a mistralrs key");
+        assert!(
+            err.to_string().contains("request-timeout-secs"),
+            "error should name the rejected key, got: {err}"
         );
-        assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs);
-        // Even a `0`, which is a hard error on any remote style, validates
-        // here: the key never made it into the parsed provider at all.
+
+        let cfg = parse(
+            r#"
+[providers.local]
+style = "mistralrs"
+"#,
+        );
+        assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
         cfg.validate(None)
             .expect("mistralrs carries no timeout to validate");
     }
@@ -2107,7 +2116,8 @@ mod config_load {
         // model-path; the existence check resolves against repo_root.
         let model_dir = tmp.path().join(".agents/outrig/models");
         fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("llama-3-8b-instruct.q4.gguf"), b"\0").unwrap();
+        let weights = model_dir.join("llama-3-8b-instruct.q4.gguf");
+        fs::write(&weights, b"\0").unwrap();
 
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/docs")).unwrap();
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/cache")).unwrap();
@@ -2116,6 +2126,14 @@ mod config_load {
         assert_eq!(cfg.default_image.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
         assert_eq!(cfg.default_model.as_deref(), Some("fast"));
+
+        // The only relative `model-path` in tree, and the point of keeping it
+        // relative: the file the validator found is the file the loader is
+        // handed, named once by `resolved_model_path` rather than joined twice.
+        assert_eq!(
+            cfg.models["llama-local"].resolved_model_path(tmp.path()),
+            Some(weights),
+        );
     }
 
     #[test]

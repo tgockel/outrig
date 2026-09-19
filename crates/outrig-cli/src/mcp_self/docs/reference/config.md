@@ -315,7 +315,9 @@ agent, or the first turn fails saying so. See
 > **Deprecated.** This provider style and the `local-llm` build feature are deprecated and
 > will be removed in a future release. Run the model under an OpenAI-compatible local server
 > (Ollama, vLLM, `llama.cpp`) and use a [`style = "openai"`](#style--openai) provider with a
-> `localhost` `base-url` instead. Existing configs keep parsing and working for now. See
+> `localhost` `base-url` instead. Nothing is removed in this release: configs carrying this
+> style still parse, still validate, and still run on a `--features local-llm` build. The
+> removal can only land in a release *after* the one that first carried this warning. See
 > [Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html)
 > for a before/after migration.
 
@@ -334,9 +336,10 @@ style = "mistralrs"
 |---------|--------|----------|---------|-------------------------------------|
 | `style` | string | yes      | --      | Must be `"mistralrs"` for this row. |
 
-`base-url` and `api-key` are not allowed on `style = "mistralrs"`. The model-specific
-fields (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `device`)
-live on `[models.<name>]` -- see the
+`base-url`, `api-key`, and any other key are rejected on `style = "mistralrs"`: the table
+above is the whole of it, and an unknown key here is an error exactly as it is anywhere else
+in this schema. The model-specific fields (`model-id`, `model-path`, `model-file`, `revision`,
+`context-length`, `device`) live on `[models.<name>]` -- see the
 [mistralrs models](#mistralrs-models) subsection.
 
 #### Always parses, even without `--features local-llm`
@@ -1099,7 +1102,10 @@ config through disk should resolve paths first, or keep the two files separate.
 
 The practical effect is that a global `[images.<name>]` can use the build shape: its Dockerfile
 and context live beside `~/.outrig/config.toml` and are found from any repo on the machine. One
-exception remains repo-relative: `[models.<name>].model-path`, which is documented under
+exception is repo-relative rather than file-relative: `[models.<name>].model-path` resolves
+against the repo root no matter which file declared it, and does so for the existence check and
+for the load alike. A *global* `[models.<name>]` with a relative `model-path` therefore follows
+whichever repo is current, so give that one an absolute path. See
 [Validation rules](#validation-rules).
 
 Because provenance is recorded per entry, a diagnostic about a config-declared path names the
@@ -1258,7 +1264,9 @@ image-config in the merged config but does not require agent/model/provider wiri
   single string (one GGUF file) or an array of strings (a multi-shard
   quantization, e.g. `*-00001-of-00003.gguf`). `revision` is optional and
   only meaningful with `model-id`. A `model-path`, if set, must exist on
-  disk relative to the repo root (or be absolute). `identifier` is not
+  disk relative to the repo root (or be absolute); the repo root is also
+  the base it is opened against when the model loads, whatever directory
+  `outrig` was invoked from. `identifier` is not
   allowed on mistralrs models. `device`, if set, must be one of `cpu`, `cuda`,
   `cuda:N`, or `metal`.
 - `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.

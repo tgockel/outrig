@@ -74,6 +74,9 @@ pub struct SubagentContext {
     /// The session's MCP-backed tools. Cloning shares the live connections.
     pub mcp_tools: Vec<SessionTool>,
     pub cache_root: PathBuf,
+    /// The base a re-resolution joins a relative `model-path` to -- the same
+    /// one the session resolved against, kept for the same reason `cfg` is.
+    pub repo_root: PathBuf,
     /// Where per-subagent transcripts go, alongside `<server>.stderr`.
     pub log_dir: PathBuf,
     /// The depth of the subagents *this* registry launches. The primary agent
@@ -702,6 +705,7 @@ fn resolve_launch_model(
     // `None` for the device override: a subagent names a model, not hardware.
     match crate::llm::resolve_agent_with_overrides(
         &ctx.cfg,
+        &ctx.repo_root,
         ctx.resolved.agent_name.as_deref(),
         Some(model),
         None,
@@ -1072,7 +1076,7 @@ pub(crate) mod fixtures {
     pub(crate) fn local_model_config() -> Config {
         let mut cfg = test_config();
         cfg.providers
-            .insert("local".to_string(), LlmProvider::Mistralrs);
+            .insert("local".to_string(), LlmProvider::Mistralrs {});
         let mut model = Model::new("local");
         model.model_id = Some("Qwen/Qwen2.5-7B-Instruct".to_string());
         cfg.models.insert("onprem".to_string(), model);
@@ -1151,6 +1155,7 @@ pub(crate) mod fixtures {
             cfg: Arc::new(cfg),
             mcp_tools: Vec::new(),
             cache_root: PathBuf::from("."),
+            repo_root: PathBuf::from("."),
             log_dir: log_dir.path().to_path_buf(),
             depth,
             #[cfg(feature = "local-llm")]

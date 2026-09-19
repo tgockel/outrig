@@ -339,6 +339,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     } else if args.llm_session {
         let resolved = llm::resolve_agent_with_overrides(
             &cfg,
+            &repo_root,
             args.agent_flag.or(cfg.default_agent.as_deref()),
             args.model_override,
             args.device_override,

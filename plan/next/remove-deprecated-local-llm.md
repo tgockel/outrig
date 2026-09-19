@@ -1,9 +1,10 @@
 # Remove the deprecated `local-llm` feature
 
 > **Still buffered, and still post-0.2.0** -- the deprecation has to ship in a released version
-> first. But the open question below (parse error versus no-op) is answered by
-> `plan/todo/0002-46-deprecated-local-llm-behavior-for-0.2.0.md`, which settles the 0.2.0 behavior.
-> Read 0002-46's `## Decisions` before executing this entry; the removal inherits that answer.
+> first. 0002-46 has landed and settled what 0.2.0 does: the style ships **operational**, so this
+> entry is the next thing that happens to the surface rather than a variant of what 0.2.0 already
+> did. Read its `## Decisions` before executing --
+> `plan/done/phase/0002-sidecars/tasks/0002-46-deprecated-local-llm-behavior-for-0.2.0.md`.
 
 ## Context
 
@@ -55,13 +56,23 @@ following are in `crates/outrig/public-api.txt`: `LlmProvider::Mistralrs`,
 Also `Model::mistralrs_weight_fields()` and its use in `provider_shape_fields()`,
 plus the `validate_mistralrs_model` dispatch in `config/validate.rs`.
 
+0002-46 added one item to that list and reshaped another: `Model::resolved_model_path` goes with
+the weight fields, and `LlmProvider::Mistralrs` is now a braced variant, so a downstream matcher
+already writes `Mistralrs { .. }`.
+
 `LlmProvider`, `ConfigValidationError`, `Model` and `Config` are all
 `#[non_exhaustive]`, so per Rust's rules variant/field removal is not *formally*
 breaking -- but any downstream code that names `LlmProvider::Mistralrs` or reads
 `Model::model_id` stops compiling, so treat it as breaking in practice and pick
 the version deliberately.
 
-## The decision this entry does not make
+## The decision this entry still has to make
+
+0002-46 answered the *other* question -- what 0.2.0 does -- and the answer removes the reason this
+one was blocked. 0.2.0 carries the deprecation with the style fully working, so by the time this
+entry runs there is a released version in which users saw the warning. Either option below is then
+defensible on deprecation grounds, and the choice is a straight trade between API cleanup and a
+soft landing rather than a question of whether the deprecation counts.
 
 **Does `style = "mistralrs"` become a parse error, or keep parsing as a no-op?**
 Both are defensible and they are very different for users:
@@ -82,14 +93,11 @@ choosing it means the API cleanup does *not* happen in the same release.
 
 ## Related entries to resolve together
 
-- `plan/next/mistralrs-provider-swallows-keys.md` -- proposes reshaping
-  `Mistralrs` to a braced variant so `deny_unknown_fields` bites. **If the variant
-  is being removed, do not do this work**; close it instead. It currently reads as
-  live work on a deprecated surface.
-- `plan/next/model-path-runtime-unjoined.md` -- a real bug (relative `model-path`
-  validated against the repo root, loaded against cwd) in code scheduled for
-  deletion. Probably closes unfixed; say so rather than leaving it to look
-  outstanding.
+- `plan/next/mistralrs-provider-swallows-keys.md` and
+  `plan/next/model-path-runtime-unjoined.md` -- **both executed by 0002-46 and deleted.** The
+  variant is now `Mistralrs {}` and refuses unknown keys, and `Model::resolved_model_path` is the
+  one place a relative `model-path` picks up a base. Nothing is left of either to close; the
+  analysis lives in their git history and in 0002-46's `## Decisions`.
 - `plan/next/ci-configuration-coverage.md` -- its highest-value item is a
   `macos-latest` x `local-llm,metal` job, and it notes the macOS-only dependency
   block hardcodes `candle-core`/`mistralrs-core` pins instead of inheriting from

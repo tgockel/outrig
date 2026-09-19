@@ -22,18 +22,17 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-46` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-47` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
-public-surface changes (`0002-41` through `0002-45` landed) that have to happen before the
+public-surface changes (`0002-41` through `0002-46` landed) that have to happen before the
 freeze, then release engineering. Each task carries its own evidence; the report is not in the tree.
 
 **Public surface, before the freeze**
 
 | Task      | What it settles                                                     |
 | --------- | ------------------------------------------------------------------- |
-| `0002-46` | What the deprecated local-LLM surface does in 0.2.0                 |
 | `0002-47` | Narrow or explicitly freeze the rmcp-coupled and low-level surfaces |
 
 **Release engineering**
@@ -56,7 +55,9 @@ Cross-cutting notes the individual tasks carry rather than this file:
   `SUPPORTED_PROTOCOL_VERSIONS` on "frozen" and the three `OutrigError` variants on "narrow", so
   `0002-47` inherits a verdict rather than a principle. See its `## Decisions`, in
   `plan/done/phase/0002-sidecars/tasks/`.
-- `0002-46`'s fork 2 decides whether `Model` gains path provenance; `0002-42` deferred it there.
+- `0002-46` resolved `0002-42`'s fork 3, which had deferred it: `Model` gains no `ConfigSource`,
+  and a relative `[models.<n>].model-path` stays repo-root-relative -- now for the load as well as
+  the existence check. It is the one documented exception to the declaring-file rule.
 - `0002-48` regenerates both `public-api.txt` files, so it wants to follow `0002-45` through
   `0002-47`. `0002-44` left the surface untouched -- its seams are `pub(crate)` -- so nothing it
   did reaches the snapshot. The `std::io::error` -> `core::io::error` compiler drift that `0002-41` left out of

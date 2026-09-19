@@ -4,7 +4,7 @@
 //! message, and `model-cache-root` validation.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
@@ -202,6 +202,70 @@ identifier = "claude-sonnet-4-6"
             "{field} should be rejected, got: {err:?}",
         );
     }
+}
+
+/// Unknown keys are an error everywhere in this schema, and `mistralrs` was
+/// the one place that was not true: as a unit variant it had no field set for
+/// `deny_unknown_fields` to check against, so a key copied off a remote
+/// provider -- or an outright typo -- parsed clean and was discarded.
+///
+/// Driven through `toml::from_str::<Config>` as well as `Config::load_from_str`
+/// on purpose. The loader wraps the deserializer and adds error handling of its
+/// own, so only the bare `Deserialize` path shows that the *derive* is what
+/// refuses the key. An empty braced variant either gives `deny_unknown_fields`
+/// something to check or it does not, and this is the test that says which.
+#[test]
+fn mistralrs_provider_rejects_unknown_keys() {
+    for key in [
+        "retry-budget-secs = 30",
+        "request-timeout-secs = 0",
+        r#"base-url = "https://localhost:1234/v1""#,
+        "not-a-real-key = 1",
+    ] {
+        let toml = format!(
+            r#"
+[providers.local]
+style = "mistralrs"
+{key}
+"#
+        );
+        let name = key.split_whitespace().next().expect("key name");
+
+        let err = Config::load_from_str(&toml).expect_err("unknown key should fail");
+        assert!(
+            err.to_string().contains(name),
+            "load_from_str should name {name}, got: {err}",
+        );
+
+        let err = toml::from_str::<Config>(&toml).expect_err("unknown key should fail");
+        assert!(
+            err.to_string().contains(name),
+            "toml::from_str should name {name}, got: {err}",
+        );
+    }
+}
+
+/// The bare provider is the whole of the surface -- `style` and nothing else --
+/// and giving the variant a field set did not change how it is written. It
+/// round-trips to an *equal* `Config`; byte-identical serializer output is a
+/// stronger claim than the schema makes.
+#[test]
+fn mistralrs_provider_alone_parses_and_round_trips() {
+    let cfg = parse(
+        r#"
+[providers.local]
+style = "mistralrs"
+"#,
+    );
+    assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
+    cfg.validate(None).expect("validates");
+
+    let serialized = toml::to_string(&cfg).expect("serializes");
+    assert!(
+        serialized.contains(r#"style = "mistralrs""#),
+        "style should round-trip as the documented tag, got: {serialized}",
+    );
+    assert_eq!(cfg, Config::load_from_str(&serialized).expect("reparses"));
 }
 
 #[test]
@@ -541,6 +605,43 @@ model-cache-root = "/var/cache/outrig/models"
 "#,
     );
     cfg.validate(None).expect("absolute path is fine");
+}
+
+/// `model-path` is joined exactly once, by the library, against the repo root:
+/// the base `validate` checks below and the base the loader is handed. It is
+/// deliberately *not* the declaring file's directory, which is the rule for
+/// every other config-declared path -- see 0002-46's Decisions.
+#[test]
+fn resolved_model_path_joins_relative_and_leaves_absolute_alone() {
+    let cfg = parse(
+        r#"
+[providers.local]
+style = "mistralrs"
+
+[models.rel]
+provider   = "local"
+model-path = "models/local.gguf"
+
+[models.abs]
+provider   = "local"
+model-path = "/opt/weights/local.gguf"
+
+[models.from-hub]
+provider   = "local"
+model-id   = "Qwen/Qwen2.5-7B-Instruct"
+model-file = "q4.gguf"
+"#,
+    );
+    let root = Path::new("/srv/repo");
+    assert_eq!(
+        cfg.models["rel"].resolved_model_path(root),
+        Some(PathBuf::from("/srv/repo/models/local.gguf")),
+    );
+    assert_eq!(
+        cfg.models["abs"].resolved_model_path(root),
+        Some(PathBuf::from("/opt/weights/local.gguf")),
+    );
+    assert_eq!(cfg.models["from-hub"].resolved_model_path(root), None);
 }
 
 /// Mirrors how dockerfile/context paths are checked against `repo_root`:

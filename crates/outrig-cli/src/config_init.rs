@@ -324,7 +324,7 @@ async fn prompt_provider_body(prompt: &mut impl PromptSource, style: &str) -> Re
     match style {
         "openai" => prompt_openai_provider(prompt).await,
         "anthropic" => prompt_anthropic_provider(prompt).await,
-        "mistralrs" => Ok(LlmProvider::Mistralrs),
+        "mistralrs" => Ok(LlmProvider::Mistralrs {}),
         other => Err(OutrigError::Configuration(format!("unknown provider style: {other}")).into()),
     }
 }
@@ -432,7 +432,9 @@ pub(crate) async fn prompt_models_loop(
         // usable prompt instead of an error. Anthropic gets its own arm on top
         // of that, for the ceiling its API insists on.
         let model = match provider {
-            LlmProvider::Mistralrs => prompt_mistralrs_model(prompt, hf, provider_name).await?,
+            LlmProvider::Mistralrs { .. } => {
+                prompt_mistralrs_model(prompt, hf, provider_name).await?
+            }
             LlmProvider::Anthropic { .. } => prompt_anthropic_model(prompt, provider_name).await?,
             _ => {
                 let identifier = prompt

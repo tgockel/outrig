@@ -15,6 +15,12 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use walkdir::WalkDir;
 
+/// These models are named by whoever runs the suite, so the working directory
+/// is the base a relative `model-path` among them was written against.
+fn cwd() -> std::path::PathBuf {
+    std::env::current_dir().expect("cwd")
+}
+
 const TEST_MODEL: &str = "OUTRIG_MISTRALRS_TEST_MODEL";
 const TEST_MODEL_ID: &str = "OUTRIG_MISTRALRS_TEST_MODEL_ID";
 const TEST_MODEL_FILE: &str = "OUTRIG_MISTRALRS_TEST_MODEL_FILE";
@@ -93,7 +99,7 @@ async fn offline_path_smoke() {
     };
 
     let cfg = Config::load_from_str(&cfg_with_model_path(&model_path)).expect("config parses");
-    let resolved = resolve_agent(&cfg, Some("smoke")).expect("agent resolves");
+    let resolved = resolve_agent(&cfg, &cwd(), Some("smoke")).expect("agent resolves");
 
     let cache = TempDir::new().expect("tempdir");
     let registry = std::sync::Arc::new(LlmRegistry::new());
@@ -124,7 +130,7 @@ async fn download_path_smoke() {
         Config::load_from_str(&cfg_with_model_id(&model_id, &model_file)).expect("config parses");
 
     // First load: downloads.
-    let resolved = resolve_agent(&cfg, Some("smoke")).expect("agent resolves");
+    let resolved = resolve_agent(&cfg, &cwd(), Some("smoke")).expect("agent resolves");
     let registry = std::sync::Arc::new(LlmRegistry::new());
     let agent = build_agent(&resolved, vec![], cache.path(), &registry)
         .await
@@ -215,7 +221,7 @@ preamble = "You are a terse assistant."
     .expect("config parses");
     cfg.validate(None).expect("config validates");
 
-    let resolved = resolve_agent(&cfg, Some("smoke")).expect("resolves");
+    let resolved = resolve_agent(&cfg, &cwd(), Some("smoke")).expect("resolves");
     // SAFETY: as above.
     unsafe { std::env::remove_var(var) };
     assert_eq!(

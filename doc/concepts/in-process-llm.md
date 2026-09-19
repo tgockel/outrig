@@ -1,8 +1,10 @@
 # In-process LLMs
 
 > **Deprecated.** The `local-llm` feature and the `style = "mistralrs"` provider are
-> deprecated and will be removed in a future release. Nothing changes today: a build with
-> `--features local-llm` still works, configs still parse, and no key has changed spelling.
+> deprecated and will be removed in a future release. Nothing is removed in this one: a build
+> with `--features local-llm` still works, configs still parse and validate, and no key has
+> changed spelling. The removal can only land in a release *after* the one that first carried
+> this warning.
 > New setups should run the model under an OpenAI-compatible local server -- Ollama, vLLM,
 > or `llama.cpp`'s server -- and point a
 > [`style = "openai"`](llm-providers.md#pointing-at-openai-compatible-endpoints) provider at
@@ -207,7 +209,11 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 
 Use this when you want to pre-stage the model yourself -- in CI, in air-gapped environments,
 or when you want to manage the cache directory by hand. `model-path` may be absolute or
-relative to the repo root.
+relative to the repo root -- and the repo root is the base for both halves: the one the
+existence check runs against and the one the weights are opened against, whatever directory
+`outrig` was invoked from. A relative path in a *global* config follows whichever repo is
+current rather than sitting beside that file, which is the one place `models` departs from
+[the usual rule](../reference/config.md#path-resolution); name an absolute path there.
 
 ### One or the other, not both
 

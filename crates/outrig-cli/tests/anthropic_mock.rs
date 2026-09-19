@@ -275,7 +275,9 @@ async fn build_mock_agent(
     for var in vars {
         set_test_env(var, KEY);
     }
-    let resolved = resolve_agent(cfg, Some("coding")).expect("resolves");
+    // No `[models.<name>].model-path` in any config here, so the repo root
+    // this resolves relative paths against never comes up.
+    let resolved = resolve_agent(cfg, std::path::Path::new("/"), Some("coding")).expect("resolves");
     for var in vars {
         unset_test_env(var);
     }

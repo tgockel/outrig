@@ -211,7 +211,10 @@ srv = { command = ["bin", "arg1"] }
             )),
         );
         assert_eq!(llama.context_length, Some(4096));
-        assert!(matches!(cfg.providers["local"], LlmProvider::Mistralrs));
+        assert!(matches!(
+            cfg.providers["local"],
+            LlmProvider::Mistralrs { .. }
+        ));
 
         // Alias rows carry no provider at all, and both spellings -- a bare
         // string and an array -- normalize to the same `Vec`.

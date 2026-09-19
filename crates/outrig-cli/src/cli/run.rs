@@ -261,7 +261,13 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     // re-resolve a launch against a different model, against the same merged
     // config the session resolved from.
     let mut resolved =
-        llm::resolve_agent_with_overrides(&cfg, agent_name, model_override, device_override)?;
+        llm::resolve_agent_with_overrides(
+            &cfg,
+            repo_root,
+            agent_name,
+            model_override,
+            device_override,
+        )?;
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
@@ -298,6 +304,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         cfg: cfg.clone(),
         mcp_tools: all_tools.clone(),
         cache_root: cache_root.to_path_buf(),
+        repo_root: repo_root.to_path_buf(),
         log_dir: log_dir.to_path_buf(),
         // The primary is the root at depth 1, so its subagents live at depth 2.
         depth: 2,

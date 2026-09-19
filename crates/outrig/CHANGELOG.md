@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **`style = "mistralrs"` and the config surface behind it**: `LlmProvider::Mistralrs`,
+  `MistralrsDeviceSpec` and `MistralrsDeviceParseError`, the six `Model` weight fields
+  (`model_id`, `model_path`, `model_file`, `revision`, `context_length`, `device`),
+  `Config::model_cache_root`, and the nine `ConfigValidationError` variants that police them.
+  They will be removed in a future release -- not this one.
+
+  This is the library half of a deprecation `outrig-cli` announced on its own; every item above
+  lives here, so recording it only there left the crate that publishes them silent. Nothing is
+  removed, no key changed spelling, and a config naming this style still parses and validates.
+  Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
+  its `localhost` `base-url`; the migration is in
+  [In-process LLMs](../../doc/concepts/in-process-llm.md).
+
+### Changed
+
+- **`LlmProvider::Mistralrs` is a braced variant**, `Mistralrs {}`, rather than a unit one.
+  That is a source break with a one-token migration: a pattern becomes
+  `LlmProvider::Mistralrs { .. }` and a construction becomes `LlmProvider::Mistralrs {}`. The
+  variant is deliberately **not** `#[non_exhaustive]`, unlike its two siblings, so it stays
+  constructible outside this crate and needs no constructor function of its own.
+
+  It buys the one thing a unit variant could not have: `deny_unknown_fields` on the
+  internally-tagged enum now has a field set -- an empty one -- to check a `[providers.<name>]`
+  block against, so a key written on a `style = "mistralrs"` provider is refused instead of
+  silently discarded. It is a pre-0.2.0 break on purpose; after the freeze the same change
+  costs a major version, and the surface it repairs is one every other style already had.
+
 ### Added
+
+- **`Model::resolved_model_path(repo_root)`** returns `model_path` made absolute, and is the
+  single place the base for a relative one is chosen. `Config::validate` and the CLI's model
+  resolution both call it; they used to join the same value independently, against the repo
+  root and against the process's working directory respectively, and agreed only when `outrig`
+  happened to be invoked from the repo root.
+
+  The base is the repo root rather than the declaring file's directory, which makes
+  `[models.<name>].model-path` the one exception to the rule `ConfigSource` states for every
+  other config-declared path. `Model` therefore gains no `ConfigSource` and no accessor break.
+  The consequence to know: a global `[models.<name>]` with a relative `model-path` resolves it
+  under whichever repo is current, so name an absolute path there.
 
 - **MCP tool results carry the protocol's data.** `McpToolResult` is an ordered
   `Vec<McpContent>` -- text, images, audio, embedded resources, resource links -- beside

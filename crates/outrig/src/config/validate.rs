@@ -743,7 +743,7 @@ pub(super) fn validate_with_options(
                 } => (*retry_budget_secs, *request_timeout_secs),
                 // In-process: no HTTP layer, so nothing to retry and no
                 // request to time out.
-                LlmProvider::Mistralrs => (None, None),
+                LlmProvider::Mistralrs { .. } => (None, None),
             };
             if let Some(value) = retry_budget_secs {
                 validate_retry_budget_secs(
@@ -804,7 +804,9 @@ pub(super) fn validate_with_options(
                 LlmProvider::OpenAi { .. } | LlmProvider::Anthropic { .. } => {
                     validate_remote_model(provider.style(), model_name, model)?
                 }
-                LlmProvider::Mistralrs => validate_mistralrs_model(model_name, model, repo_root)?,
+                LlmProvider::Mistralrs { .. } => {
+                    validate_mistralrs_model(model_name, model, repo_root)?
+                }
             }
         }
     }
@@ -1709,19 +1711,21 @@ fn validate_mistralrs_model(
         });
     }
 
+    // Through `Model::resolved_model_path` rather than joining here, so the
+    // base is chosen in one place: the resolver joins through it too, and the
+    // path this check accepts is the path that gets opened.
     if let Some(path) = model.model_path.as_deref()
         && let Some(root) = repo_root
+        && !model
+            .resolved_model_path(root)
+            .is_some_and(|resolved| resolved.exists())
     {
-        // Still repo-root-relative: `models` was left out of the provenance
-        // sweep, and this validated base disagrees with the unjoined path the
-        // loader opens -- see `plan/next/model-path-runtime-unjoined.md`.
-        let resolved = super::resolve_against(root, path);
-        if !resolved.exists() {
-            return Err(ConfigValidationError::MistralrsModelPathMissing {
-                model: model_name.to_string(),
-                path: path.to_path_buf(),
-            });
-        }
+        return Err(ConfigValidationError::MistralrsModelPathMissing {
+            model: model_name.to_string(),
+            // The text the row carries, not the join: the base is documented,
+            // and the declared value is what the reader has to go change.
+            path: path.to_path_buf(),
+        });
     }
 
     Ok(())
