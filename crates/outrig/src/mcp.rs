@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use crate::config::{EnvValue, McpServerSpec};
 use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
-use crate::error::{IoPathExt, OutrigError, Result};
+use crate::error::{IoPathExt, McpFailureKind, McpSessionError, OutrigError, Result};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
 use crate::process::{Cmd, Owned, StdioSpec, Transcript};
 
@@ -224,7 +224,7 @@ impl McpClient {
         let tools = self.service.list_all_tools().await.map_err(|source| {
             OutrigError::McpToolsListFailed {
                 name: self.name.clone(),
-                source: Box::new(source),
+                source: session_error_from_rmcp(&source),
             }
         })?;
         Ok(tools.into_iter().map(tool_from_rmcp).collect())
@@ -252,7 +252,12 @@ impl McpClient {
         if let Some(arguments) = arguments {
             request = request.with_arguments(arguments);
         }
-        Ok(result_from_rmcp(self.service.call_tool(request).await?))
+        let result = self
+            .service
+            .call_tool(request)
+            .await
+            .map_err(|source| OutrigError::McpService(session_error_from_rmcp(&source)))?;
+        Ok(result_from_rmcp(result))
     }
 
     /// Cancel the rmcp service (which closes the child's stdin -- the MCP
@@ -437,9 +442,78 @@ pub(crate) fn kind_of(v: &Value) -> &'static str {
     }
 }
 
+/// Classify an rmcp session failure as outrig's own [`McpSessionError`].
+///
+/// A fifth conversion across the boundary [`crate::mcp_content`] documents,
+/// and a free function for the same reason its four are: a public
+/// `From<rmcp type>` would put the SDK back on the surface.
+fn session_error_from_rmcp(source: &rmcp::service::ServiceError) -> McpSessionError {
+    use rmcp::service::ServiceError as E;
+
+    // `ServiceError` is `#[non_exhaustive]`, so the wildcard is mandatory and
+    // a variant an SDK upgrade adds becomes `Other` without a compile error.
+    // Review this mapping on every rmcp bump, alongside
+    // `SUPPORTED_PROTOCOL_VERSIONS` -- `plan/next/rmcp-list-result-spec-gaps.md`
+    // carries both obligations.
+    let kind = match source {
+        E::TransportSend(_) | E::TransportClosed => McpFailureKind::Transport,
+        E::McpError(_) | E::UnexpectedResponse | E::InputRequiredRoundsExceeded { .. } => {
+            McpFailureKind::Protocol
+        }
+        E::Timeout { .. } => McpFailureKind::Timeout,
+        E::Cancelled { .. } => McpFailureKind::Canceled,
+        // Everything else, `SubscriptionLagged` included -- a consumer that
+        // fell behind its own notification buffer is neither the peer's
+        // failure nor the transport's.
+        _ => McpFailureKind::Other,
+    };
+    McpSessionError::new(kind, source.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport_error() -> rmcp::transport::DynamicTransportError {
+        rmcp::transport::DynamicTransportError::from_parts(
+            "test",
+            std::any::TypeId::of::<()>(),
+            Box::new(std::io::Error::other("boom")),
+        )
+    }
+
+    /// All eight `ServiceError` variants rmcp 3.1.0 declares, named one by
+    /// one, because the classifier's wildcard means the list is the only
+    /// record of what was classified on purpose. Also pins that the SDK's
+    /// wording crosses the boundary verbatim: `kind` is the contract,
+    /// `message` is what a human reads.
+    #[rustfmt::skip]
+    #[test]
+    fn every_rmcp_service_error_is_classified() {
+        use rmcp::model::ErrorData;
+        use rmcp::service::ServiceError as E;
+
+        use McpFailureKind as K;
+
+        for (source, expected) in [
+            (E::TransportSend(transport_error()), K::Transport),
+            (E::TransportClosed, K::Transport),
+            (E::McpError(ErrorData::internal_error("upstream said no", None)), K::Protocol),
+            (E::UnexpectedResponse, K::Protocol),
+            (E::InputRequiredRoundsExceeded { max_rounds: 3 }, K::Protocol),
+            (E::Timeout { timeout: Duration::from_secs(5) }, K::Timeout),
+            (E::Cancelled { reason: Some("the caller stopped".to_string()) }, K::Canceled),
+            (E::SubscriptionLagged { capacity: 16 }, K::Other),
+        ] {
+            let rendered = source.to_string();
+            let classified = session_error_from_rmcp(&source);
+            assert_eq!(classified.kind, expected, "classifying {rendered:?}");
+            assert_eq!(
+                classified.message, rendered,
+                "the SDK's own wording is what a human reads"
+            );
+        }
+    }
 
     #[test]
     fn resolve_mcp_env_overlay_wins_and_resolves_refs() {

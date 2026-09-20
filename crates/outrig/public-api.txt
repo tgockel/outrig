@@ -809,6 +809,12 @@ pub fn outrig::container::force_remove_detached(&str)
 pub fn outrig::container::install_panic_hook()
 pub fn outrig::container::sidecar_container_name(&str, &str) -> alloc::string::String
 pub mod outrig::error
+#[non_exhaustive] pub enum outrig::error::McpFailureKind
+pub outrig::error::McpFailureKind::Canceled
+pub outrig::error::McpFailureKind::Other
+pub outrig::error::McpFailureKind::Protocol
+pub outrig::error::McpFailureKind::Timeout
+pub outrig::error::McpFailureKind::Transport
 #[non_exhaustive] pub enum outrig::error::OutrigError
 pub outrig::error::OutrigError::ApiKey(outrig::config::ApiKeyError)
 #[non_exhaustive] pub outrig::error::OutrigError::BootstrapExhausted
@@ -840,12 +846,11 @@ pub outrig::error::OutrigError::McpArgsNotObject::kind: &'static str
 pub outrig::error::OutrigError::McpEnvResolveFailed::key: alloc::string::String
 pub outrig::error::OutrigError::McpEnvResolveFailed::name: alloc::string::String
 pub outrig::error::OutrigError::McpEnvResolveFailed::source: outrig::config::EnvValueError
-pub outrig::error::OutrigError::McpServerInitialize(alloc::boxed::Box<rmcp::service::server::ServerInitializeError>)
-pub outrig::error::OutrigError::McpService(rmcp::service::ServiceError)
+pub outrig::error::OutrigError::McpService(outrig::error::McpSessionError)
 pub outrig::error::OutrigError::McpStartupFailed(alloc::boxed::Box<outrig::error::McpStartupFailure>)
 #[non_exhaustive] pub outrig::error::OutrigError::McpToolsListFailed
 pub outrig::error::OutrigError::McpToolsListFailed::name: alloc::string::String
-pub outrig::error::OutrigError::McpToolsListFailed::source: alloc::boxed::Box<rmcp::service::ServiceError>
+pub outrig::error::OutrigError::McpToolsListFailed::source: outrig::error::McpSessionError
 pub outrig::error::OutrigError::NetworkAttachNotUndone(alloc::boxed::Box<outrig::error::NetworkAttachFailure>)
 #[non_exhaustive] pub outrig::error::OutrigError::NetworkAuditUnwritten
 pub outrig::error::OutrigError::NetworkAuditUnwritten::container: alloc::string::String
@@ -874,10 +879,11 @@ pub outrig::error::OutrigError::SidecarNotUnwound(alloc::boxed::Box<outrig::erro
 pub outrig::error::OutrigError::Spawn::command: alloc::string::String
 pub outrig::error::OutrigError::Spawn::program: &'static str
 pub outrig::error::OutrigError::Spawn::source: core::io::error::Error
-impl core::convert::From<rmcp::service::server::ServerInitializeError> for outrig::error::OutrigError
-pub fn outrig::error::OutrigError::from(rmcp::service::server::ServerInitializeError) -> Self
 impl core::convert::From<tempfile::file::PersistError> for outrig::error::OutrigError
 pub fn outrig::error::OutrigError::from(tempfile::file::PersistError) -> Self
+#[non_exhaustive] pub struct outrig::error::McpSessionError
+pub outrig::error::McpSessionError::kind: outrig::error::McpFailureKind
+pub outrig::error::McpSessionError::message: alloc::string::String
 #[non_exhaustive] pub struct outrig::error::McpStartupFailure
 pub outrig::error::McpStartupFailure::command: alloc::string::String
 pub outrig::error::McpStartupFailure::declaration_source: core::option::Option<alloc::string::String>
@@ -901,7 +907,7 @@ pub outrig::error::SidecarUnwindFailure::sidecar: alloc::string::String
 pub outrig::error::SidecarUnwindFailure::source: alloc::boxed::Box<outrig::error::OutrigError>
 impl outrig::error::SidecarUnwindFailure
 pub fn outrig::error::SidecarUnwindFailure::new(impl core::convert::Into<alloc::string::String>, outrig::error::OutrigError, alloc::vec::Vec<outrig::error::OutrigError>) -> Self
-pub trait outrig::error::IoPathExt<T>
+pub trait outrig::error::IoPathExt<T>: outrig::error::sealed::Sealed<T>
 pub fn outrig::error::IoPathExt::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
 impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, core::io::error::Error>
 pub fn core::result::Result<T, core::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>

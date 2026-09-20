@@ -1,0 +1,21 @@
+error[E0277]: the trait bound `Result<(), std::io::Error>: outrig::error::sealed::Sealed<Local>` is not satisfied
+  --> tests/ui/io_path_ext_seal_covers_the_type_argument.rs:12:42
+   |
+12 | impl outrig::error::IoPathExt<Local> for Result<(), std::io::Error> {
+   |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `outrig::error::sealed::Sealed<Local>` is not implemented for `Result<(), std::io::Error>`
+   |
+help: the trait `Sealed<Local>` is not implemented for `Result<(), std::io::Error>`
+      but trait `Sealed<()>` is implemented for it
+  --> src/error.rs
+   |
+   | impl<T> sealed::Sealed<T> for std::result::Result<T, std::io::Error> {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: for that trait implementation, expected `()`, found `Local`
+note: required by a bound in `IoPathExt`
+  --> src/error.rs
+   |
+   | pub trait IoPathExt<T>: sealed::Sealed<T> {
+   |                         ^^^^^^^^^^^^^^^^^ required by this bound in `IoPathExt`
+   = note: `IoPathExt` is a "sealed trait", because to implement it you also need to implement `outrig::error::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = help: the following type implements the trait:
+             std::result::Result<T, std::io::Error>

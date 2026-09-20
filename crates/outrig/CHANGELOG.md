@@ -363,6 +363,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads the repo's declared mode and nothing else, so the operator-owned policy is safe by
   construction rather than by a check that has to run. The signature stays infallible.
 
+- **Breaking: the MCP SDK's error types are off the public surface.** `OutrigError::McpService`
+  and `OutrigError::McpToolsListFailed::source` carried `rmcp::service::ServiceError`, so an SDK
+  major was a break on every fallible call in the crate -- `tools/list` and `tools/call` reach a
+  caller through `error::Result` like everything else does. Both now carry
+  `error::McpSessionError`: an `error::McpFailureKind` -- `Transport`, `Protocol`, `Timeout`,
+  `Canceled`, `Other` -- beside the SDK's own rendering, kept verbatim as `message`.
+
+  A caller that printed the error sees no change; the wording and the prefixes are what they
+  were. A caller that matched the SDK's enum branches on `kind` instead and gets a
+  classification that survives an SDK upgrade. The mapping needs a wildcard, because the SDK's
+  enum is `#[non_exhaustive]`, so a variant a future SDK adds reads as `Other` until the mapping
+  is revisited -- an obligation that now rides along with the one
+  `mcp_proxy::SUPPORTED_PROTOCOL_VERSIONS` already carries on every SDK bump.
+
+  This finishes the boundary the tool-result entry above states. The SDK remains on the surface
+  in exactly eleven places, every one of them under `mcp_proxy`: `ProxyServer`'s `ServerHandler`
+  impl, the two `RequestContext`-free halves of it, and `SUPPORTED_PROTOCOL_VERSIONS`. Each
+  exists to participate in the SDK's own machinery, and **an SDK major is an outrig major for
+  those -- and, now, for nothing else that this crate's signatures name.**
+
+  One opt-in coupling survives and is worth knowing about rather than discovering:
+  `McpStartupFailure::source` is a `Box<dyn Error + Send + Sync>` that in practice holds the
+  SDK's client-handshake error. Nothing in a signature says so, so an SDK major does not break a
+  build -- but a consumer who downcasts it is depending on the SDK's major, and gets a silent
+  `None` rather than an error when that moves. Reading it, or its rendering, costs nothing.
+
+- **Breaking: `error::IoPathExt` is sealed.** It is the internal helper that turns a
+  context-free `io::Error` into `OutrigError::Path`, and it has exactly one receiver,
+  `Result<T, io::Error>`. Nothing outside this crate plausibly implemented an IO-error context
+  helper, and sealing it means a second required method is an addition rather than a break.
+  Calling `path_ctx` is unaffected.
+
+### Removed
+
+- **Breaking: `OutrigError::McpServerInitialize`, and the `From<ServerInitializeError>` that
+  built it.** The library never produced either. An initialize failure happens while *serving*
+  MCP, and the library does not serve: a consumer driving `mcp_proxy::ProxyServer` calls the
+  SDK's `serve_server` itself and already holds the SDK's error. The variant existed so that
+  `outrig-cli`'s `?` would compile, and it has moved there, onto a type that is not published
+  surface. Nothing in this crate could return it, so no `match` on `OutrigError` loses an arm it
+  could reach.
+
 ### Fixed
 
 - **`LaunchSpec::from_config` now applies the `[network]` block it was handed.** It lowered

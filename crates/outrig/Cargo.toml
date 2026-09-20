@@ -14,14 +14,29 @@ repository.workspace    = true
 keywords.workspace      = true
 categories.workspace    = true
 # A generated record of the published API, for review; of no use to a consumer.
-exclude                 = ["public-api.txt"]
+# The test that reads it has to travel with it: it is ungated, so shipping the
+# test without its input turns `cargo test` in an unpacked or vendored package
+# into a missing-file panic. Excluding both keeps the check strict in the repo,
+# where a snapshot that has gone missing is exactly what it should catch.
+exclude                 = ["public-api.txt", "tests/public_api_boundary.rs"]
 
 [features]
 e2e = []
+# `tests/compile_fail.rs` only. trybuild builds its cases in a scratch project
+# with a target directory of its own, so running it compiles this crate's whole
+# dev dependency graph a second time -- ~2 GB, and `build.rs`'s musl launcher
+# again with it. Behind a feature so an ordinary `cargo test` does not pay that,
+# and so the CI matrix pays it on one row rather than three; the step is in
+# `.github/workflows/ci.yml`.
+seal-tests = []
 
 [[test]]
 name              = "library_surface"
 required-features = ["e2e"]
+
+[[test]]
+name              = "compile_fail"
+required-features = ["seal-tests"]
 
 [dependencies]
 anyhow             = { workspace = true, features = ["std"] }
@@ -49,8 +64,15 @@ tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "trac
 walkdir            = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json", "rustls"] }
+reqwest  = { workspace = true, features = ["json", "rustls"] }
 # `test-util` pauses the clock so the interceptor's sniff window can be driven
 # deterministically rather than slept through.
-tokio   = { workspace = true, features = ["test-util"] }
-toml    = { workspace = true, features = ["display", "parse", "serde"] }
+tokio    = { workspace = true, features = ["test-util"] }
+toml     = { workspace = true, features = ["display", "parse", "serde"] }
+# Behind the `seal-tests` feature above. It is the sole way to assert that an
+# out-of-crate `impl IoPathExt` is rejected *by the seal* and not by the orphan
+# rules, which a snapshot line cannot distinguish. Cargo builds every
+# dev-dependency whatever features are on -- optional ones are not allowed here
+# -- but trybuild's own graph is three small crates; the cost the feature gates
+# is the scratch build its cases trigger at run time.
+trybuild = { workspace = true }

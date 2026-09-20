@@ -123,11 +123,11 @@ pub enum OutrigError {
         source: std::io::Error,
     },
 
+    /// A request on a live MCP session failed. Carries outrig's own
+    /// [`McpSessionError`] rather than the MCP SDK's error type -- see that
+    /// type for why.
     #[error("mcp service: {0}")]
-    McpService(#[from] rmcp::service::ServiceError),
-
-    #[error("mcp server initialize: {0}")]
-    McpServerInitialize(#[source] Box<rmcp::service::ServerInitializeError>),
+    McpService(#[source] McpSessionError),
 
     #[error("mcp server {name:?} env key {key:?}: {source}")]
     #[non_exhaustive]
@@ -167,7 +167,7 @@ pub enum OutrigError {
     McpToolsListFailed {
         name: String,
         #[source]
-        source: Box<rmcp::service::ServiceError>,
+        source: McpSessionError,
     },
 
     #[error("mcp call_tool: arguments must be a JSON object or null, got {kind}")]
@@ -260,9 +260,67 @@ impl From<tempfile::PersistError> for OutrigError {
     }
 }
 
-impl From<rmcp::service::ServerInitializeError> for OutrigError {
-    fn from(e: rmcp::service::ServerInitializeError) -> Self {
-        OutrigError::McpServerInitialize(Box::new(e))
+/// What class of failure an [`McpSessionError`] reports.
+///
+/// Deliberately coarse. It exists so a caller can branch -- retry a timeout,
+/// stop reusing a session whose transport is gone -- without matching on the
+/// MCP SDK's own error enums, which would make an SDK upgrade a break for
+/// every consumer of this crate. The SDK's own wording is kept verbatim in
+/// [`McpSessionError::message`]; this is the part outrig commits to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpFailureKind {
+    /// The transport carrying the session failed or closed under it. Nothing
+    /// was learned about the request, and the session is finished.
+    Transport,
+    /// The peer answered, and the answer was either a protocol-level error or
+    /// a message the protocol does not allow at that point.
+    Protocol,
+    /// The request did not finish within its deadline.
+    Timeout,
+    /// The request was cancelled before it finished.
+    Canceled,
+    /// A failure this build does not classify. The SDK's error enums are
+    /// `#[non_exhaustive]`, so a kind added by an SDK upgrade reads as this
+    /// one until outrig learns it.
+    Other,
+}
+
+/// A failure the MCP session machinery reported, as outrig's own type.
+///
+/// The MCP SDK's error types are not on this crate's public surface. They are
+/// `#[non_exhaustive]` enums that reshape across major versions, and an error
+/// is something outrig reports in its own right rather than something handed
+/// back to the SDK -- so an SDK major would otherwise be an outrig major for
+/// every fallible call in the crate. What survives the boundary is the SDK's
+/// rendering, as `message`, and its shape, as [`kind`](Self::kind).
+///
+/// It has no `source` of its own: `message` already *is* the underlying
+/// rendering, so naming a cause beside it would print the same text twice in
+/// every rendered chain.
+#[derive(Debug, Error)]
+#[error("{message}")]
+#[non_exhaustive]
+pub struct McpSessionError {
+    /// What class of failure this is.
+    pub kind: McpFailureKind,
+    /// The SDK's rendering of what went wrong. Diagnostic text for a human to
+    /// read -- branch on `kind` rather than parsing this.
+    pub message: String,
+}
+
+impl McpSessionError {
+    /// Report an MCP session failure.
+    ///
+    /// `pub(crate)`, unlike [`SidecarUnwindFailure::new`]: nothing outside
+    /// this crate produces one of these, because nothing outside drives an
+    /// MCP session outrig owns. A consumer reads these errors rather than
+    /// building them, so a public constructor would be surface with no caller.
+    pub(crate) fn new(kind: McpFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 }
 
@@ -441,9 +499,31 @@ pub type Result<T> = std::result::Result<T, OutrigError>;
 ///
 /// `op` is a verb phrase that reads into the message: `"read"`, `"create"`,
 /// `"remove"` produce "failed to read `/etc/hosts`: ...".
-pub trait IoPathExt<T> {
+///
+/// Sealed: implementable only inside this crate. It is an internal IO-error
+/// context helper that callers *use* rather than back, and sealing means a
+/// second method here is an addition rather than a break.
+///
+/// Private supertrait bound: nothing outside this crate can name
+/// [`sealed::Sealed`], so nothing outside can implement this.
+///
+/// Generic over `T` rather than over `Self` alone, which is the difference
+/// between a seal and most of one. `Result<(), io::Error>` is a supported
+/// receiver, so a `Sealed` bound on `Self` is one it already satisfies --
+/// leaving `impl IoPathExt<Local> for Result<(), io::Error>` legal outside
+/// the crate. A local type as the trait's *argument* satisfies the orphan
+/// rule, and it cannot overlap the real impl below, which requires the
+/// argument to be the `Ok` type. `Sealed<T>` is implemented for exactly the
+/// pairing that impl uses, so the argument has to match too.
+mod sealed {
+    pub trait Sealed<T> {}
+}
+
+pub trait IoPathExt<T>: sealed::Sealed<T> {
     fn path_ctx(self, op: &'static str, path: impl Into<PathBuf>) -> Result<T>;
 }
+
+impl<T> sealed::Sealed<T> for std::result::Result<T, std::io::Error> {}
 
 impl<T> IoPathExt<T> for std::result::Result<T, std::io::Error> {
     fn path_ctx(self, op: &'static str, path: impl Into<PathBuf>) -> Result<T> {
@@ -563,6 +643,41 @@ mod tests {
                 "every cause has to be in the rendering, missing {named:?}: {rendered}"
             );
         }
+    }
+
+    /// The narrowed MCP errors keep the context outrig adds, keep the SDK's
+    /// own wording, and leave a caller a classification to branch on instead
+    /// of a string to parse. The chain stops at the session failure, because
+    /// its message already *is* the underlying rendering.
+    #[test]
+    fn a_narrowed_mcp_error_carries_a_classification_not_an_sdk_type() {
+        use std::error::Error;
+
+        let listed = OutrigError::McpToolsListFailed {
+            name: "fs".to_string(),
+            source: McpSessionError::new(McpFailureKind::Timeout, "request timeout after 5s"),
+        };
+        let rendered = listed.to_string();
+        assert!(rendered.contains(r#""fs""#), "{rendered}");
+        assert!(rendered.contains("request timeout after 5s"), "{rendered}");
+
+        let source = listed
+            .source()
+            .unwrap_or_else(|| panic!("a tools/list failure has a cause: {listed}"));
+        let session = source
+            .downcast_ref::<McpSessionError>()
+            .unwrap_or_else(|| panic!("and the cause is the classified failure: {source}"));
+        assert_eq!(session.kind, McpFailureKind::Timeout);
+        assert!(
+            session.source().is_none(),
+            "nothing below it, or the same text renders twice: {session}"
+        );
+
+        let called = OutrigError::McpService(McpSessionError::new(
+            McpFailureKind::Transport,
+            "Transport closed",
+        ));
+        assert_eq!(called.to_string(), "mcp service: Transport closed");
     }
 
     fn spawn_err(kind: ErrorKind) -> OutrigError {

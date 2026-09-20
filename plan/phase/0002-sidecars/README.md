@@ -58,7 +58,7 @@ and 0.2.0 ships with a migration guide for anyone on 0.1.
 ## Tasks
 
 Numbered `0002-01` onward, with no gaps. Finished tasks are in
-`plan/done/phase/0002-sidecars/tasks/`; `0002-41` through `0002-54` are queued in
+`plan/done/phase/0002-sidecars/tasks/`; `0002-48` through `0002-54` are queued in
 `plan/todo/`, and `plan/todo/README.md` carries the per-step index and the sequencing
 rationale.
 

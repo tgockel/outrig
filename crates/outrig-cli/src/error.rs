@@ -24,6 +24,20 @@ pub enum CliError {
     #[error("{0}")]
     LlmResolve(#[from] LlmResolveError),
 
+    /// The MCP `initialize` handshake failed while *serving* -- `outrig mcp`
+    /// and `outrig mcp self` are the only two callers, and both are in this
+    /// crate.
+    ///
+    /// It lives here rather than on `OutrigError` because the library never
+    /// serves: a consumer driving `mcp_proxy::ProxyServer` calls the SDK's
+    /// `serve_server` itself and handles the SDK's error itself. `CliError` is
+    /// not published -- `outrig-cli` exports only `run()` -- so keeping the
+    /// SDK's type is free here and would not have been there. Boxed because
+    /// the variant otherwise dominates `CliError`'s size, which is what
+    /// `clippy::result_large_err` watches.
+    #[error("mcp server initialize: {0}")]
+    McpServerInitialize(#[source] Box<rmcp::service::ServerInitializeError>),
+
     #[error("agent prompt failed: {0}")]
     Prompt(rig::completion::PromptError),
 
@@ -72,7 +86,7 @@ impl From<std::io::Error> for CliError {
 
 impl From<rmcp::service::ServerInitializeError> for CliError {
     fn from(e: rmcp::service::ServerInitializeError) -> Self {
-        CliError::Outrig(OutrigError::from(e))
+        CliError::McpServerInitialize(Box::new(e))
     }
 }
 

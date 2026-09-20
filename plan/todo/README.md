@@ -22,18 +22,12 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-47` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-48` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
-public-surface changes (`0002-41` through `0002-46` landed) that have to happen before the
+public-surface changes (`0002-41` through `0002-47` landed) that have to happen before the
 freeze, then release engineering. Each task carries its own evidence; the report is not in the tree.
-
-**Public surface, before the freeze**
-
-| Task      | What it settles                                                     |
-| --------- | ------------------------------------------------------------------- |
-| `0002-47` | Narrow or explicitly freeze the rmcp-coupled and low-level surfaces |
 
 **Release engineering**
 
@@ -49,12 +43,12 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
-- `0002-43` recorded where rmcp stops being an implementation detail -- an rmcp type is public
-  only where the item exists to participate in rmcp's own machinery -- and `0002-47` applies that
-  answer to the surfaces `0002-43` did not touch. It lands `ProxyServer`'s trait impl and
-  `SUPPORTED_PROTOCOL_VERSIONS` on "frozen" and the three `OutrigError` variants on "narrow", so
-  `0002-47` inherits a verdict rather than a principle. See its `## Decisions`, in
-  `plan/done/phase/0002-sidecars/tasks/`.
+- `0002-43` and `0002-47` between them settled where rmcp stops being an implementation detail:
+  an rmcp type is public only where the item exists to participate in rmcp's own machinery. What
+  survives is eleven lines under `outrig::mcp_proxy` and nothing else -- the fact `0002-49`'s
+  migration guide has to carry, and the invariant `crates/outrig/tests/public_api_boundary.rs`
+  now holds. `0002-47` also froze `container::enter`'s two functions and sealed `IoPathExt`.
+  Both `## Decisions` sections are in `plan/done/phase/0002-sidecars/tasks/`.
 - `0002-46` resolved `0002-42`'s fork 3, which had deferred it: `Model` gains no `ConfigSource`,
   and a relative `[models.<n>].model-path` stays repo-root-relative -- now for the load as well as
   the existence check. It is the one documented exception to the declaring-file rule.

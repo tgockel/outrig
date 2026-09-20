@@ -50,3 +50,11 @@ Two things worth doing:
 that both servers meet that revision's requirements. The regression test in
 `crates/outrig-cli/tests/mcp_self.rs` speaks raw JSON-RPC precisely because a typed rmcp client
 deserializes the fields into `Option` and cannot see them missing.
+
+`session_error_from_rmcp` (`crates/outrig/src/mcp.rs`) needs the same review, and for the same
+kind of reason. 0002-47 narrowed `OutrigError`'s rmcp payloads to an outrig-owned
+`McpSessionError`, which classifies `rmcp::service::ServiceError` into an `McpFailureKind`.
+`ServiceError` is `#[non_exhaustive]`, so the mapping carries a wildcard: a variant a later rmcp
+adds classifies as `Other` and compiles silently. `every_rmcp_service_error_is_classified` names
+all eight variants rmcp 3.1.0 declares, so the list of what was classified deliberately is in the
+tree -- but nothing fails when a ninth appears. Check both on the same upgrade.

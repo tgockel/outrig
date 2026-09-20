@@ -106,6 +106,14 @@ jobs:
             crates/outrig/src/container/enter/launcher.rs
           file -b "$RUNNER_TEMP/outrig-enter-aarch64" | grep -q 'ARM aarch64'
       - run: cargo test ${{ matrix.cargo_args }} ${{ matrix.test_args }}
+      # `outrig`'s seal test, gated out of the line above on purpose: trybuild
+      # compiles the crate's dev dependency graph again in a scratch target
+      # directory of its own, which no row shares with any other. One row pays
+      # it. The arm64 row would prove nothing extra -- the seal is a property of
+      # the type system, not of the target -- and the e2e row runs `--no-run`,
+      # under which trybuild never executes at all.
+      - if: matrix.name == 'default'
+        run: cargo test -p outrig --features seal-tests --test compile_fail
 
   doc-style:
     name: doc-style
