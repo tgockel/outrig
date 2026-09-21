@@ -23,6 +23,28 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## Public-API snapshots
+
+`crates/outrig/public-api.txt` and `crates/outrig-cli/public-api.txt` are generated records of
+each crate's published surface, and CI fails when either has drifted from the code:
+
+```sh
+python3 scripts/check-public-api.py --install-missing
+```
+
+It needs **Python 3.11 or newer** (it reads the pins with `tomllib`), which is newer than
+`scripts/audit-doc-style.py` asks for -- on Ubuntu 22.04 reach for a `python3.11` rather than
+the default `python3`. It is kept out of the block above because the first run installs a
+pinned nightly and a pinned `cargo-public-api` into a cache directory, which takes a few
+minutes; without `--install-missing` the script reports what is absent instead of downloading
+anything. Both
+pins live in `[workspace.metadata.public-api]` in the root `Cargo.toml`, and the exit code
+separates the two ways this fails -- 1 when the surface differs, 2 when the tooling does.
+
+The check does not forbid changing the API. After an intentional surface change, regenerate
+with `python3 scripts/check-public-api.py --write` and let the regenerated snapshot travel in
+the same commit: that diff is the review material.
+
 ## End-to-end tests
 
 Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. CI compiles

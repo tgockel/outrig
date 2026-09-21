@@ -14,6 +14,49 @@ repository    = "https://github.com/tgockel/outrig"
 keywords      = ["llm", "agent", "mcp", "podman", "sandbox"]
 categories    = ["command-line-utilities", "development-tools"]
 
+# Pins for the generated `crates/*/public-api.txt` surface snapshots.
+# `scripts/check-public-api.py` and the `public-api` CI job read this table; nothing else does.
+# Cargo ignores `[workspace.metadata]` and it never reaches a published manifest.
+#
+# `tool-version` is not a pin on its own, which is the trap this table exists to close.
+# `cargo-public-api 0.52.0` depends on `public-api ^0.52.0`; that crate's 0.52.0 and 0.52.1 want
+# `rustdoc-types ^0.57.3` while its 0.52.2 wants `^0.59.0`. A `rustdoc-types` major *is* rustdoc
+# JSON's `format_version`, and 57 and 59 are disjoint -- so locked and unlocked installs of one
+# `cargo-public-api` version accept non-overlapping sets of nightlies while reporting the same
+# `--version`. Hence `locked`; and hence `toolchain` and `tool-version` are one decision rather
+# than two. Locked 0.52.0 speaks format 57, which nightly emitted from 2025-11-22
+# (`rustdoc-types` 0.57.0) until 2026-06-24 (0.58.0). Moving either pin usually moves both.
+#
+# `toolchain-rustc` is the identity check, and it is load-bearing: `cargo-public-api` selects
+# rustdoc through `RUSTUP_TOOLCHAIN` and otherwise falls back to whatever the `nightly` alias
+# happens to point at, so a pin that is only named fails open. The script asserts this exact
+# string before generating anything.
+#
+# There is deliberately no target triple. `crates/outrig/src/lib.rs` refuses to compile off
+# Linux and no public item is gated on `target_arch`, so pinning a triple would buy nothing and
+# would cross-build the whole graph on the aarch64 runner. `host-os` is asserted instead.
+#
+# `plan/next/pin-book-toolchain.md` wants the same treatment for the mdbook and lychee versions
+# that CI and the dogfood image pin separately. A `[workspace.metadata.book]` table beside this
+# one is the obvious shape but not the whole answer: that entry's consumers are a workflow
+# `env:` block and a Dockerfile `RUN`, neither of which can read TOML. It needs a way to print
+# a pin as well as a place to keep one, and nothing here anticipates that -- this table has
+# exactly one reader, and building a second mechanism for it would be the speculative kind.
+[workspace.metadata.public-api]
+tool                = "cargo-public-api"
+tool-version        = "0.52.0"
+locked              = true
+toolchain           = "nightly-2026-05-06"
+toolchain-rustc     = "rustc 1.97.0-nightly (e95e73209 2026-05-05)"
+host-os             = "linux"
+omit                = ["blanket-impls", "auto-trait-impls", "auto-derived-impls"]
+features            = []
+no-default-features = false
+crates = [
+    { package = "outrig",     snapshot = "crates/outrig/public-api.txt" },
+    { package = "outrig-cli", snapshot = "crates/outrig-cli/public-api.txt" },
+]
+
 [workspace.dependencies]
 anyhow             = { version = "1.0.104", default-features = false }
 async-stream       = { version = "0.3.6",   default-features = false }

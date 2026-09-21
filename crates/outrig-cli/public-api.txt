@@ -1,10 +1,9 @@
-# Public API surface of `outrig-cli`, as reported by cargo-public-api 0.52.0:
+# Public API surface of `outrig-cli` -- generated, do not edit.
 #
-#     cargo public-api -p outrig-cli --omit blanket-impls,auto-trait-impls,auto-derived-impls
-#
-# Regenerate after any intentional surface change and review the diff. The tool's
-# output format shifts between releases, so a diff with no source change means the
-# pinned version above moved.
-
+# Regenerate with `python3 scripts/check-public-api.py --write`. The pinned nightly, the pinned
+# `cargo-public-api` version, and the flags it is invoked with all live in
+# `[workspace.metadata.public-api]` in the root `Cargo.toml`; this file deliberately repeats
+# none of them, because a version recorded in two places is a version that drifts. CI runs this
+# same script, so a surface change that skips the regeneration fails there.
 pub mod outrig_cli
 pub fn outrig_cli::run() -> std::process::ExitCode

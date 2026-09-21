@@ -6,17 +6,25 @@
 //! has a mechanical form -- every `rmcp::` in the snapshot is under
 //! `outrig::mcp_proxy`, and nowhere else.
 //!
-//! This is not the snapshot gate `0002-48` adds, and the two are not
-//! symmetric. That one says "the file is current"; this one says "the file
-//! obeys the boundary", and the second is only worth what the first is:
-//! nothing verifies the snapshot's currency yet, so a surface change that is
-//! never regenerated leaves this green. What it does catch, which a byte-exact
-//! diff does not, is a *deliberate* regeneration that carries an SDK type back
-//! into `outrig::error` -- the diff would accept it as the new truth.
+//! This is not the snapshot gate in `scripts/check-public-api.py`, and the two
+//! are not symmetric. That one says "the file is current"; this one says "the
+//! file obeys the boundary". The second used to be worth only what the first
+//! was, because nothing verified the snapshot's currency and a surface change
+//! that was never regenerated left this green. This repo's CI now regenerates
+//! and fails on any difference, so here the committed file is fresh data. In a
+//! vendored or unpacked copy it is only as fresh as the release it shipped
+//! with, which is the right thing for it to be and is why both it and this
+//! test are `exclude`d from the package.
 //!
-//! It reads the committed file, so it needs neither nightly nor
-//! `cargo-public-api`. `0002-48` should fold the assertion into whatever it
-//! generates, at which point this becomes the same check against fresh data.
+//! What it catches that a byte-exact diff does not is a *deliberate*
+//! regeneration carrying an SDK type back into `outrig::error` -- the diff
+//! would accept that as the new truth.
+//!
+//! The rule stays here rather than moving into the generator. Reading the
+//! committed file costs neither nightly nor `cargo-public-api`, so it runs on
+//! every `cargo test` rather than only where the pinned toolchain is
+//! available; restating it in Python would create the second copy it exists to
+//! prevent.
 
 use std::path::Path;
 

@@ -30,6 +30,16 @@ Worth deciding at the same time whether CI and the image should share one source
 versions rather than repeating them -- a small script, or a `[workspace.metadata]` block the
 Dockerfile and workflow both read.
 
+0002-48 established the table half: `[workspace.metadata.public-api]` in the root `Cargo.toml`,
+read by `scripts/check-public-api.py`. A `[workspace.metadata.book]` beside it is the obvious
+shape, but it is only half the answer here, and the harder half is the one left: this entry's
+three consumers are `.github/workflows/docs.yml`'s `env:` block, `ci.yml`'s `cargo install`
+line, and a Dockerfile `RUN`. None can read TOML, and the Dockerfile cannot see the root
+manifest at all from its build context. So this needs a way to *print* a pin -- a
+`scripts/pins.py <key>`, or a `--print-pin` on an existing script, feeding `$GITHUB_ENV` and a
+`--build-arg` -- before a shared table buys anything. 0002-48 deliberately built no such reader:
+it had one consumer, and speculative generality is how the second copy gets written.
+
 This is the same class as the unpinned `npm install`/`pip install` layer 0002-27 removed from this
 image, and the reason is the same: a rebuild months from now should produce the image the
 Dockerfile describes.

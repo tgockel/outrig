@@ -1,8 +1,9 @@
 # A surface test for the runtime-core API
 
 > **A recorded 0.2.0 release exception, not an oversight.** Gate item 17 asked for API-snapshot
-> enforcement *and* this test; `plan/todo/0002-48-enforce-the-public-api-snapshot.md` delivers the
-> first and formally defers this one, with the reasoning in its `## Decisions`. 0.2.0's release
+> enforcement *and* this test;
+> `plan/done/phase/0002-sidecars/tasks/0002-48-enforce-the-public-api-snapshot.md` delivered the
+> first and formally deferred this one, with the reasoning in its `## Decisions`. 0.2.0's release
 > notes therefore record item 17 as partially met. A snapshot proves the runtime-core shape did
 > not move; this proves the shape is still usable from outside, and nothing else does. First
 > thing to queue after 0.2.0 ships.

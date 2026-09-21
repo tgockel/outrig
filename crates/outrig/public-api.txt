@@ -1,10 +1,10 @@
-# Public API surface of `outrig`, as reported by cargo-public-api 0.52.0:
+# Public API surface of `outrig` -- generated, do not edit.
 #
-#     cargo public-api -p outrig --omit blanket-impls,auto-trait-impls,auto-derived-impls
-#
-# Regenerate after any intentional surface change and review the diff. The tool's
-# output format shifts between releases, so a diff with no source change means the
-# pinned version above moved.
+# Regenerate with `python3 scripts/check-public-api.py --write`. The pinned nightly, the pinned
+# `cargo-public-api` version, and the flags it is invoked with all live in
+# `[workspace.metadata.public-api]` in the root `Cargo.toml`; this file deliberately repeats
+# none of them, because a version recorded in two places is a version that drifts. CI runs this
+# same script, so a surface change that skips the regeneration fails there.
 pub mod outrig
 pub mod outrig::config
 #[non_exhaustive] pub enum outrig::config::ApiKeyError
@@ -821,7 +821,7 @@ pub outrig::error::OutrigError::ApiKey(outrig::config::ApiKeyError)
 pub outrig::error::OutrigError::BootstrapExhausted::kind: &'static str
 #[non_exhaustive] pub outrig::error::OutrigError::BootstrapNamespace
 pub outrig::error::OutrigError::BootstrapNamespace::container: alloc::string::String
-pub outrig::error::OutrigError::BootstrapNamespace::source: core::io::error::Error
+pub outrig::error::OutrigError::BootstrapNamespace::source: std::io::error::Error
 pub outrig::error::OutrigError::BootstrapNamespace::step: alloc::string::String
 #[non_exhaustive] pub outrig::error::OutrigError::BuildArgResolveFailed
 pub outrig::error::OutrigError::BuildArgResolveFailed::image: alloc::string::String
@@ -839,7 +839,7 @@ pub outrig::error::OutrigError::Configuration(alloc::string::String)
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::image: alloc::string::String
 pub outrig::error::OutrigError::EmbeddedImageConfigParse::source: alloc::boxed::Box<outrig::container::embedded::EmbeddedImageConfigError>
 pub outrig::error::OutrigError::FilesystemHelperUnavailable
-pub outrig::error::OutrigError::Io(core::io::error::Error)
+pub outrig::error::OutrigError::Io(std::io::error::Error)
 #[non_exhaustive] pub outrig::error::OutrigError::McpArgsNotObject
 pub outrig::error::OutrigError::McpArgsNotObject::kind: &'static str
 #[non_exhaustive] pub outrig::error::OutrigError::McpEnvResolveFailed
@@ -868,7 +868,7 @@ pub outrig::error::OutrigError::NoRepoConfig
 #[non_exhaustive] pub outrig::error::OutrigError::Path
 pub outrig::error::OutrigError::Path::op: &'static str
 pub outrig::error::OutrigError::Path::path: std::path::PathBuf
-pub outrig::error::OutrigError::Path::source: core::io::error::Error
+pub outrig::error::OutrigError::Path::source: std::io::error::Error
 #[non_exhaustive] pub outrig::error::OutrigError::Process
 pub outrig::error::OutrigError::Process::argv: alloc::vec::Vec<std::ffi::os_str::OsString>
 pub outrig::error::OutrigError::Process::exit_code: core::option::Option<i32>
@@ -878,7 +878,7 @@ pub outrig::error::OutrigError::SidecarNotUnwound(alloc::boxed::Box<outrig::erro
 #[non_exhaustive] pub outrig::error::OutrigError::Spawn
 pub outrig::error::OutrigError::Spawn::command: alloc::string::String
 pub outrig::error::OutrigError::Spawn::program: &'static str
-pub outrig::error::OutrigError::Spawn::source: core::io::error::Error
+pub outrig::error::OutrigError::Spawn::source: std::io::error::Error
 impl core::convert::From<tempfile::file::PersistError> for outrig::error::OutrigError
 pub fn outrig::error::OutrigError::from(tempfile::file::PersistError) -> Self
 #[non_exhaustive] pub struct outrig::error::McpSessionError
@@ -909,8 +909,8 @@ impl outrig::error::SidecarUnwindFailure
 pub fn outrig::error::SidecarUnwindFailure::new(impl core::convert::Into<alloc::string::String>, outrig::error::OutrigError, alloc::vec::Vec<outrig::error::OutrigError>) -> Self
 pub trait outrig::error::IoPathExt<T>: outrig::error::sealed::Sealed<T>
 pub fn outrig::error::IoPathExt::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
-impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, core::io::error::Error>
-pub fn core::result::Result<T, core::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
+impl<T> outrig::error::IoPathExt<T> for core::result::Result<T, std::io::error::Error>
+pub fn core::result::Result<T, std::io::error::Error>::path_ctx(self, &'static str, impl core::convert::Into<std::path::PathBuf>) -> outrig::error::Result<T>
 pub fn outrig::error::superseded_by_a_confirmed_stop(outrig::error::OutrigError, &str) -> outrig::error::OutrigError
 pub type outrig::error::Result<T> = core::result::Result<T, outrig::error::OutrigError>
 pub mod outrig::image
@@ -1270,7 +1270,7 @@ pub outrig::ToolHandle::title: core::option::Option<alloc::string::String>
 pub struct outrig::Transcript
 impl outrig::Transcript
 pub async fn outrig::Transcript::create(&std::path::Path, bool) -> outrig::error::Result<Self>
-pub async fn outrig::Transcript::line(&self, &'static str, &str) -> core::io::error::Result<()>
+pub async fn outrig::Transcript::line(&self, &'static str, &str) -> std::io::error::Result<()>
 #[non_exhaustive] pub struct outrig::WorkspaceSpec
 pub outrig::WorkspaceSpec::container: std::path::PathBuf
 pub outrig::WorkspaceSpec::host: std::path::PathBuf

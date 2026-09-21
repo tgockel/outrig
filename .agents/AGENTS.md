@@ -29,7 +29,8 @@ the environment the agent gets to play in, leaving the agents free to work quick
 - `crates/*/tests/` -- integration tests. The e2e ones need a real podman and are gated
   behind each crate's `e2e` feature (`--features outrig/e2e,outrig-cli/e2e`); CI compiles
   them without running them.
-- `scripts/` -- repo-local tooling (doc-style audit, mdbook assets).
+- `scripts/` -- repo-local tooling (doc-style audit, public-API snapshot gate, mdbook
+  assets).
 - `book.toml` -- mdbook config; output goes to `target/book/`.
 
 ## Conventions for `doc/`

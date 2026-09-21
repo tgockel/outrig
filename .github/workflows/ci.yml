@@ -115,6 +115,64 @@ jobs:
       - if: matrix.name == 'default'
         run: cargo test -p outrig --features seal-tests --test compile_fail
 
+  public-api:
+    name: public-api
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `cargo install` below needs a compiler, and `Swatinem/rust-cache` needs a `rustc -vV`
+      # to key on. Stable deliberately: this row installs the *tool*, while the pinned nightly
+      # the tool reads rustdoc with is installed by the script, from the manifest.
+      - uses: dtolnay/rust-toolchain@stable
+      # Caches `target/public-api`, where the script points `cargo rustdoc`. It is a separate
+      # tree from the `cargo` job's `target/debug` because that one belongs to stable and this
+      # one to a pinned nightly; sharing it would buy a full rebuild in both directions.
+      #
+      # `workspaces` has to name that tree. The script sets `CARGO_TARGET_DIR` on the child it
+      # spawns, not on this job, so the default `. -> target` would key and prune the wrong
+      # directory and the nightly's artifacts would be rebuilt every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-public-api
+          workspaces: ". -> target/public-api"
+          # The action keys on the *default* toolchain's `rustc -vV` -- which is the stable
+          # installed above, while everything in this tree is built by the pinned nightly --
+          # and on the member manifests and lockfile, none of which is the virtual root
+          # `Cargo.toml` the pins live in. So a nightly bump alone would leave the key
+          # unchanged: the job would restore the old compiler's artifacts, rebuild them, and
+          # then skip saving because the lookup was an exact hit, every run until something
+          # else moved. Hashing the root manifest in gives a pin bump a cache to populate.
+          key: ${{ hashFiles('Cargo.toml') }}
+      # `cargo-public-api` installs into a version-stamped directory under `~/.cache`, neither
+      # `~/.cargo/bin` nor `target/`. Not `~/.cargo/bin`, because the same script runs on a
+      # developer's machine, where replacing a global install is not ours to do. Not `target/`,
+      # because `Swatinem/rust-cache` deletes loose files anywhere under the target directory
+      # before saving, so the binary would be recompiled on every single run. Bumping the pin
+      # renames the directory, so an older restored cache simply misses.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/outrig/public-api-tools
+          key: v0-public-api-tool-${{ hashFiles('Cargo.toml') }}
+          restore-keys: v0-public-api-tool-
+      # The pinned nightly and the pinned `cargo-public-api` live in
+      # `[workspace.metadata.public-api]` in the root `Cargo.toml` and are deliberately not
+      # repeated here. A version in this file and a version in that table is the
+      # two-places-to-look problem that left the committed snapshots carrying `core::io`
+      # renderings from an unrecorded nightly, indistinguishable from real surface moves.
+      #
+      # `--install-missing` is the only difference from what a developer runs. It is off by
+      # default so the script never downloads a toolchain and spends minutes compiling a tool
+      # unasked; a runner is disposable, so it asks.
+      #
+      # No musl targets and no `OUTRIG_REQUIRE_ENTER`, unlike the `cargo` job: the embedded
+      # `outrig-enter` launcher is a build artifact, not part of either crate's public surface.
+      - run: python3 scripts/check-public-api.py --install-missing
+      # Needs neither the toolchain nor the tool: it mutates the committed snapshot in memory,
+      # one `pub fn` removed and one added, and checks that the comparison rejects both and
+      # names what moved. Last, so a clean diff above is never the only evidence that the
+      # comparison is capable of failing at all.
+      - run: python3 scripts/check-public-api.py --self-test
+
   doc-style:
     name: doc-style
     runs-on: ubuntu-latest

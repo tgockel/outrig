@@ -22,7 +22,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-48` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-49` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
@@ -33,7 +33,6 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 | Task      | What it settles                                                   |
 | --------- | ----------------------------------------------------------------- |
-| `0002-48` | The public-API snapshots are gated, not trusted                   |
 | `0002-49` | Documentation contracts, and a drafted 0.1 -> 0.2 migration guide |
 | `0002-50` | A cancelled build owns the working containers buildah made for it |
 | `0002-51` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read |
@@ -52,11 +51,12 @@ Cross-cutting notes the individual tasks carry rather than this file:
 - `0002-46` resolved `0002-42`'s fork 3, which had deferred it: `Model` gains no `ConfigSource`,
   and a relative `[models.<n>].model-path` stays repo-root-relative -- now for the load as well as
   the existence check. It is the one documented exception to the declaring-file rule.
-- `0002-48` regenerates both `public-api.txt` files, so it wants to follow `0002-45` through
-  `0002-47`. `0002-44` left the surface untouched -- its seams are `pub(crate)` -- so nothing it
-  did reaches the snapshot. The `std::io::error` -> `core::io::error` compiler drift that `0002-41` left out of
-  its hand-edited snapshot is absorbed: `0002-43` regenerated `outrig`'s with the tool rather than
-  by hand. `outrig-cli`'s is untouched and may still carry it.
+- `0002-48` landed the gate: `scripts/check-public-api.py`, the pins in
+  `[workspace.metadata.public-api]`, and a `public-api` CI job. Regenerating under that pin moved
+  no item, so `0002-41` through `0002-47` had each regenerated correctly and the whole diff was
+  the `std::io::error` / `core::io::error` compiler drift plus a generated header on both files.
+  The drift is now settled by the pin rather than tracked, and `0002-51` and `0002-54` can treat
+  the snapshots as current.
 - `0002-49` writes only what is false *now*; `0002-54` writes the version-bearing docs, because
   those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
 - `0002-52` records the soak parameters before rc.3 ships; `0002-54` checks that record rather than
@@ -81,8 +81,8 @@ tasks is an invariant this file holds.
 ## Not queued, deliberately
 
 Regenerating `crates/outrig/public-api.txt` is each task's own deliverable rather than a task
-of its own; a queued step would only be a second place to forget it. `0002-48` adds the enforcement
-that catches a task which forgets anyway.
+of its own; a queued step would only be a second place to forget it. `0002-48` added the
+enforcement that catches a task which forgets anyway.
 
 The audit's gate item 8 -- "add deterministic regressions for every item above" -- is likewise
 not a task. It is each task's own `## Acceptance`, for the same reason.
