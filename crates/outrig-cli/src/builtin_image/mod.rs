@@ -49,14 +49,17 @@ pub(crate) fn is_reserved(name: &str) -> bool {
     RESERVED_IMAGES.contains(&name)
 }
 
-/// The banner marker for an image-config that came from the built-in default.
-/// Shared by `run` and `mcp` so the two banners cannot word it differently.
-pub(crate) fn banner_suffix(builtin_default: bool) -> &'static str {
-    if builtin_default {
+/// The banner's image-config row, marked when the name came from the built-in
+/// default. Whole row rather than just the marker, because `run` and `mcp`
+/// held the label as a literal each and only shared the suffix -- which left
+/// the half most likely to drift unshared.
+pub(crate) fn banner_image_config_row(container_name: &str, builtin_default: bool) -> String {
+    let origin = if builtin_default {
         " (built-in default)"
     } else {
         ""
-    }
+    };
+    format!("[outrig] image-config:  {container_name}{origin}")
 }
 
 /// The outcome of [`inject`]. Notes are *held* rather than printed: a repo
@@ -240,6 +243,23 @@ mod tests {
 
     use outrig::config::SidecarConfig;
     use tempfile::TempDir;
+
+    /// The row both banners print, so the wording is pinned once rather than
+    /// in each of `run`'s and `mcp`'s tests. The marker is the only thing
+    /// separating a session that fell through to the built-in from one whose
+    /// config named `outrig-default` itself, which is what `doc/usage/run.md`
+    /// and `doc/usage/mcp.md` tell a reader to look for.
+    #[test]
+    fn the_image_config_row_marks_only_what_outrig_supplied() {
+        assert_eq!(
+            banner_image_config_row("outrig-default", true),
+            "[outrig] image-config:  outrig-default (built-in default)"
+        );
+        assert_eq!(
+            banner_image_config_row("rust-dev", false),
+            "[outrig] image-config:  rust-dev"
+        );
+    }
 
     /// A materialized build context, so the shape referencing it validates.
     fn shell_context() -> TempDir {
@@ -445,6 +465,58 @@ mod tests {
                 "{name}: named in the note"
             );
         }
+    }
+
+    /// What a veto leaves behind, which `doc/usage/mcp.md` and
+    /// `doc/reference/cli.md` state: an `[images.outrig-default]` of the
+    /// user's own still resolves, so the session runs on it, while the other
+    /// four reserved names leave nothing to fall through to and startup ends.
+    /// The docs claimed for three releases that only a sidecar block could
+    /// veto at all.
+    #[test]
+    fn a_veto_leaves_only_a_users_own_default_image_resolvable() {
+        let mut cfg = Config::default();
+        cfg.images.insert(
+            DEFAULT_IMAGE.to_string(),
+            ImageConfig::from_image_name("mine:1"),
+        );
+        let injection = inject(&mut cfg);
+        assert!(!injection.applied);
+        assert_eq!(
+            injection.resolved,
+            Some(DEFAULT_IMAGE),
+            "a user's own [images.{DEFAULT_IMAGE}] is still usable"
+        );
+
+        for name in RESERVED_SIDECARS {
+            let mut cfg = Config::default();
+            cfg.images
+                .insert(name.to_string(), ImageConfig::from_image_name("mine:1"));
+            assert_eq!(inject(&mut cfg).resolved, None, "[images.{name}]");
+
+            let mut cfg = Config::default();
+            cfg.sidecars
+                .insert(name.to_string(), SidecarConfig::new("mine:1"));
+            assert_eq!(inject(&mut cfg).resolved, None, "[sidecars.{name}]");
+        }
+    }
+
+    /// `[sidecars.outrig-default]` is deliberately *not* reserved: the
+    /// built-in declares no sidecar by that name, so a user's cannot clash
+    /// with it and there is nothing to step aside for.
+    #[test]
+    fn a_sidecar_named_for_the_default_image_is_not_a_veto() {
+        let mut cfg = Config::default();
+        cfg.sidecars
+            .insert(DEFAULT_IMAGE.to_string(), SidecarConfig::new("mine:1"));
+
+        let injection = inject(&mut cfg);
+
+        assert!(
+            injection.applied,
+            "`[sidecars.{DEFAULT_IMAGE}]` is not a reserved name"
+        );
+        assert_eq!(injection.resolved, Some(DEFAULT_IMAGE));
     }
 
     #[test]

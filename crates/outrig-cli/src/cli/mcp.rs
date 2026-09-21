@@ -789,12 +789,18 @@ struct StartupBanner<'a> {
 }
 
 fn print_banner(banner: StartupBanner<'_>) {
+    eprint!("{}", render_banner(banner));
+}
+
+/// Split from `print_banner` for the same reason as `run`'s: the built-in
+/// default marker is a claim `doc/usage/mcp.md` makes, and a banner that only
+/// reaches stderr cannot be asserted on.
+fn render_banner(banner: StartupBanner<'_>) -> String {
     let mut buf = String::new();
-    let origin = crate::builtin_image::banner_suffix(banner.builtin_default);
     let _ = writeln!(
         buf,
-        "[outrig] image-config:  {}{origin}",
-        banner.container_name
+        "{}",
+        crate::builtin_image::banner_image_config_row(banner.container_name, banner.builtin_default)
     );
     let _ = writeln!(buf, "[outrig] image:             {}", banner.image_tag);
     let container_action = if banner.attached {
@@ -820,12 +826,45 @@ fn print_banner(banner: StartupBanner<'_>) {
     let _ = writeln!(buf, "[outrig] tools available: {names_joined}");
     let _ = writeln!(buf, "[outrig] session id: {}", banner.session_id);
     let _ = writeln!(buf, "[outrig] transport: {}", banner.transport);
-    eprint!("{buf}");
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_test_banner(container_name: &str, builtin_default: bool) -> String {
+        let image_tag = ImageTag::new("outrig/session:abc123");
+        render_banner(StartupBanner {
+            container_name,
+            builtin_default,
+            image_tag: &image_tag,
+            container_pod_name: "outrig-session-abc123",
+            per_server_counts: &[("fs".to_string(), 3)],
+            public_names: &["fs__read_file".to_string()],
+            session_id: "20260921T101112-abc1",
+            attached: false,
+            transport: "stdio",
+        })
+    }
+
+    /// `doc/usage/mcp.md` promises that `outrig mcp` with no image named falls
+    /// through to the built-in default rather than failing, and marks it. The
+    /// page said the opposite until the claim got a test.
+    #[test]
+    fn the_banner_marks_only_an_outrig_supplied_image_config() {
+        let supplied = render_test_banner("outrig-default", true);
+        assert!(
+            supplied.contains("[outrig] image-config:  outrig-default (built-in default)\n"),
+            "banner should mark the built-in default: {supplied}"
+        );
+
+        let configured = render_test_banner("rust-dev", false);
+        assert!(
+            !configured.contains("built-in default"),
+            "a configured image-config is not the built-in default: {configured}"
+        );
+    }
 
     #[test]
     fn parse_listen_addr_accepts_tcp_socket_addr() {

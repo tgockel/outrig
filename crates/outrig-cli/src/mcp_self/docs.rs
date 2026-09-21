@@ -205,4 +205,41 @@ mod tests {
             "the argument that replaced the promise has to be documented"
         );
     }
+
+    /// The pages `get_doc` serves are `include_str!`'d from this directory,
+    /// and the `doc/` tree mdBook and `scripts/audit-doc-style.py` read is
+    /// symlinked to them. That is what makes the doc an agent is served over
+    /// MCP and the doc a human reads the same bytes rather than two copies
+    /// that agree today.
+    ///
+    /// Nothing else asserts the arrangement, and it is quiet to break: a
+    /// checkout without symlink support, or an editor that replaces a symlink
+    /// with a regular file on save, leaves two real files that drift from
+    /// there on. Comparing their *contents* would not notice -- through a
+    /// symlink it compares a file to itself and can never fail -- so this
+    /// compares the resolved paths.
+    #[test]
+    fn every_embedded_page_is_what_doc_resolves_to() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let doc_root = crate_root
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .join("doc");
+        for doc in DOCS {
+            let page = format!("{}.md", doc.page);
+            let from_doc = doc_root.join(&page);
+            let embedded = crate_root.join("src/mcp_self/docs").join(&page);
+            let resolved = std::fs::canonicalize(&from_doc)
+                .unwrap_or_else(|e| panic!("{}: {e}", from_doc.display()));
+            let source = std::fs::canonicalize(&embedded)
+                .unwrap_or_else(|e| panic!("{}: {e}", embedded.display()));
+            assert_eq!(
+                resolved,
+                source,
+                "{} no longer resolves to the file `get_doc` serves; restore the symlink",
+                from_doc.display(),
+            );
+        }
+    }
 }

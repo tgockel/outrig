@@ -906,6 +906,14 @@ struct StartupBanner<'a> {
 }
 
 fn print_banner(banner: StartupBanner<'_>) {
+    eprint!("{}", render_banner(banner));
+}
+
+/// Split from `print_banner` so the lines it claims can be asserted on. Every
+/// conditional row here -- the agentless lead, the failover list, the device,
+/// the built-in-default marker -- is something `doc/` states, and a banner that
+/// only ever reaches stderr is a documented claim with nothing behind it.
+fn render_banner(banner: StartupBanner<'_>) -> String {
     let StartupBanner {
         resolved,
         container_name,
@@ -962,8 +970,11 @@ fn print_banner(banner: StartupBanner<'_>) {
     if let Some(weights) = resolved.model_weights() {
         let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
     }
-    let origin = crate::builtin_image::banner_suffix(builtin_default);
-    let _ = writeln!(buf, "[outrig] image-config:  {container_name}{origin}");
+    let _ = writeln!(
+        buf,
+        "{}",
+        crate::builtin_image::banner_image_config_row(container_name, builtin_default)
+    );
     let _ = writeln!(buf, "[outrig] image:             {image_tag}");
     let _ = writeln!(buf, "[outrig] container started: {container_pod_name}");
     for (name, count) in per_server_counts {
@@ -976,7 +987,7 @@ fn print_banner(banner: StartupBanner<'_>) {
         buf,
         "[outrig] session id: {session_id}   (Ctrl-D to exit, /help for slash commands)"
     );
-    eprint!("{buf}");
+    buf
 }
 
 fn build_tools_summary(tools: &[SessionTool]) -> String {
@@ -1076,6 +1087,128 @@ mod tests {
             subagent_width_max: outrig::config::DEFAULT_SUBAGENT_WIDTH_MAX,
             image: None,
         }
+    }
+
+    /// Renders the startup banner for `resolved`, with the image-config named
+    /// `container_name` and `builtin_default` saying whether outrig supplied
+    /// it. The remaining rows are fixed.
+    fn render_test_banner(
+        resolved: &llm::ResolvedAgent,
+        container_name: &str,
+        builtin_default: bool,
+    ) -> String {
+        let image_tag = ImageTag::new("outrig/session:abc123");
+        render_banner(StartupBanner {
+            resolved,
+            container_name,
+            builtin_default,
+            image_tag: &image_tag,
+            container_pod_name: "outrig-session-abc123",
+            per_server_counts: &[("fs".to_string(), 3)],
+            all_tools: &[],
+            session_id: "20260921T101112-abc1",
+        })
+    }
+
+    /// `doc/usage/run.md` and `doc/reference/cli.md` both promise that naming
+    /// no image falls through to the built-in default *and says so*. The
+    /// marker is the only thing distinguishing that session from one whose
+    /// config named `outrig-default` itself, so the converse is half the
+    /// claim: a repo that named its own image-config hears nothing about
+    /// built-in defaults.
+    #[test]
+    fn the_banner_marks_only_an_outrig_supplied_image_config() {
+        let resolved = test_resolved_agent();
+
+        let supplied = render_test_banner(&resolved, "outrig-default", true);
+        assert!(
+            supplied.contains("[outrig] image-config:  outrig-default (built-in default)\n"),
+            "banner should mark the built-in default: {supplied}"
+        );
+
+        let configured = render_test_banner(&resolved, "rust-dev", false);
+        assert!(
+            configured.contains("[outrig] image-config:  rust-dev\n"),
+            "banner should name the image-config plainly: {configured}"
+        );
+        assert!(
+            !configured.contains("built-in default"),
+            "a configured image-config is not the built-in default: {configured}"
+        );
+    }
+
+    /// `outrig run` no longer needs an agent, and an agentless session has no
+    /// agent name to print, so the banner leads with the model instead.
+    #[test]
+    fn an_agentless_banner_leads_with_the_model() {
+        let resolved = llm::ResolvedAgent {
+            agent_name: None,
+            ..test_resolved_agent()
+        };
+        let banner = render_test_banner(&resolved, "rust-dev", false);
+        assert!(
+            banner.starts_with("[outrig] model:             fast (provider: mistralrs / "),
+            "an agentless banner leads with the model: {banner}"
+        );
+        assert!(
+            !banner.contains("[outrig] agent:"),
+            "there is no agent to name: {banner}"
+        );
+    }
+
+    /// A chain can change models mid-turn, so the vendors it may move to are
+    /// named before the session starts. A session that cannot move says
+    /// nothing, which is what keeps a one-candidate banner byte-identical to
+    /// the pre-failover one.
+    #[test]
+    fn the_banner_lists_failover_candidates_only_when_a_chain_can_move() {
+        let single = test_resolved_agent();
+        assert!(
+            !render_test_banner(&single, "rust-dev", false).contains("model failover:"),
+            "a single-candidate session has nowhere to move"
+        );
+
+        let mut chained = test_resolved_agent();
+        chained.alias_name = Some("opus".to_string());
+        chained.candidates.push(llm::ResolvedCandidate {
+            model_name: "slow".to_string(),
+            ..chained.candidates[0].clone()
+        });
+        let banner = render_test_banner(&chained, "rust-dev", false);
+        assert!(
+            banner.contains("[outrig] model failover:    slow\n"),
+            "the fallbacks are named up front: {banner}"
+        );
+        assert!(
+            banner.contains("[outrig] agent:             coding (model: opus -> fast "),
+            "the banner shows the alias hop: {banner}"
+        );
+    }
+
+    /// `--device` selects hardware for an in-process model, so the row exists
+    /// only when the session resolved to one.
+    #[test]
+    fn the_banner_names_the_device_only_for_an_in_process_model() {
+        let remote = test_resolved_agent();
+        assert!(
+            !render_test_banner(&remote, "rust-dev", false).contains("model device:"),
+            "a remote model has no device to report"
+        );
+
+        let mut local = test_resolved_agent();
+        local.candidates[0].model_weights = Some(llm::MistralrsWeights {
+            model_id: Some("some/model".to_string()),
+            model_path: None,
+            model_file: None,
+            revision: None,
+            context_length: None,
+            device: outrig::config::MistralrsDeviceSpec::Cpu,
+        });
+        assert!(
+            render_test_banner(&local, "rust-dev", false)
+                .contains("[outrig] model device:      cpu\n"),
+            "an in-process model reports its device"
+        );
     }
 
     /// Locks `/help` to the exact text the REPL printed when it owned the

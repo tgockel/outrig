@@ -42,7 +42,7 @@ outrig init               # set up global config and scaffold an image config
 outrig config init        # configure global settings interactively
 outrig run                # start an interactive agent session
 outrig mcp                # serve the configured MCP servers as one MCP over stdio
-outrig design             # generate AI-assisted design prompts
+outrig design prompt      # generate AI-assisted design prompts
 outrig build              # build (or cache-hit) the session image
 outrig image add          # scaffold a new image config in the repo
 outrig image init|build   # create / build a standalone image project

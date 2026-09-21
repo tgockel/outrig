@@ -16,6 +16,7 @@ outrig run [--agent <name>]
            [--image <name-or-local-ref>]
            [--config <path>]
            [--device <cpu|cuda|cuda:N|metal>]
+           [--env <KEY=VALUE>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
            [--model <name>]
@@ -27,8 +28,8 @@ outrig run [--agent <name>]
 ```
 
 - `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block. With
-  neither, the session runs with no agent: no preamble, and the image comes from `--image` or
-  `default-image`.
+  neither, the session runs with no agent: no preamble, and the image comes from `--image`,
+  `default-image`, or [the built-in default](#the-built-in-default-image).
 - `--image <name-or-local-ref>` (default: agent's `image`, else `default-image`):
   pick an image-config by name; if an explicit `--image` value does not match
   config, treat it as a local Podman image ref and run it without pulling.
@@ -37,6 +38,13 @@ outrig run [--agent <name>]
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   override the in-process mistralrs model device for this run. **Deprecated** with the
   in-process backend; see [In-process LLMs](../concepts/in-process-llm.md).
+- `--env <KEY=VALUE>` (repeatable): add or override env vars for the MCP servers this session
+  starts. `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one server by name.
+  Values take the same `${VAR}` host-env-reference syntax config files use, described in
+  [Reference -> Config](../reference/config.md#mcp-env-value-syntax). Within a scope the last
+  value given for a key wins; across scopes the per-key precedence is config-file env < global
+  `--env` < per-server `--env`. A `SERVER:` prefix naming a server the image does not declare
+  is an error.
 - `--max-tool-calls <n>` (default: resolved `tool-call-max`, else `50`): override the
   per-turn tool-call max for this run.
 - `--max-tool-result-bytes <n>` (default: resolved `tool-result-max`, else `262144`):

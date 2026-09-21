@@ -352,9 +352,76 @@ fn repo_cmd_ctx(
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
 
     use super::{Cli, Cmd, ImageCmd, log_filter_spec};
+
+    /// The `outrig ...` lines of the README's `## Commands` fence, with
+    /// trailing comments dropped and an `a|b` alternation in the final word
+    /// expanded into one command each.
+    fn readme_commands(readme: &str) -> Vec<String> {
+        let fence = readme
+            .split_once("\n## Commands\n")
+            .expect("README has a `## Commands` section")
+            .1
+            .split_once("```sh\n")
+            .expect("`## Commands` opens a ```sh block")
+            .1
+            .split_once("```")
+            .expect("the ```sh block is terminated")
+            .0;
+
+        let mut commands = Vec::new();
+        for line in fence.lines() {
+            let line = line.split_once('#').map_or(line, |(code, _)| code).trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Alternations sit in the final word: `outrig ls|logs|discard|clean`.
+            let (head, last) = line
+                .rsplit_once(' ')
+                .expect("every README command is `outrig <verb> ...`");
+            commands.extend(last.split('|').map(|verb| format!("{head} {verb}")));
+        }
+        assert!(!commands.is_empty(), "the README fence listed no commands");
+        commands
+    }
+
+    /// Every command the crates.io README advertises resolves in the clap
+    /// tree. The README is the published front page and the one doc a reader
+    /// meets before installing, so a command spelled only there is a promise
+    /// the binary breaks -- `outrig design` was exactly that, since `design`
+    /// requires a subcommand and the real spelling is `outrig design prompt`.
+    ///
+    /// A line may legitimately still fail to parse for want of a required
+    /// *argument*: the README lists `outrig image inspect` without an image
+    /// ref. That is a shape, not a wrong command, so it is the one error kind
+    /// this accepts.
+    #[test]
+    fn every_readme_command_resolves_in_the_clap_tree() {
+        for command in readme_commands(include_str!("../../README.md")) {
+            if let Err(err) = Cli::try_parse_from(command.split_whitespace()) {
+                assert_eq!(
+                    err.kind(),
+                    ErrorKind::MissingRequiredArgument,
+                    "the README documents `{command}`, which clap rejects:\n{err}",
+                );
+            }
+        }
+    }
+
+    /// The other half of the claim above, stated directly so a README edit
+    /// cannot satisfy the sweep by deleting the line rather than fixing it.
+    /// `DisplayHelpOnMissingArgumentOrSubcommand` is clap's way of saying the
+    /// command tree stops here: it renders help and exits 2, so bare
+    /// `outrig design` is a usage failure rather than a command.
+    #[test]
+    fn design_requires_the_prompt_subcommand() {
+        let err = Cli::try_parse_from(["outrig", "design"]).expect_err("`design` needs a verb");
+        assert_eq!(err.kind(), ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand);
+        assert_eq!(err.exit_code(), 2, "a usage failure is not a successful run");
+        Cli::try_parse_from(["outrig", "design", "prompt"]).expect("`design prompt` parses");
+    }
 
     #[test]
     fn outrig_log_wins_over_rust_log() {

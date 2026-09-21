@@ -236,8 +236,12 @@ Reads the global and repo configs, resolves agent -> model -> provider, builds t
 when stdin reaches EOF, when the user types `/quit`, or after a second Ctrl-C.
 
 With no repo config found and no `--config`, `run` and `mcp` use the current directory as the
-workspace root and take all config from the global file; `run` then needs its agent from the
-global config and an explicit `--image`. `build` still requires a repo config.
+workspace root and take all config from the global file. `run` then needs exactly one thing
+from it: a resolvable **model**. The agent is optional -- without one the session sends no
+preamble -- and so is the image, which falls through to outrig's built-in default. `mcp`
+resolves no model either, so it needs nothing beyond a working podman. `build` still requires
+a repo config and does not fall through; pass `--image outrig-default` to pre-warm the
+built-in.
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.
 
@@ -282,13 +286,19 @@ outrig mcp self
 
 There is no `--agent` flag. `outrig mcp` does not resolve `default-agent`, does not let
 `agent.image` participate in image-config selection, and does not read provider API keys.
-Image selection is explicit `--image`, then top-level `default-image`, then an error.
-Config entries win; an unknown explicit `--image` is treated as a local Podman image ref.
-`default-image` remains config-only.
+Image selection is explicit `--image`, then top-level `default-image`, then outrig's built-in
+default image-config. Config entries win; an unknown explicit `--image` is treated as a local
+Podman image ref. `default-image` remains config-only. The fallback is announced on stderr,
+and declaring a reserved name yourself takes it away: `[images.outrig-default]`,
+`[images.outrig-default-fs]`, `[images.outrig-default-shell]`,
+`[sidecars.outrig-default-fs]`, or `[sidecars.outrig-default-shell]`. `[sidecars.outrig-default]`
+is not reserved. Your own `[images.outrig-default]` still resolves after the veto; the other
+four leave nothing to fall through to, which is when naming no image is still an error.
 
 Like `outrig run`, `mcp` runs config-less when no `.agents/outrig/config.toml` is found (and no
 `--config`): the current directory becomes the workspace root and config comes from the global
-file. With no agent to resolve, `--image <local-ref>` is enough.
+file. With no agent to resolve, it reads no model and no provider either, so
+`--image <local-ref>` is enough -- and, with the built-in default behind it, not required.
 
 With `--attach`, the value is resolved first as an exact session id under the resolved
 session root. A session match supplies the podman container name and default

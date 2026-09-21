@@ -64,20 +64,36 @@ API keys. Image selection is only:
 
 1. `--image <name-or-local-ref>`
 2. top-level `default-image`
+3. outrig's [built-in default image-config](run.md#the-built-in-default-image)
 
-If neither is set, startup fails with:
+With neither of the first two set, startup does not fail. The session falls through to the
+built-in default and marks it on stderr:
 
 ```
-error: no --image or default-image configured
+[outrig] no --image, agent image, or default-image configured; using outrig's built-in default
+[outrig] image-config:  outrig-default (built-in default)
 ```
+
+Declaring a reserved name yourself vetoes the injection, and outrig steps aside with a note
+saying so. Five names do it: `[images.outrig-default]`, `[images.outrig-default-fs]`,
+`[images.outrig-default-shell]`, `[sidecars.outrig-default-fs]`, and
+`[sidecars.outrig-default-shell]`. `[sidecars.outrig-default]` is *not* reserved -- the
+built-in declares no sidecar by that name, so yours cannot clash with it.
+
+What a veto leaves behind depends on which name you took. An `[images.outrig-default]` of your
+own still resolves, so the session runs on it. Any of the other four leaves nothing to fall
+through to, and startup ends there -- so a repo that declares only
+`[images.outrig-default-fs]` and no `default-image` fails rather than falling back.
 
 `default-image` must name a config block. The raw local-image fallback applies
 only to explicit `--image` values and to raw image refs saved in session records.
 
 `outrig mcp` can also run in a directory with no `.agents/outrig/config.toml` (and no
 `--config`): it uses the current directory as the workspace root and merges in the global
-config. Since there is no agent, all you need is `--image <local-ref>`; the proxied MCP servers
-come from the image's `org.outrig.mcp` labels.
+config. With no agent it resolves no model and no provider either, so a working podman is all
+it needs -- the built-in default supplies the image and two MCP servers. Pass
+`--image <local-ref>` to proxy a different image instead; its proxied MCP servers come from
+that image's `org.outrig.mcp` labels.
 
 With `--attach`, image-config selection is different:
 
@@ -105,9 +121,6 @@ exits before the client sees an MCP `initialize` response.
 
 ```toml
 default-image = "coding"
-
-[workspace]
-root = "."
 
 [images.coding]
 dockerfile = ".agents/outrig/images/coding/Dockerfile"

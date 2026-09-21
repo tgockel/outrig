@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Migrating from 0.1
+
+Everything a 0.1 config or command line has to change, by name. Most announce themselves --
+the config fails to parse, fails to validate, or the session says so on stderr. Two do not and
+want checking by hand: a `[sidecars.<sc>]` block that no `[mcp]` entry names now simply does
+not start, with nothing said about it, and an agent that omits `preamble` stops sending the
+sentence 0.1 supplied on its behalf.
+
+- **Toolchain and platform.** The minimum supported Rust version (MSRV) is 1.88, up from
+  1.87. outrig builds for Linux on x86-64 and AArch64 only; any other target stops at a
+  `compile_error!` rather than failing somewhere in the container plumbing, and on Windows the
+  supported arrangement is WSL2. podman 4.3 or newer is required at run time. Building
+  `view = "primary"` sidecars additionally needs the matching `<arch>-unknown-linux-musl`
+  target installed -- without it the built-in default degrades rather than failing, with `fs`
+  falling back to a read-write bind mount of the workspace and `shell` unavailable.
+
+- **`outrig design` is `outrig design prompt`.** The bare form was never a command and exits
+  with a usage error.
+
+- **Sidecars are declared at the top level** as `[sidecars.<sc>]` rather than inside an
+  image-config, and one starts only when some `[images.<name>.mcp]` entry names it. Declaring
+  a block instantiates nothing on its own, which retires two shapes: a sidecar hosting no MCP
+  servers at all, and one whose servers came only from its own image's `org.outrig.mcp` label.
+
+- **An agent that omits `preamble` sends no system prompt.** 0.1 substituted a fixed sentence
+  that appeared in no config and could not be turned off -- `You are a careful assistant whose
+  tools run inside a sandboxed container.` Paste it into `preamble` to keep it. Agents that
+  set `preamble` are unaffected, and so are subagents.
+
+- **An alias fails over mid-turn.** A `[models.<name>]` entry naming other models is no longer
+  fixed to one endpoint at startup: a failing request moves to the next candidate under a
+  budget shared across the chain. If you relied on a name resolving to exactly one endpoint,
+  declare it with a single target, which takes the pre-failover path unchanged.
+
+- **A repo config may declare only `mode` under `[network]`.** `default`, `allow`, and `deny`
+  in a repo file are a validation error. The rule predates this release, but it was applied by
+  scanning the config text and a differently formatted table could slip past it; it now reads
+  the parsed value, so a repo policy that previously went through is refused. A `[network]`
+  table with no `mode` inherits the global mode instead of resetting it to `default`.
+
+- **`style = "mistralrs"` is deprecated, not removed**, along with the `local-llm`, `cuda`, and
+  `metal` features, the six `[models.<name>]` weight keys, `model-cache-root`, and
+  `outrig run --device`. Everything still parses, validates, and runs. Two things do change:
+  a provider block carrying a key this style never read -- `base-url`, `request-timeout-secs`,
+  `retry-budget-secs`, or an outright typo -- now fails to load instead of being discarded,
+  and a relative `[models.<name>].model-path` is opened against the repo root rather than the
+  process's working directory, so one written in a *global* config follows whichever repo is
+  current. Give that one an absolute path. The replacement is an OpenAI-compatible server on
+  `localhost` behind a `style = "openai"` provider.
+
+Config file names and locations are unchanged, and no key not listed here changed spelling.
+
 ### Fixed
 
 - **`style = "mistralrs"` rejects unknown keys**, closing the one hole in this schema's
@@ -30,6 +82,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This stays the one path in the schema that is repo-relative rather than relative to the file
   that declared it. A *global* `[models.<name>]` with a relative `model-path` therefore follows
   whichever repo is current; give that one an absolute path.
+
+- **A hostname allow-rule grants only against a bound destination.** Under `mode = "filter"`
+  with `default = "deny"`, a rule like `allow = ["allowed.example:443"]` was matched against
+  the name the *client itself* announced in `Host:` or SNI as well as against the address the
+  connection was going to. The client half is attacker-controlled, so a container could open a
+  connection to an unrelated address, claim to be `allowed.example`, and be bridged to it --
+  the enforcement half of the interceptor did not hold the property it advertised, and
+  `SECURITY.md` names failure to enforce a host:port policy as in scope.
+
+  A name now authorizes a destination only when this attachment's own DNS listener validated
+  it for that address. What the client claims is kept apart from what was resolved and is
+  consulted on the deny list only: a claim may cost a client its own connection and may never
+  buy it one. The `ip` and `cidr` allow forms lost the same client-asserted disjunct.
+
+  The bindings behind it are per attachment rather than session-global, so one container's
+  lookup no longer grants another authority over an address; they are keyed address to name to
+  expiry, so shared hosting keeps every name rather than the latest lookup erasing the rest;
+  their TTLs come from the answering record, clamped to between 30 seconds and an hour; and
+  the table is capped. DNS answers are validated before they bind -- right resolver,
+  transaction id, question, and QR bit -- addresses are attributed through the CNAME chain to
+  the name that was queried, and decoded names are checked, since a wire label may legally
+  contain a `.` and an unchecked one could forge a parent domain.
+
+- **A provider response outrig cannot use ends the turn, not the session.** A reply that
+  decodes into nothing outrig can turn into a turn is retried a couple of times and then
+  reported as `the model returned a response outrig could not use (<detail>)`, leaving the
+  history untouched so the prompt can simply be sent again. This is a different class from the
+  rate-limited or unreachable provider recorded for the previous release candidate -- that one
+  is a transport or status failure, this one is a well-formed response with an unusable body
+  -- and it used to take the whole session down.
+
+- **A turn that produced only reasoning is reported rather than swallowed.** A response with
+  no text and no tool calls, but with reasoning content, reached the user as pure silence: the
+  agent layer concatenates the final turn's text parts, which is the empty string here, and
+  the REPL printed nothing at all. A minute of billed generation was indistinguishable from
+  outrig ignoring the prompt. The structured turn is now salvaged and shown, the streaming
+  path is covered too, and a turn that genuinely finished with nothing to display says so and
+  names the finish reason and any ceiling in force.
+
+- **A session record outlives the schema that wrote it.** `outrig ls` failed outright with
+  `missing field image_config_name` against any session started before that field was renamed,
+  and `clean`, `logs`, and `discard` broke identically because all four read the same listing.
+  The field is now optional and accepts its old name, so an old record keeps its real value
+  rather than degrading to a blank. A `session.json` that still cannot be read costs its own
+  row and a report instead of the whole command: `ls` distinguishes an empty session root from
+  one where nothing parsed and exits 0 either way, `clean` counts an unparsable entry as
+  surviving rather than treating its container as record-less and force-removing it, and
+  naming one broken session by id still fails, because that is a request for that session.
 
 ### Deprecated
 
@@ -81,10 +181,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable set and non-empty -- which is what lets one committed config serve a laptop with
   `ANTHROPIC_API_KEY` and a CI runner holding a Bedrock role.
 
-  Selection happens once, at startup, and answers "am I configured for this" rather than "is
-  this endpoint up": building a remote client does no network I/O, so an alias does **not**
-  fail over when a vendor rate-limits mid-session. An alias with no reachable candidate ends
-  the session listing every candidate and the distinct reason each was skipped.
+  Selection happens at startup and answers "am I configured for this" rather than "is this
+  endpoint up": building a remote client does no network I/O, so nothing here can tell a
+  rate-limited endpoint from a healthy one. Whether an endpoint answers is settled per
+  request instead, by the chain failover below. An alias none of whose candidates this build
+  is configured for ends the session listing every candidate and the distinct reason each was
+  skipped.
 
   Attribution follows the name: the banner, the subagent launch trace, the subagent tool
   result, and the transcript header all render `alias -> concrete` when a hop was taken. A
@@ -92,6 +194,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `--device` is refused for an alias spanning more than one candidate -- it selects hardware
   for one in-process model, and an alias may span styles. A single-target alias takes it.
+
+- **An alias fails over mid-turn.** A request that fails against one candidate moves to the
+  next from inside the same model call, so the turn continues rather than ending. The move is
+  announced on stderr (`[outrig] model <a> failed (<reason>); trying <b>`), and a chain with
+  nothing left reports every candidate and the distinct reason each failed -- ending the turn
+  if any of those reasons was recoverable, and the session only if all of them were terminal.
+
+  Three properties govern what it costs. The retry budget is **shared across the chain**: one
+  deadline is armed per model call and every candidate's retry loop is bounded by what remains
+  of it, so three candidates cannot each spend a full `retry-budget-secs` against one outage.
+  A fresh request **restarts at the head** of the chain, because the list is a preference order
+  and a single rate-limit window should not quietly demote it for the rest of the session. And
+  **completed tool calls are never replayed**: tools run between model calls and never inside
+  one, so moving candidates within a call re-runs nothing that already happened in a container.
+
+  A chain of one takes the pre-failover path byte for byte -- same retry stack, same errors,
+  same output. The banner lists the fallbacks up front, so the ordering is visible before a
+  turn needs it.
+
+  The chain's `retry-budget-secs` comes from the first *remote* candidate's provider, which is
+  not always the first candidate: the lookup skips `style = "mistralrs"` rows, because an
+  in-process provider has no such key and rejects one. So a local-first alias takes its budget
+  from the first OpenAI- or Anthropic-style row after the local ones, and writing
+  `retry-budget-secs` onto the local provider to influence the chain does not configure it --
+  it fails to load.
+
+- **Subagents.** An agent can launch another agent in the same session through the built-in
+  `outrig__subagent` tool, which occupies a reserved `outrig__` namespace alongside the
+  documentation tools rather than coming from any MCP server. A subagent gets its own turn
+  loop and reports back through a `set_result` protocol fragment composed into its preamble.
+  `subagent-depth-max` bounds how deep the nesting goes and `subagent-width-max` how many one
+  agent may hold at once; the launching agent may name the `model` its subagent runs under,
+  and a release list naming an unknown subagent is rejected whole rather than half-applied.
 
 ### Changed
 
@@ -101,6 +236,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advertised and failed at launch. An alias is offered when *any* of its candidates is
   reachable, which is what lets `alias = ["opus-local", "opus-anthropic"]` stay launchable
   in a build without `--features local-llm` where naming `opus-local` directly would not be.
+
+- **An endpoint that never answered gets a much shorter leash.** While every attempt against a
+  candidate has failed to connect -- nothing has come back from it at all -- the retry loop is
+  bounded at 30 seconds rather than by the whole `retry-budget-secs`, and each attempt's
+  connect phase is capped at 10. A misconfigured `base-url` or an unreachable host now reports
+  in well under a minute instead of spending the full budget on a socket that was never going
+  to open. The short bound lifts the moment the endpoint answers anything, an error included,
+  because at that point the failure is the provider's and the configured budget is the right
+  one. It is also what makes an alias chain cheap to walk past a dead candidate.
+
+- **A dropped future no longer leaves its subprocess running.** Interrupting a session used to
+  leave podman and buildah children behind to finish on their own, so a cancelled build could
+  still be writing layers after the command that asked for it returned. Cancellation now
+  reaches the subprocess, and a command cut short reports `OutrigError::Canceled` naming the
+  program and argv rather than an exit status it never collected.
+
+- **A repo config may declare `mode` under `[network]`, and nothing else.** `default`, `allow`,
+  and `deny` in a repo file are a validation error naming the key. The rule is not new, but it
+  used to be applied by scanning the config text, which a differently formatted table could
+  slip past; it now reads the parsed value, so a policy that a repo file previously smuggled
+  through is refused. A `[network]` table that declares no `mode` also inherits the global one
+  instead of resetting it to `default`.
+
+- **The MCP SDK moved to rmcp 3.1**, two majors on from the 1.x this project shipped in 0.1.0
+  and one on from the 2.x this changelog last recorded. The protocol revisions `outrig mcp`
+  advertises follow the SDK, so a client negotiating an older revision still gets a revision
+  it can speak.
 
 ### Removed
 

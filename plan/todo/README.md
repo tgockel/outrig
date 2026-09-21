@@ -22,7 +22,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-49` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-50` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
@@ -33,7 +33,6 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 | Task      | What it settles                                                   |
 | --------- | ----------------------------------------------------------------- |
-| `0002-49` | Documentation contracts, and a drafted 0.1 -> 0.2 migration guide |
 | `0002-50` | A cancelled build owns the working containers buildah made for it |
 | `0002-51` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read |
 | `0002-52` | A fresh RC, and a packaging check that can catch a reused version |
@@ -101,8 +100,10 @@ get, a `plan/next/` entry.
 - `Transcript` is a concrete public sink and therefore an extension-point commitment that `0002-47`
   does not cover.
 - Dynamic sidecar add has no removal or handle-lifecycle contract.
-- Device colon grammar, mount lexical normalization, the silent Anthropic ceiling, and
-  startup-banner testing all remain buffered -- though `0002-49` pulls the banner item forward if it
-  can, since three of its documentation corrections are what the banner would regress.
+- Device colon grammar, mount lexical normalization, and the silent Anthropic ceiling remain
+  buffered. Startup-banner testing no longer does: `0002-49` pulled it in, since three of its
+  documentation corrections are what the banner would have regressed. What it could not reach --
+  the mid-turn failover move announcement -- is refiled as
+  `plan/next/failover-move-announcement-untested.md`.
 - Workspace rustdoc output-name collision, and local-LLM build-warning cleanliness, have no
   entry yet and should get one.
