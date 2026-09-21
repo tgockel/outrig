@@ -15,9 +15,12 @@ pub enum CliError {
     /// A monitored session container went away: the borrowed container in
     /// attach mode stopped, or the watcher saw the primary die externally.
     /// The type doubles as a control signal -- after teardown the process
-    /// must `std::process::exit` instead of returning, because the blocking
-    /// stdin read (MCP stdio transport, REPL) never completes while the peer
-    /// holds the pipe open. See `cli::watcher::exit_if_monitor_stopped`.
+    /// must `std::process::exit` instead of returning, because a blocking
+    /// stdin read never completes while the peer holds the pipe open. The MCP
+    /// stdio transport always has one outstanding; the REPL does too whenever
+    /// it is reading stdin rather than driving its line editor, whose reader
+    /// sits on a detached thread tokio never joins.
+    /// See `cli::watcher::exit_if_monitor_stopped`.
     #[error("{0}")]
     SessionMonitorStopped(String),
 

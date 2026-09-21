@@ -301,6 +301,9 @@ and committed the change. The file now reads:
 > 
 ```
 
+`Up` and `Down` recall the prompts you typed earlier in the session, and the prompt edits like any
+readline prompt; see [Line editing and history](usage/run.md#line-editing-and-history).
+
 Press `Ctrl-D` to end the session. outrig stops the container, finalizes the session record,
 and exits.
 
