@@ -129,8 +129,10 @@ pub async fn execute_with<E, R, D, DFut, B, BFut>(
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
+    // Returns the subset of `names` still in the store afterwards -- see the
+    // call site for why the batch's exit status cannot answer that.
     D: FnMut(Vec<String>) -> DFut,
-    DFut: Future<Output = Result<()>>,
+    DFut: Future<Output = Result<Vec<String>>>,
     B: FnMut(Vec<String>) -> BFut,
     BFut: Future<Output = Result<()>>,
 {
@@ -223,16 +225,35 @@ where
     }
 
     // One `podman rm -f` for every stray. Guard the empty case -- `podman rm
-    // -f` with no names is an error -- and print the same per-container line
-    // for each on success, so the happy path stays byte-identical.
-    let strays_removed = stray_targets.len();
-    if !stray_targets.is_empty() {
-        remove_containers(stray_targets.iter().map(|s| s.name.clone()).collect()).await?;
-        for stray in &stray_targets {
-            let msg = format!("[outrig] removed container {}\n", stray.name);
-            stderr.write_all(msg.as_bytes()).await?;
-        }
+    // -f` with no names is an error.
+    //
+    // The per-container outcome comes from a re-read, not from the batch's
+    // exit status. That status is one number for every name in the batch, and
+    // podman returns zero having skipped a container that another process was
+    // tearing down at the same moment -- measured, repeatedly, and it is
+    // self-perpetuating: the container this claimed to remove joins the next
+    // sweep's batch and is skipped again. A line saying a container was
+    // removed is now a claim about that container.
+    let kept: BTreeSet<String> = if stray_targets.is_empty() {
+        BTreeSet::new()
+    } else {
+        remove_containers(stray_targets.iter().map(|s| s.name.clone()).collect())
+            .await?
+            .into_iter()
+            .collect()
+    };
+    for stray in &stray_targets {
+        let verb = if kept.contains(&stray.name) {
+            "could not remove"
+        } else {
+            "removed"
+        };
+        let msg = format!("[outrig] {verb} container {}\n", stray.name);
+        stderr.write_all(msg.as_bytes()).await?;
     }
+    // `kept` is what the removal hook reports still present, so it is a subset
+    // of the names it was handed and the subtraction cannot underflow.
+    let strays_removed = stray_targets.len() - kept.len();
 
     // After the strays, so a `podman rm` that failed reports rather than
     // letting this claim a clean sweep on top of it.
@@ -253,7 +274,9 @@ where
         clean_summary(removed, strays_removed, builds_removed)
     );
     stderr.write_all(summary.as_bytes()).await?;
-    Ok(0)
+    // Reporting the failure is not enough on its own: a script that checks the
+    // exit code would otherwise read a partial sweep as a complete one.
+    Ok(if kept.is_empty() { 0 } else { 1 })
 }
 
 pub fn parse_duration(value: &str) -> std::result::Result<Duration, String> {
@@ -569,12 +592,52 @@ fn format_retention(duration: Duration) -> String {
     }
 }
 
-/// `podman rm -f <name>...` for every stray in one invocation, propagating
-/// failure -- clean should report a container it could not remove rather than
-/// claiming success. Callers guard the empty case (`podman rm -f` with no
-/// names is an error).
-async fn podman_remove_force_batch(names: Vec<String>) -> Result<()> {
-    engine::remove_batch("podman", &["rm", "-f"], names).await
+/// `podman rm -f <name>...` for every stray in one invocation, returning the
+/// names that are **still there** afterwards -- clean should report a
+/// container it could not remove rather than claiming success, and the
+/// invocation's own exit status cannot tell it which those are. Callers guard
+/// the empty case (`podman rm -f` with no names is an error).
+///
+/// A failing batch is still an error: that is a removal that did not run, as
+/// against one that ran and did not take.
+async fn podman_remove_force_batch(names: Vec<String>) -> Result<Vec<String>> {
+    engine::remove_batch("podman", &["rm", "-f"], names.clone()).await?;
+    let mut left = still_present(&names).await?;
+    // A name the batch skipped is not a name podman refuses: asked for it on
+    // its own, it removes it at once. So the batch stays the common path and
+    // the survivors are retried one at a time, which is also the shape that
+    // can attribute a failure -- a batch reports one exit status for every
+    // name in it, which is how skipping went unnoticed in the first place.
+    //
+    // Best-effort: a name that will not go away is reported by the caller
+    // rather than failing the whole sweep, because the rest of it did work.
+    if !left.is_empty() {
+        for name in &left {
+            let _ = engine::remove_batch("podman", &["rm", "-f"], vec![name.clone()]).await;
+        }
+        left = still_present(&left).await?;
+    }
+    Ok(left)
+}
+
+/// Which of `names` podman still has. Reuses the sweep's own listing call
+/// rather than adding a second way to read the store -- it is one more `podman
+/// ps` and no new parsing *code*, though it does re-parse every row on the
+/// host to answer a membership test over `names`. Only the labeled half is
+/// consulted: a stray is a container carrying `org.outrig.session`, so a name
+/// absent from that list is gone as far as this sweep can ever act on it.
+///
+/// `plan/next/clean-verify-above-the-seam.md` has the cheaper shape -- podman's
+/// own `rm` output already names what it removed -- and why it is not taken
+/// here.
+async fn still_present(names: &[String]) -> Result<Vec<String>> {
+    let (labeled, _running) = list_all_containers().await?;
+    let present: BTreeSet<&str> = labeled.iter().map(|c| c.name.as_str()).collect();
+    Ok(names
+        .iter()
+        .filter(|name| present.contains(name.as_str()))
+        .cloned()
+        .collect())
 }
 
 /// `podman ps -a --format json`, decoded into the labeled-container rows (the

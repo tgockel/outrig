@@ -280,6 +280,12 @@ $ outrig clean --older-than 7d
 Clean 1 session and 1 stray container? [y/N]:
 ```
 
+Each `[outrig] removed container <name>` line is a claim about that container, checked by
+re-reading the container list rather than inferred from the batched `podman rm -f`'s exit
+status -- one status for every name in the batch cannot say which of them went away. A name the
+batch skipped is retried on its own; one that is still there afterwards is reported as
+`could not remove container <name>`, and a sweep that ends with any of those exits `1`.
+
 A third sweep, `--build-containers`, is available for the buildah *working containers* an
 interrupted build can leave behind. It is off by default and is the one sweep outrig cannot
 scope to its own work: buildah offers no way to mark these containers, so the sweep covers

@@ -1,5 +1,14 @@
 # `outrig clean` can report a stray it did not remove
 
+> **Landed in 0002-53.** Found again -- twice in two full live runs -- the first time the e2e
+> suite was executed in CI-shaped conditions, with the leftover from run one failing run two
+> exactly as the self-perpetuating note below predicted. The fix is the shape this entry
+> proposed: `podman_remove_force_batch` re-reads the container list, reports `removed` only for
+> names that actually went away, and reports the rest as `could not remove`. Two things were
+> added beyond the proposal -- a survivor is retried with a `podman rm -f` of its own, which
+> removes it, and a sweep that still left one behind exits 1 rather than 0. Kept for the
+> analysis, which is what made the fix cheap.
+
 Task 0002-09 coalesced the stray sweep's per-container `podman rm -f` calls into a single
 batched invocation (`podman_remove_force_batch` in `crates/outrig-cli/src/cli/clean.rs`).
 `execute_with` awaits that one call, then prints `[outrig] removed container <name>` for

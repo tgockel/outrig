@@ -8,7 +8,8 @@
 //! What the fakes can prove is that outrig kills the client it spawned and
 //! issues the engine-side cleanup it owes. What they cannot prove is that the
 //! *engine* then has no container, no working container, and no stray tag;
-//! that needs a real podman and belongs with the live-engine work in 0002-52.
+//! that needs a real podman. `tests/container_cancellation_e2e.rs` and
+//! `tests/build_cancellation_e2e.rs` are where it is proved.
 //!
 //! Process-level ownership (every capture shape, the spawn-to-owner handoff,
 //! the cooperative confirmed reap) is covered in `src/process_tests.rs`, which

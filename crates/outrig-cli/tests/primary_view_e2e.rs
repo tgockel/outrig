@@ -26,9 +26,12 @@
 //! server can reach the primary-only cargo path through the view; both the
 //! workspace and the cargo path are then provable through the real server.
 //!
-//! Run with (targeting this test binary specifically -- the rest of the e2e
-//! suite has unrelated compile bit-rot, see
-//! `plan/next/e2e-imageconfig-sidecars-bitrot.md`):
+//! On AArch64 this is also the first thing anywhere to *exec* the launcher
+//! built for that architecture, so it is what decides whether the syscall
+//! numbers in `outrig/src/container/enter/launcher.rs` are right.
+//!
+//! Run with (targeting this test binary specifically; the whole suite is
+//! `cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e`):
 //!
 //! ```sh
 //! cargo test -p outrig-cli --features e2e --test primary_view_e2e -- --nocapture

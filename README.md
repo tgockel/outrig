@@ -29,7 +29,9 @@ For library use, depend on the `outrig` crate from your Rust package.
 
 ## Platform support
 
-OutRig runs on Linux, x86-64 or AArch64. Install the matching musl target
+OutRig runs on Linux, x86-64 or AArch64. Both architectures are held to the same evidence:
+the end-to-end suite runs against a live podman on each of them on every pull request, so
+neither is a claim resting on a build that compiled. Install the matching musl target
 (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) to enable `view = "primary"`
 sidecars: those need the `outrig-enter` helper, which is always a Linux binary because it runs
 inside the container rather than in the host process. A build without that target still works

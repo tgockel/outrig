@@ -2,7 +2,16 @@
 
 `crates/outrig-cli/tests/mcp_sidecar_smoke.rs:489` failed once during the 0002-39
 work, then passed three consecutive isolated runs and two full-suite runs with no
-change to it. The assertion that failed was:
+change to it. **Sighted again in 0002-53's first full live run**, on the assertion
+that line now carries -- "stray container should be removed" -- and with the
+mechanism visible in the captured stderr: the sweep under test reported removing
+nine containers, five of which belonged to `entrypoint_stdio_audit_covers_first_packet`
+running concurrently in the same binary. That confirms the diagnosis below from the
+output rather than by inference. It also raises the stakes: 0002-53's `live-e2e` job
+runs this suite on two runners on every pull request, so a race that used to surface
+once a quarter now has two chances per PR.
+
+The assertion that failed the first time was:
 
 ```
 clean should report removing the stray: <outrig clean stderr>

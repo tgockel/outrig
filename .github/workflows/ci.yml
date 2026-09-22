@@ -31,26 +31,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The e2e row is a compile gate. Its tests drive real podman, which
-          # the runner has no way to provide, so `test_args` pins them at
-          # `--no-run`: they must build, never run. The other rows pass "" and
-          # run their tests as before. Features are package-qualified to match
-          # the local-llm row's style, not out of necessity -- Cargo fans an
-          # unqualified `--features e2e` out to every member declaring it.
+          # The `e2e` feature has no row here. It used to have one, pinned at
+          # `cargo test --no-run` because "the runner has no way to provide"
+          # podman -- which was never true of the `ubuntu-24.04` images. The
+          # `live-e2e` job below runs that suite against the engine the runner
+          # already ships, so a compile-only row would only be a second, weaker
+          # build of the same configuration.
           #
           # The arm64 row is the only place build.rs's `"aarch64" =>` arm is
           # taken: every other row is x86-64 and reaches AArch64 through the
           # cross-compile step below, which covers the launcher by itself and
           # nothing around it. This row builds the whole crate for the arch and
           # runs the suite there, so `tests/enter_embedded.rs` checks a
-          # natively embedded helper. It still never *execs* that helper, so
-          # the AArch64 syscall numbers in `launcher.rs` remain unverified by
-          # CI -- the graft is a manual check against a live session, as
-          # `plan/done/phase/0002-sidecars/tasks/0002-12-outrig-enter-helper.md` describes.
-          - { name: default,   runner: ubuntu-latest,    cargo_args: "", test_args: "" }
-          - { name: local-llm, runner: ubuntu-latest,    cargo_args: "--features outrig-cli/local-llm", test_args: "" }
-          - { name: e2e,       runner: ubuntu-latest,    cargo_args: "--features outrig/e2e,outrig-cli/e2e", test_args: "--no-run" }
-          - { name: arm64,     runner: ubuntu-24.04-arm, cargo_args: "", test_args: "" }
+          # natively embedded helper. What *execs* that helper -- and so decides
+          # whether `launcher.rs`'s AArch64 syscall numbers are right -- is the
+          # aarch64 `live-e2e` row, not this one.
+          #
+          # `live-e2e (aarch64)` runs on the same label and its invocation is a
+          # superset of this row's, so almost everything here is covered there
+          # too. It stays anyway: it answers in minutes where that job answers
+          # in fifteen, it fails independently of a live engine, and its `cargo
+          # check` is the only place the published lib-and-bin-only shape is
+          # compiled for AArch64 at all. What that costs is a duplicate cache
+          # bucket, which plan/next/ci-configuration-coverage.md owns.
+          - { name: default,   runner: ubuntu-latest,    cargo_args: "" }
+          - { name: local-llm, runner: ubuntu-latest,    cargo_args: "--features outrig-cli/local-llm" }
+          - { name: arm64,     runner: ubuntu-24.04-arm, cargo_args: "" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -122,15 +128,80 @@ jobs:
             -o "$RUNNER_TEMP/outrig-enter-aarch64" \
             crates/outrig/src/container/enter/launcher.rs
           file -b "$RUNNER_TEMP/outrig-enter-aarch64" | grep -q 'ARM aarch64'
-      - run: cargo test ${{ matrix.cargo_args }} ${{ matrix.test_args }}
+      - run: cargo test ${{ matrix.cargo_args }}
       # `outrig`'s seal test, gated out of the line above on purpose: trybuild
       # compiles the crate's dev dependency graph again in a scratch target
       # directory of its own, which no row shares with any other. One row pays
-      # it. The arm64 row would prove nothing extra -- the seal is a property of
-      # the type system, not of the target -- and the e2e row runs `--no-run`,
-      # under which trybuild never executes at all.
+      # it, and the arm64 row would prove nothing extra -- the seal is a
+      # property of the type system, not of the target.
       - if: matrix.name == 'default'
         run: cargo test -p outrig --features seal-tests --test compile_fail
+
+  # The e2e suite, executed. Every other job in this file proves the tree
+  # compiles; this is the only one that puts outrig in front of a container
+  # engine, which is the only thing that can answer what a cancelled build left
+  # behind, whether a `detach` really cut its bridges, or whether a forged SNI
+  # is refused by an interceptor rather than by a unit test's idea of one.
+  #
+  # Two rows, one invocation. Both runner images ship the same engine --
+  # podman 4.9.3 and buildah 1.33.7 -- so a difference between the rows is a
+  # difference in the architecture, which is the question the aarch64 row
+  # exists to ask. The labels are pinned rather than `ubuntu-latest`: this job
+  # is evidence about a specific engine, and `ubuntu-latest` moves to 26.04
+  # (podman 5.7.0) on a schedule of its own.
+  #
+  # The aarch64 row is the first thing anywhere to *exec* the `outrig-enter`
+  # launcher built for AArch64, so it is what decides whether the syscall
+  # numbers in `crates/outrig/src/container/enter/launcher.rs` are right.
+  live-e2e:
+    name: live-e2e (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # Generous, but not the six-hour default: the suite does real builds and
+    # real cancellations, and a hung engine should free the slot rather than
+    # hold it all afternoon.
+    timeout-minutes: 75
+    env:
+      # `view = "primary"` sidecars need the embedded musl launcher, and
+      # `build.rs` degrades a launcher it cannot compile to a warning plus an
+      # empty artifact. Without this the primary-view tests would fail as a
+      # missing helper rather than the row failing as a missing target.
+      OUTRIG_REQUIRE_ENTER: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86-64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live-e2e-${{ matrix.arch }}
+          cache-on-failure: true
+      # The environment this row's evidence is about, in the log beside it. A
+      # pass means nothing without the engine version it passed against, and
+      # these are the versions quoted in the task record and in `README.md`.
+      - name: Record the engine
+        run: |
+          uname -srm
+          podman --version
+          buildah --version
+          nft --version
+          podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphDriverName}}'
+      # The e2e targets' own lint gate. It was the load-bearing half of the old
+      # compile-only row -- `cargo clippy --all-targets` type-checks every e2e
+      # target, so reintroduced bit-rot fails here in seconds rather than after
+      # the suite has built and started pulling images.
+      - run: cargo clippy --all-targets --features outrig/e2e,outrig-cli/e2e -- -D warnings
+      # Written out in full rather than assembled from matrix fields, so that
+      # "we ran the e2e suite" means one thing on both machines. Both crates
+      # declare `e2e`; qualifying it per package is what keeps either suite
+      # from silently staying out.
+      - run: cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e
 
   public-api:
     name: public-api

@@ -22,7 +22,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-53` and `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-54` is what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
@@ -31,10 +31,9 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 **Release engineering**
 
-| Task      | What it settles                                    |
-| --------- | -------------------------------------------------- |
-| `0002-53` | The e2e suite runs for real, on both architectures |
-| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met     |
+| Task      | What it settles                                |
+| --------- | ---------------------------------------------- |
+| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -53,6 +52,13 @@ Cross-cutting notes the individual tasks carry rather than this file:
   the `std::io::error` / `core::io::error` compiler drift plus a generated header on both files.
   The drift is now settled by the pin rather than tracked, and `0002-51` and `0002-54` can treat
   the snapshots as current.
+- `0002-53` turned the e2e suite on: a `live-e2e` job runs it against a live podman on
+  `ubuntu-24.04` and `ubuntu-24.04-arm` per PR, and the compile-only row is gone. The first
+  execution found that the network interceptor installed **no rules at all** on nft 1.0.9 --
+  `audit` recorded nothing, `filter` refused nothing -- which is a security-semantics defect
+  present in rc.3 and therefore in the class `0002-52` recorded as forcing another candidate.
+  `0002-54` has to decide on that before it can ship a final. Its `## Decisions` also carry the
+  `outrig clean` false-removal fix and what the ARM row does and does not now cover.
 - `0002-49` writes only what is false *now*; `0002-54` writes the version-bearing docs, because
   those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
 - `0002-52` landed the RC, strict rustdoc in CI, and a `package` job that packages both crates

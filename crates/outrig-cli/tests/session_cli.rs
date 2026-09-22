@@ -766,8 +766,17 @@ fn clean_args(older_than: Duration, yes: bool) -> clean::CleanArgs {
 /// A named fn item rather than twenty `|_| async { Ok(()) }` literals, and
 /// the same shape production passes: `podman_remove_force_batch` and
 /// `buildah_remove_batch` are fn items too.
-async fn no_removals(names: Vec<String>) -> outrig_cli::error::Result<()> {
+/// The stray-removal hook. Returns the names still present afterwards, so
+/// `Ok(vec![])` means every container in the batch went away.
+async fn no_removals(names: Vec<String>) -> outrig_cli::error::Result<Vec<String>> {
     panic!("nothing should have been removed, but {names:?} was");
+}
+
+/// The build-container removal hook, which still reports only success or
+/// failure -- `buildah rm` names containers by id, and nothing has been
+/// measured skipping one.
+async fn no_build_removals(names: Vec<String>) -> outrig_cli::error::Result<()> {
+    panic!("no build container should have been removed, but {names:?} was");
 }
 
 fn clean_now() -> SystemTime {
@@ -851,7 +860,7 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -911,7 +920,7 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -950,7 +959,7 @@ async fn clean_without_yes_aborts_on_n() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -990,7 +999,7 @@ async fn clean_accepts_yes_at_prompt() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1023,7 +1032,7 @@ async fn clean_skips_running_sessions() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1061,7 +1070,7 @@ async fn clean_removes_stale_unfinalized_non_running_sessions() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1106,7 +1115,7 @@ async fn clean_removes_symlinked_session_target_and_link() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1172,6 +1181,69 @@ fn labeled(
     }
 }
 
+/// A batched `podman rm -f` exits zero having skipped a container another
+/// process was tearing down at the same moment -- measured, and
+/// self-perpetuating, because the container this claimed to have removed joins
+/// the next sweep's batch and is skipped again. So a `removed container` line
+/// is a claim about that container, taken from a re-read, and a sweep that
+/// left one behind does not exit zero.
+#[tokio::test]
+async fn clean_reports_a_stray_the_engine_still_has() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let strays = vec![
+        labeled("outrig-went-away", "went-away", None, false, days(40), now),
+        labeled(
+            "outrig-still-here",
+            "still-here",
+            None,
+            false,
+            days(40),
+            now,
+        ),
+    ];
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        strays,
+        Vec::new(),
+        // The batch succeeds, and one of the two is still in the store.
+        |_names: Vec<String>| async move { Ok(vec!["outrig-still-here".to_string()]) },
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(
+        rc, 1,
+        "a sweep that left a container behind is not a success"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("[outrig] removed container outrig-went-away"),
+        "the one that went away is still reported as removed: {err}"
+    );
+    assert!(
+        err.contains("[outrig] could not remove container outrig-still-here"),
+        "the one still in the store must be reported as not removed: {err}"
+    );
+    assert!(
+        !err.contains("[outrig] removed container outrig-still-here"),
+        "and must not also be claimed as removed: {err}"
+    );
+}
+
 #[tokio::test]
 async fn clean_removes_old_stopped_stray_containers() {
     let root = tempfile::tempdir().expect("tempdir root");
@@ -1212,10 +1284,10 @@ async fn clean_removes_old_stopped_stray_containers() {
             let batches = batches_ref.clone();
             async move {
                 batches.lock().unwrap().push(names);
-                Ok(())
+                Ok(Vec::new())
             }
         },
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1288,10 +1360,10 @@ async fn clean_spares_containers_of_unreadable_records() {
             let batches = batches_ref.clone();
             async move {
                 batches.lock().unwrap().push(names);
-                Ok(())
+                Ok(Vec::new())
             }
         },
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean must survive an unreadable record");
@@ -1360,10 +1432,10 @@ async fn clean_never_removes_running_or_record_backed_containers() {
             let batches = batches_ref.clone();
             async move {
                 batches.lock().unwrap().push(names);
-                Ok(())
+                Ok(Vec::new())
             }
         },
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1429,10 +1501,10 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
             let batches = batches_ref.clone();
             async move {
                 batches.lock().unwrap().push(names);
-                Ok(())
+                Ok(Vec::new())
             }
         },
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");
@@ -1552,7 +1624,7 @@ async fn clean_without_the_flag_reads_exactly_as_before() {
         Vec::new(),
         Vec::new(),
         no_removals,
-        no_removals,
+        no_build_removals,
     )
     .await
     .expect("clean");

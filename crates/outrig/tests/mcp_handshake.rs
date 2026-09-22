@@ -140,16 +140,28 @@ async fn stderr_captured_on_crash() {
         Ok(_) => panic!("connect should have failed (server exits before initialize)"),
     }
 
-    // Give the kernel a moment to flush the child's stderr to disk; on
-    // unloaded systems this is usually instant, but `--features e2e` runs
-    // can be CI-bound.
+    // Give the child's stderr time to reach the file. On an unloaded machine
+    // this is instant; the wait is for a loaded one, where the drain is racing
+    // every other test binary in the run for a core.
+    //
+    // Ten seconds rather than the two this used to allow. Two was enough until
+    // the suite started running in CI, where twenty-odd binaries share a
+    // four-core runner: the file was still empty at the deadline, on a machine
+    // that was not otherwise in trouble. The ceiling only bounds a hang -- a
+    // capture that works still returns as soon as the bytes land -- so a
+    // generous one costs nothing and a tight one buys nothing.
+    const FLUSH_CEILING: Duration = Duration::from_secs(10);
     let stderr_path = log_dir.join("crashy.stderr");
     let mut contents = String::new();
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + FLUSH_CEILING;
+    loop {
         if let Ok(text) = std::fs::read_to_string(&stderr_path)
             && text.contains("boom-from-mcp")
         {
             contents = text;
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

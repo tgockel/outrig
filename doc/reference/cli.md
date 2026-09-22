@@ -469,6 +469,9 @@ only thing keeping it away from a build in flight.
 | `2`   | Misuse (bad flags, missing required args). clap prints the usage line. |
 | `130` | Interrupted by SIGINT before subcommand-specific handling.             |
 
+`outrig clean` also exits `1` when the sweep ran but a container it tried to remove is still
+there; the run is reported in full, and the container is named on stderr.
+
 ## Environment variables
 
 - `[providers.<name>].api-key` references via `${VAR}`: provider API key.

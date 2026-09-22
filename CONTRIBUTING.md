@@ -64,17 +64,21 @@ Like an ordinary build it needs the `<arch>-unknown-linux-musl` target installed
 
 ## End-to-end tests
 
-Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. CI compiles
-them but does not run them -- the runners have no podman, so the `e2e` matrix row stops at
-`cargo test --no-run`. Compilation failures are caught; behavior regressions are not. Run the
-full suite yourself with:
+Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. CI runs them,
+on every pull request, against the podman and buildah the GitHub runner images already ship --
+the `live-e2e` job, one row on `ubuntu-24.04` and one on `ubuntu-24.04-arm`, both issuing:
 
 ```sh
-cargo test --workspace --features outrig/e2e,outrig-cli/e2e
+cargo test --workspace --locked --features outrig/e2e,outrig-cli/e2e
 ```
 
-Prerequisites: rootless `podman` + `buildah` on `PATH`. The two run-time tests have
-different requirements:
+Run the same command yourself. Both crates declare `e2e`, so the feature has to be named per
+package or one crate's suite silently stays out. Prefix it with `OUTRIG_REQUIRE_ENTER=1` to
+match CI: without it `build.rs` degrades a launcher it cannot compile to a warning, and the
+`view = "primary"` tests then fail as a missing helper rather than as a missing musl target.
+
+Prerequisites: rootless `podman` + `buildah` on `PATH`, plus `nft` and `nsenter` for the
+network-interceptor tests. The two run-time tests have different requirements:
 
 - `quickstart_mocked` (always runs under `--features e2e`) needs only podman/buildah. It
   drives `outrig init -> build -> run` end-to-end against a hand-rolled mock OpenAI
@@ -85,7 +89,7 @@ different requirements:
   `OPENAI_API_KEY` exported to exercise the live OpenAI endpoint. The cost is negligible
   (~$0.01 of `gpt-4o-mini` per run); the test retries the run leg up to twice to absorb
   LLM non-determinism.
-- The remaining e2e tests (`run_smoke`, `container_add_buildable`, `image_build_smoke`,
+- The remaining e2e tests (`run_smoke`, `image_add_buildable`, `image_build_smoke`,
   `container_lifecycle`, etc.) only need podman/buildah.
 
 ## Documentation

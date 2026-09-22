@@ -17,6 +17,20 @@ courtesy to a plain `podman run <image>`, not something the session depends on. 
 shell-less fixture (`crates/outrig/tests/library_surface.rs:96-110`) states this outright and
 declares no `CMD` at all.
 
+It also costs ten seconds on every teardown. `sleep` is PID 1 in the container's PID namespace,
+and PID 1 has no default signal dispositions: SIGTERM is discarded unless the process installs a
+handler, which `sleep` does not. So podman's stop waits its full grace and then SIGKILLs.
+Measured while landing 0002-53, against podman 4.9.3: removing a container that had actually
+started took **10.4-12.0 s** every time, against **25-600 ms** for one cancelled before its
+`sleep` was running -- so the whole difference is the grace, not outrig's cleanup. The
+fake-driven tests in `crates/outrig/tests/cancellation.rs` cannot see this at all; it is the
+live `container_cancellation_e2e.rs` that measures it, and its `ENGINE_CEILING` is sized for
+it.
+
+A keepalive that handles SIGTERM, or a `--stop-timeout 0` on create, would remove the wait.
+Both are in this entry's territory rather than a separate one, because they are decisions about
+the same appended command.
+
 What the appended command does do is put two requirements on the image that nothing else in the
 run path imposes:
 

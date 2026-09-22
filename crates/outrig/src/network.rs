@@ -1148,6 +1148,11 @@ where
     // to two and exit zero (measured against nft in podman 4.9.3), leaving the
     // undo to delete whatever it merged into along with its own rules.
     //
+    // What that reasoning missed for a while is that `create table` earns it
+    // only in the flat form `nft_rules` now emits: given a nested block, nft
+    // 1.0.9 creates the table, drops the block, and exits zero. See
+    // `nft_rules`.
+    //
     // By name and not yet by handle, because there is no handle until the
     // kernel has made the table. A cancellation landing in the apply therefore
     // undoes by the name -- which is correct there: the name is unobservable
@@ -2964,18 +2969,30 @@ fn nft_table_name(session_id: &str) -> String {
     format!("outrig_{suffix}_{nonce:016x}")
 }
 
+/// The redirect script, as a sequence of top-level commands.
+///
+/// Deliberately **not** a `create table` with the chain nested inside it. nft
+/// accepts that form, exits zero, and creates the table with the whole block
+/// silently dropped -- measured against nft 1.0.9, which is what Ubuntu 24.04
+/// ships and therefore what every GitHub runner has. The result was an empty
+/// table and an interceptor that redirected nothing: no audit records in audit
+/// mode, and every connection allowed in filter mode, including the ones a
+/// `default = deny` policy exists to stop. `nft list table` showed the table
+/// with no chain in it, and `--echo` reported only the table line.
+///
+/// The flat form installs the same ruleset and keeps the two properties
+/// `create` is here for: it still fails rather than merging if a table of this
+/// name already exists, and `nft -f` is one transaction either way, so a
+/// failure anywhere in the script leaves nothing behind.
 fn nft_rules(table: &str, tcp_port: u16, dns_port: u16) -> String {
     format!(
         "\
-create table inet {table} {{
-  chain output {{
-    type nat hook output priority dstnat; policy accept;
-    ip daddr 127.0.0.0/8 return
-    ip6 daddr ::1 return
-    meta l4proto tcp redirect to :{tcp_port}
-    udp dport 53 redirect to :{dns_port}
-  }}
-}}
+create table inet {table}
+add chain inet {table} output {{ type nat hook output priority dstnat; policy accept; }}
+add rule inet {table} output ip daddr 127.0.0.0/8 return
+add rule inet {table} output ip6 daddr ::1 return
+add rule inet {table} output meta l4proto tcp redirect to :{tcp_port}
+add rule inet {table} output udp dport 53 redirect to :{dns_port}
 "
     )
 }
@@ -6072,15 +6089,29 @@ mod tests {
     #[test]
     fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
         let rules = nft_rules("outrig_test", 44123, 44124);
-        assert!(
-            rules.contains("create table inet outrig_test"),
+        let lines: Vec<&str> = rules.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            Some("create table inet outrig_test"),
             "`create` rather than `add`: it fails on a table that already \
              exists, which is what makes deleting one afterwards safe"
         );
-        assert!(rules.contains("ip daddr 127.0.0.0/8 return"));
-        assert!(rules.contains("ip6 daddr ::1 return"));
-        assert!(rules.contains("meta l4proto tcp redirect to :44123"));
-        assert!(rules.contains("udp dport 53 redirect to :44124"));
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line.starts_with("add chain ") || line.starts_with("add rule ")),
+            "every declaration is its own top-level command. Nesting them in a \
+             `create table {{ ... }}` block parses, exits zero, and installs an \
+             empty table on nft 1.0.9 -- an interceptor that redirects nothing. \
+             Asserting only that the text contains each rule cannot tell the \
+             two apart, which is why it did not: {rules}"
+        );
+        assert!(rules.contains("add rule inet outrig_test output ip daddr 127.0.0.0/8 return"));
+        assert!(rules.contains("add rule inet outrig_test output ip6 daddr ::1 return"));
+        assert!(
+            rules.contains("add rule inet outrig_test output meta l4proto tcp redirect to :44123")
+        );
+        assert!(rules.contains("add rule inet outrig_test output udp dport 53 redirect to :44124"));
     }
 
     #[test]

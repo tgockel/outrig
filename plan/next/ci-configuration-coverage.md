@@ -1,10 +1,11 @@
 # Close the remaining "declared but never compiled" gaps in CI
 
-> **Partly queued.** The live-e2e and AArch64 coverage moved to
-> `plan/todo/0002-53-live-podman-e2e-and-a-green-aarch64-row.md`. The `cargo publish --dry-run`
-> item has **landed** -- 0002-52 added a `package` job; see the entry for it. What stays
-> here: the generalizing `cargo hack --each-feature` job, the MSRV check, and the
-> cache-bucket and sccache cleanups. The
+> **Partly queued.** The live-e2e and AArch64 coverage **landed** -- 0002-53 added a
+> `live-e2e` job with an `ubuntu-24.04` row and an `ubuntu-24.04-arm` row, and deleted the
+> compile-only `e2e` matrix row this entry's efficiency items were written about; see the two
+> notes below. The `cargo publish --dry-run` item has **landed** too -- 0002-52 added a
+> `package` job; see the entry for it. What stays here: the generalizing `cargo hack
+> --each-feature` job, the MSRV check, and the sccache cleanup. The
 > `macos-latest` x `local-llm,metal` item **survives**: 0002-46 decided that 0.2.0 ships
 > `style = "mistralrs"` operational, so the feature and its macOS dependency block are still
 > real for at least this release. It evaporates with
@@ -65,7 +66,20 @@ not get re-proposed.
 
 ## Efficiency items in the existing `cargo` job
 
-**The `e2e` cache bucket duplicates `default` byte for byte.** `Swatinem/rust-cache`'s `key` is a
+**Moved rather than resolved, and 0002-53 made it one bucket worse.** That task deleted the
+`e2e` matrix row this described, and added `live-e2e-x86-64` and `live-e2e-aarch64`: four
+buckets became five. Its own record first claimed the two new ones "are genuinely distinct
+because they are different architectures", which is true of them relative to *each other* and
+not the comparison that matters. `live-e2e (aarch64)` runs on `ubuntu-24.04-arm` -- the same
+runner label as the `cargo (arm64)` row -- with the same toolchain and targets, and `e2e = []`
+adds no dependency nodes, so it cold-builds the same ~222 crates that row is building
+concurrently and stores a second copy. The duplication is exact and unconditional. (The x86-64
+pair is `ubuntu-24.04` against `ubuntu-latest`: the same image today, legitimately divergent
+once `ubuntu-latest` moves to 26.04.) This entry's fix applies verbatim to the new pair.
+
+The measurement that started it stands: **the `e2e` cache bucket duplicated `default` byte for
+byte.**
+`Swatinem/rust-cache`'s `key` is a
 literal key component, so each matrix row gets its own bucket -- but both `e2e` features are
 `e2e = []`, and `cargo tree --workspace --edges all` yields 1698 identical nodes with and without
 them. So the e2e row cold-builds the same ~222 dependency crates the `default` row is building
@@ -77,18 +91,20 @@ rows don't race to save the same key. `local-llm` genuinely needs its own bucket
 **`mozilla-actions/sccache-action` is dead weight, now paid three times.** Nothing sets
 `RUSTC_WRAPPER=sccache` or `SCCACHE_GHA_ENABLED=true` anywhere in `.github/`, and there is no root
 `.cargo/config.toml`; the action does not set them itself. Each row downloads sccache and runs a
-"Post Run sccache-cache" step that caches nothing -- roughly 5-15 s of pure waste per job, and the
-new e2e row makes it a third payer. `@v0.0.3` also predates upstream's note that sccache before
+"Post Run sccache-cache" step that caches nothing -- roughly 5-15 s of pure waste per job.
+(0002-53 removed the e2e row that had made it a third payer, and did not add the step to
+`live-e2e`.) `@v0.0.3` also predates upstream's note that sccache before
 v0.10.0 "probably will not work." Either wire it up (and then reconsider its overlap with
 `rust-cache`) or drop the step.
 
 ## Non-issue, recorded so it is not re-litigated
 
-The e2e row's `clippy --all-targets` followed by `cargo test --no-run` is not a wasteful double
-build. Measured on a 20-core box against a pruned workspace: clippy 5.1 s, the `--no-run` build
-18.6 s after it versus 22.3 s standalone. Clippy and rustc share no artifacts, but the clippy
-pass is nearly free and partly warms the build that follows. Clippy is the load-bearing gate;
-`--no-run` adds codegen and link coverage on top. Keep both.
+`clippy --all-targets` followed by a `cargo test` of the same feature set is not a wasteful
+double build. Measured on a 20-core box against a pruned workspace: clippy 5.1 s, the `--no-run`
+build 18.6 s after it versus 22.3 s standalone. Clippy and rustc share no artifacts, but the
+clippy pass is nearly free and partly warms the build that follows. This is why `live-e2e` kept
+the clippy step when it inherited the deleted row's job.
 
-`cargo test --no-run` also does not build doctests, so doc examples on `#[cfg(feature = "e2e")]`
-items would go unchecked. There are none today.
+`cargo test --no-run` does not build doctests, so doc examples on `#[cfg(feature = "e2e")]`
+items would have gone unchecked. Moot now that the suite is run rather than only linked, and
+there are none today in any case.

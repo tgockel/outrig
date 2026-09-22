@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`outrig clean` reported removing stray containers it had not removed.** The sweep coalesces
+  its removals into one `podman rm -f <name>...`, and printed `removed container <name>` for
+  every name in the batch on the strength of that one exit status. podman exits zero having
+  skipped a container another process is tearing down at the same moment, so the line was a
+  claim about the batch rather than about the container -- and it was self-perpetuating: the
+  container clean said it had removed joined the next sweep's batch and was skipped again.
+
+  Each name's outcome now comes from re-reading the container list. A name the batch skipped is
+  retried on its own, which removes it; one that is still there afterwards is reported as
+  `could not remove container <name>` and makes `outrig clean` exit **1** instead of 0, so a
+  script checking the status no longer reads a partial sweep as a complete one. The batch
+  remains the common path and the per-name retry runs only when something survived it.
+
+- **`--network audit` recorded nothing and `--network filter` refused nothing** on hosts with
+  nft 1.0.9, which is what Ubuntu 24.04 ships. The interceptor's redirect table was created
+  empty, so no container traffic ever reached it. Fixed in `outrig`; see that crate's
+  changelog for what the script does now and why no unit test could have caught it.
+
 ### Migrating from 0.1
 
 Everything a 0.1 config or command line has to change, by name. Most announce themselves --

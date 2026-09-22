@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The network interceptor installed no rules at all on nft 1.0.9**, which is what Ubuntu
+  24.04 ships. The redirect script was one `create table inet <t> { chain output { ... } }`;
+  nft parses that, exits zero, creates the table, and silently drops the nested block. The
+  result was a table with no chain in it, so nothing was redirected to the interceptor: in
+  `audit` mode no connection was ever recorded, and in `filter` mode every connection was
+  allowed, including the ones a `default = deny` policy exists to refuse. `attach` and
+  `detach` both reported success throughout.
+
+  The script is now a flat sequence -- `create table`, then `add chain`, then one `add rule`
+  per rule -- which installs the same ruleset and keeps both properties `create` was chosen
+  for: it still fails rather than merging if a table of that name already exists, and `nft -f`
+  is a single transaction either way, so a failure leaves nothing behind.
+
+  Nothing in the unit suite could see this. `nft_rules` was checked by asserting the generated
+  text *contained* each rule, which both forms satisfy, and no test ran nft. It surfaced the
+  first time the `e2e` suite was executed against a live engine rather than compiled: seven of
+  the eight `network_interceptor` tests failed, every one of them waiting for an audit record
+  that was never going to arrive. That suite now runs in CI on every pull request, on x86-64
+  and AArch64.
+
 ## [0.2.0-rc.3](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.3) - 2026-09-22
 
 A third release candidate, cut to close the 0.2.0 release gate: the public surface is narrowed,
