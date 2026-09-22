@@ -45,8 +45,8 @@ and 0.2.0 ships with a migration guide for anyone on 0.1.
 - The e2e suite runs against a live podman on both x86-64 and AArch64, and both rows are
   green.
 - `doc/` carries no contract that is false at 0.2.0, and a 0.1 -> 0.2 migration guide exists.
-- 0.2.0-rc.3 ships with its soak parameters recorded in advance, and 0.2.0 final is checked
-  against that record rather than against one composed after the fact.
+- 0.2.0-rc.3 ships, and what would force a further candidate is recorded in advance rather
+  than argued after the fact.
 - `cargo test --workspace`, `cargo clippy --all-targets`, `cargo fmt --check` all exit 0.
 
 ## Linked subsystems

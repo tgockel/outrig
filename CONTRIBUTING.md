@@ -45,6 +45,23 @@ The check does not forbid changing the API. After an intentional surface change,
 with `python3 scripts/check-public-api.py --write` and let the regenerated snapshot travel in
 the same commit: that diff is the review material.
 
+## Packaging
+
+What gets published is not what `cargo test` builds. `crates/outrig/build.rs` compiles the
+`outrig-enter` launcher out of the crate's own sources at build time and degrades any failure --
+including sources that are not in the archive -- to a cargo warning and an empty artifact. A
+published crate missing `src/container/enter/launcher.rs` would therefore build green and then
+fail every `view = "primary"` sidecar at session start.
+
+CI's `package` job closes that by packaging both crates with `OUTRIG_REQUIRE_ENTER=1`, which
+makes the degradation a build error, against the packaged archive rather than the working tree:
+
+```sh
+OUTRIG_REQUIRE_ENTER=1 cargo package --locked -p outrig -p outrig-cli
+```
+
+Like an ordinary build it needs the `<arch>-unknown-linux-musl` target installed.
+
 ## End-to-end tests
 
 Tests gated behind `#[cfg(feature = "e2e")]` exercise real podman containers. CI compiles

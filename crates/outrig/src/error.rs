@@ -83,7 +83,7 @@ pub enum OutrigError {
     /// The command could never be started -- the binary is missing from `PATH`,
     /// is not executable, or the fork itself failed. Distinct from
     /// [`OutrigError::Process`], which means the command ran and exited badly.
-    /// `command` is the [`crate::process::Cmd::render`] output, carried
+    /// `command` is the `crate::process::Cmd::render` output, carried
     /// pre-rendered so this module stays independent of `process`.
     #[error("{}", format_spawn(program, command, source))]
     #[non_exhaustive]

@@ -1,5 +1,12 @@
 # `try_capture_logged_traces_spawn_and_exit_at_debug` is order-flaky
 
+> **The named test has drifted.** As of `trunk` at `c929ab9e`, the test that actually flakes is
+> its sibling `run_streamed_forwards_stderr_to_tracing`, in the same module and by the same
+> mechanism: four consecutive `cargo test -p outrig --lib process::process_tests` runs on an
+> unmodified tree gave one pass and three failures, with no rebuild between them. Which test
+> loses the race is itself scheduling-dependent, so a fix wants to address the callsite-interest
+> caching below rather than either test by name.
+
 `crates/outrig/src/process_tests.rs:223` failed once during unrelated work, then passed five
 consecutive full-suite runs with no change to it. The assertion that failed was the first one:
 

@@ -81,6 +81,23 @@ jobs:
       # and turn that feature on, so this is the only place the published
       # configuration gets compiled at all.
       - run: cargo check ${{ matrix.cargo_args }}
+      # Strict rustdoc on the library, one row. Unlike the public-API snapshot this
+      # depends on nothing that churns between nightlies -- a doc link either
+      # resolves against the surface in this commit or it does not -- so it
+      # belongs in per-PR CI rather than behind a pin. `--lib` deliberately:
+      # rustdoc'ing the workspace collides the CLI's `outrig` bin target with
+      # the library's `outrig` lib target onto one output path, which is a
+      # separate problem (plan/next/workspace-rustdoc-output-collision.md) and
+      # not one to solve by widening this. Private and unresolved links are
+      # errors here because seven of them accumulated unnoticed while nothing
+      # ran this.
+      # Both libs, one target each: `outrig` renders to `outrig` and `outrig-cli` to
+      # `outrig_cli`, so naming them separately avoids the collision a workspace-wide run
+      # hits while still covering both published surfaces.
+      - if: matrix.name == 'default'
+        run: cargo rustdoc -p outrig --lib --locked -- -D warnings
+      - if: matrix.name == 'default'
+        run: cargo rustdoc -p outrig-cli --lib --locked -- -D warnings
       # The library against musl's headers, where `msghdr`/`cmsghdr` length
       # fields are `socklen_t` rather than glibc's `size_t` -- `nsfork.rs` is
       # the only code that touches them, and nothing else here would notice it
@@ -172,6 +189,26 @@ jobs:
       # names what moved. Last, so a clean diff above is never the only evidence that the
       # comparison is capable of failing at all.
       - run: python3 scripts/check-public-api.py --self-test
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    env:
+      # The whole point of this job. `crates/outrig/build.rs` compiles the `outrig-enter`
+      # launcher out of the crate's own sources at build time, and degrades a failure --
+      # including sources that are not there -- to a cargo warning plus an empty artifact.
+      # So a `cargo publish` whose archive was missing `src/container/enter/launcher.rs`
+      # would verify-build green and ship a binary whose `view = "primary"` sidecars all
+      # fail at session start. This variable makes that degradation a hard error, and
+      # `cargo package` applies it to the *packaged* archive rather than the working tree,
+      # which is the copy nothing else here builds.
+      OUTRIG_REQUIRE_ENTER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: cargo package --locked -p outrig -p outrig-cli
 
   doc-style:
     name: doc-style

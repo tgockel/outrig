@@ -1,9 +1,10 @@
 # Close the remaining "declared but never compiled" gaps in CI
 
 > **Partly queued.** The live-e2e and AArch64 coverage moved to
-> `plan/todo/0002-53-live-podman-e2e-and-a-green-aarch64-row.md`, and the `cargo publish --dry-run`
-> item to `plan/todo/0002-52-cut-0.2.0-rc.3.md`. What stays here: the generalizing
-> `cargo hack --each-feature` job, the MSRV check, and the cache-bucket and sccache cleanups. The
+> `plan/todo/0002-53-live-podman-e2e-and-a-green-aarch64-row.md`. The `cargo publish --dry-run`
+> item has **landed** -- 0002-52 added a `package` job; see the entry for it. What stays
+> here: the generalizing `cargo hack --each-feature` job, the MSRV check, and the
+> cache-bucket and sccache cleanups. The
 > `macos-latest` x `local-llm,metal` item **survives**: 0002-46 decided that 0.2.0 ships
 > `style = "mistralrs"` operational, so the feature and its macOS dependency block are still
 > real for at least this release. It evaporates with
@@ -45,11 +46,22 @@ either row produces. Cheap to close via cargo-hack.
 **`rust-version = "1.87"` is never verified.** All jobs use `dtolnay/rust-toolchain@stable`, so a
 dependency bump or newly stabilized API can silently raise the true MSRV above the declared one.
 
-**No `cargo publish --dry-run` / `cargo package` job.** `crates/outrig/build.rs` compiles
-`src/container/enter/launcher.rs` at build time, so the published crate must ship that file.
-There is no `include`/`exclude` in the manifest, so it does today -- but nothing enforces it, and
-the project's constraint is that `cargo install` builds every feature from source with no
-prebuilt binaries. Worth having before the 0.2.0 freeze.
+**~~No `cargo publish --dry-run` / `cargo package` job.~~ Landed in 0002-52** as a `package`
+job running `cargo package --locked -p outrig -p outrig-cli` with `OUTRIG_REQUIRE_ENTER=1`.
+
+One correction to what this entry claimed: "there is no `include`/`exclude` in the manifest" had
+gone stale before it was read. Both crates carry `exclude` lists now, so a dropped build input is
+an ordinary edit away rather than hypothetical, which is what made the gap worth closing.
+
+The variable is the load-bearing half and was not obvious. Without it `build.rs` degrades a
+launcher it cannot compile to a cargo warning and an empty artifact, so the verify build that
+`cargo package` already performs goes green on exactly the archive this job exists to reject.
+With it, a missing `src/container/enter/launcher.rs` fails the build of the packaged tarball --
+which is stronger than checking the file list, because it tests what the file is for.
+
+0002-52 first built a 500-line Python checker around this and removed it again; that is recorded
+in its `## Decisions`, along with what `cargo publish` already covers, so the larger version does
+not get re-proposed.
 
 ## Efficiency items in the existing `cargo` job
 

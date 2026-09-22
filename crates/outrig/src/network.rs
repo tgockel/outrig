@@ -10,9 +10,9 @@
 //! interceptor.
 //!
 //! Policy evaluation keeps two kinds of evidence apart. The names an
-//! attachment's own DNS listener validated for an address ([`ResolvedNames`])
+//! attachment's own DNS listener validated for an address (`ResolvedNames`)
 //! are the only thing that may *grant* a hostname rule; the name a client
-//! writes into a `Host:` header or a TLS `ClientHello` ([`ClientAssertion`])
+//! writes into a `Host:` header or a TLS `ClientHello` (`ClientAssertion`)
 //! may deny, and may never authorize a destination OutRig never resolved to
 //! that name.
 

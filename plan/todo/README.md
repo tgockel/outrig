@@ -22,7 +22,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-52` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-53` and `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
@@ -31,11 +31,10 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 **Release engineering**
 
-| Task      | What it settles                                                   |
-| --------- | ----------------------------------------------------------------- |
-| `0002-52` | A fresh RC, and a packaging check that can catch a reused version |
-| `0002-53` | The e2e suite runs for real, on both architectures                |
-| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met                    |
+| Task      | What it settles                                    |
+| --------- | -------------------------------------------------- |
+| `0002-53` | The e2e suite runs for real, on both architectures |
+| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met     |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -56,8 +55,13 @@ Cross-cutting notes the individual tasks carry rather than this file:
   the snapshots as current.
 - `0002-49` writes only what is false *now*; `0002-54` writes the version-bearing docs, because
   those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
-- `0002-52` records the soak parameters before rc.3 ships; `0002-54` checks that record rather than
-  composing one after the fact.
+- `0002-52` landed the RC, strict rustdoc in CI, and a `package` job that packages both crates
+  under `OUTRIG_REQUIRE_ENTER=1`, so an archive missing a source `build.rs` compiles fails
+  rather than shipping. It first built two release-gate scripts for this and removed them again;
+  its `## Decisions` records what `cargo publish` already covers, so they are not re-proposed.
+  There is no soak window -- `0002-52` considered one and recorded why it measures nothing --
+  and what `0002-54` checks instead is the blocker class recorded there. rc.3 stays a
+  library-only cut, as rc.1 and rc.2 were.
 - Gate item 17 ships **partially met**: `0002-48` enforces the API snapshots, and the downstream
   runtime-core surface test (`plan/next/container-surface-test.md`) is a deliberate, recorded
   exception rather than an omission.
@@ -99,5 +103,7 @@ get, a `plan/next/` entry.
   documentation corrections are what the banner would have regressed. What it could not reach --
   the mid-turn failover move announcement -- is refiled as
   `plan/next/failover-move-announcement-untested.md`.
-- Workspace rustdoc output-name collision, and local-LLM build-warning cleanliness, have no
-  entry yet and should get one.
+- The workspace rustdoc output-name collision now has one, filed by `0002-52` while adding the
+  `cargo rustdoc` gate whose `-p` and `--lib` work around it:
+  `plan/next/workspace-rustdoc-output-collision.md`. local-LLM build-warning cleanliness
+  still has no entry and should get one.

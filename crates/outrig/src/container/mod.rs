@@ -763,7 +763,7 @@ impl Container {
 
     /// The in-container home directory of the bootstrapped user, or `None`
     /// before [`Container::bootstrap_user`] has run. The same path
-    /// [`Container::build_exec_argv`] gives every exec-stdio server as `HOME`,
+    /// `Container::build_exec_argv` gives every exec-stdio server as `HOME`,
     /// so a sidecar that takes it from here cannot disagree with them.
     pub fn home_dir(&self) -> Option<String> {
         self.user_name.as_deref().map(userdb::home_dir)
@@ -779,8 +779,8 @@ impl Container {
     ///
     /// Writes `/etc/passwd` and `/etc/group` from the host, through
     /// descriptors a forked child opened inside the container's namespaces
-    /// (see [`namespace`]), so the image needs no `useradd`, `groupadd`, or
-    /// `getent`. Probes first: on podman 5.x, `--userns=keep-id` auto-injects
+    /// (see the `namespace` module), so the image needs no `useradd`, `groupadd`,
+    /// or `getent`. Probes first: on podman 5.x, `--userns=keep-id` auto-injects
     /// the host UID/GID into both files, so there is frequently nothing to
     /// write.
     ///

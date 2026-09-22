@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0-rc.3](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.3) - 2026-09-22
+
+A third release candidate, cut to close the 0.2.0 release gate: the public surface is narrowed,
+sealed, and now enforced by a committed snapshot, and the documentation contracts have been
+corrected against what the code actually does. Everything here is measured against
+**0.2.0-rc.2**; a consumer still on 0.1.0 should read **Migrating from 0.1** below first.
 
 ### Migrating from 0.1
 

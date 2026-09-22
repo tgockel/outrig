@@ -4,7 +4,7 @@
 //! ENTRYPOINT, joins the primary container's mount namespace, grafts the
 //! sidecar's own rootfs aside, and execs the real payload -- giving a
 //! third-party MCP image the *primary's* filesystem view. Its source is
-//! [`launcher.rs`] (+ the pure [`elf`] parser); the crate `build.rs` compiles
+//! `launcher.rs` (+ the pure `elf.rs` parser); the crate `build.rs` compiles
 //! it for `<arch>-unknown-linux-musl` and drops the result in `OUT_DIR`, which
 //! is embedded below.
 //!
