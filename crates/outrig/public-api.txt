@@ -937,6 +937,7 @@ pub async fn outrig::image::probe_cached(&outrig::image::ImageTag) -> outrig::er
 pub async fn outrig::image::probe_pulled(&outrig::image::ImageTag) -> outrig::error::Result<bool>
 pub async fn outrig::image::pull_image(&outrig::image::ImageTag) -> outrig::error::Result<()>
 pub async fn outrig::image::read_image_entrypoint_cmd(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<(alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<alloc::string::String>)>
+pub async fn outrig::image::read_image_env(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub async fn outrig::image::read_image_labels(&outrig::image::ImageTag, core::option::Option<&outrig::Transcript>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub async fn outrig::image::read_remote_image_labels(&str) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
 pub mod outrig::mcp_proxy

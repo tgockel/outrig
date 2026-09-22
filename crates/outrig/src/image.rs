@@ -707,6 +707,51 @@ pub async fn read_image_entrypoint_cmd(
     ))
 }
 
+/// Read a local image's declared environment (OCI `Config.Env`) via `podman
+/// image inspect`, as a `KEY` -> `value` map. This reads image metadata only --
+/// no container runs, and for a local image nothing is pulled. An image that
+/// declares no environment yields an empty map. A missing tag fails the inspect
+/// and surfaces as a process error.
+///
+/// `transcript`, when present, tees the podman command line and output into the
+/// session transcript, matching every other in-session podman call.
+pub async fn read_image_env(
+    tag: &ImageTag,
+    transcript: Option<&Transcript>,
+) -> Result<BTreeMap<String, String>> {
+    let cmd = Cmd::new("podman")
+        .arg("image")
+        .arg("inspect")
+        .arg(tag.as_str())
+        .arg("--format")
+        .arg("{{json .Config.Env}}");
+    let output = process::run_capture_logged(cmd, "podman", transcript).await?;
+    parse_env_json(tag, &String::from_utf8_lossy(&output.stdout))
+}
+
+/// Split podman's `Config.Env` array into a map.
+///
+/// An entry without `=` is skipped rather than guessed at -- it names neither a
+/// key nor a value. The split is on the *first* `=`, so a value that contains
+/// one survives (`FOO=a=b` is `FOO` -> `a=b`), and a repeated key takes the
+/// last entry, which is the order a runtime applies the list in anyway.
+fn parse_env_json(tag: &ImageTag, text: &str) -> Result<BTreeMap<String, String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(BTreeMap::new());
+    }
+    let entries: Vec<String> = serde_json::from_str(trimmed).map_err(|source| {
+        OutrigError::Configuration(format!(
+            "podman image inspect {tag}: invalid env JSON: {source}"
+        ))
+    })?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect())
+}
+
 /// Read OCI labels from a registry ref via `skopeo inspect` without pulling
 /// image layers. Plain image refs are inspected as `docker://<ref>`, and an
 /// already-prefixed `docker://...` ref is accepted. Other explicit skopeo
@@ -1285,6 +1330,76 @@ mod tests {
             err.to_string().contains("invalid inspect JSON"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn parse_env_json_reads_key_value_entries() {
+        let env = parse_env_json(
+            &ImageTag::new("outrig-cache:test"),
+            r#"["PATH=/usr/local/bin:/usr/bin","RUSTFLAGS=--cfg=tokio_unstable","EMPTY="]"#,
+        )
+        .expect("env parse");
+
+        assert_eq!(env["PATH"], "/usr/local/bin:/usr/bin");
+        // Split on the first `=` only: the value keeps its own.
+        assert_eq!(env["RUSTFLAGS"], "--cfg=tokio_unstable");
+        assert_eq!(env["EMPTY"], "");
+        assert_eq!(env.len(), 3);
+    }
+
+    #[test]
+    fn parse_env_json_skips_an_entry_with_no_equals() {
+        let env = parse_env_json(
+            &ImageTag::new("outrig-cache:test"),
+            r#"["PATH=/usr/bin","BARE_NAME"]"#,
+        )
+        .expect("env parse");
+
+        assert_eq!(env["PATH"], "/usr/bin");
+        assert!(!env.contains_key("BARE_NAME"), "got: {env:?}");
+        assert_eq!(env.len(), 1);
+    }
+
+    #[test]
+    fn parse_env_json_takes_the_last_of_a_repeated_key() {
+        let env = parse_env_json(
+            &ImageTag::new("outrig-cache:test"),
+            r#"["PATH=/first","PATH=/second"]"#,
+        )
+        .expect("env parse");
+
+        assert_eq!(env["PATH"], "/second");
+    }
+
+    #[test]
+    fn parse_env_json_allows_null_or_empty_output() {
+        let tag = ImageTag::new("outrig-cache:test");
+
+        assert!(
+            parse_env_json(&tag, "null\n")
+                .expect("null env parse")
+                .is_empty()
+        );
+        assert!(
+            parse_env_json(&tag, "[]")
+                .expect("empty env parse")
+                .is_empty()
+        );
+        assert!(
+            parse_env_json(&tag, "")
+                .expect("empty output parse")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_env_json_rejects_invalid_json() {
+        let err = parse_env_json(&ImageTag::new("outrig-cache:test"), r#"["PATH=/usr/bin""#)
+            .expect_err("invalid JSON must fail");
+
+        assert!(matches!(err, OutrigError::Configuration(_)));
+        assert!(err.to_string().contains("invalid env JSON"), "got: {err}");
+        assert!(err.to_string().contains("outrig-cache:test"), "got: {err}");
     }
 
     #[tokio::test(flavor = "current_thread")]

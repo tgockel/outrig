@@ -22,7 +22,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-51` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-52` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
@@ -33,7 +33,6 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 | Task      | What it settles                                                   |
 | --------- | ----------------------------------------------------------------- |
-| `0002-51` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read |
 | `0002-52` | A fresh RC, and a packaging check that can catch a reused version |
 | `0002-53` | The e2e suite runs for real, on both architectures                |
 | `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met                    |

@@ -207,6 +207,15 @@ that it does.
 
 ### Added
 
+- **`image::read_image_env(tag, transcript)`** returns a local image's declared `Config.Env`
+  as a `KEY` -> `value` map. It is the same `podman image inspect` read `read_image_labels`
+  and `read_image_entrypoint_cmd` already make, one field over, and it starts no container.
+  An embedder layering its own environment over a per-repository image's `PATH` -- what a
+  `view = "primary"` sidecar needs, since it keeps its own image's environment -- no longer
+  has to shell out to podman for that one value. The map rather than the raw `KEY=value`
+  list is the point: precedence is what the caller is computing. An entry without `=` is
+  skipped, and a repeated key takes its last entry.
+
 - **`Model::resolved_model_path(repo_root)`** returns `model_path` made absolute, and is the
   single place the base for a relative one is chosen. `Config::validate` and the CLI's model
   resolution both call it; they used to join the same value independently, against the repo

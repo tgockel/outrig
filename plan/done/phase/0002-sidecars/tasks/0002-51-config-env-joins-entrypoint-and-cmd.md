@@ -77,6 +77,39 @@ An embedder can read an image's `Config.Env` through OutRig, the same way it alr
 
 None hard.
 
+## Decisions
+
+- **`parse_env_json` takes the tag.** The deliverable sketches it as `parse_env_json(text:
+  &str)`, but the error message it produces names the tag (`podman image inspect {tag}:
+  invalid env JSON`), so the signature is `parse_env_json(tag: &ImageTag, text: &str)`. This
+  is the same reason `labels_from_skopeo_inspect` takes `remote_ref` -- the pure half owns the
+  error, so it needs what the error says.
+
+- **The `null` question was settled by precedent, not by a build.** Empirically, podman emits
+  a JSON array for `Config.Env` on every local image checked (alpine, an `outrig-cache` image,
+  an `mcp-web` image), and it does emit a bare `null` for `Config.Labels` on alpine -- the nil
+  Go value marshalling that makes `null` reachable at all, and the same one a nil `[]string`
+  goes through. The remaining case, an image declaring no `ENV`, would have needed a throwaway
+  `FROM scratch` build to observe; skopeo is not installed, so there was no read-only way to
+  reach it. We took the `Labels` precedent instead and treat `null` and empty output alike as
+  an empty map, with a unit test on that branch either way. Cheap to be right about, and the
+  branch cannot misfire: the only other reading of `null` would be an error, which would make
+  a legitimately env-less image fail an inspect it should pass.
+
+- **Repeated keys take the last entry.** `Config.Env` is a list, so a duplicate key is
+  representable even though podman normally collapses them at build time. `BTreeMap::insert`
+  gives last-wins for free, which is the order a runtime applies a sequential env list in
+  anyway -- so the map agrees with what the container would actually see.
+
+- **An empty key is not special-cased.** `=value` yields a `""` key rather than being skipped.
+  The deliverable names exactly one skip rule (no `=`), and inventing a second one for a
+  degenerate entry would be a guess of the kind the first rule exists to avoid.
+
+- **A changelog entry was added even though the deliverables omit it.** Neither sibling
+  accessor has one, but every recent `feat:` commit touches `crates/outrig/CHANGELOG.md`, and
+  0.2.0-rc.3 (`0002-52`) is the next task -- a new public accessor should appear in those
+  release notes rather than land silently.
+
 ## See also
 
 - `plan/done/phase/0002-sidecars/tasks/0002-26-primary-view-relative-entrypoint.md` -- the related,
