@@ -9,16 +9,26 @@
 //! session record is gone (lost record, SIGKILLed outrig, failed `--rm`) --
 //! and `podman rm -f`s the stopped ones older than the cutoff in one
 //! invocation. Running containers are never removed, labeled or not.
+//!
+//! `--build-containers` adds a third sweep, off by default and answered from
+//! its own listings. Separate for a reason beyond tidiness: buildah working
+//! containers are not podman containers and never appear in `podman ps -a`,
+//! so folding them into that listing would feed the other two sweeps rows
+//! they have no way to reason about. See [`crate::cli::build_containers`]
+//! for why it is opt-in.
 
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::cli::build_containers::{
+    self, BuildContainer, buildah_remove_batch, classify_build_containers,
+};
+use crate::cli::engine;
 use crate::error::{OutrigError, Result};
 use crate::session::{self, Session, SessionStore};
 use outrig::container::{LABEL_SESSION, LABEL_SIDECAR};
@@ -40,6 +50,13 @@ pub struct CleanArgs {
     /// Skip the interactive `[y/N]` confirmation.
     #[arg(short = 'y', long = "yes")]
     pub yes: bool,
+    /// Also remove buildah working containers left by interrupted builds.
+    ///
+    /// Unlike the other sweeps this one is not label-scoped -- buildah offers
+    /// no way to mark these -- so it removes *every* buildah working
+    /// container older than the cutoff, including any you made yourself.
+    #[arg(long = "build-containers")]
+    pub build_containers: bool,
 }
 
 /// One `org.outrig.session`-labeled podman container, as reported by
@@ -67,7 +84,18 @@ pub async fn execute(
         cwd,
     )?;
     let store = SessionStore::new(root);
-    let (labeled, running) = list_all_containers().await?;
+    // Only when asked: with the flag off, `clean` still needs nothing but
+    // podman, and buildah is never invoked. When it is asked, the listings
+    // are independent read-only queries and run together rather than end to
+    // end.
+    let ((labeled, running), build) = if args.build_containers {
+        tokio::try_join!(
+            list_all_containers(),
+            build_containers::list_build_containers()
+        )?
+    } else {
+        (list_all_containers().await?, Vec::new())
+    };
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut stderr = tokio::io::stderr();
     execute_with(
@@ -78,13 +106,15 @@ pub async fn execute(
         SystemTime::now(),
         running,
         labeled,
+        build,
         podman_remove_force_batch,
+        buildah_remove_batch,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_with<E, R, D, DFut>(
+pub async fn execute_with<E, R, D, DFut, B, BFut>(
     stderr: &mut E,
     stdin: R,
     store: &SessionStore,
@@ -92,13 +122,17 @@ pub async fn execute_with<E, R, D, DFut>(
     now: SystemTime,
     running: BTreeSet<String>,
     labeled: Vec<LabeledContainer>,
+    build: Vec<BuildContainer>,
     mut remove_containers: D,
+    mut remove_build_containers: B,
 ) -> Result<i32>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
     D: FnMut(Vec<String>) -> DFut,
     DFut: Future<Output = Result<()>>,
+    B: FnMut(Vec<String>) -> BFut,
+    BFut: Future<Output = Result<()>>,
 {
     let listing = store.list()?;
     let sessions = listing.sessions;
@@ -133,21 +167,43 @@ where
         now,
     );
 
+    let (build_targets, build_undatable) =
+        classify_build_containers(build, args.older_than, now);
+
     write_skipped_running(stderr, &skipped_running).await?;
     write_stray_running(stderr, &stray_running).await?;
+    write_build_undatable(stderr, &build_undatable).await?;
 
     let retention = format_retention(args.older_than);
-    if targets.is_empty() && stray_targets.is_empty() {
-        let msg =
-            format!("[outrig] no stopped sessions or stray containers older than {retention}\n");
+    if targets.is_empty() && stray_targets.is_empty() && build_targets.is_empty() {
+        // The wording only grows when the sweep was asked for, so a run
+        // without the flag reads exactly as it always has.
+        let msg = if args.build_containers {
+            format!(
+                "[outrig] no stopped sessions, stray containers, or build containers \
+                 older than {retention}\n"
+            )
+        } else {
+            format!("[outrig] no stopped sessions or stray containers older than {retention}\n")
+        };
         stderr.write_all(msg.as_bytes()).await?;
         return Ok(0);
     }
 
     write_preview(stderr, &targets, &retention).await?;
     write_stray_preview(stderr, &stray_targets, &retention).await?;
+    write_build_preview(stderr, &build_targets, &retention).await?;
 
-    if !args.yes && !confirm(stderr, stdin, targets.len(), stray_targets.len()).await? {
+    if !args.yes
+        && !confirm(
+            stderr,
+            stdin,
+            targets.len(),
+            stray_targets.len(),
+            build_targets.len(),
+        )
+        .await?
+    {
         stderr.write_all(b"[outrig] aborted\n").await?;
         return Ok(0);
     }
@@ -178,9 +234,23 @@ where
         }
     }
 
+    // After the strays, so a `podman rm` that failed reports rather than
+    // letting this claim a clean sweep on top of it.
+    let builds_removed = build_targets.len();
+    if !build_targets.is_empty() {
+        remove_build_containers(build_targets.iter().map(|c| c.id.clone()).collect()).await?;
+        for container in &build_targets {
+            let msg = format!(
+                "[outrig] removed build container {}\n",
+                container.short_id()
+            );
+            stderr.write_all(msg.as_bytes()).await?;
+        }
+    }
+
     let summary = format!(
         "[outrig] cleaned {}\n",
-        clean_summary(removed, strays_removed)
+        clean_summary(removed, strays_removed, builds_removed)
     );
     stderr.write_all(summary.as_bytes()).await?;
     Ok(0)
@@ -314,12 +384,18 @@ where
     Ok(())
 }
 
-async fn confirm<E, R>(stderr: &mut E, mut stdin: R, sessions: usize, strays: usize) -> Result<bool>
+async fn confirm<E, R>(
+    stderr: &mut E,
+    mut stdin: R,
+    sessions: usize,
+    strays: usize,
+    builds: usize,
+) -> Result<bool>
 where
     E: AsyncWrite + Unpin,
     R: AsyncBufRead + Unpin,
 {
-    let prompt = format!("Clean {}? [y/N]: ", clean_summary(sessions, strays));
+    let prompt = format!("Clean {}? [y/N]: ", clean_summary(sessions, strays, builds));
     stderr.write_all(prompt.as_bytes()).await?;
     stderr.flush().await?;
     let mut line = String::new();
@@ -328,19 +404,28 @@ where
     Ok(answer == "y" || answer == "yes")
 }
 
-/// `"2 sessions"`, `"3 stray containers"`, or `"2 sessions and 3 stray
-/// containers"`.
-fn clean_summary(sessions: usize, strays: usize) -> String {
-    let stray_part = |count: usize| {
-        format!(
-            "{count} stray {}",
-            crate::cli::session_setup::plural(count, "container", "containers")
-        )
-    };
-    match (sessions, strays) {
-        (_, 0) => session_count(sessions),
-        (0, s) => stray_part(s),
-        (n, s) => format!("{} and {}", session_count(n), stray_part(s)),
+/// `"2 sessions"`, `"3 stray containers"`, `"2 sessions and 3 stray
+/// containers"`, or all three joined `"a, b and c"`.
+///
+/// Zero-count parts drop out, so a run without `--build-containers` reads
+/// exactly as it did before there was a third one.
+fn clean_summary(sessions: usize, strays: usize, builds: usize) -> String {
+    let mut parts = Vec::new();
+    if sessions > 0 {
+        parts.push(session_count(sessions));
+    }
+    if strays > 0 {
+        parts.push(container_count(strays, "stray"));
+    }
+    if builds > 0 {
+        parts.push(container_count(builds, "build"));
+    }
+    match parts.split_last() {
+        // Nothing to name, which still reads as "0 sessions" -- the wording
+        // the empty case had before there was anything else to count.
+        None => session_count(0),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -374,7 +459,7 @@ where
     }
     let header = format!(
         "[outrig] will remove {} older than {retention} (no session record):\n",
-        clean_summary(0, strays.len())
+        container_count(strays.len(), "stray")
     );
     stderr.write_all(header.as_bytes()).await?;
     for stray in strays {
@@ -389,6 +474,78 @@ where
         stderr.write_all(line.as_bytes()).await?;
     }
     Ok(())
+}
+
+/// Report the working containers whose age could not be established. Not a
+/// removal list: without an age there is no telling a month-old stray from a
+/// build that started a second ago.
+async fn write_build_undatable<E>(stderr: &mut E, undatable: &[BuildContainer]) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    write_build_list(
+        stderr,
+        "[outrig] skipped build containers with no creation time:\n",
+        undatable,
+    )
+    .await
+}
+
+/// Preview every build container that will be removed.
+///
+/// Everything, never a count: this sweep is not label-scoped, so the only
+/// thing standing between it and a container outrig did not make is the
+/// reader.
+async fn write_build_preview<E>(
+    stderr: &mut E,
+    builds: &[BuildContainer],
+    retention: &str,
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if builds.is_empty() {
+        return Ok(());
+    }
+    let header = format!(
+        "[outrig] will remove {} older than {retention} (buildah working containers):\n",
+        container_count(builds.len(), "build")
+    );
+    write_build_list(stderr, &header, builds).await
+}
+
+/// `header`, then one line per container. The row shape is written once so
+/// the two lists cannot drift into describing the same thing differently.
+async fn write_build_list<E>(
+    stderr: &mut E,
+    header: &str,
+    containers: &[BuildContainer],
+) -> Result<()>
+where
+    E: AsyncWrite + Unpin,
+{
+    if containers.is_empty() {
+        return Ok(());
+    }
+    stderr.write_all(header.as_bytes()).await?;
+    for container in containers {
+        let line = format!(
+            "  {}  {}  image {}\n",
+            container.short_id(),
+            container.name,
+            container.image
+        );
+        stderr.write_all(line.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// `"1 stray container"`, `"2 build containers"`.
+fn container_count(count: usize, noun: &str) -> String {
+    format!(
+        "{count} {noun} {}",
+        crate::cli::session_setup::plural(count, "container", "containers")
+    )
 }
 
 fn session_count(count: usize) -> String {
@@ -417,21 +574,7 @@ fn format_retention(duration: Duration) -> String {
 /// claiming success. Callers guard the empty case (`podman rm -f` with no
 /// names is an error).
 async fn podman_remove_force_batch(names: Vec<String>) -> Result<()> {
-    let output = tokio::process::Command::new("podman")
-        .args(["rm", "-f"])
-        .args(&names)
-        .stdin(Stdio::null())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(OutrigError::Configuration(format!(
-            "podman rm -f {} failed: {}",
-            names.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-        .into());
-    }
-    Ok(())
+    engine::remove_batch("podman", &["rm", "-f"], names).await
 }
 
 /// `podman ps -a --format json`, decoded into the labeled-container rows (the
@@ -440,19 +583,9 @@ async fn podman_remove_force_batch(names: Vec<String>) -> Result<()> {
 /// outrig-unlabeled primary still shows up in the running set. Rows missing the
 /// expected fields are skipped rather than failing the sweep.
 async fn list_all_containers() -> Result<(Vec<LabeledContainer>, BTreeSet<String>)> {
-    let output = tokio::process::Command::new("podman")
-        .args(["ps", "-a", "--format", "json"])
-        .stdin(Stdio::null())
-        .output()
-        .await?;
-    if !output.status.success() {
-        return Err(OutrigError::Configuration(format!(
-            "podman ps failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-        .into());
-    }
-    parse_all_containers(&output.stdout)
+    let listing =
+        engine::capture("podman", &["ps", "-a", "--format", "json"], "outrig clean").await?;
+    parse_all_containers(&listing)
 }
 
 fn parse_all_containers(stdout: &[u8]) -> Result<(Vec<LabeledContainer>, BTreeSet<String>)> {

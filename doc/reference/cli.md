@@ -433,18 +433,32 @@ Delete old stopped session records in bulk.
 ```
 outrig clean [--older-than <duration>]
              [--yes]
+             [--build-containers]
              [--session-root <path>]
 ```
 
-| Argument / flag            | Default | Description                          |
-|----------------------------|---------|--------------------------------------|
-| `--older-than <duration>`  | `30d`   | Remove sessions older than cutoff.   |
-| `--yes`, `-y`              | off     | Skip the interactive confirmation.   |
+| Argument / flag            | Default | Description                                   |
+|----------------------------|---------|-----------------------------------------------|
+| `--older-than <duration>`  | `30d`   | Remove sessions older than cutoff.            |
+| `--yes`, `-y`              | off     | Skip the interactive confirmation.            |
+| `--build-containers`       | off     | Also remove buildah working containers.       |
 
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
 The command previews matching sessions and asks once before deleting unless `--yes` is set.
 Running sessions are skipped. Sessions created with `--session-dir` remove both the symlink
-target and the symlink under the session root.
+target and the symlink under the session root. Alongside the record walk, `clean` sweeps
+*stray containers*: containers carrying `org.outrig.session` whose session record is gone.
+Stopped strays older than the cutoff are removed; running ones are only reported.
+
+`--build-containers` adds a third sweep, for the buildah *working containers* an interrupted
+build can leave behind, and needs `buildah` on `PATH`. It removes by container id, subject to
+the same `--older-than` cutoff, and previews every container before asking. It is opt-in
+because it is the one sweep outrig cannot scope: buildah offers no way to mark these
+containers and `buildah containers --filter` selects only on id, name, and ancestor, so the
+sweep covers *every* buildah working container past the cutoff, including one you created
+yourself with `buildah from`. A container whose creation time cannot be read is reported and
+left alone. Do not pair it with a short cutoff while a build is running -- the cutoff is the
+only thing keeping it away from a build in flight.
 
 ## Exit codes
 

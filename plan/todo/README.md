@@ -22,7 +22,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-50` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
+`0002-51` through `0002-54` are what is left of the 0.2.0 release gate, derived from an external
 release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
 below is that report's recommended sequencing: security semantics first (`0002-37` and
 `0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
@@ -33,7 +33,6 @@ freeze, then release engineering. Each task carries its own evidence; the report
 
 | Task      | What it settles                                                   |
 | --------- | ----------------------------------------------------------------- |
-| `0002-50` | A cancelled build owns the working containers buildah made for it |
 | `0002-51` | `Config.Env` joins `Config.Entrypoint` and `Config.Cmd` as a read |
 | `0002-52` | A fresh RC, and a packaging check that can catch a reused version |
 | `0002-53` | The e2e suite runs for real, on both architectures                |
@@ -60,10 +59,6 @@ Cross-cutting notes the individual tasks carry rather than this file:
   those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
 - `0002-52` records the soak parameters before rc.3 ships; `0002-54` checks that record rather than
   composing one after the fact.
-- `0002-50` is lifecycle work sitting inside the release block because it was found after the
-  ordering was set: `0002-39` closed a process leak and opened a smaller engine-resource one, which
-  `0002-52` should ship rather than describe. Its acceptance needs a live engine, so it shares a
-  fixture with `0002-53` and runs in that harness if `0002-53` lands first.
 - Gate item 17 ships **partially met**: `0002-48` enforces the API snapshots, and the downstream
   runtime-core surface test (`plan/next/container-surface-test.md`) is a deliberate, recorded
   exception rather than an omission.

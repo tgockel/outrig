@@ -3,9 +3,11 @@
 
 pub mod app;
 pub mod build;
+pub mod build_containers;
 pub mod clean;
 pub mod design_prompt;
 pub mod discard;
+pub mod engine;
 pub mod env_arg;
 pub mod logs;
 pub mod ls;

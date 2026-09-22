@@ -293,3 +293,51 @@ fn image_tag_reads_back_what_it_was_built_from() {
     assert_eq!(from_str.to_string(), "docker.io/library/alpine:3.20");
     assert_eq!(from_string.into_string(), "docker.io/library/alpine:3.20");
 }
+
+/// A temporary tag stays inside the 128 characters an engine accepts, however
+/// long the caller's ref is.
+///
+/// `build_standalone` hands this whatever ref the project declared, and a
+/// 128-character tag is valid. Echoing it back under a nonce would push the
+/// *build* over the limit and fail a build that used to succeed, so the
+/// echoed part is bounded.
+#[test]
+fn a_temporary_tag_fits_an_engine_tag_however_long_the_caller_ref_is() {
+    const OCI_TAG_LIMIT: usize = 128;
+
+    for key_len in [1, 16, 32, 33, OCI_TAG_LIMIT] {
+        let key = "k".repeat(key_len);
+        let temp = super::temporary_build_tag(&super::ImageTag::new(format!("rust-dev:{key}")));
+        let (repo, tag) = temp
+            .as_str()
+            .rsplit_once(':')
+            .expect("a temporary tag always has a tag part");
+        assert_eq!(repo, "rust-dev");
+        assert!(
+            tag.len() <= OCI_TAG_LIMIT,
+            "a {key_len}-character key produced a {}-character tag: {tag}",
+            tag.len()
+        );
+        assert!(
+            tag.starts_with("outrig-tmp-"),
+            "the temporary shape is what every cleanup selects on, got {tag}"
+        );
+    }
+}
+
+/// A registry port is not a tag separator, and a ref with no tag keeps its
+/// own repository rather than landing in `outrig-cache`.
+#[test]
+fn a_temporary_tag_splits_a_ref_where_the_engine_would() {
+    let cases = [
+        ("rust-dev:1.0", "rust-dev"),
+        ("localhost:5000/team/img", "localhost:5000/team/img"),
+        ("rust-dev", "rust-dev"),
+    ];
+    for (input, expected_repo) in cases {
+        let temp = super::temporary_build_tag(&super::ImageTag::new(input));
+        let (repo, tag) = temp.as_str().rsplit_once(':').expect("tagged");
+        assert_eq!(repo, expected_repo, "for {input}");
+        assert!(!tag.contains('/'), "a tag may not contain a slash: {tag}");
+    }
+}

@@ -344,6 +344,13 @@ the build on a cache hit -- a standalone build tags a stable, caller-named ref w
 hash, so there is no project-level cache to skip: `--no-cache` only forwards `--no-cache` to
 buildah to force a clean build.
 
+The build itself runs into a temporary `outrig-tmp-*` tag and is renamed to `<ref>` once it
+succeeds, so a cancelled or failed build cannot leave a half-built image under the name you
+asked for -- which may already belong to something else. The rename adds a name to an image
+that already exists; no layer is copied. A cancelled build is asked to stop rather than killed,
+so buildah removes the per-stage working containers it made; see
+[Concepts -> Containers](../concepts/containers.md).
+
 ## outrig image inspect
 
 `outrig image inspect` prints the OutRig config labels declared by an image. It is read-only:

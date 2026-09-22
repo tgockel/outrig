@@ -11,13 +11,28 @@
 //! back as an [`Owned`]. Other modules are entitled to rely on two properties
 //! of that.
 //!
-//! **Dropping the future kills the child.** `Owned`'s destructor sends
-//! `SIGKILL` synchronously -- the signal has been delivered by the time the
-//! drop returns -- and hands the reap to a task on the runtime that spawned
-//! the child, since a tokio `Child` is bound to its own runtime's signal
-//! driver. The command also carries `kill_on_drop(true)`, which covers the
-//! case where that task is never polled: the child is killed again (harmless)
-//! and tokio's orphan queue reaps it instead.
+//! **Dropping the future terminates the child.** `Owned`'s destructor signals
+//! synchronously -- the signal has been delivered by the time the drop
+//! returns -- and hands the reap to a task on the runtime that spawned the
+//! child, since a tokio `Child` is bound to its own runtime's signal driver.
+//! The command also carries `kill_on_drop(true)`, which covers the case where
+//! that task is never polled: the child is killed again (harmless) and
+//! tokio's orphan queue reaps it instead.
+//!
+//! *Which* signal is the spawn's [`Termination`] claim. `Kill` is the default
+//! and sends `SIGKILL`; `TermThenKill` sends `SIGTERM` and lets the reap task
+//! escalate once a grace has passed without an exit. The bound is the same
+//! either way -- something was delivered before the drop returned, and the
+//! process will be gone -- but a graceful stop trades a bounded delay for the
+//! chance that the child cleans up after itself on the way out. It is for the
+//! one command that owns resources outrig cannot name; see [`Termination`].
+//!
+//! A grace is worth something only while this runtime is alive. A runtime
+//! shutting down inside one drops the reap task, `kill_on_drop` escalates
+//! immediately, and the child is back to being killed outright. Ctrl-C is not
+//! covered by this mechanism at all and does not need to be: the terminal
+//! delivers `SIGINT` to the whole foreground process group, so the child has
+//! a catchable signal from the kernel before outrig does anything.
 //!
 //! So the bound a caller who never passes a stop signal gets is **terminated
 //! synchronously, reaped as soon as the runtime is next driven** -- measured
@@ -61,7 +76,7 @@ use std::future::Future;
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -73,6 +88,33 @@ use crate::error::{IoPathExt, OutrigError, Result};
 
 pub(crate) const STDERR_TAIL_LIMIT: usize = 1024 * 1024;
 const TRUNCATED_MARKER: &str = "... (truncated) ...\n";
+
+/// What a child is sent when the future owning it is abandoned.
+///
+/// [`Termination::Kill`] is the default and is right for nearly everything:
+/// a catchable signal buys nothing from a client that creates nothing outrig
+/// cannot already name, and every engine-side resource outrig *can* name is
+/// covered by a [`crate::supervise::CleanupGuard`] that removes it by a
+/// selector only this attempt can be.
+///
+/// The exception is a command owning resources outrig cannot name at all.
+/// `buildah build` creates a working container per stage; buildah offers no
+/// way to label or name them, and `buildah containers --filter` selects only
+/// on id, name, and ancestor -- so outrig can neither mark them going in nor
+/// pick them out afterwards. Asking buildah to stop is what gets them removed
+/// by the one process that holds their ids: buildah itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Termination {
+    /// `SIGKILL`, delivered synchronously as the drop returns.
+    Kill,
+    /// `SIGTERM`, then `SIGKILL` once the grace has passed without an exit.
+    ///
+    /// The grace rides in the variant rather than being read from a constant
+    /// so a test can pin a short one without sharing mutable state with the
+    /// production value, and so the number stays with the caller that knows
+    /// what it is waiting for rather than in here.
+    TermThenKill(Duration),
+}
 const STREAM_READ_CHUNK: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
@@ -130,10 +172,16 @@ impl Cmd {
     /// what makes ownership structural rather than something each call site
     /// has to remember. `kill_on_drop(true)` is applied here and nowhere else.
     ///
+    /// `termination` is the one thing a call site does have to state. It is
+    /// a claim about what the child owns that outrig does not -- not a
+    /// preference -- so it is spelled at the spawn in the same way
+    /// [`crate::supervise::Reissue`] is spelled at the cleanup, rather than
+    /// guessed from an argv.
+    ///
     /// Synchronous on purpose. An `async fn` would put a cancellation point
     /// between the `spawn` and the `Owned` that owns its child, which is the
     /// window this abstraction exists to close.
-    pub(crate) fn spawn_owned(&self, stdio: StdioSpec) -> Result<Owned> {
+    pub(crate) fn spawn_owned(&self, stdio: StdioSpec, termination: Termination) -> Result<Owned> {
         // The reap has to run on the runtime that created the child, because
         // a tokio `Child` polls that runtime's SIGCHLD driver. Both this and
         // the spawn below need a runtime to be current; taking the handle
@@ -148,10 +196,19 @@ impl Cmd {
             .stderr(stdio.stderr)
             .kill_on_drop(true);
 
-        let child = command.spawn().map_err(|e| self.spawn_error(e))?;
+        let mut child = command.spawn().map_err(|e| self.spawn_error(e))?;
+        // Duplicated here rather than where a caller takes the pipes, so the
+        // invariant is "a graceful child keeps its write ends usable until
+        // the reap" and not "... if somebody took its readers".
+        let keepalive = match termination {
+            Termination::Kill => Vec::new(),
+            Termination::TermThenKill(_) => keep_pipes_open(&mut child),
+        };
         Ok(Owned {
             child: Some(child),
             handle,
+            termination,
+            keepalive,
         })
     }
 
@@ -240,6 +297,79 @@ pub(crate) struct Owned {
     /// `Drop` has nothing to do.
     child: Option<Child>,
     handle: Handle,
+    /// What the abandoning paths send. Fixed at the spawn, because the claim
+    /// it encodes is about the command, not about the moment it is stopped.
+    termination: Termination,
+    /// Duplicates of the read ends of this child's pipes, held until it is
+    /// reaped. Empty unless the policy is graceful.
+    ///
+    /// A stop is worth nothing to a child that cannot write. The helpers hand
+    /// each pipe to a [`Drain`], which **aborts** when dropped, and a dropped
+    /// future drops the drain before it drops this -- so the read end is gone
+    /// before the signal goes out, and the child's next write to the pipe
+    /// gets `EPIPE`. Go turns that into `SIGPIPE` on fds 1 and 2 and dies on
+    /// the spot, which is precisely the abrupt ending the stop exists to
+    /// avoid: measured against buildah 1.33.7, a build stopped this way exits
+    /// on signal 13 and leaves the working container it was told to clean up.
+    ///
+    /// Holding a duplicate keeps the pipe open without reading it. After the
+    /// drain is aborted nothing consumes it, so a child that wrote more than
+    /// the pipe buffer would block -- bounded by the grace, and far past what
+    /// a teardown writes.
+    ///
+    /// **This is why a drain may not stop before its stream ends.** Until the
+    /// abort, the pipe's only protection against filling is that something is
+    /// reading it; with this duplicate open, a drain that gives up early
+    /// leaves the child blocked on a write with nobody coming, no
+    /// cancellation, and no grace running. The helpers hold that up: neither
+    /// invalid UTF-8 nor a failed transcript write ends a drain, and a read
+    /// error only does because it means the pipe is already broken.
+    keepalive: Vec<std::os::fd::OwnedFd>,
+}
+
+/// Duplicate the read end of each of `child`'s pipes, so they stay open for
+/// as long as the duplicates are held. See [`Owned::keepalive`] for what
+/// happens to a stopped child that cannot write.
+///
+/// A descriptor this cannot duplicate is dropped rather than raised: running
+/// out is a condition the spawn above would already have failed on, and
+/// degrading to the ungraceful ending is better than failing a build over it.
+fn keep_pipes_open(child: &mut Child) -> Vec<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd as _;
+
+    let mut kept = Vec::new();
+    let readers = [
+        child.stdout.as_ref().map(|s| s.as_fd()),
+        child.stderr.as_ref().map(|s| s.as_fd()),
+    ];
+    for reader in readers.into_iter().flatten() {
+        match reader.try_clone_to_owned() {
+            Ok(duplicate) => kept.push(duplicate),
+            Err(e) => tracing::debug!(target: "outrig::process", error = %e, "pipe keepalive"),
+        }
+    }
+    kept
+}
+
+/// Ask `child` to stop, reporting whether the signal was delivered.
+///
+/// Naming a pid is safe here and in few other places: this module has not
+/// waited on the child, so the kernel is still holding its slot and cannot
+/// have handed the number to anything else. The worst case is a process that
+/// has already exited, whose zombie absorbs the signal harmlessly.
+///
+/// The signal goes to the pid and never to a process group. outrig shares its
+/// group with everything it spawns, so `kill(-pgid, ..)` would be outrig
+/// signalling itself and every sibling command in flight.
+fn request_stop(child: &Child) -> bool {
+    let Some(pid) = child.id() else {
+        return false;
+    };
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .is_ok()
 }
 
 /// A stream-draining task that is **aborted** when dropped, rather than
@@ -364,6 +494,16 @@ impl Owned {
     /// asking the kernel about a pid nobody owns any more. `Drop` sees the
     /// same cached status through `try_wait` and does nothing.
     pub(crate) async fn terminate(&mut self) -> std::io::Result<()> {
+        // Under a graceful policy the caller is present to wait, so the stop
+        // is awaited here rather than handed to a detached task -- the same
+        // sequence `Drop` runs, with the confirmation `Drop` cannot give.
+        if let Termination::TermThenKill(grace) = self.termination
+            && request_stop(self.child_mut())
+            && let Ok(waited) = tokio::time::timeout(grace, self.child_mut().wait()).await
+        {
+            waited?;
+            return Ok(());
+        }
         // The only `start_kill` failure is "already exited", which is the
         // state this is trying to reach.
         let _ = self.child_mut().start_kill();
@@ -394,15 +534,47 @@ impl Drop for Owned {
         // scheduled. `kill_on_drop` would send this too, but only once
         // `child` is dropped -- which is after the reap task below has been
         // handed it, or after that task has itself been dropped.
-        let _ = child.start_kill();
+        //
+        // Which signal goes out depends on the policy, but *a* signal goes
+        // out before this returns either way: the bound other modules rely on
+        // is "terminated synchronously", and a graceful policy changes what
+        // was sent, not whether anything was. A `SIGTERM` that could not be
+        // delivered falls through to the kill rather than leaving the child
+        // unsignalled.
+        let grace = if let Termination::TermThenKill(grace) = self.termination
+            && request_stop(&child)
+        {
+            Some(grace)
+        } else {
+            // The only `start_kill` failure is "already exited", which is the
+            // state this is trying to reach.
+            let _ = child.start_kill();
+            None
+        };
         // Spawning on a runtime that has already shut down does not panic;
         // the task is dropped instead. That drops `child`, which tokio puts
         // on its orphan queue to reap on a later SIGCHLD -- so the reap still
         // happens, by the backstop rather than by this task. `kill_on_drop`
         // is what makes sure the kill has been sent by then; the queueing
         // happens either way.
+        //
+        // That backstop is also the limit of a grace: it is worth something
+        // only while this runtime is alive. A runtime shutting down inside
+        // one drops the task, and `kill_on_drop` escalates immediately --
+        // correct, and the reason the grace is not a promise.
+        //
+        // The keepalives ride along and are closed by this task's end, which
+        // is after the reap: a child asked to stop has to be able to write
+        // until it is gone.
+        let keepalive = std::mem::take(&mut self.keepalive);
         self.handle.spawn(async move {
+            if let Some(grace) = grace
+                && tokio::time::timeout(grace, child.wait()).await.is_err()
+            {
+                let _ = child.start_kill();
+            }
             let _ = child.wait().await;
+            drop(keepalive);
         });
     }
 }
@@ -462,7 +634,7 @@ impl Transcript {
 /// `buildah images --quiet TAG` for "does this tag exist?") rather than an
 /// error condition.
 pub(crate) async fn try_capture(cmd: Cmd) -> Result<Output> {
-    let mut child = cmd.spawn_owned(StdioSpec::captured_inheriting_stdin())?;
+    let mut child = cmd.spawn_owned(StdioSpec::captured_inheriting_stdin(), Termination::Kill)?;
     let stdout_task = Drain::spawn(capture_all(child.take_stdout()));
     let stderr_task = Drain::spawn(capture_all(child.take_stderr()));
 
@@ -489,7 +661,14 @@ pub(crate) async fn try_capture_logged(
     prefix: &'static str,
     transcript: Option<&Transcript>,
 ) -> Result<Output> {
-    try_capture_logged_until(cmd, prefix, transcript, std::future::pending()).await
+    try_capture_logged_until(
+        cmd,
+        prefix,
+        transcript,
+        Termination::Kill,
+        std::future::pending(),
+    )
+    .await
 }
 
 /// [`try_capture_logged`], stoppable.
@@ -516,6 +695,7 @@ pub(crate) async fn try_capture_logged_until(
     cmd: Cmd,
     prefix: &'static str,
     transcript: Option<&Transcript>,
+    termination: Termination,
     stop: impl Future<Output = ()>,
 ) -> Result<Output> {
     let transcript = transcript.cloned();
@@ -528,7 +708,7 @@ pub(crate) async fn try_capture_logged_until(
     tracing::debug!(target: "outrig::process", command = %cmd.render(), "spawn");
     let started = Instant::now();
 
-    let mut child = cmd.spawn_owned(StdioSpec::captured())?;
+    let mut child = cmd.spawn_owned(StdioSpec::captured(), termination)?;
     let stdout_task = Drain::spawn(capture_stream(
         child.take_stdout(),
         prefix,
@@ -581,7 +761,7 @@ pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
     tracing::debug!(target: "outrig::process", command = %cmd.render(), "spawn");
     let started = Instant::now();
 
-    let mut child = cmd.spawn_owned(StdioSpec::captured())?;
+    let mut child = cmd.spawn_owned(StdioSpec::captured(), Termination::Kill)?;
     let stdout_task = Drain::spawn(capture_all(child.take_stdout()));
     let stderr_task = Drain::spawn(capture_stderr_tail(child.take_stderr()));
 
@@ -619,7 +799,29 @@ pub(crate) async fn run_capture_logged(
     prefix: &'static str,
     transcript: Option<&Transcript>,
 ) -> Result<Output> {
-    let output = try_capture_logged(cmd.clone(), prefix, transcript).await?;
+    run_capture_logged_terminating(cmd, prefix, transcript, Termination::Kill).await
+}
+
+/// [`run_capture_logged`] for a caller that owns the termination claim.
+///
+/// Separate rather than a fourth parameter on the common helper: `Kill` is
+/// right for every one of its callers but the build, and a parameter on all
+/// of them would bury the single exception in a column of identical
+/// arguments instead of naming it.
+pub(crate) async fn run_capture_logged_terminating(
+    cmd: Cmd,
+    prefix: &'static str,
+    transcript: Option<&Transcript>,
+    termination: Termination,
+) -> Result<Output> {
+    let output = try_capture_logged_until(
+        cmd.clone(),
+        prefix,
+        transcript,
+        termination,
+        std::future::pending(),
+    )
+    .await?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -637,20 +839,72 @@ pub(crate) async fn run_capture_logged(
 /// inherits the parent's; stdin is null. Returns the [`ExitStatus`] -- a
 /// non-zero exit is **not** an error, since callers may want to inspect
 /// status before deciding what it means.
-pub(crate) async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitStatus> {
-    let mut child = cmd.spawn_owned(StdioSpec::streamed())?;
+pub(crate) async fn run_streamed(
+    cmd: Cmd,
+    prefix: &'static str,
+    termination: Termination,
+) -> Result<ExitStatus> {
+    let mut child = cmd.spawn_owned(StdioSpec::streamed(), termination)?;
     let stderr = child.take_stderr();
 
     let log_task = Drain::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::info!(target: "outrig::process", "[{prefix}] {line}");
+        // Bytes then lossy, rather than `lines()`, because a drain that
+        // stops early while the child is still writing is a hang. Nothing
+        // reads the pipe after that, and for a child whose read end this
+        // module holds open (see [`Owned::keepalive`]) an unread pipe fills
+        // at 64 KiB and blocks the writer -- with `wait` below still ahead
+        // of the join, on the ordinary path, with no cancellation and no
+        // grace to end it. `lines()` returns `Err` for invalid UTF-8, which
+        // a `RUN` writing binary to stderr produces, so that was reachable
+        // by a build simply being noisy.
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            // A read error means the pipe itself is broken, so there is
+            // nothing left to drain and nothing that can block on it.
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let rendered = String::from_utf8_lossy(&line);
+            tracing::info!(
+                target: "outrig::process",
+                "[{prefix}] {}",
+                rendered.trim_end_matches(['\r', '\n'])
+            );
         }
     });
 
     let status = child.wait().await?;
     log_task.join().await;
     Ok(status)
+}
+
+/// [`run_streamed`] for a caller that treats a non-zero exit as an error.
+///
+/// The streamed counterpart of [`run_capture`]'s exit check. There is no
+/// stderr tail to offer -- it was forwarded to `tracing` line by line as the
+/// command ran, which is the point of streaming -- so the error carries the
+/// argv and the code, and the output is already in the log above it.
+pub(crate) async fn run_streamed_checked(
+    cmd: Cmd,
+    prefix: &'static str,
+    termination: Termination,
+) -> Result<()> {
+    let program = cmd.program;
+    let argv = cmd.args.clone();
+    let status = run_streamed(cmd, prefix, termination).await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(OutrigError::Process {
+            program,
+            argv,
+            exit_code: status.code(),
+            stderr_tail: String::new(),
+        })
+    }
 }
 
 /// Spawn the command with all three of stdin/stdout/stderr piped, returning
@@ -663,7 +917,9 @@ pub(crate) async fn run_streamed(cmd: Cmd, prefix: &'static str) -> Result<ExitS
 /// child it has handed away. Nor does killing the client stop what it started:
 /// a dead `podman exec` leaves its in-container process running under conmon.
 pub(crate) async fn spawn_stdio(cmd: Cmd) -> Result<Child> {
-    Ok(cmd.spawn_owned(StdioSpec::bidirectional())?.into_child())
+    Ok(cmd
+        .spawn_owned(StdioSpec::bidirectional(), Termination::Kill)?
+        .into_child())
 }
 
 pub(crate) fn tail_string(bytes: &[u8], limit: usize) -> String {
@@ -765,6 +1021,11 @@ where
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     let mut captured = Vec::new();
+    // Reported once the stream is drained, never in place of draining it. A
+    // transcript on a full disk used to end this loop with the child still
+    // writing, which for a child whose read end this module holds open is a
+    // stall rather than an error -- see the drain in [`run_streamed`].
+    let mut transcript_failed = None;
     loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line).await?;
@@ -772,13 +1033,20 @@ where
             break;
         }
         captured.extend_from_slice(&line);
-        if let Some(t) = &transcript {
+        if let Some(t) = &transcript
+            && transcript_failed.is_none()
+        {
             let rendered = String::from_utf8_lossy(&line);
-            t.line(prefix, rendered.trim_end_matches(['\r', '\n']))
-                .await?;
+            let rendered = rendered.trim_end_matches(['\r', '\n']);
+            if let Err(e) = t.line(prefix, rendered).await {
+                transcript_failed = Some(e);
+            }
         }
     }
-    Ok(captured)
+    match transcript_failed {
+        Some(e) => Err(e),
+        None => Ok(captured),
+    }
 }
 
 fn render_arg(arg: &OsStr) -> String {

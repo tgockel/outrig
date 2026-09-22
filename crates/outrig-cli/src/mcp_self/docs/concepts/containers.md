@@ -412,8 +412,10 @@ is reserved and the moment outrig holds a handle for the container, there is no 
 `Drop` to run on -- so a start that is abandoned partway (a timeout, a cancelled task, an
 error) used to leave both the podman client and, potentially, the container itself. The guard
 owns that window instead: it is armed before the first podman command and removes the container
-unless a handle takes over. The same shape covers an image build's temporary tag and its
-buildah working container, neither of which any sweeper knows the name of.
+unless a handle takes over. The same shape covers an image build's temporary tag and the
+`outrig-label-<pid>-<nonce>` working container the label-stamping pass creates, neither of
+which any sweeper knows the name of. Both are outrig's own: it chose those names, and no
+other build can share them.
 
 It removes by a **per-attempt label**, not by the name it asked for. `--name` can fail because
 the name is already in use -- another session, a stray, a container you made yourself -- and
@@ -422,6 +424,29 @@ stamps a fresh `org.outrig.attempt` value on the container it asks for and remov
 create that collided made nothing carrying it, and a cleanup still in flight cannot reach a
 container you have since started under the same name. Labels are part of the creation request,
 so there is no instant in which the container exists without the mark that identifies it.
+
+**A cancelled build is asked to stop rather than killed**, and it is the only command that is.
+buildah creates a working container per *stage*, and those are not outrig's to name: buildah
+derives the name from the base image, offers no way to label one, and
+`buildah containers --filter` selects only on id, name, and ancestor. So there is nothing to
+arm a guard against -- a removal scoped to `<base>-working-container` would be a removal by a
+string two concurrent builds from one base both answer to.
+
+The stop is what resolves that. buildah installs a signal handler while a `RUN` instruction's
+command is executing; a `SIGTERM` there fails the step, and the build unwinds through its own
+stage cleanup, removing each working container by the id only it holds. Attribution becomes
+buildah's, which is the one place perfect knowledge of it exists. outrig waits a bounded grace
+and escalates to `SIGKILL` if the stop is refused, so a wedged build is still terminated.
+
+Three limits, stated rather than implied. Outside a `RUN` -- during a pull, a `COPY`, the
+commit, or the seam between two `RUN`s -- no handler is registered and buildah ends where it
+stands. The grace is only worth something while outrig's own runtime is alive; a process on
+its way out escalates immediately. And a stopped child has to be able to *write*: outrig holds
+the read ends of its pipes open until the reap, because a Go program that gets `EPIPE` on
+stdout or stderr dies of `SIGPIPE` on the spot -- which was exactly the abrupt ending the stop
+was trying to avoid. What the first two limits leave behind is collected by
+`outrig clean --build-containers`; see
+[Sessions -> outrig clean](https://tgockel.github.io/outrig/usage/sessions.html#outrig-clean).
 
 Abandoning a call also terminates the podman client it was waiting on. The signal is sent
 synchronously, as the call is abandoned; the process is reaped shortly after, without the caller

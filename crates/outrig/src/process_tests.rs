@@ -17,7 +17,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use crate::error::OutrigError;
 
-use super::{Cmd, Transcript};
+use super::{Cmd, Termination, Transcript};
 
 /// Ceiling for the drop path. Termination is synchronous and the reap is one
 /// task hop, so the real figure is microseconds; this is margin for a loaded
@@ -217,6 +217,7 @@ fn run_streamed_forwards_stderr_to_tracing() {
         super::run_streamed(
             Cmd::new("/bin/sh").args(["-c", "echo hello-from-stderr 1>&2"]),
             "test",
+            Termination::Kill,
         )
         .await
         .expect("run_streamed must succeed")
@@ -678,7 +679,13 @@ async fn a_stop_while_draining_returns_and_aborts_the_readers() {
 
     let cancel = CancellationToken::new();
     let (result, descendant) = tokio::join!(
-        super::try_capture_logged_until(cmd, "test", None, cancel.clone().cancelled_owned()),
+        super::try_capture_logged_until(
+            cmd,
+            "test",
+            None,
+            Termination::Kill,
+            cancel.clone().cancelled_owned()
+        ),
         async {
             let descendant = published_pid(&descendant_file).await;
             let direct = published_pid(&direct_file).await;
@@ -725,6 +732,7 @@ async fn a_stop_at_the_spawn_handoff_returns_after_a_confirmed_reap() {
         pid_publishing_sleeper(&path),
         "test",
         None,
+        Termination::Kill,
         cancel.cancelled_owned(),
     )
     .await;
@@ -761,6 +769,7 @@ async fn a_stopped_capture_returns_after_a_confirmed_reap() {
             pid_publishing_sleeper(&path),
             "test",
             None,
+            Termination::Kill,
             cancel.clone().cancelled_owned()
         ),
         async {
@@ -824,4 +833,278 @@ async fn a_dropped_spawn_stdio_child_is_killed() {
 
     let took = elapsed_until_gone(pid).await;
     println!("spawn_stdio drop: pid {pid} gone in {took:?} (ceiling {REAP_CEILING:?})");
+}
+
+/// A sleeper that publishes its pid, catches `SIGTERM`, records that it did,
+/// and exits of its own accord.
+///
+/// Not `exec`ed, unlike [`pid_publishing_sleeper`]: a trap cannot survive an
+/// `exec`, and catching the signal is the whole point here. `SIGKILL` cannot
+/// be caught, so the marker existing is proof that what arrived was something
+/// catchable rather than the escalation.
+fn stop_catching_sleeper(pid_file: &Path, marker: &Path) -> Cmd {
+    Cmd::new("/bin/sh").args([
+        "-c".to_string(),
+        format!(
+            "trap 'echo caught > {}; exit 0' TERM; echo $$ > {}; sleep 5 & wait",
+            marker.display(),
+            pid_file.display()
+        ),
+    ])
+}
+
+/// A sleeper that publishes its pid and then ignores `SIGTERM`.
+///
+/// An ignored disposition survives `fork` and `exec`, so the backgrounded
+/// `sleep` ignores it too and nothing short of the escalation ends this.
+fn stop_ignoring_sleeper(pid_file: &Path) -> Cmd {
+    Cmd::new("/bin/sh").args([
+        "-c".to_string(),
+        format!(
+            "trap '' TERM; echo $$ > {}; sleep 5 & wait",
+            pid_file.display()
+        ),
+    ])
+}
+
+/// The graceful drop path asks first. The marker proves a catchable signal
+/// arrived, and finishing well inside the grace proves the child reached its
+/// own ending rather than being killed at the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn a_dropped_graceful_child_is_asked_to_stop_before_it_is_killed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+    let marker = dir.path().join("caught");
+
+    let grace = Duration::from_secs(2);
+    let child = stop_catching_sleeper(&path, &marker)
+        .spawn_owned(
+            super::StdioSpec::captured(),
+            Termination::TermThenKill(grace),
+        )
+        .expect("spawn must succeed");
+    let pid = published_pid(&path).await;
+    drop(child);
+
+    let took = elapsed_until_gone(pid).await;
+    assert!(
+        marker.exists(),
+        "the child should have caught a signal it could catch"
+    );
+    assert!(
+        took < grace,
+        "the child ended at {took:?}, not inside the {grace:?} grace -- \
+         that is the escalation firing, not the child stopping"
+    );
+    println!("graceful drop: pid {pid} stopped itself in {took:?} (grace {grace:?})");
+}
+
+/// A child that refuses the stop is still killed, and not before the grace is
+/// up. The lower bound is the half that proves we waited rather than killing
+/// at once and calling it graceful.
+#[tokio::test(flavor = "current_thread")]
+async fn a_graceful_child_that_ignores_the_stop_is_killed_at_the_grace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+
+    let grace = Duration::from_millis(150);
+    let child = stop_ignoring_sleeper(&path)
+        .spawn_owned(
+            super::StdioSpec::captured(),
+            Termination::TermThenKill(grace),
+        )
+        .expect("spawn must succeed");
+    let pid = published_pid(&path).await;
+    let dropped = Instant::now();
+    drop(child);
+
+    elapsed_until_gone(pid).await;
+    let took = dropped.elapsed();
+    assert!(
+        took >= grace,
+        "pid {pid} was gone in {took:?}, inside the {grace:?} grace it was owed"
+    );
+    println!("graceful escalation: pid {pid} gone in {took:?} (grace {grace:?})");
+}
+
+/// The awaited path runs the same sequence and returns only once the child is
+/// terminated *and* reaped, matching
+/// [`a_stopped_capture_returns_after_a_confirmed_reap`].
+#[tokio::test(flavor = "current_thread")]
+async fn a_graceful_terminate_returns_after_a_confirmed_reap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+    let marker = dir.path().join("caught");
+
+    let mut child = stop_catching_sleeper(&path, &marker)
+        .spawn_owned(
+            super::StdioSpec::captured(),
+            Termination::TermThenKill(Duration::from_secs(2)),
+        )
+        .expect("spawn must succeed");
+    let pid = published_pid(&path).await;
+    child.terminate().await.expect("terminate must succeed");
+
+    assert!(
+        !occupies_a_process_slot(pid),
+        "terminate returned with pid {pid} still in the process table"
+    );
+    assert!(
+        marker.exists(),
+        "terminate should ask a graceful child to stop before killing it"
+    );
+}
+
+/// The bound 0002-39 established, pinned against this change: under the
+/// default policy a child that ignores `SIGTERM` is still gone promptly,
+/// because nothing asked it anything.
+#[tokio::test(flavor = "current_thread")]
+async fn the_default_policy_is_still_an_immediate_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+
+    let child = stop_ignoring_sleeper(&path)
+        .spawn_owned(super::StdioSpec::captured(), Termination::Kill)
+        .expect("spawn must succeed");
+    let pid = published_pid(&path).await;
+    drop(child);
+
+    let took = elapsed_until_gone(pid).await;
+    assert!(
+        took < Duration::from_secs(1),
+        "the default policy waited {took:?} for a child that ignores SIGTERM"
+    );
+    println!("default drop: pid {pid} gone in {took:?}");
+}
+
+/// A stop is worth nothing to a child that cannot write.
+///
+/// The helpers hand each pipe to a [`Drain`], which aborts when dropped, and
+/// a dropped future drops the drain first -- so without the keepalive the
+/// read end is gone before the signal goes out and the child dies of
+/// `SIGPIPE` on its first write instead of running its cleanup. The child
+/// here writes from inside its handler, so the marker only appears if the
+/// pipe was still open when the stop arrived.
+///
+/// Measured against buildah 1.33.7 before it was a test: a cancelled build
+/// exited on signal 13 and left the working container it was asked to remove.
+#[tokio::test(flavor = "current_thread")]
+async fn a_graceful_child_can_still_write_while_it_stops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = pid_file(&dir);
+    let marker = dir.path().join("caught");
+
+    let cmd = Cmd::new("/bin/sh").args([
+        "-c".to_string(),
+        format!(
+            "trap 'echo stopping 1>&2; : > {}; exit 0' TERM; echo started 1>&2; \
+             echo $$ > {}; sleep 5 & wait",
+            marker.display(),
+            path.display()
+        ),
+    ]);
+    let mut child = cmd
+        .spawn_owned(
+            super::StdioSpec::streamed(),
+            Termination::TermThenKill(Duration::from_secs(2)),
+        )
+        .expect("spawn must succeed");
+    // Taken and dropped, which is what the helpers' aborted drains amount to
+    // by the time the signal is sent.
+    drop(child.take_stderr());
+    let pid = published_pid(&path).await;
+    drop(child);
+
+    elapsed_until_gone(pid).await;
+    assert!(
+        marker.exists(),
+        "the child could not write while stopping, so it died of SIGPIPE \
+         instead of running its handler"
+    );
+}
+
+/// A noisy child does not hang a graceful build.
+///
+/// The keepalive holds the pipe's read end open, so if the drain stops before
+/// the child does, nothing is reading and the child blocks once the 64 KiB
+/// pipe buffer fills -- with no cancellation in sight and no grace to end it.
+/// Invalid UTF-8 on stderr used to do exactly that, because `lines()` yields
+/// `Err` for it and the drain's loop ended there.
+///
+/// The child writes a bad byte and then far more than a pipe buffer's worth,
+/// so a drain that gave up at the bad byte cannot reach the end.
+#[tokio::test(flavor = "current_thread")]
+async fn a_graceful_child_writing_invalid_utf8_still_finishes() {
+    let cmd = Cmd::new("/bin/sh").args([
+        "-c".to_string(),
+        // `printf` writes the lone continuation byte 0x80, which is not
+        // valid UTF-8 in any position.
+        "printf '\\200\\n' 1>&2; i=0; while [ $i -lt 2000 ]; do \
+         echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1>&2; \
+         i=$((i+1)); done"
+            .to_string(),
+    ]);
+
+    let status = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::run_streamed(
+            cmd,
+            "test",
+            Termination::TermThenKill(Duration::from_secs(5)),
+        ),
+    )
+    .await
+    .expect("the child blocked on an unread pipe instead of finishing")
+    .expect("run_streamed must succeed");
+    assert!(status.success());
+}
+
+/// The same hazard on the captured path: a transcript that cannot be written
+/// must not take the drain down with it.
+///
+/// `/dev/full` fails every write with `ENOSPC`, so the transcript genuinely
+/// fails rather than merely looking like it might -- unlinking a file would
+/// not have done it, since the descriptor it already holds keeps working.
+///
+/// The stream is a `duplex` whose buffer is far smaller than what the writer
+/// sends, so the writer can only run to completion if something kept reading.
+/// That completion is the assertion, and it is what the old implementation
+/// fails: a drain that gives up at the first transcript error abandons the
+/// stream with the writer still going.
+///
+/// What the writer then *sees* differs from production by construction -- a
+/// dropped `duplex` half reports an error, where a real pipe whose read end
+/// [`Owned::keepalive`] still holds open would block instead. The property
+/// under test is the one that matters either way: the drain does not stop
+/// before its stream ends.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failing_transcript_does_not_stop_the_drain() {
+    let transcript = Transcript::create(Path::new("/dev/full"), false)
+        .await
+        .expect("a transcript whose every write fails");
+
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let pump = tokio::spawn(async move {
+        for _ in 0..200 {
+            writer.write_all(b"a line of output\n").await?;
+        }
+        writer.shutdown().await
+    });
+
+    let drained = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::capture_stream(reader, "test", Some(transcript)),
+    )
+    .await
+    .expect("the drain stopped reading and never returned");
+
+    assert!(
+        drained.is_err(),
+        "a transcript that failed every write should still be reported"
+    );
+    tokio::time::timeout(Duration::from_secs(20), pump)
+        .await
+        .expect("the writer was left blocked on a stream nobody was draining")
+        .expect("the pump task panicked")
+        .expect("the writer must have been able to finish");
 }

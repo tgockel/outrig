@@ -98,6 +98,28 @@ Force a rebuild without changing files:
 $ outrig build --no-cache
 ```
 
+## Cancelling a build
+
+Ctrl-C, a timeout, or an abandoned MCP call stops a build in flight. outrig asks buildah to
+stop rather than killing it outright, and waits a bounded grace before escalating, because a
+buildah that unwinds removes the per-stage *working containers* it created and a killed one
+does not. Those are the one engine resource outrig cannot name for itself: buildah derives
+their names from the base image and offers no way to label them, so the only process that can
+prove which belong to this build is buildah.
+
+What a cancelled build leaves:
+
+- **The temporary `outrig-tmp-*` tag** is removed. It carries this build's pid and a nonce, so
+  nothing else on the machine can be what the removal names.
+- **The stage working containers** are removed by buildah, if the stop landed while a `RUN` was
+  executing.
+- **The final `<name>:<hash>` tag** was never created; the commit is the last step.
+
+The gap is the second row's condition. buildah installs its signal handler only while a `RUN`'s
+command is running, so a build stopped during a pull, a `COPY`, the commit, or the seam between
+two `RUN`s still ends where it stands and can leave a working container behind. Collect those
+with [`outrig clean --build-containers`](sessions.md#outrig-clean).
+
 ## Exit codes
 
 - `0` -- every selected image is built or cache-hit.

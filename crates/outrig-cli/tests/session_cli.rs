@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use clap::Parser;
+use outrig_cli::cli::build_containers::BuildContainer;
 use outrig_cli::cli::{clean, discard, logs, ls};
 use outrig_cli::session::{Session, SessionId, SessionStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -753,7 +754,20 @@ fn days(count: u64) -> Duration {
 }
 
 fn clean_args(older_than: Duration, yes: bool) -> clean::CleanArgs {
-    clean::CleanArgs { older_than, yes }
+    clean::CleanArgs {
+        older_than,
+        yes,
+        build_containers: false,
+    }
+}
+
+/// A removal sink for a `clean` case that expects nothing to be removed.
+///
+/// A named fn item rather than twenty `|_| async { Ok(()) }` literals, and
+/// the same shape production passes: `podman_remove_force_batch` and
+/// `buildah_remove_batch` are fn items too.
+async fn no_removals(names: Vec<String>) -> outrig_cli::error::Result<()> {
+    panic!("nothing should have been removed, but {names:?} was");
 }
 
 fn clean_now() -> SystemTime {
@@ -835,7 +849,9 @@ async fn clean_default_30d_removes_only_old_finished_sessions() {
         now,
         BTreeSet::new(),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -893,7 +909,9 @@ async fn clean_custom_older_than_uses_requested_cutoff() {
         now,
         BTreeSet::new(),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -930,7 +948,9 @@ async fn clean_without_yes_aborts_on_n() {
         now,
         BTreeSet::new(),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -968,7 +988,9 @@ async fn clean_accepts_yes_at_prompt() {
         now,
         BTreeSet::new(),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -999,7 +1021,9 @@ async fn clean_skips_running_sessions() {
         now,
         BTreeSet::from([running]),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -1035,7 +1059,9 @@ async fn clean_removes_stale_unfinalized_non_running_sessions() {
         now,
         BTreeSet::new(),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -1078,7 +1104,9 @@ async fn clean_removes_symlinked_session_target_and_link() {
         now,
         BTreeSet::new(),
         Vec::new(),
-        |_| async { Ok(()) },
+        Vec::new(),
+        no_removals,
+        no_removals,
     )
     .await
     .expect("clean");
@@ -1179,6 +1207,7 @@ async fn clean_removes_old_stopped_stray_containers() {
         now,
         BTreeSet::new(),
         strays,
+        Vec::new(),
         move |names: Vec<String>| {
             let batches = batches_ref.clone();
             async move {
@@ -1186,6 +1215,7 @@ async fn clean_removes_old_stopped_stray_containers() {
                 Ok(())
             }
         },
+        no_removals,
     )
     .await
     .expect("clean");
@@ -1253,6 +1283,7 @@ async fn clean_spares_containers_of_unreadable_records() {
         now,
         BTreeSet::new(),
         strays,
+        Vec::new(),
         move |names: Vec<String>| {
             let batches = batches_ref.clone();
             async move {
@@ -1260,6 +1291,7 @@ async fn clean_spares_containers_of_unreadable_records() {
                 Ok(())
             }
         },
+        no_removals,
     )
     .await
     .expect("clean must survive an unreadable record");
@@ -1323,6 +1355,7 @@ async fn clean_never_removes_running_or_record_backed_containers() {
             "outrig-orphan".to_string(),
         ]),
         strays,
+        Vec::new(),
         move |names: Vec<String>| {
             let batches = batches_ref.clone();
             async move {
@@ -1330,6 +1363,7 @@ async fn clean_never_removes_running_or_record_backed_containers() {
                 Ok(())
             }
         },
+        no_removals,
     )
     .await
     .expect("clean");
@@ -1390,6 +1424,7 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
         now,
         BTreeSet::new(),
         strays,
+        Vec::new(),
         move |names: Vec<String>| {
             let batches = batches_ref.clone();
             async move {
@@ -1397,6 +1432,7 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
                 Ok(())
             }
         },
+        no_removals,
     )
     .await
     .expect("clean");
@@ -1411,5 +1447,120 @@ async fn clean_sweeps_strays_of_records_removed_in_same_run() {
     assert!(
         err.contains("cleaned 1 session and 1 stray container"),
         "summary should mention both: {err}"
+    );
+}
+
+fn build_container(id: &str, name: &str, created: Option<SystemTime>) -> BuildContainer {
+    BuildContainer {
+        id: id.to_string(),
+        name: name.to_string(),
+        image: "localhost/outrig-cache:d8aa33".to_string(),
+        created,
+    }
+}
+
+/// `--build-containers` removes by id, honors the same cutoff as every other
+/// sweep, and reports rather than removes a container whose age it could not
+/// establish -- the rule that keeps it away from a build in flight.
+#[tokio::test]
+async fn clean_removes_old_build_containers_by_id() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let build = vec![
+        build_container(
+            "213c716fa504aa1f",
+            "old-working-container",
+            Some(now - days(40)),
+        ),
+        build_container(
+            "00000000beef0000",
+            "young-working-container",
+            Some(now - days(1)),
+        ),
+        build_container("ffffffffdead0000", "undated-working-container", None),
+    ];
+
+    let removed: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+    let removed_ref = removed.clone();
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let mut args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    args.build_containers = true;
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        Vec::new(),
+        build,
+        no_removals,
+        move |ids: Vec<String>| {
+            let removed = removed_ref.clone();
+            async move {
+                removed.lock().unwrap().push(ids);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+    assert_eq!(rc, 0);
+
+    assert_eq!(
+        removed.lock().unwrap().clone(),
+        vec![vec!["213c716fa504aa1f".to_string()]],
+        "only the container past the cutoff should be removed, and by its id"
+    );
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("skipped build containers with no creation time"),
+        "an undatable container should be reported: {err}"
+    );
+    assert!(
+        err.contains("undated-working-container"),
+        "the report should name it: {err}"
+    );
+    assert!(
+        err.contains("cleaned 1 build container"),
+        "the summary should count build containers: {err}"
+    );
+}
+
+/// With the flag off, nothing about `clean` changes -- including the wording
+/// of the nothing-to-do line, which existing runs and tests read.
+#[tokio::test]
+async fn clean_without_the_flag_reads_exactly_as_before() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args(clean::DEFAULT_OLDER_THAN, true);
+    clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        Vec::new(),
+        Vec::new(),
+        no_removals,
+        no_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("no stopped sessions or stray containers older than 30d"),
+        "the empty-case wording should be unchanged: {err}"
     );
 }

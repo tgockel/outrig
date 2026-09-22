@@ -1049,6 +1049,7 @@ impl Container {
             self.engine_call(stop.clone()),
             "podman",
             self.transcript.as_ref(),
+            process::Termination::Kill,
             // Saturating, because `grace` is a caller's number and
             // `Duration`'s `+` panics on overflow: a library caller passing
             // `Duration::MAX` -- or anything within `MIN_REMOVAL_BUDGET` of it
@@ -1096,6 +1097,7 @@ impl Container {
             self.engine_call(removal.clone()),
             "podman",
             self.transcript.as_ref(),
+            process::Termination::Kill,
             tokio::time::sleep(self.engine_budget(removal_budget)),
         )
         .await;

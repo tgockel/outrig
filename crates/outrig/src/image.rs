@@ -40,6 +40,65 @@ const UNSUPPORTED_REMOTE_TRANSPORTS: &[&str] = &[
     "oci-archive:",
 ];
 
+/// How long a stopped `buildah build` gets to reach its own ending before
+/// `SIGKILL` follows.
+///
+/// A `SIGTERM` reaching buildah mid-`RUN` is forwarded to the command in the
+/// stage container and escalated there; the build then fails and unwinds
+/// through its own stage cleanup. So the grace has to cover buildah's
+/// escalation *plus* the removal of every working container the build made,
+/// not merely the time to deliver a signal. Nothing waits on it -- the grace
+/// is paid by a detached task, and the drop that started it returns at once
+/// -- so erring long costs a process that lingers, and erring short costs the
+/// leak this exists to prevent. Measured on buildah 1.33.7, the whole unwind
+/// takes about 200 ms.
+const BUILD_TERM_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(any(test, feature = "e2e"))]
+tokio::task_local! {
+    /// Set for the duration of one [`ungraceful_build_termination`] call.
+    ///
+    /// Task-local rather than a process-wide flag: the override then belongs
+    /// to the call being tested instead of to whichever test happens to be
+    /// running, and needs no lock, no reset, and no guard against a panicking
+    /// test leaving it on.
+    static FORCE_UNGRACEFUL_BUILD: ();
+}
+
+/// How a cancelled `buildah build` is stopped.
+///
+/// The only command outrig asks to stop rather than killing outright. Its
+/// per-stage working containers carry no mark outrig can put on them and no
+/// mark `buildah containers --filter` could select by, so the sole process
+/// able to prove which ones belong to this build is buildah, which holds
+/// their ids. A `SIGTERM` reaching it during a `RUN` fails the build, and the
+/// build unwinds through its own stage cleanup on the way out.
+///
+/// Not a guarantee, and deliberately not described as one. Outside a `RUN`
+/// -- during a pull, a `COPY`, the final commit, or the seam between two
+/// `RUN`s -- buildah has no handler registered and dies where it stands, and
+/// so does it if outrig's runtime goes away inside the grace. What is left
+/// over is what `outrig clean --build-containers` exists to collect.
+fn build_termination() -> process::Termination {
+    #[cfg(any(test, feature = "e2e"))]
+    if FORCE_UNGRACEFUL_BUILD.try_with(|()| ()).is_ok() {
+        return process::Termination::Kill;
+    }
+    process::Termination::TermThenKill(BUILD_TERM_GRACE)
+}
+
+/// Run `build` with a cancellation killing buildah outright, as it did before
+/// the graceful stop existed.
+///
+/// Exists so a live-engine test can *show* the working-container leak come
+/// back when the stop is taken away, rather than assume the assertion that
+/// passes would have failed without it. Compiled only for tests and the `e2e`
+/// feature, so it is not part of the shipped surface.
+#[cfg(any(test, feature = "e2e"))]
+pub async fn ungraceful_build_termination<F: std::future::Future>(build: F) -> F::Output {
+    FORCE_UNGRACEFUL_BUILD.scope((), build).await
+}
+
 /// Repository name for a build-type image: the image-config name, falling back
 /// to [`TAG_PREFIX`] for the nameless library path ([`UNNAMED_IMAGE`]).
 fn tag_repo(image: &str) -> &str {
@@ -324,18 +383,12 @@ pub async fn ensure_local_image(
 /// Pull an image by ref via `podman pull`. Stderr is streamed to
 /// `tracing::info!` with the `[podman]` prefix.
 pub async fn pull_image(tag: &ImageTag) -> Result<()> {
-    let cmd = Cmd::new("podman").arg("pull").arg(tag.as_str());
-    let argv_for_error = cmd.args.clone();
-    let status = process::run_streamed(cmd, "podman").await?;
-    if !status.success() {
-        return Err(OutrigError::Process {
-            program: "podman",
-            argv: argv_for_error,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        });
-    }
-    Ok(())
+    process::run_streamed_checked(
+        Cmd::new("podman").arg("pull").arg(tag.as_str()),
+        "podman",
+        process::Termination::Kill,
+    )
+    .await
 }
 
 /// Logged sibling of [`pull_image`] for session startup.
@@ -362,6 +415,27 @@ pub async fn build_image_for(
     build_image_with_build_args(cfg, repo_root, tag, no_cache, &build_args).await
 }
 
+/// Run `build` against a temporary tag, and own that tag whatever happens to
+/// it.
+///
+/// The envelope every build path shares, held in one place because its
+/// ordering is the load-bearing part: the guard is armed before the tag can
+/// exist, so the store never holds it unowned, and released strictly *after*
+/// the awaited cleanup, because a cancellation landing inside that cleanup is
+/// the case the guard is for. Three call sites got that right independently;
+/// one is easier to keep right.
+async fn into_temp_tag<F>(tag: &ImageTag, transcript: Option<&Transcript>, build: F) -> Result<()>
+where
+    F: AsyncFnOnce(&ImageTag) -> Result<()>,
+{
+    let temp_tag = temporary_build_tag(tag);
+    let temp_owned = temp_tag_guard(&temp_tag);
+    let result = build(&temp_tag).await;
+    cleanup_temp_image(&temp_tag, transcript).await;
+    temp_owned.release();
+    result
+}
+
 async fn build_image_with_build_args(
     cfg: &ImageConfig,
     repo_root: &Path,
@@ -369,26 +443,16 @@ async fn build_image_with_build_args(
     no_cache: bool,
     build_args: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let temp_tag = temporary_build_tag(tag);
-    let temp_owned = temp_tag_guard(&temp_tag);
-    let result = async {
-        let cmd = build_image_cmd(cfg, repo_root, &temp_tag, no_cache, build_args);
-        let argv_for_error = cmd.args.clone();
-        let status = process::run_streamed(cmd, "buildah").await?;
-        if !status.success() {
-            return Err(OutrigError::Process {
-                program: "buildah",
-                argv: argv_for_error,
-                exit_code: status.code(),
-                stderr_tail: String::new(),
-            });
-        }
-        stamp_repo_image_labels(&temp_tag, tag, &cfg.mcp, None).await
-    }
-    .await;
-    cleanup_temp_image(&temp_tag, None).await;
-    temp_owned.release();
-    result
+    into_temp_tag(tag, None, async |temp_tag| {
+        process::run_streamed_checked(
+            build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
+            "buildah",
+            build_termination(),
+        )
+        .await?;
+        stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, None).await
+    })
+    .await
 }
 
 async fn build_image_logged_with_build_args(
@@ -399,21 +463,17 @@ async fn build_image_logged_with_build_args(
     transcript: Option<&Transcript>,
     build_args: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let temp_tag = temporary_build_tag(tag);
-    let temp_owned = temp_tag_guard(&temp_tag);
-    let result = async {
-        process::run_capture_logged(
-            build_image_cmd(cfg, repo_root, &temp_tag, no_cache, build_args),
+    into_temp_tag(tag, transcript, async |temp_tag| {
+        process::run_capture_logged_terminating(
+            build_image_cmd(cfg, repo_root, temp_tag, no_cache, build_args),
             "buildah",
             transcript,
+            build_termination(),
         )
         .await?;
-        stamp_repo_image_labels(&temp_tag, tag, &cfg.mcp, transcript).await
-    }
-    .await;
-    cleanup_temp_image(&temp_tag, transcript).await;
-    temp_owned.release();
-    result
+        stamp_repo_image_labels(temp_tag, tag, &cfg.mcp, transcript).await
+    })
+    .await
 }
 
 /// Probe the build tag (`outrig-cache:<key>` for this nameless variant); on
@@ -538,6 +598,12 @@ pub async fn ensure_tagged_image_for(
 /// standalone build tags a stable caller-named ref (e.g. `rust-dev`), not a
 /// `<name>:<key>` content-hash tag. `no_cache` therefore only forwards
 /// `--no-cache` to buildah.
+///
+/// The build runs into a temporary tag and is renamed on success, the shape
+/// the cached paths already use. `tag` is the caller's requested output: it
+/// may exist already, and it may belong to something else, so a cancelled
+/// build must not be able to remove it. Only the intermediate image is this
+/// build's to clean up, and only that is guarded.
 pub async fn build_standalone(
     project_dir: &Path,
     dockerfile: &Path,
@@ -548,25 +614,31 @@ pub async fn build_standalone(
 ) -> Result<()> {
     let dockerfile = project_dir.join(dockerfile);
     let context = project_dir.join(context);
-    let cmd = buildah_build_cmd(
-        &dockerfile,
-        &context,
-        tag,
-        no_cache,
-        &BTreeMap::new(),
-        labels,
-    );
-    let argv_for_error = cmd.args.clone();
-    let status = process::run_streamed(cmd, "buildah").await?;
-    if !status.success() {
-        return Err(OutrigError::Process {
-            program: "buildah",
-            argv: argv_for_error,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        });
-    }
-    Ok(())
+    // The cleanup `into_temp_tag` runs below is an *untag* on the success
+    // path: `tag_image` has by then given the image a second name, so
+    // removing the temporary one leaves the image under the caller's. On the
+    // path where the build never reached the tag, it is a real delete --
+    // which is what the guard is for.
+    into_temp_tag(tag, None, async |temp_tag| {
+        // `--label` stays on the build. The cached path commits its labels
+        // afterwards because it has to merge the Dockerfile's own against the
+        // config's; a standalone project has its whole label set up front.
+        process::run_streamed_checked(
+            buildah_build_cmd(
+                &dockerfile,
+                &context,
+                temp_tag,
+                no_cache,
+                &BTreeMap::new(),
+                labels,
+            ),
+            "buildah",
+            build_termination(),
+        )
+        .await?;
+        tag_image(temp_tag, tag).await
+    })
+    .await
 }
 
 /// Read the OCI labels off a local image `tag` via `podman image inspect`. This
@@ -730,15 +802,66 @@ fn temp_tag_guard(temp_tag: &ImageTag) -> CleanupGuard {
 }
 
 fn temporary_build_tag(final_tag: &ImageTag) -> ImageTag {
-    let (repo, key) = final_tag
-        .as_str()
-        .rsplit_once(':')
-        .unwrap_or((TAG_PREFIX, "image"));
+    let raw = final_tag.as_str();
+    // Only a `:` after the last `/` introduces a tag. The cached path always
+    // hands this a `<repo>:<key>`, but `build_standalone` hands it whatever
+    // ref the project asked for -- and `localhost:5000/team/img` split on the
+    // last colon yields a "tag" of `5000/team/img`, which no engine accepts.
+    // A ref with no tag at all keeps its repository rather than falling back
+    // to `outrig-cache`, so the temporary image reads as the caller's.
+    let (repo, key) = match raw.rsplit_once(':') {
+        Some((repo, key)) if !key.contains('/') => (repo, key),
+        _ => (raw, "image"),
+    };
+    let repo = if repo.is_empty() { TAG_PREFIX } else { repo };
+    // The caller's key is carried only so the temporary image is
+    // recognizable, so it is bounded rather than trusted: an OCI tag may be
+    // 128 characters, and the cached path's 16-hex key always fits while a
+    // standalone project's ref is whatever it wants to be. Adding a nonce to
+    // a valid 128-character tag would push the *build* over the limit and
+    // fail it outright -- a build that used to succeed.
+    let key = truncate_chars(key, TEMP_TAG_KEY_LIMIT);
     ImageTag::new(format!(
-        "{repo}:outrig-tmp-{}-{}-{key}",
+        "{repo}:outrig-tmp-{}-{:032x}-{key}",
         std::process::id(),
         temp_nonce()
     ))
+}
+
+/// How much of the caller's tag a temporary tag echoes back.
+///
+/// The rest of the name is bounded by construction: `outrig-tmp-` plus a pid,
+/// a 32-hex nonce and two separators is at most 55 characters, so this keeps
+/// the whole tag inside the 128 an engine accepts.
+const TEMP_TAG_KEY_LIMIT: usize = 32;
+
+/// The first `limit` characters of `text`, split on a character boundary so a
+/// multi-byte ref cannot be cut in half.
+fn truncate_chars(text: &str, limit: usize) -> &str {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
+}
+
+/// Give a built image the name its caller asked for.
+///
+/// `buildah tag` adds a name to an image that already exists; no layer is
+/// copied and the image id is unchanged. Removing the temporary name
+/// afterwards is therefore an untag, not a delete -- which is exactly what
+/// makes the build's [`CleanupGuard`] safe to leave armed across it.
+async fn tag_image(source: &ImageTag, target: &ImageTag) -> Result<()> {
+    run_buildah_capture(
+        Cmd::new("buildah")
+            .arg("tag")
+            .arg(source.as_str())
+            .arg(target.as_str()),
+        // `build_standalone` is the only caller and has no transcript to
+        // thread: `outrig image build` streams buildah's output rather than
+        // capturing it into a session log.
+        None,
+    )
+    .await
 }
 
 fn temporary_builder_name() -> String {

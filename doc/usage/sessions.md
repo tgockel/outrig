@@ -280,6 +280,23 @@ $ outrig clean --older-than 7d
 Clean 1 session and 1 stray container? [y/N]:
 ```
 
+A third sweep, `--build-containers`, is available for the buildah *working containers* an
+interrupted build can leave behind. It is off by default and is the one sweep outrig cannot
+scope to its own work: buildah offers no way to mark these containers, so the sweep covers
+every buildah working container past the cutoff, including one you made yourself with
+`buildah from`. Removal is by container id, everything is previewed before the prompt, and a
+container whose creation time cannot be read is reported and left alone:
+
+```sh
+$ outrig clean --older-than 7d --build-containers
+[outrig] will remove 1 build container older than 7d (buildah working containers):
+  213c716fa504  outrig-cache-working-container  image localhost/outrig-cache:d8aa33
+Clean 1 build container? [y/N]:
+```
+
+The cutoff is what keeps this away from a build that is running right now, so do not pair
+`--build-containers` with a short `--older-than` while one is in flight.
+
 ## What sessions don't track
 
 - **Workspace changes.** outrig uses a direct bind-mount; mutations land on your host filesystem

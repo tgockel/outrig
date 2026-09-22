@@ -100,5 +100,10 @@ ready on either architecture.
   `crates/outrig-cli/tests/primary_view_e2e.rs` -- the `e2e`-gated suites that have never run.
 - `plan/done/phase/0002-sidecars/tasks/0002-15-e2e-imageconfig-sidecars-bitrot.md` -- where the
   `--no-run` row came from, and why the class of gap it left is still open.
+- `crates/outrig/tests/build_cancellation_e2e.rs` -- the live-engine harness 0002-50 built
+  rather than waiting for this task: unique per-test base images so every assertion is a delta,
+  and helpers for reaching a build's `RUN` window and waiting the engine back to clean. It is
+  the shape this row's other engine-state checks should take, and it needs a real buildah, so
+  it is one of the suites this has to actually run.
 - `plan/next/ci-configuration-coverage.md` -- the sibling entry, deliberately not absorbed.
 - `.github/workflows/ci.yml` -- the matrix this extends.

@@ -49,7 +49,11 @@ const CEILING: Duration = Duration::from_secs(10);
 /// cleanup scopes itself to the container it asked for.
 ///
 /// `run`, `create`, `init`, `start`, `build` and `from` sleep instead of
-/// returning, so a test can cancel while one is in flight. A `fast.<verb>.<token>` marker
+/// returning, so a test can cancel while one is in flight. `build` parks in a
+/// shell rather than `exec`ing a sleeper, because it is the one verb outrig
+/// asks to stop instead of killing and a trap cannot survive an `exec`: it
+/// records the stop as `term.<pid>`, and an `ignore.term.<token>` marker makes
+/// it refuse one so a test can reach the escalation. A `fast.<verb>.<token>` marker
 /// makes that one verb return immediately when `<token>` appears in its argv,
 /// which is how a test reaches the *boundary between* two commands instead of
 /// the middle of the first. Scoping the marker to a verb matters: `podman
@@ -63,8 +67,12 @@ printf '%s\n%s\n' "$$" "$*" > "$pending"
 # Publish this invocation: `inv.` is the prefix the test polls for, and nothing
 # may carry it before whatever a cancellation triggered by that sighting is
 # entitled to find. rename(2) is atomic, so a published record is a complete
-# one. Every exit path below publishes exactly once.
+# one. Every exit path below publishes.
+#
+# Idempotent, because `build` publishes from a different place than every
+# other verb and the paths they share must be callable from both.
 publish() {
+  [ -e "$pending" ] || return 0
   mv "$pending" "$journal/inv.${pending##*/pending.}"
 }
 
@@ -153,7 +161,11 @@ case "$1" in
     if [ -n "$label" ]; then
       printf '%s\n' "$subject" > "$journal/labeled.$label"
     fi
-    publish
+    # `build` publishes later, once its trap is in place -- see the parking
+    # block below. A test that cancels on first sight would otherwise be
+    # racing the trap's installation, and would measure the window before the
+    # client could catch anything rather than what it does when it can.
+    [ "$1" = build ] || publish
     # What podman writes for a `create` or a detached `run`: the container's
     # id, 64 hex digits and nothing else. Outrig refuses to build a handle
     # without one -- a handle that cannot name what it made can only name it by
@@ -167,9 +179,49 @@ case "$1" in
       [ -e "$marker" ] || continue
       token=${marker##*/fast.$1.}
       case " $* " in
-        *"$token"*) exit 0 ;;
+        *"$token"*) publish; exit 0 ;;
       esac
     done
+    # `build` is the one verb outrig asks to stop instead of killing, so it
+    # has to stay a shell that can see the signal -- a trap cannot survive an
+    # `exec`. It records the stop as `term.<pid>`, under the same pid the
+    # journal published, so a test can name one process for both the signal
+    # and the reap. `SIGKILL` cannot be trapped, so that file existing is
+    # proof of a signal the client could have acted on.
+    #
+    # An `ignore.term.<token>` marker makes the parked build record the stop
+    # and refuse it, which is how a test reaches the escalation behind it.
+    if [ "$1" = build ]; then
+      ignore=
+      for marker in "$journal"/ignore.term.*; do
+        [ -e "$marker" ] || continue
+        token=${marker##*/ignore.term.}
+        case " $* " in
+          *"$token"*) ignore=1 ;;
+        esac
+      done
+      sleep 30 &
+      child=$!
+      if [ -n "$ignore" ]; then
+        trap ': > "$journal/term.$$"' TERM
+      else
+        # The sleeper goes with the shell: it is forked rather than `exec`ed
+        # here, so without this it would outlive the stop it was standing in
+        # for and leak into the developer's session.
+        trap ': > "$journal/term.$$"; kill "$child" 2>/dev/null; exit 0' TERM
+      fi
+      # Only now is this invocation safe to act on: the trap is installed, so
+      # a stop arriving the instant a test sees this record is one the client
+      # can answer rather than the window before it could.
+      publish
+      # `wait` returns as soon as a trapped signal runs, so a refused stop
+      # comes back here. The accepting trap exits from inside itself and
+      # never returns, so one loop serves both.
+      while kill -0 "$child" 2>/dev/null; do
+        wait "$child" 2>/dev/null
+      done
+      exit 0
+    fi
     # `exec` so the pid recorded above is the process that is actually
     # asleep: a forked `sleep` would survive the kill and leak into the
     # developer's session. 30s is comfortably longer than any ceiling here, so
@@ -248,6 +300,33 @@ fn unique_name(what: &str) -> String {
 /// `token` appears in its argv.
 fn return_immediately_for(journal: &Path, verb: &str, token: &str) {
     std::fs::write(journal.join(format!("fast.{verb}.{token}")), "").expect("write fast marker");
+}
+
+/// Make the fake's parked `build` record a stop and refuse it, so a test can
+/// reach the escalation waiting behind the grace.
+fn ignore_stop_for(journal: &Path, token: &str) {
+    std::fs::write(journal.join(format!("ignore.term.{token}")), "").expect("write ignore marker");
+}
+
+/// Whether the fake running as `pid` was sent something it could catch.
+///
+/// `SIGKILL` cannot be trapped, so this file can only have been written by a
+/// client that was asked to stop rather than killed where it stood.
+fn was_asked_to_stop(journal: &Path, pid: u32) -> bool {
+    journal.join(format!("term.{pid}")).exists()
+}
+
+/// Wait until the fake running as `pid` records a catchable stop.
+async fn expect_asked_to_stop(journal: &Path, pid: u32) -> Duration {
+    let started = Instant::now();
+    while !was_asked_to_stop(journal, pid) {
+        assert!(
+            started.elapsed() < CEILING,
+            "pid {pid} was never asked to stop within {CEILING:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    started.elapsed()
 }
 
 /// Make the fake's `verb` fail the way podman fails a name collision: nothing
@@ -476,11 +555,20 @@ fn still_running(pid: u32) -> bool {
 /// why `kill(pid, 0)` is both the liveness and the no-zombie assertion, and
 /// why this has to be async.
 async fn expect_gone(pid: u32) -> Duration {
+    expect_gone_within(pid, CEILING).await
+}
+
+/// [`expect_gone`] with a ceiling of the caller's choosing.
+///
+/// A build that refuses its stop is not gone until the grace behind it has
+/// expired, and that grace is the production one -- longer, by design, than
+/// the ceiling every other wait here uses.
+async fn expect_gone_within(pid: u32, ceiling: Duration) -> Duration {
     let started = Instant::now();
     while still_running(pid) {
         assert!(
-            started.elapsed() < CEILING,
-            "pid {pid} still occupied a process slot after {CEILING:?}"
+            started.elapsed() < ceiling,
+            "pid {pid} still occupied a process slot after {ceiling:?}"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -837,4 +925,266 @@ async fn a_caller_cannot_claim_the_attempt_label() {
         .filter(|(_, argv)| argv.contains(&name))
         .count();
     assert_eq!(started, 0, "nothing should have been spawned");
+}
+
+/// A cancelled build asks buildah to stop before it kills it.
+///
+/// The one command outrig stops this way, and the reason is what the fake
+/// cannot model: buildah's per-stage working containers carry no mark outrig
+/// can put on them and none `buildah containers --filter` could select by, so
+/// the only process able to remove them and prove they were its own is
+/// buildah. What is provable here is that a catchable signal reached the
+/// client at all -- that the stop was asked and not merely performed. Whether
+/// the engine is then clean needs a real engine, and lives in
+/// `tests/build_cancellation_e2e.rs`.
+#[tokio::test]
+async fn a_canceled_build_asks_buildah_to_stop_before_killing_it() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("graceful");
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let build = outrig::image::build_image_for("graceful", &cfg, context.path(), &final_tag, false);
+    let mut build = Box::pin(build);
+
+    let building = [token.as_str()];
+    let (client, _) = tokio::select! {
+        _ = &mut build => panic!("the fake `buildah build` should not have returned"),
+        found = invocation(journal, "build", &building) => found,
+    };
+    drop(build);
+
+    let asked = expect_asked_to_stop(journal, client).await;
+    let took = expect_gone(client).await;
+    println!("canceled build: buildah {client} asked to stop in {asked:?}, gone in {took:?}");
+}
+
+/// The same for the transcript-logged path, which reaches buildah through a
+/// different helper and would not inherit the first test's policy.
+#[tokio::test]
+async fn a_canceled_logged_build_asks_buildah_to_stop_before_killing_it() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+    let transcript = outrig::Transcript::create(&context.path().join("log"), false)
+        .await
+        .expect("create transcript");
+
+    let token = unique_name("logged");
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let build = outrig::image::ensure_tagged_image_for(
+        "logged",
+        &cfg,
+        context.path(),
+        &final_tag,
+        false,
+        Some(&transcript),
+    );
+    let mut build = Box::pin(build);
+
+    let building = [token.as_str()];
+    let (client, _) = tokio::select! {
+        _ = &mut build => panic!("the fake `buildah build` should not have returned"),
+        found = invocation(journal, "build", &building) => found,
+    };
+    drop(build);
+
+    let asked = expect_asked_to_stop(journal, client).await;
+    let took = expect_gone(client).await;
+    println!("canceled logged build: buildah {client} asked in {asked:?}, gone in {took:?}");
+}
+
+/// And for the standalone path, which had no guard of any kind before this.
+#[tokio::test]
+async fn a_canceled_standalone_build_asks_buildah_to_stop_before_killing_it() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("standalone");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let labels = std::collections::BTreeMap::new();
+    let build = outrig::image::build_standalone(
+        context.path(),
+        Path::new("Dockerfile"),
+        Path::new("."),
+        &final_tag,
+        false,
+        &labels,
+    );
+    let mut build = Box::pin(build);
+
+    let building = [token.as_str()];
+    let (client, _) = tokio::select! {
+        _ = &mut build => panic!("the fake `buildah build` should not have returned"),
+        found = invocation(journal, "build", &building) => found,
+    };
+    drop(build);
+
+    let asked = expect_asked_to_stop(journal, client).await;
+    let took = expect_gone(client).await;
+    println!("canceled standalone build: buildah {client} asked in {asked:?}, gone in {took:?}");
+}
+
+/// A buildah that refuses the stop is killed anyway. The grace is a bound on
+/// how long outrig will wait for a client to clean up after itself, not a
+/// promise it will.
+///
+/// This one waits out the production grace, so it carries its own ceiling:
+/// every other wait in this file is bounded by `CEILING`, which the grace is
+/// deliberately comparable to.
+#[tokio::test]
+async fn a_buildah_that_ignores_the_stop_is_killed_anyway() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("stubborn");
+    ignore_stop_for(journal, &token);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let build = outrig::image::build_image_for("stubborn", &cfg, context.path(), &final_tag, false);
+    let mut build = Box::pin(build);
+
+    let building = [token.as_str()];
+    let (client, _) = tokio::select! {
+        _ = &mut build => panic!("the fake `buildah build` should not have returned"),
+        found = invocation(journal, "build", &building) => found,
+    };
+    drop(build);
+
+    let asked = expect_asked_to_stop(journal, client).await;
+    let took = expect_gone_within(client, CEILING * 3).await;
+    assert!(
+        took > Duration::from_secs(1),
+        "buildah {client} was gone in {took:?}, so it was never given a grace to refuse"
+    );
+    println!("stubborn build: buildah {client} asked in {asked:?}, killed after {took:?}");
+}
+
+/// A cancelled standalone build removes its temporary tag and leaves the
+/// caller's alone.
+///
+/// The final tag is the caller's requested output and may already name
+/// something else, so a cancellation must not reach it. The temporary tag is
+/// read back out of the recorded argv, since nothing outside the build knows
+/// it -- which is why it needs a guard rather than a sweeper.
+#[tokio::test]
+async fn a_canceled_standalone_build_removes_only_its_temporary_tag() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("tmptag");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let labels = std::collections::BTreeMap::new();
+    let build = outrig::image::build_standalone(
+        context.path(),
+        Path::new("Dockerfile"),
+        Path::new("."),
+        &final_tag,
+        false,
+        &labels,
+    );
+    let mut build = Box::pin(build);
+
+    let building = [token.as_str()];
+    let (client, argv) = tokio::select! {
+        _ = &mut build => panic!("the fake `buildah build` should not have returned"),
+        found = invocation(journal, "build", &building) => found,
+    };
+    let temp_tag = flag_value(&argv, "--tag");
+    assert!(
+        temp_tag.contains("outrig-tmp-"),
+        "a standalone build should target a temporary tag, got {temp_tag:?}"
+    );
+    assert_ne!(
+        temp_tag,
+        final_tag.as_str(),
+        "the temporary tag must not be the caller's"
+    );
+    drop(build);
+
+    expect_gone(client).await;
+    expect_removed(journal, &temp_tag).await;
+    // `expect_removed` above is what makes this safe to read: a removal has
+    // provably run, so the caller's tag surviving is a decision rather than a
+    // race the assertion happened to win.
+    assert!(
+        !was_removed(journal, final_tag.as_str()),
+        "a cancelled build removed the caller's own tag {final_tag}"
+    );
+}
+
+/// A standalone build that succeeds still ends up under the name the caller
+/// asked for: the temporary tag is a detour, not the output.
+#[tokio::test]
+async fn a_successful_standalone_build_names_the_image_the_caller_asked_for() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("renamed");
+    return_immediately_for(journal, "build", &token);
+
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let labels = std::collections::BTreeMap::new();
+    outrig::image::build_standalone(
+        context.path(),
+        Path::new("Dockerfile"),
+        Path::new("."),
+        &final_tag,
+        false,
+        &labels,
+    )
+    .await
+    .expect("the fake `buildah build` returns success");
+
+    let (_, tagging) = invocation(journal, "tag", &[final_tag.as_str()]).await;
+    let temp_tag = tagging
+        .split_whitespace()
+        .nth(1)
+        .expect("`buildah tag` takes a source and a target")
+        .to_string();
+    assert!(
+        temp_tag.contains("outrig-tmp-"),
+        "the tag should rename the temporary image, got {tagging:?}"
+    );
+    // The temporary name goes, and only the name: by here the image carries
+    // both, so this is an untag.
+    expect_removed(journal, &temp_tag).await;
+}
+
+/// The graceful stop is scoped to builds. A cancelled container start is
+/// still killed outright, which is the bound 0002-39 established and the one
+/// every other cancellation test in this file relies on.
+#[tokio::test]
+async fn a_canceled_container_start_is_still_killed_outright() {
+    let journal = fake_runtime();
+    let name = unique_name("ungraceful");
+
+    let tag = image();
+    let start = Container::start_named(&tag, ContainerLaunchSpec::default(), name.clone(), None);
+    let mut start = Box::pin(start);
+
+    let running = [name.as_str()];
+    let client = tokio::select! {
+        _ = &mut start => panic!("the fake `podman run` should not have returned"),
+        pid = invocation_pid(journal, "run", &running) => pid,
+    };
+    drop(start);
+
+    expect_gone(client).await;
+    // Read after the removal has provably run, for the reason
+    // `expect_not_removed` gives: a marker that has not appeared yet and one
+    // that never will look the same until something else has finished.
+    expect_removed(journal, &name).await;
+    assert!(
+        !was_asked_to_stop(journal, client),
+        "podman {client} was asked to stop; only builds are"
+    );
 }

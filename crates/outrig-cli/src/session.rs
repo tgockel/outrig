@@ -444,7 +444,7 @@ fn write_session_json_atomic(dir: &Path, session: &Session) -> Result<()> {
     Ok(())
 }
 
-mod iso_systime {
+pub(crate) mod iso_systime {
     use std::time::SystemTime;
 
     use serde::{Deserialize, Deserializer, Serialize, Serializer};

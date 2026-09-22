@@ -182,8 +182,10 @@ impl McpClient {
         // `Command`, so this child gets the same ownership guarantee as every
         // other: see `crate::process`. The stderr override is the only reason
         // this site needs a spec of its own.
-        let mut child =
-            cmd.spawn_owned(StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_std)))?;
+        let mut child = cmd.spawn_owned(
+            StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_std)),
+            crate::process::Termination::Kill,
+        )?;
         let stdin = child.take_stdin();
         let stdout = child.take_stdout();
 
@@ -623,6 +625,7 @@ mod tests {
             .args(["-c", "echo boom 1>&2; exit 7"])
             .spawn_owned(
                 StdioSpec::bidirectional().with_stderr(Stdio::from(stderr_file.into_std().await)),
+                crate::process::Termination::Kill,
             )
             .unwrap();
 
