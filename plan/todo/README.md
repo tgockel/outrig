@@ -35,6 +35,13 @@ freeze, then release engineering. Each task carries its own evidence; the report
 | --------- | ---------------------------------------------- |
 | `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met |
 
+`0002-55` is done and is in `plan/done/`, having landed *before* `0002-54`. That inverts the
+"lands lowest-numbered first" rule above and is deliberate: it fixes issue #147, the panic-hook
+sweep removing containers outrig never created, and the decision recorded in its `## Decisions`
+is that the defect does not force another candidate -- so `0002-54` keeps its number and rc.3
+still stands. The dependency invariant is intact either way: `0002-55` depends on `0002-39`
+alone, and `0002-54` does not depend on `0002-55`.
+
 Cross-cutting notes the individual tasks carry rather than this file:
 
 - `0002-43` and `0002-47` between them settled where rmcp stops being an implementation detail:
@@ -97,6 +104,11 @@ get, a `plan/next/` entry.
 - MCP shutdown may consume multiple grace periods and return success without a confirmed reap.
   Adjacent to `0002-39`'s cooperative-reap work; not folded in because it is a different owner.
 - Post-fork use of `std::net::*::bind` is a residual async-signal-safety risk in `nsfork`.
+- The panic-hook sweep removing by requested name is **no longer buffered** -- `0002-55` fixed it,
+  and what that task could not reach is refiled as
+  `plan/next/panic-hook-sweep-is-never-driven-by-a-panic.md`,
+  `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`, and
+  `plan/next/a-forked-child-inherits-the-parents-cleanup-obligations.md`.
 - The four-site `[security]` lowering (`plan/next/launch-spec-security-lowering.md`) is the same
   silent-drop class as `0002-41` and stays buffered: `0002-41` fixed a block that was not lowered
   at all, which was the bug; the four sites are ergonomics. It is *not* the same conversion --

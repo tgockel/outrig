@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::builtin_image;
 use crate::cli::env_arg::CliEnvEntries;
 use crate::cli::volume_arg::CliVolume;
-use crate::cli::watcher::SessionWatcher;
+use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
@@ -151,6 +151,15 @@ pub struct SessionContainers {
     /// sidecar and one serving MCP with no interception on it.
     pub abandoned: Vec<Container>,
     pub sidecars: BTreeMap<String, Container>,
+    /// Random per session, and half of every sidecar's `org.outrig.instance`
+    /// value: the label reads `<salt>-<config name>`, which is unique across
+    /// every container on the machine because the salt is and unique within
+    /// the session because the config name is.
+    ///
+    /// A salt plus a derivation rather than a stored nonce per container, so
+    /// there is no second map to be populated deep in the start path and kept
+    /// in step with `sidecars`.
+    pub instance_salt: String,
     pub primary: Container,
 }
 
@@ -182,6 +191,25 @@ impl SessionContainers {
         self.sidecars
             .values()
             .map(|container| container.name().to_string())
+            .collect()
+    }
+
+    /// One started sidecar as the watcher wants it: the container name beside
+    /// the selector its reap filters on. `None` for a sidecar this session did
+    /// not start (warn'd, manual, or reaped).
+    pub fn sidecar_ref(&self, config_name: &str) -> Option<SidecarRef> {
+        let container = self.sidecars.get(config_name)?;
+        Some(SidecarRef::new(
+            container.name().to_string(),
+            instance_label_value(&self.instance_salt, config_name),
+        ))
+    }
+
+    /// Every started sidecar, in the same shape.
+    pub fn sidecar_refs(&self) -> Vec<SidecarRef> {
+        self.sidecars
+            .keys()
+            .filter_map(|config_name| self.sidecar_ref(config_name))
             .collect()
     }
 }
@@ -602,15 +630,20 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     }
     span.done("container user ready");
 
+    // In a local as well as in `containers`, because the sidecar phase takes
+    // the container set by `&mut` and cannot also hold a borrow into it.
+    let instance_salt = instance_salt();
     let mut containers = SessionContainers {
         abandoned: Vec::new(),
         sidecars: BTreeMap::new(),
+        instance_salt: instance_salt.clone(),
         primary: container,
     };
 
     // Placement plan, sidecar starts, and network interception. Any error
     // propagated out of the phase aborts the whole container set.
     let phase = SidecarPhaseArgs {
+        instance_salt: &instance_salt,
         cfg: &cfg,
         repo_root: &repo_root,
         image_cfg: &image_cfg,
@@ -650,7 +683,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     let watcher = if args.start_sidecars && !mcp_plan.sidecars.is_empty() {
         Some(SessionWatcher::spawn(
             containers.primary.name().to_string(),
-            session.sidecar_container_names.clone(),
+            containers.sidecar_refs(),
             sid.0.clone(),
             session.started_at,
         ))
@@ -681,6 +714,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
 struct SidecarPhaseArgs<'a> {
     cfg: &'a Config,
     repo_root: &'a Path,
+    /// See [`SessionContainers::instance_salt`].
+    instance_salt: &'a str,
     image_cfg: &'a ImageConfig,
     image_tag: &'a ImageTag,
     sid: &'a SessionId,
@@ -702,6 +737,7 @@ impl<'a> SidecarPhaseArgs<'a> {
             cfg: self.cfg,
             repo_root: self.repo_root,
             sid: self.sid.as_str(),
+            instance_salt: self.instance_salt,
             host_workspace: self.host_workspace,
             container_workspace: self.container_workspace,
             transcript: self.transcript,
@@ -717,6 +753,8 @@ pub(crate) struct SidecarStartCtx<'a> {
     pub repo_root: &'a Path,
     /// Container-name suffix: sidecars are named `outrig-<sid>-<sc>`.
     pub sid: &'a str,
+    /// This session's half of every sidecar's `org.outrig.instance` label.
+    pub instance_salt: &'a str,
     pub host_workspace: &'a Path,
     pub container_workspace: &'a Path,
     pub transcript: Option<&'a Transcript>,
@@ -1127,8 +1165,38 @@ fn sidecar_launch_base(ctx: &SidecarStartCtx<'_>, sc: &SidecarPlan) -> Container
     launch.labels = BTreeMap::from([
         (LABEL_SESSION.to_string(), ctx.sid.to_string()),
         (LABEL_SIDECAR.to_string(), sc.name.clone()),
+        (
+            LABEL_INSTANCE.to_string(),
+            instance_label_value(ctx.instance_salt, &sc.name),
+        ),
     ]);
     launch
+}
+
+/// A salt no other session on the machine carries.
+///
+/// The same 128 bits, and the same reasoning, as `container::attempt_token`:
+/// the reap that selects on it runs seconds after the containers it means have
+/// exited and freed their names, so the selector has to be something nothing
+/// else can become. `LABEL_SESSION` would not do -- a session id is a
+/// timestamp plus sixteen bits, which two sessions starting in one second can
+/// share.
+fn instance_salt() -> String {
+    // The same body as `container::attempt_token`, which is private to the
+    // other crate; sharing it would mean exporting it, and
+    // `crates/outrig/public-api.txt` is a release gate. `image::temp_nonce` is
+    // a third copy for the same reason. Noted rather than silently repeated.
+    use rand::Rng;
+
+    let mut buf = [0_u8; 16];
+    rand::rng().fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The `org.outrig.instance` value for one sidecar. Derived in one place, so
+/// what is stamped at launch and what is selected at reap cannot drift.
+fn instance_label_value(salt: &str, config_name: &str) -> String {
+    format!("{salt}-{config_name}")
 }
 
 /// Config `mounts` as launch-spec bind mounts, each host path resolved against
@@ -1267,6 +1335,7 @@ async fn abort_containers(containers: SessionContainers, store: &SessionStore, s
     let SessionContainers {
         abandoned,
         sidecars,
+        instance_salt: _,
         primary,
     } = containers;
     for container in abandoned {
@@ -1497,6 +1566,7 @@ pub async fn teardown(
     let SessionContainers {
         abandoned,
         sidecars,
+        instance_salt: _,
         primary,
     } = containers;
     // Cleanup-only containers first: they are the ones already known not to
@@ -1535,6 +1605,31 @@ pub async fn teardown(
 
 #[cfg(test)]
 mod tests {
+    /// The salt is what makes the reap selector unreachable by anything else.
+    /// `LABEL_SESSION` could not do this job: a session id is a timestamp plus
+    /// sixteen bits of randomness, so two sessions starting in the same second
+    /// collide once in 65536 -- and the whole point of selecting on a label
+    /// rather than a name is to not depend on that.
+    #[test]
+    fn two_sessions_do_not_share_an_instance_salt() {
+        let (first, second) = (instance_salt(), instance_salt());
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 32, "128 bits, hex-encoded");
+    }
+
+    /// Stamped at launch and selected at reap through this one function, so
+    /// the two cannot drift into disagreeing about what identifies a
+    /// container. The config name is what separates two sidecars of one
+    /// session, the salt what separates two sessions.
+    #[test]
+    fn an_instance_label_is_the_salt_and_the_config_name() {
+        assert_eq!(instance_label_value("abc123", "tools"), "abc123-tools");
+        assert_ne!(
+            instance_label_value("abc123", "tools"),
+            instance_label_value("abc123", "docs")
+        );
+    }
+
     use super::*;
 
     #[test]

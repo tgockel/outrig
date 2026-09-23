@@ -16,7 +16,7 @@
 //!
 //! Reaping is what this adds over a bare fire-and-forget spawn. Without it
 //! every cleanup leaves a zombie for the life of the process, which is what
-//! the pre-0.2.0 `spawn_detached_rm` did.
+//! the pre-0.2.0 detached removal did.
 //!
 //! There is **one** reaper thread for the process, and it polls with
 //! `try_wait` rather than blocking on one child at a time. Both halves matter:

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The panic-hook sweep could remove a container outrig never created.** The last-resort
+  cleanup layer tracked container *names* and swept them with `podman rm -f <name>`. A name
+  is a request, not a claim: `podman run --name N` failing because N is already in use is an
+  ordinary outcome, so a panic arriving between the name being reserved and the start guard
+  dropping force-removed whatever held N -- another session, a stray, a container made by
+  hand. Every other cleanup layer had already moved to the per-attempt `org.outrig.attempt`
+  label; the sweep now replays that same removal and holds no name it could remove by.
+
+  The registry it sweeps is also keyed by the attempt token rather than by the name. It was a
+  set of names, so two starts asking for one name collapsed into one entry and whichever
+  finished first discharged the other's obligation -- leaving a container outrig had made with
+  no last-resort cleanup behind it. Two attempts are now two obligations.
+
+  This is reachable without a name collision. `start` passes `--rm`, so after a stop whose
+  removal timed out the container is likely gone and its name free, and a panic in that window
+  swept whatever had since taken the name.
+
 - **The network interceptor installed no rules at all on nft 1.0.9**, which is what Ubuntu
   24.04 ships. The redirect script was one `create table inet <t> { chain output { ... } }`;
   nft parses that, exits zero, creates the table, and silently drops the nested block. The

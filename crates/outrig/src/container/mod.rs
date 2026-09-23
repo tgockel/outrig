@@ -2,14 +2,23 @@
 //!
 //! Wraps `podman run`/`podman stop`/`podman rm` so callers get a typed
 //! [`Container`] handle instead of poking podman directly. Cleanup is
-//! defended in three layers, in order of preference:
+//! defended in four layers, in order of preference:
 //!
 //! 1. [`Container::stop`] -- explicit teardown on the happy path.
-//! 2. [`Drop`] -- best-effort detached `podman rm -f` if a `Container`
+//! 2. The start guard (`NameGuard`) -- covers the window between a name being
+//!    chosen and a `Container` existing to own what podman made, which is the
+//!    window `Drop` cannot see because there is no handle in it yet.
+//! 3. [`Drop`] -- best-effort detached `podman rm -f` if a `Container`
 //!    falls out of scope without `stop` being called (e.g. a future was
 //!    cancelled, an `?` propagated past the handle).
-//! 3. [`install_panic_hook`] -- last-resort sweep over `TRACKED` when
-//!    the process is unwinding from a panic and `Drop` cannot run.
+//! 4. [`install_panic_hook`] -- last-resort replay of every outstanding
+//!    attempt's removal when the process is unwinding from a panic and `Drop`
+//!    cannot run.
+//!
+//! All four select the container by the per-attempt `org.outrig.attempt` label
+//! rather than by the name that was asked for. A name is a request and podman
+//! can grant it again; only the label is one attempt's alone. `NameGuard`
+//! carries the argument in full.
 
 pub mod embedded;
 pub mod enter;
@@ -17,7 +26,7 @@ mod namespace;
 pub mod sidecar;
 mod userdb;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Mutex, OnceLock};
@@ -66,7 +75,19 @@ const PODMAN_ID_LEN: usize = 64;
 /// has to be retried. The bound exists for the client that will never return.
 const MIN_REMOVAL_BUDGET: Duration = Duration::from_secs(30);
 
-static TRACKED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Outstanding last-resort cleanup obligations, keyed by the attempt token
+/// that scopes each one.
+///
+/// **The key is the obligation's identity and the value is never a selector.**
+/// A token is minted fresh per [`NameGuard::reserve`], so two starts that ask
+/// for one name are two entries and discharging either leaves the other's
+/// obligation standing -- which a set of names could not express, and did not:
+/// one `untrack` used to cancel every concurrent reservation of that name.
+///
+/// The name is kept for [`is_tracked`] and for diagnostics. Building a removal
+/// out of it would be the defect this keying exists to close, which is why the
+/// sweep goes through [`removal_by_attempt`] and cannot see it.
+static TRACKED: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
 #[derive(Debug)]
 pub struct Container {
@@ -466,9 +487,9 @@ impl Container {
     ) -> Result<Self> {
         // Armed before anything is spawned, and the only owner of what podman
         // creates until the `Container` below exists. A `?` or a dropped
-        // future in between drops the guard, which removes the container it
-        // recorded and untracks the name -- neither of which `Drop for
-        // Container` can do, because no `Container` has been constructed yet.
+        // future in between drops the guard, which removes the container this
+        // attempt made and discharges its obligation -- neither of which `Drop
+        // for Container` can do, because no `Container` exists yet.
         reject_reserved_labels(&launch.labels)?;
         let reserved = NameGuard::reserve(&name);
 
@@ -621,12 +642,18 @@ impl Container {
     /// way on every machine and without podman having to be installed or to
     /// answer in any particular way. A test that wants a different stop
     /// assigns its own `engine_override`, which replaces this one.
+    ///
+    /// The attempt token is minted rather than a constant, even though this
+    /// handle is deliberately never tracked. A shared literal would be one
+    /// obligation key for every such handle in the binary, so the first
+    /// `discharge` would cancel the rest -- the very collapse a token-keyed
+    /// registry exists to prevent, reintroduced through test scaffolding.
     #[cfg(test)]
     pub(crate) fn unstoppable() -> Self {
         let mut container = Self::handle(
             EngineIdentity::Owned {
                 name: "outrig-test-unstoppable".to_string(),
-                attempt: "outrig-test-never-created".to_string(),
+                attempt: attempt_token(),
                 // An id no container has. Nothing is ever run against it
                 // here, but an owned handle cannot be built without one --
                 // which is the point of that type.
@@ -1062,8 +1089,9 @@ impl Container {
         match classify_engine_call(&stop, stopped) {
             EngineOutcome::Done => {}
             // Nothing here can tell whether the container stopped, so it is
-            // not disposed of and not untracked: the caller keeps a handle to
-            // try again through, and `Drop` still has its detached removal.
+            // not disposed of, and the obligation is not discharged: the
+            // caller keeps a handle to try again through, and `Drop` still has
+            // its detached removal.
             EngineOutcome::TimedOut => {
                 return Err(OutrigError::Canceled {
                     program: stop.program,
@@ -1118,13 +1146,24 @@ impl Container {
                     argv: removal.args,
                 });
             }
-            // Neither disposed nor untracked, so the caller keeps something to
-            // try again through and `Drop` still has its detached removal to
-            // fall back on. A stop that says it worked is how a leak becomes
-            // nobody's.
+            // Neither disposed of nor discharged, so the caller keeps
+            // something to try again through and `Drop` still has its detached
+            // removal to fall back on. A stop that says it worked is how a
+            // leak becomes nobody's.
+            //
+            // Holding the obligation here is also the second place the
+            // name-versus-token distinction earns its keep, and it needs no
+            // collision to reach: `start` passes `--rm`, so by the time a
+            // removal has timed out the `podman stop` above has already run
+            // and the container is very likely gone -- with its name free for
+            // the next one. An obligation recorded as a name would have the
+            // panic sweep reach that replacement; recorded as this attempt's
+            // token, it can only ever reach what this attempt made.
             EngineOutcome::Failed(e) => return Err(e),
         }
-        untrack(&self.name);
+        if let Some(attempt) = self.attempt.as_deref() {
+            discharge(attempt);
+        }
         self.disposed = true;
         Ok(())
     }
@@ -1143,7 +1182,9 @@ impl Drop for Container {
             return;
         }
         removal_cmd(&self.name, self.attempt.as_deref()).detach();
-        untrack(&self.name);
+        if let Some(attempt) = self.attempt.as_deref() {
+            discharge(attempt);
+        }
     }
 }
 
@@ -1173,28 +1214,46 @@ impl Drop for Container {
 /// distinction falls out of the mechanism rather than being a case anyone has
 /// to remember.
 ///
+/// The panic sweep now shares that selector rather than keeping its own. It
+/// used to hold names and remove by them, so a panic landing while a start had
+/// collided force-removed the container that already held the name -- this
+/// argument, reached through a different trigger. What the registry holds is
+/// the token, and [`pending_removals`] can build nothing else from it.
+///
 /// A label rather than a `--cidfile` because a label exists from the instant
 /// the container does: it is part of the creation request, so there is no
 /// interval in which podman has registered a container the guard cannot yet
 /// name. A cidfile is written *after* creation, and a cancellation landing in
 /// between would leave behind exactly the container this guard is for.
 struct NameGuard {
-    /// `None` once [`Self::release`] has handed the obligation on.
-    name: Option<String>,
     /// Identifies the container *this attempt* asked podman to create, and
-    /// nothing else on the machine.
+    /// nothing else on the machine. The only thing this guard can name.
     attempt: String,
+    /// Set by [`Self::release`]: the obligation belongs to a [`Container`]
+    /// from then on.
+    ///
+    /// A flag rather than an emptied `attempt`, so the token is valid in every
+    /// state this struct can be in. Encoding "released" by blanking the token
+    /// would leave `Drop` reading a field that is a real token in one state
+    /// and `""` in another, with a second field saying which -- the shape
+    /// [`EngineIdentity`] exists to keep out of this module.
+    released: bool,
 }
 
 impl NameGuard {
-    /// Reserve `name`, registering it with `TRACKED` so the panic hook sees it
-    /// as well.
+    /// Reserve `name`, registering the obligation this attempt now owes so the
+    /// panic hook can discharge it too.
+    ///
+    /// The guard keeps no copy of `name`. It is recorded against the token for
+    /// [`is_tracked`] and diagnostics, and the guard cannot reach it -- so
+    /// there is no state from which this guard could remove by name.
     fn reserve(name: &str) -> Self {
-        track(name);
-        Self {
-            name: Some(name.to_string()),
+        let guard = Self {
             attempt: attempt_token(),
-        }
+            released: false,
+        };
+        track(&guard.attempt, name);
+        guard
     }
 
     /// The `--label` this attempt's container must carry for the guard to
@@ -1206,19 +1265,28 @@ impl NameGuard {
     /// Hand the container to a constructed [`Container`], whose own `Drop`
     /// covers it from here on, and give it the attempt token so that its
     /// removals can be scoped the same way this one's are.
+    ///
+    /// The registry entry is deliberately left standing: the obligation
+    /// changes owner rather than lapsing, so no instant exists in which the
+    /// container podman made is owed nothing. `#[must_use]` because dropping
+    /// the token on the floor here is what would orphan that entry.
+    #[must_use]
     fn release(mut self) -> String {
-        self.name = None;
-        std::mem::take(&mut self.attempt)
+        self.released = true;
+        self.attempt.clone()
     }
 }
 
 impl Drop for NameGuard {
     fn drop(&mut self) {
-        let Some(name) = self.name.take() else {
+        if self.released {
             return;
-        };
-        removal_cmd(&name, Some(&self.attempt)).detach();
-        untrack(&name);
+        }
+        // Detached first, discharged second, never the reverse: a panic landing
+        // between the two has to find the obligation still registered, so the
+        // hook re-issues a removal rather than finding nothing owed.
+        removal_by_attempt(&self.attempt).detach();
+        discharge(&self.attempt);
     }
 }
 
@@ -1235,14 +1303,7 @@ impl Drop for NameGuard {
 /// that is this attempt's alone. See [`NameGuard`] for the argument in full.
 fn removal_cmd(name: &str, attempt: Option<&str>) -> Removal {
     match attempt {
-        Some(token) => Removal {
-            cmd: Cmd::new("podman")
-                .args(["rm", "-f", "--filter"])
-                .arg(format!("label={ATTEMPT_LABEL}={token}")),
-            // The label is this attempt's alone, so re-issuing the removal
-            // later can still only reach what this attempt made.
-            reissue: Reissue::Safe,
-        },
+        Some(token) => removal_by_attempt(token),
         // An attached container has no attempt of outrig's behind it, so
         // there is nothing to scope to. Nothing that reaches here removes
         // one: `Drop` and `stop` both return early for them.
@@ -1250,6 +1311,24 @@ fn removal_cmd(name: &str, attempt: Option<&str>) -> Removal {
             cmd: Cmd::new("podman").args(["rm", "-f"]).arg(name),
             reissue: Reissue::Once,
         },
+    }
+}
+
+/// The removal for the container one attempt asked podman to create.
+///
+/// Takes no name, and that is the point rather than an economy: a caller
+/// holding only this cannot build a removal that reaches a container this
+/// process did not create. The panic sweep goes through here for exactly that
+/// reason -- it used to hold names and remove by them, so a panic landing
+/// while a start had collided force-removed whatever already held the name.
+fn removal_by_attempt(attempt: &str) -> Removal {
+    Removal {
+        cmd: Cmd::new("podman")
+            .args(["rm", "-f", "--filter"])
+            .arg(format!("label={ATTEMPT_LABEL}={attempt}")),
+        // The label is this attempt's alone, so re-issuing the removal later
+        // can still only reach what this attempt made.
+        reissue: Reissue::Safe,
     }
 }
 
@@ -1403,21 +1482,28 @@ fn attempt_token() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Best-effort, fire-and-forget `podman rm -f <name>`. Public form of the
-/// `Drop`/panic-hook sweeper for callers that must reap a container they do
-/// not hold a `Container` handle for (e.g. the session watcher reaping
-/// sidecars after the primary dies out from under outrig).
+/// Best-effort, fire-and-forget `podman rm -f <name>`, for a caller that must
+/// reap a container it holds no [`Container`] handle for.
+///
+/// **No caller in this workspace.** The session watcher was the one, and it now
+/// stamps and selects its own label instead. This stays because it is published
+/// surface, not because anything here needs it; whether it should survive the
+/// next surface review is recorded in
+/// `plan/next/a-container-handle-should-hold-the-id-podman-gave-it.md`.
+///
+/// Synchronous, detached, and needs no tokio runtime, so it is safe from a
+/// `Drop`. It goes through `crate::supervise`, so the `podman rm` it starts
+/// is reaped rather than left a zombie for the life of the process.
+///
+/// The one removal here that selects by name, and the only one left. That is
+/// sound for this caller for the same reason it is for `Drop for Container`:
+/// outrig chose the name and is known to have created what holds it. It is
+/// still a name rather than a claim, which is why it is issued once --
+/// `Reissue::Safe` would let a retry land after the name had moved on.
+///
+/// The cleanup layers inside this module do *not* come through here. Each of
+/// them holds an attempt token and removes by `removal_by_attempt`.
 pub fn force_remove_detached(name: &str) {
-    spawn_detached_rm(name);
-}
-
-/// Best-effort `podman rm -f <name>` with stdio nulled. Synchronous,
-/// detached, requires no tokio runtime -- safe from `Drop` and panic hooks.
-/// Through [`crate::supervise`], so the `podman rm` it starts is reaped
-/// rather than left a zombie for the life of the process.
-fn spawn_detached_rm(name: &str) {
-    // By name, so issued once: the name can belong to a replacement by the
-    // time a retry would land, and removing that is worse than the leak.
     crate::supervise::detach_cleanup(
         Cmd::new("podman").args(["rm", "-f"]).arg(name),
         Reissue::Once,
@@ -1607,34 +1693,91 @@ fn append_bind_mount(
         .arg(format!("{}:{}:{opts}", host.display(), container.display()))
 }
 
-/// Install a process-wide panic hook that sweeps `TRACKED` with
-/// `podman rm -f` before delegating to the previous hook. Idempotent --
+/// Every removal the panic sweep would issue right now, one per outstanding
+/// obligation and each scoped to the attempt that owes it.
+///
+/// Separate from the hook for two reasons, the second of which is the one that
+/// was a defect. It lets the sweep be asserted on without a process panic. And
+/// it builds the commands under the lock and spawns them outside it: the hook
+/// used to `Command::spawn` -- and, through [`crate::supervise`], possibly start
+/// a thread -- while still holding the registry, from a panicking thread.
+///
+/// `try_lock` rather than `lock`, because a hook runs at the panic site before
+/// unwinding: a thread that panics while holding the registry would re-lock a
+/// non-reentrant mutex on itself and hang there, and a forked child
+/// ([`crate::nsfork`]) inherits a lock held by a thread it does not have. A
+/// sweep that gives up is a leak; one that deadlocks is a process that never
+/// reports the panic at all.
+///
+/// A registry that will not come free is left alone. Giving up costs a sweep;
+/// waiting would cost the panic report itself.
+fn pending_removals() -> Vec<Removal> {
+    match TRACKED.try_lock() {
+        Ok(guard) => removals_for(&guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => removals_for(&poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Vec::new(),
+    }
+}
+
+/// The removals `tracked` owes. Pure, and separate from acquiring the lock, so
+/// a caller that can afford to wait for the registry does not have to inherit
+/// the hook's refusal to.
+fn removals_for(tracked: &BTreeMap<String, String>) -> Vec<Removal> {
+    tracked
+        .keys()
+        .map(|attempt| removal_by_attempt(attempt))
+        .collect()
+}
+
+/// Install a process-wide panic hook that replays every outstanding attempt's
+/// label-scoped removal before delegating to the previous hook. Idempotent --
 /// safe to call from multiple `main`s or test setups.
+///
+/// Not to be installed from a test. It is process-wide and `OnceLock`-guarded,
+/// so one test installing it makes every *other* failing test in that binary
+/// sweep obligations it does not own.
 pub fn install_panic_hook() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if let Ok(g) = TRACKED.lock() {
-                for name in g.iter() {
-                    spawn_detached_rm(name);
-                }
+            for removal in pending_removals() {
+                removal.detach();
             }
             prev(info);
         }));
     });
 }
 
-fn track(name: &str) {
-    if let Ok(mut g) = TRACKED.lock() {
-        g.insert(name.to_string());
-    }
+/// The registry, read or written through a poisoned lock rather than around
+/// it.
+///
+/// One policy for every accessor, because they used to disagree: `track` and
+/// `discharge` skipped on poison while the sweep read through it, so one
+/// panicking thread would quietly stop obligations being *recorded* and
+/// *discharged* while leaving the sweep to act on a snapshot that no longer
+/// moved. Every mutation here is a single `insert` or `remove`, so a panic
+/// cannot leave the map half-written and there is no invariant for poisoning
+/// to protect -- and refusing the map after some other thread panicked
+/// disables the last-resort layer at the moment it exists for.
+fn tracked() -> std::sync::MutexGuard<'static, BTreeMap<String, String>> {
+    TRACKED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn untrack(name: &str) {
-    if let Ok(mut g) = TRACKED.lock() {
-        g.remove(name);
-    }
+/// Register the obligation `attempt` owes, under the name it asked podman for.
+fn track(attempt: &str, name: &str) {
+    tracked().insert(attempt.to_string(), name.to_string());
+}
+
+/// Discharge the obligation `attempt` owed.
+///
+/// A no-op for a token that owes nothing, which is what lets `Drop for
+/// Container` run after a `stop` that already discharged, and what keeps one
+/// attempt's failure from touching another's entry.
+fn discharge(attempt: &str) {
+    tracked().remove(attempt);
 }
 
 fn runtime_id() -> String {
@@ -1689,9 +1832,14 @@ fn parse_container_inspect(name: &str, stdout: &[u8]) -> Result<ContainerInspect
     })
 }
 
+/// Whether any outstanding obligation asked podman for `name`.
+///
+/// A scan rather than a lookup, because the obligation is keyed by the attempt
+/// token and not by the name. Two live reservations of one name both answer to
+/// this, and it stays true until the last of them is discharged.
 #[cfg(any(test, feature = "e2e"))]
 pub fn is_tracked(name: &str) -> bool {
-    TRACKED.lock().map(|g| g.contains(name)).unwrap_or(false)
+    tracked().values().any(|asked_for| asked_for == name)
 }
 
 async fn selinux_enforcing() -> bool {
@@ -1979,6 +2127,203 @@ mod tests {
             Reissue::Once,
             "a bare name may be reused, so this one must never be re-issued"
         );
+    }
+
+    /// Every removal the panic sweep would issue right now, as
+    /// `(argv, reissue)`.
+    fn swept() -> Vec<(Vec<String>, Reissue)> {
+        // Through the blocking lock, not the hook's `try_lock`. A test that
+        // used `pending_removals` would read "another test is holding the
+        // registry" as "nothing is owed" and fail at random in a parallel
+        // binary; the hook declines to wait because a panic hook must not, and
+        // a test has no such constraint. What is under test is the mapping,
+        // and `removals_for` is exactly that half.
+        removals_for(&tracked())
+            .into_iter()
+            .map(|removal| (argv(removal.cmd), removal.reissue))
+            .collect()
+    }
+
+    /// The sweep narrowed to one attempt.
+    ///
+    /// `TRACKED` is process-wide and these tests run in parallel in one
+    /// binary, so every *positive* assertion about the sweep goes through
+    /// here. Asserting on `swept()` as a whole -- its length, or that it is
+    /// empty -- would be asserting about obligations other tests own.
+    fn swept_for(attempt: &str) -> Vec<(Vec<String>, Reissue)> {
+        let selector = format!("label={ATTEMPT_LABEL}={attempt}");
+        swept()
+            .into_iter()
+            .filter(|(argv, _)| argv.contains(&selector))
+            .collect()
+    }
+
+    /// An `(attempt, name)` pair no other test in this binary can produce.
+    ///
+    /// The token is prefixed rather than hex so it cannot collide with a real
+    /// `attempt_token()`, and counted so two calls -- here or in another test
+    /// running at the same time -- never agree.
+    fn unique_obligation(what: &str) -> (String, String) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        (
+            format!("unit-{what}-{n}"),
+            format!("outrig-unit-{what}-{n}"),
+        )
+    }
+
+    /// The defect: the sweep held names and removed by them, so a panic while
+    /// a start had collided force-removed whatever already held the name --
+    /// a container outrig never created.
+    ///
+    /// Asserted without a panic, which is the point of `pending_removals`
+    /// being separate from the hook.
+    #[test]
+    fn the_panic_sweep_removes_by_attempt_and_never_by_name() {
+        let (attempt, name) = unique_obligation("sweep-selector");
+        track(&attempt, &name);
+
+        let swept_here = swept_for(&attempt);
+        assert_eq!(swept_here.len(), 1, "one obligation, one removal");
+        assert_eq!(
+            swept_here[0].0,
+            vec![
+                "podman",
+                "rm",
+                "-f",
+                "--filter",
+                &format!("label=org.outrig.attempt={attempt}"),
+            ],
+            "the sweep must select by the attempt this obligation is keyed by"
+        );
+        assert_eq!(
+            swept_here[0].1,
+            Reissue::Safe,
+            "a per-attempt label still means this attempt however late it runs"
+        );
+
+        // The load-bearing assertion, and the one place a test may look at the
+        // whole sweep: `name` is unique to this test, so no obligation of
+        // anyone else's could mention it. Nothing the sweep issues may.
+        for (argv, _) in swept() {
+            assert!(
+                !argv.iter().any(|arg| arg.contains(&name)),
+                "a swept removal named the container: {argv:?}"
+            );
+        }
+
+        discharge(&attempt);
+    }
+
+    /// The second defect: `TRACKED` was a set of names, so two attempts
+    /// reserving one name collapsed into a single entry and whichever
+    /// finished first discharged the other's obligation -- leaving a
+    /// container outrig had made with no last-resort cleanup behind it.
+    ///
+    /// Keying by attempt is what separates them, and this is the only place
+    /// that can be shown: podman cannot tell the two apart by name, and
+    /// neither can the fake in `tests/cancellation.rs`.
+    #[test]
+    fn two_reservations_of_one_name_are_two_obligations() {
+        let (first, name) = unique_obligation("shared-name");
+        let (second, _) = unique_obligation("shared-name");
+
+        track(&first, &name);
+        track(&second, &name);
+        assert_eq!(swept_for(&first).len(), 1);
+        assert_eq!(swept_for(&second).len(), 1);
+
+        discharge(&first);
+        assert!(
+            swept_for(&first).is_empty(),
+            "the discharged attempt owes nothing"
+        );
+        assert_eq!(
+            swept_for(&second).len(),
+            1,
+            "one attempt finishing must not cancel the other's obligation"
+        );
+        assert!(
+            is_tracked(&name),
+            "the name is still spoken for while any attempt owes it"
+        );
+
+        discharge(&second);
+        assert!(!is_tracked(&name));
+    }
+
+    /// The handoff from the guard to the handle has no gap: `release` hands
+    /// the obligation on rather than lapsing it, so no instant exists in which
+    /// the container podman made is owed nothing.
+    ///
+    /// It also pins the fact the whole design rests on and that nothing else
+    /// asserts -- the obligation is keyed by the same string podman is told to
+    /// stamp on the container.
+    #[test]
+    fn releasing_a_reservation_hands_the_obligation_on_without_dropping_it() {
+        let (_, name) = unique_obligation("handoff");
+        let guard = NameGuard::reserve(&name);
+
+        let label = guard.attempt_label();
+        let attempt = label
+            .strip_prefix(&format!("{ATTEMPT_LABEL}="))
+            .expect("the label is the attempt label")
+            .to_string();
+        assert_eq!(
+            swept_for(&attempt).len(),
+            1,
+            "the obligation is keyed by the token podman is told to stamp"
+        );
+        assert!(is_tracked(&name));
+
+        let released = guard.release();
+        assert_eq!(released, attempt, "the handle adopts the same token");
+        assert_eq!(
+            swept_for(&attempt).len(),
+            1,
+            "releasing hands the obligation on; it must not lapse in between"
+        );
+        assert!(is_tracked(&name));
+
+        discharge(&attempt);
+        assert!(swept_for(&attempt).is_empty());
+        assert!(!is_tracked(&name));
+    }
+
+    /// `Drop for Container` runs after a `stop` that already discharged, so
+    /// discharging what is no longer owed has to be ordinary.
+    #[test]
+    fn a_discharged_obligation_leaves_the_sweep_nothing_and_discharging_twice_is_a_no_op() {
+        let (attempt, name) = unique_obligation("double-discharge");
+        track(&attempt, &name);
+
+        discharge(&attempt);
+        assert!(swept_for(&attempt).is_empty());
+
+        discharge(&attempt);
+        assert!(swept_for(&attempt).is_empty());
+        assert!(!is_tracked(&name));
+    }
+
+    /// A borrowed container is nobody's here to remove, so it owes the sweep
+    /// nothing -- before or after the handle goes away.
+    #[test]
+    fn an_attached_container_owes_the_sweep_nothing() {
+        let (_, name) = unique_obligation("attached");
+        let attached = Container::attach(name.clone(), ImageTag::new("outrig-test"), None, None);
+
+        assert!(!is_tracked(&name));
+        drop(attached);
+        assert!(!is_tracked(&name));
+
+        for (argv, _) in swept() {
+            assert!(
+                !argv.iter().any(|arg| arg.contains(&name)),
+                "a borrowed container must never be swept: {argv:?}"
+            );
+        }
     }
 
     #[test]

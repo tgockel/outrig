@@ -2,6 +2,12 @@
 
 ## Symptom
 
+The module has more than one test in this class. `0002-55`'s verification run also caught
+`process::process_tests::run_streamed_forwards_stderr_to_tracing` failing the same way, and
+running the `process_tests` module on its own reproduces at 8 failures in 12 on `ad59179e`
+with nothing applied -- so the rate below understates it when these tests are selected
+together. The named test is the one first diagnosed, not the only one affected.
+
 `process::process_tests::try_capture_logged_traces_spawn_and_exit_at_debug` fails
 intermittently, in one of two complementary ways -- either assertion can be the one that
 trips, and whichever fails reports that the *other* event is the only one present:

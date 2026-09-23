@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The session watcher reaped sidecars by container name.** When the primary container dies
+  out from under outrig, the watcher removes that session's sidecars -- and it asked podman for
+  them by name. Sidecars die at the same moment the primary does and `--rm` frees a name on the
+  spot, so a removal resolving a name a moment later could reach whatever had taken it. Each
+  sidecar now carries an `org.outrig.instance` label, unique per container and per session, and
+  the reap selects on that. A failed reap is now reported rather than discarded, the way
+  `outrig clean` reports one. (`outrig clean`'s own stray sweep still removes by name, and
+  still has to: a stray's session is over, so nothing is left holding the label it was
+  started with.)
+
 - **`outrig clean` reported removing stray containers it had not removed.** The sweep coalesces
   its removals into one `podman rm -f <name>...`, and printed `removed container <name>` for
   every name in the batch on the strength of that one exit status. podman exits zero having

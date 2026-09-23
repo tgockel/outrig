@@ -401,8 +401,12 @@ so `outrig clean` sweeps a library session's strays the same way.)
 **Lifecycle coupling** is entirely outrig-managed (no pods, no `--requires`): sidecars start
 after the primary and stop before it, and the same four cleanup layers -- explicit stop, the
 name guard, Drop, and the panic-hook sweep -- cover every container. In addition, sessions with
-sidecars run a `podman wait` watcher on the primary: if the primary dies out from under outrig
-(manual `podman kill`, OOM), the watcher reaps all sidecars and ends the session with an error.
+sidecars run a `podman events` watcher on the primary: if the primary dies out from under
+outrig (manual `podman kill`, OOM), the watcher reaps all sidecars and ends the session with an
+error. It reaps by `org.outrig.instance`, a per-container label whose value is unique to the
+session, rather than by container name -- a sidecar dies at the same moment the primary does
+and `--rm` frees its name on the spot, so a removal that resolved a name a moment later could
+reach whatever had taken it.
 A stray that survives even that (say, a SIGKILLed outrig) is caught by `outrig clean`, which
 sweeps stopped, record-less containers carrying `org.outrig.session`; see
 [Sessions -> outrig clean](https://tgockel.github.io/outrig/usage/sessions.html#outrig-clean).
@@ -424,6 +428,16 @@ stamps a fresh `org.outrig.attempt` value on the container it asks for and remov
 create that collided made nothing carrying it, and a cleanup still in flight cannot reach a
 container you have since started under the same name. Labels are part of the creation request,
 so there is no instant in which the container exists without the mark that identifies it.
+
+**Every layer uses that selector**, not just the start guard. The panic-hook sweep used to hold
+container *names* and remove by them, so a panic arriving while a start had collided would
+delete the container that already held the name -- one outrig never created. It now replays
+each outstanding attempt's label-scoped removal instead, and it tracks those attempts
+separately, so two starts asking for one name are two obligations and neither can cancel the
+other's. No layer that covers a container for the lifetime of the session that made it -- stop,
+start guard, Drop, panic sweep, sidecar reap -- addresses that container by name any more.
+`outrig clean` still does, and necessarily: a stray belongs to a process that is gone, so the
+per-attempt label it was started with died with the outrig that chose it.
 
 **A cancelled build is asked to stop rather than killed**, and it is the only command that is.
 buildah creates a working container per *stage*, and those are not outrig's to name: buildah

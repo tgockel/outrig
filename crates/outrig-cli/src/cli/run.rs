@@ -650,10 +650,14 @@ async fn try_sidecar_add(
             primary.transcript(),
         )
     };
+    // Cloned out of the shared state: the salt is the session's, so a sidecar
+    // added mid-session is labeled the same way the ones started with it were.
+    let instance_salt = state.runtime.borrow().containers.instance_salt.clone();
     let ctx = SidecarStartCtx {
         cfg: state.cfg,
         repo_root: state.repo_root,
         sid: state.sid.as_str(),
+        instance_salt: &instance_salt,
         host_workspace: &host_workspace,
         container_workspace: &container_workspace,
         transcript: transcript.as_ref(),
@@ -760,8 +764,12 @@ async fn try_sidecar_add(
             .sidecars
             .insert(name.to_string(), container);
         runtime.mcp_arcs.extend(new_arcs);
-        if let Some(watcher) = runtime.watcher.as_mut() {
-            watcher.register_sidecar(container_name.clone());
+        // Derived by the container set that just took ownership, so the
+        // selector the reap will use is built in one place rather than
+        // re-assembled here from its parts.
+        let registered = runtime.containers.sidecar_ref(name);
+        if let (Some(watcher), Some(sidecar)) = (runtime.watcher.as_mut(), registered) {
+            watcher.register_sidecar(sidecar);
         }
     }
     state.agent.extend_tools(new_adapters);
@@ -1298,6 +1306,7 @@ mod tests {
                         SessionContainers {
                             abandoned: Vec::new(),
                             sidecars: std::collections::BTreeMap::new(),
+                            instance_salt: "test-salt".to_string(),
                             primary,
                         },
                     ),

@@ -34,8 +34,15 @@ Three things to settle while doing it:
   through `inspect_existing`, or keep by-name where the caller took that risk knowingly.
 - **What the name is still for.** Log lines, `session.json`, `session_suffix`, and the panic
   hook's `TRACKED` set all want the human-readable name; only the *addressing* moves.
-- **`force_remove_detached`** is public and takes a name, because its caller (the session
-  watcher) has no handle. It stays by-name, and stays `Reissue::Once` for that reason.
+- **`force_remove_detached`** is public and takes a name, because its caller has no handle.
+  It stays by-name, and stays `Reissue::Once` for that reason.
+
+  Note the premise was wrong, and the entry is kept only for the id work it is really about.
+  It assumed the only alternative to a name was the attempt token, which the session watcher
+  cannot have -- but a name was not the only thing left. The watcher now stamps its own
+  `org.outrig.instance` label and reaps by that, so it no longer calls this at all.
+  `force_remove_detached` is public API and therefore stays, but it has no caller in the tree;
+  whether it should survive the next surface review is a question for that review.
 
 ## Worth doing with 0002-50 or 0002-53
 
