@@ -122,7 +122,15 @@ if [ "$1" = "init" ] && [ -n "$2" ] && [ -f "$journal/hold.init.$2" ]; then
   exec sleep 300
 fi
 
-exec "$OUTRIG_REAL_PODMAN" "$@"
+# Hand the search back to the shell, with this wrapper's directory removed.
+# `execvp` is what decides which `podman` an ordinary spawn would have found:
+# it skips a candidate the *effective* user cannot execute and keeps looking,
+# which no mode-bit test here reproduces faithfully -- `mode & 0o111` is true
+# of a file owned by this user at 0645, which it cannot execute. Rather than
+# imitate that rule, use it.
+PATH="$OUTRIG_REAL_PATH"
+export PATH
+exec podman "$@"
 "#;
 
 /// Install the wrapper ahead of the real podman on `PATH`, and return the
@@ -137,9 +145,9 @@ fn wrapper_runtime() -> &'static Path {
     JOURNAL.get_or_init(|| {
         use std::os::unix::fs::PermissionsExt;
 
-        // Resolved before `PATH` is rewritten, or the wrapper would find itself
-        // and recurse.
-        let real = real_podman();
+        // Captured before `PATH` is rewritten: it is what the wrapper restores
+        // so its own `exec podman` cannot find the wrapper again.
+        let real_path = std::env::var_os("PATH").unwrap_or_default();
 
         let root = tempfile::Builder::new()
             .prefix("outrig-e2e-podman-wrapper")
@@ -166,12 +174,11 @@ fn wrapper_runtime() -> &'static Path {
         unsafe {
             std::env::set_var("PATH", search);
             std::env::set_var("OUTRIG_E2E_JOURNAL", &journal);
-            // Through the environment rather than interpolated into the
-            // script. `$OUTRIG_REAL_PODMAN` carries the path's own bytes and
-            // the expansion of a quoted variable is not rescanned, so a
-            // directory containing `$` or `"` neither expands nor breaks the
-            // parse -- and nothing has to survive `to_string_lossy`.
-            std::env::set_var("OUTRIG_REAL_PODMAN", &real);
+            // Through the environment, never interpolated into the script: it
+            // carries the original bytes, and the expansion of a quoted
+            // variable is not rescanned, so an entry containing `$` or `"`
+            // neither expands nor breaks the parse.
+            std::env::set_var("OUTRIG_REAL_PATH", &real_path);
         }
 
         // The directory has to outlive every test in the binary, and nothing
@@ -180,28 +187,6 @@ fn wrapper_runtime() -> &'static Path {
         std::mem::forget(root);
         journal
     })
-}
-
-/// The first `podman` on the inherited `PATH`.
-///
-/// Resolved by hand rather than with a crate: it runs once, and taking a
-/// dev-dependency to split a string on `:` would cost more than it saves.
-fn real_podman() -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = std::env::var_os("PATH").expect("PATH is set");
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("podman"))
-        .find(|candidate| {
-            // The executable bit, not just "a file named podman". `execvp`
-            // skips a non-executable match and keeps searching, so resolving
-            // on `is_file` alone would pick one that an ordinary spawn never
-            // would -- and the wrapper would exec it and exit 126.
-            candidate
-                .metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-        .expect("an executable podman on PATH")
 }
 
 /// Ask the wrapper to park `podman init <name>` when it reaches it.

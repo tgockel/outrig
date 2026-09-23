@@ -1982,6 +1982,9 @@ mod tests {
     /// unknown, with nothing observable left if those retries also failed.
     #[tokio::test]
     async fn a_removal_that_never_returns_does_not_count_as_a_stop() {
+        // Reaches `stop_inner`, and so `try_capture_logged_until`'s callsites,
+        // with no subscriber installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let mut container = Container::unstoppable();
         // The stop is held still so the removal is reached at all, and so the
         // test needs no engine of its own.

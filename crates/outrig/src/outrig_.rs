@@ -1501,6 +1501,9 @@ mod tests {
     /// is told about a container no one can do anything about.
     #[tokio::test]
     async fn a_sidecar_that_would_not_stop_is_kept_for_teardown() {
+        // Reaches `stop_inner`, and so `try_capture_logged_until`'s callsites,
+        // with no subscriber installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
 
         let reported = unwind_sidecar(
@@ -1538,6 +1541,9 @@ mod tests {
     /// caller looking for something that no longer exists.
     #[tokio::test]
     async fn a_stop_that_worked_supersedes_a_detach_that_did_not() {
+        // Reaches `stop_inner`, and so `try_capture_logged_until`'s callsites,
+        // with no subscriber installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
 
         let reported = unwound(
@@ -1570,6 +1576,9 @@ mod tests {
     /// against something that no longer exists, next to "session unaffected".
     #[tokio::test]
     async fn a_confirmed_stop_supersedes_an_attach_that_could_not_be_undone() {
+        // Reaches `stop_inner`, and so `try_capture_logged_until`'s callsites,
+        // with no subscriber installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
 
         let reported = unwind_sidecar(
@@ -1605,6 +1614,9 @@ mod tests {
     /// the session is unaffected.
     #[tokio::test]
     async fn an_unwind_that_worked_keeps_nothing() {
+        // Reaches `stop_inner`, and so `try_capture_logged_until`'s callsites,
+        // with no subscriber installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let mut abandoned = Vec::new();
         let reported = unwind_sidecar(
             "tools",
