@@ -64,11 +64,18 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// The directory three levels above `repo_cfg`, or `.` when there is none.
+/// A relative path of exactly three components -- `--config
+/// .agents/outrig/config.toml` -- has `""` there rather than no parent at all,
+/// and the empty path is not the current directory to what receives it:
+/// `Path::new("").exists()` is false, and mistralrs-core reads an empty
+/// model directory as a Hugging Face repo ID.
 pub(crate) fn repo_root_from_config_path(repo_cfg: &Path) -> PathBuf {
     repo_cfg
         .parent()
         .and_then(Path::parent)
         .and_then(Path::parent)
+        .filter(|root| !root.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -219,6 +226,44 @@ mod tests {
         let custom = tmp.path().join("elsewhere/my-config.toml");
         let resolved = resolve_repo_config(Some(&custom), tmp.path()).unwrap();
         assert_eq!(resolved, custom);
+    }
+
+    #[test]
+    fn repo_root_from_config_path_is_never_empty() {
+        for (cfg, root) in [
+            (".agents/outrig/config.toml", "."),
+            ("./.agents/outrig/config.toml", "."),
+            ("sub/.agents/outrig/config.toml", "sub"),
+            ("/repo/.agents/outrig/config.toml", "/repo"),
+            ("config.toml", "."),
+        ] {
+            assert_eq!(
+                repo_root_from_config_path(Path::new(cfg)),
+                Path::new(root),
+                "--config {cfg}",
+            );
+        }
+    }
+
+    /// The directory the mistralrs loader is handed for a bare `model-path`
+    /// under `--config .agents/outrig/config.toml`. An empty one is looked up
+    /// on Hugging Face instead of opened.
+    #[test]
+    fn bare_model_path_under_derived_root_has_a_local_parent() {
+        let cfg = outrig::config::Config::load_from_str(
+            r#"
+[providers.local]
+style = "mistralrs"
+
+[models.bare]
+provider   = "local"
+model-path = "local.gguf"
+"#,
+        )
+        .unwrap();
+        let root = repo_root_from_config_path(Path::new(REPO_CONFIG_REL));
+        let model_path = cfg.models["bare"].resolved_model_path(&root).unwrap();
+        assert_eq!(model_path.parent(), Some(Path::new(".")));
     }
 
     #[test]
