@@ -5,53 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 
-### Fixed
-
-- **The panic-hook sweep could remove a container outrig never created.** The last-resort
-  cleanup layer tracked container *names* and swept them with `podman rm -f <name>`. A name
-  is a request, not a claim: `podman run --name N` failing because N is already in use is an
-  ordinary outcome, so a panic arriving between the name being reserved and the start guard
-  dropping force-removed whatever held N -- another session, a stray, a container made by
-  hand. Every other cleanup layer had already moved to the per-attempt `org.outrig.attempt`
-  label; the sweep now replays that same removal and holds no name it could remove by.
-
-  The registry it sweeps is also keyed by the attempt token rather than by the name. It was a
-  set of names, so two starts asking for one name collapsed into one entry and whichever
-  finished first discharged the other's obligation -- leaving a container outrig had made with
-  no last-resort cleanup behind it. Two attempts are now two obligations.
-
-  This is reachable without a name collision. `start` passes `--rm`, so after a stop whose
-  removal timed out the container is likely gone and its name free, and a panic in that window
-  swept whatever had since taken the name.
-
-- **The network interceptor installed no rules at all on nft 1.0.9**, which is what Ubuntu
-  24.04 ships. The redirect script was one `create table inet <t> { chain output { ... } }`;
-  nft parses that, exits zero, creates the table, and silently drops the nested block. The
-  result was a table with no chain in it, so nothing was redirected to the interceptor: in
-  `audit` mode no connection was ever recorded, and in `filter` mode every connection was
-  allowed, including the ones a `default = deny` policy exists to refuse. `attach` and
-  `detach` both reported success throughout.
-
-  The script is now a flat sequence -- `create table`, then `add chain`, then one `add rule`
-  per rule -- which installs the same ruleset and keeps both properties `create` was chosen
-  for: it still fails rather than merging if a table of that name already exists, and `nft -f`
-  is a single transaction either way, so a failure leaves nothing behind.
-
-  Nothing in the unit suite could see this. `nft_rules` was checked by asserting the generated
-  text *contained* each rule, which both forms satisfy, and no test ran nft. It surfaced the
-  first time the `e2e` suite was executed against a live engine rather than compiled: seven of
-  the eight `network_interceptor` tests failed, every one of them waiting for an audit record
-  that was never going to arrive. That suite now runs in CI on every pull request, on x86-64
-  and AArch64.
-
-## [0.2.0-rc.3](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.3) - 2026-09-22
-
-A third release candidate, cut to close the 0.2.0 release gate: the public surface is narrowed,
-sealed, and now enforced by a committed snapshot, and the documentation contracts have been
-corrected against what the code actually does. Everything here is measured against
-**0.2.0-rc.2**; a consumer still on 0.1.0 should read **Migrating from 0.1** below first.
+The first release since 0.1.0. It breaks the public Rust surface in most of the ways a 0.1
+consumer will notice, so everything below is measured against **0.1.0** and **Migrating from
+0.1** is the ordered list of work. Read it before the entries: three of the breaks it names
+are compiler-silent, and a consumer who updates, compiles clean, and stops there will be
+wrong about all three.
 
 ### Migrating from 0.1
 
@@ -221,35 +181,6 @@ that it does.
   nine `ConfigValidationError` variants policing them will be removed in a future release --
   not this one. Nothing is removed here and no key changed spelling. Point a `style = "openai"`
   provider at an OpenAI-compatible server on `localhost` instead.
-
-### Deprecated
-
-- **`style = "mistralrs"` and the config surface behind it**: `LlmProvider::Mistralrs`,
-  `MistralrsDeviceSpec` and `MistralrsDeviceParseError`, the six `Model` weight fields
-  (`model_id`, `model_path`, `model_file`, `revision`, `context_length`, `device`),
-  `Config::model_cache_root`, and the nine `ConfigValidationError` variants that police them.
-  They will be removed in a future release -- not this one.
-
-  This is the library half of a deprecation `outrig-cli` announced on its own; every item above
-  lives here, so recording it only there left the crate that publishes them silent. Nothing is
-  removed, no key changed spelling, and a config naming this style still parses and validates.
-  Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
-  its `localhost` `base-url`; the migration is in
-  [In-process LLMs](../../doc/concepts/in-process-llm.md).
-
-### Changed
-
-- **`LlmProvider::Mistralrs` is a braced variant**, `Mistralrs {}`, rather than a unit one.
-  That is a source break with a one-token migration: a pattern becomes
-  `LlmProvider::Mistralrs { .. }` and a construction becomes `LlmProvider::Mistralrs {}`. The
-  variant is deliberately **not** `#[non_exhaustive]`, unlike its two siblings, so it stays
-  constructible outside this crate and needs no constructor function of its own.
-
-  It buys the one thing a unit variant could not have: `deny_unknown_fields` on the
-  internally-tagged enum now has a field set -- an empty one -- to check a `[providers.<name>]`
-  block against, so a key written on a `style = "mistralrs"` provider is refused instead of
-  silently discarded. It is a pre-0.2.0 break on purpose; after the freeze the same change
-  costs a major version, and the surface it repairs is one every other style already had.
 
 ### Added
 
@@ -423,7 +354,241 @@ that it does.
   built-in default config is exactly this shape, so parity here is not hypothetical: it was
   reached by parsing TOML because the library could not be asked.
 
+- **`[<...>.security]` gains an `unmask` key**, an ordered list of paths excluded from podman's
+  default masking, lowered one `--security-opt=unmask=<path>` per entry beside the existing
+  `--device` loop. It rides `ContainerSecurity`, `SecuritySpec`, and `ContainerLaunchSpec`, so
+  images and sidecars declare it the same way and both `podman run` and `podman create` carry
+  it. Default empty: no existing launch changes.
+
+  This is the key that makes a **nested container runtime** possible at all. The kernel's
+  "fully visible" rule for procfs (`mount_too_revealing` in `fs/namespace.c`) lets a process in
+  a non-initial user namespace mount a fresh `procfs` only while the `/proc` already in its
+  mount namespace is unobstructed. Podman's default hardening mounts read-only tmpfs over
+  `/proc/acpi`, `/proc/scsi`, and friends, and those mounts are created by a more privileged
+  namespace and locked -- so no capability the container can hold will remove them, and an
+  inner `podman run` dies at creation with ``crun: mount `proc` to `proc`: Operation not
+  permitted``. Measured against podman 5.7 on Linux 7.0, the working recipe is
+  `unmask = ["/proc/*"]`, `cap-add = ["SYS_ADMIN"]` (inner-namespace capabilities are bounded
+  by the outer set), and `devices = ["/dev/fuse", "/dev/net/tun"]` -- the second device for
+  `pasta`, podman 5's default rootless network backend, which an earlier published recipe
+  for this omitted.
+
+  Entries reach podman verbatim, so `unmask = ["ALL"]` stays expressible without an image that
+  asked for `/proc/*` being silently widened into it. Seven `ConfigValidationError` variants
+  come with it, and every one of them exists because the alternative is silence rather than a
+  failure: `UnmaskPathEmpty`; `UnmaskPathRelative` (absolute paths and `ALL` only);
+  `UnmaskPathListSeparator`, since podman splits an unmask value on `:` and a colon-joined
+  entry would expand back into several at launch; `UnmaskPathDuplicate`; `UnmaskPathBadGlob`,
+  because podman answers a malformed pattern with a log line and a container whose path is
+  still masked; and `UnmaskAllNotCanonical` / `UnmaskAllNotAlone`, because podman lifts the
+  *read-only* paths -- the ones that make `/sys/fs/cgroup` writable -- only when `ALL` is
+  spelled in exact uppercase and comes first. Lowercase `all` and `["/proc/*", "ALL"]` both
+  still clear the masked paths, so they look like a full unmask and are not one. outrig
+  rejects them rather than reordering a caller's list behind their back.
+
+  **This retracts the `newuidmap` rationale previously given for `no-new-privileges`.** That
+  rationale said a nested rootless podman needs `newuidmap`, a setuid binary, so `no_new_privs`
+  must be cleared for it. Under `--userns=keep-id` that never happens: the primary's user
+  namespace is owned by the host user, so its owner is inside-UID 1000 rather than 0, and the
+  kernel grants
+  capabilities in a namespace only to a process whose effective UID *is* the owner -- so
+  reaching euid 0 through `newuidmap` gains nothing and fails. With no `/etc/subuid` entry
+  podman takes its rootless single-mapping path instead, creating the namespace with a plain
+  `unshare` and never calling `newuidmap` at all. That is the path the recipe above runs on,
+  with `--security-opt=no-new-privileges` still applied. Adding `/etc/subuid` and
+  `/etc/subgid` entries actively breaks nesting by pushing podman back onto the `newuidmap`
+  path. The key itself is unchanged and still useful for images that do carry setuid tooling;
+  only its stated motivation was wrong.
+
+- **A `[models.<name>]` entry can name other models instead of a provider.** The new `alias`
+  key takes one model name (`alias = "opus-5"`) or an ordered list of them
+  (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`), and both spellings deserialize through
+  the same helper `model-file` already uses. `Model::alias` joins `Model::new` as a
+  constructor, `Model::source` returns the new `ModelSourceRef` discriminating the two shapes,
+  and `Config::model_candidates` flattens an alias graph to the ordered list of concrete model
+  names it stands for.
+
+  An alias *is* a model: it lives in the same table, under one namespace and one lookup, so
+  everything that already accepts a model name accepts it unchanged. A separate
+  `[model-aliases]` table would have needed a documented precedence rule for a name declared
+  in both; inside one table that collision cannot be expressed, so the rule does not need to
+  exist.
+
+  Six `ConfigValidationError` variants come with it -- `ModelSourceMissing`,
+  `ModelSourceConflict`, `ModelAliasEmpty`, `UnknownModelAliasTarget`, `ModelAliasCycle`, and
+  `ModelAliasTooDeep`, the last bounding traversal depth at `MODEL_ALIAS_DEPTH_MAX` (32) so a
+  long chain reports a bad config instead of exhausting the stack. The enum is
+  `#[non_exhaustive]`, so all six are additive. Unlike the other model rules,
+  these are checked on every validation path including `outrig build`'s: they establish an
+  entry's *shape* rather than resolve a cross-reference, and until `provider` became optional
+  serde's own "missing field" enforced half of it everywhere.
+
+  `Config::model_candidates` is the first method on `Config` that is neither `load*` nor
+  `validate*`. It is public because both crates walk this graph -- validation checks it, and
+  the binary's resolver selects from it -- and two traversals that had to agree on ordering
+  and on cycle handling would be two chances to disagree.
+
+- **Anthropic's native Messages API is a provider style.** `style = "anthropic"` on a
+  `[providers.<name>]` block reaches Claude directly -- `POST {base-url}/v1/messages` with
+  `x-api-key` auth, tools advertised as `input_schema`, and `tool_use` / `tool_result` content
+  blocks -- rather than through an OpenAI-compatible bridge. It takes the same `base-url`,
+  `api-key`, and `request-timeout-secs` fields as `style = "openai"`, and the same timeout,
+  transient-retry, tool-call, history, and subagent behavior applies. `base-url` is the API
+  root (`https://api.anthropic.com`); a trailing `/v1`, `/messages`, or `/v1/messages` is
+  trimmed if present. Reaching Claude through a bridge is still an `openai` provider pointed
+  at that bridge, and both remain supported.
+
+  `LlmProvider::Anthropic` and its `LlmProvider::anthropic(..)` constructor arrive together
+  with the `#[non_exhaustive]` sweep below, so a match with a catch-all arm keeps compiling.
+
+- **`retry-budget-secs`,** as `Config::retry_budget_secs` and a field on the `OpenAi` and
+  `Anthropic` variants of `LlmProvider`, bounding how long a transiently-failing LLM call
+  keeps retrying. `DEFAULT_RETRY_BUDGET_SECS` is `600` and `RETRY_BUDGET_SECS_CEILING` is
+  `3600`; `0` disables retries. A provider's own value wins over the top-level one, which
+  wins over the default. Over-ceiling values are rejected with the new
+  `ConfigValidationError::RetryBudgetSecsTooLarge`.
+
+  Set it with `OpenAiOptions::with_retry_budget_secs(..)` or
+  `AnthropicOptions::with_retry_budget_secs(..)`. The options struct is also what replaces the
+  positional timeout argument to `LlmProvider::openai(..)` / `::anthropic(..)`, detailed under
+  **Changed**. `LlmProvider`, its `OpenAi` and `Anthropic` variants, and `Config` are
+  `#[non_exhaustive]`; `Mistralrs {}` deliberately is not, so it stays constructible.
+
+- **`LlmProvider::style()`,** the `style` tag a provider serializes as. It lives next to the
+  serde attributes that define those tags, so a diagnostic or a label can name a style
+  without retyping the string somewhere it can drift out of agreement with what the config
+  file actually accepts.
+
+- **`[models.<name>].max-tokens`,** the output-token ceiling for turns run against that
+  model. `[agents.<name>].max-tokens` still wins where it is set; the model value covers
+  every agent that uses it and is `None` by default, so nothing changes for a config that
+  does not set it.
+
+  It exists because Anthropic requires `max_tokens` on every request and the ceiling is a
+  property of the model, not of the role using it. outrig sends the published ceiling for
+  the Claude identifiers it recognizes; any other identifier now has somewhere to declare
+  one other than every agent that names it. Setting neither is no longer an error: an
+  Anthropic model outrig has no published ceiling for falls back to 32768 and says so once
+  on stderr, naming the tables the ceiling belongs in. The fallback errs high on purpose --
+  a model whose real limit is lower rejects the request and names that limit, whereas a
+  ceiling set too low truncates replies with nothing logged.
+
+- **Relative config paths resolve against the file that declared them.** A path in
+  `~/.outrig/config.toml` (or a `--global-config` file) is now relative to that file's own
+  directory rather than to the repo root. The practical effect is that a global
+  `[images.<name>]` can finally use the build shape: its `dockerfile` and `context` live beside
+  the global config and resolve identically from any repo on the machine. Before this, such a
+  block parsed and validated as legal but was joined onto the current repo root, so it either
+  failed with `DockerfileMissing` or -- worse -- silently picked up a same-named path inside the
+  repo. The same fix covers `host-path` in `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`,
+  which matters most for workspace mounts: global and repo mount lists are *concatenated*, so a
+  single base directory could never have been right for every element of the result.
+
+  Repo-declared paths are unchanged in every case, and absolute paths were never affected. An
+  entry that never went through `Config::load` -- anything hand-built from the library API --
+  records no source and keeps resolving against the `repo_root` it is passed.
+
+  The provenance is carried, not discarded after use: `ConfigSource` is public, with
+  `base_dir()` for the directory paths resolve against and `config_path()` for the file to name
+  in a diagnostic. `ImageConfig::config_source()`, `ImageConfig::base_dir()`,
+  `ImageConfig::resolved_build_paths()`, `MountConfig::config_source()`,
+  `MountConfig::resolved_host_path()`, and `Workspace::resolved_host_path()` expose it.
+
+  `ConfigValidationError::DockerfileMissing` and `ContextMissing` gained a
+  `declared_in: Option<PathBuf>` field, so a global entry's failure no longer reads as a repo
+  problem. Both variants were already `#[non_exhaustive]`, so this is additive. It is an
+  `Option` rather than a defaulted path because a filename in an error message is a claim: an
+  entry built by hand and validated directly has no declaring file, and the message omits the
+  `(declared in ...)` clause entirely rather than naming a config that never mentioned it.
+
+- **The library API reaches every sidecar placement.** A hand-built `SidecarSpec` can now host
+  an entrypoint-stdio server -- one with no `command`, whose container's `ENTRYPOINT` is the
+  server -- with `SidecarSpec::with_entrypoint_server(name, args)`, and can run it against the
+  primary container's filesystem view with `with_view(SidecarView::Primary)`. Both
+  `Outrig::add_sidecar` and `LaunchSpec::with_sidecar` accept them, so an embedding program
+  reaches the same tool
+  topology as `outrig run` -- including serving an off-the-shelf MCP image over the primary's
+  own tree. `SidecarSpec::with_server_spec(name, server)` is the general form the other
+  `with_*server` methods are shorthands for, for a server that needs both a transport and an
+  environment.
+
+  `view = "primary"` from the library is the same posture change it is from the CLI
+  (`CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace), and a build without
+  the `<arch>-unknown-linux-musl` helper fails before any container is created, naming the
+  missing artifact. The helper is materialized into the `LaunchSpec`'s log directory.
+
+  The placement rules are no longer duplicated: a hand-built spec that sets `view = "primary"`
+  alongside workspace access, or hosts an entrypoint server next to another server, is rejected
+  by the same code and with the same message as the equivalent `[sidecars.<sc>]` block.
+- **`Outrig::exec_stdio` and `Outrig::exec_capture`** run a command in the *primary* container
+  as the session's runtime user -- the first streaming, the second returning a
+  `std::process::Output` with a non-zero exit reported as data rather than an error. The
+  primary `Container` stays private, so an embedder cannot stop a container the session owns.
+- **MCP sidecar containers** -- an MCP server can run in its own container alongside the
+  primary. `LaunchSpec::with_sidecar` declares sidecars at launch (abort-only: any failure
+  tears down everything already started), and `Outrig::add_sidecar` starts one mid-session,
+  returning the new tool handles so callers need not diff `tools()`. `SidecarSpec` and
+  `SidecarServerSpec` are the builder types -- a raw podman image ref used verbatim, plus
+  workspace access, mounts, security, and servers.
+- **Config-driven sidecar placement** -- `LaunchSpec::from_config(&Config, image_name,
+  repo_root, log_dir)` translates an image config's `[mcp]` map into the primary MCP map plus
+  resolved `SidecarSpec`s, resolving a sidecar's image against sibling `[images.<name>]`
+  blocks. It replaces `LaunchSpec::from_image_config`; see **Removed**.
+- **Entrypoint-stdio MCP servers** -- an image whose `ENTRYPOINT` is itself the server (an
+  inline image with no command) is supported, so off-the-shelf MCP images work with no
+  repo-side command knowledge. Launch splits into `podman create` + `podman init` +
+  `podman start`, which lets the network interceptor attach to the held process before the
+  server's first packet.
+- **Sidecars that share the primary's filesystem view** -- `view = "primary"` runs a sidecar's
+  server against the primary container's own tree, via the embedded `outrig-enter` launcher,
+  so a server needs no bind mount and cannot disagree with the primary about paths. It is
+  entrypoint-stdio only, requires the `<arch>-unknown-linux-musl` helper at build time, and
+  costs `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` in the primary's user namespace.
+  `OutrigError::FilesystemHelperUnavailable` names the missing artifact, and the build-time
+  reason it was not produced, when the helper is absent.
+
+  The launcher holds those capabilities only until the graft is in place: it clears its
+  supplementary groups and becomes the session's uid/gid immediately before exec'ing the
+  payload, which drops the permitted, effective and ambient sets with the uid transition. So a
+  server placed this way is indistinguishable from an exec-stdio one in what it may do and what
+  it may own -- in particular, what it writes into the workspace comes back owned by the
+  invoking user. A server needing root over the primary's filesystem is not supported.
+- **Device passthrough and a no-new-privileges opt-out** -- `[image.security]` carries
+  `devices` and `no-new-privileges`, surfaced as `ContainerSecurity`. `no_new_privileges`
+  defaults to `true`, so the default posture is unchanged from 0.1.0.
+- **The container's runtime user is written from the host** -- the session user is grafted
+  into the container's `/etc/passwd` and `/etc/group` without executing anything inside it,
+  so a bootstrap no longer depends on the image shipping `useradd`.
+- **`subagent-depth-max` and `subagent-width-max`** bound how deeply subagents nest and how
+  many one agent may hold at once. Both are top-level `Config` keys with an
+  `[agents.<name>]` override; the defaults are 3 and 8.
+- **Every podman/buildah command line is logged at debug level**, so a session can be
+  reconstructed from a trace without reproducing it.
+- **Arguments for entrypoint-stdio MCP servers** -- an `args` key on `[images.<name>.mcp]`
+  entries and on `[sidecars.<sc>]` blocks supplies the container's trailing argv,
+  so images that take their configuration positionally (`docker.io/mcp/filesystem` and most of
+  the MCP catalog) can be named and run without spelling out their internal layout as an
+  exec-stdio `command`.
+- **Named sidecars can be entrypoint hosts** -- a `[sidecars.<sc>]` block whose
+  one MCP entry omits `command` runs that image's `ENTRYPOINT` as the server, which is how an
+  entrypoint-stdio server gets a workspace view, mounts, or its own security policy. Such a
+  block hosts exactly one server and must be `start = "auto"`.
+- `SidecarSpec`, `SidecarServerSpec`, `SidecarWorkspaceAccess`, `SidecarView`, and
+  `resolve_mcp_env` are exported from the crate root.
+
 ### Changed
+
+- **`LlmProvider::Mistralrs` is a braced variant**, `Mistralrs {}`, rather than a unit one.
+  That is a source break with a one-token migration: a pattern becomes
+  `LlmProvider::Mistralrs { .. }` and a construction becomes `LlmProvider::Mistralrs {}`. The
+  variant is deliberately **not** `#[non_exhaustive]`, unlike its two siblings, so it stays
+  constructible outside this crate and needs no constructor function of its own.
+
+  It buys the one thing a unit variant could not have: `deny_unknown_fields` on the
+  internally-tagged enum now has a field set -- an empty one -- to check a `[providers.<name>]`
+  block against, so a key written on a `style = "mistralrs"` provider is refused instead of
+  silently discarded. It is a pre-0.2.0 break on purpose; after the freeze the same change
+  costs a major version, and the surface it repairs is one every other style already had.
 
 - **Breaking: an advertised tool name carries a hash suffix whenever outrig had to change
   it**, not only when it was too long. `sanitize_tool_name` used to apply its blake3 suffix on
@@ -476,8 +641,8 @@ that it does.
   pairing behind, after which the new value resolved against the directory of a file that never
   contained it: a bind mount of the wrong host tree, read-write if the mount says so. The
   setters clear the source, because a hand-set value belongs to no config file and resolves
-  against the `repo_root` argument like any other. `Workspace::set_host_path` has worked this
-  way since the primary workspace gained provenance; this is the rest of the rule.
+  against the `repo_root` argument like any other. `Workspace::set_host_path` takes the same
+  treatment in the entry below; this is the rest of the rule.
 
   `set_build_paths` replaces the pair in one call rather than offering a setter per path,
   because one source backs both: clearing it for `dockerfile` alone would rebase `context` from
@@ -581,7 +746,7 @@ that it does.
 
   Making a public field private is a break `#[non_exhaustive]` does not cover, so it is free
   before the 0.2.0 freeze and costs a major version after -- the same trade the `Workspace`
-  entry in 0.2.0-rc.2 took, and for the same reason.
+  accessors took, and for the same reason.
 
 - **`merge` cannot apply a repo config's network policy, whatever built that config.** It
   reads the repo's declared mode and nothing else, so the operator-owned policy is safe by
@@ -619,6 +784,257 @@ that it does.
   helper, and sealing it means a second required method is an addition rather than a break.
   Calling `path_ctx` is unaffected.
 
+- **Breaking: `LlmProvider::openai` and `LlmProvider::anthropic` now take an options
+  struct**, `OpenAiOptions` and `AnthropicOptions` respectively, instead of a positional
+  `request_timeout_secs`. Both structs also carry `retry_budget_secs`, so
+  `LlmProvider::with_retry_budget_secs` is removed -- a retry budget can no longer be handed to
+  the in-process `Mistralrs` variant, which had nowhere to record it and discarded it in
+  silence. Migrate a constructor with no overrides by replacing its third argument with
+  `OpenAiOptions::new()` or `AnthropicOptions::new()`, and one that set a timeout with
+  `OpenAiOptions::new().with_request_timeout_secs(secs)`; `with_retry_budget_secs(secs)` on
+  either options type replaces the removed `LlmProvider` method. The structs are
+  `#[non_exhaustive]`, so later connection settings can be added without changing the
+  constructor signatures again -- which also means the `with_*` setters, not the public fields,
+  are how a downstream crate builds one.
+
+- **Breaking: `Model::provider` is now `Option<String>`.** A model entry has two mutually
+  exclusive shapes -- a provider that serves it, or an `alias` naming other models -- so the
+  field that identifies the first cannot be required. This follows `ImageConfig` exactly,
+  which has carried `image-name` XOR `dockerfile`+`context` in one table since 0.1: every
+  field `Option`, exactly-one-shape enforced by validation, and a discriminated accessor
+  (`ImageConfig::source`, now joined by `Model::source`) as the way readers ask which shape
+  they got.
+
+  `Model::new(provider)` is unchanged and still the way to build a provider-shape model, so
+  the common construction path does not move. Readers of the field take a one-line migration:
+  `model.provider` becomes `model.provider.as_deref()` compared against `Some("...")`, or a
+  `match model.source()` where the shape matters.
+
+  Taken now rather than deferred because it is a field *type* change, which the
+  `#[non_exhaustive]` sweep does not make additive the way it does field and variant
+  additions. It rides the breaking changes already in this section rather than forcing a new
+  one; after 0.2.0 it would have had to wait for the next major.
+
+  One consequence worth stating: `Model` carries `deny_unknown_fields`, so a config using
+  `alias` is rejected outright by an older outrig rather than degrading. That is the correct
+  behavior, and it makes a shared repo config with an alias in it a breaking change for
+  collaborators who have not upgraded.
+
+- **Breaking: an exec can name the directory it runs in, and the four exec methods now take an
+  `ExecOptions` instead of a bare environment map.** `Outrig::exec_stdio`, `Outrig::exec_capture`,
+  and the two `Container` methods behind them previously took `(&[String], &BTreeMap<String,
+  String>)` and had no way to say where the command should run. They now take `(&[String],
+  &ExecOptions)`, where `ExecOptions::with_workdir` becomes `--workdir <path>` on the
+  `podman exec` and `ExecOptions::with_env` carries what the map used to. Omitting the directory
+  emits no flag, so an exec that does not ask for one issues the `podman exec` it always has.
+
+  Note what "no flag" actually means, because the docs got this wrong at first and it is
+  load-bearing: the exec inherits the container's configured working directory, which is the
+  image's `WORKDIR` only when nothing overrode it. A workspace-backed session sets `-w` to the
+  workspace's container path on the run, so an unset exec runs *in the workspace*, on the
+  mounted checkout. Set the directory explicitly if a relative or destructive command must not
+  land there.
+
+  Without this a caller wanting a build to run in the checkout had three bad options: wrap the
+  command in `sh -c 'cd ... && ...'`, which defeats the argv form that exists so a shell-less
+  image stays usable and pushes quoting onto the caller; set `PWD`, which changes the variable
+  without moving the process, so `getcwd` never notices; or require every path to be absolute,
+  which does not help a tool that resolves relative paths itself.
+
+  The environment moved inside the struct rather than staying a third parameter.
+  `ContainerCreateOptions` already holds its `env` that way, so keeping it out here would have
+  meant env is in the bag on create and beside it on exec; a timeout and a tty flag are the
+  foreseeable next knobs and would all land inside. Rust has no default arguments, so leaving
+  `env` in place would have broken every call site anyway without buying source compatibility.
+  `ExecOptions` is `#[non_exhaustive]`, so those later fields are additive. It lives in
+  `outrig::container` next to `ContainerCreateOptions` and is re-exported at the crate root,
+  since `Outrig`'s methods name it.
+
+  A directory the container does not have stays podman's error to report. It surfaces the way
+  any failing exec does -- a non-zero `Output::status` with podman's message, which names the
+  path, on stderr -- not as an `Err`. Validating existence up front would cost an extra exec on
+  every call to pre-empt a case podman already handles.
+
+- **Breaking: `Workspace::host_path` and `Workspace::container_path` are accessors, not public
+  fields.** Both are private `Option<PathBuf>` now. Read the effective value -- what was declared,
+  else the built-in default -- with `host_path()` / `container_path()`, and ask what a config
+  actually wrote with `declared_host_path()` / `declared_container_path()`; `set_host_path` and
+  `set_container_path` write them. The *hand-written* `impl Default for Workspace` is gone with
+  the fields; the trait is not. `Workspace` derives it, and the derived value means something the
+  hand-written one did not: it declares neither path, where the old one declared `.` and
+  `/workspace`. That distinction is load-bearing rather than cosmetic -- a `Workspace` declaring
+  nothing inherits both fields on merge, which is what stops a repo file with no `[workspace]`
+  table from shadowing a global one that had it. `Workspace::new(host, container)` is unchanged
+  and remains the way to build one that declares both.
+
+  The `Option` is what per-key merge needs: `PathBuf` cannot tell an absent key from one written
+  out to the value the default happens to have, and the merge fix below turns on exactly that
+  distinction. Leaving the fields public would then have let a caller replace a `host-path` while
+  leaving behind the `ConfigSource` it is paired with, resolving the substitute against a
+  directory it never came from -- and the primary mount is read-write. The setters clear that
+  provenance; only a *declared* path carries any, since the built-in `.` belongs to no file.
+
+  Making a public field private is a break `#[non_exhaustive]` does not cover, so it is free
+  before the 0.2.0 freeze and costs a major version after -- the same trade the `Model::provider`
+  entry above takes.
+
+- **Breaking: `request-timeout-secs` is now range-checked**, closing an asymmetry with its
+  sibling `retry-budget-secs`, which has validated against `RETRY_BUDGET_SECS_CEILING` since it
+  landed. A remote provider's `request-timeout-secs` must be between `1` and the new
+  `REQUEST_TIMEOUT_SECS_CEILING` (`3600`, the same hour as the budget's ceiling); both bounds
+  are inclusive. Breaking because a config 0.1 accepted -- any `u64` at all -- can now be
+  rejected at load; the two new error variants are themselves additive.
+
+  `0` is rejected rather than treated as "no timeout". Checked against the pinned reqwest
+  0.13.4, `Duration::ZERO` is an *immediate* timeout: the builder stores it, it becomes a
+  `tokio::time::sleep` that is ready on first poll, and the request fails before it can be
+  answered. So `request-timeout-secs = 0` was a config that parsed, validated, and then could
+  not work. Note this differs from `retry-budget-secs = 0`, which means "do not retry" and
+  remains legal -- one key counts attempts, the other bounds a single one.
+
+  Two `ConfigValidationError` variants carry it: `RequestTimeoutSecsTooLarge { path, value,
+  max }` and `RequestTimeoutSecsZero { path, max }`. The enum is `#[non_exhaustive]`, so both
+  are additive.
+
+  The bound applies per provider, which is the only place the key exists -- unlike
+  `retry-budget-secs` there is no top-level default to check. Adding one is additive and is
+  filed as follow-up work rather than folded in here. It is also checked only on the paths that
+  can reach an HTTP client: `outrig build` skips the `[providers]` block wholesale, as it does
+  for every LLM-side rule, so a build still succeeds against a config `outrig run` would reject.
+
+- **Breaking: a mount validation error names the config file that declared the mount**, the way
+  an image path error does. Global and repo `[[workspace.mounts]]` lists are
+  *concatenated*, so a bare relative path in a diagnostic is ambiguous between two files:
+  `workspace mount host-path "shared" does not exist` reads as a repo problem even when
+  `shared` was only ever meant to be found beside `~/.outrig/config.toml`. The message now ends
+  with `(declared in "/home/you/.outrig/config.toml")`, and an entry with no recorded source --
+  every hand-built `MountConfig` -- renders no clause at all rather than an empty one.
+
+  Every variant of `MountRuleViolation` changed shape to carry it. The five were tuple variants
+  and are now struct variants: `HostMissing { path, declared_in }`,
+  `HostNotDirectory { path, declared_in }`, `ContainerNotAbsolute { path, declared_in }`,
+  `ContainerDuplicate { path, declared_in }`, and `ContainerRoot { declared_in }`, which was a
+  unit variant. The five `ConfigValidationError::WorkspaceMount*` variants gained the same
+  field, `WorkspaceMountContainerRoot` likewise ceasing to be a unit variant.
+  `ConfigValidationError::SidecarMount` is unchanged and needed no change -- it wraps the
+  violation whole, so the clause arrives through the violation's own rendering.
+
+  The container-path rules carry it too, though they judge the value rather than look for a
+  directory on disk: the clause answers which file to go edit, which is the same question for
+  every rule, and `ContainerRoot`'s message carries no path at all, so the declaring file is
+  the only handle it offers. On a duplicate, the named file is the one that declared the
+  *rejected* entry -- the later of the two, and the one to edit -- rather than both sides of
+  the collision.
+
+  All ten reshaped variants are now `#[non_exhaustive]`, so the next field they take is
+  additive. That makes the pattern in a `match` need a trailing `..`; these are return-only
+  error variants, so sealing them removes no construction path.
+
+- **Breaking:** the `rmcp` MCP SDK moved from 1.x to **3.1**, so consumers of this library
+  link against rmcp 3.x. Two migrations are folded into this one step. rmcp 2.x replaced the
+  `Annotated<RawContent>` content model with a flat `ContentBlock`, which the proxy and client
+  now build on; rmcp 3.x then changed `ServerHandler::call_tool` to return `CallToolResponse`
+  (the `Complete` / `InputRequired` / `Task` enum) rather than `CallToolResult`, and gave
+  `ListToolsResult` three further fields that block struct-literal construction.
+
+  `ProxyServer::dispatch_call` still hands back a `CallToolResult`, so a caller driving the
+  dispatch path directly is unaffected by the second change. Peers negotiating a protocol
+  version older than `2026-07-28` see the same bytes as before.
+- **Breaking:** the minimum supported Rust version is **1.88**, up from 1.87, matching rmcp
+  3.1.0's own declared MSRV.
+- **Breaking:** the crate builds on Linux only, and a non-Linux target now fails with an
+  explicit `compile_error!` naming the reason. `network`, `nsfork`, and
+  `container::namespace` call `setns` and `CLONE_NEW*` with nothing between them and the
+  crate root, so an Apple or Windows target never resolved; it previously surfaced as an
+  avalanche of unresolved-import errors instead of one message. Supported architectures are
+  x86-64 and AArch64.
+- The network interceptor spans N containers rather than one: a single policy and audit log
+  covers the primary and every sidecar, with traffic attributed to the container that produced
+  it.
+- The session watcher is a single `podman events` stream per session, replacing one
+  `podman wait` child per container.
+- Sidecar bring-up fans out -- distinct images are ensured and label-inspected concurrently and
+  only once each, then containers start concurrently. Label-collision errors stay deterministic.
+- **A `view = "primary"` sidecar's server runs as the session user**, not as the sidecar
+  image's `USER`; see the placement's entry under **Added**. Servers that expect to write to
+  root-owned paths in the primary -- or to the image's `HOME`, typically `/root` -- are
+  refused.
+- **Breaking:** the three provider-specific `ConfigValidationError` variants are now named
+  for what they check rather than for one style, and the two remote ones carry the style
+  they are reporting on: `OpenAiModelMissingIdentifier { model }` becomes
+  `RemoteModelMissingIdentifier { model, style }`, `OpenAiModelHasMistralrsField` becomes
+  `RemoteModelHasMistralrsField { model, style, field }`, and `MistralrsModelHasOpenAiField`
+  becomes `MistralrsModelHasRemoteField`. Both remote variants are now `#[non_exhaustive]`,
+  so a third remote style will not break them again.
+
+  The rendered messages for `openai` models are unchanged; an `anthropic` model now reports
+  `(provider style=anthropic)` instead of claiming to be an openai one.
+- **Breaking:** every public struct and enum that stays public is now `#[non_exhaustive]`, so
+  adding a field or a variant stops being a breaking change. Downstream crates can no longer
+  build these types with a struct literal -- including with `..Default::default()`, which the
+  attribute blocks along with every other struct expression -- and `match` on a public enum now
+  needs a catch-all arm.
+
+  Two construction paths replace the literal, and this release ships both. Types whose fields
+  are all optional gained or kept `Default`, and their `pub` fields stay assignable:
+  `let mut cfg = Config::default(); cfg.default_image = Some(name);`. Types with a required
+  field gained a constructor naming exactly that field -- `ImageConfig::from_dockerfile` /
+  `from_image_name`, `SidecarConfig::new`, `Model::new`, `Workspace::new`, `MountConfig::new`,
+  `MountSpec::new`, `WorkspaceSpec::new`, `CapabilitySpec::new`,
+  `ContainerWorkspace::new`, `ContainerMount::new`, `ContainerCapabilities::new`,
+  `PrimaryView::new`, `McpTool::new`, and `McpToolResult::ok` / `error`. Types that only ever
+  come back out of the library -- `ToolHandle`, `ContainerInspect`, `ImageBuildOutcome`,
+  `McpStartupFailure`, the `sidecar` planning types, the `embedded` parse results, and every
+  error enum -- get the attribute alone, since nothing outside builds them.
+
+  Two enum variants are sealed the same way and so grew constructors of their own, since a
+  sealed variant is otherwise unconstructible from outside: `McpServerSpec::Full` is now reached
+  through `McpServerSpec::exec` / `entrypoint` plus `with_env` / `with_sidecar` / `with_args` /
+  `with_view`, and `LlmProvider::OpenAi` through `LlmProvider::openai`. `McpServerSpec::Short`
+  is unaffected. Variant-level sealing is otherwise limited to what is known to churn: every
+  field-bearing `OutrigError` variant, `ImageSourceRef`'s two, and
+  `ConfigValidationError::{DockerfileMissing, ContextMissing}`. Patterns that bind a sealed
+  variant's fields need a trailing `..`.
+
+  Nothing was removed and no signature changed; the surface diff is the attribute plus the new
+  constructors. Three additions exist so a caller need not match a sealed enum at all:
+  `McpServerSpec::command` / `env` borrow what only `normalize` used to clone,
+  `Placement::sidecar_name` answers the one question callers asked `Placement` for, and
+  `SidecarView::as_str` gives the wire name. `From<&ContainerSecurity> for ContainerCapabilities`
+  is also new: that mapping now has to live here, because a future security knob can only be
+  wired through inside this crate.
+- **Breaking:** `mcp_proxy::BackingClient` is sealed and can no longer be implemented outside
+  this crate. Nothing about *using* `ProxyServer` changes; only an external `impl BackingClient`
+  is affected, and the only known one was this repo's own test fake, now a crate-internal
+  module. Sealing is what lets the trait gain a method later without a break.
+  `ProxyServer::list_tools_inner` and `dispatch_call` stay public: they are the
+  `RequestContext`-free half of the dispatch path, useful to a caller driving the proxy without
+  an rmcp server.
+- **Breaking:** `ImageTag`'s tuple field is private. `ImageTag::new` (taking anything
+  `Into<String>`) and `From<String>` construct one; `as_str` borrows the reference and
+  `into_string` takes it by value, replacing `.0` reads and moves respectively. `Display` is
+  unchanged and still covers the common read path. The field was the last thing freezing the
+  tag's representation into the contract -- `ApiKeyRef` has always been opaque this way.
+- `McpServerSpec::Full` gained `sidecar`, `image`, `args`, and `view` fields alongside its
+  existing `command` and `env`, carrying the placement of a server that runs in a sidecar.
+  The variant is sealed by the sweep above, so it is built through `McpServerSpec::exec` /
+  `entrypoint` plus the `with_*` methods rather than as a literal.
+
+### Deprecated
+
+- **`style = "mistralrs"` and the config surface behind it**: `LlmProvider::Mistralrs`,
+  `MistralrsDeviceSpec` and `MistralrsDeviceParseError`, the six `Model` weight fields
+  (`model_id`, `model_path`, `model_file`, `revision`, `context_length`, `device`),
+  `Config::model_cache_root`, and the nine `ConfigValidationError` variants that police them.
+  They will be removed in a future release -- not this one.
+
+  This is the library half of the deprecation `outrig-cli` announces for the config surface;
+  every item above lives here, so both crates record it. Nothing is
+  removed, no key changed spelling, and a config naming this style still parses and validates.
+  Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
+  its `localhost` `base-url`; the migration is in
+  [In-process LLMs](../../doc/concepts/in-process-llm.md).
+
 ### Removed
 
 - **Breaking: `OutrigError::McpServerInitialize`, and the `From<ServerInitializeError>` that
@@ -629,7 +1045,79 @@ that it does.
   surface. Nothing in this crate could return it, so no `match` on `OutrigError` loses an arm it
   could reach.
 
+- **The `podman exec` user-bootstrap fallback, and the `OUTRIG_BOOTSTRAP` environment
+  variable.** The runtime user is now written into the container from the host,
+  through the container's own namespaces; the older `getent` / `groupadd` / `useradd`
+  chain remained only for hosts that cannot enter those namespaces, which means a podman
+  service on another machine. OutRig does not support that topology -- the built-in default
+  image-config alone declares two `view = "primary"` sidecars, which cannot work against a
+  remote engine -- so the fallback kept one subsystem limping where nothing else would run.
+
+  **Breaking:** `container::direct_bootstrap_supported` was public and is gone. It answered
+  "will this host need `useradd`/`groupadd` in the image", a question that no longer has a
+  yes case. `Container::bootstrap_user` is unchanged, and its failures are unchanged in
+  kind -- only in that a namespace-entry failure is now reported rather than absorbed.
+
+- **Breaking:** the `McpToolResult::content_text` field, replaced by the
+  `McpToolResult::render_text()` method. The rendering is byte-identical for a text-only
+  result, so the migration is mechanical -- but it is deliberately a method under a different
+  name rather than a renamed field, because a call site that kept compiling would have had its
+  meaning move from "the result" to "one view of the result". The blocks it was rendered from
+  are the result now; see the entry under **Added**.
+
+- **Breaking:** three label-plumbing helpers left `container::embedded` --
+  `mcp_config_to_labels`, `merged_mcp_config_to_labels`, and `merge_mcp`. They served the
+  crate's own build and launch paths, never a caller: each takes the internal shape of a
+  half-resolved MCP table, and none had a consumer outside this crate.
+  `standalone_config_to_labels` and `parse_standalone_image_labels` remain for building and
+  reading a standalone image's labels.
+- **Breaking:** `LaunchSpec::from_image_config`, which copied an image config's `[mcp]` map
+  verbatim and left placement-bearing entries to fail at launch. Use `LaunchSpec::from_config`,
+  which performs the translation faithfully.
+
+These are the only reachability `0.2.0` removes. The rest of the surface is now settled
+deliberately: `config`, `container`, `error`, `image`, `mcp_proxy`, and `network` are all
+supported API, so a caller can drive containers, images, and egress policy directly rather than
+only through the `Outrig` facade.
+
 ### Fixed
+
+- **The panic-hook sweep could remove a container outrig never created.** The last-resort
+  cleanup layer tracked container *names* and swept them with `podman rm -f <name>`. A name
+  is a request, not a claim: `podman run --name N` failing because N is already in use is an
+  ordinary outcome, so a panic arriving between the name being reserved and the start guard
+  dropping force-removed whatever held N -- another session, a stray, a container made by
+  hand. Every other cleanup layer had already moved to the per-attempt `org.outrig.attempt`
+  label; the sweep now replays that same removal and holds no name it could remove by.
+
+  The registry it sweeps is also keyed by the attempt token rather than by the name. It was a
+  set of names, so two starts asking for one name collapsed into one entry and whichever
+  finished first discharged the other's obligation -- leaving a container outrig had made with
+  no last-resort cleanup behind it. Two attempts are now two obligations.
+
+  This is reachable without a name collision. `start` passes `--rm`, so after a stop whose
+  removal timed out the container is likely gone and its name free, and a panic in that window
+  swept whatever had since taken the name.
+
+- **The network interceptor installed no rules at all on nft 1.0.9**, which is what Ubuntu
+  24.04 ships. The redirect script was one `create table inet <t> { chain output { ... } }`;
+  nft parses that, exits zero, creates the table, and silently drops the nested block. The
+  result was a table with no chain in it, so nothing was redirected to the interceptor: in
+  `audit` mode no connection was ever recorded, and in `filter` mode every connection was
+  allowed, including the ones a `default = deny` policy exists to refuse. `attach` and
+  `detach` both reported success throughout.
+
+  The script is now a flat sequence -- `create table`, then `add chain`, then one `add rule`
+  per rule -- which installs the same ruleset and keeps both properties `create` was chosen
+  for: it still fails rather than merging if a table of that name already exists, and `nft -f`
+  is a single transaction either way, so a failure leaves nothing behind.
+
+  Nothing in the unit suite could see this. `nft_rules` was checked by asserting the generated
+  text *contained* each rule, which both forms satisfy, and no test ran nft. It surfaced the
+  first time the `e2e` suite was executed against a live engine rather than compiled: seven of
+  the eight `network_interceptor` tests failed, every one of them waiting for an audit record
+  that was never going to arrive. That suite now runs in CI on every pull request, on x86-64
+  and AArch64.
 
 - **A hostname rule grants only against a bound destination.** `CompiledNetworkEntry::matches`
   accepted a hostname pattern when *either* the destination address matched or the name the
@@ -660,19 +1148,10 @@ that it does.
   validated, which the allow-side property depends on: a wire label is a counted byte string
   and may legally contain a `.`, so an unchecked one could otherwise forge a parent domain.
 
-- **The previous release candidate's entry for `Workspace` overstated one removal.** It said
-  that `impl Default for Workspace` was "gone with the fields". The *hand-written* impl is
-  gone; the trait is not. `Workspace` derives `Default`, and the derived value means something
-  the hand-written one did not: it declares neither path, where the old one declared `.` and
-  `/workspace`. The distinction is load-bearing rather than cosmetic -- a `Workspace` that
-  declares nothing inherits both fields on merge, which is what stopped a repo file with no
-  `[workspace]` table from shadowing a global one that had it. `Workspace::new(host,
-  container)` remains the way to build one that declares both. The released section is left as
-  it was published; this is the correction.
-
-- **`LaunchSpec::from_config` now applies the `[network]` block it was handed.** It lowered
-  `[workspace]`, `[security]`, the image source, MCP placement, and sidecars, and then wrote
-  `NetworkSpec::default()` -- `config.network` was never read. A library caller whose config
+- **`LaunchSpec::from_config` applies the `[network]` block it is handed.** Neither 0.1's
+  `from_image_config` nor `from_config` as it stood during the 0.2 candidates read
+  `config.network`: both lowered `[workspace]`, `[security]`, the image source, MCP placement,
+  and sidecars, and then wrote `NetworkSpec::default()`. A library caller whose config
   declared `mode = "audit"` or `mode = "filter"` with an allow list got a session with no
   interceptor attached, so the auditing or filtering they configured was not running and
   nothing reported that. Anyone embedding outrig through `from_config` should assume a previous
@@ -869,7 +1348,7 @@ that it does.
   be picked up by the next session.
 
   No outrig source had to change for this to start happening. `supported_protocol_versions`
-  defaults to every revision the SDK can name, so upgrading rmcp 2.2 -> 3.1 moved the ceiling
+  defaults to every revision the SDK can name, so upgrading rmcp to 3.1 moved the ceiling
   onto `2026-07-28` underneath a server that did not satisfy it. `ProxyServer` now overrides
   the method with `SUPPORTED_PROTOCOL_VERSIONS`, and a client asking for a revision outside
   that list is answered with the server's own default -- `2025-11-25` today -- rather than in
@@ -885,254 +1364,6 @@ that it does.
   default result was malformed in exactly the way `tools/list` was -- `resultType` present,
   `ttlMs` and `cacheScope` absent. A capability-respecting client never asked, which is why this
   went unnoticed; the three methods now return `-32601`, matching the capability set.
-
-## [0.2.0-rc.2](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.2) - 2026-08-12
-
-A second release candidate, cut because the cycle kept breaking the public surface after rc.1
-went out. Everything here is measured against **0.2.0-rc.1**; a consumer still on 0.1.0 should
-read that section first.
-
-The breaks an rc.1 consumer hits, all detailed under **Changed**: `LlmProvider::openai` and
-`::anthropic` take an options struct instead of a positional timeout (and
-`with_retry_budget_secs` moves onto it), `Model::provider` is `Option<String>`, the four exec
-methods take an `ExecOptions` in place of a bare environment map, `Workspace`'s `host-path` and
-`container-path` are accessors rather than public fields, and the five `MountRuleViolation`
-variants are struct variants carrying the file that declared the mount.
-
-### Added
-
-- **`[<...>.security]` gains an `unmask` key**, an ordered list of paths excluded from podman's
-  default masking, lowered one `--security-opt=unmask=<path>` per entry beside the existing
-  `--device` loop. It rides `ContainerSecurity`, `SecuritySpec`, and `ContainerLaunchSpec`, so
-  images and sidecars declare it the same way and both `podman run` and `podman create` carry
-  it. Default empty: no existing launch changes.
-
-  This is the key that makes a **nested container runtime** possible at all. The kernel's
-  "fully visible" rule for procfs (`mount_too_revealing` in `fs/namespace.c`) lets a process in
-  a non-initial user namespace mount a fresh `procfs` only while the `/proc` already in its
-  mount namespace is unobstructed. Podman's default hardening mounts read-only tmpfs over
-  `/proc/acpi`, `/proc/scsi`, and friends, and those mounts are created by a more privileged
-  namespace and locked -- so no capability the container can hold will remove them, and an
-  inner `podman run` dies at creation with ``crun: mount `proc` to `proc`: Operation not
-  permitted``. Measured against podman 5.7 on Linux 7.0, the working recipe is
-  `unmask = ["/proc/*"]`, `cap-add = ["SYS_ADMIN"]` (inner-namespace capabilities are bounded
-  by the outer set), and `devices = ["/dev/fuse", "/dev/net/tun"]` -- the second device for
-  `pasta`, podman 5's default rootless network backend, which the previous entry on this
-  subject missed.
-
-  Entries reach podman verbatim, so `unmask = ["ALL"]` stays expressible without an image that
-  asked for `/proc/*` being silently widened into it. Seven `ConfigValidationError` variants
-  come with it, and every one of them exists because the alternative is silence rather than a
-  failure: `UnmaskPathEmpty`; `UnmaskPathRelative` (absolute paths and `ALL` only);
-  `UnmaskPathListSeparator`, since podman splits an unmask value on `:` and a colon-joined
-  entry would expand back into several at launch; `UnmaskPathDuplicate`; `UnmaskPathBadGlob`,
-  because podman answers a malformed pattern with a log line and a container whose path is
-  still masked; and `UnmaskAllNotCanonical` / `UnmaskAllNotAlone`, because podman lifts the
-  *read-only* paths -- the ones that make `/sys/fs/cgroup` writable -- only when `ALL` is
-  spelled in exact uppercase and comes first. Lowercase `all` and `["/proc/*", "ALL"]` both
-  still clear the masked paths, so they look like a full unmask and are not one. outrig
-  rejects them rather than reordering a caller's list behind their back.
-
-  **This retracts the rationale published with the `no-new-privileges` key below.** That entry
-  said a nested rootless podman needs `newuidmap`, a setuid binary, so `no_new_privs` must be
-  cleared for it. Under `--userns=keep-id` that never happens: the primary's user namespace is
-  owned by the host user, so its owner is inside-UID 1000 rather than 0, and the kernel grants
-  capabilities in a namespace only to a process whose effective UID *is* the owner -- so
-  reaching euid 0 through `newuidmap` gains nothing and fails. With no `/etc/subuid` entry
-  podman takes its rootless single-mapping path instead, creating the namespace with a plain
-  `unshare` and never calling `newuidmap` at all. That is the path the recipe above runs on,
-  with `--security-opt=no-new-privileges` still applied. Adding `/etc/subuid` and
-  `/etc/subgid` entries actively breaks nesting by pushing podman back onto the `newuidmap`
-  path. The key itself is unchanged and still useful for images that do carry setuid tooling;
-  only its stated motivation was wrong.
-
-- **A `[models.<name>]` entry can name other models instead of a provider.** The new `alias`
-  key takes one model name (`alias = "opus-5"`) or an ordered list of them
-  (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`), and both spellings deserialize through
-  the same helper `model-file` already uses. `Model::alias` joins `Model::new` as a
-  constructor, `Model::source` returns the new `ModelSourceRef` discriminating the two shapes,
-  and `Config::model_candidates` flattens an alias graph to the ordered list of concrete model
-  names it stands for.
-
-  An alias *is* a model: it lives in the same table, under one namespace and one lookup, so
-  everything that already accepts a model name accepts it unchanged. A separate
-  `[model-aliases]` table would have needed a documented precedence rule for a name declared
-  in both; inside one table that collision cannot be expressed, so the rule does not need to
-  exist.
-
-  Six `ConfigValidationError` variants come with it -- `ModelSourceMissing`,
-  `ModelSourceConflict`, `ModelAliasEmpty`, `UnknownModelAliasTarget`, `ModelAliasCycle`, and
-  `ModelAliasTooDeep`, the last bounding traversal depth at `MODEL_ALIAS_DEPTH_MAX` (32) so a
-  long chain reports a bad config instead of exhausting the stack. The enum is
-  `#[non_exhaustive]`, so all six are additive. Unlike the other model rules,
-  these are checked on every validation path including `outrig build`'s: they establish an
-  entry's *shape* rather than resolve a cross-reference, and until `provider` became optional
-  serde's own "missing field" enforced half of it everywhere.
-
-  `Config::model_candidates` is the first method on `Config` that is neither `load*` nor
-  `validate*`. It is public because both crates walk this graph -- validation checks it, and
-  the binary's resolver selects from it -- and two traversals that had to agree on ordering
-  and on cycle handling would be two chances to disagree.
-
-### Changed
-
-- **Breaking: `LlmProvider::openai` and `LlmProvider::anthropic` now take an options
-  struct**, `OpenAiOptions` and `AnthropicOptions` respectively, instead of a positional
-  `request_timeout_secs`. Both structs also carry `retry_budget_secs`, so
-  `LlmProvider::with_retry_budget_secs` is removed -- a retry budget can no longer be handed to
-  the in-process `Mistralrs` variant, which had nowhere to record it and discarded it in
-  silence. Migrate a constructor with no overrides by replacing its third argument with
-  `OpenAiOptions::new()` or `AnthropicOptions::new()`, and one that set a timeout with
-  `OpenAiOptions::new().with_request_timeout_secs(secs)`; `with_retry_budget_secs(secs)` on
-  either options type replaces the removed `LlmProvider` method. The structs are
-  `#[non_exhaustive]`, so later connection settings can be added without changing the
-  constructor signatures again -- which also means the `with_*` setters, not the public fields,
-  are how a downstream crate builds one.
-
-- **Breaking: `Model::provider` is now `Option<String>`.** A model entry has two mutually
-  exclusive shapes -- a provider that serves it, or an `alias` naming other models -- so the
-  field that identifies the first cannot be required. This follows `ImageConfig` exactly,
-  which has carried `image-name` XOR `dockerfile`+`context` in one table since 0.1: every
-  field `Option`, exactly-one-shape enforced by validation, and a discriminated accessor
-  (`ImageConfig::source`, now joined by `Model::source`) as the way readers ask which shape
-  they got.
-
-  `Model::new(provider)` is unchanged and still the way to build a provider-shape model, so
-  the common construction path does not move. Readers of the field take a one-line migration:
-  `model.provider` becomes `model.provider.as_deref()` compared against `Some("...")`, or a
-  `match model.source()` where the shape matters.
-
-  Taken now rather than deferred because it is a field *type* change, which the
-  `#[non_exhaustive]` sweep does not make additive the way it does field and variant
-  additions. It rides the breaking changes already in this section rather than forcing a new
-  one; after 0.2.0 it would have had to wait for the next major.
-
-  One consequence worth stating: `Model` carries `deny_unknown_fields`, so a config using
-  `alias` is rejected outright by an older outrig rather than degrading. That is the correct
-  behavior, and it makes a shared repo config with an alias in it a breaking change for
-  collaborators who have not upgraded.
-
-- **Breaking: an exec can name the directory it runs in, and the four exec methods now take an
-  `ExecOptions` instead of a bare environment map.** `Outrig::exec_stdio`, `Outrig::exec_capture`,
-  and the two `Container` methods behind them previously took `(&[String], &BTreeMap<String,
-  String>)` and had no way to say where the command should run. They now take `(&[String],
-  &ExecOptions)`, where `ExecOptions::with_workdir` becomes `--workdir <path>` on the
-  `podman exec` and `ExecOptions::with_env` carries what the map used to. Omitting the directory
-  emits no flag, so an exec that does not ask for one is byte-identical to what 0.2.0-rc.1 ran.
-
-  Note what "no flag" actually means, because the docs got this wrong at first and it is
-  load-bearing: the exec inherits the container's configured working directory, which is the
-  image's `WORKDIR` only when nothing overrode it. A workspace-backed session sets `-w` to the
-  workspace's container path on the run, so an unset exec runs *in the workspace*, on the
-  mounted checkout. Set the directory explicitly if a relative or destructive command must not
-  land there.
-
-  Without this a caller wanting a build to run in the checkout had three bad options: wrap the
-  command in `sh -c 'cd ... && ...'`, which defeats the argv form that exists so a shell-less
-  image stays usable and pushes quoting onto the caller; set `PWD`, which changes the variable
-  without moving the process, so `getcwd` never notices; or require every path to be absolute,
-  which does not help a tool that resolves relative paths itself.
-
-  The environment moved inside the struct rather than staying a third parameter.
-  `ContainerCreateOptions` already holds its `env` that way, so keeping it out here would have
-  meant env is in the bag on create and beside it on exec; a timeout and a tty flag are the
-  foreseeable next knobs and would all land inside. Rust has no default arguments, so leaving
-  `env` in place would have broken every call site anyway without buying source compatibility.
-  `ExecOptions` is `#[non_exhaustive]`, so those later fields are additive. It lives in
-  `outrig::container` next to `ContainerCreateOptions` and is re-exported at the crate root,
-  since `Outrig`'s methods name it.
-
-  A directory the container does not have stays podman's error to report. It surfaces the way
-  any failing exec does -- a non-zero `Output::status` with podman's message, which names the
-  path, on stderr -- not as an `Err`. Validating existence up front would cost an extra exec on
-  every call to pre-empt a case podman already handles.
-
-- **Breaking: `Workspace::host_path` and `Workspace::container_path` are accessors, not public
-  fields.** Both are private `Option<PathBuf>` now. Read the effective value -- what was declared,
-  else the built-in default -- with `host_path()` / `container_path()`, and ask what a config
-  actually wrote with `declared_host_path()` / `declared_container_path()`; `set_host_path` and
-  `set_container_path` write them. `impl Default for Workspace` is gone with the fields, while
-  `Workspace::new(host, container)` is unchanged and remains the way to build one.
-
-  The `Option` is what per-key merge needs: `PathBuf` cannot tell an absent key from one written
-  out to the value the default happens to have, and the merge fix below turns on exactly that
-  distinction. Leaving the fields public would then have let a caller replace a `host-path` while
-  leaving behind the `ConfigSource` it is paired with, resolving the substitute against a
-  directory it never came from -- and the primary mount is read-write. The setters clear that
-  provenance; only a *declared* path carries any, since the built-in `.` belongs to no file.
-
-  Making a public field private is a break `#[non_exhaustive]` does not cover, so it is free
-  before the 0.2.0 freeze and costs a major version after -- the same trade the `Model::provider`
-  entry above takes.
-
-- **Breaking: `request-timeout-secs` is now range-checked**, closing an asymmetry with its
-  sibling `retry-budget-secs`, which has validated against `RETRY_BUDGET_SECS_CEILING` since it
-  landed. A remote provider's `request-timeout-secs` must be between `1` and the new
-  `REQUEST_TIMEOUT_SECS_CEILING` (`3600`, the same hour as the budget's ceiling); both bounds
-  are inclusive. Breaking because a config 0.2.0-rc.1 accepted -- any `u64` at all -- can now be
-  rejected at load; the two new error variants are themselves additive.
-
-  `0` is rejected rather than treated as "no timeout". Checked against the pinned reqwest
-  0.13.4, `Duration::ZERO` is an *immediate* timeout: the builder stores it, it becomes a
-  `tokio::time::sleep` that is ready on first poll, and the request fails before it can be
-  answered. So `request-timeout-secs = 0` was a config that parsed, validated, and then could
-  not work. Note this differs from `retry-budget-secs = 0`, which means "do not retry" and
-  remains legal -- one key counts attempts, the other bounds a single one.
-
-  Two `ConfigValidationError` variants carry it: `RequestTimeoutSecsTooLarge { path, value,
-  max }` and `RequestTimeoutSecsZero { path, max }`. The enum is `#[non_exhaustive]`, so both
-  are additive.
-
-  The bound applies per provider, which is the only place the key exists -- unlike
-  `retry-budget-secs` there is no top-level default to check. Adding one is additive and is
-  filed as follow-up work rather than folded in here. It is also checked only on the paths that
-  can reach an HTTP client: `outrig build` skips the `[providers]` block wholesale, as it does
-  for every LLM-side rule, so a build still succeeds against a config `outrig run` would reject.
-
-- **Breaking: a mount validation error names the config file that declared the mount**, the way
-  an image path error has since 0.2.0-rc.1. Global and repo `[[workspace.mounts]]` lists are
-  *concatenated*, so a bare relative path in a diagnostic is ambiguous between two files:
-  `workspace mount host-path "shared" does not exist` reads as a repo problem even when
-  `shared` was only ever meant to be found beside `~/.outrig/config.toml`. The message now ends
-  with `(declared in "/home/you/.outrig/config.toml")`, and an entry with no recorded source --
-  every hand-built `MountConfig` -- renders no clause at all rather than an empty one.
-
-  Every variant of `MountRuleViolation` changed shape to carry it. The five were tuple variants
-  and are now struct variants: `HostMissing { path, declared_in }`,
-  `HostNotDirectory { path, declared_in }`, `ContainerNotAbsolute { path, declared_in }`,
-  `ContainerDuplicate { path, declared_in }`, and `ContainerRoot { declared_in }`, which was a
-  unit variant. The five `ConfigValidationError::WorkspaceMount*` variants gained the same
-  field, `WorkspaceMountContainerRoot` likewise ceasing to be a unit variant.
-  `ConfigValidationError::SidecarMount` is unchanged and needed no change -- it wraps the
-  violation whole, so the clause arrives through the violation's own rendering.
-
-  The container-path rules carry it too, though they judge the value rather than look for a
-  directory on disk: the clause answers which file to go edit, which is the same question for
-  every rule, and `ContainerRoot`'s message carries no path at all, so the declaring file is
-  the only handle it offers. On a duplicate, the named file is the one that declared the
-  *rejected* entry -- the later of the two, and the one to edit -- rather than both sides of
-  the collision.
-
-  All ten reshaped variants are now `#[non_exhaustive]`, so the next field they take is
-  additive. That makes the pattern in a `match` need a trailing `..`; these are return-only
-  error variants, so sealing them removes no construction path.
-
-### Removed
-
-- **The `podman exec` user-bootstrap fallback, and the `OUTRIG_BOOTSTRAP` environment
-  variable.** Since 0.2.0-rc.1 the runtime user has been written into the container from the
-  host, through the container's own namespaces; the older `getent` / `groupadd` / `useradd`
-  chain remained only for hosts that cannot enter those namespaces, which means a podman
-  service on another machine. OutRig does not support that topology -- the built-in default
-  image-config alone declares two `view = "primary"` sidecars, which cannot work against a
-  remote engine -- so the fallback kept one subsystem limping where nothing else would run.
-
-  **Breaking:** `container::direct_bootstrap_supported` was public and is gone. It answered
-  "will this host need `useradd`/`groupadd` in the image", a question that no longer has a
-  yes case. `Container::bootstrap_user` is unchanged, and its failures are unchanged in
-  kind -- only in that a namespace-entry failure is now reported rather than absorbed.
-
-### Fixed
 
 - **A global `[workspace]` block is no longer thrown away.** `host-path` and `container-path` in
   `~/.outrig/config.toml` were parsed, validated, merged, and then discarded in silence: merge
@@ -1174,277 +1405,6 @@ variants are struct variants carrying the file that declared the mount.
   dynamically linked `PROGRAM` named by a relative path is refused rather than exec'd as the
   nonsense `/mnt./server`. Statically linked payloads are untouched -- they exec from a
   descriptor and resolve nothing after the setns, which is why they were never affected.
-
-## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0-rc.1) - 2026-08-02
-
-A release candidate. This is the first cycle to break the public surface, so it goes out for
-integration testing ahead of 0.2.0 final. Everything here is measured against **0.1.0**, the
-last published release.
-
-The three things a 0.1.0 consumer hits first: the crate now links **rmcp 3.x** (0.1.0 was on
-1.x), the **minimum supported Rust version is 1.88** (was 1.87), and every public struct and
-enum is `#[non_exhaustive]`, so struct literals and exhaustive `match`es on them no longer
-compile. Each is detailed under **Changed**.
-
-### Added
-
-- **Anthropic's native Messages API is a provider style.** `style = "anthropic"` on a
-  `[providers.<name>]` block reaches Claude directly -- `POST {base-url}/v1/messages` with
-  `x-api-key` auth, tools advertised as `input_schema`, and `tool_use` / `tool_result` content
-  blocks -- rather than through an OpenAI-compatible bridge. It takes the same `base-url`,
-  `api-key`, and `request-timeout-secs` fields as `style = "openai"`, and the same timeout,
-  transient-retry, tool-call, history, and subagent behavior applies. `base-url` is the API
-  root (`https://api.anthropic.com`); a trailing `/v1`, `/messages`, or `/v1/messages` is
-  trimmed if present. Reaching Claude through a bridge is still an `openai` provider pointed
-  at that bridge, and both remain supported.
-
-  `LlmProvider::Anthropic` and its `LlmProvider::anthropic(..)` constructor arrive together
-  with the `#[non_exhaustive]` sweep below, so a match with a catch-all arm keeps compiling.
-
-- **`retry-budget-secs`,** as `Config::retry_budget_secs` and a field on the `OpenAi` and
-  `Anthropic` variants of `LlmProvider`, bounding how long a transiently-failing LLM call
-  keeps retrying. `DEFAULT_RETRY_BUDGET_SECS` is `600` and `RETRY_BUDGET_SECS_CEILING` is
-  `3600`; `0` disables retries. A provider's own value wins over the top-level one, which
-  wins over the default. Over-ceiling values are rejected with the new
-  `ConfigValidationError::RetryBudgetSecsTooLarge`.
-
-  Set it with `LlmProvider::with_retry_budget_secs(..)` rather than a fourth argument to
-  `LlmProvider::openai(..)` / `::anthropic(..)`, which would have been a breaking change to
-  a surface this release otherwise settles. The enum and its variants are
-  `#[non_exhaustive]`, and so is `Config`.
-
-- **`LlmProvider::style()`,** the `style` tag a provider serializes as. It lives next to the
-  serde attributes that define those tags, so a diagnostic or a label can name a style
-  without retyping the string somewhere it can drift out of agreement with what the config
-  file actually accepts.
-
-- **`[models.<name>].max-tokens`,** the output-token ceiling for turns run against that
-  model. `[agents.<name>].max-tokens` still wins where it is set; the model value covers
-  every agent that uses it and is `None` by default, so nothing changes for a config that
-  does not set it.
-
-  It exists because Anthropic requires `max_tokens` on every request and the ceiling is a
-  property of the model, not of the role using it. outrig sends the published ceiling for
-  the Claude identifiers it recognizes; any other identifier now has somewhere to declare
-  one other than every agent that names it. Setting neither is no longer an error: an
-  Anthropic model outrig has no published ceiling for falls back to 32768 and says so once
-  on stderr, naming the tables the ceiling belongs in. The fallback errs high on purpose --
-  a model whose real limit is lower rejects the request and names that limit, whereas a
-  ceiling set too low truncates replies with nothing logged.
-
-- **Relative config paths resolve against the file that declared them.** A path in
-  `~/.outrig/config.toml` (or a `--global-config` file) is now relative to that file's own
-  directory rather than to the repo root. The practical effect is that a global
-  `[images.<name>]` can finally use the build shape: its `dockerfile` and `context` live beside
-  the global config and resolve identically from any repo on the machine. Before this, such a
-  block parsed and validated as legal but was joined onto the current repo root, so it either
-  failed with `DockerfileMissing` or -- worse -- silently picked up a same-named path inside the
-  repo. The same fix covers `host-path` in `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`,
-  which matters most for workspace mounts: global and repo mount lists are *concatenated*, so a
-  single base directory could never have been right for every element of the result.
-
-  Repo-declared paths are unchanged in every case, and absolute paths were never affected. An
-  entry that never went through `Config::load` -- anything hand-built from the library API --
-  records no source and keeps resolving against the `repo_root` it is passed.
-
-  The provenance is carried, not discarded after use: `ConfigSource` is public, with
-  `base_dir()` for the directory paths resolve against and `config_path()` for the file to name
-  in a diagnostic. `ImageConfig::config_source()`, `ImageConfig::base_dir()`,
-  `ImageConfig::resolved_build_paths()`, `MountConfig::config_source()`,
-  `MountConfig::resolved_host_path()`, and `Workspace::resolved_host_path()` expose it.
-
-  `ConfigValidationError::DockerfileMissing` and `ContextMissing` gained a
-  `declared_in: Option<PathBuf>` field, so a global entry's failure no longer reads as a repo
-  problem. Both variants were already `#[non_exhaustive]`, so this is additive. It is an
-  `Option` rather than a defaulted path because a filename in an error message is a claim: an
-  entry built by hand and validated directly has no declaring file, and the message omits the
-  `(declared in ...)` clause entirely rather than naming a config that never mentioned it.
-
-- **The library API reaches every sidecar placement.** A hand-built `SidecarSpec` can now host
-  an entrypoint-stdio server -- one with no `command`, whose container's `ENTRYPOINT` is the
-  server -- with `SidecarSpec::with_entrypoint_server(name, args)`, and can run it against the
-  primary container's filesystem view with `with_view(SidecarView::Primary)`. `SidecarView` is
-  re-exported from the crate root beside `SidecarWorkspaceAccess`. Both `Outrig::add_sidecar`
-  and `LaunchSpec::with_sidecar` accept them, so an embedding program reaches the same tool
-  topology as `outrig run` -- including serving an off-the-shelf MCP image over the primary's
-  own tree. `SidecarSpec::with_server_spec(name, server)` is the general form the other
-  `with_*server` methods are shorthands for, for a server that needs both a transport and an
-  environment.
-
-  `view = "primary"` from the library is the same posture change it is from the CLI
-  (`CAP_SYS_ADMIN` and `CAP_SYS_PTRACE` in the primary's user namespace), and a build without
-  the `<arch>-unknown-linux-musl` helper fails before any container is created, naming the
-  missing artifact. The helper is materialized into the `LaunchSpec`'s log directory.
-
-  The placement rules are no longer duplicated: a hand-built spec that sets `view = "primary"`
-  alongside workspace access, or hosts an entrypoint server next to another server, is rejected
-  by the same code and with the same message as the equivalent `[sidecars.<sc>]` block.
-- **`Outrig::exec_stdio` and `Outrig::exec_capture`** run a command in the *primary* container
-  as the session's runtime user -- the first streaming, the second returning a
-  `std::process::Output` with a non-zero exit reported as data rather than an error. The
-  primary `Container` stays private, so an embedder cannot stop a container the session owns.
-- **MCP sidecar containers** -- an MCP server can run in its own container alongside the
-  primary. `LaunchSpec::with_sidecar` declares sidecars at launch (abort-only: any failure
-  tears down everything already started), and `Outrig::add_sidecar` starts one mid-session,
-  returning the new tool handles so callers need not diff `tools()`. `SidecarSpec` and
-  `SidecarServerSpec` are the builder types -- a raw podman image ref used verbatim, plus
-  workspace access, mounts, security, and servers.
-- **Config-driven sidecar placement** -- `LaunchSpec::from_config(&Config, image_name,
-  repo_root, log_dir)` translates an image config's `[mcp]` map into the primary MCP map plus
-  resolved `SidecarSpec`s, resolving a sidecar's image against sibling `[images.<name>]`
-  blocks. It replaces `LaunchSpec::from_image_config`; see **Removed**.
-- **Entrypoint-stdio MCP servers** -- an image whose `ENTRYPOINT` is itself the server (an
-  inline image with no command) is supported, so off-the-shelf MCP images work with no
-  repo-side command knowledge. Launch splits into `podman create` + `podman init` +
-  `podman start`, which lets the network interceptor attach to the held process before the
-  server's first packet.
-- **Sidecars that share the primary's filesystem view** -- `view = "primary"` runs a sidecar's
-  server against the primary container's own tree, via the embedded `outrig-enter` launcher,
-  so a server needs no bind mount and cannot disagree with the primary about paths. It is
-  entrypoint-stdio only, requires the `<arch>-unknown-linux-musl` helper at build time, and
-  costs `CAP_SYS_ADMIN`/`CAP_SYS_PTRACE` in the primary's user namespace.
-  `OutrigError::FilesystemHelperUnavailable` names the missing artifact, and the build-time
-  reason it was not produced, when the helper is absent.
-
-  The launcher holds those capabilities only until the graft is in place: it clears its
-  supplementary groups and becomes the session's uid/gid immediately before exec'ing the
-  payload, which drops the permitted, effective and ambient sets with the uid transition. So a
-  server placed this way is indistinguishable from an exec-stdio one in what it may do and what
-  it may own -- in particular, what it writes into the workspace comes back owned by the
-  invoking user. A server needing root over the primary's filesystem is not supported.
-- **Device passthrough and a no-new-privileges opt-out** -- `[image.security]` carries
-  `devices` and `no-new-privileges`, surfaced as `ContainerSecurity`. `no_new_privileges`
-  defaults to `true`, so the default posture is unchanged from 0.1.0.
-- **The container's runtime user is written from the host** -- the session user is grafted
-  into the container's `/etc/passwd` and `/etc/group` without executing anything inside it,
-  so a bootstrap no longer depends on the image shipping `useradd`.
-- **`subagent-depth-max` and `subagent-width-max`** bound how deeply subagents nest and how
-  many one agent may hold at once. Both are top-level `Config` keys with an
-  `[agents.<name>]` override; the defaults are 3 and 8.
-- **Every podman/buildah command line is logged at debug level**, so a session can be
-  reconstructed from a trace without reproducing it.
-- **Arguments for entrypoint-stdio MCP servers** -- an `args` key on `[images.<name>.mcp]`
-  entries and on `[sidecars.<sc>]` blocks supplies the container's trailing argv,
-  so images that take their configuration positionally (`docker.io/mcp/filesystem` and most of
-  the MCP catalog) can be named and run without spelling out their internal layout as an
-  exec-stdio `command`.
-- **Named sidecars can be entrypoint hosts** -- a `[sidecars.<sc>]` block whose
-  one MCP entry omits `command` runs that image's `ENTRYPOINT` as the server, which is how an
-  entrypoint-stdio server gets a workspace view, mounts, or its own security policy. Such a
-  block hosts exactly one server and must be `start = "auto"`.
-- `SidecarSpec`, `SidecarServerSpec`, `SidecarWorkspaceAccess`, `SidecarView`, and
-  `resolve_mcp_env` are exported from the crate root.
-
-### Changed
-
-- **Breaking:** the `rmcp` MCP SDK moved from 1.x to **3.1**, so consumers of this library
-  link against rmcp 3.x. Two migrations are folded into this one step. rmcp 2.x replaced the
-  `Annotated<RawContent>` content model with a flat `ContentBlock`, which the proxy and client
-  now build on; rmcp 3.x then changed `ServerHandler::call_tool` to return `CallToolResponse`
-  (the `Complete` / `InputRequired` / `Task` enum) rather than `CallToolResult`, and gave
-  `ListToolsResult` three further fields that block struct-literal construction.
-
-  `ProxyServer::dispatch_call` still hands back a `CallToolResult`, so a caller driving the
-  dispatch path directly is unaffected by the second change. Peers negotiating a protocol
-  version older than `2026-07-28` see the same bytes as before.
-- **Breaking:** the minimum supported Rust version is **1.88**, up from 1.87, matching rmcp
-  3.1.0's own declared MSRV.
-- **Breaking:** the crate builds on Linux only, and a non-Linux target now fails with an
-  explicit `compile_error!` naming the reason. `network`, `nsfork`, and
-  `container::namespace` call `setns` and `CLONE_NEW*` with nothing between them and the
-  crate root, so an Apple or Windows target never resolved; it previously surfaced as an
-  avalanche of unresolved-import errors instead of one message. Supported architectures are
-  x86-64 and AArch64.
-- The network interceptor spans N containers rather than one: a single policy and audit log
-  covers the primary and every sidecar, with traffic attributed to the container that produced
-  it.
-- The session watcher is a single `podman events` stream per session, replacing one
-  `podman wait` child per container.
-- Sidecar bring-up fans out -- distinct images are ensured and label-inspected concurrently and
-  only once each, then containers start concurrently. Label-collision errors stay deterministic.
-- **A `view = "primary"` sidecar's server runs as the session user**, not as the sidecar
-  image's `USER`; see the placement's entry under **Added**. Servers that expect to write to
-  root-owned paths in the primary -- or to the image's `HOME`, typically `/root` -- are
-  refused.
-- **Breaking:** the three provider-specific `ConfigValidationError` variants are now named
-  for what they check rather than for one style, and the two remote ones carry the style
-  they are reporting on: `OpenAiModelMissingIdentifier { model }` becomes
-  `RemoteModelMissingIdentifier { model, style }`, `OpenAiModelHasMistralrsField` becomes
-  `RemoteModelHasMistralrsField { model, style, field }`, and `MistralrsModelHasOpenAiField`
-  becomes `MistralrsModelHasRemoteField`. Both remote variants are now `#[non_exhaustive]`,
-  so a third remote style will not break them again.
-
-  The rendered messages for `openai` models are unchanged; an `anthropic` model now reports
-  `(provider style=anthropic)` instead of claiming to be an openai one.
-- **Breaking:** every public struct and enum that stays public is now `#[non_exhaustive]`, so
-  adding a field or a variant stops being a breaking change. Downstream crates can no longer
-  build these types with a struct literal -- including with `..Default::default()`, which the
-  attribute blocks along with every other struct expression -- and `match` on a public enum now
-  needs a catch-all arm.
-
-  Two construction paths replace the literal, and this release ships both. Types whose fields
-  are all optional gained or kept `Default`, and their `pub` fields stay assignable:
-  `let mut cfg = Config::default(); cfg.default_image = Some(name);`. Types with a required
-  field gained a constructor naming exactly that field -- `ImageConfig::from_dockerfile` /
-  `from_image_name`, `SidecarConfig::new`, `Model::new`, `Workspace::new`, `MountConfig::new`,
-  `MountSpec::new`, `WorkspaceSpec::new`, `CapabilitySpec::new`,
-  `ContainerWorkspace::new`, `ContainerMount::new`, `ContainerCapabilities::new`,
-  `PrimaryView::new`, `McpTool::new`, and `McpToolResult::ok` / `error`. Types that only ever
-  come back out of the library -- `ToolHandle`, `ContainerInspect`, `ImageBuildOutcome`,
-  `McpStartupFailure`, the `sidecar` planning types, the `embedded` parse results, and every
-  error enum -- get the attribute alone, since nothing outside builds them.
-
-  Two enum variants are sealed the same way and so grew constructors of their own, since a
-  sealed variant is otherwise unconstructible from outside: `McpServerSpec::Full` is now reached
-  through `McpServerSpec::exec` / `entrypoint` plus `with_env` / `with_sidecar` / `with_args` /
-  `with_view`, and `LlmProvider::OpenAi` through `LlmProvider::openai`. `McpServerSpec::Short`
-  is unaffected. Variant-level sealing is otherwise limited to what is known to churn: every
-  field-bearing `OutrigError` variant, `ImageSourceRef`'s two, and
-  `ConfigValidationError::{DockerfileMissing, ContextMissing}`. Patterns that bind a sealed
-  variant's fields need a trailing `..`.
-
-  Nothing was removed and no signature changed; the surface diff is the attribute plus the new
-  constructors. Three additions exist so a caller need not match a sealed enum at all:
-  `McpServerSpec::command` / `env` borrow what only `normalize` used to clone,
-  `Placement::sidecar_name` answers the one question callers asked `Placement` for, and
-  `SidecarView::as_str` gives the wire name. `From<&ContainerSecurity> for ContainerCapabilities`
-  is also new: that mapping now has to live here, because a future security knob can only be
-  wired through inside this crate.
-- **Breaking:** `mcp_proxy::BackingClient` is sealed and can no longer be implemented outside
-  this crate. Nothing about *using* `ProxyServer` changes; only an external `impl BackingClient`
-  is affected, and the only known one was this repo's own test fake, now a crate-internal
-  module. Sealing is what lets the trait gain a method later without a break.
-  `ProxyServer::list_tools_inner` and `dispatch_call` stay public: they are the
-  `RequestContext`-free half of the dispatch path, useful to a caller driving the proxy without
-  an rmcp server.
-- **Breaking:** `ImageTag`'s tuple field is private. `ImageTag::new` (taking anything
-  `Into<String>`) and `From<String>` construct one; `as_str` borrows the reference and
-  `into_string` takes it by value, replacing `.0` reads and moves respectively. `Display` is
-  unchanged and still covers the common read path. The field was the last thing freezing the
-  tag's representation into the contract -- `ApiKeyRef` has always been opaque this way.
-- `McpServerSpec::Full` gained `sidecar`, `image`, `args`, and `view` fields alongside its
-  existing `command` and `env`, carrying the placement of a server that runs in a sidecar.
-  The variant is sealed by the sweep above, so it is built through `McpServerSpec::exec` /
-  `entrypoint` plus the `with_*` methods rather than as a literal.
-
-### Removed
-
-- **Breaking:** three label-plumbing helpers left `container::embedded` --
-  `mcp_config_to_labels`, `merged_mcp_config_to_labels`, and `merge_mcp`. They served the
-  crate's own build and launch paths, never a caller: each takes the internal shape of a
-  half-resolved MCP table, and none had a consumer outside this crate.
-  `standalone_config_to_labels` and `parse_standalone_image_labels` remain for building and
-  reading a standalone image's labels.
-- **Breaking:** `LaunchSpec::from_image_config`, which copied an image config's `[mcp]` map
-  verbatim and left placement-bearing entries to fail at launch. Use `LaunchSpec::from_config`,
-  which performs the translation faithfully.
-
-  These are the only reachability `0.2.0` removes. The rest of the surface is now settled
-  deliberately: `config`, `container`, `error`, `image`, `mcp_proxy`, and `network` are all
-  supported API, so a caller can drive containers, images, and egress policy directly rather than
-  only through the `Outrig` facade.
-
-### Fixed
 
 - A `view = "primary"` sidecar whose image declares an `ENTRYPOINT` no longer fails to start,
   in either of the two ways it used to. An **absolute** program was looked for under the graft

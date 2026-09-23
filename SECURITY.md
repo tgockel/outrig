@@ -3,12 +3,12 @@
 ## Supported versions
 
 OutRig is pre-1.0 and ships from a single `trunk` line. Security fixes land on the latest
-`0.1.x` release; there are no separate maintenance branches for older patch releases yet.
+`0.2.x` release; there are no separate maintenance branches for older patch releases yet.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | yes       |
-| < 0.1   | no        |
+| 0.2.x   | yes       |
+| < 0.2   | no        |
 
 ## Reporting a vulnerability
 
@@ -21,7 +21,7 @@ suspected vulnerability.
 - Alternatively, email **travis@gockelhut.com** with details and, ideally, a reproduction.
 
 This is a small, single-maintainer project. Expect an initial acknowledgement within about a
-week. Once a fix is ready it ships in the next `0.1.x` release, with credit in the CHANGELOG
+week. Once a fix is ready it ships in the next `0.2.x` release, with credit in the CHANGELOG
 unless you ask to remain anonymous.
 
 ## Security model

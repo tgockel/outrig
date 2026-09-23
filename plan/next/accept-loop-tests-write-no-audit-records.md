@@ -43,7 +43,28 @@ rewrote the first one's wait onto `await_audit_records`. Observed on `9df4482b`,
 whose diff touches no file under `crates/*/src/`, so it is a property of trunk rather than of
 the branch that found it.
 
-## Open question, and why it is not resolved here
+## Answered: it is the sandbox, not the `AuditSink` write path
+
+`0002-54` ran both halves of the first step below, and they agree.
+
+- **CI is green on these exact names.** `cargo (default)` on run `35912249747` (trunk,
+  `0c583523`) logs `the_accept_loop_waits_for_the_connections_it_started ... ok` and
+  `the_accept_loop_keeps_taking_finished_connections_back ... ok`, in a lib row reporting
+  `423 passed; 0 failed`.
+- **They pass on an ordinary shell.** The same two, run outside the sandbox on this machine,
+  finish in **0.18 s**. Inside it they burn the full 30 s poll and report 0 records. The
+  local totals line up either way -- 421 passed + 2 failed sandboxed against 423 passed
+  unsandboxed -- so nothing is being skipped, only failed.
+
+So the finding is the one this entry's first step predicted for a green CI: **the tests depend
+on ambient conditions they do not state**, and they fail closed rather than saying which
+condition was missing. `AuditSink` is exonerated; what remains is test hygiene, and it is
+worth fixing because the failure these two produce is indistinguishable from the real defect
+`0002-53` found -- an interceptor that enforces nothing also shows up as an empty audit log.
+The 30 s poll is the other half: whatever the cause, giving up silently after 30 s is a poor
+way to report a precondition that was never met.
+
+## Original open question, kept for the record
 
 Found while landing 0002-48, whose diff cannot reach this code, so it was recorded rather
 than chased. It was seen only inside a sandboxed shell, and both tests do two things a

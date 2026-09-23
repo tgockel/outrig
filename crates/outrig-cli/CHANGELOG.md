@@ -5,46 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
-### Added
-
-- **`outrig clean --session <id>`**, which narrows both sweeps to one session. Only that
-  session's record is considered for removal, and only containers labeled
-  `org.outrig.session=<id>` are stray candidates. The sweep is machine-wide without it, and a
-  stray is defined by the *absence* of a record -- so a container whose record lives under a
-  different `--session-root` (another checkout, a parallel CI job) has no record the sweep can
-  see and is removed as a stray. The default is unchanged.
-
-### Fixed
-
-- **The session watcher reaped sidecars by container name.** When the primary container dies
-  out from under outrig, the watcher removes that session's sidecars -- and it asked podman for
-  them by name. Sidecars die at the same moment the primary does and `--rm` frees a name on the
-  spot, so a removal resolving a name a moment later could reach whatever had taken it. Each
-  sidecar now carries an `org.outrig.instance` label, unique per container and per session, and
-  the reap selects on that. A failed reap is now reported rather than discarded, the way
-  `outrig clean` reports one. (`outrig clean`'s own stray sweep still removes by name, and
-  still has to: a stray's session is over, so nothing is left holding the label it was
-  started with.)
-
-- **`outrig clean` reported removing stray containers it had not removed.** The sweep coalesces
-  its removals into one `podman rm -f <name>...`, and printed `removed container <name>` for
-  every name in the batch on the strength of that one exit status. podman exits zero having
-  skipped a container another process is tearing down at the same moment, so the line was a
-  claim about the batch rather than about the container -- and it was self-perpetuating: the
-  container clean said it had removed joined the next sweep's batch and was skipped again.
-
-  Each name's outcome now comes from re-reading the container list. A name the batch skipped is
-  retried on its own, which removes it; one that is still there afterwards is reported as
-  `could not remove container <name>` and makes `outrig clean` exit **1** instead of 0, so a
-  script checking the status no longer reads a partial sweep as a complete one. The batch
-  remains the common path and the per-name retry runs only when something survived it.
-
-- **`--network audit` recorded nothing and `--network filter` refused nothing** on hosts with
-  nft 1.0.9, which is what Ubuntu 24.04 ships. The interceptor's redirect table was created
-  empty, so no container traffic ever reached it. Fixed in `outrig`; see that crate's
-  changelog for what the script does now and why no unit test could have caught it.
+The first release since 0.1.0. Everything below is measured against **0.1.0**, and
+**Migrating from 0.1** is the ordered list of what a 0.1 config or command line has to change
+-- including the two breaks that announce themselves nowhere.
 
 ### Migrating from 0.1
 
@@ -98,112 +63,14 @@ sentence 0.1 supplied on its behalf.
 
 Config file names and locations are unchanged, and no key not listed here changed spelling.
 
-### Fixed
-
-- **`style = "mistralrs"` rejects unknown keys**, closing the one hole in this schema's
-  "unknown keys are an error" rule. The provider was a serde *unit* variant, so
-  `deny_unknown_fields` had no field set to check against, and every key written on one of
-  these blocks -- `retry-budget-secs`, `request-timeout-secs`, `base-url`, an outright typo --
-  parsed clean and was discarded. Aiming a remote-only setting at an in-process provider
-  through TOML was the last surviving way to have one vanish rather than be refused; the
-  Rust-side spelling had already gone.
-
-  The provider table is unchanged -- `style` and nothing else -- so the only configs this stops
-  loading are ones that were carrying a key outrig never read.
-
-- **A relative `[models.<name>].model-path` is opened against the repo root**, which is the base
-  it has always been *validated* against. The resolver copied the row's text into the runtime
-  weights unjoined and the mistralrs loader opened it relative to the process's working
-  directory, so a config that validated clean named a different file -- usually no file --
-  whenever `outrig` was started from anywhere but the repo root. Both halves now go through one
-  library call, `Model::resolved_model_path`.
-
-  This stays the one path in the schema that is repo-relative rather than relative to the file
-  that declared it. A *global* `[models.<name>]` with a relative `model-path` therefore follows
-  whichever repo is current; give that one an absolute path.
-
-- **A hostname allow-rule grants only against a bound destination.** Under `mode = "filter"`
-  with `default = "deny"`, a rule like `allow = ["allowed.example:443"]` was matched against
-  the name the *client itself* announced in `Host:` or SNI as well as against the address the
-  connection was going to. The client half is attacker-controlled, so a container could open a
-  connection to an unrelated address, claim to be `allowed.example`, and be bridged to it --
-  the enforcement half of the interceptor did not hold the property it advertised, and
-  `SECURITY.md` names failure to enforce a host:port policy as in scope.
-
-  A name now authorizes a destination only when this attachment's own DNS listener validated
-  it for that address. What the client claims is kept apart from what was resolved and is
-  consulted on the deny list only: a claim may cost a client its own connection and may never
-  buy it one. The `ip` and `cidr` allow forms lost the same client-asserted disjunct.
-
-  The bindings behind it are per attachment rather than session-global, so one container's
-  lookup no longer grants another authority over an address; they are keyed address to name to
-  expiry, so shared hosting keeps every name rather than the latest lookup erasing the rest;
-  their TTLs come from the answering record, clamped to between 30 seconds and an hour; and
-  the table is capped. DNS answers are validated before they bind -- right resolver,
-  transaction id, question, and QR bit -- addresses are attributed through the CNAME chain to
-  the name that was queried, and decoded names are checked, since a wire label may legally
-  contain a `.` and an unchecked one could forge a parent domain.
-
-- **A provider response outrig cannot use ends the turn, not the session.** A reply that
-  decodes into nothing outrig can turn into a turn is retried a couple of times and then
-  reported as `the model returned a response outrig could not use (<detail>)`, leaving the
-  history untouched so the prompt can simply be sent again. This is a different class from the
-  rate-limited or unreachable provider recorded for the previous release candidate -- that one
-  is a transport or status failure, this one is a well-formed response with an unusable body
-  -- and it used to take the whole session down.
-
-- **A turn that produced only reasoning is reported rather than swallowed.** A response with
-  no text and no tool calls, but with reasoning content, reached the user as pure silence: the
-  agent layer concatenates the final turn's text parts, which is the empty string here, and
-  the REPL printed nothing at all. A minute of billed generation was indistinguishable from
-  outrig ignoring the prompt. The structured turn is now salvaged and shown, the streaming
-  path is covered too, and a turn that genuinely finished with nothing to display says so and
-  names the finish reason and any ceiling in force.
-
-- **A session record outlives the schema that wrote it.** `outrig ls` failed outright with
-  `missing field image_config_name` against any session started before that field was renamed,
-  and `clean`, `logs`, and `discard` broke identically because all four read the same listing.
-  The field is now optional and accepts its old name, so an old record keeps its real value
-  rather than degrading to a blank. A `session.json` that still cannot be read costs its own
-  row and a report instead of the whole command: `ls` distinguishes an empty session root from
-  one where nothing parsed and exits 0 either way, `clean` counts an unparsable entry as
-  surviving rather than treating its container as record-less and force-removing it, and
-  naming one broken session by id still fails, because that is a request for that session.
-
-### Deprecated
-
-- **The `local-llm` Cargo feature and the `style = "mistralrs"` provider**, along with the
-  `cuda` and `metal` features that select a backend for them, the six `[models.<name>]` weight
-  keys (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `device`), the
-  top-level `model-cache-root`, and `outrig run --device`. They will be removed in a future
-  release -- not this one. This release *carries* the deprecation: the style parses, validates
-  and runs as it always has, and the two defects it had been shipping are fixed rather than
-  left standing for a surface on its way out. The earliest a removal can land is the release
-  after the one that first puts this warning in users' hands.
-
-  **Nothing changes today.** A build with `--features local-llm` still runs in-process models,
-  every config still parses and validates, and no key changed spelling. What changed is that
-  outrig now says the feature is going away, at three moments: `cargo build --features
-  local-llm` emits a build warning, loading an in-process model prints a one-line warning per
-  model, and the error a default build already raised for `style = "mistralrs"` now names the
-  deprecation and the replacement alongside the `--features local-llm` flag that still works.
-
-  Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com), vLLM, or
-  `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
-  `base-url`. Migration, before and after, is in
-  [In-process LLMs](../../doc/concepts/in-process-llm.md).
-
-  Two consequences worth stating plainly. Running a local model well is a problem with good
-  dedicated tools, and outrig was a worse place to solve it: the backend roughly triples the
-  dependency count, and outrig's config duplicated weight, quantization, and device knobs those
-  servers expose better. And outrig is **giving up a property it claimed** -- that a question
-  never crosses a process boundary. A localhost server does serialize payloads over a socket.
-  That trade is deliberate, and the documentation retracts the argument it made against
-  localhost servers rather than quietly dropping it; the unimplemented egress filter, tool-use
-  filter, and prompt-injection scanner that were the stated consumers of the property will have
-  to answer the question on their own terms.
-
 ### Added
+
+- **`outrig clean --session <id>`**, which narrows both sweeps to one session. Only that
+  session's record is considered for removal, and only containers labeled
+  `org.outrig.session=<id>` are stray candidates. The sweep is machine-wide without it, and a
+  stray is defined by the *absence* of a record -- so a container whose record lives under a
+  different `--session-root` (another checkout, a parallel CI job) has no record the sweep can
+  see and is removed as a stray. The default is unchanged.
 
 - **`[<...>.security]` accepts `unmask`**, so a session container can host a container runtime
   of its own. `outrig run` carries the key from the selected image-config onto the primary and
@@ -211,7 +78,8 @@ Config file names and locations are unchanged, and no key not listed here change
   `cap-add = ["SYS_ADMIN"]` and `devices = ["/dev/fuse", "/dev/net/tun"]`, `unmask = ["/proc/*"]`
   is what lets an agent build an image or run a throwaway container inside its own session --
   see [Nested container runtimes](../../doc/concepts/containers.md#nested-container-runtimes),
-  which also retracts the `newuidmap` rationale previously given for `no-new-privileges`.
+  which also retracts the `newuidmap` rationale that page previously gave for
+  `no-new-privileges`.
 
 - **`[models.<name>]` entries can be aliases**, so `--model`, `default-model`,
   `[agents.<name>].model`, and a subagent's `model` argument all accept a name that stands
@@ -266,54 +134,6 @@ Config file names and locations are unchanged, and no key not listed here change
   `subagent-depth-max` bounds how deep the nesting goes and `subagent-width-max` how many one
   agent may hold at once; the launching agent may name the `model` its subagent runs under,
   and a release list naming an unknown subagent is rejected whole rather than half-applied.
-
-### Changed
-
-- **The `outrig__subagent` tool no longer advertises a model whose `api-key` variable is
-  unset or empty.** The schema's `enum` and the alias selector are now one predicate, so a
-  name is offered exactly when a launch could reach it. Previously an unset key was
-  advertised and failed at launch. An alias is offered when *any* of its candidates is
-  reachable, which is what lets `alias = ["opus-local", "opus-anthropic"]` stay launchable
-  in a build without `--features local-llm` where naming `opus-local` directly would not be.
-
-- **An endpoint that never answered gets a much shorter leash.** While every attempt against a
-  candidate has failed to connect -- nothing has come back from it at all -- the retry loop is
-  bounded at 30 seconds rather than by the whole `retry-budget-secs`, and each attempt's
-  connect phase is capped at 10. A misconfigured `base-url` or an unreachable host now reports
-  in well under a minute instead of spending the full budget on a socket that was never going
-  to open. The short bound lifts the moment the endpoint answers anything, an error included,
-  because at that point the failure is the provider's and the configured budget is the right
-  one. It is also what makes an alias chain cheap to walk past a dead candidate.
-
-- **A dropped future no longer leaves its subprocess running.** Interrupting a session used to
-  leave podman and buildah children behind to finish on their own, so a cancelled build could
-  still be writing layers after the command that asked for it returned. Cancellation now
-  reaches the subprocess, and a command cut short reports `OutrigError::Canceled` naming the
-  program and argv rather than an exit status it never collected.
-
-- **A repo config may declare `mode` under `[network]`, and nothing else.** `default`, `allow`,
-  and `deny` in a repo file are a validation error naming the key. The rule is not new, but it
-  used to be applied by scanning the config text, which a differently formatted table could
-  slip past; it now reads the parsed value, so a policy that a repo file previously smuggled
-  through is refused. A `[network]` table that declares no `mode` also inherits the global one
-  instead of resetting it to `default`.
-
-- **The MCP SDK moved to rmcp 3.1**, two majors on from the 1.x this project shipped in 0.1.0
-  and one on from the 2.x this changelog last recorded. The protocol revisions `outrig mcp`
-  advertises follow the SDK, so a client negotiating an older revision still gets a revision
-  it can speak.
-
-### Removed
-
-- **The `OUTRIG_BOOTSTRAP` environment variable**, along with the `podman exec` user-bootstrap
-  fallback it selected. The runtime user is written into the container from the host, and that
-  is now the only path.
-- **The `user_bootstrap_package_missing` warning** from `validate_dockerfile` (`mcp self` and
-  the `rig` self tool). It advised installing `passwd`/`shadow` on hosts that would fall back
-  to `useradd`/`groupadd`; with no fallback there is no such host. The tool no longer runs a
-  `podman info` probe to decide, so it answers without touching podman at all.
-
-### Added
 
 - **A built-in default image-config**, so a session that names no image no longer fails.
   `--image`, `agents.<n>.image`, and `default-image` gain a fourth rung below them, which
@@ -400,7 +220,54 @@ Config file names and locations are unchanged, and no key not listed here change
   ceiling is `3600`. A provider's own value wins over the top-level one, which wins over the
   default -- rate limits belong to the endpoint, so per-provider is usually the right place.
 
+- **MCP sidecar containers** -- an `[images.<name>.mcp]` entry can declare `sidecar = "<sc>"`
+  to run the server in a sidecar declared at the top level as `[sidecars.<sc>]`, or an inline
+  `image` to give it a dedicated anonymous one. A declared sidecar carries its own image,
+  workspace access, mounts, and security; a referenced `start = "auto"` sidecar comes up with
+  the session, and `start = "manual"` waits for `/sidecar add`. Declaring a block starts
+  nothing on its own -- see **Changed**.
+- **Entrypoint-stdio servers** -- an `image` with no `command` runs that image's `ENTRYPOINT`
+  as the MCP server, so off-the-shelf MCP images work without repo-side command knowledge.
+  The `--env` overlay applies to them at container-create time.
+- **`/sidecar` in the REPL** -- `/sidecar list` shows the declared sidecars and their status;
+  `/sidecar add <name>` starts a `start = "manual"` sidecar mid-session, and its tools join
+  the running agent.
+
 ### Changed
+
+- **The `outrig__subagent` tool no longer advertises a model whose `api-key` variable is
+  unset or empty.** The schema's `enum` and the alias selector are now one predicate, so a
+  name is offered exactly when a launch could reach it. Previously an unset key was
+  advertised and failed at launch. An alias is offered when *any* of its candidates is
+  reachable, which is what lets `alias = ["opus-local", "opus-anthropic"]` stay launchable
+  in a build without `--features local-llm` where naming `opus-local` directly would not be.
+
+- **An endpoint that never answered gets a much shorter leash.** While every attempt against a
+  candidate has failed to connect -- nothing has come back from it at all -- the retry loop is
+  bounded at 30 seconds rather than by the whole `retry-budget-secs`, and each attempt's
+  connect phase is capped at 10. A misconfigured `base-url` or an unreachable host now reports
+  in well under a minute instead of spending the full budget on a socket that was never going
+  to open. The short bound lifts the moment the endpoint answers anything, an error included,
+  because at that point the failure is the provider's and the configured budget is the right
+  one. It is also what makes an alias chain cheap to walk past a dead candidate.
+
+- **A dropped future no longer leaves its subprocess running.** Interrupting a session used to
+  leave podman and buildah children behind to finish on their own, so a cancelled build could
+  still be writing layers after the command that asked for it returned. Cancellation now
+  reaches the subprocess, and a command cut short reports `OutrigError::Canceled` naming the
+  program and argv rather than an exit status it never collected.
+
+- **A repo config may declare `mode` under `[network]`, and nothing else.** `default`, `allow`,
+  and `deny` in a repo file are a validation error naming the key. The rule is not new, but it
+  used to be applied by scanning the config text, which a differently formatted table could
+  slip past; it now reads the parsed value, so a policy that a repo file previously smuggled
+  through is refused. A `[network]` table that declares no `mode` also inherits the global one
+  instead of resetting it to `default`.
+
+- **The MCP SDK moved to rmcp 3.1**, two majors on from the 1.x this project shipped in 0.1.0;
+  the intermediate 2.x step is folded into it. The revisions `outrig mcp` and `outrig mcp self`
+  advertise are an explicit list of outrig's own rather than whatever the SDK knows, so an SDK
+  bump cannot silently move the ceiling out from under a client; see **Fixed**.
 
 - **`validate_dockerfile` now flags `ENTRYPOINT` rather than a missing `CMD`** (`outrig mcp
   self` and the `rig` self tool). OutRig appends `sleep infinity` after the image reference, so
@@ -420,6 +287,13 @@ Config file names and locations are unchanged, and no key not listed here change
   the banner leads with `model:` in place of the usual `agent:` line. Declaring
   `[agents.<name>]` is still how you attach a preamble or per-agent limits; it is just no
   longer the price of admission. A `default-agent` that names nothing remains an error.
+
+- **Breaking (config):** sidecars are declared at the top level as `[sidecars.<sc>]`, not
+  `[images.<name>.sidecars.<sc>]`. Move the blocks up a level; the keys are unchanged. The old
+  form is now an unknown-field parse error. One block can be shared by several image-configs,
+  and the global config can declare sidecars a repo references.
+- **Breaking (config):** a sidecar starts only when an `[images.<name>.mcp]` entry names it.
+  Declaring a block no longer starts it -- with blocks shared and global, it cannot.
 
 - **Breaking (config): an agent that omits `preamble` now sends no system prompt.** outrig used
   to fill the gap with a fixed sentence ("You are a careful assistant whose tools run inside a
@@ -446,7 +320,172 @@ Config file names and locations are unchanged, and no key not listed here change
   overwhelmingly common one that succeeds first try. Replaying at the HTTP layer clones a
   header map and bumps a refcount on the serialized body instead.
 
+- Upgraded the LLM/agent stack: `rig-core` 0.39 -> 0.40, plus routine dependency bumps
+  (anyhow, ignore, jiff, rand, toml). rig 0.40's `max_turns` now
+  counts total model calls rather than tool-call rounds; outrig compensates so the per-turn
+  tool-call limit behaves as before.
+- Egress policy and the audit log cover every sidecar container, not just the primary.
+- `outrig clean` reads one `podman ps -a` instead of a `podman inspect` per aged session, and
+  coalesces stray-container removal into a single `podman rm -f`.
+- Slash commands run through one dispatcher. `/help` output is unchanged, but two edge cases
+  of the old exact-match arms are gone: a trailing-space `/quit ` now executes, and
+  tab-separated `/sidecar` arguments parse.
+
+### Deprecated
+
+- **The `local-llm` Cargo feature and the `style = "mistralrs"` provider**, along with the
+  `cuda` and `metal` features that select a backend for them, the six `[models.<name>]` weight
+  keys (`model-id`, `model-path`, `model-file`, `revision`, `context-length`, `device`), the
+  top-level `model-cache-root`, and `outrig run --device`. They will be removed in a future
+  release -- not this one. This release *carries* the deprecation: the style parses, validates
+  and runs as it always has, and the two defects it had been shipping are fixed rather than
+  left standing for a surface on its way out. The earliest a removal can land is the release
+  after the one that first puts this warning in users' hands.
+
+  **Nothing changes today.** A build with `--features local-llm` still runs in-process models,
+  every config still parses and validates, and no key changed spelling. What changed is that
+  outrig now says the feature is going away, at three moments: `cargo build --features
+  local-llm` emits a build warning, loading an in-process model prints a one-line warning per
+  model, and the error a default build already raised for `style = "mistralrs"` now names the
+  deprecation and the replacement alongside the `--features local-llm` flag that still works.
+
+  Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com), vLLM, or
+  `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
+  `base-url`. Migration, before and after, is in
+  [In-process LLMs](../../doc/concepts/in-process-llm.md).
+
+  Two consequences worth stating plainly. Running a local model well is a problem with good
+  dedicated tools, and outrig was a worse place to solve it: the backend roughly triples the
+  dependency count, and outrig's config duplicated weight, quantization, and device knobs those
+  servers expose better. And outrig is **giving up a property it claimed** -- that a question
+  never crosses a process boundary. A localhost server does serialize payloads over a socket.
+  That trade is deliberate, and the documentation retracts the argument it made against
+  localhost servers rather than quietly dropping it; the unimplemented egress filter, tool-use
+  filter, and prompt-injection scanner that were the stated consumers of the property will have
+  to answer the question on their own terms.
+
+### Removed
+
+- **The `OUTRIG_BOOTSTRAP` environment variable**, along with the `podman exec` user-bootstrap
+  fallback it selected. The runtime user is written into the container from the host, and that
+  is now the only path.
+- **The `user_bootstrap_package_missing` warning** from `validate_dockerfile` (`mcp self` and
+  the `rig` self tool). It advised installing `passwd`/`shadow` on hosts that would fall back
+  to `useradd`/`groupadd`; with no fallback there is no such host. The tool no longer runs a
+  `podman info` probe to decide, so it answers without touching podman at all.
+
+- **Breaking (library):** this crate's internals are no longer a public path. `builtin_tool`,
+  `cli`, `config_init`, `error`, `hf`, `image_setup`, `init`, `llm`, `mcp_self`, `repl`,
+  `rig_tool`, `session`, `session_tool`, and `subagent` were `pub` only so the integration tests
+  in `tests/` could reach them, which the crate's own module doc has always said. They are now
+  crate-private unless the `internal-test-api` feature is on, which only those tests enable.
+  `CliError`, `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`, `MistralrsWeights`,
+  `RigAgent`, and `resolve_agent_with_overrides` were the growth points this closes -- all of
+  them gained fields, variants, or parameters during `0.2`.
+
+  The published surface is now `outrig_cli::run() -> ExitCode`, which runs the CLI and returns
+  its exit code. Nothing else is covered by SemVer. Depend on the `outrig` crate for a supported
+  Rust API; **the `outrig` command-line interface itself is unaffected.**
+
 ### Fixed
+
+- **The session watcher reaped sidecars by container name.** When the primary container dies
+  out from under outrig, the watcher removes that session's sidecars -- and it asked podman for
+  them by name. Sidecars die at the same moment the primary does and `--rm` frees a name on the
+  spot, so a removal resolving a name a moment later could reach whatever had taken it. Each
+  sidecar now carries an `org.outrig.instance` label, unique per container and per session, and
+  the reap selects on that. A failed reap is now reported rather than discarded, the way
+  `outrig clean` reports one. (`outrig clean`'s own stray sweep still removes by name, and
+  still has to: a stray's session is over, so nothing is left holding the label it was
+  started with.)
+
+- **`outrig clean` reported removing stray containers it had not removed.** The sweep coalesces
+  its removals into one `podman rm -f <name>...`, and printed `removed container <name>` for
+  every name in the batch on the strength of that one exit status. podman exits zero having
+  skipped a container another process is tearing down at the same moment, so the line was a
+  claim about the batch rather than about the container -- and it was self-perpetuating: the
+  container clean said it had removed joined the next sweep's batch and was skipped again.
+
+  Each name's outcome now comes from re-reading the container list. A name the batch skipped is
+  retried on its own, which removes it; one that is still there afterwards is reported as
+  `could not remove container <name>` and makes `outrig clean` exit **1** instead of 0, so a
+  script checking the status no longer reads a partial sweep as a complete one. The batch
+  remains the common path and the per-name retry runs only when something survived it.
+
+- **`--network audit` recorded nothing and `--network filter` refused nothing** on hosts with
+  nft 1.0.9, which is what Ubuntu 24.04 ships. The interceptor's redirect table was created
+  empty, so no container traffic ever reached it. Fixed in `outrig`; see that crate's
+  changelog for what the script does now and why no unit test could have caught it.
+
+- **`style = "mistralrs"` rejects unknown keys**, closing the one hole in this schema's
+  "unknown keys are an error" rule. The provider was a serde *unit* variant, so
+  `deny_unknown_fields` had no field set to check against, and every key written on one of
+  these blocks -- `retry-budget-secs`, `request-timeout-secs`, `base-url`, an outright typo --
+  parsed clean and was discarded. Aiming a remote-only setting at an in-process provider
+  through TOML was the last surviving way to have one vanish rather than be refused; the
+  Rust-side spelling had already gone.
+
+  The provider table is unchanged -- `style` and nothing else -- so the only configs this stops
+  loading are ones that were carrying a key outrig never read.
+
+- **A relative `[models.<name>].model-path` is opened against the repo root**, which is the base
+  it has always been *validated* against. The resolver copied the row's text into the runtime
+  weights unjoined and the mistralrs loader opened it relative to the process's working
+  directory, so a config that validated clean named a different file -- usually no file --
+  whenever `outrig` was started from anywhere but the repo root. Both halves now go through one
+  library call, `Model::resolved_model_path`.
+
+  This stays the one path in the schema that is repo-relative rather than relative to the file
+  that declared it. A *global* `[models.<name>]` with a relative `model-path` therefore follows
+  whichever repo is current; give that one an absolute path.
+
+- **A hostname allow-rule grants only against a bound destination.** Under `mode = "filter"`
+  with `default = "deny"`, a rule like `allow = ["allowed.example:443"]` was matched against
+  the name the *client itself* announced in `Host:` or SNI as well as against the address the
+  connection was going to. The client half is attacker-controlled, so a container could open a
+  connection to an unrelated address, claim to be `allowed.example`, and be bridged to it --
+  the enforcement half of the interceptor did not hold the property it advertised, and
+  `SECURITY.md` names failure to enforce a host:port policy as in scope.
+
+  A name now authorizes a destination only when this attachment's own DNS listener validated
+  it for that address. What the client claims is kept apart from what was resolved and is
+  consulted on the deny list only: a claim may cost a client its own connection and may never
+  buy it one. The `ip` and `cidr` allow forms lost the same client-asserted disjunct.
+
+  The bindings behind it are per attachment rather than session-global, so one container's
+  lookup no longer grants another authority over an address; they are keyed address to name to
+  expiry, so shared hosting keeps every name rather than the latest lookup erasing the rest;
+  their TTLs come from the answering record, clamped to between 30 seconds and an hour; and
+  the table is capped. DNS answers are validated before they bind -- right resolver,
+  transaction id, question, and QR bit -- addresses are attributed through the CNAME chain to
+  the name that was queried, and decoded names are checked, since a wire label may legally
+  contain a `.` and an unchecked one could forge a parent domain.
+
+- **A provider response outrig cannot use ends the turn, not the session.** A reply that
+  decodes into nothing outrig can turn into a turn is retried a couple of times and then
+  reported as `the model returned a response outrig could not use (<detail>)`, leaving the
+  history untouched so the prompt can simply be sent again. This is a different class from the
+  rate-limited or unreachable provider the retry stack already handled -- that one is a
+  transport or status failure, this one is a well-formed response with an unusable body
+  -- and it used to take the whole session down.
+
+- **A turn that produced only reasoning is reported rather than swallowed.** A response with
+  no text and no tool calls, but with reasoning content, reached the user as pure silence: the
+  agent layer concatenates the final turn's text parts, which is the empty string here, and
+  the REPL printed nothing at all. A minute of billed generation was indistinguishable from
+  outrig ignoring the prompt. The structured turn is now salvaged and shown, the streaming
+  path is covered too, and a turn that genuinely finished with nothing to display says so and
+  names the finish reason and any ceiling in force.
+
+- **A session record outlives the schema that wrote it.** `outrig ls` failed outright with
+  `missing field image_config_name` against any session started before that field was renamed,
+  and `clean`, `logs`, and `discard` broke identically because all four read the same listing.
+  The field is now optional and accepts its old name, so an old record keeps its real value
+  rather than degrading to a blank. A `session.json` that still cannot be read costs its own
+  row and a report instead of the whole command: `ls` distinguishes an empty session root from
+  one where nothing parsed and exits 0 either way, `clean` counts an unparsable entry as
+  surviving rather than treating its container as record-less and force-removing it, and
+  naming one broken session by id still fails, because that is a request for that session.
 
 - **A subagent launched under another model takes that model's `max-tokens`.** The launching
   agent's ceiling used to be copied onto the subagent whatever model it named, so an expensive
@@ -475,13 +514,6 @@ Config file names and locations are unchanged, and no key not listed here change
   resend when the window clears. Genuine faults -- a bad API key, a malformed config -- still
   exit `1`. A subagent round that hits this still reaches its parent as a failed round.
 
-- **Breaking (config):** sidecars are declared at the top level as `[sidecars.<sc>]`, not
-  `[images.<name>.sidecars.<sc>]`. Move the blocks up a level; the keys are unchanged. The old
-  form is now an unknown-field parse error. One block can be shared by several image-configs,
-  and the global config can declare sidecars a repo references.
-- **Breaking (config):** a sidecar starts only when an `[images.<name>.mcp]` entry names it.
-  Declaring a block no longer starts it -- with blocks shared and global, it cannot.
-
 - **`outrig mcp` and `outrig mcp self` list their tools again to a client speaking protocol
   revision `2026-07-28`.** That revision requires `ttlMs` and `cacheScope` on every list
   result, both servers omitted them, and the client's answer to a malformed `tools/list` is to
@@ -500,54 +532,6 @@ Config file names and locations are unchanged, and no key not listed here change
   which they never had a resource or a prompt to put in. rmcp replied to all three from default
   handler bodies with an empty success -- a surface neither server advertises, malformed on
   `2026-07-28` in the same way `tools/list` was. They now return method-not-found.
-
-### Removed
-
-- **Breaking (library):** this crate's internals are no longer a public path. `builtin_tool`,
-  `cli`, `config_init`, `error`, `hf`, `image_setup`, `init`, `llm`, `mcp_self`, `repl`,
-  `rig_tool`, `session`, `session_tool`, and `subagent` were `pub` only so the integration tests
-  in `tests/` could reach them, which the crate's own module doc has always said. They are now
-  crate-private unless the `internal-test-api` feature is on, which only those tests enable.
-  `CliError`, `LlmResolveError`, `ResolvedProvider`, `ResolvedAgent`, `MistralrsWeights`,
-  `RigAgent`, and `resolve_agent_with_overrides` were the growth points this closes -- all of
-  them gained fields, variants, or parameters during `0.2`.
-
-  The published surface is now `outrig_cli::run() -> ExitCode`, which runs the CLI and returns
-  its exit code. Nothing else is covered by SemVer. Depend on the `outrig` crate for a supported
-  Rust API; **the `outrig` command-line interface itself is unaffected.**
-
-## [0.2.0-rc.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0-rc.1) - 2026-07-24
-
-A release candidate, cut so the library's breaking changes get integration testing ahead of
-0.2.0 final. A pre-release is opt-in, so install it explicitly:
-`cargo install outrig-cli --version 0.2.0-rc.1`.
-
-### Added
-
-- **MCP sidecar containers** -- an `[mcp.<name>]` entry can declare `sidecar = "<sc>"` to run
-  the server in a sidecar declared under `[images.<name>.sidecars.<sc>]`, or an inline `image`
-  to give it a dedicated anonymous one. A declared sidecar carries its own image, workspace
-  access, mounts, and security; `start = "auto"` brings it up with the session, and
-  `start = "manual"` waits for `/sidecar add`.
-- **Entrypoint-stdio servers** -- an `image` with no `command` runs that image's `ENTRYPOINT`
-  as the MCP server, so off-the-shelf MCP images work without repo-side command knowledge.
-  The `--env` overlay applies to them at container-create time.
-- **`/sidecar` in the REPL** -- `/sidecar list` shows the declared sidecars and their status;
-  `/sidecar add <name>` starts a `start = "manual"` sidecar mid-session, and its tools join
-  the running agent.
-
-### Changed
-
-- Upgraded the LLM/agent stack: `rig-core` 0.39 -> 0.40 and the `rmcp` MCP SDK 1.x -> 2.x,
-  plus routine dependency bumps (anyhow, ignore, jiff, rand, toml). rig 0.40's `max_turns` now
-  counts total model calls rather than tool-call rounds; outrig compensates so the per-turn
-  tool-call limit behaves as before.
-- Egress policy and the audit log cover every sidecar container, not just the primary.
-- `outrig clean` reads one `podman ps -a` instead of a `podman inspect` per aged session, and
-  coalesces stray-container removal into a single `podman rm -f`.
-- Slash commands run through one dispatcher. `/help` output is unchanged, but two edge cases
-  of the old exact-match arms are gone: a trailing-space `/quit ` now executes, and
-  tab-separated `/sidecar` arguments parse.
 
 ## [0.1.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.1.0) - 2026-06-26
 

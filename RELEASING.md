@@ -92,8 +92,11 @@ the index has not caught up.
 ### Refresh the version-bearing docs
 
 Update the sample `outrig --version` output in
-[`doc/quickstart.md`](doc/quickstart.md) and the supported-version prose and table in
-[`SECURITY.md`](SECURITY.md), then commit. Skip this step for a pre-release -- a bare
+[`doc/quickstart.md`](doc/quickstart.md) and all three version sites in
+[`SECURITY.md`](SECURITY.md) -- the supported-version prose, its table, and the
+`0.X.x` in **Reporting a vulnerability** that says where a fix ships -- then commit.
+The third one is easy to miss; a `grep` for the previous minor over both files is
+what catches it. Skip this step for a pre-release -- a bare
 `cargo install outrig-cli` still lands on the latest stable, so both files should go on
 describing that.
 

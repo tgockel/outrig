@@ -22,25 +22,19 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ### Phase 0002 -- sidecars
 
-`0002-54` is what is left of the 0.2.0 release gate, derived from an external
-release-readiness audit of `trunk` at `adee4f61` that returned no-go for 0.2.0 final. The ordering
-below is that report's recommended sequencing: security semantics first (`0002-37` and
-`0002-38`, both landed), then lifecycle (`0002-39` and `0002-40` landed), then the
-public-surface changes (`0002-41` through `0002-47` landed) that have to happen before the
-freeze, then release engineering. Each task carries its own evidence; the report is not in the tree.
+**The queue is empty.** Every task of this phase has landed, and the 0.2.0 release gate --
+derived from an external release-readiness audit of `trunk` at `adee4f61` that returned no-go
+for 0.2.0 final -- is closed by `0002-54`. The report's recommended sequencing is what the
+numbering followed: security semantics first (`0002-37` and `0002-38`), then lifecycle
+(`0002-39` and `0002-40`), then the public-surface changes (`0002-41` through `0002-47`) that
+had to happen before the freeze, then release engineering. Each task carries its own evidence;
+the report is not in the tree.
 
-**Release engineering**
-
-| Task      | What it settles                                |
-| --------- | ---------------------------------------------- |
-| `0002-54` | 0.2.0 ships, once rc.3's exit criteria are met |
-
-`0002-55` is done and is in `plan/done/`, having landed *before* `0002-54`. That inverts the
-"lands lowest-numbered first" rule above and is deliberate: it fixes issue #147, the panic-hook
-sweep removing containers outrig never created, and the decision recorded in its `## Decisions`
-is that the defect does not force another candidate -- so `0002-54` keeps its number and rc.3
-still stands. The dependency invariant is intact either way: `0002-55` depends on `0002-39`
-alone, and `0002-54` does not depend on `0002-55`.
+`0002-55` sits above `0002-54` in `plan/done/` although it landed first, which inverts the
+"lands lowest-numbered first" rule above. That was deliberate, and its `## Decisions` records
+why: the maintainer read `0002-52`'s blocker class as not forcing another candidate for issue
+#147, so rc.3 stood and the release kept its number. The dependency invariant holds either way
+-- `0002-55` depends on `0002-39` alone, and `0002-54` never depended on `0002-55`.
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -57,23 +51,26 @@ Cross-cutting notes the individual tasks carry rather than this file:
   `[workspace.metadata.public-api]`, and a `public-api` CI job. Regenerating under that pin moved
   no item, so `0002-41` through `0002-47` had each regenerated correctly and the whole diff was
   the `std::io::error` / `core::io::error` compiler drift plus a generated header on both files.
-  The drift is now settled by the pin rather than tracked, and `0002-51` and `0002-54` can treat
-  the snapshots as current.
+  The drift is now settled by the pin rather than tracked, so `0002-51` and `0002-54` could
+  treat the snapshots as current.
 - `0002-53` turned the e2e suite on: a `live-e2e` job runs it against a live podman on
   `ubuntu-24.04` and `ubuntu-24.04-arm` per PR, and the compile-only row is gone. The first
   execution found that the network interceptor installed **no rules at all** on nft 1.0.9 --
   `audit` recorded nothing, `filter` refused nothing -- which is a security-semantics defect
   present in rc.3 and therefore in the class `0002-52` recorded as forcing another candidate.
-  `0002-54` has to decide on that before it can ship a final. Its `## Decisions` also carry the
-  `outrig clean` false-removal fix and what the ARM row does and does not now cover.
-- `0002-49` writes only what is false *now*; `0002-54` writes the version-bearing docs, because
-  those can be written only once. `0002-52` -> `0002-54` is a loop: another RC returns to `0002-52`.
+  `0002-54` decided on that and waived it, recording the waiver and what it costs rather than
+  claiming the class was satisfied. Its `## Decisions` also carry the `outrig clean`
+  false-removal fix and what the ARM row does and does not now cover.
+- `0002-49` wrote only what was false *then*; `0002-54` wrote the version-bearing docs and
+  folded every candidate section into one `[0.2.0]` measured against 0.1.0, because that can be
+  written only once. `0002-52` -> `0002-54` was a loop: another RC would have returned to
+  `0002-52`.
 - `0002-52` landed the RC, strict rustdoc in CI, and a `package` job that packages both crates
   under `OUTRIG_REQUIRE_ENTER=1`, so an archive missing a source `build.rs` compiles fails
   rather than shipping. It first built two release-gate scripts for this and removed them again;
   its `## Decisions` records what `cargo publish` already covers, so they are not re-proposed.
   There is no soak window -- `0002-52` considered one and recorded why it measures nothing --
-  and what `0002-54` checks instead is the blocker class recorded there. rc.3 stays a
+  and what `0002-54` checked instead is the blocker class recorded there. rc.3 stayed a
   library-only cut, as rc.1 and rc.2 were.
 - Gate item 17 ships **partially met**: `0002-48` enforces the API snapshots, and the downstream
   runtime-core surface test (`plan/next/container-surface-test.md`) is a deliberate, recorded
