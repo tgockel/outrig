@@ -135,43 +135,32 @@ async fn stderr_captured_on_crash() {
         Err(OutrigError::McpStartupFailed(payload)) => {
             assert_eq!(payload.name, "crashy");
             assert_eq!(payload.stderr_path, log_dir.join("crashy.stderr"));
+            // The payload, not the file beside it. This used to poll the file
+            // for ten seconds and assert nothing at all about `stderr_tail`,
+            // because `enrich_startup_error` read the tail exactly once and a
+            // loaded runner beat it there -- so the test passed while the
+            // diagnostic a user actually receives said "(empty)". That the
+            // test was written to route around the payload was the symptom;
+            // the single read was the cause, and it settles now.
+            assert!(
+                payload.stderr_tail.contains("boom-from-mcp"),
+                "the failure should carry the server's own stderr, got {:?} (file: {})",
+                payload.stderr_tail,
+                payload.stderr_path.display(),
+            );
+            // Asserted as "not the timeout sentinel" rather than as `code 1`.
+            // The exact status is deterministic only if the wait wins, and
+            // pinning it would put this test back on the timing bet the rest
+            // of this branch exists to remove; what the widened wait buys is
+            // that a child which has already exited gets read at all.
+            assert_ne!(
+                payload.exit, "still running (wait timed out)",
+                "the server exited before `initialize`, so its status was there to read"
+            );
         }
         Err(other) => panic!("expected McpStartupFailed error, got: {other:?}"),
         Ok(_) => panic!("connect should have failed (server exits before initialize)"),
     }
-
-    // Give the child's stderr time to reach the file. On an unloaded machine
-    // this is instant; the wait is for a loaded one, where the drain is racing
-    // every other test binary in the run for a core.
-    //
-    // Ten seconds rather than the two this used to allow. Two was enough until
-    // the suite started running in CI, where twenty-odd binaries share a
-    // four-core runner: the file was still empty at the deadline, on a machine
-    // that was not otherwise in trouble. The ceiling only bounds a hang -- a
-    // capture that works still returns as soon as the bytes land -- so a
-    // generous one costs nothing and a tight one buys nothing.
-    const FLUSH_CEILING: Duration = Duration::from_secs(10);
-    let stderr_path = log_dir.join("crashy.stderr");
-    let mut contents = String::new();
-    let deadline = std::time::Instant::now() + FLUSH_CEILING;
-    loop {
-        if let Ok(text) = std::fs::read_to_string(&stderr_path)
-            && text.contains("boom-from-mcp")
-        {
-            contents = text;
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        contents.contains("boom-from-mcp"),
-        "stderr file at {} should contain `boom-from-mcp`, got: {:?}",
-        stderr_path.display(),
-        contents,
-    );
 
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }

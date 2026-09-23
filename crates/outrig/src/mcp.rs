@@ -350,12 +350,12 @@ async fn enrich_startup_error(
     child: &mut Owned,
     source: rmcp::service::ClientInitializeError,
 ) -> OutrigError {
-    let exit_status = match tokio::time::timeout(Duration::from_millis(250), child.wait()).await {
+    let exit_status = match tokio::time::timeout(CHILD_EXIT_CEILING, child.wait()).await {
         Ok(Ok(status)) => Some(status),
         _ => None,
     };
     let exit = format_exit(exit_status);
-    let stderr_tail = read_stderr_tail(stderr_path).await;
+    let stderr_tail = read_stderr_tail_settled(stderr_path).await;
 
     if !exit_status.is_some_and(|s| s.success()) {
         tracing::error!(
@@ -378,6 +378,35 @@ async fn enrich_startup_error(
     }))
 }
 
+/// How long [`enrich_startup_error`] gives the child to exit.
+///
+/// The child is a container engine, not a process -- `podman start --attach`
+/// has an image store and an OCI runtime behind it. The 250 ms this replaces
+/// bounded a flush rather than a hang, and a host under load got "still
+/// running (wait timed out)" in place of an exit status. It stays bounded
+/// because `serve_client` can fail against a server that is still running,
+/// which is the only reason there is a timeout here at all.
+const CHILD_EXIT_CEILING: Duration = Duration::from_secs(2);
+
+/// How long [`read_stderr_tail_settled`] keeps looking for stderr that has not
+/// landed yet.
+///
+/// The bytes a reader needs are not necessarily written by the process that
+/// just exited: for a container whose entrypoint cannot be resolved, the
+/// message comes from the OCI runtime by way of conmon, whose write is not
+/// ordered against `podman start --attach` returning. Reading once wins on an
+/// idle machine and loses on a loaded one -- CI reported `exit: code 1` beside
+/// a `(empty)` tail for exactly that container, which is the one thing the
+/// field exists to prevent.
+///
+/// Paid only on a failure path, and only while the file is *still* empty: a
+/// server that genuinely said nothing waits this out once, on its way to an
+/// error it was going to return regardless.
+const STDERR_SETTLE_CEILING: Duration = Duration::from_secs(5);
+
+/// How often [`read_stderr_tail_settled`] re-reads while it waits.
+const STDERR_SETTLE_POLL: Duration = Duration::from_millis(25);
+
 fn format_exit(status: Option<std::process::ExitStatus>) -> String {
     let Some(status) = status else {
         return "still running (wait timed out)".to_string();
@@ -395,25 +424,48 @@ fn format_exit(status: Option<std::process::ExitStatus>) -> String {
     "terminated".to_string()
 }
 
-async fn read_stderr_tail(path: &Path) -> String {
+async fn read_stderr_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     const MAX: u64 = 2048;
 
-    async fn inner(path: &Path) -> std::io::Result<Vec<u8>> {
-        let mut file = tokio::fs::File::open(path).await?;
-        let len = file.metadata().await?.len();
-        if len > MAX {
-            file.seek(SeekFrom::End(-(MAX as i64))).await?;
-        }
-        let mut buf = Vec::with_capacity(len.min(MAX) as usize);
-        file.read_to_end(&mut buf).await?;
-        Ok(buf)
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    if len > MAX {
+        file.seek(SeekFrom::End(-(MAX as i64))).await?;
     }
+    let mut buf = Vec::with_capacity(len.min(MAX) as usize);
+    file.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
 
-    match inner(path).await {
+fn render_stderr_tail(read: std::io::Result<Vec<u8>>) -> String {
+    match read {
         Ok(bytes) if bytes.is_empty() => "(empty)".to_string(),
         Ok(bytes) => String::from_utf8_lossy(&bytes).trim_end().to_string(),
         Err(_) => "(could not read stderr file)".to_string(),
+    }
+}
+
+/// The tail of `path`, giving a writer that has not caught up a bounded chance
+/// to land. See [`STDERR_SETTLE_CEILING`] for why one read is not enough.
+async fn read_stderr_tail_settled(path: &Path) -> String {
+    read_stderr_tail_settling_for(path, STDERR_SETTLE_CEILING).await
+}
+
+/// The above with the ceiling named, so a test can assert the giving-up branch
+/// without waiting out the real one.
+async fn read_stderr_tail_settling_for(path: &Path, ceiling: Duration) -> String {
+    let deadline = tokio::time::Instant::now() + ceiling;
+    loop {
+        let read = read_stderr_bytes(path).await;
+        // Empty is the only outcome a later write changes. A file that cannot
+        // be opened will not open by being asked again, and a non-empty one is
+        // already the answer -- so neither spins.
+        let still_empty = matches!(&read, Ok(bytes) if bytes.is_empty());
+        if !still_empty || tokio::time::Instant::now() >= deadline {
+            return render_stderr_tail(read);
+        }
+        tokio::time::sleep(STDERR_SETTLE_POLL).await;
     }
 }
 
@@ -591,26 +643,82 @@ mod tests {
 
         let missing = dir.path().join("nope.stderr");
         assert_eq!(
-            read_stderr_tail(&missing).await,
+            read_stderr_tail_settling_for(&missing, Duration::ZERO).await,
             "(could not read stderr file)"
         );
 
         let empty = dir.path().join("empty.stderr");
         tokio::fs::write(&empty, b"").await.unwrap();
-        assert_eq!(read_stderr_tail(&empty).await, "(empty)");
+        assert_eq!(
+            read_stderr_tail_settling_for(&empty, Duration::ZERO).await,
+            "(empty)"
+        );
 
         let normal = dir.path().join("normal.stderr");
         tokio::fs::write(&normal, b"line one\nline two\n")
             .await
             .unwrap();
-        assert_eq!(read_stderr_tail(&normal).await, "line one\nline two");
+        assert_eq!(
+            read_stderr_tail_settling_for(&normal, Duration::ZERO).await,
+            "line one\nline two"
+        );
 
         let big = dir.path().join("big.stderr");
         let payload: Vec<u8> = (0..10_000).map(|i| b'A' + (i % 26) as u8).collect();
         tokio::fs::write(&big, &payload).await.unwrap();
-        let tail = read_stderr_tail(&big).await;
+        let tail = read_stderr_tail_settling_for(&big, Duration::ZERO).await;
         assert!(tail.len() <= 2048, "tail was {} bytes", tail.len());
         assert!(payload.ends_with(tail.trim_end().as_bytes()));
+    }
+
+    /// The defect this exists for: the process that exits and the process that
+    /// writes the useful stderr are not always the same one. For a container
+    /// whose entrypoint cannot be resolved, `podman start --attach` returns
+    /// while the OCI runtime's message is still on its way through conmon, and
+    /// a single read gets an empty file.
+    #[tokio::test]
+    async fn a_tail_waits_for_a_writer_that_has_not_landed_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.stderr");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let late = tokio::spawn({
+            let path = path.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                tokio::fs::write(
+                    &path,
+                    b"exec: \"nope\": executable file not found in $PATH\n",
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let tail = read_stderr_tail_settling_for(&path, Duration::from_secs(5)).await;
+        assert!(
+            tail.contains("executable file not found"),
+            "a late write must still reach the tail, got: {tail:?}"
+        );
+        late.await.unwrap();
+    }
+
+    /// And it still gives up: a server that really said nothing must not hold
+    /// the error path open for the whole ceiling's worth of nothing.
+    #[tokio::test]
+    async fn a_tail_gives_up_on_a_file_that_stays_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent.stderr");
+        tokio::fs::write(&path, b"").await.unwrap();
+
+        let started = std::time::Instant::now();
+        let tail = read_stderr_tail_settling_for(&path, Duration::from_millis(50)).await;
+        assert_eq!(tail, "(empty)");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "giving up took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
