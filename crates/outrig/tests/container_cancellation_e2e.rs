@@ -20,11 +20,16 @@
 //! times and asserts that enough of them landed somewhere that counts. What
 //! counts differs by path, because the two windows are not the same size.
 //!
-//! **`create` is observable.** `podman create` returns, the engine holds a
-//! container, and the future is still inside `podman init`. That window is
-//! hundreds of milliseconds wide -- comfortably wider than the `podman ps`
-//! that observes it -- so the test waits until the engine demonstrably holds
-//! the container and cancels then. This is the window 0002-39 named.
+//! **`create` is arranged.** `podman create` returns, the engine holds a
+//! container, and the future is still inside `podman init`. An earlier version
+//! of this file went looking for that window with `podman ps`, and CI showed
+//! what that costs: a poll spawns a process, and on a loaded runner the spawn
+//! outlasts the window it is watching, so 0 of 5 cancels landed in flight and
+//! the test failed having measured nothing -- three runs in a row, x86-64
+//! only. The window is held open now rather than hunted for. `WRAPPER` parks
+//! `podman init` after a real `create` has returned, so the engine provably
+//! holds the container and the cancel lands there 5 times in 5 by
+//! construction. This is the window 0002-39 named.
 //!
 //! **`start` is not.** `podman run -d` prints the container's id only once the
 //! container is *up*, and `start_named` returns as soon as it has parsed that
@@ -54,6 +59,8 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -71,10 +78,10 @@ static E2E_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// out podman's stop grace besides -- see `await_engine_free`.
 const ENGINE_CEILING: Duration = Duration::from_secs(60);
 
-/// How many times each test cancels. Measured at five: `start` lands in flight
-/// 5 times out of 5, and `create` catches the engine holding the container 4
-/// times out of 5, so one run is never the only evidence and the file still
-/// finishes in seconds.
+/// How many times each test cancels. `create` is arranged rather than raced,
+/// so it lands 5 times out of 5 and asserts exactly that; `start` cancels on a
+/// swept timer and has measured 5 in 5 as well. Five keeps a single attempt
+/// from ever being the only evidence, and the file still finishes in seconds.
 const ATTEMPTS: usize = 5;
 
 /// Distinct from `build_cancellation_e2e.rs`'s `outrig-e2e-cancel-` prefix on
@@ -92,13 +99,125 @@ fn unique_name(what: &str) -> String {
     )
 }
 
+/// A `podman` that is the real one, except where a marker says to park.
+///
+/// `create_initialized` runs `podman create` and then `podman init <name>`, so
+/// by the time `init` is spawned the engine is already holding the container.
+/// This wrapper parks exactly there -- after a real create, before a real init
+/// -- and publishes `holding.<name>`, which a test waits on with a stat rather
+/// than with a subprocess. Every other invocation, including the cleanup's own
+/// `podman rm`, execs the real engine, so a test that plants no marker behaves
+/// as though this file were not here, and what the assertions read afterwards
+/// is still real engine state.
+const WRAPPER: &str = r#"#!/bin/sh
+journal="$OUTRIG_E2E_JOURNAL"
+
+# `podman init <name>`, and only for a name a test asked to hold. Publishing
+# before parking is what lets the wait be a stat: the marker appearing means
+# the real create has already returned and the engine holds the container.
+if [ "$1" = "init" ] && [ -n "$2" ] && [ -f "$journal/hold.init.$2" ]; then
+  : > "$journal/holding.$2"
+  # `exec` so the cancellation's kill reaches the sleeper itself rather than a
+  # shell that would have to forward it.
+  exec sleep 300
+fi
+
+exec "__REAL_PODMAN__" "$@"
+"#;
+
+/// Install the wrapper ahead of the real podman on `PATH`, and return the
+/// journal directory.
+///
+/// The same shape and the same synchronization as `cancellation.rs`'s
+/// `fake_runtime`: `PATH` is process-global, so the write happens once inside
+/// `OnceLock::get_or_init`, which blocks every other caller until the first has
+/// returned. Every test in this binary calls this before it spawns anything.
+fn wrapper_runtime() -> &'static Path {
+    static JOURNAL: OnceLock<PathBuf> = OnceLock::new();
+    JOURNAL.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Resolved before `PATH` is rewritten, or the wrapper would find itself
+        // and recurse.
+        let real = real_podman();
+
+        let root = tempfile::Builder::new()
+            .prefix("outrig-e2e-podman-wrapper")
+            .tempdir()
+            .expect("tempdir");
+        let bin = root.path().join("bin");
+        let journal = root.path().join("journal");
+        std::fs::create_dir_all(&bin).expect("create wrapper bin dir");
+        std::fs::create_dir_all(&journal).expect("create journal dir");
+
+        let script = WRAPPER.replace("__REAL_PODMAN__", &real.to_string_lossy());
+        let wrapper = bin.join("podman");
+        std::fs::write(&wrapper, script).expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+
+        let mut search = std::ffi::OsString::from(&bin);
+        search.push(":");
+        search.push(std::env::var_os("PATH").unwrap_or_default());
+
+        // SAFETY: edition 2024 marks `env::set_var` unsafe because of
+        // multi-thread races. Both writes happen inside `get_or_init`, which
+        // every test in this binary enters before spawning anything, so no
+        // thread can read either variable concurrently with this write.
+        unsafe {
+            std::env::set_var("PATH", search);
+            std::env::set_var("OUTRIG_E2E_JOURNAL", &journal);
+        }
+
+        // The directory has to outlive every test in the binary, and nothing
+        // runs after the last one, so it is left in the system temp dir rather
+        // than removed. One small directory per `cargo test` run.
+        std::mem::forget(root);
+        journal
+    })
+}
+
+/// The first `podman` on the inherited `PATH`.
+///
+/// Resolved by hand rather than with a crate: it runs once, and taking a
+/// dev-dependency to split a string on `:` would cost more than it saves.
+fn real_podman() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("podman"))
+        .find(|candidate| candidate.is_file())
+        .expect("a real podman on PATH")
+}
+
+/// Ask the wrapper to park `podman init <name>` when it reaches it.
+fn hold_init_for(journal: &Path, name: &str) {
+    std::fs::write(journal.join(format!("hold.init.{name}")), "").expect("write hold marker");
+}
+
+/// Resolves once the wrapper has parked `podman init <name>` -- so once the
+/// real `podman create` has returned and the engine is holding the container.
+///
+/// A stat rather than a `podman ps`, which is the whole point of the wrapper:
+/// the poll costs microseconds, so it cannot lose to the window it watches.
+async fn await_holding(journal: &Path, name: &str) {
+    let started = Instant::now();
+    while !journal.join(format!("holding.{name}")).exists() {
+        assert!(
+            started.elapsed() < ENGINE_CEILING,
+            "the wrapper never parked `podman init {name}` within {ENGINE_CEILING:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Whether the engine currently holds a container under exactly `name`.
 ///
 /// `tokio::process` rather than `common::run_capture`'s blocking
-/// `std::process`: this runs inside a `tokio::select!` arm racing the creation
-/// future, and a blocking `output()` there stops that future being polled for
-/// as long as podman takes -- which would widen the very window the select is
-/// trying to land inside.
+/// `std::process`, so that a neighbouring task keeps being polled while podman
+/// answers. This used to run inside a `tokio::select!` arm racing the creation
+/// future, where a blocking `output()` would have widened the very window the
+/// select was trying to land inside; the wrapper above retired that use, and
+/// only `await_engine_free` calls this now.
 ///
 /// Exact-match rather than `--filter name=`, which podman treats as a regex: a
 /// filter would answer for any container whose name merely contains this one,
@@ -117,21 +236,6 @@ async fn engine_holds(name: &str) -> bool {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|line| line.trim() == name)
-}
-
-/// Resolves once the engine is demonstrably holding `name`. Polled tightly,
-/// because how soon this resolves is what decides whether the cancel lands
-/// inside the window. The ceiling is for the case where *neither* this nor the
-/// creation it is raced against resolves, which is a hang worth failing on.
-async fn await_engine_holds(name: &str) {
-    let started = Instant::now();
-    while !engine_holds(name).await {
-        assert!(
-            started.elapsed() < ENGINE_CEILING,
-            "the engine never held {name} within {ENGINE_CEILING:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 
 /// Resolves once nothing under `name` is left, returning how long that took.
@@ -160,8 +264,9 @@ async fn await_engine_free(name: &str) -> Duration {
 
 /// When to take the creation future away.
 enum CancelOn {
-    /// Once the engine is observably holding the container -- the strong form,
-    /// usable where the window is wider than a `podman ps`.
+    /// Once the wrapper has parked `podman init` -- the strong form, and no
+    /// longer a race: `podman create` has returned by then, so the engine is
+    /// holding the container.
     EngineHolds,
     /// After a fixed delay, for a window too narrow to observe from outside.
     Elapsed(Duration),
@@ -183,18 +288,40 @@ where
         outcome = &mut creation => Some(outcome),
         () = async {
             match when {
-                CancelOn::EngineHolds => await_engine_holds(name).await,
+                CancelOn::EngineHolds => {
+                    await_holding(wrapper_runtime(), name).await;
+                    // The premise, now that it costs nothing to check. While
+                    // the wrapper parks, the window stays open for as long as
+                    // this takes -- so the `podman ps` that used to be the
+                    // race is just a read, and the test can prove it really is
+                    // cancelling against a container the engine holds rather
+                    // than against nothing.
+                    assert!(
+                        engine_holds(name).await,
+                        "the wrapper parked `podman init {name}`, but the engine holds no \
+                         container under that name"
+                    );
+                }
                 CancelOn::Elapsed(delay) => tokio::time::sleep(delay).await,
             }
         } => None,
     };
     drop(creation);
 
-    let in_flight = completed.is_none();
     // A creation that won the race hands back a `Container`, and dropping it
     // is what removes it -- the same invariant by the other door, so the wait
-    // below is meaningful either way.
-    drop(completed);
+    // below is meaningful either way. An `Err` is neither: it is the engine
+    // refusing, and counting it as "the cancel arrived late" is how a podman
+    // that fails on every attempt used to surface as `require_in_flight`'s
+    // "the window may have moved" instead of as its own error.
+    let in_flight = match completed {
+        None => true,
+        Some(Ok(container)) => {
+            drop(container);
+            false
+        }
+        Some(Err(e)) => panic!("{what}: the engine refused to create {name}: {e}"),
+    };
 
     let freed_in = await_engine_free(name).await;
     println!(
@@ -219,12 +346,32 @@ fn require_in_flight(what: &str, in_flight: usize, window: &str) {
     println!("{what}: {in_flight}/{ATTEMPTS} cancels landed {window}");
 }
 
+/// The arranged form of the above: every attempt must land in the window,
+/// because nothing about where it lands is left to timing.
+///
+/// A shortfall is a broken instrument rather than a slow engine -- a `podman
+/// init` that moved, or a marker the wrapper never read -- and saying so is the
+/// point of asserting the stronger thing. Polling for the window could only
+/// ever justify "at least one", which is what let CI report 0 of 5.
+fn require_every_attempt_in_flight(what: &str, in_flight: usize) {
+    assert_eq!(
+        in_flight, ATTEMPTS,
+        "{what}: {in_flight} of {ATTEMPTS} cancels landed with the engine holding the container, \
+         so the wrapper is no longer parking `podman init` where this test needs it"
+    );
+    println!("{what}: {in_flight}/{ATTEMPTS} cancels landed with the engine holding the container");
+}
+
 /// A cancelled `podman run` leaves the engine with no container under the
 /// reserved name, and releases the name in-process too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_canceled_start_leaves_no_container() {
     let _serialized = E2E_LOCK.lock().await;
     common::init_tracing();
+    // Before `pull_alpine`, and before anything else in this binary spawns a
+    // process: `wrapper_runtime` rewrites `PATH`, and that write is only sound
+    // because every test reaches it first.
+    wrapper_runtime();
     common::pull_alpine();
 
     let image = ImageTag::new(common::ALPINE);
@@ -258,11 +405,19 @@ async fn a_canceled_start_leaves_no_container() {
 async fn a_canceled_create_leaves_no_container() {
     let _serialized = E2E_LOCK.lock().await;
     common::init_tracing();
+    // Before `pull_alpine`, and before anything else in this binary spawns a
+    // process: `wrapper_runtime` rewrites `PATH`, and that write is only sound
+    // because every test reaches it first.
+    wrapper_runtime();
     common::pull_alpine();
 
     let mut in_flight = 0usize;
     for _ in 0..ATTEMPTS {
         let name = unique_name("create");
+        // Planted before the creation starts: the wrapper reads it when
+        // `create_initialized` reaches `podman init`, which is after the real
+        // `podman create` has returned.
+        hold_init_for(wrapper_runtime(), &name);
         let options = ContainerCreateOptions::new(
             ImageTag::new(common::ALPINE),
             ContainerLaunchSpec::default(),
@@ -281,5 +436,5 @@ async fn a_canceled_create_leaves_no_container() {
         );
         in_flight += usize::from(landed);
     }
-    require_in_flight("create", in_flight, "with the engine holding the container");
+    require_every_attempt_in_flight("create", in_flight);
 }
