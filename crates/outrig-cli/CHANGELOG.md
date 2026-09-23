@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spelling always did. A relative path of exactly three components derived the empty path
   instead, so a bare `model-path = "local.gguf"` validated clean and then reached the mistralrs
   loader with an empty directory, which it looks up on Hugging Face rather than opening.
+- **`outrig config init` says what a relative `model-path` is relative to.** The local-path
+  prompt now reads `Local model-path (absolute, or relative to the repo root)`, and its `?` help
+  recommends an absolute path for the global config, which serves every repo. An answer relative
+  to the directory `config init` ran in wrote a config that failed validation naming a file that
+  exists. The answer is still stored as typed.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

@@ -6,8 +6,10 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use outrig::config::Config;
@@ -304,6 +306,73 @@ async fn mistralrs_falls_back_to_free_form_when_hf_errors() {
         text.contains("model-file = [\"phi.gguf\"]"),
         "missing free-form-prompt model-file:\n{text}"
     );
+}
+
+/// Drive the mistralrs local-path branch, giving `path_answers` at the
+/// `model-path` prompt, and return the written config along with everything
+/// the prompt printed.
+async fn write_local_path_config(target: &Path, path_answers: &str) -> (String, String) {
+    // style=mistralrs, name=local, no extra provider, define a model,
+    // name=phi, provider=local, no auto-download, then the path answers,
+    // blank context-length, no extra models, use as default-model.
+    let script = format!("mistralrs\nlocal\nn\n\nphi\nlocal\nn\n{path_answers}\n\nn\n\n");
+    let (mut prompt, mut stderr_r) = scripted_prompt(script.as_bytes()).await;
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    timeout(TEST_TIMEOUT, run_with(false, target, &mut prompt, &mut hf))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    // Dropping the prompt closes its end of the stderr pipe, so the read ends.
+    drop(prompt);
+    let mut shown = String::new();
+    stderr_r.read_to_string(&mut shown).await.unwrap();
+    (std::fs::read_to_string(target).unwrap(), shown)
+}
+
+/// Neither prompt backend prints a free-text field's description unasked, so
+/// the base a relative `model-path` is read from has to be in the prompt line
+/// itself. `?` adds the advice for a global config. The answer itself is
+/// stored as typed: the global config has no single repo root to join it to.
+#[tokio::test]
+async fn model_path_prompt_names_its_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    let (text, shown) = write_local_path_config(&target, "?\nweights/local.gguf").await;
+
+    assert!(
+        shown.contains("? Local model-path (absolute, or relative to the repo root): "),
+        "prompt line does not name the base:\n{shown}"
+    );
+    assert!(
+        shown.contains("prefer an absolute path"),
+        "`?` help does not recommend an absolute path:\n{shown}"
+    );
+    assert!(
+        text.contains("model-path = \"weights/local.gguf\""),
+        "relative answer not stored as typed:\n{text}"
+    );
+}
+
+/// An absolute answer is the one a global config wants: it names the same
+/// file from every repo, including one that holds no copy of it.
+#[tokio::test]
+async fn absolute_model_path_validates_under_any_repo_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+    let weights = tmp.path().join("weights/local.gguf");
+    std::fs::create_dir_all(weights.parent().unwrap()).unwrap();
+    std::fs::write(&weights, b"").unwrap();
+    let other_repo = tempfile::tempdir().unwrap();
+
+    let (text, _) = write_local_path_config(&target, weights.to_str().unwrap()).await;
+
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(Some(other_repo.path()))
+        .unwrap();
 }
 
 #[tokio::test]

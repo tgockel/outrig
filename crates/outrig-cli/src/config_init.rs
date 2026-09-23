@@ -157,11 +157,16 @@ const REVISION_FIELD: Field = Field {
     doc_link: "doc/concepts/in-process-llm.md",
 };
 
+// The base is in `name`, not only `description`: neither prompt backend shows
+// a free-text field's description until the user types `?`, and a relative
+// path read from the wrong directory is the mistake this prompt invites.
 const MODEL_PATH_FIELD: Field = Field {
-    name: "Local model-path",
-    description: "Filesystem path to a GGUF file.",
+    name: "Local model-path (absolute, or relative to the repo root)",
+    description: "Filesystem path to a GGUF file. A relative path is read from the root of \
+                  the repo outrig runs against, which is not necessarily this directory. A \
+                  global config serves every repo, so prefer an absolute path there.",
     options: &[],
-    doc_link: "doc/concepts/in-process-llm.md",
+    doc_link: "doc/concepts/in-process-llm.md#from-a-local-path",
 };
 
 const MODEL_FILE_FIELD: Field = Field {

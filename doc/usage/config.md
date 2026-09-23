@@ -69,7 +69,9 @@ If you pick `mistralrs` as the provider style -- **deprecated**, and offered onl
 that still carry `--features local-llm` -- the provider itself has no follow-up
 prompts -- it's just a tag. The weight-source prompts (`Use auto-download by model
 ID?`, `HuggingFace model-id` or `Local model-path`, `revision`, `context-length`) are
-asked once per model in the model loop, since each model carries its own weight spec.
+asked once per model in the model loop, since each model carries its own weight spec. A
+relative `Local model-path` is read from the repo root, not from the directory `config init`
+runs in, and the global config serves every repo -- so give that prompt an absolute path.
 New configs should pick `openai` and point it at a local Ollama/vLLM/`llama.cpp` server
 instead; see [In-process LLMs](../concepts/in-process-llm.md).
 
