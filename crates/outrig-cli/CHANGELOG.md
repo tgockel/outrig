@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`outrig clean --session <id>`**, which narrows both sweeps to one session. Only that
+  session's record is considered for removal, and only containers labeled
+  `org.outrig.session=<id>` are stray candidates. The sweep is machine-wide without it, and a
+  stray is defined by the *absence* of a record -- so a container whose record lives under a
+  different `--session-root` (another checkout, a parallel CI job) has no record the sweep can
+  see and is removed as a stray. The default is unchanged.
+
 ### Fixed
 
 - **The session watcher reaped sidecars by container name.** When the primary container dies

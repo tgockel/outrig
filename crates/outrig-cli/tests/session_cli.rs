@@ -758,6 +758,15 @@ fn clean_args(older_than: Duration, yes: bool) -> clean::CleanArgs {
         older_than,
         yes,
         build_containers: false,
+        session: None,
+    }
+}
+
+/// `clean_args` narrowed to one session id, the `--session <ID>` form.
+fn clean_args_for(older_than: Duration, yes: bool, session: &str) -> clean::CleanArgs {
+    clean::CleanArgs {
+        session: Some(session.to_string()),
+        ..clean_args(older_than, yes)
     }
 }
 
@@ -1241,6 +1250,67 @@ async fn clean_reports_a_stray_the_engine_still_has() {
     assert!(
         !err.contains("[outrig] removed container outrig-still-here"),
         "and must not also be claimed as removed: {err}"
+    );
+}
+
+/// `--session` narrows the label sweep to containers carrying that session id.
+///
+/// The sweep is unfiltered otherwise: it removes every `org.outrig.session`
+/// container whose id is not a record in the store it was handed. That is what
+/// two session roots on one host -- two checkouts, two CI jobs, the e2e suite
+/// beside a live session -- need to not do to each other, since neither can see
+/// the other's records and so reads all of its containers as strays.
+#[tokio::test]
+async fn clean_session_scopes_the_stray_sweep_to_one_id() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let now = clean_now();
+
+    // Both are record-less, stopped and old, so an unscoped sweep would take
+    // both. Only the first is this invocation's to touch.
+    let strays = vec![
+        labeled("outrig-mine", "mine", None, false, days(40), now),
+        labeled("outrig-theirs", "theirs", None, false, days(40), now),
+    ];
+
+    let (mut ew, stderr_r) = duplex(8192);
+    let stdin = tokio::io::BufReader::new(tokio::io::empty());
+    let args = clean_args_for(clean::DEFAULT_OLDER_THAN, true, "mine");
+    let rc = clean::execute_with(
+        &mut ew,
+        stdin,
+        &store,
+        &args,
+        now,
+        BTreeSet::new(),
+        strays,
+        Vec::new(),
+        // The batch is the assertion: a name from another session reaching
+        // this hook is the defect, and it has to fail here rather than in a
+        // count afterwards.
+        |names: Vec<String>| async move {
+            assert_eq!(
+                names,
+                vec!["outrig-mine".to_string()],
+                "the scoped sweep must not hand another session's container to podman"
+            );
+            Ok(Vec::new())
+        },
+        no_build_removals,
+    )
+    .await
+    .expect("clean");
+    drop(ew);
+
+    assert_eq!(rc, 0, "a scoped sweep that removed its stray is a success");
+    let err = drain(stderr_r).await;
+    assert!(
+        err.contains("[outrig] removed container outrig-mine"),
+        "the in-scope stray is removed: {err}"
+    );
+    assert!(
+        !err.contains("outrig-theirs"),
+        "the out-of-scope stray is neither previewed nor removed: {err}"
     );
 }
 

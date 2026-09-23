@@ -434,14 +434,16 @@ Delete old stopped session records in bulk.
 outrig clean [--older-than <duration>]
              [--yes]
              [--build-containers]
+             [--session <id>]
              [--session-root <path>]
 ```
 
-| Argument / flag            | Default | Description                                   |
-|----------------------------|---------|-----------------------------------------------|
-| `--older-than <duration>`  | `30d`   | Remove sessions older than cutoff.            |
-| `--yes`, `-y`              | off     | Skip the interactive confirmation.            |
-| `--build-containers`       | off     | Also remove buildah working containers.       |
+| Argument / flag           | Default | Description                             |
+|---------------------------|---------|-----------------------------------------|
+| `--older-than <duration>` | `30d`   | Remove sessions older than cutoff.      |
+| `--yes`, `-y`             | off     | Skip the interactive confirmation.      |
+| `--build-containers`      | off     | Also remove buildah working containers. |
+| `--session <id>`          | all     | Restrict both sweeps to one session id. |
 
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
 The command previews matching sessions and asks once before deleting unless `--yes` is set.
@@ -449,6 +451,13 @@ Running sessions are skipped. Sessions created with `--session-dir` remove both 
 target and the symlink under the session root. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
 Stopped strays older than the cutoff are removed; running ones are only reported.
+
+`--session <id>` narrows both sweeps to one session: only that session's record is considered
+for removal, and only containers labeled `org.outrig.session=<id>` are stray candidates.
+Without it the label sweep is machine-wide, which matters because a stray is defined by the
+*absence* of a record. A container whose record lives under a different `--session-root` --
+another checkout, a parallel CI job, a test suite with its own session root -- has no record
+this invocation can see, so an unscoped sweep reads it as a stray and removes it.
 
 `--build-containers` adds a third sweep, for the buildah *working containers* an interrupted
 build can leave behind, and needs `buildah` on `PATH`. It removes by container id, subject to

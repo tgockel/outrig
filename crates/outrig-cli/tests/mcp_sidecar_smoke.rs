@@ -473,6 +473,15 @@ async fn clean_sweeps_stopped_recordless_labeled_containers() {
             "-y",
             "--older-than",
             "2s",
+            // Without this the sweep is machine-wide: the session root above
+            // is empty, so every `org.outrig.session` container belonging to
+            // a test running beside this one reads as a stray and is removed.
+            // One sweep was measured taking nine containers, five of them a
+            // neighbour's. The assertions below are also order-dependent
+            // without it -- another sweep can remove this stray first, and
+            // then this one has nothing to report.
+            "--session",
+            &sid_label,
         ])
         .output()
         .await
@@ -483,6 +492,10 @@ async fn clean_sweeps_stopped_recordless_labeled_containers() {
     assert!(
         stderr.contains(&stray),
         "clean should report removing the stray: {stderr}"
+    );
+    assert!(
+        !stderr.contains("outrig-e2e-") && !stderr.contains("outrig-cancel-"),
+        "the scoped sweep must not reach another test's containers: {stderr}"
     );
 
     let leftovers = podman_names(&format!("name={stray}")).await;

@@ -50,6 +50,16 @@ pub struct CleanArgs {
     /// Skip the interactive `[y/N]` confirmation.
     #[arg(short = 'y', long = "yes")]
     pub yes: bool,
+    /// Restrict both sweeps to one session id.
+    ///
+    /// Only this session's record is considered for removal, and only
+    /// containers labeled `org.outrig.session=<ID>` are stray candidates.
+    /// Without it `clean` sweeps every session in the store and every
+    /// labeled container on the machine -- including containers a
+    /// *different* session root owns, whose records this invocation cannot
+    /// see and therefore reads as strays.
+    #[arg(long = "session", value_name = "ID")]
+    pub session: Option<String>,
     /// Also remove buildah working containers left by interrupted builds.
     ///
     /// Unlike the other sweeps this one is not label-scoped -- buildah offers
@@ -137,7 +147,31 @@ where
     BFut: Future<Output = Result<()>>,
 {
     let listing = store.list()?;
-    let sessions = listing.sessions;
+    // `--session` narrows both sweeps together, which is the only way the
+    // flag can mean one thing: the record walk decides what counts as a
+    // surviving session, and the label sweep removes containers whose session
+    // did not survive. Narrowing one without the other would make a scoped
+    // run delete containers it did not preview.
+    //
+    // `listing.skipped` is deliberately not narrowed. Those are directories
+    // that would not parse, so their session id is exactly what is unknown;
+    // they keep protecting a container that matches by name, which is the
+    // conservative direction.
+    let sessions: Vec<Session> = match args.session.as_deref() {
+        Some(id) => listing
+            .sessions
+            .into_iter()
+            .filter(|s| s.id.as_str() == id)
+            .collect(),
+        None => listing.sessions,
+    };
+    let labeled: Vec<LabeledContainer> = match args.session.as_deref() {
+        Some(id) => labeled
+            .into_iter()
+            .filter(|c| c.session_label == id)
+            .collect(),
+        None => labeled,
+    };
     let mut targets = Vec::new();
     let mut skipped_running = Vec::new();
 
