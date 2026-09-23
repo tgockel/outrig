@@ -15,7 +15,7 @@ use super::{BackingClient, ProxyServer, SUPPORTED_PROTOCOL_VERSIONS, TOOLS_TTL_M
 use crate::error::OutrigError;
 use crate::mcp_content::mcp_content_tests::{MIXED_RENDERING, rmcp_mixed_result, rmcp_rich_tool};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
-use crate::process::process_tests::CaptureWriter;
+use crate::process::process_tests::with_captured_tracing_at;
 
 /// Per-tool canned response. `Ok` becomes a successful `CallToolResult`;
 /// `Err` becomes the "backing client failed" path that surfaces as
@@ -374,28 +374,15 @@ async fn advertised(proxy: &ProxyServer<Arc<FakeClient>>) -> (Vec<String>, Vec<S
     (names, bodies)
 }
 
-/// Run `body` with `tracing` captured, returning what it emitted. The
-/// subscriber is thread-local, so the runtime is current-thread and built
-/// here rather than by `#[tokio::test]` -- the same shape `process_tests`
-/// uses.
+/// Run `body` with `tracing` captured, returning what it emitted.
+///
+/// A level and a body away from `process_tests`'s helper, which is where the
+/// thread-local subscriber and the gate that makes it sound both live. This
+/// used to be a second copy of that setup, and being a copy is how it came to
+/// sit at a different max level than the two tests it shares callsite state
+/// with.
 fn with_captured_tracing<T>(body: impl Future<Output = T>) -> (T, String) {
-    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(CaptureWriter(buf.clone()))
-        .with_max_level(tracing::Level::ERROR)
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build current_thread runtime");
-    let out = rt.block_on(body);
-    let captured =
-        String::from_utf8(buf.lock().unwrap().clone()).expect("captured output must be UTF-8");
-    (out, captured)
+    with_captured_tracing_at(tracing::Level::ERROR, body)
 }
 
 #[test]

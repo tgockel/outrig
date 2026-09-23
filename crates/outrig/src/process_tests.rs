@@ -6,6 +6,7 @@
 //! confirmed reap a stop signal gets.
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -89,6 +90,10 @@ async fn try_capture_returns_output_on_nonzero_exit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn logged_capture_tees_command_and_output_to_transcript() {
+    // `run_capture_logged` reaches the same two callsites
+    // `try_capture_logged_traces_spawn_and_exit_at_debug` asserts on, with no
+    // subscriber installed. See `TRACING_CALLSITES`.
+    let _emitting = emitting().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("container.log");
     let transcript = Transcript::create(&path, false)
@@ -199,21 +204,7 @@ async fn run_capture_does_not_mark_exact_limit_stderr_truncated() {
 
 #[test]
 fn run_streamed_forwards_stderr_to_tracing() {
-    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let writer = CaptureWriter(buf.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build current_thread runtime");
-    let status = rt.block_on(async {
+    let (status, captured) = with_captured_tracing_at(tracing::Level::TRACE, async {
         super::run_streamed(
             Cmd::new("/bin/sh").args(["-c", "echo hello-from-stderr 1>&2"]),
             "test",
@@ -223,9 +214,6 @@ fn run_streamed_forwards_stderr_to_tracing() {
         .expect("run_streamed must succeed")
     });
     assert!(status.success());
-
-    let captured = String::from_utf8(buf.lock().unwrap().clone())
-        .expect("captured tracing output must be UTF-8");
     assert!(
         captured.contains("[test] hello-from-stderr"),
         "tracing should receive prefixed stderr line, got: {captured}"
@@ -234,28 +222,11 @@ fn run_streamed_forwards_stderr_to_tracing() {
 
 #[test]
 fn try_capture_logged_traces_spawn_and_exit_at_debug() {
-    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let writer = CaptureWriter(buf.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build current_thread runtime");
-    rt.block_on(async {
+    let ((), captured) = with_captured_tracing_at(tracing::Level::DEBUG, async {
         super::try_capture_logged(Cmd::new("/bin/echo").arg("hi"), "test", None)
             .await
-            .expect("try_capture_logged must succeed")
+            .expect("try_capture_logged must succeed");
     });
-
-    let captured = String::from_utf8(buf.lock().unwrap().clone())
-        .expect("captured tracing output must be UTF-8");
     assert!(
         captured.contains("spawn command=/bin/echo hi"),
         "debug output should name the full command line, got: {captured}"
@@ -292,6 +263,108 @@ async fn spawn_stdio_stdin_stdout_usable() {
 
     let status = child.wait().await.expect("wait on cat");
     assert!(status.success());
+}
+
+/// Separates the tests that *observe* tracing from the tests that merely
+/// *emit* through the same callsites.
+///
+/// `tracing` keeps callsite state process-globally while
+/// `subscriber::set_default` installs a subscriber on one thread, so a test
+/// that observes tracing can capture nothing at all when it runs beside one
+/// that merely emits through the same module's callsites.
+///
+/// The mechanism is not pinned down past that, and saying so is deliberate:
+/// two earlier diagnoses of this flake did not survive being checked against
+/// the source, and the one-line remedy the first of them implied measured the
+/// same as no remedy at all. What is established is measured, on the compiled
+/// lib binary:
+///
+/// | Configuration                                   | Failures |
+/// |-------------------------------------------------|----------|
+/// | Before this gate                                | 6 / 40   |
+/// | Observers serialized against each other only    | 12 / 50  |
+/// | Every guard but the `run_streamed` emitter's    | 0 / 40   |
+/// | This gate                                       | 0 / 140  |
+///
+/// Every failure in every row was
+/// `run_streamed_forwards_stderr_to_tracing`. Two rows carry the finding.
+/// Serializing the observers against *each other* does not help and reads
+/// worse than doing nothing, so what matters is excluding the emitters rather
+/// than ordering the observers. And the emitters that matter are the
+/// `try_capture_logged` ones, which never touch the callsite the failing test
+/// asserts on -- so whatever is shared here, it is not that callsite's own
+/// `Interest`.
+///
+/// The fifth guard is kept even though the third row says it is not what
+/// closes this. It sits on the only other caller of the callsite the failing
+/// test asserts on, which is where a future change would most plausibly make
+/// it matter, and it costs nothing measurable.
+///
+/// An `RwLock` rather than a `Mutex` because the asymmetry is the point.
+/// Observers take the write side and so exclude everyone; emitters take the
+/// read side and still run concurrently with each other, which is all but
+/// three tests in this file.
+///
+/// The obligation this encodes is real but narrow: a *new* test that drives
+/// `try_capture_logged*`, `run_capture_logged*` or `run_streamed` without a
+/// subscriber wants `emitting()`. `plan/next/relocate-unit-shaped-tests.md`
+/// is where the version that needs no obligation lives -- these assert on
+/// `pub(crate)` items, so giving them their own process means widening the
+/// crate's surface, which is not a thing to do during a release freeze.
+/// `tokio`'s rather than `std`'s: an emitter holds the read side across the
+/// `await` that reaches the callsite, which a `std` guard may not do, and this
+/// one does not poison -- a test failing while it holds either side would
+/// otherwise turn one failure into every failure.
+static TRACING_CALLSITES: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// The read side: a test that drives a traced callsite without installing a
+/// subscriber.
+pub(crate) async fn emitting() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    TRACING_CALLSITES.read().await
+}
+
+/// The write side: a test that installs a subscriber and asserts on what it
+/// captured.
+///
+/// `blocking_write` rather than an `await`, because every observer is a plain
+/// `#[test]` that builds its runtime *after* taking this -- so there is no
+/// runtime on the thread to block, which is also what keeps the subscriber and
+/// the work it observes on one thread.
+fn observing() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    TRACING_CALLSITES.blocking_write()
+}
+
+/// Run `body` under a capturing subscriber at `level`, returning its value and
+/// everything the subscriber recorded.
+///
+/// Holds [`observing`] throughout, which is what makes the capture meaningful.
+/// The runtime is current-thread and built here rather than by
+/// `#[tokio::test]` because `set_default` is thread-local: the work -- and any
+/// task it spawns -- has to be polled on the thread holding the guard.
+pub(crate) fn with_captured_tracing_at<T>(
+    level: tracing::Level,
+    body: impl Future<Output = T>,
+) -> (T, String) {
+    let _observing = observing();
+
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(CaptureWriter(buf.clone()))
+        .with_max_level(level)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current_thread runtime");
+    let out = rt.block_on(body);
+
+    let captured = String::from_utf8(buf.lock().unwrap().clone())
+        .expect("captured tracing output must be UTF-8");
+    (out, captured)
 }
 
 /// A `tracing` writer that keeps what was written, so a test can assert on a
@@ -664,6 +737,7 @@ async fn a_capture_canceled_while_draining_does_not_detach_the_reader() {
 /// *aborted* by the stop, not detached to run on unobserved.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stop_while_draining_returns_and_aborts_the_readers() {
+    let _emitting = emitting().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let descendant_file = dir.path().join("descendant");
     let direct_file = dir.path().join("direct");
@@ -723,6 +797,7 @@ async fn a_stop_while_draining_returns_and_aborts_the_readers() {
 /// reap for a stopped one -- rather than only the drop half.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stop_at_the_spawn_handoff_returns_after_a_confirmed_reap() {
+    let _emitting = emitting().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = pid_file(&dir);
 
@@ -760,6 +835,7 @@ async fn a_stop_at_the_spawn_handoff_returns_after_a_confirmed_reap() {
 /// which is the difference from every test above.
 #[tokio::test(flavor = "current_thread")]
 async fn a_stopped_capture_returns_after_a_confirmed_reap() {
+    let _emitting = emitting().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let path = pid_file(&dir);
 
@@ -1035,6 +1111,10 @@ async fn a_graceful_child_can_still_write_while_it_stops() {
 /// so a drain that gave up at the bad byte cannot reach the end.
 #[tokio::test(flavor = "current_thread")]
 async fn a_graceful_child_writing_invalid_utf8_still_finishes() {
+    // Drives `run_streamed`'s stderr callsite -- the one
+    // `run_streamed_forwards_stderr_to_tracing` captures -- 2001 times, with
+    // no subscriber installed. See `TRACING_CALLSITES`.
+    let _emitting = emitting().await;
     let cmd = Cmd::new("/bin/sh").args([
         "-c".to_string(),
         // `printf` writes the lone continuation byte 0x80, which is not
