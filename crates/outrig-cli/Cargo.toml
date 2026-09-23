@@ -1,7 +1,6 @@
 [package]
 name        = "outrig-cli"
 description = "Command-line tool for running LLM agents with podman-isolated MCP servers."
-build       = "build.rs"
 version.workspace       = true
 edition.workspace       = true
 rust-version.workspace  = true
@@ -25,17 +24,6 @@ default   = []
 e2e       = []
 # Test-only; see the `src/lib.rs` module doc.
 internal-test-api = []
-# DEPRECATED -- scheduled for removal. Compiles in the in-process mistralrs
-# backend, and with it several hundred dependency crates. Run local models under
-# an OpenAI-compatible server (Ollama, vLLM, llama.cpp) and point a
-# `style = "openai"` provider at its localhost base-url instead; see
-# `doc/concepts/in-process-llm.md`. `build.rs` warns when this is enabled.
-local-llm = ["dep:mistralrs-core", "dep:hf-hub", "dep:candle-core", "dep:indexmap"]
-# DEPRECATED with `local-llm`, which these select a backend for.
-cuda      = ["candle-core?/cuda", "mistralrs-core?/cuda"]
-# Metal's upstream dependency features are Apple-only. The public feature
-# gates outrig's runtime path; macOS local-llm builds carry the backend deps.
-metal     = []
 
 [[bin]]
 name = "outrig"
@@ -45,19 +33,14 @@ path = "src/main.rs"
 outrig = { path = "../outrig", version = "0.3.0-alpha.1" }
 
 anyhow             = { workspace = true, default-features = true }
-async-stream       = { workspace = true, default-features = true }
 axum               = { workspace = true, features = ["http1", "tokio"] }
 bytes              = { workspace = true, default-features = true }
-candle-core        = { workspace = true, optional = true }
 clap               = { workspace = true, default-features = true, features = ["derive"] }
 dialoguer          = { workspace = true, default-features = true, features = ["fuzzy-select"] }
 directories        = { workspace = true, default-features = true }
 futures-util       = { workspace = true, default-features = true }
 heck               = { workspace = true, default-features = true }
-hf-hub             = { workspace = true, optional = true }
-indexmap           = { workspace = true, default-features = true, optional = true }
 jiff               = { workspace = true, default-features = true }
-mistralrs-core     = { workspace = true, optional = true }
 rand               = { workspace = true, default-features = true }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }
@@ -74,7 +57,6 @@ toml               = { workspace = true, default-features = true, features = ["s
 toml_edit          = { workspace = true, default-features = true }
 tracing            = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, default-features = true, features = ["env-filter", "fmt"] }
-walkdir            = { workspace = true, default-features = true }
 
 [dev-dependencies]
 # A dependency on self, so the integration tests -- separate crates -- see the
@@ -84,7 +66,3 @@ outrig-cli = { path = ".", features = ["internal-test-api"] }
 # `test-util` gives tests `start_paused`, so the subagent registry tests can
 # drive a round whose retry backoff would otherwise take seconds of real time.
 tokio = { workspace = true, default-features = true, features = ["test-util"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core    = { version = "=0.10.2", default-features = false, optional = true, features = ["metal"] }
-mistralrs-core = { version = "=0.8.1", default-features = false, optional = true, features = ["metal"] }

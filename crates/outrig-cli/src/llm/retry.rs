@@ -345,10 +345,10 @@ impl HttpClientExt for RetryingHttpClient {
     where
         T: Into<Bytes> + WasmCompatSend,
     {
-        // No retry: outrig's remote turns are non-streaming (the streaming
-        // path is `local-llm`/mistralrs, which is in-process and never gets
-        // here). A streaming remote provider would need its own handling --
-        // a failure can land mid-stream, after bytes the caller already saw.
+        // No retry: outrig never streams -- every turn is a non-streaming
+        // completion, so nothing reaches here. A streaming provider would need
+        // its own handling -- a failure can land mid-stream, after bytes the
+        // caller already saw.
         HttpClientExt::send_streaming(&self.inner, req)
     }
 }
@@ -420,9 +420,9 @@ impl<M: CompletionModel> CompletionModel for RetryingModel<M> {
         &self,
         request: CompletionRequest,
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-        // No retry, for the same reason `send_streaming` has none: outrig's
-        // remote turns are non-streaming, and a failure can land mid-stream,
-        // after content the caller already saw.
+        // No retry, for the same reason `send_streaming` has none: outrig
+        // never streams, and a failure can land mid-stream, after content the
+        // caller already saw.
         self.inner.stream(request).await
     }
 
@@ -995,7 +995,7 @@ mod tests {
             &self,
             _request: CompletionRequest,
         ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
-            unreachable!("outrig's remote turns are non-streaming")
+            unreachable!("outrig never streams")
         }
     }
 

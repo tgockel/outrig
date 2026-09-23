@@ -33,7 +33,7 @@ refusing the rest. Points that follow from how 0002-24 landed:
   to offer.
 - **The refusal is a third case, not the unknown-model message.** `unusable_model_message` says
   `no usable model named "x"; available: ...`. A model that exists and resolves but is not permitted
-  should say so, the way `MistralrsFeatureDisabled` is kept distinct from "unknown" -- the remedy is
+  should say so, the way an unset api-key variable is kept distinct from "unknown" -- the remedy is
   the operator's config, not a corrected guess.
 - **Validation belongs with the other agent keys.** Entries naming a model with no `[models.<name>]`
   block should fail config validation, beside `subagent-depth-max` / `subagent-width-max`'s range

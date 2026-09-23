@@ -11,10 +11,9 @@ use super::Config;
 ///   either side are preserved as-is. A repo image-config can therefore name a
 ///   sidecar the user declared globally.
 /// - For top-level scalars (`default-image`, `default-agent`,
-///   `default-model`, `session-root`, `model-cache-root`,
-///   `tool-call-max`, `tool-result-max`, `subagent-depth-max`,
-///   `subagent-width-max`, `retry-budget-secs`): repo's value wins if set,
-///   else global's.
+///   `default-model`, `session-root`, `tool-call-max`,
+///   `tool-result-max`, `subagent-depth-max`, `subagent-width-max`,
+///   `retry-budget-secs`): repo's value wins if set, else global's.
 /// - `[network].mode` follows repo precedence when the repo config declares
 ///   `mode`; a `[network]` table that declares no mode inherits the global
 ///   one. Policy keys (`default`, `allow`, `deny`) are global-only: this
@@ -62,7 +61,6 @@ pub fn merge(global: Config, repo: Config) -> Config {
         default_agent: repo.default_agent.or(global.default_agent),
         default_model: repo.default_model.or(global.default_model),
         session_root: repo.session_root.or(global.session_root),
-        model_cache_root: repo.model_cache_root.or(global.model_cache_root),
         tool_call_max: repo.tool_call_max.or(global.tool_call_max),
         tool_result_max: repo.tool_result_max.or(global.tool_result_max),
         subagent_depth_max: repo.subagent_depth_max.or(global.subagent_depth_max),

@@ -28,7 +28,6 @@ use crate::cli::session_setup::{
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
-use crate::paths::model_cache_root;
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
@@ -37,7 +36,7 @@ use crate::session_tool::{self, SessionTool};
 use crate::subagent::{SubagentContext, SubagentRegistry};
 use outrig::McpClient;
 use outrig::config::{
-    Config, MistralrsDeviceSpec, NetworkMode, SidecarStart, TOOL_CALL_MAX_LIMIT,
+    Config, NetworkMode, SidecarStart, TOOL_CALL_MAX_LIMIT,
     TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES,
 };
 use outrig::container::Container;
@@ -87,10 +86,6 @@ pub struct RunArgs {
     #[arg(long = "network", value_name = "MODE", value_parser = parse_network_mode)]
     pub network: Option<NetworkMode>,
 
-    /// Override the mistralrs model device for this run.
-    #[arg(long = "device", value_name = "DEVICE", value_parser = parse_mistralrs_device)]
-    pub device: Option<MistralrsDeviceSpec>,
-
     /// Mount an extra host directory into the container. Repeatable. Format
     /// `HOST:CONTAINER[:ro|rw]` (default read-only; the host dir must exist).
     #[arg(long = "volume", value_name = "HOST:CONTAINER[:ro|rw]", action = ArgAction::Append, value_parser = parse_volume)]
@@ -119,7 +114,6 @@ pub async fn execute(
         llm_session: true,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
-        device_override: args.device,
         volumes: &args.volume,
         start_sidecars: true,
         cli_env: &cli_env,
@@ -151,7 +145,6 @@ pub async fn execute(
     // re-resolve the agent against another `[models.<name>]`, against the same
     // merged config the session resolved from.
     let cfg = Arc::new(cfg);
-    let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
 
     // Validate per-server env entries against the full merged plan (a
     // skipped sidecar's servers are still declared names).
@@ -174,11 +167,9 @@ pub async fn execute(
         log_dir: &log_dir,
         sid: &sid,
         repo_root: &repo_root,
-        cache_root: &cache_root,
         max_tool_calls: args.max_tool_calls,
         max_tool_result_bytes: args.max_tool_result_bytes,
         model_override: args.model.as_deref(),
-        device_override: args.device,
         mcp_plan: &mcp_plan,
         cli_env: &cli_env,
         runtime: &mut runtime,
@@ -194,10 +185,6 @@ pub async fn execute(
 
 fn parse_network_mode(s: &str) -> std::result::Result<NetworkMode, String> {
     s.parse()
-}
-
-fn parse_mistralrs_device(s: &str) -> std::result::Result<MistralrsDeviceSpec, String> {
-    s.parse::<MistralrsDeviceSpec>().map_err(|e| e.to_string())
 }
 
 /// Inputs to [`run_inner`], grouped like [`SessionSetupArgs`]: the resolved
@@ -217,11 +204,9 @@ struct RunInnerArgs<'a> {
     log_dir: &'a Path,
     sid: &'a SessionId,
     repo_root: &'a Path,
-    cache_root: &'a Path,
     max_tool_calls: Option<u32>,
     max_tool_result_bytes: Option<u32>,
     model_override: Option<&'a str>,
-    device_override: Option<MistralrsDeviceSpec>,
     mcp_plan: &'a SessionMcpPlan,
     cli_env: &'a CliEnvEntries,
     runtime: &'a mut SessionRuntime,
@@ -238,11 +223,9 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         log_dir,
         sid,
         repo_root,
-        cache_root,
         max_tool_calls,
         max_tool_result_bytes,
         model_override,
-        device_override,
         mcp_plan,
         cli_env,
         runtime,
@@ -260,14 +243,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     // Wrapped by the caller so the subagent registry can hold it and
     // re-resolve a launch against a different model, against the same merged
     // config the session resolved from.
-    let mut resolved =
-        llm::resolve_agent_with_overrides(
-            &cfg,
-            repo_root,
-            agent_name,
-            model_override,
-            device_override,
-        )?;
+    let mut resolved = llm::resolve_agent_with_overrides(&cfg, agent_name, model_override)?;
     apply_tool_call_max_override(&mut resolved, max_tool_calls);
     apply_tool_result_max_override(&mut resolved, max_tool_result_bytes);
 
@@ -292,9 +268,6 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         all_tools.extend(session_tool::erase(adapters));
     }
 
-    #[cfg(feature = "local-llm")]
-    let registry = Arc::new(llm::LlmRegistry::new());
-
     // Subagents borrow the session's MCP tools as they stand now. A sidecar
     // added later grows the *primary* agent's tool list via `extend_tools`,
     // but not this snapshot, so subagents launched afterwards still see the
@@ -303,13 +276,9 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         resolved: resolved.clone(),
         cfg: cfg.clone(),
         mcp_tools: all_tools.clone(),
-        cache_root: cache_root.to_path_buf(),
-        repo_root: repo_root.to_path_buf(),
         log_dir: log_dir.to_path_buf(),
         // The primary is the root at depth 1, so its subagents live at depth 2.
         depth: 2,
-        #[cfg(feature = "local-llm")]
-        registry: registry.clone(),
     }));
     let mut agent_tools = all_tools;
     // The primary gets the launch tools when its agent opts in *and* the depth
@@ -332,14 +301,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     }
 
     let span = ProgressSpan::start("building agent");
-    let agent = llm::build_agent(
-        &resolved,
-        agent_tools.clone(),
-        cache_root,
-        #[cfg(feature = "local-llm")]
-        &registry,
-    )
-    .await?;
+    let agent = llm::build_agent(&resolved, agent_tools.clone()).await?;
     span.done("agent ready");
 
     print_banner(StartupBanner {
@@ -354,14 +316,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
     });
 
     let primary_name = runtime.containers.primary.name().to_string();
-    let agent = llm::RebuildingAgent::new(
-        agent,
-        agent_tools,
-        resolved,
-        cache_root.to_path_buf(),
-        #[cfg(feature = "local-llm")]
-        registry,
-    );
+    let agent = llm::RebuildingAgent::new(agent, agent_tools, resolved);
 
     let session = ReplSession {
         runtime: RefCell::new(runtime),
@@ -918,8 +873,8 @@ fn print_banner(banner: StartupBanner<'_>) {
 }
 
 /// Split from `print_banner` so the lines it claims can be asserted on. Every
-/// conditional row here -- the agentless lead, the failover list, the device,
-/// the built-in-default marker -- is something `doc/` states, and a banner that
+/// conditional row here -- the agentless lead, the failover list, the
+/// built-in-default marker -- is something `doc/` states, and a banner that
 /// only ever reaches stderr is a documented claim with nothing behind it.
 fn render_banner(banner: StartupBanner<'_>) -> String {
     let StartupBanner {
@@ -935,7 +890,6 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
     let provider_label = match resolved.provider() {
         llm::ResolvedProvider::OpenAi { .. } => "openai",
         llm::ResolvedProvider::Anthropic { .. } => "anthropic",
-        llm::ResolvedProvider::Mistralrs => "mistralrs",
     };
     let mut buf = String::new();
     // Shows the `alias -> concrete` hop when the session resolved through one,
@@ -975,9 +929,6 @@ fn render_banner(banner: StartupBanner<'_>) -> String {
         "[outrig] tool-result max:   {} bytes",
         resolved.tool_result_max_bytes
     );
-    if let Some(weights) = resolved.model_weights() {
-        let _ = writeln!(buf, "[outrig] model device:      {}", weights.device);
-    }
     let _ = writeln!(
         buf,
         "{}",
@@ -1081,9 +1032,19 @@ mod tests {
             candidates: vec![llm::ResolvedCandidate {
                 model_name: "fast".to_string(),
                 model_identifier: "gpt-4o-mini".to_string(),
-                provider_name: "local".to_string(),
-                provider: llm::ResolvedProvider::Mistralrs,
-                model_weights: None,
+                provider_name: "openai".to_string(),
+                // The discard port, so building an agent over this does no I/O.
+                provider: llm::ResolvedProvider::OpenAi {
+                    base_url: "http://127.0.0.1:9".to_string(),
+                    api_key: "test-key".to_string(),
+                    request_timeout_secs: None,
+                    // Retries left at their default. Nothing here drives a
+                    // turn, so pinning the budget off would be claiming a
+                    // promptness this module never measures. Were a turn
+                    // added, the short connect budget bounds a refused
+                    // connection on its own.
+                    retry_budget_secs: None,
+                },
                 max_tokens: None,
             }],
             alias_name: None,
@@ -1155,7 +1116,7 @@ mod tests {
         };
         let banner = render_test_banner(&resolved, "rust-dev", false);
         assert!(
-            banner.starts_with("[outrig] model:             fast (provider: mistralrs / "),
+            banner.starts_with("[outrig] model:             fast (provider: openai / "),
             "an agentless banner leads with the model: {banner}"
         );
         assert!(
@@ -1190,32 +1151,6 @@ mod tests {
         assert!(
             banner.contains("[outrig] agent:             coding (model: opus -> fast "),
             "the banner shows the alias hop: {banner}"
-        );
-    }
-
-    /// `--device` selects hardware for an in-process model, so the row exists
-    /// only when the session resolved to one.
-    #[test]
-    fn the_banner_names_the_device_only_for_an_in_process_model() {
-        let remote = test_resolved_agent();
-        assert!(
-            !render_test_banner(&remote, "rust-dev", false).contains("model device:"),
-            "a remote model has no device to report"
-        );
-
-        let mut local = test_resolved_agent();
-        local.candidates[0].model_weights = Some(llm::MistralrsWeights {
-            model_id: Some("some/model".to_string()),
-            model_path: None,
-            model_file: None,
-            revision: None,
-            context_length: None,
-            device: outrig::config::MistralrsDeviceSpec::Cpu,
-        });
-        assert!(
-            render_test_banner(&local, "rust-dev", false)
-                .contains("[outrig] model device:      cpu\n"),
-            "an in-process model reports its device"
         );
     }
 
@@ -1268,37 +1203,12 @@ mod tests {
                     None,
                 );
                 let resolved = llm::ResolvedAgent {
-                    candidates: vec![llm::ResolvedCandidate {
-                        provider: llm::ResolvedProvider::OpenAi {
-                            base_url: "http://127.0.0.1:9".to_string(),
-                            api_key: "test-key".to_string(),
-                            request_timeout_secs: None,
-                            // Retries left at their default. Nothing here
-                            // drives a turn -- these tests call
-                            // `handle_sidecar_command`, and the discard port
-                            // only has to make `build_agent` do no I/O -- so
-                            // pinning the budget off would be claiming a
-                            // promptness this module never measures. Were a
-                            // turn added, the short connect budget bounds a
-                            // refused connection on its own.
-                            retry_budget_secs: None,
-                        },
-                        ..test_resolved_agent().candidates[0].clone()
-                    }],
                     tool_result_max_bytes: 1024,
                     ..test_resolved_agent()
                 };
-                #[cfg(feature = "local-llm")]
-                let registry = Arc::new(llm::LlmRegistry::new());
-                let rig_agent = llm::build_agent(
-                    &resolved,
-                    Vec::new(),
-                    Path::new("."),
-                    #[cfg(feature = "local-llm")]
-                    &registry,
-                )
-                .await
-                .expect("openai agent builds without I/O");
+                let rig_agent = llm::build_agent(&resolved, Vec::new())
+                    .await
+                    .expect("openai agent builds without I/O");
                 Self {
                     runtime: SessionRuntime::new(
                         None,
@@ -1310,14 +1220,7 @@ mod tests {
                             primary,
                         },
                     ),
-                    agent: llm::RebuildingAgent::new(
-                        rig_agent,
-                        Vec::new(),
-                        resolved,
-                        PathBuf::from("."),
-                        #[cfg(feature = "local-llm")]
-                        registry,
-                    ),
+                    agent: llm::RebuildingAgent::new(rig_agent, Vec::new(), resolved),
                     store: SessionStore::new(std::env::temp_dir()),
                     sid: SessionId::from("test".to_string()),
                     cfg: cfg.clone(),
@@ -1463,20 +1366,16 @@ auto = { command = ["mcp-auto"], sidecar = "autos" }
         );
     }
 
+    /// `--device` selected hardware for the in-process backend and went with
+    /// it, so it is an unknown argument rather than a flag that does nothing.
     #[test]
-    fn device_arg_accepts_mistralrs_device_forms() {
-        let args = RunArgs::try_parse_from(["run", "--device", "cuda:2"]).expect("arg parses");
-        assert_eq!(args.device, Some(MistralrsDeviceSpec::Cuda(2)));
-    }
-
-    #[test]
-    fn device_arg_rejects_unknown_device() {
-        let err = RunArgs::try_parse_from(["run", "--device", "gpu"])
-            .expect_err("unknown device is invalid");
-        let msg = err.to_string();
-        assert!(
-            msg.contains(MistralrsDeviceSpec::EXPECTED),
-            "unexpected clap error: {msg}",
+    fn device_arg_is_rejected() {
+        let err = RunArgs::try_parse_from(["run", "--device", "cpu"])
+            .expect_err("--device no longer exists");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "unexpected clap error: {err}",
         );
     }
 

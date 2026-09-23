@@ -66,11 +66,9 @@ use super::retry::RetryPolicy;
 ///
 /// `Response` is erased to `()`. That is sound because nothing in outrig ever
 /// *reads* `CompletionResponse::raw_response` -- a property of outrig rather
-/// than of rig, which is why it is stated here rather than assumed: the only
-/// production construction is `llm/mistralrs.rs`'s, and it is never consumed,
-/// while the two remote arms' `Response` types are rig's own and outrig never
-/// touches them. The agent loop reads `choice`, `usage`, and `message_id`, all
-/// of which survive.
+/// than of rig, which is why it is stated here rather than assumed: both
+/// arms' `Response` types are rig's own and outrig never touches them. The
+/// agent loop reads `choice`, `usage`, and `message_id`, all of which survive.
 pub(crate) trait Candidate: Send + Sync {
     /// The concrete `[models.<name>]` row, for the per-candidate report and the
     /// move announcement. Never the alias's name.
@@ -192,7 +190,7 @@ struct Abandoned {
 ///
 /// `Clone` because rig's `CompletionModel` requires it and `Agent` clones the
 /// model per request. Every field shares rather than rebuilds: the candidates
-/// behind an `Arc` so cloning cannot re-pay a mistralrs weight load, and the
+/// behind an `Arc`, since a boxed trait object cannot be cloned, and the
 /// policy's own clone deliberately shares the chain deadline.
 #[derive(Clone)]
 pub struct FailoverModel {
@@ -378,10 +376,9 @@ impl CompletionModel for FailoverModel {
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         // No failover, and no delegation either. Unifying `StreamingResponse`
         // across heterogeneous candidates costs an erasure of the whole stream
-        // and buys nothing here: outrig's remote turns are non-streaming, and
-        // the streaming arm is mistralrs-only -- the one style with no endpoint
-        // to fail over from, and which `build_agent` never wraps in a chain.
-        // Matches `RetryingModel::stream`'s reasoning and the precedent in
+        // and buys nothing here: outrig never streams, so this exists only
+        // because the trait requires it. Matches `RetryingModel::stream`'s
+        // reasoning and the precedent in
         // `plan/next/streaming-path-has-no-http-retry.md`.
         Err(CompletionError::ProviderError(
             "streaming is not supported through a model alias chain".to_string(),
@@ -745,8 +742,8 @@ mod tests {
         );
     }
 
-    /// Streaming reaches no candidate at all; the mistralrs arm, which is the
-    /// only streaming one, is never wrapped in a chain.
+    /// Streaming reaches no candidate at all: outrig never streams, and a chain
+    /// refuses rather than fanning a stream out.
     #[tokio::test]
     async fn streaming_is_refused_rather_than_fanned_out() {
         let candidate = Scripted::ok("only");

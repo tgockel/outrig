@@ -16,10 +16,6 @@ where they're spelled out.
 - **[Providers, Models, and Agents](llm-providers.md)** -- the three-layer LLM config:
   providers (where), models (what), agents (which preamble + image). Most users keep
   providers and models in the global config; agents are typically per-repo.
-- **[In-process LLMs](in-process-llm.md)** -- **deprecated**, pending removal: a
-  feature-gated provider that runs the model inside the outrig process itself. Run local
-  models under an OpenAI-compatible server (Ollama, vLLM, `llama.cpp`) and point a
-  `style = "openai"` provider at it instead.
 - **[Subagents](subagents.md)** -- extra agent loops the agent launches itself, sharing the
   session's container and tools. The `outrig__` built-in tools, the explicit result inbox
   they report through, and why a subagent cannot launch subagents.

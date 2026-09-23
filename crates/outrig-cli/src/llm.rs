@@ -1,26 +1,17 @@
 //! Resolve agent -> model -> provider; build Rig agent.
 
 use std::cell::{Cell, Ref, RefCell};
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-#[cfg(feature = "local-llm")]
-use futures_util::StreamExt;
 use rig::agent::{AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
-#[cfg(feature = "local-llm")]
-use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
-#[cfg(feature = "local-llm")]
-use rig::streaming::{StreamedAssistantContent, StreamingChat};
 use thiserror::Error;
-#[cfg(feature = "local-llm")]
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::{CliError, Result};
 use crate::session_tool::{self, SessionTool};
-use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider, MistralrsDeviceSpec};
+use outrig::config::{Config, DEFAULT_TOOL_CALL_MAX, LlmProvider};
 
 /// Hard max on tool calls per turn. The per-turn [`OutrigPromptHook`] trips
 /// this and surfaces a controllable message. rig's own `max_turns` is a
@@ -60,14 +51,6 @@ pub const ANTHROPIC_FALLBACK_MAX_TOKENS: u64 = 32_768;
 pub mod failover;
 pub mod retry;
 
-#[cfg(feature = "local-llm")]
-pub mod mistralrs;
-#[cfg(feature = "local-llm")]
-pub mod registry;
-
-#[cfg(feature = "local-llm")]
-pub use registry::LlmRegistry;
-
 /// Failures that surface while walking `agents -> models -> providers` or
 /// constructing the Rig client. Wrapped into [`crate::error::OutrigError`]
 /// at the top level via `#[from]`.
@@ -97,58 +80,6 @@ pub enum LlmResolveError {
     )]
     UnsupportedProvider { name: String },
 
-    /// The remedy this carries is deliberately no longer "rebuild with
-    /// `--features local-llm`" alone. That feature is deprecated and scheduled
-    /// for removal, so sending a user to adopt it -- and to pay a
-    /// several-hundred-crate build -- for something that will be gone is advice
-    /// with a short shelf life. It still names the flag, because it remains the
-    /// only way to run this config *today* and a message that withheld it would
-    /// be unactionable; it just no longer recommends it without saying what the
-    /// flag's future is.
-    #[error(
-        "mistralrs provider {name:?} requested but this build of outrig \
-         does not include the 'local-llm' feature. That feature is \
-         deprecated and will be removed in a future release: prefer an \
-         OpenAI-compatible local server (Ollama, vLLM, llama.cpp) reached \
-         through a style=\"openai\" provider with a localhost base-url. To \
-         run this config as-is meanwhile, rebuild with --features local-llm"
-    )]
-    MistralrsFeatureDisabled { name: String },
-
-    #[error(
-        "mistralrs model {model:?} has invalid device {device:?}; \
-         expected one of: cpu, cuda, cuda:N, metal"
-    )]
-    MistralrsDeviceInvalid { model: String, device: String },
-
-    #[error(
-        "mistralrs model {model:?} requested device {device:?} but this \
-         build of outrig does not include the '{feature}' feature; rebuild \
-         with --features {feature} to enable"
-    )]
-    MistralrsDeviceUnavailable {
-        model: String,
-        device: String,
-        feature: &'static str,
-    },
-
-    #[error(
-        "model {model:?} uses provider {provider:?}, which is not \
-         style=mistralrs; --device only applies to mistralrs models"
-    )]
-    MistralrsDeviceOverrideUnsupported { model: String, provider: String },
-
-    /// The multi-candidate counterpart of the variant above. Deliberately not
-    /// that one: `--device` selects hardware for one in-process model, and an
-    /// alias spanning several candidates has no single provider to name, so
-    /// that message's "uses provider X" clause would be a lie.
-    #[error(
-        "--device selects hardware for one in-process model, but model \
-         {model:?} is an alias over several candidates ({candidates}); pass \
-         --model naming one of them directly"
-    )]
-    MistralrsDeviceOverrideAlias { model: String, candidates: String },
-
     /// A `[models.<name>]` row that is neither shape. Validation rejects it and
     /// `Model::source` panics on it, so this is reachable only through a
     /// `ModelSourceRef` variant added after this match was written.
@@ -162,32 +93,13 @@ pub enum LlmResolveError {
     #[error("no usable model for alias {alias:?}; tried:\n{tried}")]
     NoUsableAliasCandidate { alias: String, tried: String },
 
-    #[cfg(feature = "local-llm")]
-    #[error(
-        "mistralrs model {model:?}: requested context-length \
-         {requested} exceeds the model's maximum of {max}"
-    )]
-    MistralrsContextTooLong {
-        model: String,
-        requested: u32,
-        max: usize,
-    },
-
-    #[cfg(feature = "local-llm")]
-    #[error("mistralrs model {model:?}: failed to load model: {source}")]
-    MistralrsLoad {
-        model: String,
-        #[source]
-        source: anyhow::Error,
-    },
-
     #[error("failed to build rig client: {0}")]
     RigClientBuild(String),
 }
 
 /// Runtime-shaped provider view -- mirrors the config `LlmProvider` enum, but
-/// with the env-var-backed `ApiKeyRef` already resolved to a plain `String`
-/// for the remote variants. Variants are kept in sync with `LlmProvider`'s.
+/// with the env-var-backed `ApiKeyRef` already resolved to a plain `String`.
+/// Variants are kept in sync with `LlmProvider`'s.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedProvider {
     OpenAi {
@@ -202,23 +114,21 @@ pub enum ResolvedProvider {
         request_timeout_secs: Option<u64>,
         retry_budget_secs: Option<u64>,
     },
-    Mistralrs,
 }
 
-/// Weight-source spec for a mistralrs-backed model. Lifted off
-/// `[models.<name>]` at resolve time. Only one of `model_id` / `model_path`
-/// is meaningful in any given instance; validation enforces that, but
-/// `mistralrs::load` is also defensive.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MistralrsWeights {
-    pub model_id: Option<String>,
-    /// Absolute: the config's text joined to the repo root at resolve time, so
-    /// nothing downstream has to know what a relative one would have meant.
-    pub model_path: Option<PathBuf>,
-    pub model_file: Option<Vec<String>>,
-    pub revision: Option<String>,
-    pub context_length: Option<u32>,
-    pub device: MistralrsDeviceSpec,
+impl ResolvedProvider {
+    /// This provider's retry budget, the top-level value already folded in.
+    /// `None` is an answer -- "the compiled default" -- not an absence.
+    fn retry_budget_secs(&self) -> Option<u64> {
+        match self {
+            Self::OpenAi {
+                retry_budget_secs, ..
+            }
+            | Self::Anthropic {
+                retry_budget_secs, ..
+            } => *retry_budget_secs,
+        }
+    }
 }
 
 /// One concrete `[models.<name>]` row a session may run against, fully
@@ -232,16 +142,12 @@ pub struct MistralrsWeights {
 /// preamble, the temperature, the tool limits -- stays on `ResolvedAgent`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCandidate {
-    /// The *concrete* `[models.<name>]` row, which is also the `LlmRegistry`
-    /// cache key -- so two names for one in-process model share one loaded
-    /// engine. Never the alias's name, per candidate as much as per session.
+    /// The *concrete* `[models.<name>]` row: never the alias's name, per
+    /// candidate as much as per session.
     pub model_name: String,
     pub model_identifier: String,
     pub provider_name: String,
     pub provider: ResolvedProvider,
-    /// `Some` for mistralrs-style models, `None` for remote ones. Carries
-    /// the per-model weight spec that used to live on the provider config.
-    pub model_weights: Option<MistralrsWeights>,
     /// This row's output-token ceiling: the agent's if it set one, this
     /// model's otherwise.
     ///
@@ -254,9 +160,9 @@ pub struct ResolvedCandidate {
 /// Fully-resolved view of one agent: every knob the agent loop needs to
 /// build a Rig client and run a turn.
 ///
-/// For the remote provider variants, the api-key is resolved from the env at
-/// construction time. The struct lives in the agent loop, not in session
-/// metadata, so it should never get serialized.
+/// The api-key is resolved from the env at construction time. The struct
+/// lives in the agent loop, not in session metadata, so it should never get
+/// serialized.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAgent {
     /// `None` for a session that named no agent: `outrig run` with neither
@@ -276,8 +182,8 @@ pub struct ResolvedAgent {
     pub candidates: Vec<ResolvedCandidate>,
     /// The name the caller asked for, when it was an alias standing for the
     /// candidates below; `None` when no alias was involved. Kept beside them
-    /// rather than replacing them so attribution can show the hop without the
-    /// alias reaching the registry.
+    /// rather than replacing them so attribution can show the hop while every
+    /// per-model key stays on the concrete row.
     pub alias_name: Option<String>,
     /// `None` sends no system prompt at all. That is what an agent which omits
     /// `preamble` resolves to, and what every agentless session resolves to.
@@ -341,11 +247,6 @@ impl ResolvedAgent {
         &self.primary().provider
     }
 
-    /// The first candidate's weight spec, for in-process models.
-    pub fn model_weights(&self) -> Option<&MistralrsWeights> {
-        self.primary().model_weights.as_ref()
-    }
-
     /// The first candidate's output-token ceiling.
     pub fn max_tokens(&self) -> Option<u32> {
         self.primary().max_tokens
@@ -370,16 +271,6 @@ impl ResolvedAgent {
     }
 }
 
-/// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
-/// loop needs. Bails with a descriptive error if a reference is dangling or
-/// the api-key env var is unset.
-///
-/// `agent_name` is optional: `None` resolves the *agentless* session that
-/// `outrig run` starts when neither `--agent` nor `default-agent` names one.
-/// That case behaves as an `[agents.<name>]` block with no keys set -- no
-/// preamble, no image hint, every limit from the top-level config -- so the
-/// only thing it still needs from somewhere is a model.
-///
 /// Why a concrete model is not a candidate this build could pick.
 ///
 /// Every arm that has a canonical error elsewhere *is* that error rather than a
@@ -393,7 +284,7 @@ pub(crate) enum Unselectable {
     /// `Config::model_candidates`; kept so the predicate stays total on a
     /// hand-built config.
     NotConcrete,
-    /// Carries the resolver's own error for the three cases it also reports.
+    /// Carries the resolver's own error for the two cases it also reports.
     AsResolved(LlmResolveError),
     /// The rendered `ApiKeyError` -- unset, or not valid UTF-8. Held as text
     /// because `ApiKeyRef::resolve` returns the library crate's `OutrigError`.
@@ -420,16 +311,14 @@ impl std::fmt::Display for Unselectable {
 /// `subagent::usable_model_names`, which advertises a name when any of its
 /// candidates passes. They were separate filters that agreed by coincidence.
 ///
-/// The bar is "not a guaranteed failure" rather than "works". A wrong key, a
-/// down endpoint, and a missing GGUF are all invisible from here and stay so --
-/// no network I/O, no weight load, no client construction, so the synchronous
-/// schema-building path can call it.
+/// The bar is "not a guaranteed failure" rather than "works". A wrong key and a
+/// down endpoint are both invisible from here and stay so -- no network I/O, no
+/// client construction, so the synchronous schema-building path can call it.
 ///
-/// It predicts two later stages: the api-key resolution in
-/// `resolve_agent_with_overrides` and the `local-llm` check in `build_agent`.
-/// A precondition added to either without being added here goes stale silently
-/// -- aliases would pick a candidate that then dies, and the subagent schema
-/// would over-advertise.
+/// It predicts one later stage: the api-key resolution in
+/// `resolve_agent_with_overrides`. A precondition added there without being
+/// added here goes stale silently -- aliases would pick a candidate that then
+/// dies, and the subagent schema would over-advertise.
 ///
 /// One divergence is deliberate: an *empty* api-key variable counts as unset,
 /// where `ApiKeyRef::resolve` accepts it (`std::env::var` returns `Ok("")` for
@@ -461,27 +350,6 @@ pub(crate) fn selectability(
                 Ok(_) => Err(Unselectable::ApiKeyEmpty(api_key.var_name().to_string())),
                 Err(e) => Err(Unselectable::ApiKey(e.to_string())),
             }
-        }
-        // Two compile-time decisions, not runtime ones. `cfg!` keeps one body
-        // compiling in every build, so they cannot drift apart.
-        LlmProvider::Mistralrs { .. } => {
-            if !cfg!(feature = "local-llm") {
-                return Err(Unselectable::AsResolved(
-                    LlmResolveError::MistralrsFeatureDisabled {
-                        name: provider_name.to_string(),
-                    },
-                ));
-            }
-            // The *backend* is a second gate: a row asking for `cuda` in a
-            // build without `--features cuda` is as unreachable as a mistralrs
-            // row without `local-llm`, and resolution rejects it a moment
-            // later. Selecting it anyway would strand a multi-candidate alias
-            // on a model that cannot run while a hosted candidate sat behind
-            // it. Delegated to the resolver's own parser so the device rules
-            // are stated once.
-            parse_mistralrs_device(model_name, model.device.as_deref())
-                .map(|_| ())
-                .map_err(Unselectable::AsResolved)
         }
         // `LlmProvider` is `#[non_exhaustive]`: a style this function has not
         // been taught about is not selectable.
@@ -592,36 +460,15 @@ pub(crate) fn render_candidate_reasons(rows: &[(&str, String)]) -> String {
 /// Each lookup is re-checked here -- the function does not assume
 /// `cfg.validate()` was called -- so errors carry the resolution context
 /// (which agent, which model) regardless.
-///
-/// `repo_root` is the base a relative `[models.<name>].model-path` is joined
-/// to, through [`Model::resolved_model_path`] -- the same call
-/// [`Config::validate`] checks it with. Resolution is where the config's text
-/// becomes a path the loader opens, so it is where the base has to arrive.
 #[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
-pub fn resolve_agent(
-    cfg: &Config,
-    repo_root: &Path,
-    agent_name: Option<&str>,
-) -> Result<ResolvedAgent> {
-    resolve_agent_with_overrides(cfg, repo_root, agent_name, None, None)
-}
-
-#[cfg_attr(not(feature = "internal-test-api"), allow(dead_code))]
-pub fn resolve_agent_with_device_override(
-    cfg: &Config,
-    repo_root: &Path,
-    agent_name: Option<&str>,
-    device_override: Option<MistralrsDeviceSpec>,
-) -> Result<ResolvedAgent> {
-    resolve_agent_with_overrides(cfg, repo_root, agent_name, None, device_override)
+pub fn resolve_agent(cfg: &Config, agent_name: Option<&str>) -> Result<ResolvedAgent> {
+    resolve_agent_with_overrides(cfg, agent_name, None)
 }
 
 pub fn resolve_agent_with_overrides(
     cfg: &Config,
-    repo_root: &Path,
     agent_name: Option<&str>,
     model_override: Option<&str>,
-    device_override: Option<MistralrsDeviceSpec>,
 ) -> Result<ResolvedAgent> {
     // The agentless session resolves against an empty agent rather than a
     // parallel code path, so every fallback below is written once and cannot
@@ -682,26 +529,12 @@ pub fn resolve_agent_with_overrides(
             .model_candidates(model_name)
             .map_err(|e| CliError::Outrig(e.into()))?;
 
-        // `--device` selects hardware for one in-process model, and an alias
-        // may span several styles. Picking a device for whichever candidate
-        // happened to win is a silent surprise on a multi-GPU host. A
-        // single-target alias names exactly one model, so it is free to take
-        // the flag.
-        if candidates.len() > 1 && device_override.is_some() {
-            return Err(LlmResolveError::MistralrsDeviceOverrideAlias {
-                model: model_name.to_string(),
-                candidates: candidates.join(", "),
-            }
-            .into());
-        }
-
         let chain = match candidates.as_slice() {
             // One candidate is renaming, not choosing. Resolve it exactly as if
             // the user had typed it, rather than filtering it: that keeps every
             // existing error with its own text *and its own remedy* -- an unset
-            // api key names the variable, and a mistralrs model in a default
-            // build still reports `MistralrsFeatureDisabled`, the one that says
-            // "rebuild with --features local-llm".
+            // api key names the variable rather than becoming one line of a
+            // list.
             [only] => vec![*only],
             // Every selectable candidate, not just the first: the extras are
             // the chain a mid-turn failure moves along. Selection still drops
@@ -720,13 +553,7 @@ pub fn resolve_agent_with_overrides(
     // aliases existed -- the loop is the only new thing.
     let mut resolved = Vec::with_capacity(concrete.len());
     for name in concrete {
-        resolved.push(resolve_candidate(
-            cfg,
-            repo_root,
-            agent,
-            name,
-            device_override,
-        )?);
+        resolved.push(resolve_candidate(cfg, agent, name)?);
     }
 
     Ok(ResolvedAgent {
@@ -765,10 +592,8 @@ pub fn resolve_agent_with_overrides(
 /// `Unselectable` also exists to preserve.
 fn resolve_candidate(
     cfg: &Config,
-    repo_root: &Path,
     agent: &outrig::config::Agent,
     model_name: &str,
-    device_override: Option<MistralrsDeviceSpec>,
 ) -> Result<ResolvedCandidate> {
     let model = cfg
         .models
@@ -796,89 +621,31 @@ fn resolve_candidate(
                 name: provider_name.to_string(),
             })?;
 
-    // `--device` selects hardware for an in-process model, so it is a
-    // mistralrs-only knob. Checking it once here rather than per remote arm
-    // means a remote style added later cannot forget to reject it.
-    if device_override.is_some() && !matches!(provider, LlmProvider::Mistralrs { .. }) {
-        return Err(LlmResolveError::MistralrsDeviceOverrideUnsupported {
-            model: model_name.to_string(),
-            provider: provider_name.to_string(),
-        }
-        .into());
-    }
-    // Every remote style names its model the same way: the configured
-    // identifier, falling back to the model's own name.
-    let remote_identifier = || {
-        model
-            .identifier
-            .clone()
-            .unwrap_or_else(|| model_name.to_string())
-    };
-
-    let (resolved_provider, model_weights, model_identifier) = match provider {
+    let resolved_provider = match provider {
         LlmProvider::OpenAi {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             ..
-        } => (
-            ResolvedProvider::OpenAi {
-                base_url: base_url.clone(),
-                api_key: api_key.resolve()?,
-                request_timeout_secs: *request_timeout_secs,
-                retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
-            },
-            None,
-            remote_identifier(),
-        ),
+        } => ResolvedProvider::OpenAi {
+            base_url: base_url.clone(),
+            api_key: api_key.resolve()?,
+            request_timeout_secs: *request_timeout_secs,
+            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
+        },
         LlmProvider::Anthropic {
             base_url,
             api_key,
             request_timeout_secs,
             retry_budget_secs,
             ..
-        } => (
-            ResolvedProvider::Anthropic {
-                base_url: base_url.clone(),
-                api_key: api_key.resolve()?,
-                request_timeout_secs: *request_timeout_secs,
-                retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
-            },
-            None,
-            remote_identifier(),
-        ),
-        LlmProvider::Mistralrs { .. } => {
-            let device = match device_override {
-                Some(device) => validate_mistralrs_device(model_name, device)?,
-                None => parse_mistralrs_device(model_name, model.device.as_deref())?,
-            };
-            let weights = MistralrsWeights {
-                model_id: model.model_id.clone(),
-                model_path: model.resolved_model_path(repo_root),
-                model_file: model.model_file.clone(),
-                revision: model.revision.clone(),
-                context_length: model.context_length,
-                device,
-            };
-            // For display: prefer the HF model-id, fall back to the GGUF
-            // basename, then the model name. mistralrs's own `load()`
-            // derives the same kind of identifier internally; this is for
-            // banner / error messaging only.
-            let identifier = weights
-                .model_id
-                .clone()
-                .or_else(|| {
-                    weights
-                        .model_path
-                        .as_deref()
-                        .and_then(|p| p.file_name())
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| model_name.to_string());
-            (ResolvedProvider::Mistralrs, Some(weights), identifier)
-        }
+        } => ResolvedProvider::Anthropic {
+            base_url: base_url.clone(),
+            api_key: api_key.resolve()?,
+            request_timeout_secs: *request_timeout_secs,
+            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
+        },
         // `LlmProvider` is `#[non_exhaustive]` and lives in another crate, so
         // this match can never be exhaustive: a new style that forgets its arm
         // above lands here instead of failing to compile. There is no generic
@@ -893,15 +660,17 @@ fn resolve_candidate(
     };
 
     Ok(ResolvedCandidate {
-        // The *concrete* row, never the alias. `LlmRegistry` is keyed on this
-        // (`llm/registry.rs`), so an alias name reaching it loads the same
-        // multi-gigabyte GGUF twice in one process. The name the caller asked
-        // for rides in `ResolvedAgent::alias_name` instead.
+        // The *concrete* row, never the alias. The name the caller asked for
+        // rides in `ResolvedAgent::alias_name` instead.
         model_name: model_name.to_string(),
-        model_identifier,
+        // Every style names its model the same way: the configured identifier,
+        // falling back to the model's own name.
+        model_identifier: model
+            .identifier
+            .clone()
+            .unwrap_or_else(|| model_name.to_string()),
         provider_name: provider_name.to_string(),
         provider: resolved_provider,
-        model_weights,
         // The agent's ceiling wins; the model's is the fallback. A model that
         // carries one covers every agent pointed at it, which is what an
         // Anthropic identifier rig does not recognize needs -- it has no
@@ -914,58 +683,11 @@ fn resolve_candidate(
     })
 }
 
-fn parse_mistralrs_device(
-    model_name: &str,
-    device: Option<&str>,
-) -> std::result::Result<MistralrsDeviceSpec, LlmResolveError> {
-    let spec = match device {
-        Some(value) => value
-            .parse()
-            .map_err(|_| LlmResolveError::MistralrsDeviceInvalid {
-                model: model_name.to_string(),
-                device: value.to_string(),
-            })?,
-        None => MistralrsDeviceSpec::Cpu,
-    };
-    if !cfg!(feature = "local-llm") {
-        return Ok(spec);
-    }
-
-    validate_mistralrs_device(model_name, spec)
-}
-
-fn validate_mistralrs_device(
-    model_name: &str,
-    spec: MistralrsDeviceSpec,
-) -> std::result::Result<MistralrsDeviceSpec, LlmResolveError> {
-    if !cfg!(feature = "local-llm") {
-        return Ok(spec);
-    }
-
-    match spec {
-        MistralrsDeviceSpec::Cuda(_) if !cfg!(feature = "cuda") => {
-            Err(LlmResolveError::MistralrsDeviceUnavailable {
-                model: model_name.to_string(),
-                device: spec.to_string(),
-                feature: "cuda",
-            })
-        }
-        MistralrsDeviceSpec::Metal if !cfg!(feature = "metal") => {
-            Err(LlmResolveError::MistralrsDeviceUnavailable {
-                model: model_name.to_string(),
-                device: spec.to_string(),
-                feature: "metal",
-            })
-        }
-        _ => Ok(spec),
-    }
-}
-
-/// Runtime-dispatched Rig agent. The OpenAi-backed, Anthropic-backed, and
-/// mistralrs-backed `CompletionModel` impls produce concretely different
-/// `Agent<M>` types (Rig's trait carries associated response and client types,
-/// so a single concrete `RigAgent` can't carry them all). Callers (the agent
-/// loop) match on the variant.
+/// Runtime-dispatched Rig agent. The OpenAi-backed and Anthropic-backed
+/// `CompletionModel` impls produce concretely different `Agent<M>` types
+/// (Rig's trait carries associated response and client types, so a single
+/// concrete `RigAgent` can't carry them all). Callers (the agent loop) match
+/// on the variant.
 pub enum RigAgent {
     OpenAi {
         agent: rig::agent::Agent<
@@ -983,15 +705,10 @@ pub enum RigAgent {
         >,
         tool_call_max: usize,
     },
-    #[cfg(feature = "local-llm")]
-    Mistralrs {
-        agent: rig::agent::Agent<crate::llm::mistralrs::MistralrsModel>,
-        tool_call_max: usize,
-    },
     /// A multi-candidate alias: one agent over a chain that moves between
     /// provider-equivalent rows when one fails mid-turn.
     ///
-    /// A fourth variant rather than a wrapper around the three above, for the
+    /// A third variant rather than a wrapper around the two above, for the
     /// reason the enum exists at all -- the chain is its own concrete
     /// `CompletionModel`, and a chain spanning an OpenAI row and an Anthropic
     /// one is neither of those variants. A single-candidate alias never lands
@@ -1002,15 +719,6 @@ pub enum RigAgent {
     },
 }
 
-/// Build a Rig `Agent` ready to receive a turn. Preamble, sampling params,
-/// and the dynamic-tool list come from `resolved` plus the caller-supplied
-/// MCP-backed adapters. The `cache_root` argument is the directory into
-/// which the mistralrs HF-download path stages model files; it's ignored
-/// for remote providers.
-///
-/// The function is async because the mistralrs arm has to load (and on
-/// first use, download) a multi-gigabyte model. The remote arms do no I/O:
-/// they build an HTTP client and hand it to Rig.
 /// The retry policy every remote provider gets, from the provider's
 /// `retry-budget-secs` or [`DEFAULT_RETRY_BUDGET_SECS`]. Both retry layers take
 /// the same one, so `retry-budget-secs = 0` switches off both.
@@ -1070,26 +778,19 @@ fn remote_http_client(
     Ok(retry::RetryingHttpClient::new(inner, policy))
 }
 
-pub async fn build_agent(
-    resolved: &ResolvedAgent,
-    tools: Vec<SessionTool>,
-    cache_root: &Path,
-    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
-) -> Result<RigAgent> {
-    #[cfg(not(feature = "local-llm"))]
-    let _ = cache_root;
-
+/// Build a Rig `Agent` ready to receive a turn. Preamble, sampling params,
+/// and the dynamic-tool list come from `resolved` plus the caller-supplied
+/// MCP-backed adapters.
+///
+/// Building does no I/O: each candidate gets an HTTP client, handed to Rig.
+pub async fn build_agent(resolved: &ResolvedAgent, tools: Vec<SessionTool>) -> Result<RigAgent> {
     // A chain of one is not a special case: it takes the single-candidate path
     // below and produces exactly the `RigAgent` it always did, wrapper and all.
     // That is what keeps every no-alias session byte-for-byte what it was --
     // the same variant, the same retry stack, the same error text -- rather
     // than merely equivalent to it.
     if resolved.candidates.len() == 1 {
-        return build_single(resolved, resolved.primary(), tools, cache_root,
-            #[cfg(feature = "local-llm")]
-            registry,
-        )
-        .await;
+        return build_single(resolved, resolved.primary(), tools).await;
     }
 
     // One policy for the whole chain, so its `chain_deadline` is the same
@@ -1100,19 +801,15 @@ pub async fn build_agent(
     // The budget itself comes from the first candidate's provider. A chain
     // spanning providers that disagree on `retry-budget-secs` has no single
     // right answer, and the head of a preference order is the defensible one --
-    // it is the endpoint the user said to use.
-    let policy = retry_policy(chain_retry_budget_secs(&resolved.candidates));
+    // it is the endpoint the user said to use. A head that inherits the
+    // compiled default has still answered, so a later candidate's override does
+    // not govern it.
+    let policy = retry_policy(resolved.provider().retry_budget_secs());
 
     let mut candidates: Vec<Box<dyn failover::Candidate>> =
         Vec::with_capacity(resolved.candidates.len());
     for candidate in &resolved.candidates {
-        candidates.push(
-            build_candidate(candidate, &policy, cache_root,
-                #[cfg(feature = "local-llm")]
-                registry,
-            )
-            .await?,
-        );
+        candidates.push(build_candidate(candidate, &policy).await?);
     }
 
     Ok(RigAgent::Failover {
@@ -1128,52 +825,12 @@ pub async fn build_agent(
     })
 }
 
-/// The `retry-budget-secs` governing a whole chain. See [`build_agent`].
-///
-/// The first *remote* candidate's, rather than the first candidate's.
-/// `[providers.<name>] style = "mistralrs"` has no such key at all -- an
-/// in-process model does no HTTP and so has nothing to retry -- so a local head
-/// is skipped. Reading it anyway meant a local-first alias fell through to the
-/// compiled 600 seconds and handed that to a remote fallback, ignoring a
-/// `retry-budget-secs = 0` the user had set and the docs call the one "no
-/// retries" knob.
-///
-/// The two `None`s are *not* the same and the nesting is what keeps them apart.
-/// A local row contributes no `Option` and is skipped; a remote row whose
-/// `retry_budget_secs` is `None` contributes `Some(None)` and **stops** the
-/// search, because that `None` is an answer -- "the compiled default" -- and
-/// not an absence. Flattening one level of it is deliberate: collapsing them
-/// instead would let a later candidate's explicit override govern a preferred
-/// remote candidate that had simply inherited the default.
-///
-/// So the rule the head-of-preference-order argument actually supports holds:
-/// the earliest candidate that *can* answer decides. A chain of only local rows
-/// yields `None`, harmlessly, because nothing in it retries over HTTP.
-fn chain_retry_budget_secs(candidates: &[ResolvedCandidate]) -> Option<u64> {
-    candidates
-        .iter()
-        .find_map(|candidate| match &candidate.provider {
-            ResolvedProvider::OpenAi {
-                retry_budget_secs, ..
-            }
-            | ResolvedProvider::Anthropic {
-                retry_budget_secs, ..
-            } => Some(*retry_budget_secs),
-            ResolvedProvider::Mistralrs => None,
-        })
-        .flatten()
-}
-
 /// Build the one-candidate agent: the pre-failover path, unchanged.
 async fn build_single(
     resolved: &ResolvedAgent,
     candidate: &ResolvedCandidate,
     tools: Vec<SessionTool>,
-    cache_root: &Path,
-    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
 ) -> Result<RigAgent> {
-    #[cfg(not(feature = "local-llm"))]
-    let _ = cache_root;
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
@@ -1217,23 +874,6 @@ async fn build_single(
                 tool_call_max: resolved.tool_call_max,
             })
         }
-        ResolvedProvider::Mistralrs => {
-            #[cfg(not(feature = "local-llm"))]
-            {
-                Err(LlmResolveError::MistralrsFeatureDisabled {
-                    name: candidate.provider_name.clone(),
-                }
-                .into())
-            }
-            #[cfg(feature = "local-llm")]
-            {
-                let model = mistralrs_model(candidate, cache_root, registry).await?;
-                Ok(RigAgent::Mistralrs {
-                    agent: finish_agent((*model).clone(), resolved, candidate.max_tokens, tools),
-                    tool_call_max: resolved.tool_call_max,
-                })
-            }
-        }
     }
 }
 
@@ -1248,11 +888,7 @@ async fn build_single(
 async fn build_candidate(
     candidate: &ResolvedCandidate,
     policy: &retry::RetryPolicy,
-    cache_root: &Path,
-    #[cfg(feature = "local-llm")] registry: &Arc<LlmRegistry>,
 ) -> Result<Box<dyn failover::Candidate>> {
-    #[cfg(not(feature = "local-llm"))]
-    let _ = cache_root;
     match &candidate.provider {
         ResolvedProvider::OpenAi {
             base_url,
@@ -1288,128 +924,6 @@ async fn build_candidate(
                 max_tokens,
             )))
         }
-        ResolvedProvider::Mistralrs => {
-            #[cfg(not(feature = "local-llm"))]
-            {
-                Err(LlmResolveError::MistralrsFeatureDisabled {
-                    name: candidate.provider_name.clone(),
-                }
-                .into())
-            }
-            #[cfg(feature = "local-llm")]
-            {
-                // Deliberately *not* loaded here -- see `LazyLocalCandidate`.
-                Ok(Box::new(LazyLocalCandidate {
-                    registry: Arc::clone(registry),
-                    candidate: candidate.clone(),
-                    cache_root: cache_root.to_path_buf(),
-                }))
-            }
-        }
-    }
-}
-
-/// A chain candidate whose weights load the first time the chain reaches it.
-///
-/// Every other candidate is built eagerly, and design fork §6 is right that
-/// this costs nothing: constructing a remote client does no I/O, so building
-/// three of them is free and a move pays no build cost mid-turn. A mistralrs
-/// row breaks that premise twice over. Its "construction" is a multi-gigabyte
-/// load, and unlike a remote client it can *fail* -- missing weights, a corrupt
-/// file, no room on the device.
-///
-/// Eagerly, both land on the wrong session. A fallback whose weights are
-/// missing takes down a session whose hosted primary is perfectly healthy,
-/// which inverts the reason for naming a fallback at all: the chain exists to
-/// make an outage survivable, and it would instead make a *second* model a new
-/// way to fail to start. So the load happens when the candidate is actually
-/// reached, and a failure there is that candidate's failure, which the chain
-/// reports and moves past like any other.
-///
-/// The first-use wait is announced by the load path itself, which is the
-/// mitigation that decision 7 of
-/// `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md`
-/// already built for exactly this surprise.
-#[cfg(feature = "local-llm")]
-struct LazyLocalCandidate {
-    registry: Arc<LlmRegistry>,
-    candidate: ResolvedCandidate,
-    cache_root: PathBuf,
-}
-
-#[cfg(feature = "local-llm")]
-impl failover::Candidate for LazyLocalCandidate {
-    fn model_name(&self) -> &str {
-        &self.candidate.model_name
-    }
-
-    fn model_identifier(&self) -> &str {
-        &self.candidate.model_identifier
-    }
-
-    fn max_tokens(&self) -> Option<u64> {
-        self.candidate.max_tokens.map(u64::from)
-    }
-
-    /// Answered without loading, which is what makes the laziness possible at
-    /// all: `FailoverModel::new` ANDs this across the chain at build time.
-    ///
-    /// Sound because it is a property of the *type*, not of the loaded weights:
-    /// `MistralrsModel` does not override rig's `false` default. That is an
-    /// assumption rather than something the compiler holds, so it is stated
-    /// here -- if the in-process model ever does compose native structured
-    /// output with tools, this hardcoded answer becomes wrong for every chain
-    /// naming a local row, and the conservative direction is the safe one to be
-    /// wrong in (a chain that says `false` loses guaranteed structured output;
-    /// one that wrongly says `true` promises what a candidate cannot honor).
-    fn composes_native_output_with_tools(&self) -> bool {
-        false
-    }
-
-    fn completion(
-        &self,
-        request: rig::completion::CompletionRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = std::result::Result<
-                        rig::completion::CompletionResponse<()>,
-                        rig::completion::CompletionError,
-                    >,
-                > + Send
-                + '_,
-        >,
-    > {
-        Box::pin(async move {
-            // The wait this laziness moved here. Deferring the load is only
-            // defensible if the surprise moves with it: reaching this candidate
-            // can mean minutes of downloading or mapping weights, in the middle
-            // of a turn, and the move line above says only that the chain moved
-            // on -- which reads as "and the next one is answering now". The
-            // wording is the subagent path's, because it is the same wait.
-            if !self.registry.is_loaded(&self.candidate.model_name) {
-                eprintln!(
-                    "[outrig] loading in-process model {} (first use; this may take \
-                     several minutes)",
-                    self.candidate.model_name,
-                );
-            }
-            let model = mistralrs_model(&self.candidate, &self.cache_root, &self.registry)
-                .await
-                // A load failure is this candidate's failure, not the session's.
-                // Terminal rather than transient: a missing GGUF is still missing
-                // on a resend, so a chain of only these ends the process instead
-                // of advising a retry that cannot help.
-                .map_err(|e| rig::completion::CompletionError::ProviderError(e.to_string()))?;
-            let response =
-                rig::completion::CompletionModel::completion(&*model, request).await?;
-            Ok(rig::completion::CompletionResponse {
-                choice: response.choice,
-                usage: response.usage,
-                raw_response: (),
-                message_id: response.message_id,
-            })
-        })
     }
 }
 
@@ -1510,101 +1024,6 @@ fn anthropic_model(
     (model, max_tokens)
 }
 
-/// One candidate's in-process model, from the registry that keys them by
-/// concrete name -- so two candidates naming one model share a loaded engine.
-#[cfg(feature = "local-llm")]
-async fn mistralrs_model(
-    candidate: &ResolvedCandidate,
-    cache_root: &Path,
-    registry: &LlmRegistry,
-) -> Result<std::sync::Arc<crate::llm::mistralrs::MistralrsModel>> {
-    warn_local_llm_deprecated(candidate);
-    let weights =
-        candidate
-            .model_weights
-            .as_ref()
-            .ok_or_else(|| LlmResolveError::MistralrsLoad {
-                model: candidate.model_name.clone(),
-                source: anyhow::anyhow!("internal: resolved mistralrs agent has no model_weights"),
-            })?;
-    let model_name = candidate.model_name.as_str();
-    let model_id = weights.model_id.as_deref();
-    let model_path = weights.model_path.as_deref();
-    let model_file = weights.model_file.as_deref();
-    let revision = weights.revision.as_deref();
-    let context_length = weights.context_length;
-    let device = weights.device;
-    registry
-        .get_or_init(model_name, || async move {
-            crate::llm::mistralrs::load(
-                model_name,
-                model_id,
-                model_path,
-                model_file,
-                revision,
-                context_length,
-                device,
-                cache_root,
-            )
-            .await
-        })
-        .await
-}
-
-/// The deprecation notice shown for an in-process model, as text.
-///
-/// Split from the printing so the wording is assertable without capturing
-/// stderr. The sibling `warn_fallback_ceiling` has no test for exactly that
-/// reason, and this message is load-bearing in a way that one is not: it is the
-/// only warning a user with a *working* local model ever sees, and it names the
-/// migration path the docs and the resolve error also name, so drift between
-/// the three is the failure worth a test.
-#[cfg(feature = "local-llm")]
-pub(crate) fn local_llm_deprecation_notice(model_name: &str) -> String {
-    format!(
-        "[outrig] warning: model {model_name} runs on the in-process 'local-llm' \
-         backend, which is deprecated and will be removed in a future release. \
-         Run the model under an OpenAI-compatible local server (Ollama, vLLM, \
-         llama.cpp) and point a style=\"openai\" provider at its localhost \
-         base-url instead. See doc/concepts/in-process-llm.md."
-    )
-}
-
-/// Say, once per model, that the in-process backend serving it is going away.
-///
-/// The deprecation's whole user-visible substance in a build that *has* the
-/// feature. The error path covers the build that lacks it, but a user who
-/// compiled `--features local-llm` and has a working local model is precisely
-/// the one who would otherwise hear nothing until the removal broke them --
-/// they are not reading release notes for a flag that currently works.
-///
-/// Modeled on [`warn_fallback_ceiling`] deliberately, including the per-model
-/// keying rather than a process-wide `Once`. `build_agent` runs again on
-/// `/sidecar add` and once per subagent launch, so an unkeyed line would repeat
-/// through a fan-out and bury the traces around it; keying it per concrete row
-/// means a session naming two local models hears about both, which is the case a
-/// `Once` would get wrong.
-///
-/// Placed at the *load* path rather than at resolution so it fires exactly when
-/// an in-process model is really used. A chain that lists a local fallback it
-/// never reaches should not warn about a backend it did not run -- and
-/// `LazyLocalCandidate` only loads when the chain actually moves to it.
-#[cfg(feature = "local-llm")]
-fn warn_local_llm_deprecated(candidate: &ResolvedCandidate) {
-    static WARNED: std::sync::Mutex<std::collections::BTreeSet<String>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-    // The guard drops with the condition's temporary, so the warning below is
-    // printed unlocked.
-    if !WARNED
-        .lock()
-        .expect("local-llm deprecation warnings")
-        .insert(candidate.model_name.clone())
-    {
-        return;
-    }
-    eprintln!("{}", local_llm_deprecation_notice(&candidate.model_name));
-}
-
 /// Say, once per model, that outrig picked an output-token ceiling nobody asked
 /// for.
 ///
@@ -1651,58 +1070,12 @@ impl RigAgent {
     /// returns the partial chat history it had accumulated; outrig splices in
     /// that new suffix so the user can send a follow-up prompt to continue.
     pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<TurnEnd> {
-        match self {
-            RigAgent::OpenAi {
-                agent,
-                tool_call_max,
-            } => run_turn_inner(
-                agent,
-                prompt,
-                history,
-                OutrigPromptHook::new(*tool_call_max),
-            )
-            .await,
-            RigAgent::Anthropic {
-                agent,
-                tool_call_max,
-            } => run_turn_inner(
-                agent,
-                prompt,
-                history,
-                OutrigPromptHook::new(*tool_call_max),
-            )
-            .await,
-            RigAgent::Failover {
-                agent,
-                tool_call_max,
-            } => run_turn_inner(
-                agent,
-                prompt,
-                history,
-                OutrigPromptHook::new(*tool_call_max),
-            )
-            .await,
-            #[cfg(feature = "local-llm")]
-            RigAgent::Mistralrs {
-                agent,
-                tool_call_max,
-            } => {
-                let mut stdout = tokio::io::stdout();
-                run_turn_streaming_to(
-                    agent,
-                    prompt,
-                    history,
-                    OutrigPromptHook::new(*tool_call_max),
-                    &mut stdout,
-                )
-                .await
-            }
-        }
+        let hook = OutrigPromptHook::new(self.tool_call_max());
+        self.run_turn_with(prompt, history, hook).await
     }
 
-    /// Run one round for a subagent: nothing reaches stdout, traces carry
-    /// `label`, and each model call picks up whatever the parent has queued
-    /// through `injections`.
+    /// Run one round for a subagent: traces carry `label`, and each model call
+    /// picks up whatever the parent has queued through `injections`.
     ///
     /// Subagent outcomes come from `outrig__set_result`, not from this return
     /// value -- the text is for the transcript log, and
@@ -1715,37 +1088,29 @@ impl RigAgent {
         label: &str,
         injections: InjectionSource,
     ) -> Result<TurnEnd> {
+        let hook = OutrigPromptHook::for_subagent(self.tool_call_max(), label, injections);
+        self.run_turn_with(prompt, history, hook).await
+    }
+
+    fn tool_call_max(&self) -> usize {
         match self {
-            RigAgent::OpenAi {
-                agent,
-                tool_call_max,
-            } => {
-                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
-                run_turn_inner(agent, prompt, history, hook).await
-            }
-            RigAgent::Anthropic {
-                agent,
-                tool_call_max,
-            } => {
-                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
-                run_turn_inner(agent, prompt, history, hook).await
-            }
-            RigAgent::Failover {
-                agent,
-                tool_call_max,
-            } => {
-                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
-                run_turn_inner(agent, prompt, history, hook).await
-            }
-            #[cfg(feature = "local-llm")]
-            RigAgent::Mistralrs {
-                agent,
-                tool_call_max,
-            } => {
-                let hook = OutrigPromptHook::for_subagent(*tool_call_max, label, injections);
-                let mut sink = Vec::new();
-                run_turn_streaming_inner(agent, prompt, history, hook, &mut sink).await
-            }
+            RigAgent::OpenAi { tool_call_max, .. }
+            | RigAgent::Anthropic { tool_call_max, .. }
+            | RigAgent::Failover { tool_call_max, .. } => *tool_call_max,
+        }
+    }
+
+    /// The one dispatch both turn kinds share; they differ only in `hook`.
+    async fn run_turn_with(
+        &self,
+        prompt: &str,
+        history: &mut Vec<Message>,
+        hook: OutrigPromptHook,
+    ) -> Result<TurnEnd> {
+        match self {
+            RigAgent::OpenAi { agent, .. } => run_turn_inner(agent, prompt, history, hook).await,
+            RigAgent::Anthropic { agent, .. } => run_turn_inner(agent, prompt, history, hook).await,
+            RigAgent::Failover { agent, .. } => run_turn_inner(agent, prompt, history, hook).await,
         }
     }
 }
@@ -1754,9 +1119,8 @@ impl RigAgent {
 /// the tool list mid-session. The rig agent's toolset is frozen at build
 /// time, so [`RebuildingAgent::extend_tools`] only marks the agent stale;
 /// the next [`RebuildingAgent::run_turn`] rebuilds over the full list
-/// (a remote arm builds a fresh HTTP client, so the first turn after a
-/// rebuild re-handshakes rather than reusing the pooled connection; mistralrs
-/// model loads are registry-cached).
+/// (a fresh HTTP client, so the first turn after a rebuild re-handshakes rather
+/// than reusing the pooled connection).
 ///
 /// Interior mutability (`RefCell`/`Cell`) because the wrapper is shared by
 /// `&` between the REPL's prompt path and its `/sidecar` command; the
@@ -1764,9 +1128,6 @@ impl RigAgent {
 /// borrows never overlap and none is held across an await.
 pub struct RebuildingAgent {
     resolved: ResolvedAgent,
-    cache_root: PathBuf,
-    #[cfg(feature = "local-llm")]
-    registry: Arc<LlmRegistry>,
     tools: RefCell<Vec<SessionTool>>,
     dirty: Cell<bool>,
     // The agent rides in an inner `Rc` so a turn clones it out and never
@@ -1777,19 +1138,10 @@ pub struct RebuildingAgent {
 
 impl RebuildingAgent {
     /// Wrap an already-built agent. The first build stays with the caller
-    /// so its progress reporting (and any model download) happens there.
-    pub fn new(
-        agent: RigAgent,
-        tools: Vec<SessionTool>,
-        resolved: ResolvedAgent,
-        cache_root: PathBuf,
-        #[cfg(feature = "local-llm")] registry: Arc<LlmRegistry>,
-    ) -> Self {
+    /// so any error it raises surfaces there.
+    pub fn new(agent: RigAgent, tools: Vec<SessionTool>, resolved: ResolvedAgent) -> Self {
         Self {
             resolved,
-            cache_root,
-            #[cfg(feature = "local-llm")]
-            registry,
             tools: RefCell::new(tools),
             dirty: Cell::new(false),
             agent: RefCell::new(Rc::new(agent)),
@@ -1819,14 +1171,7 @@ impl RebuildingAgent {
     pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<TurnEnd> {
         if self.dirty.get() {
             let tools_snapshot = self.tools.borrow().clone();
-            let rebuilt = build_agent(
-                &self.resolved,
-                tools_snapshot,
-                &self.cache_root,
-                #[cfg(feature = "local-llm")]
-                &self.registry,
-            )
-            .await?;
+            let rebuilt = build_agent(&self.resolved, tools_snapshot).await?;
             *self.agent.borrow_mut() = Rc::new(rebuilt);
             self.dirty.set(false);
         }
@@ -1862,14 +1207,6 @@ pub struct TurnEnd {
     /// non-empty, since a whitespace reply shows the user nothing and is
     /// salvaged from like any other ([`is_blank`]).
     pub recovered: Option<String>,
-    /// The reply already reached the user while it decoded, so `reply` was
-    /// blanked to stop the REPL printing it twice.
-    ///
-    /// Only the primary streaming path sets this, and only when it actually
-    /// wrote something. That condition is the point: without it a blanked
-    /// reply is indistinguishable from a turn that produced nothing, and
-    /// [`TurnEnd::is_silent`] would call every streamed turn silent.
-    pub already_displayed: bool,
 }
 
 impl TurnEnd {
@@ -1885,7 +1222,7 @@ impl TurnEnd {
     /// One predicate, so a turn cannot be textless to the model layer and
     /// spoken-for to this one.
     pub fn is_silent(&self) -> bool {
-        is_blank(&self.reply) && self.stopped.is_none() && !self.already_displayed
+        is_blank(&self.reply) && self.stopped.is_none()
     }
 
     /// The one-line cause, for a subagent's parent.
@@ -1920,12 +1257,12 @@ impl TurnEnd {
 
 /// Whether a reply is anything the user could actually have seen.
 ///
-/// Whitespace is not: it renders as a blank line and tells them nothing. Four
-/// sites need this question answered the same way -- whether to salvage the
-/// turn's non-text content, whether a streamed reply was really displayed, and
-/// whether the turn was silent -- and they disagreed once already, which put a
-/// turn in the state of being reported as having produced nothing while its
-/// reasoning sat unread. Named, so they cannot drift apart again.
+/// Whitespace is not: it renders as a blank line and tells them nothing.
+/// Several sites need this question answered the same way -- whether to salvage
+/// the turn's non-text content, and whether the turn was silent -- and they
+/// disagreed once already, which put a turn in the state of being reported as
+/// having produced nothing while its reasoning sat unread. Named, so they
+/// cannot drift apart again.
 fn is_blank(reply: &str) -> bool {
     reply.trim().is_empty()
 }
@@ -2030,139 +1367,10 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
                 // a path that ends the run cleanly instead.
                 stopped: observer.stop_reason().map(TurnStop::Interrupted),
                 recovered,
-                already_displayed: false,
             })
         }
         Err(other) => handle_prompt_error(other, history, &observer),
     }
-}
-
-/// The primary agent's streaming path. Blanks the reply on purpose: it already
-/// reached `sink` chunk by chunk while decoding, so handing it back would make
-/// the REPL print it a second time. Discarding here -- and not inside
-/// [`run_turn_streaming_inner`] -- is what lets subagents reuse the same loop
-/// and actually receive the text.
-///
-/// [`TurnEnd::already_displayed`] records that the blanking happened, and only
-/// when there was something to blank: a stream that decoded no text at all
-/// leaves it `false` so the turn still registers as silent.
-///
-/// `sink` is a parameter rather than a captured `tokio::io::stdout()` purely so
-/// that suppression is testable: it is a one-line behavior the REPL's
-/// print-if-non-empty depends on, and a refactor could otherwise drop it
-/// silently.
-#[cfg(feature = "local-llm")]
-async fn run_turn_streaming_to<M, W>(
-    agent: &rig::agent::Agent<M>,
-    prompt: &str,
-    history: &mut Vec<Message>,
-    hook: OutrigPromptHook,
-    sink: &mut W,
-) -> Result<TurnEnd>
-where
-    M: CompletionModel + 'static,
-    W: AsyncWrite + Unpin,
-{
-    let mut end = run_turn_streaming_inner(agent, prompt, history, hook, sink).await?;
-    // `is_blank`, not `is_empty`: the mistralrs adapter forwards whitespace-only
-    // deltas, and nothing wraps that arm to notice a visually blank turn, so
-    // exact-emptiness here would mark one as displayed and silence the report.
-    end.already_displayed = !is_blank(&end.reply);
-    end.reply = String::new();
-    Ok(end)
-}
-
-#[cfg(feature = "local-llm")]
-fn handle_streaming_error(
-    err: StreamingError,
-    history: &mut Vec<Message>,
-    hook: &OutrigPromptHook,
-) -> Result<TurnEnd> {
-    let prompt_error = match err {
-        StreamingError::Completion(err) => rig::completion::PromptError::CompletionError(err),
-        StreamingError::Prompt(err) => *err,
-        StreamingError::Tool(err) => rig::completion::PromptError::ToolError(err),
-    };
-    handle_prompt_error(prompt_error, history, hook)
-}
-
-#[cfg(feature = "local-llm")]
-/// Drives the streaming loop, writing decoded text to `stdout` and returning
-/// it. Callers choose the sink: the primary agent passes real stdout, a
-/// subagent passes a buffer, since only the primary's reply may reach stdout.
-async fn run_turn_streaming_inner<M, W>(
-    agent: &rig::agent::Agent<M>,
-    prompt: &str,
-    history: &mut Vec<Message>,
-    hook: OutrigPromptHook,
-    stdout: &mut W,
-) -> Result<TurnEnd>
-where
-    M: CompletionModel + 'static,
-    W: AsyncWrite + Unpin,
-{
-    let max_turns = hook.max + 2;
-    // See `run_turn_inner`: the clone shares the hook's atomics so the stop
-    // reason survives the move into rig.
-    let observer = hook.clone();
-    let mut stream = agent
-        .stream_chat(prompt.to_string(), history.clone())
-        .max_turns(max_turns)
-        .add_hook(hook)
-        .await;
-
-    let mut streamed_reply = String::new();
-    let mut final_history: Option<Vec<Message>> = None;
-    let mut final_content: Option<rig::OneOrMany<rig::message::AssistantContent>> = None;
-
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                stdout.write_all(text.text.as_bytes()).await?;
-                stdout.flush().await?;
-                streamed_reply.push_str(&text.text);
-            }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
-                ..
-            })) => {
-                stdout.flush().await?;
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                final_history = response.messages().map(|messages| messages.to_vec());
-                // Same salvage as `run_turn_inner`, for the same reason: the
-                // decoded text is the only thing this loop accumulates, so a
-                // turn whose content was all reasoning leaves `streamed_reply`
-                // empty with nothing printed.
-                final_content = Some(response.content().clone());
-            }
-            Ok(_) => {}
-            Err(err) => {
-                return handle_streaming_error(err, history, &observer);
-            }
-        }
-    }
-
-    if let Some(messages) = final_history {
-        extend_history_with_new_suffix(history, messages);
-    }
-
-    if !streamed_reply.is_empty() && !streamed_reply.ends_with('\n') {
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
-    }
-
-    // Not just `finished`: a stream that ends without yielding an error can
-    // still have been cut short by the hook, and this is the only place that
-    // would notice.
-    let recovered = is_blank(&streamed_reply)
-        .then(|| final_content.as_ref().and_then(recover_non_text))
-        .flatten();
-    Ok(TurnEnd {
-        reply: streamed_reply,
-        stopped: observer.stop_reason().map(TurnStop::Interrupted),
-        recovered,
-        already_displayed: false,
-    })
 }
 
 /// Turn a loop-ending error into a [`TurnEnd`], or pass it on.
@@ -2212,7 +1420,6 @@ fn endpoint_failed(reason: String, tried: Option<&str>) -> Result<TurnEnd> {
         // Nothing to salvage: the endpoint never produced a turn to salvage
         // from. The `stopped` reason above is what gets reported.
         recovered: None,
-        already_displayed: false,
     })
 }
 
@@ -2310,7 +1517,6 @@ fn handle_prompt_error(
         // The reply above already says why the turn ended, and `stopped`
         // carries the reason for callers that need it.
         recovered: None,
-        already_displayed: false,
     })
 }
 
@@ -2476,8 +1682,8 @@ impl OutrigPromptHook {
 
 impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
     // The hook only acts on `CompletionCall` and `ToolCall`; narrowing
-    // `observes` keeps it off the per-token `TextDelta`/`ToolCallDelta` stream
-    // in the streaming path, where `on_event` below would just no-op anyway.
+    // `observes` keeps it off every other event, where `on_event` below would
+    // just no-op anyway.
     fn observes(&self, kind: StepEventKind) -> bool {
         match kind {
             StepEventKind::CompletionCall | StepEventKind::ToolCall => true,
@@ -2598,10 +1804,6 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "local-llm")]
-    use rig::completion::{CompletionError, CompletionRequest, CompletionResponse, Usage};
-    #[cfg(feature = "local-llm")]
-    use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
 
     /// A candidate on `provider`, with only the fields these tests read.
     fn candidate(name: &str, provider: ResolvedProvider) -> ResolvedCandidate {
@@ -2610,7 +1812,6 @@ mod tests {
             model_identifier: name.to_string(),
             provider_name: name.to_string(),
             provider,
-            model_weights: None,
             max_tokens: None,
         }
     }
@@ -2622,71 +1823,6 @@ mod tests {
             request_timeout_secs: None,
             retry_budget_secs,
         }
-    }
-
-    /// A chain takes its budget from the first candidate that *has* one.
-    ///
-    /// The head of a preference order decides, but an in-process row has no
-    /// `retry-budget-secs` to give -- it does no HTTP -- and that is not the
-    /// same as asking for the default. Reading only the head sent a
-    /// local-first alias to the compiled 600 seconds and handed that to a
-    /// remote fallback, quietly overriding the `0` the user set and the docs
-    /// call the one "no retries" knob.
-    #[test]
-    fn a_chain_budget_skips_candidates_that_have_none() {
-        // The case that regressed: local head, remote fallback carrying the
-        // effective top-level `retry-budget-secs = 0`.
-        assert_eq!(
-            chain_retry_budget_secs(&[
-                candidate("local", ResolvedProvider::Mistralrs),
-                candidate("hosted", remote(Some(0))),
-            ]),
-            Some(0),
-            "a local head must not discard the fallback's configured budget",
-        );
-
-        // The head still wins whenever it has an opinion of its own.
-        assert_eq!(
-            chain_retry_budget_secs(&[
-                candidate("hosted-a", remote(Some(30))),
-                candidate("hosted-b", remote(Some(600))),
-            ]),
-            Some(30),
-        );
-
-        // ...and "inherit the compiled default" *is* an opinion. A remote head
-        // with no configured budget must not be skipped in favor of a later
-        // candidate's override: that would let a fallback's `0` disable retries
-        // for the vendor the user actually preferred.
-        assert_eq!(
-            chain_retry_budget_secs(&[
-                candidate("hosted-a", remote(None)),
-                candidate("hosted-b", remote(Some(0))),
-            ]),
-            None,
-            "the head answered `use the default`; a later override does not overrule it",
-        );
-
-        // The local skip and that rule composing: skip the row that cannot
-        // answer, then stop at the first that can, default or not.
-        assert_eq!(
-            chain_retry_budget_secs(&[
-                candidate("local", ResolvedProvider::Mistralrs),
-                candidate("hosted-a", remote(None)),
-                candidate("hosted-b", remote(Some(0))),
-            ]),
-            None,
-        );
-
-        // An all-local chain has nothing to say, which is harmless: nothing in
-        // it retries over HTTP.
-        assert_eq!(
-            chain_retry_budget_secs(&[
-                candidate("local-a", ResolvedProvider::Mistralrs),
-                candidate("local-b", ResolvedProvider::Mistralrs),
-            ]),
-            None,
-        );
     }
 
     /// Feed one failing call repeatedly and collect the verdict each time.
@@ -2911,176 +2047,6 @@ mod tests {
         assert_eq!(
             history,
             vec![Message::user("first"), Message::assistant("partial")],
-        );
-    }
-
-    #[cfg(feature = "local-llm")]
-    #[derive(Clone)]
-    struct ScriptedStreamingModel {
-        chunks: Arc<Vec<RawStreamingChoice<()>>>,
-    }
-
-    #[cfg(feature = "local-llm")]
-    impl ScriptedStreamingModel {
-        fn new(chunks: Vec<RawStreamingChoice<()>>) -> Self {
-            Self {
-                chunks: Arc::new(chunks),
-            }
-        }
-    }
-
-    #[cfg(feature = "local-llm")]
-    impl CompletionModel for ScriptedStreamingModel {
-        type Response = ();
-        type StreamingResponse = ();
-        type Client = ();
-
-        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
-            Self::new(Vec::new())
-        }
-
-        async fn completion(
-            &self,
-            _request: CompletionRequest,
-        ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
-            Ok(CompletionResponse {
-                choice: rig::OneOrMany::one(rig::completion::AssistantContent::text("")),
-                usage: Usage::new(),
-                raw_response: (),
-                message_id: None,
-            })
-        }
-
-        async fn stream(
-            &self,
-            _request: CompletionRequest,
-        ) -> std::result::Result<
-            StreamingCompletionResponse<Self::StreamingResponse>,
-            CompletionError,
-        > {
-            let chunks = self.chunks.clone();
-            let stream = async_stream::try_stream! {
-                for chunk in chunks.iter().cloned() {
-                    yield chunk;
-                }
-            };
-            Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
-        }
-    }
-
-    #[cfg(feature = "local-llm")]
-    #[tokio::test]
-    async fn streaming_turn_writes_chunks_once_and_retains_history() {
-        let model = ScriptedStreamingModel::new(vec![
-            RawStreamingChoice::Message("hello ".to_string()),
-            RawStreamingChoice::Message("world".to_string()),
-        ]);
-        let agent = rig::agent::AgentBuilder::new(model).build();
-        let mut history = Vec::new();
-        let mut stdout = Vec::new();
-
-        let end = run_turn_streaming_inner(
-            &agent,
-            "hi",
-            &mut history,
-            OutrigPromptHook::new(50),
-            &mut stdout,
-        )
-        .await
-        .expect("streaming turn succeeds");
-
-        // The inner loop hands back what it decoded so a subagent can capture
-        // it; suppressing the REPL's reprint is `run_turn_streaming_to`'s job,
-        // pinned by `primary_streaming_path_suppresses_the_reprint` below.
-        assert_eq!(end.reply, "hello world");
-        assert_eq!(
-            end.stopped, None,
-            "a turn the model finished must not look cut short"
-        );
-        assert_eq!(
-            String::from_utf8(stdout).expect("stdout utf-8"),
-            "hello world\n"
-        );
-        assert_eq!(
-            history,
-            vec![Message::user("hi"), Message::assistant("hello world")],
-        );
-    }
-
-    /// The REPL prints `on_prompt`'s return value when it is non-empty
-    /// (`repl.rs`), so the primary streaming path must return empty or the
-    /// reply appears twice: once streamed while decoding, once reprinted.
-    ///
-    /// Blanking the reply is now only half the contract: a blanked reply and a
-    /// reply that never existed are the same two fields, so this also pins the
-    /// flag that tells them apart. Without it every streamed turn would report
-    /// itself as silent.
-    #[cfg(feature = "local-llm")]
-    #[tokio::test]
-    async fn primary_streaming_path_suppresses_the_reprint() {
-        let model = ScriptedStreamingModel::new(vec![
-            RawStreamingChoice::Message("hello ".to_string()),
-            RawStreamingChoice::Message("world".to_string()),
-        ]);
-        let agent = rig::agent::AgentBuilder::new(model).build();
-        let mut history = Vec::new();
-        let mut sink = Vec::new();
-
-        let end = run_turn_streaming_to(
-            &agent,
-            "hi",
-            &mut history,
-            OutrigPromptHook::new(50),
-            &mut sink,
-        )
-        .await
-        .expect("streaming turn succeeds");
-
-        assert!(
-            end.reply.is_empty(),
-            "a non-empty return would double-print the reply: {:?}",
-            end.reply,
-        );
-        assert!(
-            end.already_displayed,
-            "the reply did reach the user, and only this flag records that the \
-             blank above is a suppression rather than an empty turn",
-        );
-        assert!(
-            !end.is_silent(),
-            "a turn the user watched decode is not a silent turn",
-        );
-        assert_eq!(
-            String::from_utf8(sink).expect("sink utf-8"),
-            "hello world\n",
-            "the reply should still have been streamed exactly once"
-        );
-    }
-
-    /// The deprecation notice has to name the model, say the feature is going
-    /// away, and point at the replacement. All three are the message's whole
-    /// job: a warning that said only "deprecated" would leave the user with
-    /// nowhere to go, which is the failure mode that makes deprecation warnings
-    /// noise instead of guidance.
-    ///
-    /// Pinned alongside `mistralrs_provider_feature_off_explains_clearly` in
-    /// `tests/llm_resolve.rs`, which covers the same migration advice on the
-    /// build that *lacks* the feature. The two together are why a future edit
-    /// cannot move the recommendation in one place only.
-    #[cfg(feature = "local-llm")]
-    #[test]
-    fn the_deprecation_notice_names_the_model_and_the_replacement() {
-        let notice = local_llm_deprecation_notice("phi3-fast");
-        assert!(notice.contains("phi3-fast"), "got: {notice}");
-        assert!(notice.contains("deprecated"), "got: {notice}");
-        assert!(
-            notice.contains("removed in a future release"),
-            "a deprecation has to say it is going away, got: {notice}"
-        );
-        // The replacement, not just the complaint.
-        assert!(
-            notice.contains("Ollama") && notice.contains("style=\"openai\""),
-            "the notice must name where to go instead, got: {notice}"
         );
     }
 

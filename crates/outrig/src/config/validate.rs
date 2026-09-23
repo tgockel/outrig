@@ -19,8 +19,8 @@ use regex::Regex;
 use thiserror::Error;
 
 use super::{
-    Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, MistralrsDeviceSpec, Model,
-    ModelSourceRef, NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
+    Config, ImageConfig, ImageSourceRef, LlmProvider, McpServerSpec, Model, ModelSourceRef,
+    NetworkMode, REQUEST_TIMEOUT_SECS_CEILING, RETRY_BUDGET_SECS_CEILING,
     SUBAGENT_DEPTH_MAX_CEILING, SUBAGENT_WIDTH_MAX_CEILING, TOOL_CALL_MAX_LIMIT,
     TOOL_RESULT_MAX_CEILING_BYTES, TOOL_RESULT_MAX_FLOOR_BYTES, normalize_capability_name,
 };
@@ -175,9 +175,6 @@ pub enum ConfigValidationError {
 
     #[error("session-root {path:?} must be an absolute path")]
     SessionRootNotAbsolute { path: PathBuf },
-
-    #[error("model-cache-root {path:?} must be an absolute path")]
-    ModelCacheRootNotAbsolute { path: PathBuf },
 
     // The five below restate `MountRuleViolation` in workspace terms, so their
     // `declared_in` means exactly what the variant it is mapped from means.
@@ -340,61 +337,11 @@ pub enum ConfigValidationError {
     RepoNetworkPolicy { key: &'static str },
 
     #[error(
-        "model {model:?} (provider style=mistralrs) must set exactly one of \
-         model-id or model-path; got neither"
-    )]
-    MistralrsMissingModelSource { model: String },
-
-    #[error(
-        "model {model:?} (provider style=mistralrs) must set exactly one of \
-         model-id or model-path; got both"
-    )]
-    MistralrsBothModelSources { model: String },
-
-    #[error(
-        "model {model:?} (provider style=mistralrs) sets {field:?} which only \
-         applies when model-id is set"
-    )]
-    MistralrsExtraFieldRequiresModelId { model: String, field: &'static str },
-
-    #[error(
-        "model {model:?} (provider style=mistralrs) sets model-id={model_id:?} \
-         but no model-file; pick a specific GGUF filename inside the repo"
-    )]
-    MistralrsModelIdMissingFile { model: String, model_id: String },
-
-    #[error("model {model:?} (provider style=mistralrs) model-path {path:?} does not exist")]
-    MistralrsModelPathMissing { model: String, path: PathBuf },
-
-    #[error(
-        "model {model:?} (provider style=mistralrs) has invalid device {device:?}; \
-         expected one of: cpu, cuda, cuda:N, metal"
-    )]
-    MistralrsDeviceInvalid { model: String, device: String },
-
-    #[error(
-        "model {model:?} (provider style=mistralrs) must not set {field:?} -- \
-         that field belongs to remote providers (style=openai, style=anthropic)"
-    )]
-    MistralrsModelHasRemoteField { model: String, field: &'static str },
-
-    #[error(
         "model {model:?} (provider style={style}) must set 'identifier' (the \
          string sent to the provider API)"
     )]
     #[non_exhaustive]
     RemoteModelMissingIdentifier { model: String, style: &'static str },
-
-    #[error(
-        "model {model:?} (provider style={style}) must not set {field:?} -- \
-         that field belongs to mistralrs-style providers"
-    )]
-    #[non_exhaustive]
-    RemoteModelHasMistralrsField {
-        model: String,
-        style: &'static str,
-        field: &'static str,
-    },
 
     #[error(
         "invalid sidecar name {sidecar:?} \
@@ -677,12 +624,6 @@ pub(super) fn validate_with_options(
         return Err(ConfigValidationError::SessionRootNotAbsolute { path: path.clone() });
     }
 
-    if let Some(path) = &cfg.model_cache_root
-        && !path.is_absolute()
-    {
-        return Err(ConfigValidationError::ModelCacheRootNotAbsolute { path: path.clone() });
-    }
-
     if let Some(value) = cfg.tool_call_max {
         validate_tool_call_max("top-level tool-call-max", value)?;
     }
@@ -741,9 +682,6 @@ pub(super) fn validate_with_options(
                     request_timeout_secs,
                     ..
                 } => (*retry_budget_secs, *request_timeout_secs),
-                // In-process: no HTTP layer, so nothing to retry and no
-                // request to time out.
-                LlmProvider::Mistralrs { .. } => (None, None),
             };
             if let Some(value) = retry_budget_secs {
                 validate_retry_budget_secs(
@@ -803,9 +741,6 @@ pub(super) fn validate_with_options(
             match provider {
                 LlmProvider::OpenAi { .. } | LlmProvider::Anthropic { .. } => {
                     validate_remote_model(provider.style(), model_name, model)?
-                }
-                LlmProvider::Mistralrs { .. } => {
-                    validate_mistralrs_model(model_name, model, repo_root)?
                 }
             }
         }
@@ -1623,10 +1558,10 @@ fn validate_model_source(model_name: &str, model: &Model) -> Result<(), ConfigVa
     Ok(())
 }
 
-/// The field rules every remote (HTTP) provider style shares: an `identifier`
-/// is required, and every mistralrs weight field is rejected. `style` names the
-/// style in diagnostics, so the message points at the row the user wrote rather
-/// than at whichever remote provider happens to be listed first.
+/// The field rule every remote (HTTP) provider style shares: an `identifier`
+/// is required. `style` names the style in diagnostics, so the message points
+/// at the row the user wrote rather than at whichever remote provider happens
+/// to be listed first.
 fn validate_remote_model(
     style: &'static str,
     model_name: &str,
@@ -1638,96 +1573,6 @@ fn validate_remote_model(
             style,
         });
     }
-    for (present, field) in model.mistralrs_weight_fields() {
-        if present {
-            return Err(ConfigValidationError::RemoteModelHasMistralrsField {
-                model: model_name.to_string(),
-                style,
-                field,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_mistralrs_model(
-    model_name: &str,
-    model: &Model,
-    repo_root: Option<&Path>,
-) -> Result<(), ConfigValidationError> {
-    if model.identifier.is_some() {
-        return Err(ConfigValidationError::MistralrsModelHasRemoteField {
-            model: model_name.to_string(),
-            field: "identifier",
-        });
-    }
-    match (model.model_id.is_some(), model.model_path.is_some()) {
-        (false, false) => {
-            return Err(ConfigValidationError::MistralrsMissingModelSource {
-                model: model_name.to_string(),
-            });
-        }
-        (true, true) => {
-            return Err(ConfigValidationError::MistralrsBothModelSources {
-                model: model_name.to_string(),
-            });
-        }
-        _ => {}
-    }
-
-    if let Some(id) = model.model_id.as_deref()
-        && model.model_file.as_ref().is_none_or(|v| v.is_empty())
-    {
-        return Err(ConfigValidationError::MistralrsModelIdMissingFile {
-            model: model_name.to_string(),
-            model_id: id.to_string(),
-        });
-    }
-
-    if model.model_id.is_none() {
-        let extras: [(bool, &'static str); 2] = [
-            (
-                model.model_file.as_ref().is_some_and(|v| !v.is_empty()),
-                "model-file",
-            ),
-            (model.revision.is_some(), "revision"),
-        ];
-        for (present, field) in extras {
-            if present {
-                return Err(ConfigValidationError::MistralrsExtraFieldRequiresModelId {
-                    model: model_name.to_string(),
-                    field,
-                });
-            }
-        }
-    }
-
-    if let Some(device) = model.device.as_deref()
-        && device.parse::<MistralrsDeviceSpec>().is_err()
-    {
-        return Err(ConfigValidationError::MistralrsDeviceInvalid {
-            model: model_name.to_string(),
-            device: device.to_string(),
-        });
-    }
-
-    // Through `Model::resolved_model_path` rather than joining here, so the
-    // base is chosen in one place: the resolver joins through it too, and the
-    // path this check accepts is the path that gets opened.
-    if let Some(path) = model.model_path.as_deref()
-        && let Some(root) = repo_root
-        && !model
-            .resolved_model_path(root)
-            .is_some_and(|resolved| resolved.exists())
-    {
-        return Err(ConfigValidationError::MistralrsModelPathMissing {
-            model: model_name.to_string(),
-            // The text the row carries, not the join: the base is documented,
-            // and the declared value is what the reader has to go change.
-            path: path.to_path_buf(),
-        });
-    }
-
     Ok(())
 }
 

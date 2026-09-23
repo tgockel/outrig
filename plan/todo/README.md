@@ -120,5 +120,4 @@ get, a `plan/next/` entry.
   `plan/next/failover-move-announcement-untested.md`.
 - The workspace rustdoc output-name collision now has one, filed by `0002-52` while adding the
   `cargo rustdoc` gate whose `-p` and `--lib` work around it:
-  `plan/next/workspace-rustdoc-output-collision.md`. local-LLM build-warning cleanliness
-  still has no entry and should get one.
+  `plan/next/workspace-rustdoc-output-collision.md`.

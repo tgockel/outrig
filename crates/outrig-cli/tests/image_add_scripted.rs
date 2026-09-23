@@ -201,11 +201,10 @@ async fn fallback_yes_bootstraps_repo_config() {
     // asked during bootstrap) = 9 prompts.
     let script = b"\n\n\n\n\n\n\n\n\n";
     let (mut prompt, _stderr) = scripted_prompt(script).await;
-    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
     timeout(TEST_TIMEOUT, async {
         let (repo_root, bootstrapped_name) =
-            resolve_or_bootstrap(&cwd, &global, &mut prompt, &mut hf).await?;
+            resolve_or_bootstrap(&cwd, &global, &mut prompt).await?;
         run_with(&repo_root, bootstrapped_name, false, &mut prompt).await
     })
     .await
@@ -237,11 +236,10 @@ async fn fallback_no_returns_no_repo_config() {
     // Script: configure now? -> n. No further prompts should be consumed.
     let script = b"n\n";
     let (mut prompt, _stderr) = scripted_prompt(script).await;
-    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
     let err = timeout(
         TEST_TIMEOUT,
-        resolve_or_bootstrap(tmp.path(), &global, &mut prompt, &mut hf),
+        resolve_or_bootstrap(tmp.path(), &global, &mut prompt),
     )
     .await
     .expect("fallback must not hang")

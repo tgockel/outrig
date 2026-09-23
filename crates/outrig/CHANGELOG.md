@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`style = "mistralrs"` and the config surface behind it**, deprecated in 0.2.0:
+  `LlmProvider::Mistralrs`, `MistralrsDeviceSpec` and `MistralrsDeviceParseError`, the six
+  `Model` weight fields (`model_id`, `model_path`, `model_file`, `revision`, `context_length`,
+  `device`) and `Model::resolved_model_path`, `Config::model_cache_root`, and the nine
+  `ConfigValidationError` variants that policed them (`Mistralrs*` x7,
+  `RemoteModelHasMistralrsField`, `ModelCacheRootNotAbsolute`). Every type involved is
+  `#[non_exhaustive]`, but code naming a removed item stops compiling.
+
+  A config that still carries any of it fails to parse rather than to validate: `LlmProvider`,
+  `Model`, and `Config` all reject a tag or key they do not know, so `Config::load_from_str` returns
+  `OutrigError::Config` naming the offending tag or key, on every load path. That includes
+  `Config::load_for_build`, which skips the model rules and so used to accept a weight key on a
+  remote model; it now refuses one like any other unknown key.
+
+  Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
+  its `localhost` `base-url` -- see
+  [Local models](../../doc/concepts/llm-providers.md#local-models).
+
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 
 The first release since 0.1.0. It breaks the public Rust surface in most of the ways a 0.1
@@ -1035,7 +1055,7 @@ that it does.
   removed, no key changed spelling, and a config naming this style still parses and validates.
   Run local models under an OpenAI-compatible server and point a `style = "openai"` provider at
   its `localhost` `base-url`; the migration is in
-  [In-process LLMs](../../doc/concepts/in-process-llm.md).
+  [Local models](../../doc/concepts/llm-providers.md#local-models).
 
 ### Removed
 

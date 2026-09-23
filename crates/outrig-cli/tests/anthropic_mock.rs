@@ -30,7 +30,6 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -275,24 +274,14 @@ async fn build_mock_agent(
     for var in vars {
         set_test_env(var, KEY);
     }
-    // No `[models.<name>].model-path` in any config here, so the repo root
-    // this resolves relative paths against never comes up.
-    let resolved = resolve_agent(cfg, std::path::Path::new("/"), Some("coding")).expect("resolves");
+    let resolved = resolve_agent(cfg, Some("coding")).expect("resolves");
     for var in vars {
         unset_test_env(var);
     }
 
-    #[cfg(feature = "local-llm")]
-    let registry = std::sync::Arc::new(outrig_cli::llm::LlmRegistry::new());
-    build_agent(
-        &resolved,
-        session_tool::erase(tools),
-        Path::new("."),
-        #[cfg(feature = "local-llm")]
-        &registry,
-    )
-    .await
-    .expect("agent builds")
+    build_agent(&resolved, session_tool::erase(tools))
+        .await
+        .expect("agent builds")
 }
 
 // ---- tests ----------------------------------------------------------------

@@ -55,7 +55,6 @@ jobs:
           # compiled for AArch64 at all. What that costs is a duplicate cache
           # bucket, which plan/next/ci-configuration-coverage.md owns.
           - { name: default,   runner: ubuntu-latest,    cargo_args: "" }
-          - { name: local-llm, runner: ubuntu-latest,    cargo_args: "--features outrig-cli/local-llm" }
           - { name: arm64,     runner: ubuntu-24.04-arm, cargo_args: "" }
     steps:
       - uses: actions/checkout@v4

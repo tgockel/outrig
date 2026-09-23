@@ -25,7 +25,6 @@ default-agent = "coding"
 # global config (~/.outrig/config.toml):
 default-model      = "fast"
 session-root       = "/var/lib/outrig/sessions"       # optional; defaults to XDG data dir
-model-cache-root   = "/var/cache/outrig/models"       # optional; defaults to XDG cache dir
 tool-call-max      = 100                              # optional; defaults to 50
 tool-result-max    = 262144                           # optional; defaults to 256 KiB
 subagent-depth-max = 3                                # optional; defaults to 3
@@ -45,7 +44,6 @@ deny  = ["*:22"]                                      # optional; global only
 | `default-agent`      | string  | no                     | repo   | Default `--agent`.        |
 | `default-model`      | string  | if agent omits `model` | global | Fallback model name.      |
 | `session-root`       | path    | no                     | global | Sessions root dir.        |
-| `model-cache-root`   | path    | no                     | global | GGUF download cache dir.  |
 | `tool-call-max`      | integer | no                     | global | Per-turn tool-call max.   |
 | `tool-result-max`    | integer | no                     | global | Per-tool-result byte max. |
 | `subagent-depth-max` | integer | no                     | global | Max subagent nesting.     |
@@ -63,8 +61,8 @@ is `--image`, then `default-image`, then outrig's
 `--model` or `default-model` -- that is the one thing an agentless session cannot do without.
 
 `default-image` and `default-agent` belong in the repo config -- image-configs and agents are
-project-scoped. `default-model`, `session-root`, `model-cache-root`, `tool-call-max`, and the
-subagent limits belong in the global config since they're user/machine-level. `tool-result-max`
+project-scoped. `default-model`, `session-root`, `tool-call-max`, and the subagent limits
+belong in the global config since they're user/machine-level. `tool-result-max`
 usually belongs there too, although repo or agent config can tighten it for a noisy project.
 `retry-budget-secs` is a default for every remote provider; a `[providers.<name>]` row that
 sets its own overrides it, which is usually the better place since rate limits are a property
@@ -79,11 +77,6 @@ egress policy, not a project preference; a repo config that sets one is rejected
 config value and the default; `--session-dir <path>` (on `outrig run`/`logs`/`discard`) instead
 points at one specific session directory. See
 [Sessions](https://tgockel.github.io/outrig/usage/sessions.html).
-
-`model-cache-root` defaults to `<XDG_CACHE_HOME>/outrig/models/` (typically
-`~/.cache/outrig/models/`). It only matters for `style = "mistralrs"` models configured
-with `model-id` -- that's where the auto-downloaded GGUFs land. See
-[Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
 
 `tool-call-max` is the default maximum number of tool calls in one user turn. The compiled-in
 default is `50`; config may set any value from `1` through `2000`.
@@ -214,11 +207,16 @@ interceptor.
 
 ## `[providers.<name>]`
 
-A provider tells outrig how to reach a model -- either a remote HTTPS endpoint that speaks
-a known wire format, or a local in-process backend. Multiple providers in either file. Repo
-entries with the same name override globals, replacing the whole entry rather than merging
-field by field. The accepted `style` values are `"openai"`, `"anthropic"`, and
-`"mistralrs"`. Which other fields are valid depends on `style`.
+A provider tells outrig how to reach a model: an endpoint that speaks a known wire format.
+Multiple providers in either file. Repo entries with the same name override globals, replacing
+the whole entry rather than merging field by field. The accepted `style` values are
+`"openai"` and `"anthropic"`. Which other fields are valid depends on `style`.
+
+A local model is an ordinary `style = "openai"` provider pointed at a server on `localhost`
+(Ollama, vLLM, `llama.cpp`) -- see
+[Local models](https://tgockel.github.io/outrig/concepts/llm-providers.html#local-models).
+The in-process `style = "mistralrs"` was removed in 0.3, and a config that still names it
+fails to parse.
 
 ### `style = "openai"`
 
@@ -310,50 +308,6 @@ identifiers it recognizes; any other identifier needs `max-tokens` on the model 
 agent, or the first turn fails saying so. See
 [anthropic models](#anthropic-models).
 
-### `style = "mistralrs"`
-
-> **Deprecated.** This provider style and the `local-llm` build feature are deprecated and
-> will be removed in a future release. Run the model under an OpenAI-compatible local server
-> (Ollama, vLLM, `llama.cpp`) and use a [`style = "openai"`](#style--openai) provider with a
-> `localhost` `base-url` instead. Nothing is removed in this release: configs carrying this
-> style still parse, still validate, and still run on a `--features local-llm` build. The
-> removal can only land in a release *after* the one that first carried this warning. See
-> [Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html)
-> for a before/after migration.
-
-In-process LLM backed by the [`mistralrs`](https://crates.io/crates/mistralrs) crate. No
-HTTP, no API key. The provider table is bare -- just the `style` tag. Each set of
-weights is its own `[models.<name>]` row referencing this provider, so a single
-`mistralrs` provider can back many models. See
-[Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
-
-```toml
-[providers.local]
-style = "mistralrs"
-```
-
-| Key     | Type   | Required | Default | Description                         |
-|---------|--------|----------|---------|-------------------------------------|
-| `style` | string | yes      | --      | Must be `"mistralrs"` for this row. |
-
-`base-url`, `api-key`, and any other key are rejected on `style = "mistralrs"`: the table
-above is the whole of it, and an unknown key here is an error exactly as it is anywhere else
-in this schema. The model-specific fields (`model-id`, `model-path`, `model-file`, `revision`,
-`context-length`, `device`) live on `[models.<name>]` -- see the
-[mistralrs models](#mistralrs-models) subsection.
-
-#### Always parses, even without `--features local-llm`
-
-outrig **always** recognizes `style = "mistralrs"` for parsing and cross-reference
-validation, regardless of whether the binary was built with `--features local-llm`. The
-build-time feature gates only the *use* of the provider: trying to resolve an agent that
-points at a `mistralrs` provider on a non-feature build fails at run time, with a message
-that names the missing flag.
-
-The reason is portability -- a checked-in `.agents/outrig/config.toml` can declare both
-remote and in-process providers, and the same config works for teammates whether or not
-they built with the feature on.
-
 ### `api-key` syntax
 
 `api-key` **must** use the env-var-substitution form `"${VAR_NAME}"` -- exactly that, nothing
@@ -376,8 +330,8 @@ See [Concepts -> LLM Providers](https://tgockel.github.io/outrig/concepts/llm-pr
 
 A model entry has two shapes, and sets exactly one of them:
 
-- **A provider shape** -- `provider` plus whatever that provider needs to identify the
-  weights or wire-format model name. The required fields depend on the provider's `style`.
+- **A provider shape** -- `provider` plus the `identifier` that provider's API knows the
+  model by.
 - **An alias shape** -- `alias`, naming one or more other models. No provider-shape field
   is allowed alongside it.
 
@@ -427,15 +381,10 @@ the head of the list, so one rate-limit window does not demote the preferred ven
 rest of the session.
 
 The whole chain is bounded by one `retry-budget-secs` rather than one per candidate, and
-the value used is the one on the **first selectable remote candidate's** provider -- a
+the value used is the one on the **first selectable candidate's** provider -- a
 `retry-budget-secs` set on any later candidate's provider is not consulted. So a `0` there
 disables retries for the whole chain, and reordering an alias can change which budget
 governs it.
-
-In-process candidates are skipped when finding that value, since `style = "mistralrs"` has
-no `retry-budget-secs` key -- it does no HTTP and so has nothing to retry. An alias headed
-by a local model takes its budget from the first remote candidate after it. An alias of
-only local models has none, and needs none.
 
 When every candidate has failed the report names each one's reason, and what ends depends
 on why. If at least one failed recoverably -- a rate limit, an unusable response -- the
@@ -444,19 +393,17 @@ at each vendor, the **session** ends, exactly as that failure ends it for a sing
 no resend can satisfy credentials that are refused everywhere.
 
 A single-target alias is pure renaming, so it keeps its target's own errors -- an unset key
-still names the variable, and an in-process model in a build without `local-llm` still says
-to rebuild.
+still names the variable rather than becoming one line of a list.
 
 Two spelling notes. `alias = "opus-5"` and `alias = ["opus-5"]` are the same config; a
-round-trip through OutRig rewrites the first as the second, the same way `model-file`
-behaves. And because `[models.<name>]` rejects unknown fields, a config using `alias` is
-rejected outright by an OutRig older than this feature rather than degrading -- worth
-knowing before putting one in a shared repo config.
+round-trip through OutRig rewrites the first as the second. And because `[models.<name>]`
+rejects unknown fields, a config using `alias` is rejected outright by an OutRig older than this
+feature rather than degrading -- worth knowing before putting one in a shared repo config.
 
 ### Remote-provider models
 
 Models on a remote provider -- `style = "openai"` or `style = "anthropic"` -- name their
-model with an `identifier`. None of the mistralrs weight fields are allowed.
+model with an `identifier`.
 
 ```toml
 [models.fast]
@@ -531,73 +478,6 @@ limit, and one config line fixes it. A ceiling set too low instead cuts replies 
 mid-sentence with nothing logged, which is much harder to recognize as a config problem.
 `outrig config init` prompts for `max-tokens` when it writes an Anthropic model, so a
 generated config carries an explicit one either way.
-
-### mistralrs models
-
-> **Deprecated** with the provider style above, and removed at the same time. The six weight
-> fields below have no counterpart on a `style = "openai"` model: a local server owns the
-> weights, quantization and device placement itself. See
-> [Concepts -> In-process LLMs](https://tgockel.github.io/outrig/concepts/in-process-llm.html).
-
-For an in-process `style = "mistralrs"` provider, the model row carries the weight
-spec. Either `model-id` (HuggingFace auto-download) or `model-path` (local GGUF file)
--- exactly one. `identifier` is **not** allowed on mistralrs models -- the weights
-are the model.
-
-```toml
-# HuggingFace auto-download:
-[models.phi3-fast]
-provider   = "local"
-model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"
-# revision       = "main"   # optional git ref on the HF repo
-# context-length = 4096     # optional override
-# device         = "cuda"  # optional; defaults to "cpu"
-
-# Multi-shard quantization (one quant split across files):
-[models.llama-70b]
-provider   = "local"
-model-id   = "MaziyarPanahi/Meta-Llama-3-70B-Instruct-GGUF"
-model-file = [
-    "Meta-Llama-3-70B-Instruct.Q4_K_M-00001-of-00002.gguf",
-    "Meta-Llama-3-70B-Instruct.Q4_K_M-00002-of-00002.gguf",
-]
-
-# Local GGUF file:
-[models.llama-local]
-provider   = "local"
-model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
-# device     = "metal" # optional; defaults to "cpu"
-```
-
-| Key              | Type    | Required | Default  | Description                                  |
-|------------------|---------|----------|----------|----------------------------------------------|
-| `provider`       | string  | yes\*\*  | --       | Name of a `style = "mistralrs"` provider.    |
-| `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
-| `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
-| `model-file`     | str/arr | with `id`| --       | GGUF filename(s) inside the HF repo.         |
-| `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
-| `context-length` | integer | no       | model    | Override the model's default context window. |
-| `device`         | string  | no       | `"cpu"`  | One of `cpu`, `cuda`, `cuda:N`, `metal`.     |
-
-\* Exactly one of `model-id` / `model-path` must be set; setting both, or neither,
-is an error.
-
-\*\* Required unless the entry sets `alias` instead, which forbids every field in this
-table.
-
-`device = "cuda"` and `device = "cuda:N"` require a binary built with
-`--features "local-llm cuda"`; `device = "metal"` requires
-`--features "local-llm metal"`. The feature check happens when an agent resolves the
-model. Enabling `cuda` or `metal` without `local-llm` emits a build warning and has no
-effect. outrig does not fall back to CPU if the requested backend is unavailable. With
-CUDA, `cuda:N` selects the base device for mistralrs's automatic mapper; it is not an
-exclusive single-device sharding directive. `outrig run --device <device>` overrides this
-field for one run without editing config.
-
-Metal is only usable on macOS targets. Non-macOS builds can compile with the `metal`
-feature for feature-matrix coverage, but trying to instantiate a Metal device fails with
-a platform error.
 
 ## `[agents.<name>]`
 
@@ -1101,12 +981,7 @@ this -- the merge result is used in memory and discarded -- but a tool that roun
 config through disk should resolve paths first, or keep the two files separate.
 
 The practical effect is that a global `[images.<name>]` can use the build shape: its Dockerfile
-and context live beside `~/.outrig/config.toml` and are found from any repo on the machine. One
-exception is repo-relative rather than file-relative: `[models.<name>].model-path` resolves
-against the repo root no matter which file declared it, and does so for the existence check and
-for the load alike. A *global* `[models.<name>]` with a relative `model-path` therefore follows
-whichever repo is current, so give that one an absolute path. See
-[Validation rules](#validation-rules).
+and context live beside `~/.outrig/config.toml` and are found from any repo on the machine.
 
 Because provenance is recorded per entry, a diagnostic about a config-declared path names the
 file that declared it, as a trailing `(declared in "<path>")`. Every image and mount rule
@@ -1128,7 +1003,6 @@ its diagnostics carry no clause.
 ```toml
 default-model      = "fast"
 session-root       = "/var/lib/outrig/sessions" # optional; default = XDG data dir
-model-cache-root   = "/var/cache/outrig/models" # optional; default = XDG cache dir
 tool-call-max      = 100                         # optional; default = 50
 tool-result-max    = 262144                      # optional; default = 256 KiB
 subagent-depth-max = 3                           # optional; default = 3
@@ -1152,8 +1026,10 @@ base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
 [providers.local]
-# requires `cargo build --features local-llm` to actually use, but always parses.
-style = "mistralrs"
+# a model served on this machine, by Ollama here; see LLM providers -> Local models
+style    = "openai"
+base-url = "http://127.0.0.1:11434/v1"
+api-key  = "${OLLAMA_API_KEY}"
 
 [models.fast]
 provider   = "openai"
@@ -1168,11 +1044,9 @@ provider   = "anthropic"
 identifier = "claude-sonnet-4-6"
 max-tokens = 16384
 
-[models.phi3-fast]
+[models.local-fast]
 provider   = "local"
-model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"
-device     = "cpu"
+identifier = "qwen3:4b"
 ```
 
 ### Repo `.agents/outrig/config.toml`
@@ -1247,29 +1121,12 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An `alias` chain may be at most 32 hops deep. A graph that deep is a mistake rather than a
   configuration, and the limit is what makes it report as one.
 - Every `agents.<name>.image` (if set) must name an existing `[images.<name>]`.
-- Every `providers.<name>.style` must be one of `{"openai", "anthropic", "mistralrs"}`. Other
-  styles are reserved for future Rig adapters and listed as TODO in the providers concept
-  page. The build-time feature gate (`--features local-llm`) is **not** checked at validate
-  time -- see "Always parses, even without `--features local-llm`" above.
+- Every `providers.<name>.style` must be one of `{"openai", "anthropic"}`. Other styles are
+  reserved for future Rig adapters and listed as TODO in the providers concept page.
 - Every `providers.<name>.api-key` (on a remote style) must match
   `^\$\{[A-Z_][A-Z0-9_]*\}$`.
 - Every `[models.<name>]` whose provider has a remote style must set
-  `identifier` and must not set any of `model-id`, `model-path`, `model-file`,
-  `revision`, `context-length`, `device`. The error names the style of the
-  provider the model points at.
-- Every `[models.<name>]` whose provider has `style = "mistralrs"` must set
-  exactly one of `model-id` / `model-path`. When `model-id` is set, `model-file`
-  is **required** -- mistralrs's GGUF loader needs a specific filename and HF
-  repos typically hold many quantizations. `model-file` accepts either a
-  single string (one GGUF file) or an array of strings (a multi-shard
-  quantization, e.g. `*-00001-of-00003.gguf`). `revision` is optional and
-  only meaningful with `model-id`. A `model-path`, if set, must exist on
-  disk relative to the repo root (or be absolute); the repo root is also
-  the base it is opened against when the model loads, whatever directory
-  `outrig` was invoked from. `identifier` is not
-  allowed on mistralrs models. `device`, if set, must be one of `cpu`, `cuda`,
-  `cuda:N`, or `metal`.
-- `model-cache-root`, if set, must be an absolute path; outrig creates it if missing.
+  `identifier`. The error names the style of the provider the model points at.
 - `tool-call-max`, if set at the top level or on an agent, must be between `1` and `2000`.
 - `tool-result-max`, if set at the top level or on an agent, must be between `1024` and
   `16777216` bytes.

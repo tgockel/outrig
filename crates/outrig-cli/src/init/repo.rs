@@ -15,7 +15,6 @@ use heck::ToKebabCase;
 
 use crate::config_init;
 use crate::error::{OutrigError, Result};
-use crate::hf::HfTreeFetcher;
 use crate::image_setup::add as image_add;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::{find_repo_root_from, repo_config_path, write_atomic};
@@ -31,7 +30,6 @@ pub async fn ensure(
     repo_root: &Path,
     global_path: &Path,
     prompt: &mut impl PromptSource,
-    hf: &mut impl HfTreeFetcher,
 ) -> Result<Option<String>> {
     let cfg_path = repo_config_path(repo_root);
     if cfg_path.exists() {
@@ -45,7 +43,7 @@ pub async fn ensure(
         "[outrig] no repo config at {} -- let's create one.",
         cfg_path.display()
     );
-    let name = write_repo_config(repo_root, global_path, prompt, hf).await?;
+    let name = write_repo_config(repo_root, global_path, prompt).await?;
     Ok(Some(name))
 }
 
@@ -62,7 +60,6 @@ pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_path: &Path,
     prompt: &mut impl PromptSource,
-    hf: &mut impl HfTreeFetcher,
 ) -> Result<(PathBuf, Option<String>)> {
     match find_repo_root_from(cwd) {
         Ok(root) => Ok((root, None)),
@@ -75,7 +72,7 @@ pub async fn resolve_or_bootstrap(
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
-            let name = write_repo_config(cwd, global_path, prompt, hf).await?;
+            let name = write_repo_config(cwd, global_path, prompt).await?;
             Ok((cwd.to_path_buf(), Some(name)))
         }
         Err(other) => Err(other.into()),
@@ -90,12 +87,11 @@ async fn write_repo_config(
     repo_root: &Path,
     global_path: &Path,
     prompt: &mut impl PromptSource,
-    hf: &mut impl HfTreeFetcher,
 ) -> Result<String> {
     eprintln!();
     eprintln!("Configuring models");
     let global = load_global_summary(global_path)?;
-    let model_choices = ask_repo_models(prompt, &global, hf).await?;
+    let model_choices = ask_repo_models(prompt, &global).await?;
 
     // Agent before image: the image section then flows directly
     // into `image_setup::add`'s base/toolchains/MCP prompts without an
@@ -203,7 +199,6 @@ fn load_global_summary(global_path: &Path) -> Result<GlobalSummary> {
 async fn ask_repo_models(
     prompt: &mut impl PromptSource,
     summary: &GlobalSummary,
-    hf: &mut impl HfTreeFetcher,
 ) -> Result<RepoModelChoices> {
     if summary.providers.is_empty() {
         eprintln!(
@@ -228,7 +223,7 @@ async fn ask_repo_models(
 
     if prompt.ask_bool(&CONFIGURE_REPO_MODELS_FIELD, true).await? {
         let (models, new_providers) =
-            config_init::prompt_models_loop(prompt, &summary.providers, hf).await?;
+            config_init::prompt_models_loop(prompt, &summary.providers).await?;
         let default = config_init::prompt_default_model(prompt, &models).await?;
         return Ok(RepoModelChoices {
             models,

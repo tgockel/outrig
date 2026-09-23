@@ -1415,41 +1415,6 @@ identifier = "gpt-4o-mini"
         }
     }
 
-    /// A `mistralrs` provider has no HTTP layer, so a remote connection key
-    /// written on one is a mistake rather than a setting -- and it is refused
-    /// rather than swallowed. `config_provider_enum.rs`'s
-    /// `mistralrs_provider_rejects_unknown_keys` is where that rule is proven
-    /// in general; this pins the key it was found through.
-    ///
-    /// What is only here: a bare provider still reaches the `(None, None)` arm
-    /// of the validation match. There is no timeout to check, rather than a
-    /// timeout that checks out.
-    #[test]
-    fn mistralrs_provider_rejects_request_timeout_secs() {
-        let err = Config::load_from_str(
-            r#"
-[providers.local]
-style                = "mistralrs"
-request-timeout-secs = 0
-"#,
-        )
-        .expect_err("a remote connection key is not a mistralrs key");
-        assert!(
-            err.to_string().contains("request-timeout-secs"),
-            "error should name the rejected key, got: {err}"
-        );
-
-        let cfg = parse(
-            r#"
-[providers.local]
-style = "mistralrs"
-"#,
-        );
-        assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
-        cfg.validate(None)
-            .expect("mistralrs carries no timeout to validate");
-    }
-
     #[test]
     fn retry_budget_secs_repo_overrides_global() {
         let global = parse(
@@ -1625,40 +1590,6 @@ api-key  = "${STAGING_API_KEY}"
         assert!(merged.providers.contains_key("openai"));
         assert!(merged.providers.contains_key("anthropic"));
         assert!(merged.providers.contains_key("staging"));
-    }
-
-    #[test]
-    fn model_cache_root_repo_overrides_global() {
-        let global = parse(
-            r#"
-model-cache-root = "/var/cache/global/models"
-"#,
-        );
-        let repo = parse(
-            r#"
-model-cache-root = "/var/cache/repo/models"
-"#,
-        );
-        let merged = merge(global, repo);
-        assert_eq!(
-            merged.model_cache_root.as_deref(),
-            Some(Path::new("/var/cache/repo/models")),
-        );
-    }
-
-    #[test]
-    fn model_cache_root_global_used_when_repo_unset() {
-        let global = parse(
-            r#"
-model-cache-root = "/var/cache/global/models"
-"#,
-        );
-        let repo = parse("");
-        let merged = merge(global, repo);
-        assert_eq!(
-            merged.model_cache_root.as_deref(),
-            Some(Path::new("/var/cache/global/models")),
-        );
     }
 
     #[test]
@@ -2112,13 +2043,6 @@ mod config_load {
         fs::create_dir_all(&ctx).unwrap();
         fs::write(ctx.join("Dockerfile"), "FROM scratch\n").unwrap();
 
-        // The fixture's mistralrs `llama-local` model uses a relative
-        // model-path; the existence check resolves against repo_root.
-        let model_dir = tmp.path().join(".agents/outrig/models");
-        fs::create_dir_all(&model_dir).unwrap();
-        let weights = model_dir.join("llama-3-8b-instruct.q4.gguf");
-        fs::write(&weights, b"\0").unwrap();
-
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/docs")).unwrap();
         fs::create_dir_all(tmp.path().join(".agents/outrig/resources/cache")).unwrap();
 
@@ -2126,14 +2050,6 @@ mod config_load {
         assert_eq!(cfg.default_image.as_deref(), Some("coding"));
         assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
         assert_eq!(cfg.default_model.as_deref(), Some("fast"));
-
-        // The only relative `model-path` in tree, and the point of keeping it
-        // relative: the file the validator found is the file the loader is
-        // handed, named once by `resolved_model_path` rather than joined twice.
-        assert_eq!(
-            cfg.models["llama-local"].resolved_model_path(tmp.path()),
-            Some(weights),
-        );
     }
 
     #[test]

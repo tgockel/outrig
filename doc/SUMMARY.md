@@ -11,7 +11,6 @@
   - [MCP Trust Model](concepts/mcp-trust-model.md)
   - [Workspace](concepts/workspace.md)
   - [Providers, Models, and Agents](concepts/llm-providers.md)
-  - [In-process LLMs (deprecated)](concepts/in-process-llm.md)
   - [Subagents](concepts/subagents.md)
 
 # Usage

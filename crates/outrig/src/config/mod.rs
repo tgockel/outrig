@@ -221,8 +221,6 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_cache_root: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_max: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_max: Option<u32>,
@@ -357,12 +355,8 @@ impl Config {
     ///
     /// Only images, mounts, and `[workspace].host-path` are stamped -- the
     /// last of those only when the file declared it, since the built-in `.`
-    /// belongs to no file. Providers and agents have no path
-    /// fields, so a base directory would buy them nothing. `models.<n>`
-    /// does have one -- `model-path` -- and is left out on purpose: both the
-    /// validator and the loader resolve it through
-    /// [`Model::resolved_model_path`], which is repo-root-relative by
-    /// decision, so there is no provenance for them to disagree about.
+    /// belongs to no file. Providers, models, and agents have no path
+    /// fields, so a base directory would buy them nothing.
     fn stamp_source(&mut self, src: &ConfigSource) {
         for image in self.images.values_mut() {
             image.set_config_source(src.clone());
@@ -748,17 +742,6 @@ pub enum LlmProvider {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_budget_secs: Option<u64>,
     },
-    /// In-process weights. The provider row carries no settings of its own --
-    /// every knob lives on the `[models.<name>]` rows that reference it.
-    ///
-    /// Braced and empty rather than a unit variant, and deliberately without
-    /// `#[non_exhaustive]`. `deny_unknown_fields` has no field set to check a
-    /// unit variant against, so `style = "mistralrs"` used to accept and
-    /// discard any key at all -- the one place this schema's "unknown keys are
-    /// an error" rule did not hold. An empty field set is one serde *can*
-    /// check. `#[non_exhaustive]` would stop the variant being constructed
-    /// outside this crate, which no other spelling of this fix requires.
-    Mistralrs {},
 }
 
 impl LlmProvider {
@@ -770,7 +753,6 @@ impl LlmProvider {
         match self {
             Self::OpenAi { .. } => "openai",
             Self::Anthropic { .. } => "anthropic",
-            Self::Mistralrs { .. } => "mistralrs",
         }
     }
 
@@ -825,22 +807,6 @@ pub struct Model {
     pub alias: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_path: Option<PathBuf>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_string_or_vec_string",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub model_file: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revision: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_length: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device: Option<String>,
     /// Output-token ceiling for turns run against this model, used when the
     /// agent does not set its own. Anthropic *requires* one per request and
     /// only supplies a default for the model identifiers it recognizes, so a
@@ -888,32 +854,8 @@ impl Model {
             provider: None,
             alias: None,
             identifier: None,
-            model_id: None,
-            model_path: None,
-            model_file: None,
-            revision: None,
-            context_length: None,
-            device: None,
             max_tokens: None,
         }
-    }
-
-    /// Every field that only a `style = "mistralrs"` model may carry, paired
-    /// with whether this row sets it.
-    ///
-    /// One list, three readers: a remote model rejects all of them, an alias
-    /// rejects them along with the rest of the provider shape, and the alias
-    /// walk reports them. Adding a weight field to only one of the three would
-    /// leave the others silently permitting it.
-    pub(crate) fn mistralrs_weight_fields(&self) -> [(bool, &'static str); 6] {
-        [
-            (self.model_id.is_some(), "model-id"),
-            (self.model_path.is_some(), "model-path"),
-            (self.model_file.is_some(), "model-file"),
-            (self.revision.is_some(), "revision"),
-            (self.context_length.is_some(), "context-length"),
-            (self.device.is_some(), "device"),
-        ]
     }
 
     /// Every provider-shape field this row actually sets, in declaration order.
@@ -925,10 +867,9 @@ impl Model {
         [
             (self.provider.is_some(), "provider"),
             (self.identifier.is_some(), "identifier"),
+            (self.max_tokens.is_some(), "max-tokens"),
         ]
         .into_iter()
-        .chain(self.mistralrs_weight_fields())
-        .chain([(self.max_tokens.is_some(), "max-tokens")])
         .filter(|(present, _)| *present)
         .map(|(_, field)| field)
         .collect()
@@ -953,32 +894,14 @@ impl Model {
             ),
         }
     }
-
-    /// [`model_path`](field@Self::model_path) made absolute against
-    /// `repo_root`, or `None` for a row that sets no path.
-    ///
-    /// The base is the repo root rather than the directory of the file that
-    /// declared the row, which makes `models.<n>` the one exception to the rule
-    /// [`ConfigSource`] states for every other config-declared path. The
-    /// consequence to know: a global `[models.<n>]` with a relative
-    /// `model-path` resolves it under whichever repo is current, so name an
-    /// absolute path there.
-    ///
-    /// Both [`Config::validate`] and the CLI's model resolution go through
-    /// here, which is the point: one place chooses the base.
-    pub fn resolved_model_path(&self, repo_root: &Path) -> Option<PathBuf> {
-        self.model_path
-            .as_deref()
-            .map(|path| resolve_against(repo_root, path))
-    }
 }
 
 /// Discriminated view of what a `[models.<name>]` row names -- a provider that
 /// serves it, or other models it stands for. Returned by [`Model::source`].
 ///
 /// Deliberately carries only the discriminant: every reader already holds the
-/// `&Model` and reads the weight fields (`identifier`, `model-id`, `device`,
-/// ...) off it directly, so restating them here would be surface with no
+/// `&Model` and reads the provider-shape fields (`identifier`, `max-tokens`)
+/// off it directly, so restating them here would be surface with no
 /// consumer. The per-variant `#[non_exhaustive]` keeps adding one additive.
 #[non_exhaustive]
 pub enum ModelSourceRef<'a> {
@@ -986,66 +909,6 @@ pub enum ModelSourceRef<'a> {
     Provider { provider: &'a str },
     #[non_exhaustive]
     Alias { targets: &'a [String] },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MistralrsDeviceSpec {
-    #[default]
-    Cpu,
-    Cuda(usize),
-    Metal,
-}
-
-impl MistralrsDeviceSpec {
-    pub const EXPECTED: &'static str = "expected one of: cpu, cuda, cuda:N, metal";
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct MistralrsDeviceParseError;
-
-impl std::fmt::Display for MistralrsDeviceParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(MistralrsDeviceSpec::EXPECTED)
-    }
-}
-
-impl std::error::Error for MistralrsDeviceParseError {}
-
-impl std::str::FromStr for MistralrsDeviceSpec {
-    type Err = MistralrsDeviceParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "cpu" => Ok(Self::Cpu),
-            "cuda" => Ok(Self::Cuda(0)),
-            "metal" => Ok(Self::Metal),
-            _ => {
-                let Some(ordinal) = s.strip_prefix("cuda:") else {
-                    return Err(MistralrsDeviceParseError);
-                };
-                if ordinal.is_empty() || !ordinal.chars().all(|c| c.is_ascii_digit()) {
-                    return Err(MistralrsDeviceParseError);
-                }
-                ordinal
-                    .parse::<usize>()
-                    .map(Self::Cuda)
-                    .map_err(|_| MistralrsDeviceParseError)
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for MistralrsDeviceSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Cpu => f.write_str("cpu"),
-            Self::Cuda(0) => f.write_str("cuda"),
-            Self::Cuda(ordinal) => write!(f, "cuda:{ordinal}"),
-            Self::Metal => f.write_str("metal"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -2412,15 +2275,11 @@ impl McpServerSpec {
 }
 
 /// Accepts a bare string *or* an array of them during deserialization,
-/// normalizing to `Vec<String>`. Two fields use it:
+/// normalizing to `Vec<String>`. `alias` uses it, where the two forms are the
+/// two cases the feature exists for: one name for one model, and one name for
+/// a set of equivalents.
 ///
-/// - `model-file`, where the single-string form keeps configs from before the
-///   field went multi (split-quantization shards) parsing without a hand edit,
-///   and the array form is what the init flow writes today.
-/// - `alias`, where the two forms are the two cases the feature exists for:
-///   one name for one model, and one name for a set of equivalents.
-///
-/// Both re-serialize as an array, so a round-trip rewrites `alias = "opus-5"`
+/// It re-serializes as an array, so a round-trip rewrites `alias = "opus-5"`
 /// as `alias = ["opus-5"]`. The parsed configs compare equal, which is what
 /// the round-trip tests assert.
 fn deserialize_string_or_vec_string<'de, D>(

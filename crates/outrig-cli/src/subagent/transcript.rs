@@ -109,8 +109,7 @@ mod tests {
         assert!(text.contains("first") && text.contains("second"));
     }
 
-    /// The streaming path returns an empty reply for the primary agent, and a
-    /// subagent whose outcome came only from `set_result` has nothing to add
+    /// A subagent whose outcome came only from `set_result` has nothing to add
     /// here -- an empty `--- reply ---` block would just be noise.
     #[tokio::test]
     async fn an_empty_reply_writes_nothing() {

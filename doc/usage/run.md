@@ -15,7 +15,6 @@ current directory as the workspace and reads the agent from the global config. S
 outrig run [--agent <name>]
            [--image <name-or-local-ref>]
            [--config <path>]
-           [--device <cpu|cuda|cuda:N|metal>]
            [--env <KEY=VALUE>]
            [--max-tool-calls <n>]
            [--max-tool-result-bytes <n>]
@@ -35,9 +34,6 @@ outrig run [--agent <name>]
   config, treat it as a local Podman image ref and run it without pulling.
 - `--config <path>` (default: walks up from cwd; if not found, run config-less -- see
   [Config-less runs](#config-less-runs)): load config from a non-standard location.
-- `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
-  override the in-process mistralrs model device for this run. **Deprecated** with the
-  in-process backend; see [In-process LLMs](../concepts/in-process-llm.md).
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for the MCP servers this session
   starts. `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one server by name.
   Values take the same `${VAR}` host-env-reference syntax config files use, described in
@@ -200,10 +196,8 @@ tools) and `shell` is unavailable. Full details in
    model from `--model`, else `[agents.<a>].model`, else top-level `default-model`. `--model`
    must name an existing `[models.<name>]` entry; it is not a raw provider model identifier. Then
    `[models.<m>].provider`, then `[providers.<p>]`. Resolve the per-turn tool-call max from
-   `tool-call-max` and the per-result byte max from `tool-result-max`. For in-process
-   mistralrs models, `--device` overrides the model's configured `device` for this run. For
-   OpenAI-style models, `--device` is rejected. Then read the API key from the env var named in
-   the provider's `api-key`. Build the Rig provider client.
+   `tool-call-max` and the per-result byte max from `tool-result-max`. Then read the API key
+   from the env var named in the provider's `api-key`. Build the Rig provider client.
 9. **Build the Rig agent.** Dynamic tools from every MCP server's tool list (each prefixed
    `<server>__<tool>`), the agent's `preamble` and sampling params, assembled with
    `AgentBuilder`. An unset `preamble` -- including every agentless session -- sends no
@@ -253,9 +247,8 @@ A typical startup looks like:
 ```
 
 All startup progress and the banner are on **stderr**. The only thing that ever goes to stdout is
-the assistant's natural-language reply. For in-process `mistralrs` models, that reply is flushed
-as chunks while the model decodes; OpenAI-compatible providers print the reply when the turn
-finishes. The stream separation makes it easy to capture just the model output:
+the assistant's natural-language reply, printed when the turn finishes. The stream separation
+makes it easy to capture just the model output:
 
 ```sh
 $ echo "summarise this repo" | outrig run > summary.txt

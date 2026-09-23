@@ -9,7 +9,6 @@ corner of that surface:
 | Init path                            | Prompts for `max-tokens`? |
 |--------------------------------------|---------------------------|
 | `[models.<name>]`, anthropic         | yes, default `64000`      |
-| `[models.<name>]`, mistralrs         | no                        |
 | `[models.<name>]`, every other style | no                        |
 | `[agents.<name>]`, all styles        | no                        |
 
@@ -27,17 +26,11 @@ including the per-agent override that `config.md` documents as the higher-priori
 Not a bug. Every uncovered path has a working fallback, which is why this sat unnoticed:
 
 - OpenAI-compatible endpoints treat an absent ceiling as "use remaining context", which is
-  usually what you want.
-- mistralrs maps `max_tokens` to `sampling_params.max_len` (`llm/mistralrs.rs:371`), and
-  `None` leaves the length limit to the runtime. Worth confirming what mistralrs actually
-  does with `max_len: None` before relying on this -- the crate is behind the optional
-  `local-llm` feature and is not vendored in this checkout, so it was not verified here. If
-  `None` turns out to mean "generate until context exhaustion", the local path is the one
-  case where a prompted ceiling earns its keep.
+  usually what you want. A local server (Ollama, vLLM, `llama.cpp`) applies its own default,
+  which is worth checking for a small local model before relying on it.
 
 So the cost is not breakage, it is that the generated config is silent about a knob the user
-later has to discover from the docs, and that a long-running local model has no emitted place
-to cap output. Worth weighing against prompt-walk length before doing it -- the walk is already
+later has to discover from the docs. Worth weighing against prompt-walk length before doing it -- the walk is already
 long, and adding a question to every model is a real UX cost for a key most users can leave
 unset.
 
@@ -73,7 +66,7 @@ unset.
 
 ## See also
 
-- `crates/outrig-cli/src/config_init.rs` -- `prompt_models_loop`, the three-arm `match` on
+- `crates/outrig-cli/src/config_init.rs` -- `prompt_models_loop`, the two-arm `match` on
   `LlmProvider`, `prompt_anthropic_model`, `ask_optional_u32`.
 - `crates/outrig-cli/src/init/repo.rs` -- `render`, where the agent is built.
 - `crates/outrig-cli/src/llm.rs:413` -- the `agent.or(model)` precedence this mirrors.

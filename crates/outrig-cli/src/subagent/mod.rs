@@ -55,11 +55,6 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything needed to build a subagent's agent loop, cloned from the
 /// session. Held by the registry so a launch needs only a name and a prompt.
-///
-/// Deliberately not `Debug`: under `local-llm` this carries an
-/// `Arc<LlmRegistry>` holding loaded mistralrs engines, which are not `Debug`
-/// themselves, so a derive here compiles in a default build and breaks the
-/// feature build.
 #[derive(Clone)]
 pub struct SubagentContext {
     /// The session's resolved agent. A subagent reuses its limits and sampling;
@@ -73,10 +68,6 @@ pub struct SubagentContext {
     pub cfg: Arc<Config>,
     /// The session's MCP-backed tools. Cloning shares the live connections.
     pub mcp_tools: Vec<SessionTool>,
-    pub cache_root: PathBuf,
-    /// The base a re-resolution joins a relative `model-path` to -- the same
-    /// one the session resolved against, kept for the same reason `cfg` is.
-    pub repo_root: PathBuf,
     /// Where per-subagent transcripts go, alongside `<server>.stderr`.
     pub log_dir: PathBuf,
     /// The depth of the subagents *this* registry launches. The primary agent
@@ -84,10 +75,6 @@ pub struct SubagentContext {
     /// subagent at depth `D` may launch its own children (at `D + 1`) only while
     /// `D < resolved.subagent_depth_max`.
     pub depth: u32,
-    /// Shared with the REPL agent rather than owned: a per-subagent registry
-    /// would re-load the model's weights for every launch.
-    #[cfg(feature = "local-llm")]
-    pub registry: Arc<crate::llm::LlmRegistry>,
 }
 
 /// One live subagent as the *parent* sees it: where to read its results, how
@@ -216,27 +203,6 @@ impl SubagentRegistry {
         self.spawned_lock().retain(|s| !s.tree_finished());
 
         let shared = Arc::new(SubagentShared::new());
-        // A multi-gigabyte weight load would otherwise stall the parent's tool
-        // call with no output at all, which reads as a hang. The parent's own
-        // model is loaded by definition, so an inherited launch cannot get here.
-        //
-        // Only for a lone candidate, which is the shape whose load happens
-        // *here*, inside `build_subagent_agent`. A chain defers its local rows
-        // to the moment it reaches them and announces the wait there, so
-        // warning at launch as well would print the same line twice for one
-        // initialization -- and would be predicting a load the chain may never
-        // perform, since a working primary means the fallback is never touched.
-        #[cfg(feature = "local-llm")]
-        if resolved.candidates.len() == 1
-            && resolved.model_weights().is_some()
-            && !self.ctx.registry.is_loaded(resolved.model_name())
-        {
-            eprintln!(
-                "[outrig] subagent {name}: loading in-process model {} (first use; this may take \
-                 several minutes)",
-                resolved.model_name()
-            );
-        }
         let (agent, child) =
             build_subagent_agent(&self.ctx, &resolved, &shared, name, preamble).await?;
 
@@ -579,19 +545,18 @@ impl Spawned {
 /// set a launch can actually reach cannot drift.
 ///
 /// An **alias** is usable when *any* of its candidates is. That falls out well:
-/// `alias = ["opus-local", "opus-anthropic"]` stays offerable in a build
-/// without `local-llm`, where naming `opus-local` directly would not be.
+/// `alias = ["opus-bedrock", "opus-anthropic"]` stays offerable on a machine
+/// credentialed for only one of them, where naming the other directly would
+/// not be.
 ///
 /// Membership still does not prove a model *works* -- a key may be wrong, an
-/// endpoint may be down, a GGUF path may not exist -- only that it is not a
-/// guaranteed failure, which is the right bar for something advertised to the
-/// model. An *unset* api-key variable is on the guaranteed side of that line,
-/// since the resolver fails the session on it eagerly, so it excludes a name
-/// here too.
+/// endpoint may be down -- only that it is not a guaranteed failure, which is
+/// the right bar for something advertised to the model. An *unset* api-key
+/// variable is on the guaranteed side of that line, since the resolver fails
+/// the session on it eagerly, so it excludes a name here too.
 ///
-/// Pure inspection of `Config` plus the environment: no registry touch, no
-/// weight load, no client construction, so the synchronous schema-building
-/// path can call it.
+/// Pure inspection of `Config` plus the environment: no network I/O, no client
+/// construction, so the synchronous schema-building path can call it.
 pub(crate) fn usable_model_names(cfg: &Config) -> Vec<String> {
     cfg.models
         .keys()
@@ -702,13 +667,10 @@ fn resolve_launch_model(
     let Some(model) = model else {
         return Ok(ctx.resolved.clone());
     };
-    // `None` for the device override: a subagent names a model, not hardware.
     match crate::llm::resolve_agent_with_overrides(
         &ctx.cfg,
-        &ctx.repo_root,
         ctx.resolved.agent_name.as_deref(),
         Some(model),
-        None,
     ) {
         Ok(mut resolved) => {
             let parent = &ctx.resolved;
@@ -722,11 +684,9 @@ fn resolve_launch_model(
             Ok(resolved)
         }
         // Discriminated by matched variant, not by membership in the usable
-        // set: membership would collapse a local model in a default build into
-        // "unknown", and that case has to keep surfacing
-        // `MistralrsFeatureDisabled` so the remedy (a rebuild) is legible. That
-        // variant is merely unconstructible without the feature rather than
-        // `cfg`-gated, so this match compiles identically in both builds.
+        // set: membership would collapse a model whose api-key variable is
+        // unset into "unknown", and that case has to keep naming the variable
+        // so the remedy (export it) is legible.
         Err(crate::error::CliError::LlmResolve(
             crate::llm::LlmResolveError::UnknownModel { .. }
             | crate::llm::LlmResolveError::UnknownProvider { .. }
@@ -789,15 +749,9 @@ async fn build_subagent_agent(
         None
     };
 
-    let agent = crate::llm::build_agent(
-        &resolved,
-        tools,
-        &ctx.cache_root,
-        #[cfg(feature = "local-llm")]
-        &ctx.registry,
-    )
-    .await
-    .map_err(|e| format!("could not build subagent: {e}"))?;
+    let agent = crate::llm::build_agent(&resolved, tools)
+        .await
+        .map_err(|e| format!("could not build subagent: {e}"))?;
     Ok((agent, child))
 }
 
@@ -982,7 +936,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 pub(crate) mod fixtures {
     use super::*;
     use crate::llm::{ResolvedCandidate, ResolvedProvider};
-    use outrig::config::{Agent, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
+    use outrig::config::{Agent, AnthropicOptions, ApiKeyRef, LlmProvider, Model, OpenAiOptions};
 
     /// The env var the fixture provider's api-key points at. Unique to this
     /// module so concurrent tests cannot race another fixture on the same key.
@@ -998,14 +952,8 @@ pub(crate) mod fixtures {
         unsafe { std::env::set_var(KEY_VAR, "test-key") };
 
         let mut cfg = Config::default();
-        cfg.providers.insert(
-            "openai".to_string(),
-            LlmProvider::openai(
-                "http://127.0.0.1:9",
-                ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
-                OpenAiOptions::new().with_request_timeout_secs(1),
-            ),
-        );
+        cfg.providers
+            .insert("openai".to_string(), discard_port_openai(KEY_VAR));
         let mut agent = Agent::default();
         agent.model = Some("smart".to_string());
         agent.preamble = Some("session preamble".to_string());
@@ -1013,8 +961,17 @@ pub(crate) mod fixtures {
         cfg
     }
 
-    fn hosted_model(identifier: &str, max_tokens: Option<u32>) -> Model {
-        let mut model = Model::new("openai");
+    /// An OpenAI-style provider at the discard port, keyed by `key_var`.
+    fn discard_port_openai(key_var: &str) -> LlmProvider {
+        LlmProvider::openai(
+            "http://127.0.0.1:9",
+            ApiKeyRef::parse(&format!("${{{key_var}}}")).expect("api-key ref parses"),
+            OpenAiOptions::new().with_request_timeout_secs(1),
+        )
+    }
+
+    fn hosted_model(provider: &str, identifier: &str, max_tokens: Option<u32>) -> Model {
+        let mut model = Model::new(provider);
         model.identifier = Some(identifier.to_string());
         model.max_tokens = max_tokens;
         model
@@ -1030,10 +987,12 @@ pub(crate) mod fixtures {
         let mut cfg = base_config();
         cfg.models.insert(
             "fast".to_string(),
-            hosted_model("gpt-4o-mini", Some(16_000)),
+            hosted_model("openai", "gpt-4o-mini", Some(16_000)),
         );
-        cfg.models
-            .insert("smart".to_string(), hosted_model("gpt-4o", Some(64_000)));
+        cfg.models.insert(
+            "smart".to_string(),
+            hosted_model("openai", "gpt-4o", Some(64_000)),
+        );
         cfg
     }
 
@@ -1042,7 +1001,7 @@ pub(crate) mod fixtures {
     pub(crate) fn test_config_single() -> Config {
         let mut cfg = base_config();
         cfg.models
-            .insert("smart".to_string(), hosted_model("gpt-4o", None));
+            .insert("smart".to_string(), hosted_model("openai", "gpt-4o", None));
         cfg
     }
 
@@ -1058,28 +1017,53 @@ pub(crate) mod fixtures {
         cfg
     }
 
-    /// An alias spanning an in-process candidate and a hosted one, in that
-    /// order. Usable in *both* builds: with `local-llm` the first candidate
-    /// wins, and without it the alias falls through to the hosted one -- which
-    /// is the case naming `onprem` directly cannot express.
+    /// An alias spanning an unreachable candidate and a reachable one, in
+    /// that order. The alias falls through to the reachable one -- which is
+    /// the case naming `unreachable` directly cannot express.
     pub(crate) fn mixed_alias_config() -> Config {
-        let mut cfg = local_model_config();
+        let mut cfg = keyless_model_config();
         cfg.models
-            .insert("either".to_string(), Model::alias(["onprem", "fast"]));
+            .insert("either".to_string(), Model::alias(["unreachable", "fast"]));
         cfg
     }
 
-    /// [`test_config`] plus an in-process model, `onprem`. Usable only in a
-    /// `local-llm` build, which is exactly what makes it useful in both: one
-    /// build resolves it, the other must refuse it with the feature-disabled
-    /// error rather than "unknown model".
-    pub(crate) fn local_model_config() -> Config {
+    /// The env var [`keyless_model_config`]'s provider points at. No test sets
+    /// it, so a model behind it is unreachable in every run.
+    pub(crate) const NEVER_SET_KEY_VAR: &str = "OUTRIG_TEST_SUBAGENT_NEVER_SET_KEY";
+
+    /// [`test_config`] plus `unreachable`, a model whose provider's api-key
+    /// variable is never set: a guaranteed failure, which the schema must not
+    /// advertise and a launch must still explain in its own terms.
+    pub(crate) fn keyless_model_config() -> Config {
         let mut cfg = test_config();
-        cfg.providers
-            .insert("local".to_string(), LlmProvider::Mistralrs {});
-        let mut model = Model::new("local");
-        model.model_id = Some("Qwen/Qwen2.5-7B-Instruct".to_string());
-        cfg.models.insert("onprem".to_string(), model);
+        cfg.providers.insert(
+            "keyless".to_string(),
+            discard_port_openai(NEVER_SET_KEY_VAR),
+        );
+        cfg.models.insert(
+            "unreachable".to_string(),
+            hosted_model("keyless", "gpt-4o", None),
+        );
+        cfg
+    }
+
+    /// [`test_config`] plus `claude`, a model on an Anthropic provider, so a
+    /// launch can cross provider styles. A separate fixture for the reason
+    /// [`alias_config`] gives.
+    pub(crate) fn cross_style_config() -> Config {
+        let mut cfg = test_config();
+        cfg.providers.insert(
+            "anthropic".to_string(),
+            LlmProvider::anthropic(
+                "http://127.0.0.1:9",
+                ApiKeyRef::parse(&format!("${{{KEY_VAR}}}")).expect("api-key ref parses"),
+                AnthropicOptions::new().with_request_timeout_secs(1),
+            ),
+        );
+        cfg.models.insert(
+            "claude".to_string(),
+            hosted_model("anthropic", "claude-sonnet-4-6", None),
+        );
         cfg
     }
 
@@ -1129,7 +1113,6 @@ pub(crate) mod fixtures {
                     // it rather than the full one.
                     retry_budget_secs,
                 },
-                model_weights: None,
                 max_tokens: None,
             }],
             alias_name: None,
@@ -1154,12 +1137,8 @@ pub(crate) mod fixtures {
             resolved: test_resolved(subagent_depth_max),
             cfg: Arc::new(cfg),
             mcp_tools: Vec::new(),
-            cache_root: PathBuf::from("."),
-            repo_root: PathBuf::from("."),
             log_dir: log_dir.path().to_path_buf(),
             depth,
-            #[cfg(feature = "local-llm")]
-            registry: Arc::new(crate::llm::LlmRegistry::new()),
         });
         (registry, log_dir)
     }
@@ -2310,29 +2289,20 @@ mod tests {
     }
 
     /// An alias is usable when *any* candidate is, which is what lets one name
-    /// span an in-process model and a hosted one. Naming `onprem` directly is
-    /// refused in this build; naming the alias that lists it is not.
-    #[cfg(not(feature = "local-llm"))]
+    /// span a model this machine cannot reach and one it can. Naming
+    /// `unreachable` directly is refused; naming the alias that lists it is not.
     #[test]
-    fn an_alias_over_a_local_and_a_remote_candidate_is_usable_without_local_llm() {
+    fn an_alias_over_an_unreachable_and_a_reachable_candidate_is_usable() {
         let cfg = fixtures::mixed_alias_config();
         let usable = usable_model_names(&cfg);
         assert!(
             usable.contains(&"either".to_string()),
-            "the alias falls through to its hosted candidate: {usable:?}"
+            "the alias falls through to its reachable candidate: {usable:?}"
         );
         assert!(
-            !usable.contains(&"onprem".to_string()),
-            "naming the in-process model directly is still not offered: {usable:?}"
+            !usable.contains(&"unreachable".to_string()),
+            "naming the unreachable model directly is still not offered: {usable:?}"
         );
-    }
-
-    /// With the feature on, the same alias prefers its first candidate.
-    #[cfg(feature = "local-llm")]
-    #[test]
-    fn an_alias_over_a_local_and_a_remote_candidate_prefers_the_local_one() {
-        let cfg = fixtures::mixed_alias_config();
-        assert!(usable_model_names(&cfg).contains(&"either".to_string()));
     }
 
     /// An unset api-key variable is a guaranteed failure, so a model behind one
@@ -2340,21 +2310,7 @@ mod tests {
     /// candidates with, which is why the two cannot drift.
     #[test]
     fn a_model_whose_key_is_unset_is_not_advertised() {
-        let mut cfg = fixtures::test_config();
-        cfg.providers.insert(
-            "keyless".to_string(),
-            outrig::config::LlmProvider::openai(
-                "http://127.0.0.1:9",
-                outrig::config::ApiKeyRef::parse("${OUTRIG_TEST_SUBAGENT_NEVER_SET_KEY}")
-                    .expect("api-key ref parses"),
-                outrig::config::OpenAiOptions::new().with_request_timeout_secs(1),
-            ),
-        );
-        let mut model = outrig::config::Model::new("keyless");
-        model.identifier = Some("gpt-4o".to_string());
-        cfg.models.insert("unreachable".to_string(), model);
-
-        let usable = usable_model_names(&cfg);
+        let usable = usable_model_names(&fixtures::keyless_model_config());
         assert_eq!(
             usable,
             vec!["fast".to_string(), "smart".to_string()],
@@ -2362,47 +2318,41 @@ mod tests {
         );
     }
 
-    /// A local model in a default build must fail with the feature-disabled
-    /// error, not "unknown model" -- the remedy is a rebuild, and collapsing the
-    /// two would hide that. The schema omits the name; the error path does not.
-    #[cfg(not(feature = "local-llm"))]
+    /// A model behind an unset api-key variable must fail naming that
+    /// variable, not as "unknown model" -- the remedy is to export it, and
+    /// collapsing the two would hide that. The schema omits the name; the
+    /// error path does not.
     #[tokio::test(start_paused = true)]
-    async fn local_model_in_default_build_fails_feature_disabled() {
+    async fn an_unreachable_model_fails_with_its_own_cause() {
         let (registry, _log_dir) = registry_with(
-            local_model_config(),
+            fixtures::keyless_model_config(),
             2,
             outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
         );
 
         assert!(
-            !usable_model_names(registry.config()).contains(&"onprem".to_string()),
+            !usable_model_names(registry.config()).contains(&"unreachable".to_string()),
             "a name that cannot resolve must not be advertised"
         );
         let err = registry
-            .launch("audit", Some("onprem"), None, "work".to_string())
+            .launch("audit", Some("unreachable"), None, "work".to_string())
             .await
-            .expect_err("no local-llm feature");
-        assert!(err.contains("local-llm"), "got: {err}");
+            .expect_err("the api-key variable is unset");
+        assert!(err.contains(fixtures::NEVER_SET_KEY_VAR), "got: {err}");
         assert!(
             !err.contains("no usable model named"),
-            "the feature-disabled cause must not be collapsed into unknown: {err}"
+            "the unset-key cause must not be collapsed into unknown: {err}"
         );
     }
 
     /// Crossing provider *styles* needs no new dispatch: `RigAgent` is already
-    /// a runtime-dispatched enum, so a hosted parent naming an in-process model
-    /// just resolves to the mistralrs arm.
-    ///
-    /// Stops at resolution deliberately. Going on to `build_agent` would load
-    /// multi-gigabyte weights (or try to fetch them), which no unit test can
-    /// afford; what this pins down is that the resolution reaches the
-    /// `Mistralrs` provider with weights attached, which is the only input the
-    /// dispatch reads.
-    #[cfg(feature = "local-llm")]
+    /// a runtime-dispatched enum, so an OpenAI parent naming an Anthropic model
+    /// just resolves to, and builds, the Anthropic arm. Building does no I/O,
+    /// so the test can go all the way to the agent.
     #[tokio::test(start_paused = true)]
     async fn subagent_may_cross_provider_style() {
         let (registry, _log_dir) = registry_with(
-            local_model_config(),
+            fixtures::cross_style_config(),
             2,
             outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
         );
@@ -2414,81 +2364,20 @@ mod tests {
             "the parent is hosted"
         );
 
-        let resolved = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
+        let resolved = resolve_launch_model(&registry.ctx, Some("claude")).expect("resolves");
         assert!(matches!(
             resolved.provider(),
-            crate::llm::ResolvedProvider::Mistralrs
+            crate::llm::ResolvedProvider::Anthropic { .. }
+        ));
+        assert!(matches!(
+            crate::llm::build_agent(&resolved, Vec::new())
+                .await
+                .expect("an anthropic agent builds without I/O"),
+            crate::llm::RigAgent::Anthropic { .. }
         ));
         assert!(
-            resolved.model_weights().is_some(),
-            "the mistralrs arm carries the weight spec build_agent loads from"
-        );
-        assert!(
-            usable_model_names(registry.config()).contains(&"onprem".to_string()),
-            "a local model is advertised in a local-llm build"
-        );
-    }
-
-    /// Two subagents naming the same in-process model share one loaded engine:
-    /// `LlmRegistry` lives on the context and is keyed by model name, so both
-    /// launches reach one slot and only the first pays for the load.
-    ///
-    /// The engine is a local stub rather than a real `MistralrsModel`, which
-    /// wraps a multi-gigabyte `MistralRs`: the sharing is a property of the
-    /// registry's keying, and the key is what the two resolutions agree on. The
-    /// context's own registry is asked for `is_loaded` too, since that is the
-    /// guard on the cold-load announcement.
-    #[cfg(feature = "local-llm")]
-    #[tokio::test(start_paused = true)]
-    async fn two_subagents_on_one_local_model_share_one_engine() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        #[derive(Debug)]
-        struct Stub;
-
-        let (registry, _log_dir) = registry_with(
-            local_model_config(),
-            2,
-            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
-        );
-        let first = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
-        let second = resolve_launch_model(&registry.ctx, Some("onprem")).expect("resolves");
-        assert_eq!(
-            first.model_name(),
-            second.model_name(),
-            "both launches must reach the registry under one key"
-        );
-        assert!(
-            !registry.ctx.registry.is_loaded(first.model_name()),
-            "nothing is loaded yet, so the first launch announces a cold load"
-        );
-
-        let engines: crate::llm::LlmRegistry<Stub> = crate::llm::LlmRegistry::new();
-        let loads = AtomicUsize::new(0);
-        let one = engines
-            .get_or_init(first.model_name(), || async {
-                loads.fetch_add(1, Ordering::SeqCst);
-                Ok(Stub)
-            })
-            .await
-            .expect("first load");
-        let two = engines
-            .get_or_init(second.model_name(), || async {
-                loads.fetch_add(1, Ordering::SeqCst);
-                Ok(Stub)
-            })
-            .await
-            .expect("the second launch finds the slot");
-
-        assert!(Arc::ptr_eq(&one, &two), "one engine, shared");
-        assert_eq!(
-            loads.load(Ordering::SeqCst),
-            1,
-            "two subagents on one model must not load the weights twice"
-        );
-        assert!(
-            engines.is_loaded(first.model_name()),
-            "a loaded model must not be announced as cold again"
+            usable_model_names(registry.config()).contains(&"claude".to_string()),
+            "a model on another style is advertised like any other"
         );
     }
 

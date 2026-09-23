@@ -140,7 +140,6 @@ pub async fn execute(
         llm_session: false,
         explicit_session_dir: args.session_dir.as_deref(),
         network_mode_override: args.network,
-        device_override: None,
         volumes: &args.volume,
         // show-merged plans placement (including label merges) without
         // launching sidecar containers.

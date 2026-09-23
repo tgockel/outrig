@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The in-process LLM backend: the `local-llm` Cargo feature and `style = "mistralrs"`**,
+  together with the `cuda` and `metal` features that picked a backend for it, the six
+  `[models.<name>]` weight keys (`model-id`, `model-path`, `model-file`, `revision`,
+  `context-length`, `device`), the top-level `model-cache-root`, `outrig run --device`, and
+  `outrig init`'s weight-source prompts and HuggingFace file picker. All of it was deprecated in
+  0.2.0, the release that carried the warning.
+
+  A config that still names the style or sets any of those keys now fails to load: a parse
+  error naming the offending value, on every command, `outrig build` included. A build without
+  the feature used to parse such a config and fail only when a model was used. `--device` is an
+  unknown argument, and `--features local-llm` is a Cargo error. With the only streaming
+  backend gone, every reply prints when its turn finishes.
+
+  Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com), vLLM, or
+  `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
+  `base-url`. The recipe, including the tool-calling flags each server needs, is in
+  [Local models](../../doc/concepts/llm-providers.md#local-models).
+
+  What goes with it is a property outrig used to claim: that a question to a local model never
+  leaves the outrig process. A local server serializes each request across a socket. The
+  deprecation retracted the argument that this mattered; the removal takes away the last thing
+  that provided it. The default build is unchanged, since the backend was never in it; the
+  lockfile loses the several hundred crates that only `--features local-llm` pulled in.
+
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
 The first release since 0.1.0. Everything below is measured against **0.1.0**, and
@@ -354,7 +380,7 @@ Config file names and locations are unchanged, and no key not listed here change
   Run local models under an OpenAI-compatible server -- [Ollama](https://ollama.com), vLLM, or
   `llama.cpp`'s server -- and point a `style = "openai"` provider at its `localhost`
   `base-url`. Migration, before and after, is in
-  [In-process LLMs](../../doc/concepts/in-process-llm.md).
+  [Local models](../../doc/concepts/llm-providers.md#local-models).
 
   Two consequences worth stating plainly. Running a local model well is a problem with good
   dedicated tools, and outrig was a worse place to solve it: the backend roughly triples the

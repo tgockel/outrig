@@ -39,8 +39,8 @@ use crate::llm;
 use crate::paths::{default_session_root, repo_root_from_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
-    Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
-    SidecarOnFailure, SidecarStart, SidecarView,
+    Config, ImageConfig, McpServerSpec, MountConfig, NetworkMode, SidecarOnFailure, SidecarStart,
+    SidecarView,
 };
 use outrig::container::{
     Container, ContainerCreateOptions, ContainerLaunchSpec, ContainerMount, ContainerWorkspace,
@@ -120,7 +120,6 @@ pub struct SessionSetupArgs<'a> {
     pub llm_session: bool,
     pub explicit_session_dir: Option<&'a Path>,
     pub network_mode_override: Option<NetworkMode>,
-    pub device_override: Option<MistralrsDeviceSpec>,
     /// Extra `--volume HOST:CONTAINER[:ro|rw]` mounts appended to the
     /// container's workspace mounts. Rejected with `--attach`.
     pub volumes: &'a [CliVolume],
@@ -367,10 +366,8 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     } else if args.llm_session {
         let resolved = llm::resolve_agent_with_overrides(
             &cfg,
-            &repo_root,
             args.agent_flag.or(cfg.default_agent.as_deref()),
             args.model_override,
-            args.device_override,
         )?;
         (resolved.agent_name.clone(), resolved.image.clone())
     } else {

@@ -35,9 +35,8 @@ pub async fn run(
 ) -> Result<()> {
     let global_path = global_config_path(global_override);
     let mut prompt = prompt::auto();
-    let mut hf = crate::hf::auto();
     let (repo_root, bootstrapped_name) =
-        init_repo::resolve_or_bootstrap(cwd, &global_path, &mut prompt, &mut hf).await?;
+        init_repo::resolve_or_bootstrap(cwd, &global_path, &mut prompt).await?;
     // CLI-provided name wins; otherwise reuse whatever the bootstrap
     // already asked for.
     let effective = name.or(bootstrapped_name);

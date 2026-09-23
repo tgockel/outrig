@@ -5,7 +5,6 @@ default-image      = "coding"
 default-agent      = "coding"
 default-model      = "fast"
 session-root       = "/var/lib/outrig/sessions"
-model-cache-root   = "/var/cache/outrig/models"
 tool-call-max      = 100
 tool-result-max    = 524288
 subagent-depth-max = 4
@@ -28,7 +27,9 @@ base-url = "https://api.anthropic.com"
 api-key  = "${ANTHROPIC_API_KEY}"
 
 [providers.local]
-style = "mistralrs"
+style    = "openai"
+base-url = "http://127.0.0.1:11434/v1"
+api-key  = "${OLLAMA_API_KEY}"
 
 [models.fast]
 provider   = "openai"
@@ -43,16 +44,9 @@ provider   = "anthropic"
 identifier = "claude-sonnet-4-6"
 max-tokens = 16384
 
-[models.phi3-fast]
+[models.local-fast]
 provider   = "local"
-model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"
-device     = "cpu"
-
-[models.llama-local]
-provider       = "local"
-model-path     = ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
-context-length = 4096
+identifier = "qwen3:4b"
 
 # One name for one model: repoint this line and every agent naming `opus`
 # follows, with no other edit.
@@ -62,7 +56,7 @@ alias = "claude"
 # One name for a set of equivalents, in preference order. The first candidate
 # this build is credentialed for wins.
 [models.any-fast]
-alias = ["fast", "phi3-fast"]
+alias = ["fast", "local-fast"]
 
 [agents.coding]
 image              = "coding"

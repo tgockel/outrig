@@ -640,7 +640,6 @@ fn a_nested_conflict_names_every_offending_field() {
     let mut both = Model::alias(["leaf"]);
     both.identifier = Some("gpt-4o".to_string());
     both.max_tokens = Some(4096);
-    both.device = Some("cpu".to_string());
     cfg.models.insert("bad".to_string(), both);
     cfg.models.insert("root".to_string(), Model::alias(["bad"]));
 
@@ -648,7 +647,7 @@ fn a_nested_conflict_names_every_offending_field() {
     match &err {
         ConfigValidationError::ModelSourceConflict { model, fields, .. } => {
             assert_eq!(model, "bad");
-            for expected in ["alias", "identifier", "device", "max-tokens"] {
+            for expected in ["alias", "identifier", "max-tokens"] {
                 assert!(
                     fields.contains(&expected),
                     "missing {expected:?}: {fields:?}"

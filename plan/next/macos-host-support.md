@@ -51,8 +51,9 @@ absent by construction rather than broken at runtime.
 - **A decision on `view = "primary"`.** The helper cross-compiles fine from a macOS host, but
   it is launched with `--userns=container:<target>` and needs the primary's namespaces, which
   live in the VM. Whether that composes through podman machine is the open question.
-- **CI.** A `macos-latest` check job, which `plan/next/ci-configuration-coverage.md` wants
-  anyway for the `local-llm,metal` dependency block. One job covers both.
+- **CI.** A `macos-latest` check job. `plan/next/ci-configuration-coverage.md` used to want one
+  for the `local-llm,metal` dependency block too, but that block went with the in-process
+  backend, so this entry is now the only reason for it.
 - **Docs.** `README.md`, `CONTRIBUTING.md`, `doc/quickstart.md`, and
   `crates/outrig-cli/src/mcp_self/docs/concepts/mcp-servers.md` all state Linux-only today;
   each needs the new story.

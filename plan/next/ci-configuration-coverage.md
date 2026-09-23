@@ -5,11 +5,10 @@
 > compile-only `e2e` matrix row this entry's efficiency items were written about; see the two
 > notes below. The `cargo publish --dry-run` item has **landed** too -- 0002-52 added a
 > `package` job; see the entry for it. What stays here: the generalizing `cargo hack
-> --each-feature` job, the MSRV check, and the sccache cleanup. The
-> `macos-latest` x `local-llm,metal` item **survives**: 0002-46 decided that 0.2.0 ships
-> `style = "mistralrs"` operational, so the feature and its macOS dependency block are still
-> real for at least this release. It evaporates with
-> `plan/next/remove-deprecated-local-llm.md`, not before.
+> --each-feature` job, the MSRV check, and the sccache cleanup. The `macos-latest` x
+> `local-llm,metal` item, the `cuda`/`metal` note, and the `local-llm` + `e2e` gap all
+> **evaporated** when the 0.3 line removed the in-process backend: the three features, the macOS
+> dependency block, and the ML dependency pins are gone.
 
 ## Context
 
@@ -20,29 +19,11 @@ configuration nobody builds. Several more are uncovered today, found while revie
 
 ## The generalizing fix
 
-A `cargo hack --each-feature --exclude-features cuda,metal` job fails automatically when a new
-feature is declared and left uncovered, instead of waiting for someone to notice. Note
-`--all-features` is **not** usable: it enables `cuda`, which needs `nvcc`.
+A `cargo hack --each-feature` job fails automatically when a new feature is declared and left
+uncovered, instead of waiting for someone to notice. `--all-features` is usable as well now:
+the `cuda` feature that needed `nvcc` went with the in-process backend.
 
 ## Remaining uncovered configurations
-
-**macOS / `metal` is compiled by nothing.** Every job is `runs-on: ubuntu-latest`, and the only
-workflows are `ci.yml` and `docs.yml`. `crates/outrig-cli/Cargo.toml`'s macOS-only dependency
-block hardcodes `candle-core = "=0.10.2"` and `mistralrs-core = "=0.8.1"` rather than inheriting
-from `[workspace.dependencies]`, which carries the same pins today -- nothing detects drift when
-the workspace pins move. Meanwhile `doc/concepts/in-process-llm.md` advertises
-`cargo build --features "local-llm metal"` as supported. A `macos-latest` x `local-llm,metal`
-check job covers both. Highest-value gap of the set.
-
-**`cuda` and `metal` features themselves are low-risk.** Both are consumed only via `cfg!()`
-(`outrig-cli/src/llm.rs`, `build.rs`), never `#[cfg]`, so neither gates an item at compile time.
-On Linux `metal = []` pulls no deps, so `--features local-llm,metal` is compile-identical to
-`local-llm`. The real exposure is the macOS dependency block above, not these flags.
-
-**`local-llm` + `e2e` together is compiled by neither row.** No test file is gated on both, so
-no target is orphaned right now, but `--features local-llm` is the configuration users actually
-install, and its e2e binaries would link against a lib built with a different feature set than
-either row produces. Cheap to close via cargo-hack.
 
 **`rust-version = "1.87"` is never verified.** All jobs use `dtolnay/rust-toolchain@stable`, so a
 dependency bump or newly stabilized API can silently raise the true MSRV above the declared one.
@@ -86,7 +67,7 @@ them. So the e2e row cold-builds the same ~222 dependency crates the `default` r
 concurrently, then stores a second multi-hundred-MB copy against the repo's 10 GB Actions budget,
 adding eviction pressure on the other buckets. Fix: a `cache_key` matrix field where `default`
 and `e2e` share `"default"`, plus `save-if: ${{ matrix.name != 'e2e' }}` so the two concurrent
-rows don't race to save the same key. `local-llm` genuinely needs its own bucket (3906 nodes).
+rows don't race to save the same key.
 
 **`mozilla-actions/sccache-action` is dead weight, now paid three times.** Nothing sets
 `RUSTC_WRAPPER=sccache` or `SCCACHE_GHA_ENABLED=true` anywhere in `.github/`, and there is no root

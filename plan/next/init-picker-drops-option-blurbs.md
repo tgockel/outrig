@@ -26,8 +26,8 @@ exists only on the piped / CI backend, and only for a user who thinks to type `?
 Found while deprecating the in-process LLM backend: the `mistralrs` style's blurb was given a
 `DEPRECATED (will be removed)` prefix and reached nobody on a terminal. That commit worked
 around it by appending the notice to `STYLE_FIELD.description`, which both backends do print.
-The workaround is fine for one field and does not scale -- it puts per-option text in the
-field-level description.
+Removing the backend on the 0.3 line deleted that row and reverted the workaround with it, so
+nothing now works around the bug: every blurb is invisible on a terminal again.
 
 ## Goal
 
@@ -38,9 +38,6 @@ Make a TTY user see the same per-option help a `?`-typing piped user sees.
 - `ask_select` / `ask_multiselect` build display labels that carry the blurb (e.g.
   `format!("{value}  --  {blurb}")`) while still returning the option *index*, so every caller's
   `field.options[idx]` lookup is unchanged.
-- Revert the `STYLE_FIELD.description` workaround in `crates/outrig-cli/src/config_init.rs` once
-  the `mistralrs` blurb renders on its own. The `DEPRECATED (will be removed)` prefix in `STYLES`
-  already says it.
 - A test that a blurb reaches the rendered item list. `DialoguerPrompt` drives a real terminal,
   so the testable seam is whatever builds the label strings -- extract it as a free function and
   test that, rather than trying to drive `FuzzySelect`.
@@ -54,14 +51,13 @@ Make a TTY user see the same per-option help a `?`-typing piped user sees.
    truncating the blurb to its first clause. Check how long the real blurbs are first --
    `config_init::STYLES` blurbs are two sentences, which is already too long for a picker row.
 
-2. **Whether `description` should keep carrying option-level text -- Recommended: no.** Once
-   blurbs render, `description` goes back to describing the field. That is the cleanup the first
-   deliverable's revert performs.
+2. **Whether `description` should carry option-level text -- Settled: no.** The one workaround
+   that put option text there went with the in-process backend, and `description` describes the
+   field again. Keep it that way once blurbs render.
 
 ## Dependencies
 
-None. Independent of `plan/next/remove-deprecated-local-llm.md`, though that removal deletes the
-`mistralrs` row and with it the specific instance that surfaced this.
+None.
 
 ## See also
 

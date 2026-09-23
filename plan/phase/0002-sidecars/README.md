@@ -69,7 +69,7 @@ rationale.
 - macOS and Windows hosts. Both stay declared and unreachable; see
   `plan/next/macos-host-support.md` and `plan/next/windows-host-support.md`.
 - Removing the deprecated in-process local-LLM backend. 0.2.0 decides what the deprecated
-  surface does; the removal itself is `plan/next/remove-deprecated-local-llm.md`.
+  surface does; the removal itself landed on the 0.3 line (`version/0.3.x`).
 - The post-0.2.0 buffer that the release audit surfaced. It is catalogued under
   "Not queued, deliberately" in `plan/todo/README.md`, and is deferred by decision rather than
   by omission.

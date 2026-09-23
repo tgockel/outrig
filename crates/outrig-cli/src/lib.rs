@@ -25,7 +25,7 @@ macro_rules! internal_modules {
 
 // Exactly the modules some integration test names.
 internal_modules! {
-    cli, config_init, error, hf, image_setup, init, llm, repl, rig_tool, session,
+    cli, config_init, error, image_setup, init, llm, repl, rig_tool, session,
     session_tool,
 }
 

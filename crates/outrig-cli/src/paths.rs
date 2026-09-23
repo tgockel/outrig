@@ -109,16 +109,6 @@ pub(crate) fn builtin_image_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
-pub(crate) fn model_cache_root(from_config: Option<&Path>) -> PathBuf {
-    if let Some(p) = from_config {
-        return p.to_path_buf();
-    }
-    if let Some(dirs) = ProjectDirs::from("", "", "outrig") {
-        return dirs.cache_dir().join("models");
-    }
-    std::env::temp_dir().join("outrig-models")
-}
-
 pub(crate) fn default_session_root() -> PathBuf {
     if let Some(dirs) = ProjectDirs::from("", "", "outrig") {
         return dirs.data_dir().join("sessions");

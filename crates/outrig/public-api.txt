@@ -105,25 +105,6 @@ pub outrig::config::ConfigValidationError::McpUnknownSidecar::sidecar: alloc::st
 pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint
 pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint::image: alloc::string::String
 pub outrig::config::ConfigValidationError::McpViewNotInlineEntrypoint::server: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsBothModelSources
-pub outrig::config::ConfigValidationError::MistralrsBothModelSources::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsDeviceInvalid
-pub outrig::config::ConfigValidationError::MistralrsDeviceInvalid::device: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsDeviceInvalid::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId
-pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId::field: &'static str
-pub outrig::config::ConfigValidationError::MistralrsExtraFieldRequiresModelId::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsMissingModelSource
-pub outrig::config::ConfigValidationError::MistralrsMissingModelSource::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsModelHasRemoteField
-pub outrig::config::ConfigValidationError::MistralrsModelHasRemoteField::field: &'static str
-pub outrig::config::ConfigValidationError::MistralrsModelHasRemoteField::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile
-pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsModelIdMissingFile::model_id: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsModelPathMissing
-pub outrig::config::ConfigValidationError::MistralrsModelPathMissing::model: alloc::string::String
-pub outrig::config::ConfigValidationError::MistralrsModelPathMissing::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::ModelAliasCycle
 pub outrig::config::ConfigValidationError::ModelAliasCycle::cycle: alloc::string::String
 #[non_exhaustive] pub outrig::config::ConfigValidationError::ModelAliasEmpty
@@ -131,8 +112,6 @@ pub outrig::config::ConfigValidationError::ModelAliasEmpty::model: alloc::string
 #[non_exhaustive] pub outrig::config::ConfigValidationError::ModelAliasTooDeep
 pub outrig::config::ConfigValidationError::ModelAliasTooDeep::max: usize
 pub outrig::config::ConfigValidationError::ModelAliasTooDeep::model: alloc::string::String
-pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute
-pub outrig::config::ConfigValidationError::ModelCacheRootNotAbsolute::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::ModelSourceConflict
 pub outrig::config::ConfigValidationError::ModelSourceConflict::fields: alloc::vec::Vec<&'static str>
 pub outrig::config::ConfigValidationError::ModelSourceConflict::model: alloc::string::String
@@ -140,10 +119,6 @@ pub outrig::config::ConfigValidationError::ModelSourceConflict::model: alloc::st
 pub outrig::config::ConfigValidationError::ModelSourceMissing::model: alloc::string::String
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid
 pub outrig::config::ConfigValidationError::NetworkPolicyInvalid::message: alloc::string::String
-#[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField
-pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::field: &'static str
-pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::model: alloc::string::String
-pub outrig::config::ConfigValidationError::RemoteModelHasMistralrsField::style: &'static str
 #[non_exhaustive] pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::model: alloc::string::String
 pub outrig::config::ConfigValidationError::RemoteModelMissingIdentifier::style: &'static str
@@ -300,7 +275,6 @@ pub outrig::config::LlmProvider::Anthropic::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::Anthropic::base_url: alloc::string::String
 pub outrig::config::LlmProvider::Anthropic::request_timeout_secs: core::option::Option<u64>
 pub outrig::config::LlmProvider::Anthropic::retry_budget_secs: core::option::Option<u64>
-pub outrig::config::LlmProvider::Mistralrs
 #[non_exhaustive] pub outrig::config::LlmProvider::OpenAi
 pub outrig::config::LlmProvider::OpenAi::api_key: outrig::config::ApiKeyRef
 pub outrig::config::LlmProvider::OpenAi::base_url: alloc::string::String
@@ -337,17 +311,6 @@ pub fn outrig::config::McpServerSpec::with_args(self, impl core::iter::traits::c
 pub fn outrig::config::McpServerSpec::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> Self
 pub fn outrig::config::McpServerSpec::with_sidecar(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn outrig::config::McpServerSpec::with_view(self, outrig::config::SidecarView) -> Self
-#[non_exhaustive] pub enum outrig::config::MistralrsDeviceSpec
-pub outrig::config::MistralrsDeviceSpec::Cpu
-pub outrig::config::MistralrsDeviceSpec::Cuda(usize)
-pub outrig::config::MistralrsDeviceSpec::Metal
-impl outrig::config::MistralrsDeviceSpec
-pub const outrig::config::MistralrsDeviceSpec::EXPECTED: &'static str
-impl core::fmt::Display for outrig::config::MistralrsDeviceSpec
-pub fn outrig::config::MistralrsDeviceSpec::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::str::traits::FromStr for outrig::config::MistralrsDeviceSpec
-pub type outrig::config::MistralrsDeviceSpec::Err = outrig::config::MistralrsDeviceParseError
-pub fn outrig::config::MistralrsDeviceSpec::from_str(&str) -> core::result::Result<Self, Self::Err>
 #[non_exhaustive] pub enum outrig::config::ModelSourceRef<'a>
 #[non_exhaustive] pub outrig::config::ModelSourceRef::Alias
 pub outrig::config::ModelSourceRef::Alias::targets: &'a [alloc::string::String]
@@ -440,7 +403,6 @@ pub outrig::config::Config::default_agent: core::option::Option<alloc::string::S
 pub outrig::config::Config::default_image: core::option::Option<alloc::string::String>
 pub outrig::config::Config::default_model: core::option::Option<alloc::string::String>
 pub outrig::config::Config::images: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ImageConfig>
-pub outrig::config::Config::model_cache_root: core::option::Option<std::path::PathBuf>
 pub outrig::config::Config::models: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::Model>
 pub outrig::config::Config::network: outrig::config::NetworkConfig
 pub outrig::config::Config::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::LlmProvider>
@@ -489,25 +451,14 @@ pub fn outrig::config::ImageConfig::from_image_name(impl core::convert::Into<all
 pub fn outrig::config::ImageConfig::resolved_build_paths(&self, &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf)
 pub fn outrig::config::ImageConfig::set_build_paths(&mut self, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>)
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
-#[non_exhaustive] pub struct outrig::config::MistralrsDeviceParseError
-impl core::error::Error for outrig::config::MistralrsDeviceParseError
-impl core::fmt::Display for outrig::config::MistralrsDeviceParseError
-pub fn outrig::config::MistralrsDeviceParseError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::config::Model
 pub outrig::config::Model::alias: core::option::Option<alloc::vec::Vec<alloc::string::String>>
-pub outrig::config::Model::context_length: core::option::Option<u32>
-pub outrig::config::Model::device: core::option::Option<alloc::string::String>
 pub outrig::config::Model::identifier: core::option::Option<alloc::string::String>
 pub outrig::config::Model::max_tokens: core::option::Option<u32>
-pub outrig::config::Model::model_file: core::option::Option<alloc::vec::Vec<alloc::string::String>>
-pub outrig::config::Model::model_id: core::option::Option<alloc::string::String>
-pub outrig::config::Model::model_path: core::option::Option<std::path::PathBuf>
 pub outrig::config::Model::provider: core::option::Option<alloc::string::String>
-pub outrig::config::Model::revision: core::option::Option<alloc::string::String>
 impl outrig::config::Model
 pub fn outrig::config::Model::alias<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn outrig::config::Model::new(impl core::convert::Into<alloc::string::String>) -> Self
-pub fn outrig::config::Model::resolved_model_path(&self, &std::path::Path) -> core::option::Option<std::path::PathBuf>
 pub fn outrig::config::Model::source(&self) -> outrig::config::ModelSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::MountConfig
 impl outrig::config::MountConfig

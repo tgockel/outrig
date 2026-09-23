@@ -19,7 +19,6 @@ use std::path::Path;
 
 use crate::config_init;
 use crate::error::Result;
-use crate::hf::{self, HfTreeFetcher};
 use crate::image_setup;
 use crate::init::prompt::{Field, PromptSource};
 use crate::paths::global_config_path;
@@ -27,20 +26,17 @@ use crate::paths::global_config_path;
 pub async fn run(force: bool, global_override: Option<&Path>) -> Result<()> {
     let cwd = crate::paths::current_dir()?;
     let mut prompt = prompt::auto();
-    let mut hf = hf::auto();
-    run_with(force, global_override, &cwd, &mut prompt, &mut hf).await
+    run_with(force, global_override, &cwd, &mut prompt).await
 }
 
 /// Drives the three-phase flow against an arbitrary `PromptSource`.
 /// `cwd` anchors the repo-config phase (no walk-up; init is meant for
-/// initial setup of the directory you're standing in). `hf` is the
-/// HuggingFace tree-listing client used by mistralrs `model-id` prompts.
+/// initial setup of the directory you're standing in).
 pub async fn run_with(
     force: bool,
     global_override: Option<&Path>,
     cwd: &Path,
     prompt: &mut impl PromptSource,
-    hf: &mut impl HfTreeFetcher,
 ) -> Result<()> {
     // Phase 1: global config.
     let global_path = global_config_path(global_override);
@@ -54,14 +50,14 @@ pub async fn run_with(
             "[outrig] no global config found at {} -- let's create one.",
             global_path.display()
         );
-        config_init::run_with(force, &global_path, prompt, hf).await?;
+        config_init::run_with(force, &global_path, prompt).await?;
         eprintln!("[outrig] wrote {}", global_path.display());
     }
 
     // Phase 2: repo config. Returns the bootstrapped image name (if
     // we wrote the config) so phase 3's first image-add can skip its
     // name prompt.
-    let mut bootstrapped_name = repo::ensure(cwd, &global_path, prompt, hf).await?;
+    let mut bootstrapped_name = repo::ensure(cwd, &global_path, prompt).await?;
 
     // Phase 3: image loop. The gate prompt is skipped on the first
     // iteration when phase 2 just bootstrapped an image -- the user

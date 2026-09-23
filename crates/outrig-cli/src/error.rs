@@ -49,8 +49,8 @@ pub enum CliError {
     ///
     /// `build_agent` supplies a fallback ceiling on the native Anthropic path,
     /// so this should not be reachable there. It stays for the paths that have
-    /// no such fallback: streaming, a provider arm added later, or a rig
-    /// upgrade that moves where the default comes from.
+    /// no such fallback: a provider arm added later, or a rig upgrade that
+    /// moves where the default comes from.
     #[error(
         "the model needs an output-token ceiling: set max-tokens under [models.<name>] \
          or [agents.<name>] in outrig.toml (the provider's API calls it `max_tokens`)"

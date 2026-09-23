@@ -1,12 +1,9 @@
 //! Schema tests for the `LlmProvider` tagged-enum (task 0001-13). Exercises
 //! parse + validate paths the existing `config_schema` and `config_merge`
-//! tests don't cover -- the mistralrs variant invariants, the typo error
-//! message, and `model-cache-root` validation.
+//! tests don't cover -- the per-style field rules, the typo error message,
+//! and the parse errors the removed in-process surface now produces.
 
-use std::fs;
-use std::path::{Path, PathBuf};
-
-use tempfile::tempdir;
+use std::path::Path;
 
 use outrig::config::{
     AnthropicOptions, ApiKeyRef, Config, ConfigValidationError, LlmProvider, OpenAiOptions,
@@ -165,319 +162,6 @@ provider = "claude"
     );
 }
 
-/// Every mistralrs weight field is rejected on an Anthropic model, and the
-/// diagnostic names `anthropic` rather than whichever remote style happens to
-/// share the rule.
-#[test]
-fn anthropic_model_rejects_every_mistralrs_field() {
-    for (field, line) in [
-        ("model-id", r#"model-id = "Qwen/Qwen2.5-7B-Instruct""#),
-        ("model-path", r#"model-path = "/tmp/model.gguf""#),
-        ("model-file", r#"model-file = "model.gguf""#),
-        ("revision", r#"revision = "main""#),
-        ("context-length", "context-length = 4096"),
-        ("device", r#"device = "cpu""#),
-    ] {
-        let cfg = parse(&format!(
-            r#"
-[providers.claude]
-style    = "anthropic"
-base-url = "https://api.anthropic.com"
-api-key  = "${{ANTHROPIC_API_KEY}}"
-
-[models.sonnet]
-provider   = "claude"
-identifier = "claude-sonnet-4-6"
-{line}
-"#
-        ));
-        let err = expect_validation_err(&cfg, None);
-        assert!(
-            matches!(
-                err,
-                ConfigValidationError::RemoteModelHasMistralrsField {
-                    ref model, style, field: got, ..
-                } if model == "sonnet" && style == "anthropic" && got == field
-            ),
-            "{field} should be rejected, got: {err:?}",
-        );
-    }
-}
-
-/// Unknown keys are an error everywhere in this schema, and `mistralrs` was
-/// the one place that was not true: as a unit variant it had no field set for
-/// `deny_unknown_fields` to check against, so a key copied off a remote
-/// provider -- or an outright typo -- parsed clean and was discarded.
-///
-/// Driven through `toml::from_str::<Config>` as well as `Config::load_from_str`
-/// on purpose. The loader wraps the deserializer and adds error handling of its
-/// own, so only the bare `Deserialize` path shows that the *derive* is what
-/// refuses the key. An empty braced variant either gives `deny_unknown_fields`
-/// something to check or it does not, and this is the test that says which.
-#[test]
-fn mistralrs_provider_rejects_unknown_keys() {
-    for key in [
-        "retry-budget-secs = 30",
-        "request-timeout-secs = 0",
-        r#"base-url = "https://localhost:1234/v1""#,
-        "not-a-real-key = 1",
-    ] {
-        let toml = format!(
-            r#"
-[providers.local]
-style = "mistralrs"
-{key}
-"#
-        );
-        let name = key.split_whitespace().next().expect("key name");
-
-        let err = Config::load_from_str(&toml).expect_err("unknown key should fail");
-        assert!(
-            err.to_string().contains(name),
-            "load_from_str should name {name}, got: {err}",
-        );
-
-        let err = toml::from_str::<Config>(&toml).expect_err("unknown key should fail");
-        assert!(
-            err.to_string().contains(name),
-            "toml::from_str should name {name}, got: {err}",
-        );
-    }
-}
-
-/// The bare provider is the whole of the surface -- `style` and nothing else --
-/// and giving the variant a field set did not change how it is written. It
-/// round-trips to an *equal* `Config`; byte-identical serializer output is a
-/// stronger claim than the schema makes.
-#[test]
-fn mistralrs_provider_alone_parses_and_round_trips() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-"#,
-    );
-    assert_eq!(cfg.providers["local"], LlmProvider::Mistralrs {});
-    cfg.validate(None).expect("validates");
-
-    let serialized = toml::to_string(&cfg).expect("serializes");
-    assert!(
-        serialized.contains(r#"style = "mistralrs""#),
-        "style should round-trip as the documented tag, got: {serialized}",
-    );
-    assert_eq!(cfg, Config::load_from_str(&serialized).expect("reparses"));
-}
-
-#[test]
-fn mistralrs_with_model_id_and_file_parses_and_validates() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
-"#,
-    );
-    cfg.validate(None).expect("validates");
-    let serialized = toml::to_string(&cfg).expect("serializes");
-    let again = Config::load_from_str(&serialized).expect("reserialized parses");
-    assert_eq!(cfg, again);
-}
-
-#[test]
-fn mistralrs_device_forms_parse_validate_and_round_trip() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.cpu]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
-device     = "cpu"
-
-[models.cuda_default]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
-device     = "cuda"
-
-[models.cuda_indexed]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
-device     = "cuda:1"
-
-[models.metal]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
-device     = "metal"
-"#,
-    );
-    cfg.validate(None).expect("all documented forms validate");
-    assert_eq!(cfg.models["cpu"].device.as_deref(), Some("cpu"));
-    assert_eq!(cfg.models["cuda_default"].device.as_deref(), Some("cuda"));
-    assert_eq!(cfg.models["cuda_indexed"].device.as_deref(), Some("cuda:1"));
-    assert_eq!(cfg.models["metal"].device.as_deref(), Some("metal"));
-
-    let serialized = toml::to_string(&cfg).expect("serializes");
-    let again = Config::load_from_str(&serialized).expect("reserialized parses");
-    assert_eq!(cfg, again);
-}
-
-#[test]
-fn mistralrs_invalid_device_fails_validate() {
-    for device in ["gpu", "cuda:", "cuda:abc", "metal:0"] {
-        let cfg = parse(&format!(
-            r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "qwen2.5-7b-instruct-q4_k_m.gguf"
-device     = "{device}"
-"#,
-        ));
-        let err = expect_validation_err(&cfg, None);
-        assert!(
-            matches!(
-                err,
-                ConfigValidationError::MistralrsDeviceInvalid {
-                    ref model,
-                    device: ref got,
-                } if model == "qwen" && got.as_str() == device
-            ),
-            "device {device:?} got: {err:?}",
-        );
-    }
-}
-
-#[test]
-fn mistralrs_model_id_without_model_file_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider = "local"
-model-id = "Qwen/Qwen2.5-7B-Instruct"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::MistralrsModelIdMissingFile {
-                ref model, ref model_id,
-            } if model == "qwen" && model_id == "Qwen/Qwen2.5-7B-Instruct"
-        ),
-        "got: {err:?}",
-    );
-}
-
-#[test]
-fn mistralrs_missing_both_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider = "local"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::MistralrsMissingModelSource { ref model }
-                if model == "qwen"
-        ),
-        "got: {err:?}",
-    );
-}
-
-#[test]
-fn mistralrs_with_both_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-path = "/tmp/model.gguf"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::MistralrsBothModelSources { ref model }
-                if model == "qwen"
-        ),
-        "got: {err:?}",
-    );
-}
-
-#[test]
-fn mistralrs_extra_field_without_model_id_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider   = "local"
-model-path = "/tmp/model.gguf"
-model-file = "weights.gguf"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::MistralrsExtraFieldRequiresModelId {
-                ref model, field,
-            } if model == "qwen" && field == "model-file"
-        ),
-        "got: {err:?}",
-    );
-}
-
-#[test]
-fn mistralrs_model_with_identifier_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.qwen]
-provider   = "local"
-identifier = "qwen-on-the-wire"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::MistralrsModelHasRemoteField { ref model, field }
-                if model == "qwen" && field == "identifier"
-        ),
-        "got: {err:?}",
-    );
-}
-
 #[test]
 fn openai_model_missing_identifier_fails_validate() {
     let cfg = parse(
@@ -502,196 +186,100 @@ provider = "openai"
     );
 }
 
-#[test]
-fn openai_model_with_weight_field_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.openai]
-style    = "openai"
-base-url = "https://api.openai.com/v1"
-api-key  = "${OPENAI_API_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "gpt-4o-mini"
-model-id   = "should-not-be-here"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::RemoteModelHasMistralrsField { ref model, style, field, .. }
-                if model == "fast" && style == "openai" && field == "model-id"
-        ),
-        "got: {err:?}",
-    );
-}
-
-#[test]
-fn openai_model_with_device_fails_validate() {
-    let cfg = parse(
-        r#"
-[providers.openai]
-style    = "openai"
-base-url = "https://api.openai.com/v1"
-api-key  = "${OPENAI_API_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "gpt-4o-mini"
-device     = "cuda"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
-    assert!(
-        matches!(
-            err,
-            ConfigValidationError::RemoteModelHasMistralrsField { ref model, style, field, .. }
-                if model == "fast" && style == "openai" && field == "device"
-        ),
-        "got: {err:?}",
-    );
-}
-
-/// Pin the unknown-style error so a teammate's typo (`mistral-rs` vs
-/// `mistralrs`) lands on a useful message rather than a cryptic serde dump.
-/// The contract is "the message names what the user typed and at least one
-/// legal variant"; we don't pin the exact phrasing so a serde minor-version
-/// rephrasing won't break the regression test.
+/// Pin the unknown-style error so a teammate's typo (`open-ai` vs `openai`)
+/// lands on a useful message rather than a cryptic serde dump. `open-ai` is the
+/// realistic one: it is what the kebab-case rule would have produced, which is
+/// why the variant carries an explicit rename. The contract is "the message
+/// names what the user typed and at least one legal variant"; we don't pin the
+/// exact phrasing so a serde minor-version rephrasing won't break the
+/// regression test.
 #[test]
 fn unknown_style_typo_useful_error() {
     let toml = r#"
 [providers.local]
-style    = "mistral-rs"
+style    = "open-ai"
 base-url = "https://localhost:1234/v1"
 api-key  = "${KEY}"
 "#;
     let err = Config::load_from_str(toml).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("mistral-rs"),
+        msg.contains("open-ai"),
         "error should quote the offending value, got: {msg}",
     );
     assert!(
-        msg.contains("openai") || msg.contains("mistralrs"),
+        msg.contains("openai") || msg.contains("anthropic"),
         "error should name at least one legal variant, got: {msg}",
     );
 }
 
+/// `style = "mistralrs"` was removed rather than kept parsing: the tagged enum
+/// refuses the tag at parse time, before validation, on every load path. Same
+/// contract as the typo above -- quote the value, name a legal style.
 #[test]
-fn model_cache_root_relative_fails_validate() {
-    let cfg = parse(
-        r#"
-model-cache-root = "models"
-"#,
-    );
-    let err = expect_validation_err(&cfg, None);
+fn the_removed_mistralrs_style_is_a_parse_error() {
+    let err = Config::load_from_str("[providers.local]\nstyle = \"mistralrs\"\n").unwrap_err();
     assert!(
-        matches!(
-            err,
-            ConfigValidationError::ModelCacheRootNotAbsolute { ref path }
-                if path.as_os_str() == "models"
-        ),
-        "got: {err:?}",
+        matches!(err, OutrigError::Config(_)),
+        "a parse error, not a validation error: {err:?}",
     );
-}
-
-#[test]
-fn model_cache_root_absolute_validates() {
-    let cfg = parse(
-        r#"
-model-cache-root = "/var/cache/outrig/models"
-"#,
-    );
-    cfg.validate(None).expect("absolute path is fine");
-}
-
-/// `model-path` is joined exactly once, by the library, against the repo root:
-/// the base `validate` checks below and the base the loader is handed. It is
-/// deliberately *not* the declaring file's directory, which is the rule for
-/// every other config-declared path -- see 0002-46's Decisions.
-#[test]
-fn resolved_model_path_joins_relative_and_leaves_absolute_alone() {
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.rel]
-provider   = "local"
-model-path = "models/local.gguf"
-
-[models.abs]
-provider   = "local"
-model-path = "/opt/weights/local.gguf"
-
-[models.from-hub]
-provider   = "local"
-model-id   = "Qwen/Qwen2.5-7B-Instruct"
-model-file = "q4.gguf"
-"#,
-    );
-    let root = Path::new("/srv/repo");
-    assert_eq!(
-        cfg.models["rel"].resolved_model_path(root),
-        Some(PathBuf::from("/srv/repo/models/local.gguf")),
-    );
-    assert_eq!(
-        cfg.models["abs"].resolved_model_path(root),
-        Some(PathBuf::from("/opt/weights/local.gguf")),
-    );
-    assert_eq!(cfg.models["from-hub"].resolved_model_path(root), None);
-}
-
-/// Mirrors how dockerfile/context paths are checked against `repo_root`:
-/// `model-path` is allowed to be relative; the existence check is anchored
-/// at the repo root.
-#[test]
-fn mistralrs_relative_model_path_resolves_against_repo_root() {
-    let tmp = tempdir().unwrap();
-    let model_dir = tmp.path().join("models");
-    fs::create_dir_all(&model_dir).unwrap();
-    fs::write(model_dir.join("local.gguf"), b"\0").unwrap();
-
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.local]
-provider   = "local"
-model-path = "models/local.gguf"
-"#,
-    );
-    cfg.validate(Some(tmp.path()))
-        .expect("relative model-path under repo_root resolves");
-}
-
-#[test]
-fn mistralrs_relative_model_path_missing_under_repo_root_errors() {
-    let tmp = tempdir().unwrap();
-    let cfg = parse(
-        r#"
-[providers.local]
-style = "mistralrs"
-
-[models.local]
-provider   = "local"
-model-path = "models/missing.gguf"
-"#,
-    );
-    let err = match cfg.validate(Some(tmp.path())) {
-        Err(OutrigError::ConfigValidation(e)) => e,
-        other => panic!("expected validation error, got: {other:?}"),
-    };
+    let msg = err.to_string();
     assert!(
-        matches!(
-            err,
-            ConfigValidationError::MistralrsModelPathMissing { ref model, .. }
-                if model == "local"
-        ),
-        "got: {err:?}",
+        msg.contains("mistralrs"),
+        "error should quote the offending value, got: {msg}",
+    );
+    assert!(
+        msg.contains("openai") || msg.contains("anthropic"),
+        "error should name at least one legal style, got: {msg}",
+    );
+}
+
+/// The six weight keys and the top-level `model-cache-root` went with the
+/// style. Each refuses to parse rather than loading with the key dropped.
+#[test]
+fn removed_local_llm_keys_are_parse_errors() {
+    for line in [
+        r#"model-id = "Qwen/Qwen2.5-7B-Instruct-GGUF""#,
+        r#"model-path = "/var/cache/outrig/models/model.gguf""#,
+        r#"model-file = "model.gguf""#,
+        r#"revision = "main""#,
+        "context-length = 4096",
+        r#"device = "cpu""#,
+    ] {
+        let key = line.split_once(' ').expect("key = value").0;
+        let toml = format!(
+            r#"
+[providers.claude]
+style    = "anthropic"
+base-url = "https://api.anthropic.com"
+api-key  = "${{ANTHROPIC_API_KEY}}"
+
+[models.sonnet]
+provider   = "claude"
+identifier = "claude-sonnet-4-6"
+{line}
+"#
+        );
+        let err = Config::load_from_str(&toml).unwrap_err();
+        assert!(
+            matches!(err, OutrigError::Config(_)),
+            "{key}: a parse error, not a validation error: {err:?}",
+        );
+        assert!(
+            err.to_string().contains(key),
+            "{key}: error should name the key, got: {err}",
+        );
+    }
+
+    let err =
+        Config::load_from_str("model-cache-root = \"/var/cache/outrig/models\"\n").unwrap_err();
+    assert!(
+        matches!(err, OutrigError::Config(_)),
+        "a parse error, not a validation error: {err:?}",
+    );
+    assert!(
+        err.to_string().contains("model-cache-root"),
+        "error should name the key, got: {err}",
     );
 }
 

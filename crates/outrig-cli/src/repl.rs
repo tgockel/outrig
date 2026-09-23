@@ -74,9 +74,7 @@ impl Repl {
     /// `tokio::signal::ctrl_c()` as the interrupt source. The `banner` is
     /// printed once to stderr before the first prompt; `on_prompt` is invoked
     /// for every non-slash, non-empty input line and its non-empty returned
-    /// text is printed to stdout. Streaming callers may write incrementally
-    /// during the callback and return an empty string to suppress trailing
-    /// reprint.
+    /// text is printed to stdout.
     ///
     /// Slash commands other than the built-in `/help` and `/quit` go to
     /// `on_command` as `(name, whitespace-split args)` -- `("sidecar",

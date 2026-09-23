@@ -130,10 +130,6 @@ srv = { command = ["bin", "arg1"] }
             cfg.session_root.as_deref(),
             Some(std::path::Path::new("/var/lib/outrig/sessions")),
         );
-        assert_eq!(
-            cfg.model_cache_root.as_deref(),
-            Some(std::path::Path::new("/var/cache/outrig/models")),
-        );
         assert_eq!(cfg.tool_call_max, Some(100));
         assert_eq!(cfg.tool_result_max, Some(524288));
         assert_eq!(cfg.subagent_depth_max, Some(4));
@@ -188,33 +184,21 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(claude.identifier.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(claude.max_tokens, Some(16384));
 
-        // mistralrs-side models carry weight fields and no identifier.
-        let phi3 = &cfg.models["phi3-fast"];
-        assert_eq!(phi3.provider.as_deref(), Some("local"));
-        assert_eq!(phi3.identifier, None);
-        assert_eq!(
-            phi3.model_id.as_deref(),
-            Some("microsoft/Phi-3-mini-4k-instruct-gguf")
-        );
-        assert_eq!(
-            phi3.model_file.as_deref(),
-            Some(&["Phi-3-mini-4k-instruct-q4.gguf".to_string()][..])
-        );
-        assert_eq!(phi3.device.as_deref(), Some("cpu"));
-        let llama = &cfg.models["llama-local"];
-        assert_eq!(llama.provider.as_deref(), Some("local"));
-        assert_eq!(llama.identifier, None);
-        assert_eq!(
-            llama.model_path.as_deref(),
-            Some(std::path::Path::new(
-                ".agents/outrig/models/llama-3-8b-instruct.q4.gguf"
-            )),
-        );
-        assert_eq!(llama.context_length, Some(4096));
-        assert!(matches!(
-            cfg.providers["local"],
-            LlmProvider::Mistralrs { .. }
-        ));
+        // A local model is an ordinary `openai` row pointed at a localhost
+        // server; nothing about it is local to outrig.
+        let LlmProvider::OpenAi {
+            base_url: local_base_url,
+            api_key: local_key,
+            ..
+        } = &cfg.providers["local"]
+        else {
+            panic!("expected OpenAi variant for [providers.local]");
+        };
+        assert_eq!(local_base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(local_key.var_name(), "OLLAMA_API_KEY");
+        let local = &cfg.models["local-fast"];
+        assert_eq!(local.provider.as_deref(), Some("local"));
+        assert_eq!(local.identifier.as_deref(), Some("qwen3:4b"));
 
         // Alias rows carry no provider at all, and both spellings -- a bare
         // string and an array -- normalize to the same `Vec`.
@@ -223,7 +207,7 @@ srv = { command = ["bin", "arg1"] }
         assert_eq!(opus.alias.as_deref(), Some(&["claude".to_string()][..]));
         assert_eq!(
             cfg.models["any-fast"].alias.as_deref(),
-            Some(&["fast".to_string(), "phi3-fast".to_string()][..])
+            Some(&["fast".to_string(), "local-fast".to_string()][..])
         );
         assert_eq!(cfg.model_candidates("opus").expect("walks"), vec!["claude"]);
 

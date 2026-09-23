@@ -48,11 +48,10 @@ base-url = "https://api.openai.com/v1"
 api-key  = "${OPENAI_API_KEY}"
 ```
 
-`style` is the protocol. v0 wires `"openai"` for any OpenAI-compatible endpoint and
-`"anthropic"` for Anthropic's native Messages API (see
-[Native Anthropic](#native-anthropic-style--anthropic) below), and recognizes `"mistralrs"`
-for in-process LLMs (gated behind a Cargo feature -- see
-[In-process providers](#in-process-providers-mistralrs) below). `base-url` is the HTTPS
+`style` is the protocol. v0 wires `"openai"` for any OpenAI-compatible endpoint -- a model
+served on your own machine included, see [Local models](#local-models) -- and `"anthropic"`
+for Anthropic's native Messages API (see
+[Native Anthropic](#native-anthropic-style--anthropic) below). `base-url` is the HTTPS
 endpoint. `api-key` **must** be the `${ENV_VAR}` form -- outrig resolves it at run time,
 never reads a key from disk. See
 [Reference -> Config](../reference/config.md#api-key-syntax) for the exact rules.
@@ -162,16 +161,10 @@ Two properties worth knowing:
 * **The whole chain is bounded by one `retry-budget-secs`, not one per candidate.** Three
   candidates at the ten-minute default is a half-hour turn against a total outage, most of it spent
   on endpoints already known to be down, so the budget is shared rather than repeated. The value
-  is the one on the **first selectable remote candidate's** provider; `retry-budget-secs` on any
+  is the one on the **first selectable candidate's** provider; `retry-budget-secs` on any
   later candidate's provider is not consulted. A chain spanning providers that disagree has no
   single right answer, and the head of a preference order is the defensible one -- so a `0` there
   disables retries for every candidate, and reordering the alias can change which budget governs.
-
-  In-process candidates are skipped when finding it, because `style = "mistralrs"` has no
-  `retry-budget-secs` to give -- it does no HTTP, so it has nothing to retry. An alias whose head
-  is a local model takes its budget from the first *remote* candidate after it, which is the one
-  the setting can actually be configured on. A chain of only local candidates has no budget at
-  all, and needs none.
 * **Every model call starts again at the head of the list.** The order is a preference, so one
   rate-limit window does not demote candidate one for the rest of the session.
 
@@ -269,6 +262,64 @@ identifier = "anthropic/claude-sonnet-4-6"
 
 The agent loop is unchanged -- it's still tool calls in OpenAI's format, just routed somewhere
 else.
+
+### Local models
+
+A model running on your own machine is reached the same way: serve it with a local server that
+speaks the OpenAI wire format, and point a `style = "openai"` provider at its `localhost`
+`base-url`. Start the model however that tool wants -- note the tool-calling flags, which
+outrig's agent loop needs and none of these servers turn on by default:
+
+```sh
+ollama serve                 # then: ollama pull qwen3:4b
+# or: vllm serve Qwen/Qwen3-4B --enable-auto-tool-choice --tool-call-parser hermes
+# or: llama-server -m ./qwen3-4b-q4.gguf --port 8080 --jinja
+```
+
+```toml
+[providers.local]
+style    = "openai"
+base-url = "http://127.0.0.1:11434/v1"   # Ollama's default; vLLM 8000, llama-server 8080
+api-key  = "${OLLAMA_API_KEY}"           # see the note below
+
+[models.local-fast]
+provider   = "local"
+identifier = "qwen3:4b"                  # whatever name the server serves it under
+```
+
+Three wrinkles worth knowing before you hit them:
+
+- **The model must support tool calling.** outrig's loop needs the model to emit tool calls in
+  the provider's native format, and not every local model does. Ollama's `phi3` has no `tools`
+  capability and rejects outright a request that carries any; vLLM emits no tool calls at all
+  without `--enable-auto-tool-choice --tool-call-parser <parser>`; `llama-server` needs
+  `--jinja` to apply the template that produces them. Pick a tool-capable model (`qwen3`,
+  `llama3.1`, `mistral-nemo`) and pass those flags -- see [Tool calling](#tool-calling) for the
+  symptom and a one-shot test. A session with no MCP servers and subagents disabled sends no
+  tools at all, so a model without the capability still answers plain prompts there; it just
+  cannot run an agent.
+- **`api-key` is still required**, and must still use the `"${VAR}"` form -- outrig refuses a
+  literal. Local servers generally ignore the value, so export any non-empty placeholder
+  (`export OLLAMA_API_KEY=unused`). An unset or empty variable makes the model unselectable,
+  which is a deliberate rule and not a bug: see [API keys](#api-keys-are-env-var-only).
+- **Device placement is the server's.** GPU selection, layer offload, and quantization are the
+  server's own flags (`CUDA_VISIBLE_DEVICES`, `--n-gpu-layers`, and friends); outrig has no
+  knob for any of them.
+
+Given a tool-capable model, a local model is a model like any other: the tool loop, subagents,
+the tool-call and tool-result limits, and aliases and failover all apply, including naming the
+local model as one candidate of an alias beside a hosted one. What a local server does not give
+you is isolation from the rest of the machine: each request is serialized and crosses a socket,
+however briefly. outrig makes no claim that a question stays inside its own process.
+
+**Coming from `style = "mistralrs"`.** outrig 0.2 could also run a model in its own process,
+behind the `local-llm` build feature. That backend was removed in 0.3: a config that still names
+`style = "mistralrs"`, sets any of the six weight keys (`model-id`, `model-path`, `model-file`,
+`revision`, `context-length`, `device`), or sets the top-level `model-cache-root` fails to parse.
+Replace the bare provider and its weight-bearing rows with the pair above. The six keys have no
+counterpart on purpose -- the server owns all of them, which is the point of the move. The
+`[models.<name>]` key is yours: keep whatever the old row was called and every `model = ...`
+reference to it keeps working. Only the row's contents change.
 
 ## Native Anthropic (`style = "anthropic"`)
 
@@ -388,52 +439,6 @@ containers, stay up.
 > **TODO: Incomplete** -- v0 wires `"openai"` and `"anthropic"`. The other styles Rig ships
 > adapters for (Cohere, Gemini, and friends) are not exposed yet, and neither are the
 > Anthropic-specific extras -- prompt caching, citations, and configurable API versions.
-
-## In-process providers (`mistralrs`)
-
-> **Deprecated.** `style = "mistralrs"` and the `local-llm` build feature are deprecated and
-> will be removed in a future release. Run the model under an OpenAI-compatible local server
-> (Ollama, vLLM, `llama.cpp`) and use a `style = "openai"` provider with a `localhost`
-> `base-url` instead -- see
-> [Migrating off the in-process provider](in-process-llm.md#migrating-off-the-in-process-provider).
-> Existing configs keep working unchanged for now.
-
-An in-process provider runs the model in the outrig process itself, with no socket and no
-serialization. The use case is questions whose *content* must not leave the host -- the
-eventual egress filter, tool-use filter, and prompt-injection scanner all want this. See
-[In-process LLMs](in-process-llm.md) for the full picture.
-
-A `mistralrs` provider table is bare -- it just declares "this is the in-process
-runtime." Each set of weights goes on a `[models.<name>]` row referencing the provider:
-
-```toml
-[providers.local]
-style = "mistralrs"
-
-# Auto-download from HuggingFace on first use:
-[models.phi3-fast]
-provider   = "local"
-model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"
-
-# Or point at a GGUF you placed on disk yourself:
-[models.llama-local]
-provider   = "local"
-model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
-```
-
-The provider takes no `base-url` and no `api-key`. Each mistralrs model must set
-exactly one of `model-id` / `model-path`. One provider can back many models.
-
-The backend is gated behind `cargo build --features local-llm`. A build *without* the
-feature still parses and validates `style = "mistralrs"` blocks cleanly; the error fires
-only when an agent tries to actually use one of those models, with a message that names
-the missing feature flag. This keeps configs portable across builds.
-
-For the full schema (including `revision`, `context-length`, and the top-level
-`model-cache-root` key) see [Reference -> Config](../reference/config.md). For why this
-exists at all -- and why "localhost LLM" isn't the same thing -- see
-[In-process LLMs](in-process-llm.md).
 
 ## Tool calling
 

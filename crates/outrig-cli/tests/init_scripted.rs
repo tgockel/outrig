@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use outrig::config::Config;
 use outrig_cli::init::run_with;
 
-use common::{StubHfTreeFetcher, scripted_prompt};
+use common::scripted_prompt;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -48,11 +48,10 @@ async fn fresh_state_writes_global_repo_and_container() {
     let global = tmp.path().join("global.toml");
 
     let (mut prompt, _stderr_r) = scripted_prompt(ALL_DEFAULTS).await;
-    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
     timeout(
         TEST_TIMEOUT,
-        run_with(false, Some(&global), &cwd, &mut prompt, &mut hf),
+        run_with(false, Some(&global), &cwd, &mut prompt),
     )
     .await
     .expect("init must not hang")
@@ -97,10 +96,9 @@ async fn idempotent_rerun_leaves_files_untouched() {
 
     // Pre-seed everything: do a fresh run first.
     let (mut prompt, _stderr_r) = scripted_prompt(ALL_DEFAULTS).await;
-    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
     timeout(
         TEST_TIMEOUT,
-        run_with(false, Some(&global), &cwd, &mut prompt, &mut hf),
+        run_with(false, Some(&global), &cwd, &mut prompt),
     )
     .await
     .expect("seed init must not hang")
@@ -115,10 +113,9 @@ async fn idempotent_rerun_leaves_files_untouched() {
     // Re-run: only the container-loop prompt fires (answer "no") -- both
     // the global and repo phases short-circuit on "exists".
     let (mut prompt, _stderr_r) = scripted_prompt(b"n\n").await;
-    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
     timeout(
         TEST_TIMEOUT,
-        run_with(false, Some(&global), &cwd, &mut prompt, &mut hf),
+        run_with(false, Some(&global), &cwd, &mut prompt),
     )
     .await
     .expect("re-run must not hang")
@@ -171,11 +168,10 @@ async fn skips_global_phase_when_global_exists() {
     // Total 15.
     let script = b"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
     let (mut prompt, _stderr_r) = scripted_prompt(script).await;
-    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
 
     timeout(
         TEST_TIMEOUT,
-        run_with(false, Some(&global), &cwd, &mut prompt, &mut hf),
+        run_with(false, Some(&global), &cwd, &mut prompt),
     )
     .await
     .expect("init must not hang")

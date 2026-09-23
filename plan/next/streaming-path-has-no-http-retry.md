@@ -8,9 +8,9 @@ Both are correct today and for different reasons:
 
 - **multipart** -- a `MultipartForm` is not cloneable, so there is no body to
   replay. outrig has no multipart path at all.
-- **streaming** -- outrig's remote turns are non-streaming. The streaming path
-  (`run_turn_streaming_inner`) is `#[cfg(feature = "local-llm")]` and backed by
-  mistralrs, which is in-process and never reaches an HTTP client.
+- **streaming** -- outrig has no streaming path at all. Its only one was the in-process
+  backend's, which never reached an HTTP client and was removed on the 0.3 line along with
+  that backend.
 
 The trap is the day a streaming remote provider is wired. It will get no retry
 at all, silently, and the failure will look like the provider's.

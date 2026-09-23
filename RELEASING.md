@@ -162,7 +162,4 @@ the [Refresh the version-bearing docs](#refresh-the-version-bearing-docs) step.
 
 ## Notes
 
-- The default build pulls no heavy ML dependencies. `local-llm`, `cuda`, and `metal` are
-  opt-in features and are not exercised by the `cargo publish` verify build. All three are
-  **deprecated** and scheduled for removal; `build.rs` warns when `local-llm` is enabled.
 - See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks run before every PR.
