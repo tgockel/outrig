@@ -3441,6 +3441,26 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt as _;
 
+    /// [`run_step`], holding the tracing gate for as long as it emits.
+    ///
+    /// `run_step` reaches `run_capture_logged`, whose `spawn`/`exit` callsites
+    /// `process_tests`'s capture tests install a subscriber to observe. These
+    /// tests install none, so they are emitters in the sense
+    /// `process_tests::TRACING_CALLSITES` defines, and an observer must not be
+    /// running while one of them does. Every `run_step` in this module goes
+    /// through here for that reason.
+    ///
+    /// The gate is taken per command rather than per test on purpose: what has
+    /// to be excluded is a callsite being *reached* while a subscriber is
+    /// installed, and between two commands this module reaches none. Taking it
+    /// here also keeps it out of `run_step` itself, which observers call --
+    /// they hold the write side, so a read acquired underneath them would
+    /// deadlock.
+    async fn run_step_gated(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
+        let _emitting = crate::process::process_tests::emitting().await;
+        run_step(cmd, transcript).await
+    }
+
     fn compiled(policy: NetworkPolicy) -> CompiledNetworkPolicy {
         CompiledNetworkPolicy::new(policy).expect("compile policy")
     }
@@ -3699,7 +3719,7 @@ mod tests {
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 3"));
 
-        let run = |cmd: Cmd| run_step(cmd, None);
+        let run = |cmd: Cmd| run_step_gated(cmd, None);
         let failures = rollback.undo_now(&run).await;
 
         assert_eq!(failures.len(), 1, "a non-zero undo is a failure");
@@ -3729,7 +3749,7 @@ mod tests {
         rollback.arm(touch(&reached));
         rollback.arm(Cmd::new("/bin/sh").arg("-c").arg("exit 1"));
 
-        let run = |cmd: Cmd| run_step(cmd, None);
+        let run = |cmd: Cmd| run_step_gated(cmd, None);
         let failures = rollback.undo_now(&run).await;
 
         assert!(reached.exists(), "a failed undo must not cancel the rest");
@@ -3768,7 +3788,7 @@ mod tests {
         // The production script, with only its redirect retargeted.
         let script = RESTORE_RESOLV_SCRIPT
             .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-        run_step(
+        run_step_gated(
             Cmd::new("/bin/sh")
                 .args(["-c"])
                 .arg(script)
@@ -4775,7 +4795,7 @@ mod tests {
 
         // Holding what the install wrote: the undo fires.
         std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-        run_step(restore(ORIGINAL), None)
+        run_step_gated(restore(ORIGINAL), None)
             .await
             .expect("the restore must run");
         assert_eq!(std::fs::read(&target).expect("restored"), ORIGINAL);
@@ -4783,7 +4803,7 @@ mod tests {
         // Holding something else -- a replacement container behind a reused
         // pid, or a resolver something changed after interception: left alone.
         std::fs::write(&target, b"nameserver 9.9.9.9\n").expect("third party");
-        run_step(restore(ORIGINAL), None)
+        run_step_gated(restore(ORIGINAL), None)
             .await
             .expect("the guard makes this a no-op, not a failure");
         assert_eq!(
@@ -4811,7 +4831,7 @@ mod tests {
                 .to_string(),
         ] {
             std::fs::write(&target, &changed).expect("write");
-            run_step(
+            run_step_gated(
                 Cmd::new("/bin/sh")
                     .args(["-c"])
                     .arg(script.clone())
@@ -4849,7 +4869,7 @@ mod tests {
         tampered.insert(0, 0);
         std::fs::write(&target, &tampered).expect("tamper");
 
-        run_step(
+        run_step_gated(
             Cmd::new("/bin/sh")
                 .args(["-c"])
                 .arg(script)
@@ -4890,7 +4910,7 @@ mod tests {
             let script =
                 script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
 
-            let outcome = run_step(
+            let outcome = run_step_gated(
                 Cmd::new("/bin/sh")
                     .args(["-c"])
                     .arg(script)
@@ -4920,7 +4940,7 @@ mod tests {
         let script = RESTORE_RESOLV_SCRIPT
             .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
 
-        run_step(
+        run_step_gated(
             Cmd::new("/bin/sh")
                 .args(["-c"])
                 .arg(script)
@@ -4971,7 +4991,7 @@ mod tests {
             // `wc`. An undo that quietly retires itself because a utility is
             // missing is the failure this is for.
             let pared = format!("PATH={}; {script}", bin.display());
-            run_step(
+            run_step_gated(
                 Cmd::new("/bin/sh")
                     .args(["-c"])
                     .arg(pared)
@@ -5011,7 +5031,7 @@ mod tests {
             format!("{}search added.test\n", intercepted_resolv("outrig_test")),
         ] {
             std::fs::write(&target, &changed).expect("write");
-            run_step(
+            run_step_gated(
                 Cmd::new("/bin/sh")
                     .args(["-c"])
                     .arg(script.clone())
@@ -5047,7 +5067,7 @@ mod tests {
 
         // The file holds what a *different* attachment installed.
         std::fs::write(&target, intercepted_resolv("outrig_other")).expect("other install");
-        run_step(
+        run_step_gated(
             Cmd::new("/bin/sh")
                 .args(["-c"])
                 .arg(script)

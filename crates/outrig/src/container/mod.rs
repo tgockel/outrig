@@ -1942,6 +1942,9 @@ mod tests {
     /// sidecar compensation and every shutdown.
     #[tokio::test]
     async fn a_stop_client_that_never_returns_is_given_up_on() {
+        // `stop` reaches `run_capture_logged`'s callsites with no subscriber
+        // installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let mut container = Container::unstoppable();
         // Ten seconds, against a budget of one: long enough to be wedged
         // relative to the deadline under test, short enough that losing that
@@ -2062,6 +2065,9 @@ mod tests {
     /// it -- only `Drop`'s detached removal, which reports nothing.
     #[tokio::test]
     async fn a_container_that_will_not_stop_comes_back_to_its_caller() {
+        // `stop` reaches `run_capture_logged`'s callsites with no subscriber
+        // installed. See `process_tests::TRACING_CALLSITES`.
+        let _emitting = crate::process::process_tests::emitting().await;
         let container = Container::unstoppable();
 
         let kept = container

@@ -305,12 +305,22 @@ async fn spawn_stdio_stdin_stdout_usable() {
 /// read side and still run concurrently with each other, which is all but
 /// three tests in this file.
 ///
-/// The obligation this encodes is real but narrow: a *new* test that drives
-/// `try_capture_logged*`, `run_capture_logged*` or `run_streamed` without a
-/// subscriber wants `emitting()`. `plan/next/relocate-unit-shaped-tests.md`
-/// is where the version that needs no obligation lives -- these assert on
-/// `pub(crate)` items, so giving them their own process means widening the
-/// crate's surface, which is not a thing to do during a release freeze.
+/// The obligation this encodes is real, and wider than this file: a test that
+/// reaches `try_capture_logged*`, `run_capture_logged*` or `run_streamed`
+/// without a subscriber wants `emitting()`, and most of them reach it
+/// *indirectly*. The ones outside this file today are `network`'s tests, all
+/// of which run their commands through `tests::run_step_gated`, and the two
+/// `container` tests that call `Container::stop`. A review caught both after
+/// the first version of this gate guarded only the direct callers here.
+///
+/// Take it in the test, never inside the production helper: an observer holds
+/// the write side while calling those same helpers, so a read acquired
+/// underneath it would deadlock.
+///
+/// `plan/next/relocate-unit-shaped-tests.md` is where the version that needs
+/// no obligation lives -- these assert on `pub(crate)` items, so giving them
+/// their own process means widening the crate's surface, which is not a thing
+/// to do during a release freeze.
 /// `tokio`'s rather than `std`'s: an emitter holds the read side across the
 /// `await` that reaches the callsite, which a `std` guard may not do, and this
 /// one does not poison -- a test failing while it holds either side would

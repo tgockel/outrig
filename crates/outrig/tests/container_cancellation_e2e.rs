@@ -122,7 +122,7 @@ if [ "$1" = "init" ] && [ -n "$2" ] && [ -f "$journal/hold.init.$2" ]; then
   exec sleep 300
 fi
 
-exec "__REAL_PODMAN__" "$@"
+exec "$OUTRIG_REAL_PODMAN" "$@"
 "#;
 
 /// Install the wrapper ahead of the real podman on `PATH`, and return the
@@ -150,9 +150,8 @@ fn wrapper_runtime() -> &'static Path {
         std::fs::create_dir_all(&bin).expect("create wrapper bin dir");
         std::fs::create_dir_all(&journal).expect("create journal dir");
 
-        let script = WRAPPER.replace("__REAL_PODMAN__", &real.to_string_lossy());
         let wrapper = bin.join("podman");
-        std::fs::write(&wrapper, script).expect("write wrapper");
+        std::fs::write(&wrapper, WRAPPER).expect("write wrapper");
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
             .expect("chmod wrapper");
 
@@ -167,6 +166,12 @@ fn wrapper_runtime() -> &'static Path {
         unsafe {
             std::env::set_var("PATH", search);
             std::env::set_var("OUTRIG_E2E_JOURNAL", &journal);
+            // Through the environment rather than interpolated into the
+            // script. `$OUTRIG_REAL_PODMAN` carries the path's own bytes and
+            // the expansion of a quoted variable is not rescanned, so a
+            // directory containing `$` or `"` neither expands nor breaks the
+            // parse -- and nothing has to survive `to_string_lossy`.
+            std::env::set_var("OUTRIG_REAL_PODMAN", &real);
         }
 
         // The directory has to outlive every test in the binary, and nothing
@@ -182,11 +187,21 @@ fn wrapper_runtime() -> &'static Path {
 /// Resolved by hand rather than with a crate: it runs once, and taking a
 /// dev-dependency to split a string on `:` would cost more than it saves.
 fn real_podman() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
     let path = std::env::var_os("PATH").expect("PATH is set");
     std::env::split_paths(&path)
         .map(|dir| dir.join("podman"))
-        .find(|candidate| candidate.is_file())
-        .expect("a real podman on PATH")
+        .find(|candidate| {
+            // The executable bit, not just "a file named podman". `execvp`
+            // skips a non-executable match and keeps searching, so resolving
+            // on `is_file` alone would pick one that an ordinary spawn never
+            // would -- and the wrapper would exec it and exit 126.
+            candidate
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .expect("an executable podman on PATH")
 }
 
 /// Ask the wrapper to park `podman init <name>` when it reaches it.
