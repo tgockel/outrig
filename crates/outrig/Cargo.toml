@@ -51,9 +51,11 @@ nix                = { workspace = true, features = ["user", "fs", "process", "s
 rand               = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
+ruzstd             = { workspace = true, features = ["std"] }
 schemars           = { workspace = true, features = ["derive"] }
 serde              = { workspace = true, features = ["std", "derive"] }
 serde_json         = { workspace = true, features = ["std"] }
+tar                = { workspace = true }
 tempfile           = { workspace = true, features = ["getrandom"] }
 thiserror          = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "signal", "fs", "time", "sync"] }
@@ -63,8 +65,17 @@ tracing            = { workspace = true, features = ["std", "attributes"] }
 tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "tracing-log", "smallvec", "env-filter"] }
 walkdir            = { workspace = true }
 
+# `build.rs` fetches, verifies, and embeds the static CPython every session
+# mounts; see `src/python/archive.rs`, which it shares with this crate's tests.
+[build-dependencies]
+ruzstd = { workspace = true, features = ["std"] }
+sha2   = { workspace = true }
+tar    = { workspace = true }
+ureq   = { workspace = true, features = ["rustls"] }
+
 [dev-dependencies]
 reqwest  = { workspace = true, features = ["json", "rustls"] }
+sha2     = { workspace = true }
 # `test-util` pauses the clock so the interceptor's sniff window can be driven
 # deterministically rather than slept through.
 tokio    = { workspace = true, features = ["test-util"] }

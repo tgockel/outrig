@@ -10,7 +10,7 @@
 // source of truth: `launcher.rs` pulls it in with `include!`, so its header
 // must be plain `//` comments (inner `//!` docs are illegal mid-file). The
 // `outrig` crate also compiles it as `#[cfg(test)] mod elf` to run these tests
-// on the host.
+// on the host, and `build.rs` includes it too, to check the Python payload.
 
 /// `PT_INTERP` program-header type.
 const PT_INTERP: u32 = 3;
@@ -22,7 +22,7 @@ const PHDR_LEN: usize = 56;
 
 /// What the payload's ELF header says about how to run it.
 #[derive(Debug, PartialEq, Eq)]
-enum ElfKind {
+pub(crate) enum ElfKind {
     /// No `PT_INTERP`: run straight from the fd; nothing resolves through the
     /// target container.
     Static,
@@ -32,7 +32,7 @@ enum ElfKind {
 
 /// Why a payload was refused before any privileged work happened.
 #[derive(Debug, PartialEq, Eq)]
-enum ElfError {
+pub(crate) enum ElfError {
     /// Missing ELF magic or not `ELFCLASS64` -- also how a shebang script (or
     /// any non-ELF64 file) is rejected.
     NotElf64,
@@ -63,7 +63,7 @@ fn rd<const N: usize>(b: &[u8], off: usize) -> Result<[u8; N], ElfError> {
 /// header, the program-header table, and any `PT_INTERP` string, which for
 /// every real binary live at the very start). Little-endian only; both target
 /// architectures (x86_64, aarch64) are little-endian.
-fn elf_interp(bytes: &[u8]) -> Result<ElfKind, ElfError> {
+pub(crate) fn elf_interp(bytes: &[u8]) -> Result<ElfKind, ElfError> {
     if bytes.len() < EHDR_LEN || bytes[..4] != *b"\x7fELF" || bytes[4] != ELFCLASS64 {
         return Err(ElfError::NotElf64);
     }

@@ -33,6 +33,10 @@ const MCP_FS_IMAGE: &str = "docker.io/mcp/filesystem:latest";
 /// is the test; see there.
 const UBUNTU_IMAGE: &str = "docker.io/library/ubuntu:24.04";
 
+/// Ships no Python at all, which is what makes it the image to prove the
+/// payload against.
+const ALPINE_IMAGE: &str = "docker.io/library/alpine:latest";
+
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-fs")
 }
@@ -770,6 +774,70 @@ async fn primary_view_sidecar_with_an_unresolvable_entrypoint_names_the_path() {
         Vec::<String>::new(),
         "a failed add should leave no container"
     );
+    outrig.shutdown().await.expect("shutdown");
+}
+
+/// `argv` in the primary, which must at least have started.
+async fn capture(outrig: &Outrig, argv: &[&str]) -> std::process::Output {
+    let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
+    outrig
+        .exec_capture(&argv, &ExecOptions::new())
+        .await
+        .unwrap_or_else(|e| panic!("exec {argv:?}: {e}"))
+}
+
+/// Every session gets OutRig's interpreter whatever the image holds. The
+/// first assertion is what makes the rest mean anything: an image that
+/// carried its own Python would pass them without the payload.
+#[tokio::test]
+async fn the_python_payload_runs_in_an_image_with_no_python() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+    ensure_image(ALPINE_IMAGE);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        ALPINE_IMAGE,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    );
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+
+    let image_python = capture(
+        &outrig,
+        &[
+            "sh",
+            "-c",
+            "for p in python3 python; do command -v \"$p\" && exit 1; done; \
+             for d in /usr/lib/python3* /usr/local/lib/python3*; do [ -e \"$d\" ] && exit 1; done; \
+             exit 0",
+        ],
+    )
+    .await;
+    assert!(
+        image_python.status.success(),
+        "the image has a Python of its own: {}",
+        String::from_utf8_lossy(&image_python.stdout)
+    );
+
+    let printed = capture(
+        &outrig,
+        &["/outrig/python/bin/python3", "-I", "-c", "print(1)"],
+    )
+    .await;
+    assert!(
+        printed.status.success(),
+        "payload python failed: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&printed.stdout), "1\n");
+
+    let written = capture(&outrig, &["touch", "/outrig/python/probe"]).await;
+    assert!(
+        !written.status.success(),
+        "the payload mount accepted a write"
+    );
+
     outrig.shutdown().await.expect("shutdown");
 }
 

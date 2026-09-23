@@ -30,6 +30,7 @@ use crate::image::{self, ImageTag};
 use crate::mcp::McpClient;
 use crate::mcp_content::{McpIcon, McpTool, McpToolAnnotations, McpToolResult};
 use crate::network::NetworkInterceptor;
+use crate::python::payload;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
@@ -790,7 +791,22 @@ impl Outrig {
     /// resolve MCP config according to `spec.embedded_mcp_policy`, connect every
     /// resolved MCP server, and index their tools.
     /// Returns once every server has answered an initial `tools/list`.
+    ///
+    /// The container gets OutRig's static CPython read-only at
+    /// `/outrig/python`, whatever the image holds. The interpreter is embedded
+    /// in this build; the first launch on a machine unpacks it under the user's
+    /// cache directory. Before any image build, this fails if the workspace or
+    /// a mount is placed at or under `/outrig`, which OutRig reserves, or if
+    /// the build could not embed the payload.
     pub async fn launch(spec: &LaunchSpec) -> Result<Self> {
+        let workspace = spec.workspace.iter().map(|workspace| &workspace.container);
+        let mounts = spec.mounts.iter().map(|mount| &mount.container);
+        for destination in workspace.chain(mounts) {
+            payload::reject_reserved(destination)?;
+        }
+        let python =
+            ContainerMount::shared_read_only(payload::host_dir().await?, payload::PAYLOAD_MOUNT);
+
         let image_tag = match &spec.source {
             LaunchSource::Build {
                 dockerfile,
@@ -822,6 +838,7 @@ impl Outrig {
                 .map(|mount| {
                     ContainerMount::new(mount.host.clone(), mount.container.clone(), mount.access)
                 })
+                .chain([python])
                 .collect(),
             capabilities: ContainerCapabilities::from(&spec.security.capabilities),
             devices: spec.security.devices.clone(),

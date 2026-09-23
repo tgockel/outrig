@@ -21,6 +21,15 @@ and the user sees a missing-loader error about a path they never configured. `bu
 already cites the same number from the other side -- "Relocations in generic ELF (EM: 183)" is
 what the host linker says when it is handed foreign-arch objects.
 
+The static CPython every library session mounts at `/outrig/python` has the same blind spot.
+`build.rs` embeds the payload for the *target* architecture, as it builds the launcher, so an
+emulated foreign-arch primary gets a host-arch interpreter. What that does is unverified. The host
+kernel can exec a host-arch static binary without `qemu-user`, so the likely outcome is that it
+runs -- beside image binaries that are emulated, so the agent's Python and the programs it spawns
+disagree about the machine. Whatever check lands here should cover the payload too:
+`podman image inspect --format {{.Architecture}}` answers both, and `build.rs` already pins both
+architectures.
+
 ## Why it might matter
 
 podman will happily run a foreign-arch image under `qemu-user` binfmt, and multi-arch registry

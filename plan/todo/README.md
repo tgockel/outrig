@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-01` | A verified static CPython is mounted where the image has none      |
 | `0003-02` | The interpreter runs an agent's Python and answers by agent id     |
 | `0003-03` | The host starts the interpreter and correlates its replies         |
 | `0003-04` | The model's only tool submits Python, and `outrig` drives a round  |

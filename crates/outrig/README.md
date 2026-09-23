@@ -10,6 +10,14 @@ graph.
 
 The curated entry point is [`Outrig::launch`].
 
+Every session's container gets OutRig's own static CPython, mounted read-only at
+`/outrig/python`, so the image needs no Python of its own. The interpreter is part of the build:
+`build.rs` downloads a pinned `python-build-standalone` release once per machine, verifies its
+SHA-256, and embeds it, and the first launch unpacks it under `$XDG_CACHE_HOME/outrig/python`.
+For a build with no network, set `OUTRIG_PYTHON_ARCHIVE` to a copy of the archive; without either,
+the build warns and every launch fails with a message saying so. OutRig reserves `/outrig` inside
+the container, so neither the workspace nor a mount may be placed there.
+
 ## Example
 
 ```rust,no_run

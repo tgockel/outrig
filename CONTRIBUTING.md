@@ -14,6 +14,13 @@ build still succeeds -- it emits a warning and embeds an empty artifact -- but e
 `.agents/outrig/config.toml` declares. Development happens on Linux: macOS and native Windows
 are not supported, and WSL2 is an ordinary Linux build.
 
+The same build script downloads the static CPython every session mounts -- about 36 MB, once per
+machine, into `~/.cache/outrig/downloads` -- verifies it against a pinned SHA-256, and embeds it.
+Nothing needs doing for that beyond network access on the first build. To build offline, set
+`OUTRIG_PYTHON_ARCHIVE` to a copy of the archive the build names; without either, the build warns
+and every session fails to start until one succeeds. CI sets `OUTRIG_REQUIRE_PYTHON=1`, which
+makes that warning an error.
+
 CI runs the unit suite and `mdbook build` on every push and PR. Run the same checks locally
 before opening a PR:
 

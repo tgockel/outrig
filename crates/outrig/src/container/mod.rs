@@ -429,6 +429,10 @@ pub struct ContainerMount {
     pub host: PathBuf,
     pub container: PathBuf,
     pub access: MountAccess,
+    /// Whether other containers bind the same source at the same time. Under
+    /// SELinux a shared source is relabeled `,z`, which every container may
+    /// read, rather than `,Z`, which locks it to this one.
+    pub(crate) shared: bool,
 }
 
 impl ContainerMount {
@@ -442,6 +446,19 @@ impl ContainerMount {
             host: host.into(),
             container: container.into(),
             access,
+            shared: false,
+        }
+    }
+
+    /// Bind `host` read-only at `container`, where concurrent sessions bind
+    /// the same `host` too -- OutRig's own payloads rather than the caller's.
+    pub(crate) fn shared_read_only(
+        host: impl Into<PathBuf>,
+        container: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            shared: true,
+            ..Self::new(host, container, MountAccess::ReadOnly)
         }
     }
 }
@@ -1591,11 +1608,12 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
             &workspace.host,
             &workspace.container,
             workspace.access,
-            selinux,
+            selinux.then_some("Z"),
         );
     }
     for mount in &launch.mounts {
-        cmd = append_bind_mount(cmd, &mount.host, &mount.container, mount.access, selinux);
+        let relabel = selinux.then_some(if mount.shared { "z" } else { "Z" });
+        cmd = append_bind_mount(cmd, &mount.host, &mount.container, mount.access, relabel);
     }
 
     // A `view = "primary"` sidecar binds the primary's nsfs directory and the
@@ -1675,19 +1693,21 @@ fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -
     cmd
 }
 
+/// `relabel` is podman's SELinux option, `Z` or `z`, or `None` off SELinux.
 fn append_bind_mount(
     cmd: Cmd,
     host: &Path,
     container: &Path,
     access: MountAccess,
-    selinux: bool,
+    relabel: Option<&str>,
 ) -> Cmd {
     let mut opts = match access {
         MountAccess::ReadOnly => "ro".to_string(),
         MountAccess::ReadWrite => "rw".to_string(),
     };
-    if selinux {
-        opts.push_str(",Z");
+    if let Some(relabel) = relabel {
+        opts.push(',');
+        opts.push_str(relabel);
     }
     cmd.arg("-v")
         .arg(format!("{}:{}:{opts}", host.display(), container.display()))
@@ -2348,11 +2368,13 @@ mod tests {
                     host: "/host/docs".into(),
                     container: "/resources/docs".into(),
                     access: MountAccess::ReadOnly,
+                    shared: false,
                 },
                 ContainerMount {
                     host: "/host/cache".into(),
                     container: "/resources/cache".into(),
                     access: MountAccess::ReadWrite,
+                    shared: false,
                 },
             ],
             capabilities: ContainerCapabilities::default(),
@@ -2462,6 +2484,7 @@ mod tests {
                 host: "/host/docs".into(),
                 container: "/resources/docs".into(),
                 access: MountAccess::ReadOnly,
+                shared: false,
             }],
             capabilities: ContainerCapabilities::default(),
             labels: BTreeMap::new(),
@@ -2495,6 +2518,51 @@ mod tests {
                 "local:test",
                 "sleep",
                 "infinity",
+            ]
+        );
+    }
+
+    /// Under SELinux a shared mount takes `,z`, which every container may
+    /// read, where the rest take `,Z`: one source that concurrent sessions all
+    /// bind cannot be locked to any one of them.
+    #[test]
+    fn podman_run_args_relabel_a_shared_mount_for_every_container() {
+        let launch = ContainerLaunchSpec {
+            mounts: vec![
+                ContainerMount::new("/host/docs", "/resources/docs", MountAccess::ReadOnly),
+                ContainerMount::shared_read_only("/cache/python", "/outrig/python"),
+            ],
+            ..ContainerLaunchSpec::workspace("/host/repo", "/workspace")
+        };
+        let volumes = |selinux| {
+            let args = argv(build_podman_run_cmd(
+                &ImageTag::new("local:test"),
+                "outrig-test",
+                &launch,
+                selinux,
+                "org.outrig.attempt=testtoken",
+            ));
+            args.iter()
+                .zip(args.iter().skip(1))
+                .filter(|(flag, _)| *flag == "-v")
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            volumes(false),
+            vec![
+                "/host/repo:/workspace:rw",
+                "/host/docs:/resources/docs:ro",
+                "/cache/python:/outrig/python:ro",
+            ]
+        );
+        assert_eq!(
+            volumes(true),
+            vec![
+                "/host/repo:/workspace:rw,Z",
+                "/host/docs:/resources/docs:ro,Z",
+                "/cache/python:/outrig/python:ro,z",
             ]
         );
     }

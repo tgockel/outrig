@@ -27,6 +27,10 @@ jobs:
       # makes the degradation a hard build error. Both musl targets are
       # installed below, so every row can satisfy it.
       OUTRIG_REQUIRE_ENTER: "1"
+      # The same for the static CPython `build.rs` downloads and embeds: a
+      # fetch that failed would otherwise be a warning, and every session in
+      # the resulting binary a startup error.
+      OUTRIG_REQUIRE_PYTHON: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -165,6 +169,9 @@ jobs:
       # empty artifact. Without this the primary-view tests would fail as a
       # missing helper rather than the row failing as a missing target.
       OUTRIG_REQUIRE_ENTER: "1"
+      # Every `Outrig::launch` mounts the embedded CPython; without this a
+      # failed fetch would surface as every library test failing to start.
+      OUTRIG_REQUIRE_PYTHON: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -273,6 +280,9 @@ jobs:
       # `cargo package` applies it to the *packaged* archive rather than the working tree,
       # which is the copy nothing else here builds.
       OUTRIG_REQUIRE_ENTER: "1"
+      # And the packaged `build.rs` has to fetch, verify, and embed the Python
+      # payload from `src/python/archive.rs` as it ships, not as the tree has it.
+      OUTRIG_REQUIRE_PYTHON: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -43,12 +43,12 @@ can be used.
   conversation history is no longer the only thing carrying state. `run-legacy` is added at
   the same time as an alias for `run`, so anyone who means to stay on the existing system can
   say so before the default moves. A later milestone retargets `run` itself.
-- A static CPython supplied by OutRig and mounted read-only, so the feature does not require
-  a Python in the image. OutRig's other container prerequisites are unchanged and still
-  apply -- `plan/next/primary-image-needs-no-sleep.md` records what a minimal image still
-  cannot satisfy, and this phase does not address it. The ordinary standard
-  library is available and operates on the container: `pathlib`, `open()`, `subprocess`,
-  `asyncio`, `dataclasses`.
+- A static CPython supplied by OutRig and mounted read-only, so the feature does not require a
+  Python in the image. `cargo build` fetches, verifies, and embeds it; there is no setup step before
+  `cargo build` and `cargo run` work. OutRig's other container prerequisites are unchanged and still
+  apply -- `plan/next/primary-image-needs-no-sleep.md` records what a minimal image still cannot
+  satisfy, and this phase does not address it. The ordinary standard library is available and
+  operates on the container: `pathlib`, `open()`, `subprocess`, `asyncio`, `dataclasses`.
 - A `user` channel the agent receives from and sends to, replacing the arrangement where a
   typed line arrives as a model prompt. Messages are announced to the model by name and count;
   reading one is an act the generated code takes.
@@ -143,7 +143,5 @@ channel that replaces it is `0003-08`.
 - Anything live to attach to. `observability.md` settles that the session directory is the
   interface: a record to read, not a socket to interrogate, and read-only either way. A streaming
   transport would not change the events, which is what makes deferring it cheap.
-- Shipping the interpreter inside the binary. A developer fetches it with a script for now;
-  an embedded payload is release work, not something that can be used interactively.
 - The 0.3.0 release itself -- version, migration guide, public surface freeze, and the
   documentation contracts that go with them.

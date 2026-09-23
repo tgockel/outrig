@@ -15,10 +15,22 @@
 //! When the target is absent the build still succeeds with an empty artifact;
 //! the feature degrades to a runtime error whose hint resolves it, because the
 //! launcher source ships inside this (published) crate.
+//!
+//! It also fetches the static CPython every session mounts, verifies it against
+//! the pin below, and hands it to `include_bytes!` the same way (see
+//! `src/python/`). A plain `cargo build` is the whole setup: the archive is
+//! downloaded once per machine into the user's cache, and a build that cannot
+//! reach it degrades exactly as a missing musl target does.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+// The payload checks: `verify_archive`, and the ELF parser it rests on. See
+// `src/python/archive.rs` for why they are shared by `include!`.
+include!("src/container/enter/elf.rs");
+include!("src/python/archive.rs");
 
 const LAUNCHER: &str = "src/container/enter/launcher.rs";
 /// The launcher and everything it `include!`s, watched as a directory: cargo
@@ -43,6 +55,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed={REQUIRE_ENTER}");
 
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");
+    python_payload(Path::new(&out_dir));
     let dest = Path::new(&out_dir).join("outrig-enter");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -145,4 +158,166 @@ fn unavailable(dest: &Path, msg: &str) {
     println!("cargo:warning=outrig: {msg}; view=\"primary\" sidecars will be unavailable");
     println!("cargo:rustc-env={REASON_ENV}={msg}");
     std::fs::write(dest, []).expect("write empty helper artifact");
+}
+
+/// The static CPython every session mounts: `python-build-standalone`'s
+/// `+static` build, pinned by release and version. The `+static` variant is the
+/// point -- the plain musl builds load a musl runtime the *image* would have to
+/// supply, and the image is allowed to have none.
+const PY_RELEASE: &str = "20260901";
+const PY_VERSION: &str = "3.13.15";
+/// Per target architecture: the release's triple, the archive's SHA-256 from
+/// the release's own `SHA256SUMS`, and the interpreter's ELF `e_machine`.
+const PY_PINS: &[(&str, &str, &str, u16)] = &[
+    (
+        "x86_64",
+        "x86_64-unknown-linux-musl",
+        "68606ae38cb3f4db0d0fdb75b16dde78888428161e8f82430915d405b5ea96de",
+        62,
+    ),
+    (
+        "aarch64",
+        "aarch64-unknown-linux-musl",
+        "d6d5838cbda9365dc793b3174264715e601562282609501e591382c2db5ed7b9",
+        183,
+    ),
+];
+/// A local copy of the pinned archive, for a build with no network. Verified
+/// exactly as a download is.
+const PY_ARCHIVE_ENV: &str = "OUTRIG_PYTHON_ARCHIVE";
+/// As [`REQUIRE_ENTER`], for the Python payload.
+const REQUIRE_PYTHON: &str = "OUTRIG_REQUIRE_PYTHON";
+/// As [`REASON_ENV`]; `src/python/payload.rs` reads it back.
+const PY_REASON_ENV: &str = "OUTRIG_PYTHON_UNAVAILABLE_REASON";
+/// The archive's name less `.tar.zst`, which `src/python/payload.rs` unpacks
+/// under: a new pin unpacks beside an old one rather than over it.
+const PY_PAYLOAD_ENV: &str = "OUTRIG_PYTHON_PAYLOAD";
+
+/// Fetch, verify, and stage the Python payload as `OUT_DIR/python.tar.zst`.
+fn python_payload(out_dir: &Path) {
+    println!("cargo:rerun-if-changed=src/python/archive.rs");
+    println!("cargo:rerun-if-env-changed={PY_ARCHIVE_ENV}");
+    println!("cargo:rerun-if-env-changed={REQUIRE_PYTHON}");
+    let dest = out_dir.join("python.tar.zst");
+
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let Some(&(_, triple, sha256, e_machine)) = PY_PINS.iter().find(|pin| pin.0 == arch) else {
+        println!("cargo:rustc-env={PY_PAYLOAD_ENV}=");
+        python_unavailable(
+            &dest,
+            &format!("no Python payload is pinned for arch {arch:?}"),
+        );
+        return;
+    };
+    let payload = format!("cpython-{PY_VERSION}+{PY_RELEASE}-{triple}-noopt+static-full");
+    println!("cargo:rustc-env={PY_PAYLOAD_ENV}={payload}");
+    let name = format!("{payload}.tar.zst");
+
+    let archive = match fetch_python(&name, sha256, out_dir) {
+        Ok(archive) => archive,
+        Err(why) => return python_unavailable(&dest, &why),
+    };
+    // A failure here is not a missing payload but a wrong one, which no build
+    // embeds -- whatever `OUTRIG_REQUIRE_PYTHON` says.
+    let minor = PY_VERSION
+        .rsplit_once('.')
+        .map_or(PY_VERSION, |(minor, _)| minor);
+    let interpreter = format!("python/install/bin/python{minor}");
+    if let Err(why) = verify_archive(&archive, sha256, &interpreter, e_machine) {
+        panic!("outrig: refusing the Python payload {name}: {why}");
+    }
+    std::fs::write(&dest, &archive).expect("write the Python payload");
+}
+
+/// The pinned archive's bytes, from [`PY_ARCHIVE_ENV`] if it is set, else from
+/// the per-user download cache, else downloaded into it. Whether to trust them
+/// is `verify_archive`'s call, not this one's.
+fn fetch_python(name: &str, sha256: &str, out_dir: &Path) -> Result<Vec<u8>, String> {
+    if let Some(path) = std::env::var_os(PY_ARCHIVE_ENV) {
+        let path = PathBuf::from(path);
+        return std::fs::read(&path)
+            .map_err(|e| format!("cannot read {PY_ARCHIVE_ENV}={}: {e}", path.display()));
+    }
+    // Once per machine, not once per target directory, profile, and feature
+    // set -- each of which gets its own `OUT_DIR`, the fallback.
+    let cache = download_cache().filter(|dir| std::fs::create_dir_all(dir).is_ok());
+    let dirs: Vec<&Path> = cache
+        .iter()
+        .map(PathBuf::as_path)
+        .chain([out_dir])
+        .collect();
+    if let Some(cached) = cached_archive(&dirs, name, sha256) {
+        return Ok(cached);
+    }
+
+    // Written aside and renamed, so an interrupted download is never mistaken
+    // for the archive. The cache is used only if it takes the file: a
+    // directory that exists can still be read-only, which no rebuild fixes.
+    let partial = format!("{name}.partial-{}", std::process::id());
+    let (dir, file) = dirs
+        .iter()
+        .find_map(|&dir| {
+            let file = std::fs::File::create(dir.join(&partial)).ok()?;
+            Some((dir, file))
+        })
+        .ok_or_else(|| format!("cannot write {partial} to the download cache or OUT_DIR"))?;
+    let url = format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/{PY_RELEASE}/{name}"
+    );
+    let path = dir.join(name);
+    let downloaded = download(&url, file)
+        .and_then(|()| std::fs::rename(dir.join(&partial), &path).map_err(|e| e.to_string()));
+    if let Err(e) = downloaded {
+        let _ = std::fs::remove_file(dir.join(&partial));
+        return Err(format!(
+            "cannot download {url}: {e} -- rebuild with network access, or set \
+             {PY_ARCHIVE_ENV} to a copy of {name}"
+        ));
+    }
+    std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// `$XDG_CACHE_HOME/outrig/downloads`, or `$HOME/.cache/outrig/downloads`:
+/// `XDG_CACHE_HOME` only when absolute, the rule `src/python/payload.rs`'s
+/// `cache_root` applies to where sessions unpack.
+fn download_cache() -> Option<PathBuf> {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })?;
+    Some(root.join("outrig/downloads"))
+}
+
+/// Stream `url` into `file`, following the environment's proxy settings.
+fn download(url: &str, mut file: std::fs::File) -> Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_global(Some(Duration::from_secs(15 * 60)))
+        .build()
+        .into();
+    let response = agent.get(url).call().map_err(|e| e.to_string())?;
+    std::io::copy(&mut response.into_body().into_reader(), &mut file)
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+/// As [`unavailable`], for the Python payload: sessions then fail at start with
+/// `msg`. Also names a path that never exists as an input, which makes cargo
+/// rerun this script on every build until one succeeds -- the usual remedy is
+/// simply to rebuild with network, and nothing else it tracks would change.
+fn python_unavailable(dest: &Path, msg: &str) {
+    if std::env::var_os(REQUIRE_PYTHON).is_some() {
+        panic!("outrig: {msg} ({REQUIRE_PYTHON} is set)");
+    }
+    println!("cargo:warning=outrig: {msg}; sessions will not start until a build embeds Python");
+    println!("cargo:rustc-env={PY_REASON_ENV}={msg}");
+    println!(
+        "cargo:rerun-if-changed={}",
+        dest.with_extension("retry").display()
+    );
+    std::fs::write(dest, []).expect("write empty Python payload");
 }

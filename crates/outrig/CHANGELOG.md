@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every `Outrig::launch` mounts OutRig's static CPython** read-only at `/outrig/python`. The
+  interpreter is embedded in the build: `build.rs` downloads a pinned `python-build-standalone`
+  release, refuses it unless its SHA-256 matches and its interpreter is a static ELF64 for the
+  target, and caches the download under `$XDG_CACHE_HOME/outrig/downloads`. The first launch on a
+  machine unpacks it under `$XDG_CACHE_HOME/outrig/python`, and a cache on a `noexec` filesystem
+  is refused with a message naming `XDG_CACHE_HOME`. There is no opt-out: on this line a session
+  is a Python session.
+- **Building `outrig` needs network once, or `OUTRIG_PYTHON_ARCHIVE`.** A build that cannot fetch
+  the archive warns and embeds nothing (`OUTRIG_REQUIRE_PYTHON=1` makes that an error), and every
+  `Outrig::launch` in the result fails with `OutrigError::Configuration` saying why. The embedded
+  archive adds about 36 MB to a binary that links the crate.
+- **`/outrig` is reserved inside the container.** `Outrig::launch` refuses a workspace or mount
+  whose container path is `/outrig` or under it, with `OutrigError::Configuration`.
+
 ### Removed
 
 - **`style = "mistralrs"` and the config surface behind it**, deprecated in 0.2.0:

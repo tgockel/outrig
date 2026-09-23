@@ -23,11 +23,12 @@ use crate::error::{IoPathExt, OutrigError, Result};
 // The ELF parser, the `PATH` expansion and the symlink resolution are
 // unit-tested on the host; `launcher.rs` pulls the same files in with
 // `include!` for the musl build. None has a non-test consumer in the library,
-// so all three are compiled only under `cfg(test)`.
+// so all three are compiled only under `cfg(test)`. The ELF parser is also
+// what `build.rs` checks the Python payload with, whose tests reach it here.
 #[cfg(test)]
 mod canon;
 #[cfg(test)]
-mod elf;
+pub(crate) mod elf;
 #[cfg(test)]
 mod path_search;
 

@@ -76,9 +76,12 @@ regex              = { version = "1.12.4",  default-features = false }
 reqwest            = { version = "0.13.4",  default-features = false }
 rig                = { version = "0.40.0",  default-features = false, package = "rig-core" }
 rmcp               = { version = "3.1.0",   default-features = false }
+ruzstd             = { version = "0.9.0",   default-features = false }
 schemars           = { version = "1.2.2",   default-features = false }
 serde              = { version = "1.0.229", default-features = false }
 serde_json         = { version = "1.0.151", default-features = false }
+sha2               = { version = "0.11.0",  default-features = false }
+tar                = { version = "0.4.46",  default-features = false }
 tempfile           = { version = "3.27.0",  default-features = false }
 thiserror          = { version = "2.0.19",  default-features = false }
 tokio              = { version = "1.53.1",  default-features = false }
@@ -88,4 +91,15 @@ tracing            = { version = "0.1.44",  default-features = false }
 tracing-subscriber = { version = "0.3.23",  default-features = false }
 trybuild           = { version = "1.0.121", default-features = false }
 tokio-util         = { version = "0.7.19",  default-features = false }
+ureq               = { version = "3.4.2",   default-features = false }
 walkdir            = { version = "2.5.0",   default-features = false }
+
+# The embedded Python payload is a 36 MB zstd archive that `build.rs` hashes
+# and `outrig` unpacks on a session's first start. Unoptimized, both take long
+# enough to notice in a debug build; these two crates are small, so optimizing
+# them costs little compile time.
+[profile.dev.package.ruzstd]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
