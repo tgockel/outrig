@@ -62,9 +62,11 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// feature build.
 #[derive(Clone)]
 pub struct SubagentContext {
-    /// The session's resolved agent. A subagent reuses its limits and sampling;
-    /// the preamble is replaced by whatever the parent passes, and the model is
-    /// re-resolved when the launch names one.
+    /// The resolved agent of whoever launches through this registry: the
+    /// session's for the session's registry, a subagent's own for the one it
+    /// was handed. A subagent reuses its limits and sampling; the preamble is
+    /// replaced by whatever the parent passes, and the model is re-resolved
+    /// when the launch names one.
     pub resolved: ResolvedAgent,
     /// The merged session config, kept so a launch can re-resolve the agent
     /// against a different `[models.<name>]`. An `Arc` because the context is
@@ -779,6 +781,12 @@ async fn build_subagent_agent(
     let child = if ctx.depth < ctx.resolved.subagent_depth_max {
         let mut child_ctx = ctx.clone();
         child_ctx.depth = ctx.depth + 1;
+        // This subagent is the launching agent now, so its children inherit
+        // the model it runs under; left as the clone, a subagent launched onto
+        // a named model would hand its children its parent's instead. The
+        // agent-side fields are the same on both sides -- the launch carried
+        // them forward -- so only the model-derived ones change here.
+        child_ctx.resolved = resolved.clone();
         let child = Arc::new(SubagentRegistry::new(child_ctx));
         tools.extend(crate::builtin_tool::parent_tools(
             child.clone(),
@@ -2214,6 +2222,40 @@ mod tests {
             registry.lock().get("leaf").expect("live").child.is_none(),
             "naming a model must not exempt a launch from the depth limit"
         );
+    }
+
+    /// "Omit to use yours" means the launching agent's model at every level: a
+    /// subagent launched onto `fast` launches its own children on `fast`, not on
+    /// the session's `smart`. The agent-side fields still cross both hops.
+    #[tokio::test(start_paused = true)]
+    async fn a_subagent_on_a_named_model_hands_that_model_to_its_children() {
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.resolved.tool_call_max = 7;
+        registry
+            .launch("mid", Some("fast"), None, "work".to_string())
+            .await
+            .expect("launch");
+        let child = child_registry(&registry, "mid");
+
+        assert_eq!(
+            child.parent_model_name(),
+            "fast",
+            "the child's launch tool must name the subagent's own model as its own"
+        );
+        let inherited = resolve_launch_model(&child.ctx, None).expect("inherits");
+        assert_eq!(inherited.model_name(), "fast");
+        assert_eq!(inherited.model_identifier(), "gpt-4o-mini");
+        assert_eq!(inherited.max_tokens(), Some(16_000));
+        assert_eq!(
+            (inherited.tool_call_max, inherited.subagent_depth_max),
+            (7, 3),
+            "the session's CLI override and depth limit must survive two hops"
+        );
+
+        let named = resolve_launch_model(&child.ctx, Some("smart")).expect("resolves");
+        assert_eq!(named.model_name(), "smart");
+        assert_eq!(named.max_tokens(), Some(64_000));
+        assert_eq!(registry.ctx.resolved.model_name(), "smart");
     }
 
     /// Refusal, enumeration, no half-registration, and a corrected retry -- the

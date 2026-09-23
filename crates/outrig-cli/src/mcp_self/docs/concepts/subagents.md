@@ -55,7 +55,9 @@ everywhere afterward.
 ### Choosing the subagent's model
 
 `outrig__subagent` takes an optional `model`. Omit it and the subagent runs under the model the
-launching agent is running under, which is what every call above does.
+launching agent is running under, which is what every call above does. That holds at every depth:
+a subagent launched onto `fast` is the launching agent for its own children, so they run on `fast`
+too unless they name another.
 
 ```
 outrig__subagent({"name": "grep-callers", "prompt": "...", "model": "fast"})

@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recommends an absolute path for the global config, which serves every repo. An answer relative
   to the directory `config init` ran in wrote a config that failed validation naming a file that
   exists. The answer is still stored as typed.
+- **A subagent's children inherit its model, not its parent's.** A subagent launched with
+  `model = "fast"` gave any child that named no model the model of the agent that launched *it*,
+  with that model's provider and `max-tokens`, and its own `outrig__subagent` schema offered that
+  model as "yours". Both now follow the model the subagent itself runs under.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
