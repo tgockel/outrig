@@ -100,9 +100,16 @@ A background `create_task`
   agent and co-hosting would otherwise reintroduce.
 
 `subprocess.run([...])`
-: Each agent gets a pipe of its own, supplied as the default `stdout` and `stderr` by one patch on
-  `Popen.__init__`. `sys.stdout.fileno()` returns the same descriptor, so code that redirects
-  explicitly lands in the right place too.
+: A pipe per **execution**, supplied as the default `stdout` and `stderr` by one patch on
+  `Popen.__init__`, which reads the same contextvar. `sys.stdout.fileno()` returns that
+  descriptor, so explicit redirection lands in the right place too.
+
+  Per-execution rather than per-agent, because a child's bytes carry no writer identity: two
+  executions' children sharing one agent pipe produce a stream the drain cannot attribute, and no
+  contextvar recovers information that was never in it. A per-agent pipe would let a child cell A
+  started consume cell B's result budget -- the same defect the background bound exists to fix,
+  reintroduced one layer down. The cost is that a child outliving its execution keeps a
+  descriptor open, so the drain is bounded and the execution's result does not wait on it.
 
 `os.write(1, ...)` and `os.system()`
 : Not attributable. These name the descriptor directly, so fd 1 becomes a shared bucket. What
@@ -112,9 +119,10 @@ A background `create_task`
 Verified with two agents printing, spawning background tasks, and running subprocesses at the same
 time: every line landed in its own agent. That experiment established attribution **between**
 agents and says nothing about the case above -- one agent's old background task emitting while a
-new execution runs -- which is the harder half and is not yet tested. A subprocess inheriting a
-per-agent descriptor is the piece most likely to resist per-execution attribution; if it does, the
-weaker guarantee should be stated rather than the stronger one implied.
+new execution runs -- which is the harder half and is not yet tested. The per-execution descriptor
+above is what makes that case expressible at all; whether a descendant that outlives its execution
+can still be attributed is the part to prove, and if it cannot, the weaker guarantee is stated
+rather than the stronger one implied.
 
 The prototype's background-output fix, which `runtime-protection.md` carries, survives -- and
 survives better than it did. Between-execution output stays attributed to the agent whose task

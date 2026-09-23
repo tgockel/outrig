@@ -110,10 +110,14 @@ surface among others.
 
 ## Tasks
 
-None are written yet. The sibling design documents settle what they are: `messages.md` decides
-the channel and contract work, `harness-components.md` decides how the crate split is
-sequenced, and the two deferred subjects have their own pages. Tasks will be numbered
-`0003-01` onward and queued in `plan/todo/`, whose `README.md` carries the per-step index.
+`0003-01` through `0003-16`, queued in `plan/todo/`, whose `README.md` carries the per-step
+index. They cover the ten deliverables above; the subjects listed as out of scope below have
+design pages and no tasks.
+
+The ordering puts a usable command early. `0003-01` through `0003-05` are the shortest path to an
+interactive `run-new`, and everything after is additive. One consequence is worth knowing before
+reading them: `0003-05` passes a typed line to the model as an ordinary prompt, and the `user`
+channel that replaces it is `0003-08`.
 
 ## Out of scope
 

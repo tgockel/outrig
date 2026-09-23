@@ -15,7 +15,7 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
   crates is narrowed, sealed, and frozen for 0.2.0.
 - [0003 -- python](../phase/0003-python/README.md) -- an agent acts by writing Python into a
   persistent interpreter in its container rather than by calling MCP tools, and the agent loop
-  moves into `outrig`. Designed but not yet queued; the code lands on `version/0.3.x`.
+  moves into `outrig`. The code lands on `version/0.3.x`.
 
 ## Recently completed
 
@@ -87,6 +87,66 @@ Follow-up work discovered mid-execution collects in `plan/next/` as unnumbered e
 `/groom-plan` folds them into the numbered queue when there is an ordering worth maintaining
 -- a dependency between two buffer entries is a note, while a dependency between two numbered
 tasks is an invariant this file holds.
+
+### Phase 0003 -- python
+
+`0003-01` through `0003-16` cover the phase's ten user-visible deliverables. The ordering is
+chosen so a person can use the thing early: `0003-01` through `0003-05` are the shortest path to
+an interactive `outrig run-new`, and everything after it is additive. A first draft of this queue
+was built from the phase's exit criteria instead and silently omitted discovery, history, and
+observability -- the exit criteria describe the first milestone, the deliverables describe the
+phase.
+
+**The path to a running CLI**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-01` | A verified static CPython is mounted where the image has none      |
+| `0003-02` | The interpreter runs an agent's Python and answers by agent id     |
+| `0003-03` | The host starts the interpreter and correlates its replies         |
+| `0003-04` | The model's only tool submits Python, and `outrig` drives a round  |
+| `0003-05` | `outrig run-new` holds a session; `run-legacy` names the old one   |
+
+**Surviving what the agent writes**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-06` | A runaway execution is survivable, and the user can end one        |
+| `0003-07` | An agent's memory has a ceiling that reports rather than kills     |
+
+**How the agent is addressed, and what it can see**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-08` | The user reaches the agent through a channel, not a prompt         |
+| `0003-09` | `runtime.wait` mirrors `asyncio.wait` and watches the channels     |
+| `0003-10` | The agent can ask what it holds and what it cannot import          |
+| `0003-11` | The full conversation lives in Python; a view goes to the provider |
+| `0003-12` | The view is budgeted, and promotion has settled semantics          |
+
+**What a human can see afterwards, and finishing the loop**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-13` | A session records what its agents did, by category                 |
+| `0003-14` | A script renders a session directory to one page                   |
+| `0003-15` | Retry and failover come across from the 0.2.x loop                 |
+| `0003-16` | The docs describe the system that now exists                       |
+
+Cross-cutting notes the individual tasks carry rather than this file:
+
+- `0003-05` ships a CLI that passes a typed line to the model as an ordinary prompt. The `user`
+  channel that replaces that arrangement is `0003-08`; the staging is deliberate, and gating the
+  first runnable CLI on the channel would have bought no verification the prompt does not give.
+- `0003-04` copies the minimum of the agent loop that one round needs and `0003-15` finishes it.
+  Between them `run-new` is less resilient than `run`, which is a stated cost rather than an
+  oversight.
+- `0003-06` is not optional polish. `runtime-protection.md` records that without it the first
+  `while True:` ends the session, which is why it lands immediately after the CLI that makes it
+  reachable.
+- The phase's deferred subjects -- credential isolation, MCP as Python objects, subagents and the
+  work API -- have design pages and no tasks. They are out of scope by the phase README's own
+  list, not forgotten.
 
 ## Not queued, deliberately
 
