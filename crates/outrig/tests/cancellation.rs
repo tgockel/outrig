@@ -1,4 +1,5 @@
-//! Cancellation ownership at the container and image layers.
+//! Cancellation ownership at the container and image layers, and what a
+//! refused image cleanup still owes.
 //!
 //! Deliberately **not** `e2e`-gated. Podman and buildah are faked with shell
 //! scripts, so these run in the ordinary suite -- the same reasoning as
@@ -22,11 +23,20 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use outrig::container::{Container, ContainerCreateOptions, ContainerLaunchSpec};
+use outrig::error::OutrigError;
 use outrig::image::ImageTag;
 
 /// Generous ceiling for anything this file polls for. The real figures are
 /// milliseconds; this is margin for a loaded runner.
 const CEILING: Duration = Duration::from_secs(10);
+
+/// How long a negative waits for a reissued removal that should not come.
+///
+/// Short, because only the fake is left to wait out: a guard left armed
+/// reissues its removal from `Drop`, which runs before the build's future
+/// resolves, so by the time a test holds the result that process has been
+/// spawned. What remains is the shell starting and publishing.
+const SETTLE: Duration = Duration::from_millis(500);
 
 /// A `podman` / `buildah` stand-in that journals every invocation and can be
 /// steered per subject.
@@ -60,6 +70,12 @@ const CEILING: Duration = Duration::from_secs(10);
 /// the middle of the first. Scoping the marker to a verb matters: `podman
 /// create --name N` and `podman init N` both mention `N`, so an unscoped
 /// marker would make the whole sequence fast and the test would prove nothing.
+///
+/// A `refuse.<verb>.<token>` marker makes the next *n* invocations of that verb
+/// fail with nothing done, *n* being the count the marker holds, and an
+/// `absent.rmi.<token>` marker makes an `rmi` answer as buildah does for a tag
+/// that does not exist. A working container's name carries no token, so for
+/// these a `buildah rm` also matches against the `from` that made it.
 const FAKE: &str = r#"#!/bin/sh
 journal="$OUTRIG_FAKE_JOURNAL"
 pending=$(mktemp "$journal/pending.XXXXXX")
@@ -99,21 +115,69 @@ for arg in "$@"; do
   esac
   prev=$arg
 done
+# The last argument, which is what a bare removal names.
+target=$prev
+
+# An image tag carries `/` and `:`, which a file name cannot.
+flat() { printf '%s' "$1" | tr '/:' '__'; }
+
+# What a steering marker is matched against: the argv, plus -- for a working
+# container, whose name is outrig's own nonce and carries no test's token --
+# the argv of the `from` that made it. Read without a fork, since every
+# invocation of every verb passes through here.
+origin=
+if [ "$1" = rm ] && [ -f "$journal/origin.$target" ]; then
+  read -r origin < "$journal/origin.$target"
+fi
+seen=" $* $origin "
+
+# A `refuse.<verb>.<token>` marker holds a count, and that many invocations
+# fail the way a busy engine fails one: exit 125, with nothing created and
+# nothing removed. Once the count is spent the verb carries on as usual, which
+# is the transient failure a retry is for.
+for marker in "$journal"/refuse."$1".*; do
+  [ -e "$marker" ] || continue
+  token=${marker##*/refuse.$1.}
+  case "$seen" in
+    *"$token"*)
+      left=$(cat "$marker")
+      if [ "$left" -gt 0 ]; then
+        printf '%s\n' "$((left - 1))" > "$marker"
+        echo "Error: $1 $target: database is locked" 1>&2
+        publish
+        exit 125
+      fi
+      ;;
+  esac
+done
 
 # Removals record *what they removed*, so a test can assert on the container
 # rather than on the shape of an argv. A label-scoped removal reaches only
 # what carries that label; a bare one names its target directly.
 case "$1" in
   rm|rmi)
+    # An `absent.rmi.<token>` marker: the tag was never created, and the
+    # removal says so in buildah's own words -- exit 125 like any other
+    # failure, with the storage layer's "not known" the only difference.
+    for marker in "$journal"/absent."$1".*; do
+      [ -e "$marker" ] || continue
+      token=${marker##*/absent.$1.}
+      case "$seen" in
+        *"$token"*)
+          printf 'Error: 1 error occurred:\n\t* %s: image not known\n\n\n' "$target" 1>&2
+          publish
+          exit 125
+          ;;
+      esac
+    done
     if [ -n "$filter" ]; then
       lbl=${filter#label=}
       if [ -f "$journal/labeled.$lbl" ]; then
         removed=$(cat "$journal/labeled.$lbl")
-        : > "$journal/removed.$(printf '%s' "$removed" | tr '/:' '__')"
+        : > "$journal/removed.$(flat "$removed")"
       fi
     else
-      for arg in "$@"; do target=$arg; done
-      : > "$journal/removed.$(printf '%s' "$target" | tr '/:' '__')"
+      : > "$journal/removed.$(flat "$target")"
     fi
     publish
     exit 0
@@ -161,6 +225,11 @@ case "$1" in
     # to remove rather than race its creation.
     if [ -n "$label" ]; then
       printf '%s\n' "$subject" > "$journal/labeled.$label"
+    fi
+    # A working container answers to the image it was made from; see `seen`.
+    # Its name is `outrig-label-<pid>-<nonce>`, so it needs no folding.
+    if [ "$1" = from ]; then
+      printf '%s\n' "$*" > "$journal/origin.$subject"
     fi
     # `build` publishes later, once its trap is in place -- see the parking
     # block below. A test that cancels on first sight would otherwise be
@@ -336,6 +405,38 @@ fn fail_name_collision_for(journal: &Path, verb: &str, token: &str) {
     std::fs::write(journal.join(format!("fail.{verb}.{token}")), "").expect("write fail marker");
 }
 
+/// Make the next `times` invocations of the fake's `verb` that mention `token`
+/// fail the way a busy engine fails one, leaving everything where it was.
+fn refuse_for(journal: &Path, verb: &str, token: &str, times: u32) {
+    std::fs::write(
+        journal.join(format!("refuse.{verb}.{token}")),
+        format!("{times}\n"),
+    )
+    .expect("write refuse marker");
+}
+
+/// Assert the refusals [`refuse_for`] armed have all been spent.
+///
+/// What makes a later sighting of the target removed mean something: the
+/// refusal was not dodged, so the removal that worked came after one that did
+/// not. Read off the marker rather than by counting invocations, because the
+/// fake records a removal before it publishes the invocation that made it.
+fn expect_refusals_spent(journal: &Path, verb: &str, token: &str) {
+    let left = std::fs::read_to_string(journal.join(format!("refuse.{verb}.{token}")))
+        .expect("read refuse marker");
+    assert_eq!(
+        left.trim(),
+        "0",
+        "the fake's `{verb}` was not refused as armed, so this proves nothing"
+    );
+}
+
+/// Make the fake's `rmi` answer as buildah does for a tag that was never
+/// created.
+fn report_absent_for(journal: &Path, token: &str) {
+    std::fs::write(journal.join(format!("absent.rmi.{token}")), "").expect("write absent marker");
+}
+
 /// Park the fake's `verb` before it creates anything and keep it alive there,
 /// so a test can cancel a client that provably has no container behind it.
 ///
@@ -499,6 +600,39 @@ fn removals(journal: &Path) -> Vec<String> {
         .map(|(_, argv)| argv)
         .filter(|argv| verb_of(argv) == "rm" || verb_of(argv) == "rmi")
         .collect()
+}
+
+/// How many removals of `verb` the fake was asked for that mention `subject`,
+/// whether or not they worked.
+fn removals_of(journal: &Path, verb: &str, subject: &str) -> usize {
+    removals(journal)
+        .iter()
+        .filter(|argv| verb_of(argv) == verb && argv.contains(subject))
+        .count()
+}
+
+/// Assert exactly `n` `rmi`s mentioning `token`, once any further one has had
+/// `settle` to show itself.
+///
+/// All `n` are waited for before the settle starts, so the count is a
+/// statement about removals that ran rather than about ones that have not yet.
+async fn expect_rmis(journal: &Path, token: &str, n: usize, settle: Duration) {
+    let deadline = Instant::now() + CEILING;
+    while removals_of(journal, "rmi", token) < n {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {n} removals ran within {CEILING:?}",
+            removals_of(journal, "rmi", token)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(settle).await;
+    assert_eq!(
+        removals_of(journal, "rmi", token),
+        n,
+        "the temporary tag's removal ran a different number of times; removals seen: {:?}",
+        removals(journal)
+    );
 }
 
 /// The subcommand an invocation is, which is its first word.
@@ -1126,25 +1260,14 @@ async fn a_canceled_standalone_build_removes_only_its_temporary_tag() {
 #[tokio::test]
 async fn a_successful_standalone_build_names_the_image_the_caller_asked_for() {
     let journal = fake_runtime();
-    let context = tempfile::tempdir().expect("tempdir");
-    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
-
     let token = unique_name("renamed");
     return_immediately_for(journal, "build", &token);
 
-    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
-    let labels = std::collections::BTreeMap::new();
-    outrig::image::build_standalone(
-        context.path(),
-        Path::new("Dockerfile"),
-        Path::new("."),
-        &final_tag,
-        false,
-        &labels,
-    )
-    .await
-    .expect("the fake `buildah build` returns success");
+    standalone_build(&token)
+        .await
+        .expect("the fake `buildah build` returns success");
 
+    let final_tag = format!("example.invalid/{token}:latest");
     let (_, tagging) = invocation(journal, "tag", &[final_tag.as_str()]).await;
     let temp_tag = tagging
         .split_whitespace()
@@ -1156,8 +1279,10 @@ async fn a_successful_standalone_build_names_the_image_the_caller_asked_for() {
         "the tag should rename the temporary image, got {tagging:?}"
     );
     // The temporary name goes, and only the name: by here the image carries
-    // both, so this is an untag.
+    // both, so this is an untag. Once, too: a removal that worked releases
+    // its guard, so nothing reissues it.
     expect_removed(journal, &temp_tag).await;
+    expect_rmis(journal, &token, 1, SETTLE).await;
 }
 
 /// The graceful stop is scoped to builds. A cancelled container start is
@@ -1188,4 +1313,126 @@ async fn a_canceled_container_start_is_still_killed_outright() {
         !was_asked_to_stop(journal, client),
         "podman {client} was asked to stop; only builds are"
     );
+}
+
+/// A standalone build of `token`'s image from a scratch Dockerfile: the
+/// shortest path to a temporary tag and its removal.
+async fn standalone_build(token: &str) -> Result<(), OutrigError> {
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    outrig::image::build_standalone(
+        context.path(),
+        Path::new("Dockerfile"),
+        Path::new("."),
+        &final_tag,
+        false,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+}
+
+/// Whether `err` is buildah failing at `verb`, rather than at anything after.
+fn failed_at(err: &OutrigError, verb: &str) -> bool {
+    matches!(err, OutrigError::Process { argv, .. } if argv.first().is_some_and(|a| a == verb))
+}
+
+/// A temporary-tag removal that buildah refuses is issued again, and the build
+/// still reports its own success.
+///
+/// The refusal leaves the tag where it was, so the only removal that can record
+/// it gone is one that came after -- which exists only if the guard stayed
+/// armed across the first.
+#[tokio::test]
+async fn a_refused_temp_tag_removal_is_reissued() {
+    let journal = fake_runtime();
+    let token = unique_name("refused-tag");
+    return_immediately_for(journal, "build", &token);
+    refuse_for(journal, "rmi", &token, 1);
+
+    standalone_build(&token)
+        .await
+        .expect("a refused cleanup must not fail a build that worked");
+    expect_refusals_spent(journal, "rmi", &token);
+
+    let (_, argv) = invocation(journal, "build", &[token.as_str()]).await;
+    let temp_tag = flag_value(&argv, "--tag");
+    expect_removed(journal, &temp_tag).await;
+}
+
+/// The same for the label-stamping working container, on the path that owes
+/// its removal: a commit that failed.
+///
+/// The error is the commit's. A cleanup failing behind it must not replace the
+/// failure the caller has to act on.
+#[tokio::test]
+async fn a_refused_working_container_removal_is_reissued() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let token = unique_name("refused-builder");
+    return_immediately_for(journal, "build", &token);
+    return_immediately_for(journal, "from", &token);
+    refuse_for(journal, "commit", &token, 1);
+    refuse_for(journal, "rm", &token, 1);
+
+    let cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let err = outrig::image::build_image_for("refused", &cfg, context.path(), &final_tag, false)
+        .await
+        .expect_err("the fake refuses the commit");
+    assert!(
+        failed_at(&err, "commit"),
+        "the build should report the commit's failure, got {err}"
+    );
+    expect_refusals_spent(journal, "rm", &token);
+
+    let (_, from) = invocation(journal, "from", &["outrig-label-", token.as_str()]).await;
+    let builder = flag_value(&from, "--name");
+    expect_removed(journal, &builder).await;
+}
+
+/// A tag the build never created is not removed again.
+///
+/// Every build that fails before tagging reaches the `rmi` of a tag that does
+/// not exist, and buildah answers it with exit 125 like any other failure.
+/// Read as one, it would cost each failed build a round of detached retries.
+/// The tag a successful build's removal took is covered with the rest of that
+/// path, in `a_successful_standalone_build_names_the_image_the_caller_asked_for`.
+#[tokio::test]
+async fn a_temp_tag_that_was_never_created_is_not_reissued() {
+    let journal = fake_runtime();
+    let token = unique_name("absent-tag");
+    refuse_for(journal, "build", &token, 1);
+    report_absent_for(journal, &token);
+
+    let err = standalone_build(&token)
+        .await
+        .expect_err("the fake refuses the build");
+    assert!(
+        failed_at(&err, "build"),
+        "the build should report its own failure, got {err}"
+    );
+    expect_rmis(journal, &token, 1, SETTLE).await;
+}
+
+/// A tag buildah never lets go of is given up on, on the guard's schedule and
+/// no other.
+///
+/// Four removals in all: the awaited one, then the guard's reissue and the two
+/// retries `supervise::CLEANUP_RETRIES` allows it. The settle runs past the
+/// 1 s backoff a further retry would have waited out, so "no more" is
+/// observed rather than assumed.
+#[tokio::test]
+async fn a_temp_tag_removal_that_keeps_failing_is_abandoned() {
+    let journal = fake_runtime();
+    let token = unique_name("stuck-tag");
+    return_immediately_for(journal, "build", &token);
+    refuse_for(journal, "rmi", &token, 100);
+
+    standalone_build(&token)
+        .await
+        .expect("a refused cleanup must not fail a build that worked");
+    expect_rmis(journal, &token, 4, Duration::from_millis(1200)).await;
 }

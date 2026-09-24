@@ -795,8 +795,9 @@ impl Wait {
 /// ordinary paths still remove these themselves, awaited and in order; the
 /// guard covers the path that never gets there.
 ///
-/// Removing something twice has to be harmless, because on most paths it will
-/// be: `buildah rmi` of a tag that is already gone is a no-op.
+/// Removing something twice has to be harmless, because a removal whose
+/// outcome is not known gets issued again: `buildah rmi` of a tag that is
+/// already gone changes nothing.
 pub(crate) struct CleanupGuard(Option<(Cmd, Reissue)>);
 
 impl CleanupGuard {
@@ -809,10 +810,21 @@ impl CleanupGuard {
         Self(Some((remove, reissue)))
     }
 
+    /// The removal this guard owes, for a caller that awaits it first.
+    ///
+    /// Running this one rather than a copy built beside it is what keeps the
+    /// awaited removal and the reissue from drifting apart.
+    pub(crate) fn removal(&self) -> &Cmd {
+        // Only `release` and `Drop` empty it, and both take the guard.
+        let (remove, _) = self.0.as_ref().expect("an armed guard holds its removal");
+        remove
+    }
+
     /// The resource is gone by other means, or an owner that will remove it
     /// now exists. Release **after** the awaited cleanup, never before: a
     /// cancellation landing inside that cleanup is exactly the case the guard
-    /// is for.
+    /// is for. And only once that cleanup is known to have worked -- releasing
+    /// on the strength of a removal that failed disarms the one retry left.
     pub(crate) fn release(mut self) {
         self.0 = None;
     }

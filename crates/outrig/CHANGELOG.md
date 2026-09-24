@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A refused image cleanup no longer disarms its retry.** A build removed its temporary
+  `outrig-tmp-*` tag, and a failed label-stamping pass its `outrig-label-*` working container,
+  then released the guard that owed the removal whether or not buildah had done it. A removal
+  refused for a transient reason -- a lock, a busy image -- left the resource behind with nothing
+  coming for it, and a temporary tag stays tagged, so pruning never collects it. The guard now
+  stays armed unless the removal worked or buildah reports the target as not there, and a
+  refusal is logged as a warning and reissued in the background under the guard's usual bounded
+  retries. The build's own result is returned either way.
+
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 
 The first release since 0.1.0. It breaks the public Rust surface in most of the ways a 0.1

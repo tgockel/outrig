@@ -49,6 +49,9 @@ outrig build [--image <name>]
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.
+     The temporary tag is then removed, whether or not the build succeeded. If buildah refuses
+     the removal, outrig warns and reissues it in the background rather than leaving the tag
+     behind; the build's own result stands either way.
      The repository is the `[images.<name>]` block key, so the built image is self-describing
      in `podman images`; the `<hash>` is the content-addressed cache key.
 

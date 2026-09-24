@@ -305,9 +305,9 @@ async fn compute_tag_with_build_args(
 }
 
 /// Returns `true` iff `tag` already exists in buildah's local image store.
-/// `buildah images --quiet <tag>` prints the image id on a hit and nothing
-/// on a miss; either way exits 0, so we ignore the status and inspect
-/// stdout.
+/// `buildah images --quiet <tag>` prints the image id on a hit, and exits 125
+/// with `image not known` on a miss; any failure reads as a miss, and so does
+/// a success that printed no id.
 pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
     let probe = process::try_capture(
         Cmd::new("buildah")
@@ -421,9 +421,10 @@ pub async fn build_image_for(
 /// The envelope every build path shares, held in one place because its
 /// ordering is the load-bearing part: the guard is armed before the tag can
 /// exist, so the store never holds it unowned, and released strictly *after*
-/// the awaited cleanup, because a cancellation landing inside that cleanup is
-/// the case the guard is for. Three call sites got that right independently;
-/// one is easier to keep right.
+/// the awaited cleanup -- and only if that worked, per [`discharge`] --
+/// because a cancellation landing inside that cleanup is the case the guard is
+/// for. Three call sites got that right independently; one is easier to keep
+/// right.
 async fn into_temp_tag<F>(tag: &ImageTag, transcript: Option<&Transcript>, build: F) -> Result<()>
 where
     F: AsyncFnOnce(&ImageTag) -> Result<()>,
@@ -431,8 +432,7 @@ where
     let temp_tag = temporary_build_tag(tag);
     let temp_owned = temp_tag_guard(&temp_tag);
     let result = build(&temp_tag).await;
-    cleanup_temp_image(&temp_tag, transcript).await;
-    temp_owned.release();
+    discharge(temp_owned, "image not known", transcript).await;
     result
 }
 
@@ -832,11 +832,12 @@ struct SkopeoInspect {
 
 /// Arm the removal of a build's temporary tag.
 ///
-/// `cleanup_temp_image` below each build is what runs on every path that
-/// reaches it; this covers the one that does not, since the cleanup is a
-/// statement after an `.await` and a dropped future never gets there. The tag
-/// is named before `buildah build` runs, so arming it first leaves no instant
-/// at which the store could hold it unowned.
+/// The [`discharge`] after each build is what runs on every path that reaches
+/// it; this covers the paths on which that does not remove the tag. A dropped
+/// future never gets there, since the cleanup is a statement after an
+/// `.await`, and buildah can refuse a removal it does reach. The tag is named
+/// before `buildah build` runs, so arming it first leaves no instant at which
+/// the store could hold it unowned.
 fn temp_tag_guard(temp_tag: &ImageTag) -> CleanupGuard {
     // The tag carries this build's pid and nonce, so it names nothing another
     // build could create -- a retry is safe.
@@ -988,12 +989,14 @@ async fn commit_image_with_labels(
     .await;
 
     // `commit --rm` takes the working container on the success path, and
-    // `cleanup_builder` on the failure path -- so by here it is gone either
-    // way and the guard has nothing left to owe.
-    if result.is_err() {
-        cleanup_builder(&builder, transcript).await;
+    // `discharge` on the failure path. A reissue that leaves races the
+    // caller's `rmi` of the image this container was made from, which buildah
+    // refuses as in use if it loses -- so that guard stays armed too, and its
+    // backed-off retries land once the container is gone.
+    match result {
+        Ok(()) => builder_owned.release(),
+        Err(_) => discharge(builder_owned, "container not known", transcript).await,
     }
-    builder_owned.release();
     result
 }
 
@@ -1006,22 +1009,49 @@ async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Resul
     Ok(())
 }
 
-async fn cleanup_builder(builder: &str, transcript: Option<&Transcript>) {
-    let cmd = Cmd::new("buildah").arg("rm").arg(builder);
-    if transcript.is_some() {
-        let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
-    } else {
-        let _ = process::try_capture(cmd).await;
-    }
+/// Run `guard`'s removal now, awaited, and release the guard only if that
+/// left nothing behind; `absent` is the removal's stderr for a target that was
+/// never there.
+///
+/// Otherwise the guard drops armed, and its drop reissues the removal. The
+/// failure is warned about rather than returned: the caller is holding the
+/// build's own result, which a cleanup failure must not replace.
+async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transcript>) {
+    let cmd = guard.removal().clone();
+    let failure = match process::try_capture_logged(cmd.clone(), "buildah", transcript).await {
+        Ok(output) if left_nothing(&output, absent) => {
+            guard.release();
+            return;
+        }
+        Ok(output) => OutrigError::Process {
+            program: cmd.program,
+            argv: cmd.args,
+            exit_code: output.status.code(),
+            stderr_tail: process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
+        },
+        Err(e) => e,
+    };
+    tracing::warn!(
+        target: "outrig::image",
+        "a build cleanup left its target behind; reissuing it in the background: {failure}"
+    );
 }
 
-async fn cleanup_temp_image(tag: &ImageTag, transcript: Option<&Transcript>) {
-    let cmd = Cmd::new("buildah").arg("rmi").arg(tag.as_str());
-    if transcript.is_some() {
-        let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
-    } else {
-        let _ = process::try_capture(cmd).await;
-    }
+/// Whether a removal's output shows its target gone: removed now, or never
+/// there.
+///
+/// buildah exits 125 for a target that does not exist, the same code as for
+/// every other failure, so the storage layer's "not known" sentinel in stderr
+/// is the only thing that tells the two apart (measured against buildah
+/// 1.33.7). A presence probe would not avoid the string match: `buildah images
+/// --quiet` answers a miss the same way.
+///
+/// Absence has to count. A build that fails before it creates its tag reaches
+/// the `rmi` of that tag every time, and reading the answer as a failure would
+/// spend a round of detached retries on nothing. Should a later buildah reword
+/// the sentinel, that round is what it costs -- never a leak.
+fn left_nothing(output: &std::process::Output, absent: &str) -> bool {
+    output.status.success() || String::from_utf8_lossy(&output.stderr).contains(absent)
 }
 
 fn build_image_cmd(
@@ -1400,6 +1430,57 @@ mod tests {
         assert!(matches!(err, OutrigError::Configuration(_)));
         assert!(err.to_string().contains("invalid env JSON"), "got: {err}");
         assert!(err.to_string().contains("outrig-cache:test"), "got: {err}");
+    }
+
+    /// A removal discharges its guard only by working or by finding nothing
+    /// there. The absent answers are buildah 1.33.7's own text, exit 125 and
+    /// all -- the code every other failure exits with too.
+    #[test]
+    fn a_removal_is_discharged_only_by_success_or_a_known_absence() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = |code: i32, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        assert!(left_nothing(&output(0, ""), "image not known"));
+        assert!(left_nothing(
+            &output(
+                125,
+                "Error: 1 error occurred:\n\t* repo:outrig-tmp-1-ab-key: image not known\n\n"
+            ),
+            "image not known"
+        ));
+        assert!(left_nothing(
+            &output(
+                125,
+                "Error: removing container \"outrig-label-1-2\": container not known\n"
+            ),
+            "container not known"
+        ));
+
+        // Refusals that leave the target where it was.
+        assert!(!left_nothing(
+            &output(
+                125,
+                "Error: 1 error occurred:\n\t* image used by 5e1f: image is in use by a container\n"
+            ),
+            "image not known"
+        ));
+        assert!(!left_nothing(
+            &output(
+                125,
+                "Error: removing outrig-label-1-2: database is locked\n"
+            ),
+            "container not known"
+        ));
+        // Each removal is read against its own sentinel only.
+        assert!(!left_nothing(
+            &output(125, "Error: container not known\n"),
+            "image not known"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
