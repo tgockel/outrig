@@ -534,6 +534,9 @@ impl NetworkInterceptor {
             )));
         }
 
+        // Before anything is changed, so a host with no resolver to forward to
+        // refuses the attach with nothing to undo.
+        let resolvers = host_resolvers()?;
         let pid = container.pid().await?;
         let sockets = bind_interceptor_sockets(pid)?;
         let tcp_port = sockets.tcp.local_addr()?.port();
@@ -591,12 +594,7 @@ impl NetworkInterceptor {
             cancel.clone(),
             live,
         ));
-        tasks.spawn(dns_loop(
-            sockets.dns,
-            host_resolvers(),
-            bindings,
-            cancel.clone(),
-        ));
+        tasks.spawn(dns_loop(sockets.dns, resolvers, bindings, cancel.clone()));
 
         self.attachments.insert(
             name.to_string(),
@@ -2522,16 +2520,47 @@ async fn recv_dns_answer(
     }
 }
 
-fn host_resolvers() -> Vec<SocketAddr> {
-    let primary = read_resolvers("/etc/resolv.conf");
-    let systemd_upstream = read_resolvers("/run/systemd/resolve/resolv.conf");
-    select_host_resolvers(primary, systemd_upstream)
+/// The resolvers the host itself uses, which is who the interceptor forwards
+/// the container's lookups to. See [`select_host_resolvers`] for which file
+/// wins.
+fn host_resolvers() -> Result<Vec<SocketAddr>> {
+    host_resolvers_in(
+        Path::new("/etc/resolv.conf"),
+        Path::new("/run/systemd/resolve/resolv.conf"),
+    )
 }
 
-fn read_resolvers(path: &str) -> Vec<SocketAddr> {
+/// [`host_resolvers`] over files of the caller's choosing, so a test can stand
+/// in for the host's. A host that names no resolver in either is an error
+/// naming what each file held, since forwarding anywhere else would send every
+/// name the session resolves to a party the host never chose.
+fn host_resolvers_in(primary: &Path, systemd_upstream: &Path) -> Result<Vec<SocketAddr>> {
+    let primary_read = read_resolvers(primary);
+    let upstream_read = read_resolvers(systemd_upstream);
+    select_host_resolvers(
+        primary_read.as_deref().unwrap_or_default(),
+        upstream_read.as_deref().unwrap_or_default(),
+    )
+    .ok_or_else(|| {
+        OutrigError::Configuration(format!(
+            "no DNS resolver for the network interceptor to forward to: {}; {}",
+            describe_resolver_file(primary, &primary_read),
+            describe_resolver_file(systemd_upstream, &upstream_read),
+        ))
+    })
+}
+
+fn describe_resolver_file(path: &Path, read: &Result<Vec<SocketAddr>>) -> String {
+    match read {
+        Ok(_) => format!("`{}` names no nameserver", path.display()),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn read_resolvers(path: &Path) -> Result<Vec<SocketAddr>> {
     std::fs::read_to_string(path)
+        .path_ctx("read", path)
         .map(|text| parse_resolvers(&text))
-        .unwrap_or_default()
 }
 
 fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
@@ -2548,25 +2577,32 @@ fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
     out
 }
 
+/// Picks the resolvers to forward to from `/etc/resolv.conf` (`primary`) and
+/// the upstream servers systemd-resolved lists (`systemd_upstream`).
+///
+/// The first file naming a non-loopback resolver wins, the primary first. On
+/// a systemd-resolved host the primary names only resolved's own stub, so the
+/// upstream's non-loopback servers are taken in its place. Failing that, the
+/// first file naming any resolver wins: a loopback resolver still answers,
+/// since forwarding happens from the host's network namespace. A missing,
+/// unreadable, or empty primary names nothing, so the upstream is consulted
+/// past it. `None` means neither file names a resolver, and there is
+/// deliberately no public resolver to fall back to.
 fn select_host_resolvers(
-    primary: Vec<SocketAddr>,
-    systemd_upstream: Vec<SocketAddr>,
-) -> Vec<SocketAddr> {
-    if !primary.is_empty() && primary.iter().all(|resolver| resolver.ip().is_loopback()) {
-        let upstream: Vec<_> = systemd_upstream
-            .into_iter()
-            .filter(|resolver| !resolver.ip().is_loopback())
-            .collect();
-        if !upstream.is_empty() {
-            return upstream;
-        }
+    primary: &[SocketAddr],
+    systemd_upstream: &[SocketAddr],
+) -> Option<Vec<SocketAddr>> {
+    let remote = |resolver: &SocketAddr| !resolver.ip().is_loopback();
+    if primary.iter().any(remote) {
+        return Some(primary.to_vec());
     }
-
-    if primary.is_empty() {
-        vec![SocketAddr::from(([1, 1, 1, 1], 53))]
-    } else {
-        primary
+    if systemd_upstream.iter().any(remote) {
+        return Some(systemd_upstream.iter().copied().filter(remote).collect());
     }
+    [primary, systemd_upstream]
+        .into_iter()
+        .find(|resolvers| !resolvers.is_empty())
+        .map(<[_]>::to_vec)
 }
 
 /// Reads the container's current resolver, so the undo armed against the
@@ -6322,8 +6358,8 @@ options edns0
         ];
 
         assert_eq!(
-            select_host_resolvers(primary, upstream),
-            vec![SocketAddr::from(([172, 20, 232, 252], 53))]
+            select_host_resolvers(&primary, &upstream),
+            Some(vec![SocketAddr::from(([172, 20, 232, 252], 53))])
         );
     }
 
@@ -6332,7 +6368,62 @@ options edns0
         let primary = vec![SocketAddr::from(([10, 0, 2, 3], 53))];
         let upstream = vec![SocketAddr::from(([172, 20, 232, 252], 53))];
 
-        assert_eq!(select_host_resolvers(primary.clone(), upstream), primary);
+        assert_eq!(select_host_resolvers(&primary, &upstream), Some(primary));
+    }
+
+    #[test]
+    fn host_resolvers_keep_loopback_resolvers_when_no_file_names_another() {
+        let loopback = vec![SocketAddr::from(([127, 0, 0, 1], 53))];
+
+        assert_eq!(
+            select_host_resolvers(&loopback, &[]),
+            Some(loopback.clone())
+        );
+        assert_eq!(select_host_resolvers(&[], &loopback), Some(loopback));
+    }
+
+    #[test]
+    fn host_resolvers_use_systemd_upstream_when_primary_names_nothing() {
+        let upstream = vec![SocketAddr::from(([10, 0, 0, 53], 53))];
+
+        assert_eq!(select_host_resolvers(&[], &upstream), Some(upstream));
+    }
+
+    #[test]
+    fn host_resolvers_have_no_fallback_when_nothing_names_a_resolver() {
+        assert_eq!(select_host_resolvers(&[], &[]), None);
+    }
+
+    #[test]
+    fn host_resolvers_read_systemd_upstream_past_a_missing_primary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let upstream = dir.path().join("upstream-resolv.conf");
+        std::fs::write(&upstream, "nameserver 10.0.0.53\n").expect("write upstream resolv.conf");
+
+        let resolvers = host_resolvers_in(&dir.path().join("missing-resolv.conf"), &upstream)
+            .expect("upstream used past a missing primary");
+        assert_eq!(resolvers, vec![SocketAddr::from(([10, 0, 0, 53], 53))]);
+    }
+
+    #[test]
+    fn host_resolvers_refuse_when_no_file_names_a_resolver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("resolv.conf");
+        std::fs::write(&primary, "search example.test\n").expect("write resolv.conf");
+        let upstream = dir.path().join("missing-upstream-resolv.conf");
+
+        let Err(OutrigError::Configuration(message)) = host_resolvers_in(&primary, &upstream)
+        else {
+            panic!("expected a configuration error");
+        };
+        assert!(
+            message.contains(&format!("`{}` names no nameserver", primary.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("failed to read `{}`", upstream.display())),
+            "{message}"
+        );
     }
 
     #[test]

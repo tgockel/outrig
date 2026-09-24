@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Intercepted DNS no longer falls back to a hard-coded public resolver.** When the host's
+  `/etc/resolv.conf` was missing, unreadable, or named no nameserver, the `audit`/`filter`
+  DNS listener forwarded every lookup to Cloudflare at `1.1.1.1:53`, without saying so anywhere.
+  It did this even when systemd-resolved's `/run/systemd/resolve/resolv.conf` named a usable
+  upstream, which had already been read and was then thrown away. That upstream is now preferred
+  whenever `/etc/resolv.conf` names nothing or only loopback addresses. If neither file names a
+  resolver, attaching fails with a `Configuration` error that says what each file held, so a
+  host that had been resolving through Cloudflare now fails `audit`/`filter` setup instead.
+
 - **One slow DNS lookup no longer stalls the container's others.** The interceptor's DNS
   listener forwarded one query at a time and did not read the next until the current one was
   answered or had waited out its 5s timeout at every host resolver. So one name a resolver was

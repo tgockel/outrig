@@ -141,6 +141,12 @@ each lookup on its own, up to 64 at once per container, so one name a host resol
 answer does not hold up the container's other lookups. If either mode is requested and setup
 fails, the session fails before MCP servers launch.
 
+Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
+`/etc/resolv.conf`. When that file is missing, names no nameserver, or names only loopback
+addresses such as systemd-resolved's stub, the listener prefers the upstream servers
+systemd-resolved lists in `/run/systemd/resolve/resolv.conf`. If neither file names a resolver,
+setup fails rather than choosing one on the host's behalf.
+
 Filter policy lives in the global config only:
 
 ```toml
