@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::statvfs::{FsFlags, statvfs};
 
+use crate::container::ContainerMount;
 use crate::error::{IoPathExt, OutrigError, Result};
 
 /// The directory OutRig claims inside a session's primary container. Nothing
@@ -60,6 +61,15 @@ pub(crate) async fn host_dir() -> Result<PathBuf> {
         .await
         .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
     Ok(dir)
+}
+
+/// The payload's mount: [`host_dir`], bound read-only at [`PAYLOAD_MOUNT`],
+/// as every session's primary container gets it.
+pub(crate) async fn mount() -> Result<ContainerMount> {
+    Ok(ContainerMount::shared_read_only(
+        host_dir().await?,
+        PAYLOAD_MOUNT,
+    ))
 }
 
 /// Refuse a caller-chosen container destination at or under [`OUTRIG_ROOT`].

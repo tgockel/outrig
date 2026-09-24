@@ -23,10 +23,9 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 
+use super::host::{ARGS, PRIMARY};
 use super::payload;
 
-const PROGRAM: &str = include_str!("interpreter.py");
-const PRIMARY: &str = "primary";
 /// How long any one reply may take. Generous for a loaded CI runner; nothing
 /// here comes close.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -147,7 +146,8 @@ struct Interpreter {
 impl Interpreter {
     fn start() -> Self {
         let mut child = Command::new(python())
-            .args(["-I", "-c", PROGRAM, PRIMARY])
+            .args(ARGS)
+            .arg(PRIMARY)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

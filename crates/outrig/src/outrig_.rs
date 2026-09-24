@@ -804,8 +804,7 @@ impl Outrig {
         for destination in workspace.chain(mounts) {
             payload::reject_reserved(destination)?;
         }
-        let python =
-            ContainerMount::shared_read_only(payload::host_dir().await?, payload::PAYLOAD_MOUNT);
+        let python = payload::mount().await?;
 
         let image_tag = match &spec.source {
             LaunchSource::Build {
