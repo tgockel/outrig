@@ -405,7 +405,9 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             Some(image)
                 if builtin_image::is_reserved(image) && !cfg.images.contains_key(image) =>
             {
-                fall_back_to_builtin(&mut cfg, false);
+                // A veto surfaces below as the name not resolving, after the
+                // note naming the block -- accurate, since they typed it.
+                let _ = fall_back_to_builtin(&mut cfg, false);
                 (image.to_string(), false)
             }
             Some(image) => (image.to_string(), true),
@@ -418,18 +420,17 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             {
                 Some(image) => (image, false),
                 None => match fall_back_to_builtin(&mut cfg, true) {
-                    Some(name) => (name.to_string(), false),
-                    // A reserved *sidecar* name is declared but the matching
-                    // image-config is not, so injection was vetoed and there is
-                    // nothing to fall back to. Say what the session lacks
-                    // rather than naming a block the user never wrote.
-                    None => {
-                        return Err(OutrigError::Configuration(
-                            "no --image or default-image configured, and outrig's built-in \
-                             default is shadowed by a [sidecars.<name>] block using one of \
-                             its reserved names"
-                                .to_string(),
-                        )
+                    Ok(name) => (name.to_string(), false),
+                    // A reserved name other than `[images.outrig-default]` is
+                    // declared, so injection was vetoed and there is nothing to
+                    // fall back to. Name the block that did it -- the one the
+                    // note above names -- rather than one the user never wrote.
+                    Err(block) => {
+                        return Err(OutrigError::Configuration(format!(
+                            "no --image or default-image configured, and {block} shadows \
+                             outrig's built-in default, leaving no [images.outrig-default] \
+                             to fall back to"
+                        ))
                         .into());
                     }
                 },

@@ -66,13 +66,15 @@ pub(crate) fn banner_image_config_row(container_name: &str, builtin_default: boo
 /// that never falls through to the built-in should stay silent, and only the
 /// caller knows whether the resolved name was ours.
 pub(crate) struct Injection {
-    /// The image-config name to resolve, or `None` when nothing usable ended
-    /// up under [`DEFAULT_IMAGE`]. `None` happens when a user declares one of
-    /// the reserved *sidecar* names without declaring the image: injection is
-    /// vetoed, and there is no `[images.outrig-default]` to fall back to.
-    /// Returning the name rather than assuming it is what keeps that case from
-    /// surfacing as an error about a block the user never wrote.
-    pub(crate) resolved: Option<&'static str>,
+    /// The image-config name to resolve, or `Err` naming the block that vetoed
+    /// injection when nothing usable ended up under [`DEFAULT_IMAGE`]. That
+    /// happens when a user declares any reserved name other than
+    /// `[images.outrig-default]` without declaring that one too: there is
+    /// nothing to fall back to. Returning the name rather than assuming it is
+    /// what keeps that case from surfacing as an error about a block the user
+    /// never wrote, and carrying the vetoing block lets the error name the one
+    /// they did.
+    pub(crate) resolved: std::result::Result<&'static str, String>,
     /// The built-in itself is in play, as opposed to a user's block that
     /// happens to sit under the same name. Drives the banner marker and the
     /// `outrig__*` self-documentation tools.
@@ -83,14 +85,19 @@ pub(crate) struct Injection {
 /// Add the built-in default's image-configs and sidecars to `cfg`, unless the
 /// user already declares one of the reserved names.
 pub(crate) fn inject(cfg: &mut Config) -> Injection {
-    if let Some(note) = shadow_note(cfg) {
+    if let Some(block) = shadowing_block(cfg) {
+        let note = format!(
+            "note: {block} shadows outrig's built-in default image-config; the built-in \
+             is not in play"
+        );
         return Injection {
-            // Their `[images.outrig-default]` is usable; a shadow from one of
-            // the sidecar names leaves nothing to resolve.
+            // Their `[images.outrig-default]` is usable; a shadow from any of
+            // the other reserved names leaves nothing to resolve.
             resolved: cfg
                 .images
                 .contains_key(DEFAULT_IMAGE)
-                .then_some(DEFAULT_IMAGE),
+                .then_some(DEFAULT_IMAGE)
+                .ok_or(block),
             applied: false,
             notes: vec![note],
         };
@@ -125,7 +132,7 @@ pub(crate) fn inject(cfg: &mut Config) -> Injection {
     }
 
     Injection {
-        resolved: Some(DEFAULT_IMAGE),
+        resolved: Ok(DEFAULT_IMAGE),
         applied: true,
         notes,
     }
@@ -199,13 +206,15 @@ fn shape(launcher: bool, shell_dir: Option<&Path>) -> Config {
     cfg
 }
 
-/// A note naming the first reserved name the user already declares, if any.
+/// The first reserved block the user already declares, if any, labeled for a
+/// message: `` `[images.<name>]` (declared in <path>) `` or
+/// `` `[sidecars.<name>]` ``.
 ///
 /// Injection is all-or-nothing. Partial injection produces broken configs: a
 /// user `[images.outrig-default]` alongside our `[sidecars.outrig-default-fs]`
 /// leaves that block's `args` unreachable, which is a hard
 /// `SidecarArgsWithoutEntrypoint` for every command in that repo.
-fn shadow_note(cfg: &Config) -> Option<String> {
+fn shadowing_block(cfg: &Config) -> Option<String> {
     let declared_in = |image: &ImageConfig| {
         image
             .config_source()
@@ -216,24 +225,15 @@ fn shadow_note(cfg: &Config) -> Option<String> {
     RESERVED_IMAGES
         .iter()
         .find_map(|name| {
-            cfg.images.get(*name).map(|image| {
-                format!(
-                    "note: `[images.{name}]`{} shadows outrig's built-in default \
-                     image-config; the built-in is not in play",
-                    declared_in(image)
-                )
-            })
+            cfg.images
+                .get(*name)
+                .map(|image| format!("`[images.{name}]`{}", declared_in(image)))
         })
         .or_else(|| {
             RESERVED_SIDECARS
                 .iter()
                 .find(|name| cfg.sidecars.contains_key(**name))
-                .map(|name| {
-                    format!(
-                        "note: `[sidecars.{name}]` shadows outrig's built-in default \
-                         image-config; the built-in is not in play"
-                    )
-                })
+                .map(|name| format!("`[sidecars.{name}]`"))
         })
 }
 
@@ -472,7 +472,8 @@ mod tests {
     /// user's own still resolves, so the session runs on it, while the other
     /// four reserved names leave nothing to fall through to and startup ends.
     /// The docs claimed for three releases that only a sidecar block could
-    /// veto at all.
+    /// veto at all, and the error that ends startup went on blaming one; the
+    /// `Err` carries the block that actually did it.
     #[test]
     fn a_veto_leaves_only_a_users_own_default_image_resolvable() {
         let mut cfg = Config::default();
@@ -484,7 +485,7 @@ mod tests {
         assert!(!injection.applied);
         assert_eq!(
             injection.resolved,
-            Some(DEFAULT_IMAGE),
+            Ok(DEFAULT_IMAGE),
             "a user's own [images.{DEFAULT_IMAGE}] is still usable"
         );
 
@@ -492,12 +493,15 @@ mod tests {
             let mut cfg = Config::default();
             cfg.images
                 .insert(name.to_string(), ImageConfig::from_image_name("mine:1"));
-            assert_eq!(inject(&mut cfg).resolved, None, "[images.{name}]");
+            assert_eq!(inject(&mut cfg).resolved, Err(format!("`[images.{name}]`")));
 
             let mut cfg = Config::default();
             cfg.sidecars
                 .insert(name.to_string(), SidecarConfig::new("mine:1"));
-            assert_eq!(inject(&mut cfg).resolved, None, "[sidecars.{name}]");
+            assert_eq!(
+                inject(&mut cfg).resolved,
+                Err(format!("`[sidecars.{name}]`"))
+            );
         }
     }
 
@@ -516,7 +520,7 @@ mod tests {
             injection.applied,
             "`[sidecars.{DEFAULT_IMAGE}]` is not a reserved name"
         );
-        assert_eq!(injection.resolved, Some(DEFAULT_IMAGE));
+        assert_eq!(injection.resolved, Ok(DEFAULT_IMAGE));
     }
 
     #[test]

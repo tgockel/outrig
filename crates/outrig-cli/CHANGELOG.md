@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `model = "fast"` gave any child that named no model the model of the agent that launched *it*,
   with that model's provider and `max-tokens`, and its own `outrig__subagent` schema offered that
   model as "yours". Both now follow the model the subagent itself runs under.
+- **A vetoed built-in default names the block that vetoed it.** With no image named, a repo
+  declaring `[images.outrig-default-fs]` or `[images.outrig-default-shell]` ended startup with
+  an error blaming a `[sidecars.<name>]` block, contradicting the note just above it. The error
+  now names the declared block, the same one the note names, and says it leaves no
+  `[images.outrig-default]` to fall back to.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
