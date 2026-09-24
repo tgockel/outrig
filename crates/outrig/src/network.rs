@@ -64,6 +64,11 @@ const SO_ORIGINAL_DST: libc::c_int = 80;
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many lookups one attachment forwards at once. Each holds an ephemeral
+/// socket until its answer or its `DNS_TIMEOUT` per resolver, so this is also
+/// the attachment's bound on those. Past it the listener stops reading and
+/// the backlog waits in its receive buffer.
+const DNS_IN_FLIGHT: usize = 64;
 /// How much of a client's opening bytes is examined for an asserted name. A
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
@@ -745,7 +750,9 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
 /// its connections in a set of its own and drains it before returning, so on
 /// every path but this one they are joined with it -- but aborting the loop
 /// drops that set, which requests their abort and does not wait. The caller
-/// waits them out separately; see `Attachment::idle`.
+/// waits them out separately; see `Attachment::idle`. The DNS loop's lookups
+/// need no such wait: it aborts them itself on the way out, and they owe
+/// nothing that would be lost if it were aborted first.
 async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
     let mut failures = Vec::new();
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
@@ -2357,58 +2364,80 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
 /// Answers the container's lookups from the host's resolvers, recording what
 /// each name validly resolved to. `resolvers` is passed in rather than read
 /// here so a caller -- and a test -- decides who this forwards to.
+///
+/// Each lookup is forwarded in a task of its own. Every process in the
+/// container shares this listener, and a forward can wait out `DNS_TIMEOUT`
+/// per resolver, so one name a resolver is slow to answer must hold up only
+/// the client that asked for it. At most [`DNS_IN_FLIGHT`] run at once.
 async fn dns_loop(
     socket: UdpSocket,
     resolvers: Vec<SocketAddr>,
     bindings: Bindings,
     cancel: CancellationToken,
 ) {
+    let socket = Arc::new(socket);
+    let resolvers: Arc<[SocketAddr]> = resolvers.into();
+    let mut lookups = JoinSet::new();
     let mut buf = vec![0u8; 4096];
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            received = socket.recv_from(&mut buf) => {
+            // Takes each finished lookup back out of the set, which is what
+            // frees its slot.
+            Some(_) = lookups.join_next() => {}
+            // With the set full, the next query stays in the socket until a
+            // lookup finishes rather than being read with nowhere to go.
+            received = socket.recv_from(&mut buf), if lookups.len() < DNS_IN_FLIGHT => {
                 let Ok((n, peer)) = received else {
                     break;
                 };
                 let raw = buf[..n].to_vec();
-                let query = dns_query(&raw);
-                tracing::debug!(
-                    target: "outrig::network",
-                    "dns query from {peer}: {:?}",
-                    query.as_ref().map(|query| &query.question.name)
-                );
-                let socket_ref = &socket;
-                // A forward waits out `DNS_TIMEOUT` per resolver, which
-                // outlasts the grace a detach gives this task. Awaited bare,
-                // a detach landing mid-query would abort this task and report
-                // the abort -- a routine detach returning an error for
-                // nothing having gone wrong.
-                let Some(forwarded) = cancel
-                    .run_until_cancelled(forward_dns(&raw, query.as_ref(), &resolvers))
-                    .await
-                else {
-                    break;
-                };
-                match forwarded {
-                    Ok(response) => {
-                        if let Some(query) = &query
-                            && dns_response_is_bindable(&response)
-                        {
-                            record_dns_bindings(&bindings, &query.question.name, &response);
-                        }
-                        tracing::debug!(
-                            target: "outrig::network",
-                            "dns response to {peer}: {} bytes",
-                            response.len()
-                        );
-                        let _ = socket_ref.send_to(&response, peer).await;
-                    }
-                    Err(e) => {
-                        tracing::debug!(target: "outrig::network", "dns forward failed: {e}");
-                    }
-                }
+                let (socket, resolvers, bindings) =
+                    (socket.clone(), resolvers.clone(), bindings.clone());
+                lookups.spawn(async move {
+                    answer_dns(&socket, &raw, peer, &resolvers, &bindings).await;
+                });
             }
+        }
+    }
+    // Aborted rather than waited out: a forward outlasts the grace a detach
+    // gives this task, and a lookup owes no record, so abandoning one loses
+    // nothing a detach has to account for.
+    lookups.shutdown().await;
+}
+
+/// Forwards one query and sends `peer` whatever validly answers it.
+async fn answer_dns(
+    socket: &UdpSocket,
+    raw: &[u8],
+    peer: SocketAddr,
+    resolvers: &[SocketAddr],
+    bindings: &Bindings,
+) {
+    let query = dns_query(raw);
+    tracing::debug!(
+        target: "outrig::network",
+        "dns query from {peer}: {:?}",
+        query.as_ref().map(|query| &query.question.name)
+    );
+    match forward_dns(raw, query.as_ref(), resolvers).await {
+        Ok(response) => {
+            // Bound before the answer goes out, so a connection the client
+            // opens on the strength of it is decided with the name in hand.
+            if let Some(query) = &query
+                && dns_response_is_bindable(&response)
+            {
+                record_dns_bindings(bindings, &query.question.name, &response);
+            }
+            tracing::debug!(
+                target: "outrig::network",
+                "dns response to {peer}: {} bytes",
+                response.len()
+            );
+            let _ = socket.send_to(&response, peer).await;
+        }
+        Err(e) => {
+            tracing::debug!(target: "outrig::network", "dns forward failed: {e}");
         }
     }
 }
@@ -2477,9 +2506,10 @@ async fn recv_dns_answer(
             Some(query) => query.answered_by(resolver, peer, &buf[..n]),
             // A query the interceptor could not parse is still forwarded, and
             // the resolver's reply goes straight back. There is no evidence to
-            // protect -- nothing binds from it -- and holding the listener for
-            // the whole timeout waiting for an answer that can never be
-            // recognized would stall every later query behind it.
+            // protect -- nothing binds from it -- and waiting the whole
+            // timeout for an answer that can never be recognized would leave
+            // its client unanswered and hold one of the listener's in-flight
+            // slots for nothing.
             None => peer == resolver,
         };
         if answers {
@@ -5839,55 +5869,183 @@ mod tests {
         );
     }
 
+    /// A `dns_loop` on a loopback listener, forwarding to `resolvers`: the
+    /// listener's address, the token that ends the loop, and the set holding
+    /// it.
+    async fn spawned_dns_loop(
+        resolvers: Vec<SocketAddr>,
+        bindings: Bindings,
+    ) -> (SocketAddr, CancellationToken, JoinSet<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind dns listener");
+        let listener = socket.local_addr().expect("dns addr");
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_loop(socket, resolvers, bindings, cancel.clone()));
+        (listener, cancel, tasks)
+    }
+
+    async fn send_query(client: &UdpSocket, listener: SocketAddr, txid: u16, name: &str) {
+        client
+            .send_to(&dns_packet(txid, DNS_QUERY_FLAGS, name, &[]), listener)
+            .await
+            .expect("send query");
+    }
+
+    /// The next query the loop forwards to `resolver` within `within`, and
+    /// the address it came from, or `None` when nothing arrives in time.
+    async fn forwarded_query(
+        resolver: &UdpSocket,
+        within: Duration,
+    ) -> Option<(DnsQuery, SocketAddr)> {
+        let mut buf = [0u8; 512];
+        let (n, from) = tokio::time::timeout(within, resolver.recv_from(&mut buf))
+            .await
+            .ok()?
+            .expect("receive the forwarded query");
+        Some((
+            dns_query(&buf[..n]).expect("parse the forwarded query"),
+            from,
+        ))
+    }
+
     /// A forward waits out `DNS_TIMEOUT` per resolver, well past the grace a
-    /// detach allows. The loop has to abandon one in flight, or every detach
-    /// racing a lookup would abort the task and report the abort.
+    /// detach allows. The loop has to abandon every one it has in flight, or
+    /// every detach racing a lookup would abort the task and report the abort
+    /// -- and a lookup it left behind would outlive the attachment.
     #[tokio::test]
-    async fn the_dns_loop_does_not_outlast_a_cancellation_during_a_forward() {
-        // Receives the query and never answers it.
+    async fn the_dns_loop_does_not_outlast_a_cancellation_during_its_forwards() {
+        const PENDING: u16 = 4;
+        // Receives the queries and never answers them.
         let blackhole = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind blackhole");
         let resolver = blackhole.local_addr().expect("blackhole addr");
-
-        let socket = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("bind dns listener");
-        let listener_addr = socket.local_addr().expect("dns addr");
-        let cancel = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(dns_loop(
-            socket,
-            vec![resolver],
-            empty_bindings(),
-            cancel.clone(),
-        ));
+        let baseline = alive_tasks();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_loop(vec![resolver], empty_bindings()).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
-        client
-            .send_to(
-                &dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]),
-                listener_addr,
-            )
-            .await
-            .expect("send query");
-
-        // The forward is demonstrably in flight once the resolver has it.
-        let mut forwarded = [0u8; 512];
-        tokio::time::timeout(Duration::from_secs(5), blackhole.recv_from(&mut forwarded))
-            .await
-            .expect("the query should reach the resolver")
-            .expect("receive the forwarded query");
+        for txid in 0..PENDING {
+            send_query(&client, listener, txid, "example.test").await;
+        }
+        // The forwards are demonstrably in flight once the resolver has them.
+        for _ in 0..PENDING {
+            forwarded_query(&blackhole, DNS_TIMEOUT)
+                .await
+                .expect("every query should reach the resolver");
+        }
 
         cancel.cancel();
-        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
-            while tasks.join_next().await.is_some() {}
-        })
-        .await;
+        let failures = stop_tasks(&mut tasks).await;
         assert!(
-            stopped.is_ok(),
-            "a cancelled dns loop must not wait out {DNS_TIMEOUT:?}"
+            failures.is_empty(),
+            "a cancelled dns loop must not wait out {DNS_TIMEOUT:?}: {failures:#?}"
         );
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "a cancelled dns loop left lookups running"
+        );
+    }
+
+    /// One name a resolver is slow to answer holds up only the client that
+    /// asked for it. Every process in a container shares its DNS listener, so
+    /// a loop forwarding one lookup at a time would stall them all behind it
+    /// for `DNS_TIMEOUT` per resolver.
+    #[tokio::test]
+    async fn a_slow_lookup_does_not_hold_up_an_unrelated_one() {
+        // Played by the test, so the one resolver can hold one lookup
+        // unanswered while it answers another: the two differ only in the
+        // name, so a fast one that waited did not wait on the resolver.
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            bindings.clone(),
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+
+        send_query(&client, listener, 0x1111, "slow.test").await;
+        // Never answered, so this forward is in flight for `DNS_TIMEOUT` from
+        // here.
+        let (slow, _) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the slow query should reach the resolver");
+        assert_eq!(slow.question.name, "slow.test");
+
+        send_query(&client, listener, 0x2222, "fast.test").await;
+        // Well inside the slow forward's `DNS_TIMEOUT`, so this one was
+        // forwarded while that one was still pending, not after it gave up.
+        let (fast, from) = forwarded_query(&resolver, Duration::from_secs(1))
+            .await
+            .expect("an unrelated lookup was not forwarded while a slow one was pending");
+        assert_eq!(fast.question.name, "fast.test");
+        let answer = dns_packet(
+            fast.txid,
+            DNS_RESPONSE_FLAGS,
+            "fast.test",
+            &[Rr::A("fast.test", [198, 51, 100, 9], 60)],
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut reply))
+            .await
+            .expect("the unrelated lookup's answer was not relayed")
+            .expect("receive reply");
+        assert_eq!(dns_txid(&reply[..n]), Some(0x2222));
+        // Bound before the answer went out, so a connection the client opens
+        // on the strength of it is decided with the name in hand.
+        assert_eq!(
+            resolved_names(&bindings, ip("198.51.100.9")),
+            resolved(&["fast.test"])
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The loop forwards at most `DNS_IN_FLIGHT` lookups at once. Past that it
+    /// stops reading, so a burst of queries no resolver answers cannot spawn
+    /// a forward apiece.
+    #[tokio::test]
+    async fn the_dns_loop_forwards_at_most_its_in_flight_limit() {
+        // Receives the queries and never answers them.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![blackhole.local_addr().expect("blackhole addr")],
+            empty_bindings(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        for txid in 0..DNS_IN_FLIGHT + 8 {
+            send_query(&client, listener, txid as u16, "example.test").await;
+        }
+        for _ in 0..DNS_IN_FLIGHT {
+            forwarded_query(&blackhole, DNS_TIMEOUT)
+                .await
+                .expect("every query up to the limit should reach the resolver");
+        }
+        // Well short of `DNS_TIMEOUT`, so no forward has given up and freed
+        // its slot: a query that reaches the resolver in this window is one
+        // the limit let through.
+        assert!(
+            forwarded_query(&blackhole, Duration::from_millis(250))
+                .await
+                .is_none(),
+            "more lookups were forwarded at once than the in-flight limit allows"
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Connections that have finished do not stay in the set the accept loop
@@ -7019,7 +7177,7 @@ options edns0
 
     /// A query the interceptor cannot parse is still forwarded, and its
     /// answer comes straight back. Waiting out the timeout for an answer that
-    /// can never be recognized would stall every query behind it.
+    /// can never be recognized would leave its client unanswered.
     #[tokio::test]
     async fn an_unparsable_query_still_gets_its_answer() {
         let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");

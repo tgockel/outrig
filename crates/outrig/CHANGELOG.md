@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One slow DNS lookup no longer stalls the container's others.** The interceptor's DNS
+  listener forwarded one query at a time and did not read the next until the current one was
+  answered or had waited out its 5s timeout at every host resolver. So one name a resolver was
+  slow to answer held up every lookup from every process in that container, a large enough burst
+  behind it overflowed the socket and was silently dropped, and in `filter` mode a stalled
+  lookup recorded no binding, so a connection the policy allows could be denied. Each lookup is
+  now forwarded in its own task, up to 64 at once per attachment. Past that the listener stops
+  reading until one finishes. A detach abandons whatever is still in flight, as before.
+
 - **The runtime-user bootstrap refuses a home that is not a directory.** If the image already
   had `/home/<user>` as a regular file, a FIFO, or a symlink, `Container::bootstrap_user` took
   the existing path as done, `chown`ed it -- through the symlink, onto its target, which could
