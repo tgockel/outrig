@@ -22,23 +22,23 @@ without being rewritten, and the interpreter is being ported regardless.
   |   |  session module|    |  session module|    |  session module|    |
   |   |  runtime       |    |  runtime       |    |  runtime       |    |
   |   |  endpoints     |    |  endpoints     |    |  endpoints     |    |
-  |   |  out buf + pipe|    |  out buf + pipe|    |  out buf + pipe|    |
+  |   |  backlog, pipes|    |  backlog, pipes|    |  backlog, pipes|    |
   |   |  event loop    |    |  event loop    |    |  event loop    |    |
   |   +----------------+    +----------------+    +----------------+    |
   |     ^ SIGINT lands here, and only here                              |
   |                                                                     |
-  |   reader thread  -- NDJSON in, routed by agent id                   |
-  |   _PROTO_FD      -- NDJSON out, behind one writer lock              |
-  |   fd 1           -- the unattributed-output bucket                  |
+  |   reader thread  -- NDJSON in on _PROTO_IN, routed by agent id      |
+  |   _PROTO_OUT     -- NDJSON out, behind one writer lock              |
+  |   fd 1, fd 2     -- the exec's stderr: the unattributed bucket      |
   |   RLIMIT_AS      -- one ceiling, shared by every agent              |
   +---------------------------------------------------------------------+
 ```
 
-Each agent owns a session module registered in `sys.modules`, a runtime, its channel endpoints, an
-output buffer with a pipe behind it, an event loop, and an execution slot. That bundle is the
-agent's **kernel**; the process hosting them all is the **interpreter**, and it owns the protocol
-descriptor, the reader thread, the address-space ceiling, and the signal handler. Which
-of those two lists a thing falls into is the whole of this page.
+Each agent owns a session module registered in `sys.modules`, a runtime, its channel endpoints, a
+backlog of background output, an event loop, and an execution slot; each execution in it owns a
+pipe. That bundle is the agent's **kernel**; the process hosting them all is the **interpreter**,
+and it owns the protocol descriptors, the reader thread, the address-space ceiling, and the signal
+handler. Which of those two lists a thing falls into is the whole of this page.
 
 A channel between two co-hosted agents never reaches the host, but `messages.md` governs it
 unchanged: the two loops hand messages over through `loop.call_soon_threadsafe`, and the
@@ -85,12 +85,13 @@ usually invisible -- but in the one dimension that motivated co-hosting, it is a
 
 The requirement is unchanged: an execution's result holds that execution's output and nothing from
 a sibling. There is one fd 1 per process, so co-hosted agents cannot attribute at the descriptor
-the way the prototype's `kernel.py` does today. They attribute above it, and the coverage is good:
+the way the prototype's `kernel.py` did. They attribute above it, and the coverage is good:
 
 `print()` and `sys.stdout`
 : A dispatcher keyed on a `contextvars.ContextVar`. It names the **execution**, not just the
-  agent, which is what the verification below did not cover and what the prototype's global
-  `_foreground` flag was doing before co-hosting.
+  agent, which is what the prototype's global `_foreground` flag was doing before co-hosting.
+  While the execution runs, its writes go into the execution's own pipe, so they keep their order
+  with a child's; once it has reported, they go to its agent's backlog under its id.
 
 A background `create_task`
 : Follows for free -- asyncio copies the current context at task creation -- and because the
@@ -99,34 +100,59 @@ A background `create_task`
   task eat B's result quota, which is exactly the defect `kernel-findings` #2 fixed for one
   agent and co-hosting would otherwise reintroduce.
 
-`subprocess.run([...])`
+`subprocess.run([...])`, and `asyncio.create_subprocess_exec`, which goes through it
 : A pipe per **execution**, supplied as the default `stdout` and `stderr` by one patch on
-  `Popen.__init__`, which reads the same contextvar. `sys.stdout.fileno()` returns that
-  descriptor, so explicit redirection lands in the right place too.
+  `Popen.__init__`, which reads the same contextvar. `stdout=sys.stdout` is treated as the
+  default, and `sys.stdout.fileno()` returns that descriptor while the execution runs.
 
   Per-execution rather than per-agent, because a child's bytes carry no writer identity: two
   executions' children sharing one agent pipe produce a stream the drain cannot attribute, and no
   contextvar recovers information that was never in it. A per-agent pipe would let a child cell A
   started consume cell B's result budget -- the same defect the background bound exists to fix,
-  reintroduced one layer down. The cost is that a child outliving its execution keeps a
-  descriptor open, so the drain is bounded and the execution's result does not wait on it.
+  reintroduced one layer down.
+
+  A child can outlive its execution and keep the pipe open, so the result does not wait for the
+  pipe to close. When the body finishes, the interpreter writes a random sentinel into the pipe
+  and closes its own end; the pipe's drain thread bills what precedes the sentinel to the result
+  and what follows it to the backlog, under the execution's id, for as long as any child holds
+  the pipe. A child started after its execution reported -- by a task it left running -- gets a
+  pipe of its own, billed the same way.
 
 `os.write(1, ...)` and `os.system()`
-: Not attributable. These name the descriptor directly, so fd 1 becomes a shared bucket. What
-  lands there is recorded as an event rather than dropped -- `observability.md` -- because it
-  cannot be billed to an agent and a silent hole is worse than an unattributed line.
+: Not attributable. These name the descriptor directly. fd 1 and fd 2 are the exec's stderr, the
+  stream the host already reads as diagnostics, so what lands there is recorded as an event
+  rather than dropped -- `observability.md` -- because it cannot be billed to an agent and a
+  silent hole is worse than an unattributed line. It never reaches the protocol, which has
+  descriptors of its own, and it never reaches another agent's result.
 
 Verified with two agents printing, spawning background tasks, and running subprocesses at the same
 time: every line landed in its own agent. That experiment established attribution **between**
-agents and says nothing about the case above -- one agent's old background task emitting while a
-new execution runs -- which is the harder half and is not yet tested. The per-execution descriptor
-above is what makes that case expressible at all; whether a descendant that outlives its execution
-can still be attributed is the part to prove, and if it cannot, the weaker guarantee is stated
-rather than the stronger one implied.
+agents. The harder half -- one agent's old execution emitting while a new one runs -- is now
+tested too, in `crates/outrig/src/python/interpreter_tests.rs`, for a task and for a child
+process. For both, the new execution's output is exact, it drops nothing, and every byte of the
+old one's output is billed to the old one. The child case uses a child that writes only after
+the new execution has started, 20,000 bytes against a 16 KiB budget.
+
+The same holds for a child a background task starts after its execution reported, and for an
+exception nobody retrieved from such a task, which asyncio reports from wherever the task happens
+to be collected.
+
+What stays unattributed, stated rather than implied:
+
+- **A thread started with `threading`, and `loop.run_in_executor`.** Python 3.13 starts a thread
+  with an empty context, so there is no execution to bill; the output goes to stderr, never to
+  another execution. `asyncio.to_thread` copies the context and is attributed. Copying the
+  context into every thread would misattribute a pool's workers to whichever execution created
+  them.
+- **A `fileno()` kept past its execution.** The number is closed when the execution reports and
+  may be reused by the next one's pipe.
+- **`contextlib.redirect_stdout`.** It rebinds `sys.stdout` for the whole process, so one agent's
+  redirect also captures a sibling's prints while it is in force.
 
 The prototype's background-output fix, which `runtime-protection.md` carries, survives -- and
-survives better than it did. Between-execution output stays attributed to the agent whose task
-wrote it, so a chatty background task can no longer displace a result, and cannot reach a
+survives better than it did. Background output stays attributed to the execution whose task
+wrote it, and each result carries it apart from its own output, grouped by that execution's id and
+bounded on its own. A chatty background task can no longer displace a result, and cannot reach a
 sibling's at all.
 
 What is genuinely lost is that capture stops being inescapable. At the descriptor nothing can evade
@@ -233,5 +259,12 @@ environment, or signals -- the four things that actually bite.
 - The `podman exec` startup cost is asserted from the shape of `Container::exec_stdio` and was not
   measured. It is the term that decides whether co-hosting is worth anything at all, so measure it
   before citing this page as the reason for the decision.
-- The `Popen.__init__` patch was verified against `subprocess.run`. It has not been checked against
-  `os.popen`, `multiprocessing`, or a child that re-execs.
+- The `Popen.__init__` patch is tested against `subprocess.run` and `Popen` -- positional
+  `stdout`, `stderr=STDOUT`, `capture_output`, a spawn that warns -- and against
+  `asyncio.create_subprocess_exec`. It has not been checked against `os.popen` or a child that
+  re-execs.
+- A fork -- `os.fork`, `multiprocessing` -- goes through `os.register_at_fork` instead, and is
+  tested with the `fork` start method. The child closes the protocol descriptors and forgets their
+  numbers, so it cannot write a protocol line and its own children cannot close its files. It
+  writes through a descriptor this process drains, billed to the execution it forked under: a
+  copy of the execution's pipe while the body runs, a pipe of its own afterwards.

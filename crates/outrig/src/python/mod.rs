@@ -1,5 +1,10 @@
-//! The agent's Python: the static interpreter every session mounts, and (in
-//! later work) the process that runs under it.
+//! The agent's Python: the static interpreter every session mounts, and the
+//! program it runs.
+//!
+//! `interpreter.py` is that program: one process per session, hosting one
+//! kernel per agent and answering over NDJSON by agent id. The host side that
+//! starts it and correlates its replies is later work, so for now only its
+//! tests read it.
 //!
 //! Crate-private throughout. `outrig-cli` reaches none of it directly; the
 //! phase's one public entry point is what drives it.
@@ -14,3 +19,7 @@ mod archive {
     use crate::container::enter::elf::{ElfKind, elf_interp};
     include!("archive.rs");
 }
+
+#[cfg(test)]
+#[path = "interpreter_tests.rs"]
+mod interpreter_tests;

@@ -32,6 +32,22 @@ wedged loop never does.
 The host side is no better placed by default: its request is waiting on a reply that will never
 come, so the round hangs rather than failing.
 
+Measured again on the port, before it has any interrupt handling of its own, two of those rows
+change. **Closing stdin now exits**: the reader thread ends the process itself, so a wedged loop no
+longer outlives the host that owned it. And the port runs its loops with `run_forever` rather than
+`asyncio.run`, so nothing defers a plain SIGINT:
+
+| state when SIGINT arrives        | on the port, measured                                    |
+|----------------------------------|----------------------------------------------------------|
+| no execution running             | escapes the loop, which is re-entered; interpreter lives |
+| executing, not yielding          | `KeyboardInterrupt` in agent code; error result, freed   |
+| executing, suspended on an await | escapes the loop, which is re-entered; slot still held   |
+
+The third row no longer destroys the session, but neither does it recover the execution. Where the
+interrupt lands inside the loop's own bookkeeping -- mid-callback, or mid-way through writing a
+protocol line -- was not measured, and the handler described below is still what makes delivery
+deliberate rather than lucky.
+
 ## What the prototype established
 
 **An `interrupt` message handled on the reader thread.** The interpreter's stdin reader is a
@@ -83,6 +99,14 @@ payload: `signal.raise_signal(SIGINT)` called *from* a worker thread still runs 
 recovery designed above reaches exactly one of them -- so the primary agent takes the main thread.
 The agent with a person in front of it keeps the interrupt path as the prototype proved it, and
 `agent-placement.md` carries the reasoning.
+
+**A thread's stack, found in the port.** musl gives a thread 128 KiB of stack. Deep but legal
+recursion off the main thread -- `json.loads` of a nested document, `repr` of a nested list --
+overflowed it and killed the interpreter with `SIGSEGV`, every agent with it, before CPython's
+recursion limit could raise `RecursionError`. Measured on the payload: 1 MiB still crashed, 2 MiB
+did not. The interpreter sets 8 MiB, the main thread's, for every thread started after it boots --
+a subagent's, its reader, and any the agent starts -- so a subagent is no easier to crash than the
+primary. The cost is address space rather than memory, which `RLIMIT_AS` counts.
 
 ## What is still unsolved
 

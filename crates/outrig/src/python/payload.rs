@@ -28,7 +28,7 @@ static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/python.tar.zst
 
 /// The archive's name less `.tar.zst`, which is also the directory it unpacks
 /// to -- so a new pin unpacks beside an old one rather than over it.
-const PAYLOAD: &str = env!("OUTRIG_PYTHON_PAYLOAD");
+pub(super) const PAYLOAD: &str = env!("OUTRIG_PYTHON_PAYLOAD");
 
 /// The payload's directory on the host, ready to bind at [`PAYLOAD_MOUNT`],
 /// unpacked from the embedded archive the first time it is asked for.

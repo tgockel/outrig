@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-02` | The interpreter runs an agent's Python and answers by agent id     |
 | `0003-03` | The host starts the interpreter and correlates its replies         |
 | `0003-04` | The model's only tool submits Python, and `outrig` drives a round  |
 | `0003-05` | `outrig run-new` holds a session; `run-legacy` names the old one   |

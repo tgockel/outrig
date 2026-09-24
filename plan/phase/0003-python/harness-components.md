@@ -34,11 +34,11 @@ phase.
   |             retry, failover  (private)     |
   | agent/tool  the tool surface   (private)   |
   | python/     interpreter, console, payload  |
-  |   kernel.rs ---- NDJSON over podman exec --+------> kernel.py
+  |   interpreter.rs -- NDJSON, podman exec ---+------> interpreter.py
   |                                            |         +------------------------+
   | container/  lifecycle, exec, mounts        |         | interpreter process    |
   | mcp/        clients, proxy                 |         |  reader thread         |
-  | config/     Agent, Model, LlmProvider      |         |  _PROTO_FD, fd 1       |
+  | config/     Agent, Model, LlmProvider      |         |  _PROTO_IN/_OUT, fd 1  |
   | network/    interceptor                    |         |  RLIMIT_AS             |
   +--------------------------------------------+         |                        |
                                                          |  per agent, per thread:|
@@ -113,22 +113,25 @@ records what was weighed against that.
 
 The prototype's files are named for the older vocabulary -- `kernel.py` and `kernel.rs` implement
 what these documents now call the interpreter -- and the port renames them, since "kernel" is
-taken by the per-agent environment they host.
+taken by the per-agent environment they host. The program is
+`crates/outrig/src/python/interpreter.py`.
 
 Ported from the prototype rather than redesigned, with one change of shape. There is one interpreter
 process per session, started through `podman exec -i` and spoken to in NDJSON -- and it hosts one
 agent per thread rather than being one agent. Each agent owns a session module, an event loop, its
-channel endpoints, an output buffer, and an execution slot; the process owns the protocol
-descriptor, the reader thread, the address-space ceiling, and the signal handler. The primary agent
-runs on the main thread, because that is the only thread an interrupt can reach.
+channel endpoints, a backlog of background output, and an execution slot; the process owns the
+protocol descriptors, the reader thread, the address-space ceiling, and the signal handler. The
+primary agent runs on the main thread, because that is the only thread an interrupt can reach.
 `agent-placement.md` decides all of this and records what it costs. The interpreter itself is a
 static build mounted read-only, so the image needs nothing -- not a Python, not a shell, not a libc
 of its own.
 
 The boundary is worth naming precisely: the host writes requests to the process's stdin and
-reads results from its stdout, while the executed code's own stdout and stderr are redirected
-to a pipe the interpreter drains. Generated code therefore cannot write anything the host will read
-as a protocol message.
+reads results from its stdout, and the interpreter moves both aside before any code runs. The
+executed code's `sys.stdout` and `sys.stderr` write into a pipe per execution that the interpreter
+drains; its fd 0 reads `/dev/null`, and its fds 1 and 2 are the exec's stderr, which the host reads
+as diagnostics. Generated code therefore cannot write anything the host will read as a protocol
+message, nor read anything the host meant for the interpreter.
 
 What is *not* settled by the port is what happens when generated code misbehaves. Synchronous
 code that never yields blocks the event loop of the agent running it and every path that could
