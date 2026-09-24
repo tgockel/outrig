@@ -839,9 +839,11 @@ impl Container {
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
 
+        // The path goes in the error: on the reuse path the name, and so the
+        // home directory, is whatever the image put at the host uid.
         let home = userdb::home_dir(&user_name);
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
-            .map_err(|e| self.bootstrap_failed(e.step.label(), e.io()))?;
+            .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.io()))?;
 
         self.log_bootstrap(&format!(
             "user {user_name} and group {group_name} ready in {}, written from the host",

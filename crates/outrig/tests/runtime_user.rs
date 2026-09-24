@@ -301,6 +301,50 @@ async fn bootstrap_preserves_etc_ownership_and_mode() {
     );
 }
 
+/// A home path the image already holds as something other than a directory
+/// fails the bootstrap, naming the path, and is left alone -- a symlink in
+/// particular must not carry the `chown` to whatever it points at.
+#[tokio::test]
+async fn bootstrap_refuses_a_home_that_is_not_a_directory() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = start_alpine(host_ws.path(), None).await;
+    let name = container.name().to_string();
+
+    // Pin the entry bootstrap will reuse, and with it the home path.
+    drop_entry(&name, "/etc/passwd", container.uid());
+    let entry = format!(
+        "homeless:x:{}:{}::/home/homeless:/bin/sh",
+        container.uid(),
+        container.gid()
+    );
+    let append = format!("echo '{entry}' >> /etc/passwd");
+    run_capture(root_cmd(&name).args(["sh", "-c", &append]));
+
+    // Each shape, and the file whose ownership a misdirected chown would take.
+    for (plant, victim) in [
+        ("touch /home/homeless", "/home/homeless"),
+        (
+            "rm /home/homeless && ln -s /etc/passwd /home/homeless",
+            "/etc/passwd",
+        ),
+    ] {
+        run_capture(root_cmd(&name).args(["sh", "-c", plant]));
+        let err = container.bootstrap_user().await.expect_err(plant);
+        assert!(
+            err.to_string().contains("/home/homeless"),
+            "`{plant}`: the error should name the home path: {err}"
+        );
+        assert!(container.user_name().is_none(), "`{plant}`: not ready");
+        let owner = root_stdout(&name, &["stat", "-c", "%u %g", victim]);
+        assert_eq!(owner.trim(), "0 0", "`{plant}`: {victim} was chowned");
+    }
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
 /// The round-trip reduction, asserted rather than eyeballed: the whole
 /// bootstrap issues no `podman exec` at all.
 #[tokio::test]

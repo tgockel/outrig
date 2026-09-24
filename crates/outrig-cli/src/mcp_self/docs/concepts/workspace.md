@@ -85,6 +85,13 @@ The collision dance handles the case where the image already has a group or user
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,
 outrig reuses the existing entry rather than creating a duplicate.
 
+A `/home/<user>` the image already has is reused too, and `chown`ed to you, as long as it is a
+directory. Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a
+directory -- fails the bootstrap with an error naming the path. Taking it anyway would hand every
+tool a `$HOME` it can't write under, and a symlink would redirect the `chown` to whatever it
+points at. `/home` itself may be a symlink to a directory; only the last component is held to
+this.
+
 ## What's mounted, what isn't
 
 The `[workspace]` block controls what host directories the container sees:

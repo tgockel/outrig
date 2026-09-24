@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The runtime-user bootstrap refuses a home that is not a directory.** If the image already
+  had `/home/<user>` as a regular file, a FIFO, or a symlink, `Container::bootstrap_user` took
+  the existing path as done, `chown`ed it -- through the symlink, onto its target, which could
+  be a file in the bind-mounted workspace -- and reported the user ready, so every later exec
+  ran with a `HOME` it could not use. The home directory is now opened as a directory without
+  following a final symlink and `chown`ed through that descriptor, and anything else fails the
+  bootstrap with `BootstrapNamespace`, whose `step` now names the home path. This is stricter
+  than `mkdir -p` in one place: a symlink to a directory at `/home/<user>` is refused too. A
+  symlinked `/home` still works.
+
 - **A refused image cleanup no longer disarms its retry.** A build removed its temporary
   `outrig-tmp-*` tag, and a failed label-stamping pass its `outrig-label-*` working container,
   then released the guard that owed the removal whether or not buildah had done it. A removal
