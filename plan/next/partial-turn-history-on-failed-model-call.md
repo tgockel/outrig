@@ -34,6 +34,13 @@ Two routes, neither cheap:
 Route 2 is self-contained and probably right, but only if the hook's copy
 becomes *the* copy rather than a second one.
 
+A Ctrl-C mid-turn has the same shape. Since #170, `run_repl`'s
+`TakenHistory` guard puts the prior history back when the REPL drops the
+turn, but the interrupted turn's own tool calls are lost with rig's copy, so
+the next prompt may repeat them. Route 2 could serve both if the hook's copy
+lives outside the future the REPL drops. A lost turn also strands any
+subagent result it read: `a-lost-turn-consumes-its-subagent-result.md`.
+
 ## Acceptance
 
 - A mock-HTTP test with a script of `[tool_use, 429, ...]` and retries off:
@@ -42,5 +49,3 @@ becomes *the* copy rather than a second one.
 - The recovery message switches to the "partial history retained -- send
   another prompt (e.g. \"continue\")" wording when the history is non-empty,
   and keeps the "history unchanged" wording when it is not.
-- `plan/next/repl-interrupt-history-loss.md` is adjacent; check whether the
-  same guard-on-drop fix covers both before doing either.

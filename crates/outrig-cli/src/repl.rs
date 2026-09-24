@@ -76,7 +76,9 @@ impl Repl {
     /// for every non-slash, non-empty input line and its non-empty returned
     /// text is printed to stdout. Streaming callers may write incrementally
     /// during the callback and return an empty string to suppress trailing
-    /// reprint.
+    /// reprint. An interrupt drops the in-flight `on_prompt` future mid-await,
+    /// so anything it moves out of shared state has to go back on drop, not
+    /// in code after the await.
     ///
     /// Slash commands other than the built-in `/help` and `/quit` go to
     /// `on_command` as `(name, whitespace-split args)` -- `("sidecar",

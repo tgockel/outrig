@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error blaming a `[sidecars.<name>]` block, contradicting the note just above it. The error
   now names the declared block, the same one the note names, and says it leaves no
   `[images.outrig-default]` to fall back to.
+- **Ctrl-C during a turn keeps the conversation.** Interrupting a prompt in `outrig run` emptied
+  the session's history, so every later prompt reached the model with no earlier context, and
+  nothing said so. The conversation as it stood before the interrupted prompt now survives, as
+  the docs always promised; a turn interrupted before it finished is still not added to it.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

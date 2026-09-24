@@ -423,8 +423,12 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
 
 - **Ctrl-C** during a turn cancels the in-flight LLM/tool call. The REPL prints
   `[outrig] interrupted` to stderr and returns to a `> ` prompt with conversation history intact,
-  so you can redirect the agent. It stops the agent *waiting*, not work already handed to the
-  container: a `shell__exec` that started a build runs to completion, and any
+  so you can redirect the agent. A turn interrupted before it finished is not added, nor is
+  anything the agent did toward it: the next turn sees the conversation as it stood before that
+  prompt, so say what you still need rather than referring back to it. A local model's reply that
+  had already streamed in full is kept, even if Ctrl-C lands while its output is still being
+  written. It stops the agent *waiting*, not work already handed to the container: a
+  `shell__exec` that started a build runs to completion, and any
   [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn.
 
   Nothing is killed. The MCP servers, and the `podman exec` transports outrig talks to them
