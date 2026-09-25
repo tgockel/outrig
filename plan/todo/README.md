@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-04` | The model's only tool submits Python, and `outrig` drives a round  |
 | `0003-05` | `outrig run-new` holds a session; `run-legacy` names the old one   |
 
 **Surviving what the agent writes**

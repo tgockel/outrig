@@ -50,6 +50,9 @@ jiff               = { workspace = true, features = ["std", "tz-system", "tzdb-b
 nix                = { workspace = true, features = ["user", "fs", "process", "signal"] }
 rand               = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
+# The agent loop's; private, so no rig or reqwest type reaches the public surface.
+reqwest            = { workspace = true, features = ["rustls"] }
+rig                = { workspace = true, features = ["reqwest", "rustls"] }
 rmcp               = { workspace = true, features = ["base64", "client", "macros", "server", "transport-child-process", "transport-io", "transport-streamable-http-server"] }
 ruzstd             = { workspace = true, features = ["std"] }
 schemars           = { workspace = true, features = ["derive"] }

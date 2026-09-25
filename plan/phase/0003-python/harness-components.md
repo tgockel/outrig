@@ -60,10 +60,12 @@ phase.
 **Moved** -- `python/`: the interpreter host, console, payload locator, prompt, and tool. New on
 the prototype branch, so no 0.2.x commit can conflict with a file that line does not have.
 
-**Copied** -- `llm.rs`, `llm/retry.rs`, `llm/failover.rs`, `rig_tool.rs`, `session_tool.rs`.
-The 0.2.x line actively edits these, and a copy is what keeps those merges clean. The MCP
-adapter comes along even though the first milestone hands the model no MCP tools, because it
-is wanted once they are reachable from Python.
+**Copied** -- `llm.rs`, `llm/retry.rs`, and `llm/failover.rs`. The 0.2.x line actively edits
+them, and copying is what keeps those merges clean. `0003-04` copied the part of `llm.rs` one
+round needs; `0003-15` brings retry and failover. From `rig_tool.rs` only the result truncation
+came across, and nothing from `session_tool.rs`. The model's one tool is `submit_python`, and
+MCP servers reach Python as the objects `mcp-wrappers.md` designs rather than as rig tools, so
+the MCP adapter has no caller on this side. An earlier draft had it coming along anyway.
 
 **Neither** -- `llm/mistralrs.rs` and `llm/registry.rs`. The in-process backend is deprecated
 and its removal is `plan/next/remove-deprecated-local-llm.md`. The new loop omits it, which

@@ -140,6 +140,10 @@ pub(crate) enum Unknown {
     Exited { id: ExecId, cause: Arc<str> },
     /// The caller stopped waiting. The execution may still be running and
     /// holds the slot until its reply arrives, as a [`Late`].
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "0003-06 gives up waiting through `stop_waiting`")
+    )]
     Unresolved { id: ExecId },
 }
 
@@ -340,6 +344,10 @@ impl Interpreter {
 
     /// List what the agent's namespace holds. Answered on the agent's event
     /// loop, so it waits for as long as that loop is not turning.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "0003-06's liveness probe is the first caller")
+    )]
     pub(crate) async fn inventory(&self) -> Result<Inventory, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
         {
@@ -394,6 +402,10 @@ impl Execution {
     /// Stop waiting, recording the execution unresolved: it keeps its slot,
     /// and its reply, should one come, arrives as a [`Late`]. An outcome that
     /// had already arrived is returned instead.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "0003-06 gives up on a wedged execution with it")
+    )]
     pub(crate) fn stop_waiting(mut self) -> Outcome {
         if let Some(outcome) = self.settled.take() {
             return outcome;

@@ -5,19 +5,15 @@
 //! kernel per agent and answering over NDJSON by agent id. `host` starts it
 //! in a session's container, submits executions, and correlates the replies.
 //!
-//! Crate-private throughout. `outrig-cli` reaches none of it directly; the
-//! phase's one public entry point is what drives it.
+//! Crate-private throughout. `outrig-cli` reaches none of it directly: the
+//! agent loop in `crate::agent` drives it, and `PythonAgent` is how the binary
+//! reaches that.
 
-// Nothing drives the interpreter until the agent loop does, and among the
-// tests only the e2e ones start it in a container. Any one dead item fulfills
-// the expectation, so it holds until the last of them has a caller -- and then
-// fails the build rather than lingering as an `allow` would.
-#[cfg_attr(
-    not(all(test, feature = "e2e")),
-    expect(dead_code, reason = "the agent loop is its first caller")
-)]
 pub(crate) mod host;
 pub(crate) mod payload;
+
+#[cfg(test)]
+pub(crate) mod testing;
 
 // What `build.rs` checks the payload with before embedding it. Shared by
 // `include!` rather than a module, since a build script cannot link the crate

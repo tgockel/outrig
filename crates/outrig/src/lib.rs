@@ -29,6 +29,7 @@ compile_error!(
 
 use std::path::{Path, PathBuf};
 
+mod agent;
 pub mod config;
 pub mod container;
 pub mod error;
@@ -45,6 +46,7 @@ mod repo;
 mod supervise;
 mod tool_name;
 
+pub use agent::PythonAgent;
 pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
     NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,

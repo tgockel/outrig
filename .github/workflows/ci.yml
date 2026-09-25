@@ -110,11 +110,16 @@ jobs:
       # The library against musl's headers, where `msghdr`/`cmsghdr` length
       # fields are `socklen_t` rather than glibc's `size_t` -- `nsfork.rs` is
       # the only code that touches them, and nothing else here would notice it
-      # naming one. The target is installed above for the launcher, and the
-      # library's dependency tree needs no C cross-toolchain, unlike the
-      # binary's (aws-lc-sys). One row is enough: the difference is the libc,
-      # not the feature set.
+      # naming one. The target is installed above for the launcher. musl-tools
+      # is for aws-lc-sys, which the library's agent loop reaches through rig's
+      # and reqwest's `rustls`: its build script compiles C for the target even
+      # under `check`, and musl-gcc builds it against the libc being checked.
+      # One row is enough: the difference is the libc, not the feature set.
       - if: matrix.name == 'default'
+        run: sudo apt-get install -y --no-install-recommends musl-tools
+      - if: matrix.name == 'default'
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo check -p outrig --target x86_64-unknown-linux-musl
       # Cross-compile the standalone launcher as AArch64: a cargo build on this
       # row only ever exercises the x86-64 branch in build.rs, and the cross is

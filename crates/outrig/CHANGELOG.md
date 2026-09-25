@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`PythonAgent`, an agent that acts by writing Python.** `PythonAgent::start` takes a launched
+  `Outrig`, resolves a model from the `Config` as `outrig run` does, and starts a Python
+  interpreter in the session's primary container. `PythonAgent::round` drives one prompt. The
+  model's only tool submits source to that interpreter, so names it binds persist from round to
+  round. Errors are boxed `std::error::Error`s. A round that fails after running Python keeps what
+  it ran in the conversation, because nothing is rolled back, and its error says to continue
+  rather than resend.
+
+  **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
+  shape will change without a deprecation while the agent loop is built out. It has no retry or
+  failover yet, and an alias naming several models runs against the first.
+
 ### Changed
+
+- **`outrig` depends on `rig-core` and `reqwest`**, privately: no type of either appears in the
+  public API. Through their `rustls` features the library now links `aws-lc-sys`, whose build
+  needs a C compiler for the target. `outrig-cli` already did, so a build of the binary needs
+  nothing new. A cross-check of the library alone does: for `x86_64-unknown-linux-musl`, point
+  `CC_x86_64_unknown_linux_musl` at `musl-gcc` (from `musl-tools`).
 
 - **Every `Outrig::launch` mounts OutRig's static CPython** read-only at `/outrig/python`. The
   interpreter is embedded in the build: `build.rs` downloads a pinned `python-build-standalone`

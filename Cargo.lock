@@ -1559,6 +1559,7 @@ dependencies = [
  "rand 0.10.2",
  "regex",
  "reqwest",
+ "rig-core",
  "rmcp",
  "ruzstd",
  "schemars",

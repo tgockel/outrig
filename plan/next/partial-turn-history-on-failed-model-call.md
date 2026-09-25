@@ -44,3 +44,17 @@ becomes *the* copy rather than a second one.
   and keeps the "history unchanged" wording when it is not.
 - `plan/next/repl-interrupt-history-loss.md` is adjacent; check whether the
   same guard-on-drop fix covers both before doing either.
+
+## The library's loop had it too, and no longer does
+
+`0003-04` copied the loop into `crates/outrig/src/agent/` for `PythonAgent`, and the copy began with
+this loss in every case, since it has no retry to absorb a transient failure first. The stakes are
+higher there. A round's tool calls are Python run in the session interpreter, and nothing is rolled
+back, so a conversation that forgot them invites running them again.
+
+The PR review would not let that wait, so the copy took route 2 before landing.
+- `RoundHook` (`agent/round.rs`) keeps what each model call after the first was sent: rig's own
+  `history` and `prompt`, not a reconstruction. A failed call splices it in and says to continue.
+- A failure on the first call still leaves the history alone.
+
+`agent/agent_tests.rs` pins both cases. The CLI's loop is unchanged and still wants the same fix.

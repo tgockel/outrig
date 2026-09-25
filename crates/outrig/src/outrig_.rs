@@ -1205,6 +1205,13 @@ impl Outrig {
         self.container.exec_capture(argv, options).await
     }
 
+    /// The primary container, for the crate's own drivers of it -- the agent
+    /// loop starts the session's interpreter here, the one container `launch`
+    /// mounted the payload into. Crate-private for the reason above.
+    pub(crate) fn primary(&self) -> &Container {
+        &self.container
+    }
+
     /// Dispatch an MCP `tools/call` to the named server. `server` must
     /// match a key in the effective MCP map; `tool` is the
     /// un-namespaced tool name as it appeared in [`Outrig::tools`].

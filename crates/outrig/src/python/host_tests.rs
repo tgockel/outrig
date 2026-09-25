@@ -10,8 +10,6 @@
 //! the reader to have caught up, an inventory round-trip orders it, since
 //! replies are read in the order they were written.
 
-use std::future::Future;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,32 +17,14 @@ use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
 };
-use tokio::process::Child;
 
 use super::host::{
-    ARGS, Background, ExecId, Interpreter, InterpreterError, Late, Outcome, PRIMARY, Report,
-    Unknown,
+    Background, ExecId, Interpreter, InterpreterError, Late, Outcome, PRIMARY, Report, Unknown,
 };
-use super::payload;
-
-/// How long any one step may take before the test fails rather than hangs.
-const TIMEOUT: Duration = Duration::from_secs(20);
+use super::testing::{ok, spawn, start_on_host, within};
 
 /// What the fake transport says about itself once it closes.
 const HUNG_UP: &str = "the fake hung up";
-
-async fn within<F: Future>(step: F) -> F::Output {
-    tokio::time::timeout(TIMEOUT, step)
-        .await
-        .unwrap_or_else(|_| panic!("a step took longer than {TIMEOUT:?}"))
-}
-
-fn ok(output: &str) -> Outcome {
-    Outcome::Ok(Report {
-        output: output.to_string(),
-        ..Report::default()
-    })
-}
 
 /// The message of the startup error `started` must be.
 fn startup_error(started: Result<Interpreter, InterpreterError>) -> String {
@@ -66,30 +46,6 @@ fn gone<T>(result: Result<T, InterpreterError>) -> Arc<str> {
 
 // ---------------------------------------------------------------------------- the real payload
 
-/// The embedded payload's interpreter, started as `Interpreter::start` starts
-/// it but on the host, with `agent` as its argument when there is one.
-async fn spawn(agent: Option<&str>) -> Child {
-    let python = payload::host_dir()
-        .await
-        .expect("the payload this build embedded")
-        .join("bin/python3");
-    tokio::process::Command::new(python)
-        .args(ARGS)
-        .args(agent)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("the interpreter starts")
-}
-
-async fn started() -> Interpreter {
-    within(Interpreter::from_child(spawn(Some(PRIMARY)).await))
-        .await
-        .unwrap_or_else(|e| panic!("{e}"))
-}
-
 async fn run(interpreter: &Interpreter, source: &str) -> Outcome {
     let mut execution = interpreter.submit(source).expect("submitted");
     within(execution.outcome()).await
@@ -97,7 +53,7 @@ async fn run(interpreter: &Interpreter, source: &str) -> Outcome {
 
 #[tokio::test]
 async fn one_plus_one_comes_back_as_its_echo() {
-    let interpreter = started().await;
+    let interpreter = start_on_host().await;
     assert_eq!(run(&interpreter, "1 + 1").await, ok("2\n"));
 }
 
@@ -105,7 +61,7 @@ async fn one_plus_one_comes_back_as_its_echo() {
 /// can act on, not a transport failure.
 #[tokio::test]
 async fn a_raise_is_an_error_result_and_the_interpreter_carries_on() {
-    let interpreter = started().await;
+    let interpreter = start_on_host().await;
     let Outcome::Error { report, traceback } = run(&interpreter, "print('before')\n1 / 0").await
     else {
         panic!("expected an error result");
@@ -123,7 +79,7 @@ async fn a_raise_is_an_error_result_and_the_interpreter_carries_on() {
 /// arrives with a later result, billed to the execution that started it.
 #[tokio::test]
 async fn a_result_counts_what_it_dropped_and_carries_earlier_output() {
-    let interpreter = started().await;
+    let interpreter = start_on_host().await;
     let Outcome::Ok(flooded) = run(&interpreter, "print('x' * 20000)").await else {
         panic!("expected a clean run");
     };
@@ -154,7 +110,7 @@ async fn a_result_counts_what_it_dropped_and_carries_earlier_output() {
 
 #[tokio::test]
 async fn the_inventory_names_what_the_namespace_holds() {
-    let interpreter = started().await;
+    let interpreter = start_on_host().await;
     assert_eq!(run(&interpreter, "answer = 42").await, ok(""));
     let inventory = within(interpreter.inventory()).await.expect("an inventory");
     assert!(
@@ -169,7 +125,7 @@ async fn the_inventory_names_what_the_namespace_holds() {
 /// interpreter with it.
 #[tokio::test]
 async fn an_interpreter_that_exits_mid_execution_is_an_exit_not_an_error() {
-    let interpreter = started().await;
+    let interpreter = start_on_host().await;
     let mut execution = interpreter
         .submit("import os\nos._exit(3)")
         .expect("submitted");
@@ -518,17 +474,13 @@ mod e2e {
     use super::*;
     use crate::container::{Container, ContainerLaunchSpec};
     use crate::image::ImageTag;
-    use crate::process::{Cmd, run_capture};
-
-    /// Ships no Python, so only the payload can answer.
-    const ALPINE: &str = "docker.io/library/alpine:latest";
+    use crate::python::payload;
+    use crate::python::testing::{ALPINE, pull_alpine};
 
     /// A running alpine with its user bootstrapped, and the payload mounted
     /// as every session mounts it when `with_payload`.
     async fn alpine(with_payload: bool) -> Container {
-        run_capture(Cmd::new("podman").args(["pull", "--quiet", ALPINE]))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
+        pull_alpine().await;
         let mut launch = ContainerLaunchSpec::default();
         if with_payload {
             launch
