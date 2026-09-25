@@ -20,13 +20,15 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::Duration;
 
+use outrig::container::Container;
 use outrig::{ExecOptions, Transcript};
 
 use common::{
-    entry_for_id, init_tracing, install_shadow, pull_alpine, read_stdout, root_cmd, root_stdout,
-    run_capture, start_alpine,
+    entry_for_id, field_for_id, init_tracing, install_shadow, pull_alpine, read_stdout, root_cmd,
+    root_stdout, run_capture, start_alpine,
 };
 
 #[tokio::test]
@@ -187,6 +189,13 @@ async fn bootstrap_on_unadorned_alpine() {
         Some(user.as_str()),
         "/etc/passwd should resolve the host uid to {user}:\n{passwd}"
     );
+    // Whichever of the two wrote the entry, it names the `$HOME` checked
+    // below: podman's own names the working directory, `/workspace`.
+    assert_eq!(
+        field_for_id(&passwd, container.uid(), 5).as_deref(),
+        Some(format!("/home/{user}").as_str()),
+        "the entry at the host uid should name /home/{user} as its home:\n{passwd}"
+    );
 
     let groups = root_stdout(container.name(), &["cat", "/etc/group"]);
     assert_eq!(
@@ -233,6 +242,153 @@ async fn bootstrap_on_unadorned_alpine() {
 fn drop_entry(container: &str, path: &str, id: u32) {
     let script = format!("awk -F: '$3 != {id}' {path} > /tmp/db && cat /tmp/db > {path}");
     run_capture(root_cmd(container).args(["sh", "-c", &script]));
+}
+
+/// Append `lines` to `/etc/passwd` as the container's root.
+fn plant_passwd(container: &str, lines: &[&str]) {
+    for line in lines {
+        let append = format!("echo '{line}' >> /etc/passwd");
+        run_capture(root_cmd(container).args(["sh", "-c", &append]));
+    }
+}
+
+/// A reused entry that names some other home has that one field rewritten,
+/// in place, to the home bootstrap creates -- so `getpwnam` agrees with the
+/// `$HOME` every exec gets. Planted in podman's own `keep-id` format, with a
+/// line after it, so the test does not depend on whether this podman injects.
+#[tokio::test]
+async fn bootstrap_points_a_reused_entry_at_the_home_it_creates() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = start_alpine(host_ws.path(), None).await;
+    let name = container.name().to_string();
+    let (uid, gid) = (container.uid(), container.gid());
+
+    drop_entry(&name, "/etc/passwd", uid);
+    let planted = format!("reused:*:{uid}:{gid}:Planted User:/workspace:/bin/sh");
+    let after = "after:x:4242:4242::/after:/bin/sh";
+    plant_passwd(&name, &[&planted, after]);
+
+    let stat = ["stat", "-c", "%i %u %g %a", "/etc/passwd"];
+    let before = root_stdout(&name, &stat);
+    container.bootstrap_user().await.expect("bootstrap_user");
+    assert_eq!(container.user_name(), Some("reused"));
+
+    let passwd = root_stdout(&name, &["cat", "/etc/passwd"]);
+    let rewritten = format!("reused:*:{uid}:{gid}:Planted User:/home/reused:/bin/sh");
+    assert!(
+        passwd.lines().any(|line| line == rewritten),
+        "only the home field should change, expected `{rewritten}` in:\n{passwd}"
+    );
+    assert_eq!(
+        passwd.lines().last(),
+        Some(after),
+        "the line after the entry should survive:\n{passwd}"
+    );
+    assert_eq!(
+        root_stdout(&name, &stat),
+        before,
+        "the rewrite must keep the file's inode, owner, and mode"
+    );
+
+    // `~reused` resolves through `getpwnam`, not `$HOME`.
+    let mut child = container
+        .exec_stdio(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo \"$HOME\" ~reused".to_string(),
+            ],
+            &ExecOptions::new(),
+        )
+        .await
+        .expect("exec_stdio home probe");
+    assert_eq!(
+        read_stdout(&mut child).await.trim(),
+        "/home/reused /home/reused"
+    );
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// A borrowed container (`outrig mcp --attach`) may be running someone else's
+/// processes, so its `/etc/passwd` is never truncated: the reused entry keeps
+/// the home it names, and bootstrap still succeeds.
+#[tokio::test]
+async fn bootstrap_leaves_a_borrowed_containers_entry_alone() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let owner = start_alpine(host_ws.path(), None).await;
+    let name = owner.name().to_string();
+    let (uid, gid) = (owner.uid(), owner.gid());
+
+    drop_entry(&name, "/etc/passwd", uid);
+    let planted = format!("reused:*:{uid}:{gid}:Planted User:/workspace:/bin/sh");
+    plant_passwd(&name, &[&planted]);
+    let before = root_stdout(&name, &["cat", "/etc/passwd"]);
+
+    let mut borrowed = Container::attach(
+        name.clone(),
+        owner.image_tag().clone(),
+        Some((host_ws.path(), Path::new("/workspace"))),
+        None,
+    );
+    borrowed.bootstrap_user().await.expect("bootstrap_user");
+    assert_eq!(borrowed.user_name(), Some("reused"));
+    assert_eq!(
+        root_stdout(&name, &["cat", "/etc/passwd"]),
+        before,
+        "a borrowed container's /etc/passwd must not be rewritten"
+    );
+
+    drop(borrowed);
+    owner.stop(Duration::from_secs(2)).await.expect("stop");
+}
+
+/// A reused name that is not a single path component would put the home
+/// outside `/home` (`..` is `/` itself) or make directories on the way to it
+/// (`a/b`). Bootstrap refuses it, naming the entry, and touches nothing.
+#[tokio::test]
+async fn bootstrap_refuses_a_reused_name_that_is_not_a_directory() {
+    init_tracing();
+    pull_alpine();
+
+    let host_ws = tempfile::tempdir().expect("tempdir");
+    let mut container = start_alpine(host_ws.path(), None).await;
+    let name = container.name().to_string();
+    let (uid, gid) = (container.uid(), container.gid());
+
+    for bad in ["..", "a/b"] {
+        drop_entry(&name, "/etc/passwd", uid);
+        let planted = format!("{bad}:x:{uid}:{gid}::/:/bin/sh");
+        plant_passwd(&name, &[&planted]);
+
+        let err = container.bootstrap_user().await.expect_err(bad);
+        assert!(
+            err.to_string().contains(&format!("{bad:?}")),
+            "`{bad}`: the error should name the entry: {err}"
+        );
+        assert!(container.user_name().is_none(), "`{bad}`: not ready");
+
+        let passwd = root_stdout(&name, &["cat", "/etc/passwd"]);
+        assert!(
+            passwd.lines().any(|line| line == planted),
+            "`{bad}`: the entry should be left as it was:\n{passwd}"
+        );
+        let root = root_stdout(&name, &["stat", "-c", "%u %g", "/"]);
+        assert_eq!(root.trim(), "0 0", "`{bad}`: / was chowned");
+        let made = root_stdout(
+            &name,
+            &["sh", "-c", "test -e /home/a && echo yes || echo no"],
+        );
+        assert_eq!(made.trim(), "no", "`{bad}`: /home/a was created");
+    }
+
+    container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
 /// What bootstrap writes when there is nothing to reuse: podman's auto-injected
@@ -320,8 +476,7 @@ async fn bootstrap_refuses_a_home_that_is_not_a_directory() {
         container.uid(),
         container.gid()
     );
-    let append = format!("echo '{entry}' >> /etc/passwd");
-    run_capture(root_cmd(&name).args(["sh", "-c", &append]));
+    plant_passwd(&name, &[&entry]);
 
     // Each shape, and the file whose ownership a misdirected chown would take.
     for (plant, victim) in [

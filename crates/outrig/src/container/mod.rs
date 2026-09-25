@@ -807,9 +807,12 @@ impl Container {
     /// Writes `/etc/passwd` and `/etc/group` from the host, through
     /// descriptors a forked child opened inside the container's namespaces
     /// (see the `namespace` module), so the image needs no `useradd`, `groupadd`,
-    /// or `getent`. Probes first: on podman 5.x, `--userns=keep-id` auto-injects
-    /// the host UID/GID into both files, so there is frequently nothing to
-    /// write.
+    /// or `getent`. Probes first: `--userns=keep-id` auto-injects the host
+    /// UID/GID into both files, so there is frequently nothing to append. A
+    /// reused passwd entry still has its home field pointed at
+    /// [`Container::home_dir`], though -- podman's names the container's
+    /// working directory, which for a primary is the user's checkout -- except
+    /// in a container from [`Container::attach`], whose file is left alone.
     ///
     /// Records the resolved names on the struct for
     /// [`Container::exec_stdio`] to reference. Must be called once, after
@@ -839,11 +842,25 @@ impl Container {
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
 
-        // The path goes in the error: on the reuse path the name, and so the
-        // home directory, is whatever the image put at the host uid.
+        // On the reuse path the name, and so the home directory, is whatever
+        // the image put at the host uid -- so it has to be checked before it
+        // becomes a path, and the path goes in the error after that.
+        if !userdb::is_path_component(&user_name) {
+            return Err(self.bootstrap_failed(
+                format!(
+                    "name the home directory after /etc/passwd's {user_name:?} (uid {})",
+                    self.uid
+                ),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "not a single path component",
+                ),
+            ));
+        }
         let home = userdb::home_dir(&user_name);
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
             .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.io()))?;
+        self.reconcile_home(&db, &home).await?;
 
         self.log_bootstrap(&format!(
             "user {user_name} and group {group_name} ready in {}, written from the host",
@@ -891,6 +908,49 @@ impl Container {
         db.append(which, &userdb::append_blob(&text, &line))
             .map_err(|e| self.bootstrap_failed(format!("append to {}", which.path()), e))?;
         Ok(name)
+    }
+
+    /// Point the passwd entry at the host uid to `home` if it names another,
+    /// so `getpwuid` agrees with the `HOME` every exec gets. Only a reused
+    /// entry can disagree; one this bootstrap appended already names `home`.
+    /// Runs after [`namespace::create_home`], so a home that step refuses
+    /// leaves the file as it was.
+    ///
+    /// Only in a container this handle started. The rewrite is safe only while
+    /// nothing else can be using the file, and a failed one is cleaned up only
+    /// by tearing the container down. A borrowed container (`outrig mcp
+    /// --attach`) is already running someone else's processes, and outlives
+    /// this handle, so its entry is left as it is. One outrig started was
+    /// reconciled by its own bootstrap anyway.
+    async fn reconcile_home(&self, db: &namespace::UserDb, home: &str) -> Result<()> {
+        let passwd = namespace::Db::Passwd;
+        let raw = db
+            .read_raw(passwd)
+            .map_err(|e| self.bootstrap_failed(format!("read {}", passwd.path()), e))?;
+        let Some(rehome) = userdb::rehome(&raw, self.uid, home) else {
+            return Ok(());
+        };
+        if self.ownership == ContainerOwnership::Attached {
+            self.log_bootstrap(&format!(
+                "left the home of the {} entry at uid {} as {}, not {home}: the container is \
+                 borrowed, and rewriting the file could lose a live writer's change",
+                passwd.path(),
+                self.uid,
+                rehome.was
+            ))
+            .await;
+            return Ok(());
+        }
+        db.replace_tail(passwd, rehome.at as u64, &rehome.tail)
+            .map_err(|e| self.bootstrap_failed(format!("rewrite {}", passwd.path()), e))?;
+        self.log_bootstrap(&format!(
+            "home of the {} entry at uid {} moved from {} to {home}",
+            passwd.path(),
+            self.uid,
+            rehome.was
+        ))
+        .await;
+        Ok(())
     }
 
     /// A bootstrap failure, labeled with `step` -- how far the chain into the

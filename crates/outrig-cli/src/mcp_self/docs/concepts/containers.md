@@ -480,8 +480,9 @@ also supplies the container's command: `sleep infinity`, appended after the imag
 which overrides the image's `CMD` (see [Don't set an `ENTRYPOINT`](#dont-set-an-entrypoint)).
 The bootstrap runs from the host: a forked child joins the container's user namespace, becomes
 its root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group`
-entries before creating `/home/<user>`. No `podman exec` is involved, and nothing is written
-when podman's `keep-id` mapping already planted the entries. A
+entries before creating `/home/<user>`. No `podman exec` is involved. When podman's `keep-id`
+mapping already planted the entries, nothing is appended, but the planted user entry's home --
+the container's working directory -- is rewritten to `/home/<user>`. A
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see

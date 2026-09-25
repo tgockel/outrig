@@ -11,8 +11,8 @@
 //!
 //! 1. [`open_user_db`] hands back open descriptors for `/etc/passwd` and
 //!    `/etc/group`. The kernel checks permission at `open`, not at `write`, so
-//!    the parent can then read and append through them with ordinary code even
-//!    though it is an unprivileged host process.
+//!    the parent can then read, append, and truncate through them with ordinary
+//!    code even though it is an unprivileged host process.
 //! 2. [`create_home`] creates and `chown`s the home directory, which cannot be
 //!    expressed as a descriptor handed back out.
 //!
@@ -161,14 +161,19 @@ impl UserDb {
 
     /// Current contents, read from the start without disturbing where the
     /// next append lands (the descriptor carries `O_APPEND`, so writes always
-    /// go to the end regardless of this offset). Lossy-decoded: both files are
-    /// ASCII in every image that has them.
-    pub(super) fn read(&self, which: Db) -> io::Result<String> {
+    /// go to the end regardless of this offset).
+    pub(super) fn read_raw(&self, which: Db) -> io::Result<Vec<u8>> {
         let mut file = self.file(which);
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
+    }
+
+    /// [`UserDb::read_raw`], lossy-decoded: both files are ASCII in every
+    /// image that has them, and the lookups only need the ids and names.
+    pub(super) fn read(&self, which: Db) -> io::Result<String> {
+        Ok(String::from_utf8_lossy(&self.read_raw(which)?).into_owned())
     }
 
     /// Append `blob` at end of file. Appending in place, rather than writing a
@@ -178,6 +183,21 @@ impl UserDb {
         let mut file = self.file(which);
         file.write_all(blob)?;
         file.flush()
+    }
+
+    /// Replace everything from byte `at` on with `tail`: truncate there, then
+    /// append. Still the same inode, so owner and mode survive as they do for
+    /// [`UserDb::append`], and nothing before `at` is written at all.
+    ///
+    /// Unlike an append it is not atomic: until the write lands, a reader sees
+    /// the file cut off at `at`, a concurrent append is lost, and a failed
+    /// write leaves it cut off for good. So the caller must own the container
+    /// and have it to itself. Bootstrap does this only in a container it just
+    /// started, before any exec, while the container's one process is its
+    /// `sleep`, and a failure there tears the container down.
+    pub(super) fn replace_tail(&self, which: Db, at: u64, tail: &[u8]) -> io::Result<()> {
+        self.file(which).set_len(at)?;
+        self.append(which, tail)
     }
 }
 
@@ -498,6 +518,52 @@ mod tests {
                 "{shape}: the home path should be left as it was"
             );
         }
+    }
+
+    /// A [`UserDb`] over two tempfiles, opened the way the child opens the
+    /// real ones: read-write and append-only.
+    fn user_db_at(dir: &Path, passwd: &[u8]) -> UserDb {
+        let open = |name: &str, contents: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).expect("write");
+            std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .expect("open")
+        };
+        UserDb {
+            passwd: open("passwd", passwd),
+            group: open("group", b"root:x:0:\n"),
+        }
+    }
+
+    #[test]
+    fn replace_tail_rewrites_only_from_the_offset_on_the_same_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let head = b"root:x:0:0:root:/root:/bin/sh\n";
+        let db = user_db_at(
+            tmp.path(),
+            &[&head[..], b"dev:*:1000:1000::/workspace:/bin/sh\n"].concat(),
+        );
+        let inode = std::fs::metadata(tmp.path().join("passwd"))
+            .expect("stat")
+            .ino();
+
+        let tail = b"dev:*:1000:1000::/home/dev:/bin/sh\n";
+        db.replace_tail(Db::Passwd, head.len() as u64, tail)
+            .expect("replace_tail");
+
+        assert_eq!(
+            db.read_raw(Db::Passwd).expect("read"),
+            [&head[..], tail].concat()
+        );
+        let after = std::fs::metadata(tmp.path().join("passwd")).expect("stat");
+        assert_eq!(after.ino(), inode, "the file must not be replaced");
+        // The other database is untouched.
+        assert_eq!(db.read(Db::Group).expect("read"), "root:x:0:\n");
     }
 
     #[test]

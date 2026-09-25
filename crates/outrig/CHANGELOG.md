@@ -54,6 +54,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than `mkdir -p` in one place: a symlink to a directory at `/home/<user>` is refused too. A
   symlinked `/home` still works.
 
+- **`getpwuid()` now names the same home as `$HOME`.** When `/etc/passwd` already had an entry
+  at the host uid, `Container::bootstrap_user` reused its name but never read its home, and
+  created and exported `/home/<name>` regardless. That is the default path: `--userns=keep-id`
+  plants an entry before bootstrap runs, with the container's working directory as its home --
+  `/workspace` for a primary. So `$HOME` was right, but `~<name>`, `su -`, `sudo`, and anything
+  else that asks NSS got the user's checkout, and per-user state written that way landed in the
+  repo. A reused entry's home field is now rewritten to `/home/<name>` when it names something
+  else, including a six-field entry with no shell, whose last field glibc reads as the home.
+  Nothing else in the entry changes. The file is truncated at the entry and it and the lines
+  after it appended back, so it keeps its inode, owner, and mode. That is not atomic, so it is
+  done only in a container the bootstrap's own handle started. A container from
+  `Container::attach` (`outrig mcp --attach`) may already be running other processes, and its
+  entry is left as it was.
+
+- **The runtime-user bootstrap refuses a reused name that is not a directory name.** A name
+  taken from the image's `/etc/passwd` became `/home/<name>` unchecked, so an entry named `..`
+  had bootstrap `chown` the container's `/` to the session user, `../etc` did the same to
+  `/etc`, and `a/b` created a root-owned `/home/a` on the way. A name of `.` or `..`, or one
+  containing `/`, now fails the bootstrap with `BootstrapNamespace` naming the entry, before
+  anything is created or written. A host user name that sanitizes to `.` or `..` falls back to
+  `u<uid>`, as an empty one already did.
+
 - **A refused image cleanup no longer disarms its retry.** A build removed its temporary
   `outrig-tmp-*` tag, and a failed label-stamping pass its `outrig-label-*` working container,
   then released the guard that owed the removal whether or not buildah had done it. A removal

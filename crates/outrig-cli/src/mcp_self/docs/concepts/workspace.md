@@ -73,8 +73,9 @@ mkdir -p /home/tgockel && chown 1000:1000 /home/tgockel
 ```
 
 Appending, rather than rewriting the files, is deliberate: it keeps their owner and mode, and it
-is safe against a concurrent writer. `/etc/shadow` gets no entry -- nothing in outrig
-authenticates as this user, and the entry `useradd` would write is a locked password.
+is safe against a concurrent writer. The one exception is a reused user entry's home, covered
+below. `/etc/shadow` gets no entry -- nothing in outrig authenticates as this user, and the entry
+`useradd` would write is a locked password.
 
 After bootstrap, every `podman exec` outrig issues -- to start MCP servers, to run anything else
 -- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>`. Files written under `/workspace`
@@ -83,7 +84,20 @@ tooling: any base image works, including one with no `useradd`, `groupadd`, or `
 
 The collision dance handles the case where the image already has a group or user at your UID/GID
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,
-outrig reuses the existing entry rather than creating a duplicate.
+outrig reuses the existing entry rather than creating a duplicate. `--userns=keep-id` usually
+gets there first: podman appends an entry for you before the bootstrap looks, and that is the
+one reused.
+
+A reused user entry keeps its name, but its home is changed to `/home/<name>` if it names
+another, so `getpwuid()`, `~<name>`, and `su -` agree with `$HOME`. podman's own entry names the
+container's working directory, which for the primary is `/workspace` -- your checkout, where a
+tool that finds its home that way would leave its caches. Only that field changes. The file is
+truncated where the entry starts and the entry and the lines after it appended back, so it keeps
+its owner and mode, and nothing before the entry is rewritten. That rewrite is not atomic, so it
+is done only in a container outrig has just started and nothing else is using yet. A container
+borrowed with `outrig mcp --attach` keeps its entry as it is. The name has to work as a
+directory under `/home`: an entry named `.`, `..`, or anything with a `/` in it fails the
+bootstrap with an error naming the entry, and nothing is written or created.
 
 A `/home/<user>` the image already has is reused too, and `chown`ed to you, as long as it is a
 directory. Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a
