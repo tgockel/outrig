@@ -136,10 +136,12 @@ Accepted modes:
 Audit and filter mode require host `nft` and `nsenter` plus permission to enter the rootless podman
 container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
 send DNS to the per-session in-namespace DNS listener, installs nftables redirection for
-outbound TCP and UDP/53, and removes the nftables table during teardown. The listener forwards
-each lookup on its own, up to 64 at once per container, so one name a host resolver is slow to
-answer does not hold up the container's other lookups. If either mode is requested and setup
-fails, the session fails before MCP servers launch.
+outbound TCP and UDP/53 over both IPv4 and IPv6, and removes the nftables table during teardown.
+A lookup a tool sends to some other resolver address, such as `dig @8.8.8.8`, is redirected to
+the same listener and answered from the address it was sent to. The listener forwards each
+lookup on its own, up to 64 at once per container, so one name a host resolver is slow to answer
+does not hold up the container's other lookups. If either mode is requested and setup fails, the
+session fails before MCP servers launch.
 
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
 `/etc/resolv.conf`. When that file is missing, names no nameserver, or names only loopback

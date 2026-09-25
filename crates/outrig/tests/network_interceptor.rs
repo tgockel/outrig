@@ -1,8 +1,10 @@
 //! End-to-end smoke for audit-mode network interception. Gated behind
 //! `--features e2e` because it needs podman/buildah and nftables namespace
-//! access. [`a_resolved_name_grants_a_hostname_allow`] additionally needs
-//! working outbound DNS, since resolving through the interceptor is the whole
-//! point of it.
+//! access. [`a_resolved_name_grants_a_hostname_allow`] and
+//! [`a_lookup_sent_to_another_resolver_is_answered`] additionally need working
+//! outbound DNS, since resolving through the interceptor is the whole point of
+//! them. The IPv6 tests need the container to have an IPv6 default route,
+//! which rootless podman's pasta gives it by default.
 //!
 //! Run with:
 //!
@@ -15,7 +17,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -451,6 +453,15 @@ async fn curl_http_host_writes_allow_audit_record() {
         record.get("id.resp_h").and_then(Value::as_str),
         Some(host_ip.as_str()),
         "audit record should include the host destination IP",
+    );
+    // The listener takes both families, so an IPv4 client arrives as a
+    // v4-mapped IPv6 peer. The record names it the way it connected.
+    assert!(
+        record
+            .get("id.orig_h")
+            .and_then(Value::as_str)
+            .is_some_and(|orig| orig.parse::<Ipv4Addr>().is_ok()),
+        "an IPv4 connection is recorded by its IPv4 address: {record:#?}"
     );
     assert!(
         record
@@ -941,6 +952,157 @@ async fn a_forged_sni_does_not_grant_a_hostname_allow() {
         "the record should say the name in it was a claim: {record:#?}"
     );
     assert_eq!(record.get("orig_bytes").and_then(Value::as_u64), Some(0));
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// Whether the container has an IPv6 default route, which it needs for an
+/// IPv6 connect to get as far as the redirect. Rootless podman's pasta gives
+/// it one by default, even on a host with no global IPv6 address of its own.
+fn assert_container_has_ipv6_route(container: &Container) {
+    let output = run_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["ip", "-6", "route"]),
+    );
+    let routes = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        routes.lines().any(|line| line.starts_with("default")),
+        "this test needs the container to have an IPv6 default route, as pasta \
+         gives it by default; its IPv6 routes were: {routes}"
+    );
+}
+
+/// IPv6 connections reach the interceptor, are recorded, and are decided by
+/// the IPv6 CIDR and literal entries the policy holds. Both destinations are
+/// denied on purpose: a denial is recorded at once, where an allowed one
+/// would first wait out an upstream connect to an address nothing answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_connections_are_intercepted_recorded_and_filtered() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+    assert_container_has_ipv6_route(&container);
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Allow)
+        .deny_host("2001:db8:b::/48")
+        .deny_host_port("2001:db8:c::1", 9443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    // `-g`, because curl otherwise reads the brackets around an IPv6 literal
+    // as a glob.
+    for url in [
+        "http://[2001:db8:b::1]:9443/",
+        "http://[2001:db8:c::1]:9443/",
+    ] {
+        let output = try_capture(&mut curl_cmd(&container, &["-g"], url));
+        assert!(!output.status.success(), "{url} should have been denied");
+    }
+
+    let records = read_audit_records_until(&log_dir, |records| records.len() >= 2).await;
+    for (dst, rule) in [("2001:db8:b::1", "deny[0]"), ("2001:db8:c::1", "deny[1]")] {
+        let record = records
+            .iter()
+            .find(|record| record.get("id.resp_h").and_then(Value::as_str) == Some(dst))
+            .unwrap_or_else(|| panic!("no audit record for [{dst}]:9443 in {records:#?}"));
+        assert_eq!(
+            record.get("outrig.action").and_then(Value::as_str),
+            Some("deny"),
+            "{record:#?}"
+        );
+        assert_eq!(
+            record.get("outrig.rule").and_then(Value::as_str),
+            Some(rule),
+            "{record:#?}"
+        );
+        assert_eq!(record.get("id.resp_p").and_then(Value::as_u64), Some(9443));
+        assert!(
+            record
+                .get("id.orig_h")
+                .and_then(Value::as_str)
+                .is_some_and(|orig| orig.parse::<Ipv6Addr>().is_ok()),
+            "an IPv6 connection comes from the container's IPv6 address: {record:#?}"
+        );
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// A lookup sent to a resolver other than the one interception installed is
+/// redirected to the interceptor's DNS listener and answered, over either
+/// family. Nothing else could answer it: both addresses are from the
+/// documentation ranges, so an answer at all is the proof. The answer has to
+/// come back from the address the redirect rewrote the query to, or the
+/// client never sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_sent_to_another_resolver_is_answered() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+    assert_container_has_ipv6_route(&container);
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+
+    for resolver in ["192.0.2.53", "2001:db8::53"] {
+        let output = try_capture(
+            Command::new("podman")
+                .arg("exec")
+                .arg(container.name())
+                .args(["nslookup", "example.com", resolver]),
+        );
+        assert!(
+            output.status.success(),
+            "a lookup sent to {resolver} should be answered: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     interceptor
         .shutdown()

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`audit`/`filter` interception now covers IPv6.** The nftables redirect matched TCP of either
+  family, but the interceptor listened on IPv4 only. So every IPv6 connection from the container
+  was refused: it was not in `network.jsonl`, and a filter policy never saw it. The IPv6 literal
+  and CIDR entries `[network]` documents could never match anything. Rootless podman gives
+  containers an IPv6 route by default, and resolvers prefer IPv6 when there is one, so ordinary
+  tools hit this first. The TCP and DNS listeners now take both families on one socket each. That
+  also holds their ports in IPv6, so another process in the container can no longer bind the
+  IPv6 side and receive redirected connections itself. An IPv4 connection is still recorded under
+  its IPv4 `id.orig_h`. A kernel with no IPv6 support at all gets IPv4-only listeners, as before.
+
+- **A lookup sent to any resolver but the installed one is now answered.** Interception rewrites
+  the container's resolver to `127.0.0.1`, but a tool that names its own server (`dig @8.8.8.8`,
+  or a runtime with a built-in resolver list) has its query redirected to the DNS listener. The
+  answer went back from the container's own address rather than the one the query was redirected
+  to, so the client discarded it and the lookup timed out. Answers now leave from the address
+  each query arrived at, for IPv4 and IPv6 alike.
+
 - **Intercepted DNS no longer falls back to a hard-coded public resolver.** When the host's
   `/etc/resolv.conf` was missing, unreadable, or named no nameserver, the `audit`/`filter`
   DNS listener forwarded every lookup to Cloudflare at `1.1.1.1:53`, without saying so anywhere.
