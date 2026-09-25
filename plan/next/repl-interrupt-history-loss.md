@@ -19,6 +19,12 @@ vec that writes back in `Drop` (covering both completion and cancellation),
 or switch the history slot to something the callback can mutate in place
 without holding a borrow across the await.
 
+A deeper form of the same fix: bound `Repl::run`'s callbacks on `AsyncFnMut` rather than
+`FnMut(String) -> impl Future`. The current bound cannot lend a borrow of the callback's state to
+the future it returns, which is why `run` moves the history out and `run-new` (`0003-05`) keeps
+its agent behind a `Mutex`. With `AsyncFnMut` both could borrow in place, and a cancelled future
+would take nothing with it.
+
 ## Acceptance
 
 - A repl_io-style test: prompt turn interrupted mid-callback, then a

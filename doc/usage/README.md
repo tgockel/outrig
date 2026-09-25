@@ -12,6 +12,8 @@ like in practice, what comes back when something goes wrong.
 - **[AI-assisted design](ai-assisted-design.md)** -- use `outrig mcp self` when the
   built-in image templates do not fit.
 - **[outrig run](run.md)** -- start an interactive agent session. The main subcommand.
+- **[outrig run-new](../reference/cli.md#outrig-run-new)** -- preview a session whose agent
+  acts by writing Python rather than by calling MCP tools.
 - **[outrig mcp](mcp.md)** -- expose an image-config's MCP tools to an external client.
 - **[outrig build](build.md)** -- pre-warm the image cache so the next `outrig run` is instant.
 - **[Sessions](sessions.md)** -- `outrig ls`, `outrig logs`, `outrig discard`,

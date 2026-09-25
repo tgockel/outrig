@@ -1184,6 +1184,11 @@ pub async fn outrig::Outrig::shutdown(self) -> outrig::error::Result<()>
 pub fn outrig::Outrig::tools(&self) -> &[outrig::ToolHandle]
 pub struct outrig::PythonAgent
 impl outrig::PythonAgent
+pub fn outrig::PythonAgent::check(&outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
+pub fn outrig::PythonAgent::container_name(&self) -> &str
+pub fn outrig::PythonAgent::model(&self) -> &str
+pub fn outrig::PythonAgent::on_submit(&mut self, impl core::ops::function::Fn(&str) + core::marker::Send + core::marker::Sync + 'static)
+pub fn outrig::PythonAgent::python_version(&self) -> &str
 pub async fn outrig::PythonAgent::round(&mut self, &str) -> core::result::Result<alloc::string::String, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub async fn outrig::PythonAgent::start(&outrig::Outrig, &outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::PythonAgent, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 #[non_exhaustive] pub struct outrig::SecuritySpec

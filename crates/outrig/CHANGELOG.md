@@ -15,7 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model's only tool submits source to that interpreter, so names it binds persist from round to
   round. Errors are boxed `std::error::Error`s. A round that fails after running Python keeps what
   it ran in the conversation, because nothing is rolled back, and its error says to continue
-  rather than resend.
+  rather than resend. So does a round whose future is dropped, such as by a Ctrl-C, at the moment
+  it is dropped -- including the calls of an unfinished batch that had returned. Every other call
+  in that batch is answered with a note that it had not returned or had not started, since a
+  provider refuses a call without its result.
+
+  The system prompt opens with a short orientation: the one tool is the only way to act, the
+  working directory is the workspace, and the interpreter cannot install packages. The agent's
+  configured `preamble` follows it.
+
+  `PythonAgent::check` runs `start`'s model resolution without starting anything, so a caller can
+  fail before pulling an image. `model`, `python_version`, and `container_name` report what a
+  started agent runs on. `on_submit` registers an observer that sees each submission's source as
+  the interpreter accepts it.
 
   **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
   shape will change without a deprecation while the agent loop is built out. It has no retry or

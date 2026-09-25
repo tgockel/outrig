@@ -6,6 +6,8 @@
 //! itself. The e2e module at the end starts the interpreter through podman,
 //! which is the one path the rest skips.
 
+use std::sync::{Arc, Mutex};
+
 use rig::tool::{ToolDyn, ToolError};
 use serde_json::json;
 
@@ -91,6 +93,19 @@ async fn round(agent: &mut PythonAgent, prompt: &str) -> String {
     within(agent.round(prompt))
         .await
         .unwrap_or_else(|e| panic!("the round failed: {e}"))
+}
+
+/// The system prompt `request` carried, whether rig sent it as one string or
+/// as text blocks.
+fn system_prompt(request: &RecordedRequest) -> String {
+    match &request.body["system"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| block["text"].as_str().expect("a text block"))
+            .collect(),
+        other => panic!("no system prompt: {other}"),
+    }
 }
 
 /// The text of the `tool_result` for `id` in `request`, as the model reads it.
@@ -365,6 +380,236 @@ async fn the_tool_call_cap_ends_the_round_and_keeps_it() {
     assert!(
         tool_result(&recorded[2], "toolu_b").contains("tool call not executed"),
         "the call past the cap was skipped, and the next round's request says so"
+    );
+}
+
+/// A round whose future is dropped after it ran Python -- which is what Ctrl-C
+/// at the REPL does to it -- keeps what it ran, as a failed model call does.
+/// The next round's request carries the execution, so the model is not invited
+/// to run it again.
+#[tokio::test]
+async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_DROPPED",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_ran", "x = 41\nprint('ran')"),
+            text_reply("never read"),
+            text_reply("carried on"),
+        ],
+    )
+    .await;
+
+    // Dropped once its second model call is on the wire: the Python has run
+    // and its result was sent, but the round never returns. `biased` polls
+    // the recorder first, and the mock records a request before it answers.
+    let second_call = async {
+        requests.recv().await.expect("the first model call");
+        requests.recv().await.expect("the second model call");
+    };
+    tokio::select! {
+        biased;
+        () = within(second_call) => {}
+        _ = agent.round("set x") => panic!("the round returned before it could be dropped"),
+    }
+    assert!(
+        !agent.history.is_empty(),
+        "what the round ran is kept as it is dropped, not a round later"
+    );
+
+    assert_eq!(round(&mut agent, "continue").await, "carried on");
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 1, "{recorded:#?}");
+    assert_eq!(
+        tool_result(&recorded[0], "toolu_ran"),
+        "ran\n",
+        "the next round's request carries the execution the dropped round ran"
+    );
+}
+
+/// A turn asking for several calls runs them one at a time. Dropped while the
+/// second runs, the round keeps the first's source and result: its effects
+/// stand, and its outcome was already handed to the round, so no late result
+/// would bring it back. Every other call in the turn is answered too, since a
+/// provider refuses a call without its result -- the one in flight with a note
+/// that it had not returned, the one after with a note that it never started.
+#[tokio::test]
+async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
+    let batch = mock_http::message(
+        json!([
+            { "type": "tool_use", "id": "toolu_a", "name": tool::NAME,
+              "input": { "source": "x = 41\nprint('a ran')" } },
+            { "type": "tool_use", "id": "toolu_b", "name": tool::NAME,
+              "input": { "source": "import time\ntime.sleep(30)" } },
+            { "type": "tool_use", "id": "toolu_c", "name": tool::NAME,
+              "input": { "source": "print('c ran')" } },
+        ]),
+        "tool_use",
+    );
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_DROPPED_BATCH",
+        MODEL,
+        "max-tokens = 4096",
+        vec![batch, text_reply("carried on")],
+    )
+    .await;
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_submit(move |source| {
+        let _ = started.send(source.to_string());
+    });
+
+    // The second source going to run means the first has returned.
+    let inside_the_second = async {
+        starts.recv().await.expect("the first call");
+        starts.recv().await.expect("the second call");
+    };
+    tokio::select! {
+        biased;
+        () = within(inside_the_second) => {}
+        _ = agent.round("run three") => panic!("the round returned before it could be dropped"),
+    }
+
+    assert_eq!(round(&mut agent, "continue").await, "carried on");
+    let recorded = mock_http::drain(&mut requests);
+    let next = recorded.last().expect("the next round's request");
+    assert_eq!(tool_result(next, "toolu_a"), "a ran\n");
+    assert!(
+        tool_result(next, "toolu_b").contains("had not returned when the round ended"),
+        "{}",
+        tool_result(next, "toolu_b")
+    );
+    assert!(
+        tool_result(next, "toolu_c").contains("not run"),
+        "{}",
+        tool_result(next, "toolu_c")
+    );
+}
+
+/// A submission the interpreter refuses, because code a dropped round left
+/// running still holds its slot, is not shown as running: it never ran.
+#[tokio::test]
+async fn the_observer_is_not_told_of_a_refused_submission() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_OBSERVER_REFUSED",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_slow", "import time\ntime.sleep(30)"),
+            submit("toolu_next", "print('next')"),
+            text_reply("refused"),
+        ],
+    )
+    .await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_submit(move |source| {
+        sink.lock().expect("unpoisoned").push(source.to_string());
+        let _ = started.send(());
+    });
+
+    tokio::select! {
+        biased;
+        _ = within(starts.recv()) => {}
+        _ = agent.round("sleep") => panic!("the round returned before it could be dropped"),
+    }
+    assert_eq!(round(&mut agent, "go on").await, "refused");
+
+    assert_eq!(
+        *seen.lock().expect("unpoisoned"),
+        ["import time\ntime.sleep(30)"]
+    );
+}
+
+/// The observer is told each submission's source, and not a call the cap
+/// refuses, since that one does not run.
+#[tokio::test]
+async fn the_observer_is_told_each_source_that_runs() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_OBSERVER",
+        MODEL,
+        "max-tokens = 4096\ntool-call-max = 2",
+        vec![
+            submit("toolu_a", "x = 1"),
+            submit("toolu_b", "print(x)"),
+            submit("toolu_c", "print('past the cap')"),
+        ],
+    )
+    .await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    agent.on_submit(move |source| sink.lock().expect("unpoisoned").push(source.to_string()));
+
+    round(&mut agent, "go").await;
+
+    assert_eq!(*seen.lock().expect("unpoisoned"), ["x = 1", "print(x)"]);
+}
+
+/// The model is oriented before the agent's own preamble, and an agentless
+/// session, which has no preamble of its own, is oriented all the same.
+#[tokio::test]
+async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_ORIENTATION",
+        MODEL,
+        "max-tokens = 4096",
+        vec![text_reply("hi")],
+    )
+    .await;
+    round(&mut agent, "hello").await;
+    let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+    assert!(
+        system.starts_with("You act on this project by writing Python.")
+            && system.contains("`pip install` does not work")
+            && system.ends_with("\n\nYou write Python."),
+        "{system}"
+    );
+    // Run on the host, the interpreter has no workspace to name.
+    assert!(!system.contains("working directory"), "{system}");
+
+    let (addr, mut requests) = mock_http::start(vec![text_reply("hi")]).await;
+    let var = "OUTRIG_TEST_AGENT_ORIENTATION_AGENTLESS";
+    let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    let interpreter = start_on_host().await;
+    let mut agentless = with_key(var, || {
+        PythonAgent::with_interpreter(interpreter, &cfg, None, None)
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    round(&mut agentless, "hello").await;
+    let system = system_prompt(&mock_http::drain(&mut requests)[0]);
+    assert!(
+        system.starts_with("You act on this project by writing Python.")
+            && !system.contains("You write Python."),
+        "{system}"
+    );
+}
+
+#[test]
+fn the_orientation_names_the_workspace_when_there_is_one() {
+    let text = super::orientation::preamble(Some(std::path::Path::new("/workspace")), None);
+    assert!(
+        text.contains("Your working directory is /workspace, which holds the project's files."),
+        "{text}"
+    );
+}
+
+/// What a startup line reports: the model row the agent runs against, never
+/// an alias, and the version the interpreter itself reported.
+#[tokio::test]
+async fn the_agent_names_its_model_and_its_python() {
+    let (agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_NAMES",
+        MODEL,
+        "max-tokens = 4096",
+        vec![text_reply("unused")],
+    )
+    .await;
+    assert_eq!(agent.model(), "sonnet");
+    assert_eq!(
+        agent.python_version(),
+        start_on_host().await.version(),
+        "the version the interpreter greeted with"
     );
 }
 
@@ -802,6 +1047,28 @@ fn an_unknown_agent_names_the_ones_that_exist() {
     );
 }
 
+/// `check` is `start`'s resolution with nothing started: it passes what
+/// `start` would run and fails, with the same error, on what `start` would
+/// refuse.
+#[tokio::test]
+async fn check_agrees_with_start() {
+    let vars = "OUTRIG_TEST_AGENT_CHECK";
+    let cfg = two_provider_config(vars, "");
+    with_both_keys(vars, || PythonAgent::check(&cfg, Some("coding"), None))
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let checked = PythonAgent::check(&cfg, Some("coding"), Some("head"))
+        .expect_err("the key is unset")
+        .to_string();
+    let started =
+        PythonAgent::with_interpreter(start_on_host().await, &cfg, Some("coding"), Some("head"))
+            .err()
+            .expect("the key is unset")
+            .to_string();
+    assert_eq!(checked, started);
+    assert!(checked.contains(&format!("{vars}_FIRST")), "{checked}");
+}
+
 /// An alias runs against the first of its models this build can reach: one
 /// whose key is unset is passed over rather than tried, and when none can be
 /// reached the error names each and why.
@@ -866,6 +1133,11 @@ mod e2e {
         let started = within(PythonAgent::start(&outrig, &cfg, Some("coding"), None)).await;
         unsafe { std::env::remove_var(var) };
         let mut agent = started.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            agent.container_name().starts_with("outrig-"),
+            "{}",
+            agent.container_name()
+        );
 
         assert_eq!(round(&mut agent, "which alpine?").await, "read it");
 

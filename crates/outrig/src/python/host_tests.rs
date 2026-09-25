@@ -21,6 +21,7 @@ use tokio::io::{
 use super::host::{
     Background, ExecId, Interpreter, InterpreterError, Late, Outcome, PRIMARY, Report, Unknown,
 };
+use super::payload::PAYLOAD;
 use super::testing::{ok, spawn, start_on_host, within};
 
 /// What the fake transport says about itself once it closes.
@@ -55,6 +56,18 @@ async fn run(interpreter: &Interpreter, source: &str) -> Outcome {
 async fn one_plus_one_comes_back_as_its_echo() {
     let interpreter = start_on_host().await;
     assert_eq!(run(&interpreter, "1 + 1").await, ok("2\n"));
+}
+
+/// The version a startup line reports is the one the interpreter said it is,
+/// and that is the one this build pinned.
+#[tokio::test]
+async fn the_version_it_greets_with_is_the_pinned_one() {
+    let interpreter = start_on_host().await;
+    let version = interpreter.version();
+    assert!(
+        version.starts_with("3.") && PAYLOAD.starts_with(&format!("cpython-{version}+")),
+        "greeted with {version:?}; the payload is {PAYLOAD:?}"
+    );
 }
 
 /// The point of the outcome split: code that raises is a result the model
@@ -248,6 +261,7 @@ async fn an_unanswered_execution_keeps_its_slot_and_its_late_reply() {
         .submit("await never_resolves()")
         .expect("submitted");
     let id = first.id();
+    assert!(first.queued(), "a free slot takes the source");
     fake.exec(id).await;
     assert!(
         tokio::time::timeout(Duration::from_secs(60), first.outcome())
@@ -263,6 +277,7 @@ async fn an_unanswered_execution_keeps_its_slot_and_its_late_reply() {
     // The slot is still the first's. The host refuses without writing, so the
     // next thing on the wire is the inventory.
     let mut second = interpreter.submit("1 + 1").expect("submitted");
+    assert!(!second.queued(), "a refused submission never went to run");
     assert_eq!(
         within(second.outcome()).await,
         Outcome::Refused { holder: id }
@@ -457,7 +472,8 @@ async fn an_interpreter_that_never_greets_is_a_startup_error() {
 #[tokio::test]
 async fn a_greeting_that_is_not_the_primarys_ready_is_a_startup_error() {
     for greeting in [
-        json!({"t": "ready", "agent": "someone-else"}),
+        json!({"t": "ready", "agent": "someone-else", "version": "3.13"}),
+        json!({"t": "ready", "agent": PRIMARY}),
         json!({"t": "result", "agent": PRIMARY, "id": 1, "status": "ok"}),
     ] {
         let (mut fake, host) = Fake::pair();

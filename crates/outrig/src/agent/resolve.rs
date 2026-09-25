@@ -98,7 +98,8 @@ pub(crate) struct ResolvedCandidate {
 #[derive(Debug)]
 pub(crate) struct ResolvedAgent {
     pub(crate) candidate: ResolvedCandidate,
-    /// `None` sends no system prompt at all.
+    /// The agent's configured preamble, which the system prompt carries after
+    /// the orientation.
     pub(crate) preamble: Option<String>,
     pub(crate) temperature: Option<f32>,
     pub(crate) tool_call_max: usize,

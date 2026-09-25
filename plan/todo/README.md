@@ -97,12 +97,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**The path to a running CLI**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-05` | `outrig run-new` holds a session; `run-legacy` names the old one   |
-
 **Surviving what the agent writes**
 
 | Task      | What it settles                                                    |

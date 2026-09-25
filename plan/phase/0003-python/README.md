@@ -127,11 +127,15 @@ channel that replaces it is `0003-08`.
 - Isolating credentials from the interpreter. `security.md` decides where the boundary
   actually is, `pyro-remote-objects.md` covers the mechanism across it, and
   `call-inspection.md` covers authorizing and recording what crosses -- which the transport
-  does not do at all. Nothing in the first milestone depends on any of them, and the sandbox
-  holds no credentials until they land.
+  does not do at all. Nothing in the first milestone depends on any of them, and until they land
+  OutRig starts nothing in the sandbox that holds a credential from its config. What the
+  container runtime passes in on its own is outside that -- podman forwards the host's proxy
+  variables, and a proxy URL can carry a password -- and so is what an operator's image,
+  workspace, or mounts hold.
 - MCP servers presented as Python objects (`mcp-wrappers.md`). It cannot be built before the
-  isolation boundary exists, for reasons that document records. Until then the servers still
-  run and the model is simply not handed their tools.
+  isolation boundary exists, for reasons that document records. Until then `run-new` does not
+  start them: the model could not call one, and a server in the primary container would hold its
+  resolved secrets beside the interpreter, as the same user.
 - Subagents themselves. `work.md` designs the child and work-item API that
   `harness-components.md` records as undesigned -- two lifetimes, typed completion, and limits
   enforced outside generated code -- but none of it is built while one agent runs.

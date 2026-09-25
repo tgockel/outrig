@@ -83,17 +83,8 @@ pub(crate) struct Injection {
 /// Add the built-in default's image-configs and sidecars to `cfg`, unless the
 /// user already declares one of the reserved names.
 pub(crate) fn inject(cfg: &mut Config) -> Injection {
-    if let Some(note) = shadow_note(cfg) {
-        return Injection {
-            // Their `[images.outrig-default]` is usable; a shadow from one of
-            // the sidecar names leaves nothing to resolve.
-            resolved: cfg
-                .images
-                .contains_key(DEFAULT_IMAGE)
-                .then_some(DEFAULT_IMAGE),
-            applied: false,
-            notes: vec![note],
-        };
+    if let Some(vetoed) = vetoed(cfg) {
+        return vetoed;
     }
 
     let mut notes = Vec::new();
@@ -129,6 +120,45 @@ pub(crate) fn inject(cfg: &mut Config) -> Injection {
         applied: true,
         notes,
     }
+}
+
+/// [`inject`] for a session that starts no MCP server: the built-in's primary
+/// image-config alone, with no servers and no sidecars. So nothing is
+/// materialized, and there is no launcher note about servers that would not
+/// have started anyway.
+pub(crate) fn inject_primary(cfg: &mut Config) -> Injection {
+    if let Some(vetoed) = vetoed(cfg) {
+        return vetoed;
+    }
+    let mut primary = shape(true, None)
+        .images
+        .remove(DEFAULT_IMAGE)
+        .expect("the built-in default declares its primary image-config");
+    primary.mcp.clear();
+    cfg.images
+        .entry(DEFAULT_IMAGE.to_string())
+        .or_insert(primary);
+    Injection {
+        resolved: Some(DEFAULT_IMAGE),
+        applied: true,
+        notes: Vec::new(),
+    }
+}
+
+/// The injection that does not happen because the user declares one of the
+/// reserved names, or `None` when nothing is shadowed.
+fn vetoed(cfg: &Config) -> Option<Injection> {
+    let note = shadow_note(cfg)?;
+    Some(Injection {
+        // Their `[images.outrig-default]` is usable; a shadow from one of the
+        // sidecar names leaves nothing to resolve.
+        resolved: cfg
+            .images
+            .contains_key(DEFAULT_IMAGE)
+            .then_some(DEFAULT_IMAGE),
+        applied: false,
+        notes: vec![note],
+    })
 }
 
 /// The materialized shell build context, or `None` with a note appended. A
@@ -533,5 +563,25 @@ mod tests {
                 "{name} is injected but not reserved"
             );
         }
+    }
+
+    /// `run-new` starts no MCP server, so it takes the built-in's primary alone:
+    /// the same image, with no servers, no sidecars, nothing materialized, and
+    /// no note about servers it would not have started.
+    #[test]
+    fn the_primary_alone_brings_no_server_and_no_sidecar() {
+        let mut cfg = Config::default();
+        let injection = inject_primary(&mut cfg);
+
+        assert_eq!(injection.resolved, Some(DEFAULT_IMAGE));
+        assert!(injection.applied, "the built-in is in play");
+        assert!(injection.notes.is_empty(), "{:?}", injection.notes);
+        assert_eq!(cfg.images.keys().collect::<Vec<_>>(), [DEFAULT_IMAGE]);
+        assert!(cfg.images[DEFAULT_IMAGE].mcp.is_empty());
+        assert_eq!(
+            cfg.images[DEFAULT_IMAGE].image_name,
+            shape(true, None).images[DEFAULT_IMAGE].image_name,
+        );
+        assert!(cfg.sidecars.is_empty());
     }
 }

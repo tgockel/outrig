@@ -182,12 +182,18 @@ pub(crate) struct Interpreter {
     /// Whole protocol lines for the writer task. Queued rather than written by
     /// the caller, so a caller cancelled mid-write cannot tear a line.
     lines: mpsc::UnboundedSender<String>,
+    /// The Python version the interpreter greeted with, as `sys.version`'s
+    /// first word.
+    version: Arc<str>,
 }
 
 /// One submission's handle. Its id is fixed at submission, which is what a
 /// later interrupt or cancellation targets.
 pub(crate) struct Execution {
     id: ExecId,
+    /// Whether the source went to the interpreter, rather than being refused
+    /// because the slot was taken.
+    queued: bool,
     receiver: oneshot::Receiver<Outcome>,
     /// The outcome once [`Execution::outcome`] has returned it.
     settled: Option<Outcome>,
@@ -224,7 +230,9 @@ struct Envelope {
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum Reply {
-    Ready,
+    Ready {
+        version: String,
+    },
     Result(WireResult),
     Inv {
         id: ExecId,
@@ -297,18 +305,31 @@ impl Interpreter {
         E: Future<Output = String> + Send + 'static,
     {
         let mut replies = BufReader::new(replies);
-        if let Err(problem) = greeting(&mut replies).await {
-            // Closing its stdin is what lets a live interpreter exit, rather
-            // than waiting out `ended`'s grace.
-            drop(requests);
-            let cause = ended.await;
-            return Err(InterpreterError::Startup(format!("{problem}; {cause}")));
-        }
+        let version = match greeting(&mut replies).await {
+            Ok(version) => version,
+            Err(problem) => {
+                // Closing its stdin is what lets a live interpreter exit,
+                // rather than waiting out `ended`'s grace.
+                drop(requests);
+                let cause = ended.await;
+                return Err(InterpreterError::Startup(format!("{problem}; {cause}")));
+            }
+        };
         let table = Arc::new(Mutex::new(Table::default()));
         let (lines, queued) = mpsc::unbounded_channel();
         tokio::spawn(write_requests(requests, queued, Arc::clone(&table)));
         tokio::spawn(read_replies(replies, Arc::clone(&table), ended));
-        Ok(Self { table, lines })
+        Ok(Self {
+            table,
+            lines,
+            version: version.into(),
+        })
+    }
+
+    /// The Python version the interpreter reported when it started, such as
+    /// `3.13.15`.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
     }
 
     /// Submit `source` to run in the agent's namespace.
@@ -322,20 +343,23 @@ impl Interpreter {
         let mut table = lock(&self.table);
         table.open()?;
         let id = table.next_id();
-        match &table.slot {
+        let queued = match &table.slot {
             Some(slot) => {
                 let _ = waiter.send(Outcome::Refused { holder: slot.id });
+                false
             }
             None => {
                 // Queued under the lock, so the wire order is the order the
                 // slot was claimed in.
                 self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}))?;
                 table.slot = Some(Slot { id, waiter });
+                true
             }
-        }
+        };
         drop(table);
         Ok(Execution {
             id,
+            queued,
             receiver,
             settled: None,
             table: Arc::clone(&self.table),
@@ -380,6 +404,12 @@ impl Interpreter {
 impl Execution {
     pub(crate) fn id(&self) -> ExecId {
         self.id
+    }
+
+    /// Whether the source was sent to run. `false` means the slot was taken,
+    /// and the outcome is already [`Outcome::Refused`].
+    pub(crate) fn queued(&self) -> bool {
+        self.queued
     }
 
     /// Wait for the outcome. Cancel-safe, and may be awaited again after a
@@ -494,8 +524,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Read the interpreter's first line, which must be the primary's `ready`.
-async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<(), String> {
+/// Read the interpreter's first line, which must be the primary's `ready`, and
+/// return the version it names.
+async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<String, String> {
     let mut line = Vec::new();
     let read =
         tokio::time::timeout(READY_TIMEOUT, next_line(replies, &mut line, REPLY_LINE_MAX)).await;
@@ -506,8 +537,8 @@ async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<(), String
         Ok(Ok(Some(cut))) => match serde_json::from_slice(&line) {
             Ok(Envelope {
                 agent,
-                reply: Reply::Ready,
-            }) if cut == 0 && agent == PRIMARY => Ok(()),
+                reply: Reply::Ready { version },
+            }) if cut == 0 && agent == PRIMARY => Ok(version),
             _ => {
                 line.truncate(200);
                 Err(format!(
@@ -605,7 +636,7 @@ fn dispatch(table: &Mutex<Table>, line: &[u8]) {
             }
             None => tracing::warn!("ignored inventory {id}, which nothing asked for"),
         },
-        Reply::Ready => tracing::warn!("ignored a second ready from the primary"),
+        Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",
             String::from_utf8_lossy(line)

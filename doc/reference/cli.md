@@ -176,7 +176,9 @@ See [Usage -> outrig image](../usage/image.md#outrig-image-inspect).
 
 ### `outrig run`
 
-Start an interactive agent session.
+Start an interactive agent session. `outrig run-legacy` is another name for this command and
+reaches the same code, so a script can name the MCP-tool agent explicitly before `run` moves to
+the Python one.
 
 ```
 outrig run [--agent <name>]
@@ -238,6 +240,65 @@ a repo config and does not fall through; pass `--image outrig-default` to pre-wa
 built-in.
 
 See [Usage -> outrig run](../usage/run.md) for REPL details.
+
+### `outrig run-new`
+
+Start an interactive session whose agent acts by writing Python. A preview: `outrig run` is
+unchanged by it.
+
+```
+outrig run-new [--agent <name>]
+               [--image <name>]
+               [--config <path>]
+               [--global-config <path>]
+               [--model <name>]
+               [--session-dir <path>]
+               [--session-root <path>]
+               [--verbose]
+```
+
+- `--agent <name>` (default: `default-agent`): selects an `[agents.<name>]` block, as for
+  `run`. Its `preamble` follows OutRig's own orientation in the system prompt.
+- `--image <name>` (default: from agent or `default-image`, else the built-in default): the
+  `[images.<name>]` block to launch. Unlike `run`, a local image ref no block names is refused.
+- `--model <name>` (default: agent's `model`, else `default-model`): as for `run`. An alias
+  runs against the first of its models this build can reach, with no failover.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): as for `run`. While another
+  `run-new` holds the directory, this one is refused before it pulls or starts anything.
+
+The model has one tool, `submit_python`, which runs source in a persistent CPython inside the
+session's primary container, with the workspace as its working directory. Names the agent binds
+stay bound from one message to the next. The interpreter is a static build OutRig mounts
+read-only, so the image needs no Python of its own; it carries the standard library and cannot
+install packages. Each submission's source is printed on stderr as it starts running.
+
+**No MCP server and no sidecar starts**, including servers an image declares in its
+`org.outrig.mcp` label; startup names the configured ones it left out. The model could not call
+them, and a server placed in the primary container would run beside the interpreter as the same
+user, with whatever its `env` resolved readable from Python where `/proc` allows. So no credential
+from an MCP or sidecar block reaches the session's containers.
+
+That is the whole of the guarantee. Python can read anything else in the container, and that
+includes what podman passes in on its own: by default it forwards the host's proxy variables
+(`HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms), and a proxy URL can carry a user and
+password. The image's own environment, the workspace, and any configured mounts are outside it
+too.
+
+Startup checks the model before anything is pulled or started, pulls or builds the image,
+starts the container and the interpreter, and prints the image, the model, and the Python
+version. The session is recorded like any other, so `outrig ls`, `discard`, and `clean` see it;
+its record is written once the interpreter is up, under the name of the container it runs in.
+
+The REPL is `run`'s, with only `/help` and `/quit`. A failed round is reported and the session
+carries on. Ctrl-C during a round stops waiting for it and returns to the prompt; Python that
+was already running keeps running, and its result reaches the model with a later call. What the
+interrupted round had already run stays in the conversation. At the prompt, one Ctrl-C starts a
+fresh line and a second exits.
+
+`run-new` does not yet take `run`'s `--env`, `--network`, `--volume`, `--max-tool-calls`, or
+`--max-tool-result-bytes`. The config keys behind the last two, `tool-call-max` and
+`tool-result-max`, apply, as do `[network]` and `[workspace]`. `-v` writes no
+`logs/container.log` here; `-vv` still turns on trace logging.
 
 ### `outrig mcp`
 

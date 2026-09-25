@@ -57,10 +57,11 @@ pub(crate) struct Built {
     pub(crate) max_tokens: Option<u32>,
 }
 
-/// Build the agent for `resolved`, with `tools` as its whole tool list. Does
-/// no I/O.
+/// Build the agent for `resolved`, with `preamble` as its system prompt and
+/// `tools` as its whole tool list. Does no I/O.
 pub(crate) fn build_agent(
     resolved: &ResolvedAgent,
+    preamble: &str,
     tools: Vec<Box<dyn ToolDyn>>,
 ) -> Result<Built, AgentError> {
     let candidate = &resolved.candidate;
@@ -78,7 +79,13 @@ pub(crate) fn build_agent(
                 .map_err(client_build)?;
             let model = client.completion_model(&candidate.model_identifier);
             Built {
-                agent: RigAgent::OpenAi(finish_agent(model, resolved, candidate.max_tokens, tools)),
+                agent: RigAgent::OpenAi(finish_agent(
+                    model,
+                    resolved,
+                    preamble,
+                    candidate.max_tokens,
+                    tools,
+                )),
                 max_tokens: candidate.max_tokens,
             }
         }
@@ -99,7 +106,13 @@ pub(crate) fn build_agent(
                 .map_err(client_build)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
             Built {
-                agent: RigAgent::Anthropic(finish_agent(model, resolved, Some(max_tokens), tools)),
+                agent: RigAgent::Anthropic(finish_agent(
+                    model,
+                    resolved,
+                    preamble,
+                    Some(max_tokens),
+                    tools,
+                )),
                 max_tokens: Some(max_tokens),
             }
         }
@@ -184,15 +197,11 @@ pub(crate) fn anthropic_model(
 fn finish_agent<M: CompletionModel + 'static>(
     model: M,
     resolved: &ResolvedAgent,
+    preamble: &str,
     max_tokens: Option<u32>,
     tools: Vec<Box<dyn ToolDyn>>,
 ) -> Agent<M> {
-    let mut builder = AgentBuilder::new(model);
-    // Skipped rather than passed as "": a builder that never saw a preamble
-    // sends no system prompt, which is what an unset `preamble` means.
-    if let Some(preamble) = &resolved.preamble {
-        builder = builder.preamble(preamble);
-    }
+    let mut builder = AgentBuilder::new(model).preamble(preamble);
     if let Some(temperature) = resolved.temperature {
         builder = builder.temperature(f64::from(temperature));
     }

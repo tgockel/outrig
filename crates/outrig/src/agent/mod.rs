@@ -8,11 +8,14 @@
 //! at the point it is caught.
 
 mod build;
+mod orientation;
 mod resolve;
 mod round;
 mod tool;
 
 use std::error::Error;
+use std::path::Path;
+use std::sync::PoisonError;
 
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
@@ -25,7 +28,7 @@ use crate::python::host::Interpreter;
 use self::build::RigAgent;
 use self::resolve::{LlmResolveError, ResolvedAgent};
 use self::round::RoundEnd;
-use self::tool::SubmitPython;
+use self::tool::{ObserverSlot, SubmitPython};
 
 /// An agent that acts by writing Python, driven one round at a time.
 ///
@@ -48,6 +51,13 @@ pub struct PythonAgent {
         expect(dead_code, reason = "0003-13 records it as an event")
     )]
     max_tokens: Option<u32>,
+    /// The concrete `[models.<name>]` row the agent runs against.
+    model: String,
+    python_version: String,
+    container_name: String,
+    /// Shared with the tool, which calls what [`PythonAgent::on_submit`] puts
+    /// here.
+    on_submit: ObserverSlot,
 }
 
 impl PythonAgent {
@@ -65,8 +75,58 @@ impl PythonAgent {
         model: Option<&str>,
     ) -> Result<PythonAgent, Box<dyn Error + Send + Sync>> {
         let resolved = resolve::resolve_agent(config, agent, model)?;
-        let interpreter = Interpreter::start(outrig.primary()).await?;
-        Ok(Self::build(&resolved, interpreter)?)
+        let primary = outrig.primary();
+        let interpreter = Interpreter::start(primary).await?;
+        // A container launched without a workspace holds an empty path.
+        let workspace = Some(primary.container_workspace()).filter(|w| !w.as_os_str().is_empty());
+        Ok(Self::build(
+            &resolved,
+            interpreter,
+            primary.name(),
+            workspace,
+        )?)
+    }
+
+    /// Whether [`PythonAgent::start`] would resolve a model from these
+    /// arguments, checked without starting anything.
+    ///
+    /// Resolution reads nothing from a container, so a caller can run this
+    /// before it pulls an image or launches one, and fail on a config that
+    /// names no usable model before paying for either.
+    pub fn check(
+        config: &Config,
+        agent: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        resolve::resolve_agent(config, agent, model)?;
+        Ok(())
+    }
+
+    /// The `[models.<name>]` row the agent runs against. An alias has already
+    /// been resolved to one of its models, so this never names an alias.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The Python version the interpreter reported when it started, such as
+    /// `3.13.15`.
+    pub fn python_version(&self) -> &str {
+        &self.python_version
+    }
+
+    /// The name of the container the interpreter runs in: `outrig`'s primary.
+    pub fn container_name(&self) -> &str {
+        &self.container_name
+    }
+
+    /// Call `observer` with the source of each submission the interpreter
+    /// accepts, as it starts running. A call the tool-call cap refuses is not
+    /// reported, because it never reaches the interpreter.
+    pub fn on_submit(&mut self, observer: impl Fn(&str) + Send + Sync + 'static) {
+        *self
+            .on_submit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(observer));
     }
 
     /// Drive one round: `prompt`, the model and whatever Python it submits, and
@@ -80,6 +140,9 @@ impl PythonAgent {
     /// Python. If it had, the completed tool calls and their results are kept,
     /// because what they did stands -- nothing is rolled back -- and the error
     /// says to continue rather than resend.
+    ///
+    /// A round whose future is dropped before it returns -- the REPL's Ctrl-C --
+    /// keeps its completed tool calls and their results the same way.
     pub async fn round(&mut self, prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let RoundEnd { reply, stopped } = self
             .agent
@@ -92,7 +155,8 @@ impl PythonAgent {
         })
     }
 
-    /// [`PythonAgent::start`] over an interpreter the caller started.
+    /// [`PythonAgent::start`] over an interpreter the caller started on the
+    /// host, which has no container and no workspace.
     #[cfg(test)]
     pub(crate) fn with_interpreter(
         interpreter: Interpreter,
@@ -100,17 +164,34 @@ impl PythonAgent {
         agent: Option<&str>,
         model: Option<&str>,
     ) -> Result<Self, AgentError> {
-        Self::build(&resolve::resolve_agent(config, agent, model)?, interpreter)
+        let resolved = resolve::resolve_agent(config, agent, model)?;
+        Self::build(&resolved, interpreter, "(host)", None)
     }
 
-    fn build(resolved: &ResolvedAgent, interpreter: Interpreter) -> Result<Self, AgentError> {
+    fn build(
+        resolved: &ResolvedAgent,
+        interpreter: Interpreter,
+        container_name: &str,
+        workspace: Option<&Path>,
+    ) -> Result<Self, AgentError> {
+        let python_version = interpreter.version().to_string();
         let tool = SubmitPython::new(interpreter, resolved.tool_result_max_bytes);
-        let built = build::build_agent(resolved, vec![Box::new(tool) as Box<dyn ToolDyn>])?;
+        let on_submit = tool.observer_slot();
+        let preamble = orientation::preamble(workspace, resolved.preamble.as_deref());
+        let built = build::build_agent(
+            resolved,
+            &preamble,
+            vec![Box::new(tool) as Box<dyn ToolDyn>],
+        )?;
         Ok(Self {
             agent: built.agent,
             history: Vec::new(),
             tool_call_max: resolved.tool_call_max,
             max_tokens: built.max_tokens,
+            model: resolved.candidate.model_name.clone(),
+            python_version,
+            container_name: container_name.to_string(),
+            on_submit,
         })
     }
 }

@@ -17,8 +17,13 @@ one the model submits code to; it holds proxies and never a credential. The **tr
 interpreter** is whatever runs the real objects on the other side of the socket, which this page
 places in a sidecar. Unqualified "the interpreter" means the agent interpreter.
 
-Nothing here is built in the first milestone. Until it is, the agent interpreter holds no
-credentials, and that is the only reason the gap is tolerable.
+Nothing here is built in the first milestone. Until it is, OutRig starts nothing in the agent's
+containers that holds a credential from its config, and that is the only reason the gap is
+tolerable. It is why `run-new` starts no MCP server: one placed in the primary would hold its
+secrets beside the interpreter as the same user, and not handing the model its tools would not
+put them out of reach. What the container runtime passes in on its own is not covered: podman
+forwards the host's proxy variables by default, and a proxy URL can carry a password
+(`plan/next/proxy-credentials-reach-the-primary.md`).
 
 ## OutRig's existing property, unchanged
 

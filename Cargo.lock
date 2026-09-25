@@ -1592,6 +1592,7 @@ dependencies = [
  "futures-util",
  "heck",
  "jiff",
+ "nix",
  "outrig",
  "outrig-cli",
  "rand 0.10.2",

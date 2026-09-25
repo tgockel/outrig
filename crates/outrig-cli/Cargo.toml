@@ -41,6 +41,7 @@ directories        = { workspace = true, default-features = true }
 futures-util       = { workspace = true, default-features = true }
 heck               = { workspace = true, default-features = true }
 jiff               = { workspace = true, default-features = true }
+nix                = { workspace = true, features = ["fs"] }
 rand               = { workspace = true, default-features = true }
 regex              = { workspace = true, default-features = true }
 reqwest            = { workspace = true, features = ["json", "rustls"] }

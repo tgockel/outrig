@@ -9,7 +9,7 @@
 //! is a tool error.
 
 use std::fmt::Write as _;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
@@ -40,6 +40,14 @@ fn parse_args(args: &str) -> Result<Args, ToolError> {
     serde_json::from_str(args).map_err(ToolError::JsonError)
 }
 
+/// Told the source of each submission sent to the interpreter to run.
+pub(crate) type SubmitObserver = Box<dyn Fn(&str) + Send + Sync>;
+
+/// Where an observer is put for the tool to find. The tool is handed to rig
+/// when the agent is built, before any observer exists, so the two share this
+/// rather than the observer being passed in.
+pub(crate) type ObserverSlot = Arc<Mutex<Option<SubmitObserver>>>;
+
 /// The tool, holding the interpreter it submits to and the byte ceiling on
 /// what it hands back.
 pub(crate) struct SubmitPython {
@@ -49,6 +57,7 @@ pub(crate) struct SubmitPython {
     /// room to report. `take_late` hands each out once, so they are held here
     /// and lead the next result rather than being lost.
     unreported: Mutex<Vec<Late>>,
+    on_submit: ObserverSlot,
 }
 
 impl SubmitPython {
@@ -57,7 +66,13 @@ impl SubmitPython {
             interpreter,
             result_max_bytes,
             unreported: Mutex::new(Vec::new()),
+            on_submit: ObserverSlot::default(),
         }
+    }
+
+    /// The slot this tool reads its observer from.
+    pub(crate) fn observer_slot(&self) -> ObserverSlot {
+        Arc::clone(&self.on_submit)
     }
 
     /// As if an earlier result had had no room for `late`.
@@ -111,6 +126,16 @@ impl ToolDyn for SubmitPython {
                 .submit(&source)
                 .map_err(|e| ToolError::ToolCallError(e.into()))?;
             tracing::debug!(execution = %execution.id(), "submitted");
+            // Only source that went to run: a refusal is the model's to read,
+            // not something to show as running.
+            if execution.queued()
+                && let Some(observer) = &*self
+                    .on_submit
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            {
+                observer(&source);
+            }
             let outcome = execution.outcome().await;
             // Taken after the outcome, so anything that arrived while this ran
             // is reported now rather than a call later -- after whatever an

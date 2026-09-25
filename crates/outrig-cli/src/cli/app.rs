@@ -12,6 +12,7 @@ use crate::cli::ls::{self, LsArgs};
 use crate::cli::mcp::{self, McpArgs};
 use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
+use crate::cli::run_new::{self, RunNewArgs};
 use crate::error::Result;
 use crate::paths::{global_config_path, resolve_repo_config, resolve_repo_config_optional};
 use crate::{config_init, image_setup, init};
@@ -47,7 +48,17 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Start an interactive agent session.
+    #[command(visible_alias = "run-legacy")]
     Run(RunArgs),
+    /// Start an interactive session whose agent acts by writing Python (preview).
+    ///
+    /// The model has one tool, which runs Python in a persistent interpreter
+    /// inside the session's container. Names it binds stay bound from one
+    /// message to the next. No MCP server and no sidecar is started.
+    ///
+    /// `outrig run` is unchanged by this command, and `outrig run-legacy` is
+    /// another name for it.
+    RunNew(RunNewArgs),
     /// Serve the configured backing MCPs as a single MCP server over stdio.
     Mcp(McpArgs),
     /// Generate prompts and setup snippets for AI-assisted design.
@@ -170,6 +181,15 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 cli.session_root.as_deref(),
                 args,
                 cli.verbose,
+            ))
+        }
+        Cmd::RunNew(args) => {
+            let (repo_config, global_config, runtime) = repo_cmd_ctx(cli, false)?;
+            runtime.block_on(run_new::execute(
+                &repo_config,
+                &global_config,
+                cli.session_root.as_deref(),
+                args,
             ))
         }
         Cmd::Mcp(args) => {
@@ -328,7 +348,7 @@ fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runti
     Ok((cwd, global, runtime))
 }
 
-/// Shared preamble for `run`/`mcp`/`build`: the resolved repo config, the
+/// Shared preamble for `run`/`run-new`/`mcp`/`build`: the resolved repo config, the
 /// resolved global config, and a current-thread tokio runtime. With
 /// `require_config` (build), errors if no repo config can be located;
 /// otherwise (run/mcp) a missing config falls back to the current directory
