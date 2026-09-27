@@ -332,9 +332,10 @@ the first build.
 outrig tags built images as `<image-config-name>:<hash>`, where the name is the `[images.<name>]`
 block key and the hash is a content-addressed cache key combining the contents of the
 `Dockerfile`, the `build-args`, the OutRig labels derived from `[images.<name>.mcp]`, and the
-content of the build context (gitignore-aware when the context is in a git repo, otherwise a
-tarball hash). So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which podman
-shows as `localhost/outrig-standard`.
+build context. When the context is in a git repo, that means every file in it that `.gitignore`
+does not exclude, committed or not, by path, permission bits, and content; otherwise it is a
+tarball hash of the whole directory. So `[images.outrig-standard]` builds to
+`outrig-standard:<hash>`, which podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
 temporary image, reads any inherited/Dockerfile MCP label, overlays `[images.<name>.mcp]`, and
@@ -348,7 +349,10 @@ alphanumeric separated by `.`, `_`, or `-` -- and `outrig` rejects invalid names
 
 A change to the `Dockerfile`, any file in the context, build args, or `[images.<name>.mcp]`
 causes a rebuild on the next `outrig run` or `outrig build`. Otherwise the cache hit is
-immediate. To force a rebuild without changing files, run `outrig build --no-cache`.
+immediate. To force a rebuild without changing files, run `outrig build --no-cache`. In a git
+repo, a file that `.gitignore` excludes does not count when the `Dockerfile` copies it by its own
+path, so run `outrig build --no-cache` after changing one. A symlink counts by what it points
+at, ignored or not, since copying the link copies that.
 
 Image-name configs use podman's local image store directly; there is no `<name>:<hash>`
 tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the

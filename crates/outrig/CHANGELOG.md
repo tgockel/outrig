@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image rebuilds when an uncommitted file in its build context changes.** When the context
+  was in a git repo, the cache key hashed only the files git tracks, yet buildah is handed the
+  whole directory. A file not yet committed -- a helper script beside a freshly scaffolded
+  `Dockerfile` -- could be copied into the image without counting toward its tag. Editing it
+  left the key unchanged, so `outrig build` and `outrig run` reported a cache hit on an image
+  built from the old content, and two contexts that differed only in such files shared a tag.
+  The key now covers every file in the context that `.gitignore` does not exclude, committed or
+  not, by path, permission bits, and content, so a rename or a `chmod +x` rebuilds too. A
+  symlink also counts by what `COPY` would copy through it, resolved inside the context the way
+  buildah resolves it. A tracked file deleted without `git rm`, a symlink to a directory, or a
+  submodule in the context used to fail the key computation outright. The first is now hashed as
+  absent, and a submodule or nested repository is hashed by the same rule in its own
+  repository. A file `.gitignore` excludes still does not count when copied by its own path.
+  Every build image whose context is in a git repo gets a new key, so each rebuilds once after
+  upgrading.
+
 - **`audit`/`filter` interception now covers IPv6.** The nftables redirect matched TCP of either
   family, but the interceptor listened on IPv4 only. So every IPv6 connection from the container
   was refused: it was not in `network.jsonl`, and a filter policy never saw it. The IPv6 literal
