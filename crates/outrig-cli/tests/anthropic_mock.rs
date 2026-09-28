@@ -25,7 +25,10 @@
 //!   than the session when it persists;
 //! * an alias chain moves to its next candidate *inside* a `completion()`
 //!   call, so a turn that has already run a tool keeps its history and does
-//!   not re-execute it -- which needs two endpoints, and so needs two mocks.
+//!   not re-execute it -- which needs two endpoints, and so needs two mocks;
+//! * reasoning Anthropic did not issue -- a fallback's, left in a chain's
+//!   shared history -- is not sent back to it as a `thinking` block it would
+//!   refuse.
 
 mod common;
 
@@ -34,6 +37,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rig::OneOrMany;
+use rig::completion::Message;
+use rig::completion::message::{AssistantContent, Reasoning};
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::{Value, json};
@@ -1151,5 +1157,97 @@ async fn a_whitespace_reply_beside_reasoning_is_still_recovered() {
     assert!(
         report.contains("still weighing it"),
         "and the reasoning must reach the user: {report}",
+    );
+}
+
+/// Reasoning Anthropic did not issue is not sent back to it.
+///
+/// An alias chain shares one history across its candidates, so a turn that a
+/// local fallback answered is still in it when the next call starts back at the
+/// Anthropic head. The in-process adapter keeps a local model's reasoning with
+/// no signature, since mistralrs has none to give it. rig turns every reasoning
+/// block into a native `thinking` block, and Anthropic refuses one without its
+/// signature. So the head would fail every call, long after its outage ended,
+/// and the chain would stay on the fallback without saying why.
+///
+/// The history below is what such a fallback leaves behind, next to a turn
+/// Anthropic answered itself. What this pins is the request the head is sent.
+#[tokio::test]
+async fn reasoning_anthropic_did_not_issue_is_not_sent_back_to_it() {
+    let (head, mut head_requests) = start_mock_http(vec![text_reply("ok")]).await;
+    let (next, mut next_requests) = start_mock_http(vec![text_reply("unused")]).await;
+    let vars = [
+        "OUTRIG_TEST_ANTHROPIC_FOREIGN_REASONING_HEAD",
+        "OUTRIG_TEST_ANTHROPIC_FOREIGN_REASONING_NEXT",
+    ];
+    let cfg = mock_chain_config(head, next, vars);
+    let agent = build_mock_agent(&cfg, &vars, vec![]).await;
+
+    let assistant = |parts: Vec<AssistantContent>| Message::Assistant {
+        id: None,
+        content: OneOrMany::many(parts).expect("non-empty"),
+    };
+    let mut history = vec![
+        Message::user("first"),
+        // Anthropic's own turn: its thinking goes back exactly as it came.
+        assistant(vec![
+            AssistantContent::Reasoning(Reasoning::new_with_signature(
+                "claude weighs it",
+                Some("sig-1".to_string()),
+            )),
+            AssistantContent::Reasoning(Reasoning::redacted("opaque-blob")),
+            AssistantContent::text("claude's answer"),
+        ]),
+        Message::user("second"),
+        // A local fallback's turn: unsigned reasoning beside its reply...
+        assistant(vec![
+            AssistantContent::reasoning("local weighs it"),
+            AssistantContent::text("local answer"),
+        ]),
+        Message::user("third"),
+        // ...and one that was nothing but reasoning.
+        assistant(vec![AssistantContent::reasoning("local only thought")]),
+    ];
+
+    agent
+        .run_turn("fourth", &mut history)
+        .await
+        .expect("the head takes the turn");
+
+    let recorded = drain_recorded(&mut head_requests);
+    assert_eq!(recorded.len(), 1, "the head answered, first time");
+    assert!(
+        drain_recorded(&mut next_requests).is_empty(),
+        "and the chain never moved",
+    );
+
+    let messages = recorded[0].body["messages"]
+        .as_array()
+        .expect("a messages array");
+    let blocks: Vec<&Value> = messages
+        .iter()
+        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        blocks
+            .iter()
+            .filter(|b| b["type"] == "thinking")
+            .all(|b| b["signature"].is_string()),
+        "Anthropic refuses a thinking block without its signature: {blocks:#?}",
+    );
+    let body = recorded[0].body.to_string();
+    assert!(
+        body.contains("claude weighs it") && body.contains("sig-1") && body.contains("opaque-blob"),
+        "Anthropic's own thinking goes back as it came: {body}",
+    );
+    assert!(
+        body.contains("local answer") && !body.contains("local weighs it"),
+        "the fallback's reply goes back without its reasoning: {body}",
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m["role"] == "assistant").count(),
+        2,
+        "the reasoning-only turn is left out whole, not sent back empty, which \
+         Anthropic refuses too: {messages:#?}",
     );
 }

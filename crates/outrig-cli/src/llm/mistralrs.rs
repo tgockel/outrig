@@ -320,30 +320,40 @@ impl CompletionModel for MistralrsModel {
         request: CompletionRequest,
     ) -> std::result::Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
     {
-        let (tx, mut rx) = mpsc::channel::<Response>(1);
+        let (tx, rx) = mpsc::channel::<Response>(1);
         let normal = build_normal_request(&self.model_identifier, request, tx, true)?;
         let request_for_engine = Request::Normal(Box::new(normal));
 
         dispatch_request(self.engine.clone(), request_for_engine).await?;
 
-        let stream = async_stream::try_stream! {
-            let mut saw_response = false;
-            let mut state = MistralrsStreamState::default();
-            while let Some(response) = rx.recv().await {
-                saw_response = true;
-                for item in state.translate(response)? {
-                    yield item;
-                }
-            }
-            if !saw_response {
-                Err(CompletionError::ProviderError(
-                    "mistralrs engine closed the response channel without replying".into(),
-                ))?;
-            }
-        };
-
-        Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
+        Ok(response_stream(rx))
     }
+}
+
+/// The stream rig reads for one request, fed by the engine's response channel.
+///
+/// Split out of [`MistralrsModel::stream`] so that everything past the engine
+/// can be driven from a scripted channel, without loading any weights.
+fn response_stream(
+    mut rx: mpsc::Receiver<Response>,
+) -> StreamingCompletionResponse<MistralrsStreamResponse> {
+    let stream = async_stream::try_stream! {
+        let mut saw_response = false;
+        let mut state = MistralrsStreamState::default();
+        while let Some(response) = rx.recv().await {
+            saw_response = true;
+            for item in state.translate(response)? {
+                yield item;
+            }
+        }
+        if !saw_response {
+            Err(CompletionError::ProviderError(
+                "mistralrs engine closed the response channel without replying".into(),
+            ))?;
+        }
+    };
+
+    StreamingCompletionResponse::stream(Box::pin(stream))
 }
 
 async fn dispatch_request(
@@ -700,6 +710,16 @@ fn translate_stream_chunk(
         if choice.finish_reason.is_some() {
             final_chunk = true;
         }
+        // Ahead of the text: a delta that straddles a closing `</think>`
+        // carries both, and the reasoning is the part generated first.
+        if let Some(reasoning) = choice.delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            out.push(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning,
+            });
+        }
         if let Some(text) = choice.delta.content
             && !text.is_empty()
         {
@@ -734,6 +754,12 @@ fn translate_stream_done(
             AssistantContent::Text(text) if !text.text.is_empty() => {
                 out.push(RawStreamingChoice::Message(text.text.clone()));
             }
+            AssistantContent::Reasoning(reasoning) => {
+                out.push(RawStreamingChoice::ReasoningDelta {
+                    id: None,
+                    reasoning: reasoning.display_text(),
+                });
+            }
             AssistantContent::ToolCall(call) => {
                 out.push(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
                     call.id.clone(),
@@ -741,9 +767,7 @@ fn translate_stream_done(
                     call.function.arguments.clone(),
                 )));
             }
-            AssistantContent::Text(_)
-            | AssistantContent::Reasoning(_)
-            | AssistantContent::Image(_) => {}
+            AssistantContent::Text(_) | AssistantContent::Image(_) => {}
         }
     }
 
@@ -768,6 +792,16 @@ fn translate_choice(
         CompletionError::ProviderError("mistralrs response had no choices".into())
     })?;
     let mut items: Vec<AssistantContent> = Vec::new();
+
+    // mistralrs *moves* a reasoning model's `<think>` block (or Harmony
+    // analysis channel) out of `content` into this field, so it is the only
+    // copy. Dropped, a turn that was all reasoning would reach the agent loop
+    // as the empty-text sentinel below and be reported as no content at all.
+    if let Some(reasoning) = &first.message.reasoning_content
+        && !reasoning.is_empty()
+    {
+        items.push(AssistantContent::reasoning(reasoning));
+    }
 
     if let Some(text) = &first.message.content
         && !text.is_empty()
@@ -911,6 +945,22 @@ mod tests {
         })
     }
 
+    /// `response` with `reasoning` split out of its first choice, as mistralrs
+    /// files a `<think>` block when the model's chat template declares one.
+    fn with_reasoning(response: Response, reasoning: &str) -> Response {
+        match response {
+            Response::Done(mut chat) => {
+                chat.choices[0].message.reasoning_content = Some(reasoning.to_string());
+                Response::Done(chat)
+            }
+            Response::Chunk(mut chunk) => {
+                chunk.choices[0].delta.reasoning_content = Some(reasoning.to_string());
+                Response::Chunk(chunk)
+            }
+            _ => unreachable!("only chat responses carry reasoning"),
+        }
+    }
+
     #[test]
     fn malformed_tool_call_arguments_fall_back_to_string() {
         // mistralrs: arguments is a String. rig: arguments is a parsed Value.
@@ -951,6 +1001,44 @@ mod tests {
             panic!("expected text, got {first:?}");
         };
         assert_eq!(t.text, "");
+    }
+
+    /// A turn that was all reasoning -- typically one cut off at `max-tokens`
+    /// inside its `<think>` block -- reaches rig as reasoning. Erased, it came
+    /// through as the empty-text sentinel above, and the agent loop reported a
+    /// model that had produced no content at all.
+    #[test]
+    fn reasoning_only_response_is_carried_as_reasoning() {
+        let response = with_reasoning(chat_done(None, None), "weighing the options");
+        let translated = translate_response(response).expect("response translates");
+        let parts: Vec<_> = translated.choice.iter().collect();
+
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [AssistantContent::Reasoning(r)] if r.display_text() == "weighing the options"
+            ),
+            "the reasoning alone, with no sentinel beside it: {parts:?}",
+        );
+    }
+
+    /// The reasoning is moved out of `content`, not copied, so a turn with a
+    /// reply loses it too unless it is carried alongside -- ahead of the text,
+    /// the order the model generated them in.
+    #[test]
+    fn reasoning_precedes_the_text_it_was_split_from() {
+        let response = with_reasoning(chat_done(Some("the answer"), None), "weighing it");
+        let translated = translate_response(response).expect("response translates");
+        let parts: Vec<_> = translated.choice.iter().collect();
+
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [AssistantContent::Reasoning(r), AssistantContent::Text(t)]
+                    if r.display_text() == "weighing it" && t.text == "the answer"
+            ),
+            "got: {parts:?}",
+        );
     }
 
     #[test]
@@ -1016,6 +1104,51 @@ mod tests {
         assert_eq!(call.arguments, serde_json::json!({ "a": 1 }));
     }
 
+    /// The delta that closes a `</think>` block carries the last of the
+    /// reasoning and the first of the reply, and they stream in that order.
+    #[test]
+    fn streaming_reasoning_delta_translates_ahead_of_text() {
+        let items = translate_stream_response(with_reasoning(
+            stream_chunk(Some("so: "), None, None, None),
+            "done.",
+        ))
+        .expect("straddling chunk translates");
+
+        assert!(
+            matches!(
+                &items[1..],
+                [
+                    RawStreamingChoice::ReasoningDelta { id: None, reasoning },
+                    RawStreamingChoice::Message(text),
+                ] if reasoning == "done." && text == "so: "
+            ),
+            "got: {items:?}",
+        );
+    }
+
+    /// A `Done` with no chunk before it is translated whole, into the items a
+    /// chunk with the same content would have produced -- reasoning included,
+    /// which this arm used to discard outright.
+    #[test]
+    fn streaming_done_without_chunks_carries_reasoning() {
+        let mut state = MistralrsStreamState::default();
+        let items = state
+            .translate(with_reasoning(chat_done(None, None), "weighing the options"))
+            .expect("done translates");
+
+        assert!(
+            matches!(
+                items.as_slice(),
+                [
+                    RawStreamingChoice::MessageId(_),
+                    RawStreamingChoice::ReasoningDelta { reasoning, .. },
+                    RawStreamingChoice::FinalResponse(_),
+                ] if reasoning == "weighing the options"
+            ),
+            "got: {items:?}",
+        );
+    }
+
     #[test]
     fn streaming_done_after_final_chunk_does_not_duplicate_text() {
         let mut state = MistralrsStreamState::default();
@@ -1075,6 +1208,115 @@ mod tests {
         assert!(
             matches!(err, CompletionError::ProviderError(ref msg) if msg.contains("boom")),
             "got: {err:?}",
+        );
+    }
+
+    /// An engine that answers every request with the same script, read back
+    /// through the [`response_stream`] a real engine's channel feeds.
+    ///
+    /// The script is a function because `Response` is not `Clone` and
+    /// `stream` only borrows the engine.
+    #[derive(Clone)]
+    struct ScriptedEngine(fn() -> Vec<Response>);
+
+    impl CompletionModel for ScriptedEngine {
+        type Response = MistralrsRawResponse;
+        type StreamingResponse = MistralrsStreamResponse;
+        type Client = ();
+
+        fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+            Self(Vec::new)
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
+            Err(CompletionError::ProviderError(
+                "the scripted engine only streams".into(),
+            ))
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> std::result::Result<
+            StreamingCompletionResponse<Self::StreamingResponse>,
+            CompletionError,
+        > {
+            let script = (self.0)();
+            let (tx, rx) = mpsc::channel(script.len().max(1));
+            for response in script {
+                assert!(
+                    tx.try_send(response).is_ok(),
+                    "the channel is sized to hold the whole script",
+                );
+            }
+            Ok(response_stream(rx))
+        }
+    }
+
+    /// The local counterpart of `anthropic_mock.rs`'s
+    /// `a_reasoning_only_turn_is_recovered_and_reported`, from the engine's
+    /// response channel to the report the REPL prints.
+    ///
+    /// A reasoning model cut off at `max-tokens` inside its `<think>` block
+    /// streams reasoning deltas and then a `length` finish, and nothing else.
+    /// With the reasoning dropped in translation, that turn was reported as
+    /// having produced no content at all -- to the user, and through
+    /// `silent_reason` to a subagent's parent -- pointing away from the
+    /// ceiling that actually cut it off.
+    #[tokio::test]
+    async fn a_reasoning_only_local_turn_is_recovered_and_reported() {
+        let engine = ScriptedEngine(|| {
+            vec![
+                with_reasoning(stream_chunk(None, None, None, None), "weighing "),
+                with_reasoning(
+                    stream_chunk(None, None, Some("length"), Some(usage())),
+                    "the options",
+                ),
+            ]
+        });
+        let agent = rig::agent::AgentBuilder::new(engine).build();
+        let mut history = Vec::new();
+        let mut stdout = Vec::new();
+
+        let end = crate::llm::run_turn_streaming_to(
+            &agent,
+            "choose",
+            &mut history,
+            crate::llm::OutrigPromptHook::new(50),
+            &mut stdout,
+        )
+        .await
+        .expect("a reasoning-only turn ends the turn, it does not fail the session");
+
+        assert!(
+            stdout.is_empty(),
+            "reasoning is not the reply, so none of it is streamed: {:?}",
+            String::from_utf8_lossy(&stdout),
+        );
+        assert!(end.is_silent(), "no text and no stop reason: {end:?}");
+        assert_eq!(
+            end.recovered.as_deref(),
+            Some("weighing the options"),
+            "the streamed deltas are salvaged, as one block",
+        );
+        let report = end.silent_report();
+        assert!(
+            report.contains("hidden reasoning") && report.contains("Recovered reasoning follows"),
+            "the report names which silence this was and carries the reasoning: {report}",
+        );
+
+        let Some(Message::Assistant { content, .. }) = history.last() else {
+            panic!("the completed turn is retained in history: {history:#?}");
+        };
+        assert!(
+            content.iter().any(|part| matches!(
+                part,
+                AssistantContent::Reasoning(r) if r.display_text() == "weighing the options"
+            )),
+            "with its reasoning: {content:?}",
         );
     }
 }

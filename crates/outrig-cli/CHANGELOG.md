@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the session's history, so every later prompt reached the model with no earlier context, and
   nothing said so. The conversation as it stood before the interrupted prompt now survives, as
   the docs always promised; a turn interrupted before it finished is still not added to it.
+- **A local model's reasoning-only turn is reported as reasoning.** With `local-llm`, a model
+  whose chat template marks out its reasoning, as a `<think>` block does, lost that reasoning on
+  the way in. A turn that produced nothing else, such as one cut off at `max-tokens` mid-thought,
+  was reported to the user and to a subagent's parent as having produced no content at all. It
+  is now reported as hidden reasoning, most likely cut off at the output-token ceiling, with the
+  reasoning printed after it on stderr. Reasoning is still not streamed, so stdout carries only
+  the reply.
+- **An Anthropic model is sent back only the reasoning it issued.** An alias chain keeps one
+  history across its candidates, so a turn another candidate answered stays in it. Reasoning in
+  such a turn, like an OpenAI-style endpoint's `reasoning_content`, reached the Anthropic API as a
+  `thinking` block with no signature, which it refuses. After one move, a chain headed by an
+  Anthropic model failed at its head on every later call and stayed on its fallback. Reasoning
+  Anthropic did not issue, a local model's included, is now left out of what it is sent; text,
+  tool calls, and Anthropic's own thinking are sent as before.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

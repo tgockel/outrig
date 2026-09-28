@@ -311,6 +311,11 @@ This matters most on CPU, where a long local reply can take minutes if you wait 
 completion. Tool-call traces and prompts remain on stderr, so `outrig run > reply.txt` still
 captures only assistant text.
 
+A reasoning model's reasoning -- the `<think>` block `mistralrs` separates from the reply when
+the GGUF's chat template uses one -- is not streamed. A turn that produces nothing but
+reasoning, usually because it hit `max-tokens` before finishing the thought, is reported on
+stderr along with the reasoning it produced.
+
 ## Model lifecycle
 
 Loading a GGUF is expensive (seconds, sometimes tens of seconds, sometimes gigabytes of

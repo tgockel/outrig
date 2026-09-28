@@ -27,6 +27,14 @@ A separate Anthropic case does exist and is *not* what this entry is about: a ge
 `end_turn` body, which rig normalizes to an empty-text sentinel that `is_empty_assistant_turn` then
 keeps out of history. There is no reasoning to preserve there, so it wants its own answer.
 
+The in-process `mistralrs` arm (`local-llm`) sits between the two. Since #179 its adapter carries
+a local model's reasoning into history, but `translate_assistant`
+(`crates/outrig-cli/src/llm/mistralrs.rs`) replays a reasoning-only message as an assistant
+message with empty content: roles stay alternating, and the model is shown an empty turn where its
+reasoning was. Whatever this entry decides for a reasoning-only turn on the OpenAI arm wants
+deciding for that arm too. Reasoning *beside* text or a tool call is a separate gap there, one the
+OpenAI arm does not share: `plan/next/mistralrs-replay-drops-reasoning.md`.
+
 So outrig's `Vec<Message>` and the conversation the provider is shown diverge on the OpenAI arm,
 and nothing downstream can tell.
 

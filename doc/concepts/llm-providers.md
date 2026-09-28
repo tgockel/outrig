@@ -182,6 +182,11 @@ from the first four, and those stay done.
 The cost is that one reply can be half one model's work. That is why a move prints, and why the
 banner lists the fallbacks a session may reach before it starts.
 
+The history travels with the chain, with one exception: an Anthropic candidate is sent only the
+reasoning Anthropic issued itself. It refuses anyone else's -- a local model's, or an OpenAI-style
+endpoint's `reasoning_content` -- so the turns another candidate answered reach it as their text
+and tool calls alone.
+
 ## `[agents.<name>]`
 
 An agent ties a model to a system preamble and (optionally) a default image. Agents are

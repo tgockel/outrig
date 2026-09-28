@@ -976,11 +976,7 @@ pub enum RigAgent {
         tool_call_max: usize,
     },
     Anthropic {
-        agent: rig::agent::Agent<
-            retry::RetryingModel<
-                rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
-            >,
-        >,
+        agent: rig::agent::Agent<retry::RetryingModel<AnthropicModel>>,
         tool_call_max: usize,
     },
     #[cfg(feature = "local-llm")]
@@ -1462,10 +1458,7 @@ fn anthropic_client(
 fn anthropic_model(
     client: &rig::providers::anthropic::Client<retry::RetryingHttpClient>,
     candidate: &ResolvedCandidate,
-) -> (
-    rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
-    Option<u32>,
-) {
+) -> (AnthropicModel, Option<u32>) {
     use rig::client::CompletionClient;
 
     // `completion_model`, never `CompletionModel::with_model`: the two
@@ -1507,7 +1500,106 @@ fn anthropic_model(
         (None, Some(ceiling)) => Some(u32::try_from(ceiling).unwrap_or(u32::MAX)),
         (None, None) => None,
     };
-    (model, max_tokens)
+    (AnthropicModel(model), max_tokens)
+}
+
+type RigAnthropicModel =
+    rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>;
+
+/// rig's Anthropic model, sent only the reasoning Anthropic itself issued.
+///
+/// rig turns every reasoning block in the history into a native `thinking`
+/// block, and Anthropic takes back only the thinking it issued: a `thinking`
+/// block with the signature it came with, or a `redacted_thinking` block.
+/// Anything else fails the whole request. A conversation can carry another
+/// provider's reasoning, though. An alias chain shares one history across its
+/// candidates, so a turn that a local or OpenAI-style fallback answered is
+/// still there when the next call starts back at an Anthropic head -- which
+/// would then fail every call, long after its own outage ended.
+///
+/// So the history is filtered here, at the one boundary every Anthropic request
+/// crosses, whether it comes from a lone model or a chain candidate. Text, tool
+/// calls, and Anthropic's own thinking pass through untouched. An assistant
+/// message left with nothing is dropped, since Anthropic refuses an empty one.
+/// outrig's own history keeps everything; only what is sent is filtered.
+#[derive(Clone)]
+pub struct AnthropicModel(RigAnthropicModel);
+
+impl CompletionModel for AnthropicModel {
+    type Response = <RigAnthropicModel as CompletionModel>::Response;
+    type StreamingResponse = <RigAnthropicModel as CompletionModel>::StreamingResponse;
+    type Client = <RigAnthropicModel as CompletionModel>::Client;
+
+    /// Never reached by outrig, which builds the model in [`anthropic_model`],
+    /// but rig's trait requires it.
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self(RigAnthropicModel::make(client, model))
+    }
+
+    async fn completion(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::completion::CompletionResponse<Self::Response>,
+        rig::completion::CompletionError,
+    > {
+        request.chat_history = only_anthropic_reasoning(request.chat_history)?;
+        self.0.completion(request).await
+    }
+
+    async fn stream(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig::completion::CompletionError,
+    > {
+        request.chat_history = only_anthropic_reasoning(request.chat_history)?;
+        self.0.stream(request).await
+    }
+
+    /// Delegated for the reason [`retry::RetryingModel`] delegates it: the
+    /// trait's `false` would cost Anthropic guaranteed structured output on
+    /// every turn that has tools.
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.0.composes_native_output_with_tools()
+    }
+}
+
+/// `history` without the reasoning Anthropic did not issue. See
+/// [`AnthropicModel`].
+fn only_anthropic_reasoning(
+    history: rig::OneOrMany<Message>,
+) -> std::result::Result<rig::OneOrMany<Message>, rig::completion::CompletionError> {
+    use rig::completion::message::{AssistantContent, ReasoningContent};
+
+    let kept = history.into_iter().filter_map(|message| match message {
+        Message::Assistant { id, content } => {
+            let content = content.into_iter().filter_map(|part| match part {
+                AssistantContent::Reasoning(mut reasoning) => {
+                    reasoning.content.retain(|block| {
+                        matches!(
+                            block,
+                            ReasoningContent::Text {
+                                signature: Some(_),
+                                ..
+                            } | ReasoningContent::Redacted { .. }
+                        )
+                    });
+                    (!reasoning.content.is_empty())
+                        .then_some(AssistantContent::Reasoning(reasoning))
+                }
+                other => Some(other),
+            });
+            rig::OneOrMany::many(content)
+                .ok()
+                .map(|content| Message::Assistant { id, content })
+        }
+        other => Some(other),
+    });
+    // Never empty in practice: only assistant messages are dropped, and a
+    // request always ends in its prompt.
+    rig::OneOrMany::many(kept).map_err(|e| rig::completion::CompletionError::RequestError(e.into()))
 }
 
 /// One candidate's in-process model, from the registry that keys them by
