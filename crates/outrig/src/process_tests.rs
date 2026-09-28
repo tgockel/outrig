@@ -240,6 +240,29 @@ fn try_capture_logged_traces_spawn_and_exit_at_debug() {
     );
 }
 
+/// A child started in its own group leads it, and so is out of reach of the
+/// `SIGINT` a terminal sends outrig's; one started without stays in outrig's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_child_can_be_started_in_a_process_group_of_its_own() {
+    use nix::unistd::{Pid, getpgid, getpgrp};
+    let pid_of = |child: &tokio::process::Child| {
+        Pid::from_raw(i32::try_from(child.id().expect("running")).expect("a pid"))
+    };
+    let alongside = super::spawn_stdio(Cmd::new("/bin/cat"))
+        .await
+        .expect("spawn");
+    assert_eq!(
+        getpgid(Some(pid_of(&alongside))),
+        Ok(getpgrp()),
+        "stays in outrig's group"
+    );
+    let apart = super::spawn_stdio(Cmd::new("/bin/cat").in_own_process_group())
+        .await
+        .expect("spawn");
+    let pid = pid_of(&apart);
+    assert_eq!(getpgid(Some(pid)), Ok(pid), "leads its own group");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_stdio_stdin_stdout_usable() {
     let mut child = super::spawn_stdio(Cmd::new("/bin/cat"))
@@ -489,7 +512,7 @@ fn has_stopped(pid: u32) -> bool {
     !occupies_a_process_slot(pid) || is_zombie(pid)
 }
 
-fn is_zombie(pid: u32) -> bool {
+pub(crate) fn is_zombie(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };

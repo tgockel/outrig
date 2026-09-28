@@ -18,6 +18,7 @@ use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use super::{AgentError, PythonAgent};
 use crate::config::Config;
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
+use crate::python::recovery::{GaveUp, Verdict, Waited};
 use crate::python::testing::{ok, start_on_host, within};
 
 const KEY: &str = "sk-ant-mock-key";
@@ -643,7 +644,7 @@ const WIDE: usize = 1 << 20;
 
 /// [`render`]'s text, where every late result it was given has room.
 fn all_shown(late: Vec<Late>, outcome: &Outcome, max: usize) -> String {
-    let (text, unreported) = render(late, outcome, max);
+    let (text, unreported) = render(late, outcome, Waited::default(), max);
     assert!(
         unreported.is_empty(),
         "{} left unreported",
@@ -818,7 +819,7 @@ fn late_statuses_past_the_ceiling_are_counted_and_handed_back() {
             outcome: raised("", &format!("ValueError: {}", n.to_string().repeat(400))),
         })
         .collect();
-    let (text, unreported) = render(late, &ok("now\n"), 1024);
+    let (text, unreported) = render(late, &ok("now\n"), Waited::default(), 1024);
     assert!(text.len() <= 1024, "{} bytes", text.len());
     assert_eq!(unreported.len(), 1, "{text}");
     assert_eq!(unreported[0].id, exec_id(3));
@@ -835,7 +836,7 @@ fn late_statuses_past_the_ceiling_are_counted_and_handed_back() {
         "{text}"
     );
 
-    let (next, rest) = render(unreported, &ok("later\n"), 1024);
+    let (next, rest) = render(unreported, &ok("later\n"), Waited::default(), 1024);
     assert!(rest.is_empty());
     assert!(
         next.starts_with("[execution 3, whose call stopped waiting for it, has since finished"),
@@ -1094,6 +1095,313 @@ fn an_alias_runs_against_its_first_reachable_model() {
 }
 
 // ---------------------------------------------------------------------------- through podman
+
+// ---------------------------------------------------------------------------- Ctrl-C
+
+/// What the host did while it waited is said alongside the outcome, each thing
+/// on its own. A runaway interrupt is not pinned on a target: it may have
+/// ended another execution's task, or this code may have caught it, and a
+/// clean run is described as one either way. A user's stop is still said when
+/// the host went on to interrupt a runaway, and an automatic give-up after it
+/// is not reported as the user asking twice.
+#[test]
+fn what_was_done_is_rendered_with_the_outcome_it_led_to() {
+    let render_one = |outcome: &Outcome, waited| render(Vec::new(), outcome, waited, 4096).0;
+    let interrupted = raised("", "KeyboardInterrupt: interrupted by outrig");
+    let user = Waited {
+        user_stopped: true,
+        ..Waited::default()
+    };
+    let runaway = Waited {
+        runaway_interrupted: true,
+        ..Waited::default()
+    };
+    let both = Waited {
+        user_stopped: true,
+        ..runaway
+    };
+
+    let raised_runaway = render_one(&interrupted, runaway);
+    assert!(
+        raised_runaway.starts_with(
+            "[this code raised KeyboardInterrupt: interrupted by outrig: the event loop"
+        ),
+        "{raised_runaway}"
+    );
+    assert!(
+        raised_runaway.contains("asyncio.to_thread"),
+        "{raised_runaway}"
+    );
+
+    let finished = render_one(&ok("fine\n"), runaway);
+    assert!(
+        finished.contains("the call then ran to completion"),
+        "{finished}"
+    );
+    assert!(!finished.contains("not this code"), "{finished}");
+    assert!(finished.ends_with("fine\n"), "{finished}");
+
+    for outcome in [&interrupted, &ok("fine\n")] {
+        let text = render_one(outcome, both);
+        assert!(
+            text.starts_with("[the user interrupted this call, and the event loop"),
+            "{text}"
+        );
+        assert!(text.contains("does not stop the processes"), "{text}");
+    }
+    assert!(
+        render_one(&ok("fine\n"), user).starts_with("[the user interrupted this call, but it ran")
+    );
+
+    let id = exec_id(7);
+    let unresolved = Outcome::Unknown(Unknown::Unresolved { id });
+    let exhausted = render_one(
+        &unresolved,
+        Waited {
+            gave_up: Some(GaveUp::Runaway),
+            ..both
+        },
+    );
+    assert!(
+        exhausted.contains("kept spinning through 3 interrupts"),
+        "{exhausted}"
+    );
+    assert!(!exhausted.contains("twice"), "{exhausted}");
+    let twice = render_one(
+        &unresolved,
+        Waited {
+            gave_up: Some(GaveUp::User),
+            ..user
+        },
+    );
+    assert!(twice.contains("the user interrupted it twice"), "{twice}");
+
+    for (verdict, says) in [
+        (Verdict::Spinning, "has interrupted it"),
+        (Verdict::Blocked, "blocked in a call"),
+        (Verdict::Turning, "suspended on an await"),
+        (Verdict::Starved, "native code"),
+    ] {
+        let refused = render_one(
+            &Outcome::Refused { holder: id },
+            Waited {
+                holder: Some(verdict),
+                ..Waited::default()
+            },
+        );
+        assert!(
+            refused.starts_with("Not run: execution 7 still holds"),
+            "{refused}"
+        );
+        assert!(refused.contains(says), "{verdict:?}: {refused}");
+    }
+}
+
+/// A file the code under test creates once it is running, so a press lands
+/// in its body rather than before it starts.
+struct Running(tempfile::TempDir);
+
+impl Running {
+    fn new() -> Self {
+        Self(tempfile::tempdir().expect("tempdir"))
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.path().join("running")
+    }
+
+    /// `source`, run once the file exists.
+    fn then(&self, source: &str) -> String {
+        format!("open({:?}, 'w').close()\n{source}", self.path())
+    }
+}
+
+/// Run `prompt` as a round, pressing Ctrl-C `presses` times once `running`
+/// exists, and return the round's reply with what each press said.
+async fn round_pressed(
+    agent: &mut PythonAgent,
+    prompt: &str,
+    running: &Running,
+    presses: usize,
+) -> (String, Vec<Option<String>>) {
+    let interrupt = agent.interrupter();
+    let pressing = async {
+        while !running.path().exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (0..presses).map(|_| interrupt()).collect()
+    };
+    tokio::join!(round(agent, prompt), within(pressing))
+}
+
+/// A bare `await` on something that never resolves is what a user is most
+/// likely to need Ctrl-C for, and what no probe can see. The press cancels it,
+/// the model reads how it ended and carries on, and the slot is free for the
+/// next round's code.
+#[tokio::test]
+async fn ctrl_c_ends_an_await_that_never_resolves_and_the_model_reads_it() {
+    let running = Running::new();
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_CTRL_C_AWAIT",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_wait",
+                &running.then("await asyncio.get_running_loop().create_future()"),
+            ),
+            text_reply("stopped it"),
+            submit("toolu_next", "1 + 1"),
+            text_reply("two"),
+        ],
+    )
+    .await;
+
+    let (reply, said) = round_pressed(&mut agent, "wait forever", &running, 1).await;
+    assert_eq!(reply, "stopped it");
+    let said = said[0].as_deref().expect("a call was waiting");
+    assert!(said.starts_with("stopping execution"), "{said}");
+
+    assert_eq!(round(&mut agent, "then add").await, "two");
+    let recorded = mock_http::drain(&mut requests);
+    let stopped = tool_result(&recorded[1], "toolu_wait");
+    assert!(
+        stopped.starts_with("[the user interrupted this call, and this code raised"),
+        "{stopped}"
+    );
+    assert!(stopped.contains("CancelledError"), "{stopped}");
+    assert!(!stopped.contains("before it started"), "{stopped}");
+    assert!(stopped.contains("does not stop the processes"), "{stopped}");
+    assert_eq!(tool_result(&recorded[3], "toolu_next"), "2\n");
+}
+
+/// With no Python running there is nothing for Ctrl-C to reach here; the
+/// caller stops a round there by dropping it.
+#[tokio::test]
+async fn ctrl_c_with_no_python_running_does_nothing() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_CTRL_C_IDLE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![submit("toolu_x", "x = 1"), text_reply("bound")],
+    )
+    .await;
+    let interrupt = agent.interrupter();
+    assert_eq!(interrupt(), None);
+    assert_eq!(round(&mut agent, "bind").await, "bound");
+    assert_eq!(interrupt(), None);
+}
+
+/// Stopping one call in a turn stops the turn: the model wrote the next call
+/// before it knew the first would be stopped, so it does not run until the
+/// model has read that.
+#[tokio::test]
+async fn a_later_call_in_a_stopped_turn_is_not_run() {
+    let running = Running::new();
+    let batch = mock_http::message(
+        json!([
+            { "type": "tool_use", "id": "toolu_wait", "name": tool::NAME,
+              "input": { "source": running.then("await asyncio.get_running_loop().create_future()") } },
+            { "type": "tool_use", "id": "toolu_after", "name": tool::NAME,
+              "input": { "source": "after = True" } },
+        ]),
+        "tool_use",
+    );
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_CTRL_C_BATCH",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            batch,
+            text_reply("read it"),
+            submit("toolu_check", "'after' in globals()"),
+            text_reply("checked"),
+        ],
+    )
+    .await;
+
+    let (reply, _) = round_pressed(&mut agent, "two things", &running, 1).await;
+    assert_eq!(reply, "read it");
+    assert_eq!(round(&mut agent, "did the second run?").await, "checked");
+    let recorded = mock_http::drain(&mut requests);
+    let skipped = tool_result(&recorded[1], "toolu_after");
+    assert!(
+        skipped.contains("not run: the user interrupted"),
+        "{skipped}"
+    );
+    assert_eq!(tool_result(&recorded[3], "toolu_check"), "False\n");
+}
+
+/// A synchronous `subprocess.run` blocks the loop, so the cancel cannot reach
+/// it; the press interrupts the blocking call instead. What the child started
+/// is not stopped with it, and the model is told so.
+#[tokio::test]
+async fn ctrl_c_on_a_blocking_run_says_what_it_leaves_running() {
+    let running = Running::new();
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_CTRL_C_RUN",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_run",
+                &running.then("import subprocess\nsubprocess.run(['sleep', '60'])"),
+            ),
+            text_reply("interrupted"),
+        ],
+    )
+    .await;
+
+    let (reply, _) = round_pressed(&mut agent, "sleep", &running, 1).await;
+    assert_eq!(reply, "interrupted");
+    let recorded = mock_http::drain(&mut requests);
+    let result = tool_result(&recorded[1], "toolu_run");
+    assert!(
+        result.contains("KeyboardInterrupt: interrupted by outrig"),
+        "{result}"
+    );
+    assert!(result.contains("does not stop the processes"), "{result}");
+}
+
+/// Pressed twice, the call stops waiting: the model is told the outcome is
+/// unknown and not to run it again, and the execution keeps the slot.
+#[tokio::test]
+async fn ctrl_c_twice_stops_waiting_and_the_model_is_told() {
+    let running = Running::new();
+    let caught = running.then(
+        "try:\n    await asyncio.get_running_loop().create_future()\n\
+         except asyncio.CancelledError:\n    pass\n\
+         await asyncio.get_running_loop().create_future()",
+    );
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_CTRL_C_TWICE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_stubborn", &caught),
+            text_reply("gave up"),
+            submit("toolu_next", "1"),
+            text_reply("refused"),
+        ],
+    )
+    .await;
+
+    let (reply, said) = round_pressed(&mut agent, "wait", &running, 2).await;
+    assert_eq!(reply, "gave up");
+    let second = said[1].as_deref().expect("a call was still waiting");
+    assert!(
+        second.starts_with("no longer waiting for execution"),
+        "{second}"
+    );
+
+    assert_eq!(round(&mut agent, "try again").await, "refused");
+    let recorded = mock_http::drain(&mut requests);
+    let unknown = tool_result(&recorded[1], "toolu_stubborn");
+    assert!(unknown.contains("interrupted it twice"), "{unknown}");
+    assert!(unknown.contains("Do not run it again"), "{unknown}");
+    let refused = tool_result(&recorded[3], "toolu_next");
+    assert!(refused.starts_with("Not run: execution"), "{refused}");
+}
 
 #[cfg(feature = "e2e")]
 mod e2e {

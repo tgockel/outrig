@@ -168,7 +168,9 @@ handler on `MainThread`, and the `KeyboardInterrupt` surfaces there.
 So the recovery path in `runtime-protection.md` reaches one agent, and the decision follows from
 that: **the primary agent runs on the main thread.** The agent with a person in front of it keeps
 the interrupt path exactly as the prototype proved it. Subagents, which run unattended inside their
-parent's work, do not.
+parent's work, do not. The port aims the signal at the main thread itself with `pthread_kill`
+rather than raising it from the reader thread, so a primary blocked in a system call wakes to take
+it too.
 
 A wedged subagent is therefore contained but unrecoverable. Its siblings keep running, because
 CPython drops the GIL every switch interval:

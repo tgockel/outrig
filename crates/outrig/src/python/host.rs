@@ -22,13 +22,26 @@
 //! afterwards becomes a [`Late`] record rather than rewriting what the caller
 //! was told.
 //!
+//! # Stopping an execution
+//!
+//! Two requests reach a running execution, each the remedy for one failure.
+//! [`Interpreter::cancel`] cancels its task through the agent's loop, which
+//! ends one suspended on an await. [`Interpreter::interrupt`] raises SIGINT
+//! on the interpreter's side without going through that loop, which ends one
+//! that has stopped yielding. Neither is a completion: the execution keeps its
+//! slot until its reply arrives, whatever its code does with the request.
+//! Choosing between them is `recovery`'s, from [`Interpreter::inventory`],
+//! answered on the loop, and [`Interpreter::cpu`], answered beside it.
+//!
 //! # What owns what
 //!
 //! The [`Child`] here is the host-side `podman exec` client, not the
 //! interpreter, which runs under conmon and outlives its client (see
 //! [`Container::exec_stdio`]). Dropping every handle closes the interpreter's
 //! stdin, which is what makes it exit on the ordinary path; otherwise it ends
-//! when the container stops.
+//! when the container stops. The client runs in a process group of its own:
+//! it exits on the SIGINT a terminal's Ctrl-C sends its group, and the
+//! interpreter would see its stdin close with it.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write as _};
@@ -140,10 +153,6 @@ pub(crate) enum Unknown {
     Exited { id: ExecId, cause: Arc<str> },
     /// The caller stopped waiting. The execution may still be running and
     /// holds the slot until its reply arrives, as a [`Late`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "0003-06 gives up waiting through `stop_waiting`")
-    )]
     Unresolved { id: ExecId },
 }
 
@@ -206,7 +215,8 @@ struct Table {
     last_id: u64,
     /// The agent's outstanding execution, answered or not. One at a time.
     slot: Option<Slot>,
-    inventories: HashMap<ExecId, oneshot::Sender<Inventory>>,
+    /// Requests other than executions, by id, until answered.
+    queries: HashMap<ExecId, Query>,
     late: Vec<Late>,
     /// Why nothing more can be sent, once that is so.
     ended: Option<Arc<str>>,
@@ -215,6 +225,12 @@ struct Table {
 struct Slot {
     id: ExecId,
     waiter: oneshot::Sender<Outcome>,
+}
+
+/// Who is waiting for a request's answer.
+enum Query {
+    Inventory(oneshot::Sender<Inventory>),
+    Cpu(oneshot::Sender<Option<f64>>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -237,6 +253,10 @@ enum Reply {
     Inv {
         id: ExecId,
         globals: Vec<(String, String)>,
+    },
+    Cpu {
+        id: ExecId,
+        seconds: Option<f64>,
     },
     #[serde(other)]
     Other,
@@ -273,7 +293,9 @@ impl Interpreter {
             .chain([PRIMARY])
             .map(String::from)
             .collect();
-        let child = container.exec_stdio(&argv, &ExecOptions::new()).await?;
+        let child = container
+            .exec_stdio_in_own_group(&argv, &ExecOptions::new())
+            .await?;
         Self::from_child(child).await
     }
 
@@ -367,23 +389,88 @@ impl Interpreter {
     }
 
     /// List what the agent's namespace holds. Answered on the agent's event
-    /// loop, so it waits for as long as that loop is not turning.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "0003-06's liveness probe is the first caller")
-    )]
+    /// loop, so it waits for as long as that loop is not turning -- which is
+    /// what makes it the liveness probe.
     pub(crate) async fn inventory(&self) -> Result<Inventory, InterpreterError> {
+        self.query("inv", Query::Inventory).await
+    }
+
+    /// The CPU time, in seconds, the thread running the agent's loop has used;
+    /// `None` when the interpreter could not read its clock.
+    ///
+    /// Answered beside the loop rather than on it, so it answers while the
+    /// loop is not turning. Two readings tell a loop spinning in Python from
+    /// one blocked in a system call -- a healthy `subprocess.run`, say. No
+    /// answer at all means nothing in the interpreter can run: native code is
+    /// holding the GIL.
+    pub(crate) async fn cpu(&self) -> Result<Option<f64>, InterpreterError> {
+        self.query("cpu", Query::Cpu).await
+    }
+
+    /// Send a request of `kind` and wait for its answer, which `waiting`
+    /// says how to deliver.
+    async fn query<T>(
+        &self,
+        kind: &str,
+        waiting: fn(oneshot::Sender<T>) -> Query,
+    ) -> Result<T, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
         {
             let mut table = lock(&self.table);
             table.open()?;
             let id = table.next_id();
-            self.send(json!({"t": "inv", "agent": PRIMARY, "id": id}))?;
-            table.inventories.insert(id, waiter);
+            self.send(json!({"t": kind, "agent": PRIMARY, "id": id}))?;
+            table.queries.insert(id, waiting(waiter));
         }
         receiver
             .await
             .map_err(|_| InterpreterError::Gone(lock(&self.table).cause()))
+    }
+
+    /// Ask the interpreter to cancel execution `id`'s task, which raises
+    /// `CancelledError` at the await it is suspended on. Sent only while `id`
+    /// holds the slot.
+    ///
+    /// Delivered through the agent's loop, so it does nothing for an execution
+    /// that has stopped yielding until it yields again. The execution may
+    /// catch the cancellation, so this frees nothing: its reply does.
+    pub(crate) fn cancel(&self, id: ExecId) {
+        self.stop(id, json!({"t": "cancel", "agent": PRIMARY, "id": id}));
+    }
+
+    /// Ask the interpreter to raise `KeyboardInterrupt` in execution `id`,
+    /// which ends one that has stopped yielding or is blocked in a call such
+    /// as `waitpid`. Sent only while `id` holds the slot.
+    ///
+    /// It lands only in agent code: in `id`'s own, or, with `runaway`, in
+    /// whatever agent code is keeping the loop from turning -- a task another
+    /// execution left running, say. It does nothing to an execution suspended
+    /// on an await, whose remedy is [`Interpreter::cancel`].
+    pub(crate) fn interrupt(&self, id: ExecId, runaway: bool) {
+        self.stop(
+            id,
+            json!({"t": "interrupt", "agent": PRIMARY, "id": id, "runaway": runaway}),
+        );
+    }
+
+    /// Send `message` if `id` still holds the slot. One that no longer does has
+    /// replied, and there is nothing left to stop.
+    fn stop(&self, id: ExecId, message: Value) {
+        let table = lock(&self.table);
+        if table.open().is_ok() && table.slot.as_ref().is_some_and(|slot| slot.id == id) {
+            let _ = self.send(message);
+        }
+    }
+
+    /// The execution holding the slot with nobody waiting for its outcome:
+    /// one recorded [`Unknown::Unresolved`], or whose [`Execution`] was
+    /// dropped.
+    pub(crate) fn abandoned(&self) -> Option<ExecId> {
+        lock(&self.table)
+            .slot
+            .as_ref()
+            .filter(|slot| slot.waiter.is_closed())
+            .map(|slot| slot.id)
     }
 
     /// Results that arrived after their callers stopped waiting, oldest first.
@@ -432,10 +519,6 @@ impl Execution {
     /// Stop waiting, recording the execution unresolved: it keeps its slot,
     /// and its reply, should one come, arrives as a [`Late`]. An outcome that
     /// had already arrived is returned instead.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "0003-06 gives up on a wedged execution with it")
-    )]
     pub(crate) fn stop_waiting(mut self) -> Outcome {
         if let Some(outcome) = self.settled.take() {
             return outcome;
@@ -612,8 +695,8 @@ where
             .waiter
             .send(Outcome::Unknown(Unknown::Exited { id: slot.id, cause }));
     }
-    // Dropping the waiters fails each inventory with the cause just recorded.
-    table.inventories.clear();
+    // Dropping the waiters fails each query with the cause just recorded.
+    table.queries.clear();
 }
 
 fn dispatch(table: &Mutex<Table>, line: &[u8]) {
@@ -630,11 +713,17 @@ fn dispatch(table: &Mutex<Table>, line: &[u8]) {
     }
     match reply {
         Reply::Result(result) => lock(table).settle(result),
-        Reply::Inv { id, globals } => match lock(table).inventories.remove(&id) {
-            Some(waiter) => {
+        Reply::Inv { id, globals } => match lock(table).queries.remove(&id) {
+            Some(Query::Inventory(waiter)) => {
                 let _ = waiter.send(Inventory { globals });
             }
-            None => tracing::warn!("ignored inventory {id}, which nothing asked for"),
+            _ => tracing::warn!("ignored inventory {id}, which nothing asked for"),
+        },
+        Reply::Cpu { id, seconds } => match lock(table).queries.remove(&id) {
+            Some(Query::Cpu(waiter)) => {
+                let _ = waiter.send(seconds);
+            }
+            _ => tracing::warn!("ignored CPU reading {id}, which nothing asked for"),
         },
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
         Reply::Other => tracing::debug!(

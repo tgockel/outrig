@@ -2,9 +2,11 @@
 //! Python in it, and a scripted Anthropic endpoint standing in for the model.
 //!
 //! One session is driven the way a person drives it -- a line, the reply, a
-//! Ctrl-C at the prompt, another line -- and everything is asserted from
-//! outside: what reached the model, what the terminal showed, and what the
-//! session left on disk.
+//! Ctrl-C at the prompt, a line whose Python never finishes and a Ctrl-C to
+//! stop it, another line -- and everything is asserted from outside: what
+//! reached the model, what the terminal showed, and what the session left on
+//! disk. Each Ctrl-C is sent to outrig's whole process group, as a terminal
+//! sends it, so it reaches every child outrig did not move out of the way.
 
 #![cfg(feature = "e2e")]
 
@@ -136,16 +138,33 @@ fn podman_names(filter: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Send SIGINT to the process group `leader` leads, as a terminal's Ctrl-C
+/// does.
+fn ctrl_c(leader: &str) {
+    let kill = std::process::Command::new("kill")
+        .args(["-INT", "--", &format!("-{leader}")])
+        .status()
+        .expect("kill -INT");
+    assert!(kill.success());
+}
+
 /// The phase's premise, through the binary: a name bound in one round is still
-/// bound in the next. Between the two, a Ctrl-C at the prompt returns to the
-/// prompt. The primary MCP server holding a secret is not started -- asserted on
+/// bound in the rounds after. Between them, a Ctrl-C at the prompt returns to
+/// the prompt, and a Ctrl-C during an `await` that would never finish stops
+/// it, the model reads how it ended, and the interpreter is still there.
+/// The primary MCP server holding a secret is not started -- asserted on
 /// startup, since starting it would have failed the launch -- and the session
 /// is recorded under the container it really ran in.
 #[tokio::test]
-async fn names_survive_rounds_and_ctrl_c_returns_to_the_prompt() {
+async fn names_survive_rounds_and_ctrl_c_stops_python_not_the_session() {
     let (addr, mut requests) = start_mock_http(vec![
         submit("toolu_1", "import os\nx = 41\nprint(os.getcwd())"),
         text_reply("bound x"),
+        submit(
+            "toolu_wait",
+            "open('running', 'w').close()\nawait asyncio.get_running_loop().create_future()",
+        ),
+        text_reply("stopped the wait"),
         submit("toolu_2", "print(x + 1)"),
         text_reply("x + 1 is 42"),
     ])
@@ -169,6 +188,8 @@ async fn names_survive_rounds_and_ctrl_c_returns_to_the_prompt() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
+        // A group of its own, led by outrig, as a shell's foreground job is.
+        .process_group(0)
         .spawn()
         .expect("spawn outrig");
     let pid = child.id().expect("a pid").to_string();
@@ -186,14 +207,23 @@ async fn names_survive_rounds_and_ctrl_c_returns_to_the_prompt() {
     read_until(&mut stdout, "bound x").await;
 
     // At the prompt now. One Ctrl-C there is a fresh line, not an exit.
-    let kill = std::process::Command::new("kill")
-        .args(["-INT", &pid])
-        .status()
-        .expect("kill -INT");
-    assert!(kill.success());
+    ctrl_c(&pid);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    stdin.write_all(b"use x\n").await.expect("second line");
+    // A wait that will never finish, stopped once it is running.
+    stdin.write_all(b"wait\n").await.expect("second line");
+    let running = repo.path().join("running");
+    timeout(TEST_TIMEOUT, async {
+        while !running.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the wait is running");
+    ctrl_c(&pid);
+    read_until(&mut stdout, "stopped the wait").await;
+
+    stdin.write_all(b"use x\n").await.expect("third line");
     read_until(&mut stdout, "x + 1 is 42").await;
     drop(stdin);
 
@@ -221,15 +251,26 @@ async fn names_survive_rounds_and_ctrl_c_returns_to_the_prompt() {
         "{stderr}"
     );
 
+    assert!(
+        stderr.contains("[outrig] stopping execution"),
+        "the Ctrl-C reached the Python: {stderr}"
+    );
+
     let recorded = drain_recorded(&mut requests);
-    assert_eq!(recorded.len(), 4, "two model calls per round");
+    assert_eq!(recorded.len(), 6, "two model calls per round");
     assert_eq!(
         tool_result(&recorded[1], "toolu_1"),
         "/workspace\n",
         "the Python ran against the workspace"
     );
+    let stopped = tool_result(&recorded[3], "toolu_wait");
+    assert!(
+        stopped.starts_with("[the user interrupted this call")
+            && stopped.contains("CancelledError"),
+        "{stopped}"
+    );
     assert_eq!(
-        tool_result(&recorded[3], "toolu_2"),
+        tool_result(&recorded[5], "toolu_2"),
         "42\n",
         "the name the first round bound is still bound"
     );

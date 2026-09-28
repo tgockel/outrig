@@ -290,10 +290,19 @@ version. The session is recorded like any other, so `outrig ls`, `discard`, and 
 its record is written once the interpreter is up, under the name of the container it runs in.
 
 The REPL is `run`'s, with only `/help` and `/quit`. A failed round is reported and the session
-carries on. Ctrl-C during a round stops waiting for it and returns to the prompt; Python that
-was already running keeps running, and its result reaches the model with a later call. What the
-interrupted round had already run stays in the conversation. At the prompt, one Ctrl-C starts a
-fresh line and a second exits.
+carries on.
+
+Ctrl-C while the agent's Python runs stops that Python, and the round carries on: the code is
+cancelled, or interrupted if it has stopped yielding, and the model reads how it ended. Stopping
+Python does not stop the processes it started. A second Ctrl-C on the same code stops waiting for
+it instead; it keeps the interpreter until it finishes, later submissions are refused until then,
+and its result reaches the model with a later call. Ctrl-C while no Python runs -- the model is
+being called -- ends the round and returns to the prompt, and what the round had already run
+stays in the conversation. At the prompt, one Ctrl-C starts a fresh line and a second exits.
+
+Python that keeps its event loop from turning while a CPU stays busy, such as `while True: pass`,
+is interrupted after about half a minute without anyone pressing anything, and the model reads
+the traceback. Code waiting on a subprocess, a sleep, or a read is left to finish.
 
 `run-new` does not yet take `run`'s `--env`, `--network`, `--volume`, `--max-tool-calls`, or
 `--max-tool-result-bytes`. The config keys behind the last two, `tool-call-max` and

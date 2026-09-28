@@ -4,6 +4,9 @@
 //! `interpreter.py` is that program: one process per session, hosting one
 //! kernel per agent and answering over NDJSON by agent id. `host` starts it
 //! in a session's container, submits executions, and correlates the replies.
+//! `recovery` waits for an execution's outcome, and cancels or interrupts one
+//! that will not end on its own -- because the user asked, or because it is
+//! spinning.
 //!
 //! Crate-private throughout. `outrig-cli` reaches none of it directly: the
 //! agent loop in `crate::agent` drives it, and `PythonAgent` is how the binary
@@ -11,6 +14,7 @@
 
 pub(crate) mod host;
 pub(crate) mod payload;
+pub(crate) mod recovery;
 
 #[cfg(test)]
 pub(crate) mod testing;

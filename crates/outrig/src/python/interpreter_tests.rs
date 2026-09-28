@@ -1119,3 +1119,505 @@ fn closing_stdin_ends_the_interpreter_even_mid_execution() {
     k.stdin.take();
     assert!(k.exit_status().success());
 }
+
+// ---------------------------------------------------------------------------- interrupts
+
+impl Interpreter {
+    /// Submit `source` to the primary without waiting for its result.
+    fn submit(&mut self, id: u64, source: &str) {
+        self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}));
+    }
+
+    fn cancel(&mut self, id: u64) {
+        self.send(json!({"t": "cancel", "agent": PRIMARY, "id": id}));
+    }
+
+    fn interrupt(&mut self, id: u64, runaway: bool) {
+        self.send(json!({"t": "interrupt", "agent": PRIMARY, "id": id, "runaway": runaway}));
+    }
+
+    /// The CPU time the primary's loop thread has used. Answered on the
+    /// reader thread, so it answers while the loop is not turning.
+    fn cpu(&mut self, id: u64) -> f64 {
+        self.send(json!({"t": "cpu", "agent": PRIMARY, "id": id}));
+        let reply = self.recv();
+        assert!(reply["t"] == "cpu" && reply["id"] == id, "got: {reply}");
+        reply["seconds"].as_f64().expect("seconds")
+    }
+
+    /// The next message, which must be execution `id`'s result.
+    fn result_of(&mut self, id: u64) -> Value {
+        let result = self.recv();
+        assert!(
+            result["t"] == "result" && result["id"] == id,
+            "expected the result of {id}, got: {result}"
+        );
+        result
+    }
+
+    /// An inventory round trip. Answered on the loop, so it proves the loop
+    /// turns and that nothing it had queued before -- a result included --
+    /// is still to come.
+    fn loop_turns(&mut self, id: u64) {
+        self.inventory(id);
+    }
+
+    /// stderr up to a line execution `id` writes. The main thread writes both
+    /// that line and any "escaped its event loop" diagnostic, so whatever the
+    /// main thread wrote before running `id` is in what this returns.
+    fn stderr_through(&mut self, id: u64) -> String {
+        let marker = format!("THROUGH {id}");
+        self.output(id, &format!("import os\nos.write(2, b'{marker}\\n')\nNone"));
+        self.await_stderr(&marker);
+        self.stderr()
+    }
+
+    fn ticks(&self) -> usize {
+        self.stderr().matches("tick\n").count()
+    }
+
+    /// Wait until the spinning body has ticked twice more, so any signal
+    /// already sent has been handled: the handler runs at the next bytecode
+    /// boundary, and ticking is past several.
+    fn still_spinning(&self) {
+        let seen = self.ticks();
+        eventually(
+            || (self.ticks() >= seen + 2).then_some(()),
+            || format!("two more ticks after {seen}; stderr: {}", self.stderr()),
+        );
+    }
+}
+
+/// A body that never yields. It says so once, then ticks on stderr now and
+/// then, so a test can tell it is still spinning.
+fn spinning(label: &str) -> String {
+    py(&format!(
+        r#"
+        import os
+        os.write(2, b'{label}\n')
+        i = 0
+        while True:
+            i += 1
+            if i % 200000 == 0:
+                os.write(2, b'tick\n')
+        "#
+    ))
+}
+
+/// The interpreter's own marker on a `KeyboardInterrupt` it raised.
+const INTERRUPTED: &str = "KeyboardInterrupt: interrupted by outrig";
+
+fn error_of(result: &Value) -> String {
+    assert_eq!(result["status"], "error", "{result}");
+    text(&result["error"])
+}
+
+#[test]
+fn a_wedge_is_interrupted_and_the_interpreter_carries_on() {
+    let mut k = Interpreter::start();
+    // The prototype's evidence was 5 of 5; this is ten in a row, one process.
+    for round in 0..10 {
+        let id = 1 + 2 * round;
+        let label = format!("SPINNING {round}");
+        k.submit(id, &spinning(&label));
+        k.await_stderr(&label);
+        k.interrupt(id, false);
+        let error = error_of(&k.result_of(id));
+        assert!(error.contains(INTERRUPTED), "{error}");
+        assert!(error.contains("File \"<execution>\""), "{error}");
+        assert!(
+            !error.contains("_on_sigint"),
+            "the handler's frame: {error}"
+        );
+        assert_eq!(k.output(id + 1, "1 + 1"), "2\n");
+    }
+}
+
+#[test]
+fn a_sigint_nobody_armed_changes_nothing() {
+    let mut k = Interpreter::start();
+    k.output(1, "kept = 41");
+    let pid = Pid::from_raw(i32::try_from(k.child.id()).expect("a pid"));
+
+    // Idle: a raw signal, and requests naming an execution that holds nothing.
+    nix::sys::signal::kill(pid, Signal::SIGINT).expect("signal it");
+    k.interrupt(1, false);
+    k.interrupt(1, true);
+    k.cancel(1);
+    k.interrupt(7, true);
+    k.cancel(7);
+    k.loop_turns(2);
+    assert_eq!(k.output(3, "kept + 1"), "42\n");
+
+    // Spinning: agent code sending itself SIGINT is not an interrupt either.
+    k.submit(4, &spinning("SPINNING"));
+    k.await_stderr("SPINNING");
+    nix::sys::signal::kill(pid, Signal::SIGINT).expect("signal it");
+    k.still_spinning();
+    k.interrupt(4, false);
+    assert!(error_of(&k.result_of(4)).contains(INTERRUPTED));
+
+    let stderr = k.stderr_through(5);
+    assert!(!stderr.contains("escaped its event loop"), "{stderr}");
+    assert_eq!(k.output(6, "kept"), "41\n");
+}
+
+#[test]
+fn an_await_that_never_resolves_is_cancelled() {
+    let mut k = Interpreter::start();
+    k.submit(1, "await asyncio.get_running_loop().create_future()");
+    k.loop_turns(2);
+    k.cancel(1);
+    let error = error_of(&k.result_of(1));
+    assert!(error.contains("CancelledError"), "{error}");
+    assert!(error.contains("File \"<execution>\""), "{error}");
+    assert_eq!(k.output(3, "1 + 1"), "2\n");
+}
+
+/// The wrong remedy for a suspended execution is a signal: the main thread is
+/// in the loop, not in agent code, and a `KeyboardInterrupt` there would land
+/// in the loop's own bookkeeping. The handler declines, and the cancel that
+/// is the right remedy still works.
+#[test]
+fn an_interrupt_leaves_a_suspended_execution_to_its_cancel() {
+    let mut k = Interpreter::start();
+    k.submit(1, "await asyncio.get_running_loop().create_future()");
+    k.loop_turns(2);
+    k.interrupt(1, false);
+    k.interrupt(1, true);
+    // Still holding its slot, and nothing reported: the next message is this.
+    k.loop_turns(3);
+    k.submit(4, "4");
+    let refused = k.result_of(4);
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["holder"], 1);
+
+    k.cancel(1);
+    assert!(error_of(&k.result_of(1)).contains("CancelledError"));
+    let stderr = k.stderr_through(5);
+    assert!(!stderr.contains("escaped its event loop"), "{stderr}");
+}
+
+#[test]
+fn a_late_cancel_or_interrupt_does_not_reach_the_next_execution() {
+    let mut k = Interpreter::start();
+    assert_eq!(k.output(1, "'first'"), "'first'\n");
+    let (blocking, awaiting) = (Flag::new(), Flag::new());
+    let source = format!(
+        "import os\nos.write(2, b'BLOCKING\\n')\n{}\n{}\n'second'",
+        blocking.blocked(),
+        awaiting.awaited()
+    );
+    k.submit(2, &source);
+
+    // 2 in synchronous agent code, where an interrupt for it would land.
+    k.await_stderr("BLOCKING");
+    k.interrupt(1, false);
+    k.interrupt(1, true);
+    k.cancel(1);
+    blocking.raise();
+
+    // 2 suspended, where a cancel for it would land.
+    k.loop_turns(3);
+    k.cancel(1);
+    k.interrupt(1, false);
+    k.loop_turns(4);
+    awaiting.raise();
+    assert_eq!(text(&k.result_of(2)["output"]), "'second'\n");
+}
+
+/// A coroutine cancelled before its first step never enters its own `try`, so
+/// a cancel delivered then would leave an execution that never reports.
+#[test]
+fn a_cancel_before_the_first_step_is_reported_rather_than_lost() {
+    let mut k = Interpreter::start();
+    let hold = Flag::new();
+    let source = format!(
+        "async def hold():\n    import os\n    os.write(2, b'HOLDING\\n')\n{}\nheld = asyncio.create_task(hold())",
+        indent(&hold.blocked())
+    );
+    k.output(1, &source);
+    k.await_stderr("HOLDING");
+
+    // Admitted, and queued behind the task holding the loop; then cancelled.
+    k.submit(2, "import os\nos.write(2, b'RAN\\n')");
+    k.cancel(2);
+    hold.raise();
+
+    let error = error_of(&k.result_of(2));
+    assert!(error.contains("stopped before it started"), "{error}");
+    let stderr = k.stderr_through(3);
+    assert!(!stderr.contains("RAN"), "its body ran: {stderr}");
+}
+
+#[test]
+fn an_execution_that_catches_its_cancel_keeps_the_slot_until_it_replies() {
+    let mut k = Interpreter::start();
+    let flag = Flag::new();
+    let source = format!(
+        "import os\ntry:\n    await asyncio.get_running_loop().create_future()\n\
+         except asyncio.CancelledError:\n    os.write(2, b'CAUGHT\\n')\n{}\n'finished anyway'",
+        flag.awaited()
+    );
+    k.submit(1, &source);
+    k.loop_turns(2);
+    k.cancel(1);
+    k.await_stderr("CAUGHT");
+
+    k.submit(3, "3");
+    let refused = k.result_of(3);
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["holder"], 1);
+
+    flag.raise();
+    assert_eq!(text(&k.result_of(1)["output"]), "'finished anyway'\n");
+    assert_eq!(k.output(4, "4"), "4\n");
+}
+
+/// A task an execution left running wedges the loop after that execution has
+/// reported. The next submission is admitted but cannot start; interrupting
+/// it ends the task that holds the loop, and the submission then runs. The
+/// task's death is billed to the execution that started it, once.
+#[test]
+fn a_background_wedge_is_interrupted_for_the_submission_it_blocks() {
+    let mut k = Interpreter::start();
+    let source = format!(
+        "async def spin():\n    await asyncio.sleep(0)\n{}\nspinner = asyncio.create_task(spin())",
+        indent(&spinning("SPINNING"))
+    );
+    k.output(1, &source);
+    k.await_stderr("SPINNING");
+
+    k.submit(2, "'next'");
+    k.interrupt(2, false);
+    let result = k.result_of(2);
+    assert_eq!(text(&result["output"]), "'next'\n", "{result}");
+    let billed = background_text(&result, 1);
+    assert!(billed.contains("outrig interrupted a task"), "{result}");
+    assert!(billed.contains(INTERRUPTED), "{result}");
+    assert!(billed.contains("in spin"), "{result}");
+
+    // Not retrieved here: that is the interpreter's to have done, or asyncio
+    // reports the same death again when the task is collected.
+    assert_eq!(k.output(3, "spinner.done()"), "True\n");
+    let collected = k.exec(4, "del spinner\nimport gc\ngc.collect()\nNone");
+    assert_eq!(
+        collected["background"],
+        json!([]),
+        "reported twice: {collected}"
+    );
+}
+
+/// The same wedge while another execution is suspended. An interrupt scoped to
+/// that execution does not touch the task, which is not its code; one the host
+/// has judged a runaway does. The suspended execution keeps waiting through
+/// both, and its own cancel still ends it.
+#[test]
+fn a_background_wedge_beside_a_suspended_execution() {
+    let mut k = Interpreter::start();
+    let source = format!(
+        "go = asyncio.Event()\nasync def spin():\n    await go.wait()\n{}\n\
+         spinner = asyncio.create_task(spin())",
+        indent(&spinning("SPINNING"))
+    );
+    k.output(1, &source);
+    k.submit(
+        2,
+        "go.set()\nawait asyncio.get_running_loop().create_future()",
+    );
+    k.await_stderr("SPINNING");
+
+    k.interrupt(2, false);
+    k.still_spinning();
+
+    k.interrupt(2, true);
+    k.loop_turns(3);
+    k.cancel(2);
+    let result = k.result_of(2);
+    assert!(error_of(&result).contains("CancelledError"), "{result}");
+    let billed = background_text(&result, 1);
+    assert!(billed.contains(INTERRUPTED), "not billed to 1: {result}");
+    assert_eq!(background_text(&result, 2), "", "{result}");
+}
+
+#[test]
+fn the_cpu_clock_tells_a_spinning_loop_from_a_blocked_one() {
+    let mut k = Interpreter::start();
+    let flag = Flag::new();
+    // A rate needs a window of wall time; the bounds are loose on purpose.
+    let window = Duration::from_millis(500);
+    let share = |k: &mut Interpreter, first: u64| {
+        let before = k.cpu(first);
+        let started = Instant::now();
+        std::thread::sleep(window);
+        let used = k.cpu(first + 1) - before;
+        used / started.elapsed().as_secs_f64()
+    };
+
+    let blocked = format!(
+        "import os, subprocess\nos.write(2, b'WAITING\\n')\n\
+         subprocess.run(['sh', '-c', 'while [ ! -e {path} ]; do sleep 0.01; done'])\n'done'",
+        path = flag.path.display()
+    );
+    k.submit(1, &blocked);
+    k.await_stderr("WAITING");
+    let idle = share(&mut k, 100);
+    assert!(idle < 0.05, "blocked in waitpid, yet {idle:.3} of a CPU");
+    flag.raise();
+    assert_eq!(text(&k.result_of(1)["output"]), "'done'\n");
+
+    k.submit(2, &spinning("SPINNING"));
+    k.await_stderr("SPINNING");
+    let busy = share(&mut k, 200);
+    assert!(busy > 0.2, "spinning, yet {busy:.3} of a CPU");
+    k.interrupt(2, true);
+    assert!(error_of(&k.result_of(2)).contains(INTERRUPTED));
+}
+
+/// A synchronous `subprocess.run` blocks the main thread in `waitpid`. The
+/// signal is aimed at that thread, so it breaks the wait; `run` then kills
+/// the child it started. What that child started is another matter.
+#[test]
+fn an_interrupt_ends_a_blocking_run_but_not_what_it_started() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pidfile = dir.path().join("grandchild");
+    let source = format!(
+        "import subprocess\nsubprocess.run(['sh', '-c', 'sleep 60 & echo $! > {path}; wait'])",
+        path = pidfile.display()
+    );
+    k.submit(1, &source);
+    let grandchild: u32 = eventually(
+        || std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok(),
+        || "the grandchild's pid".into(),
+    );
+
+    k.interrupt(1, false);
+    let error = error_of(&k.result_of(1));
+    assert!(error.contains(INTERRUPTED), "{error}");
+    let alive = Path::new(&format!("/proc/{grandchild}")).exists()
+        && !crate::process::process_tests::is_zombie(grandchild);
+    assert!(alive, "the grandchild {grandchild} is gone");
+    assert_eq!(k.output(2, "2"), "2\n");
+}
+
+/// Agent code that pumps the loop by hand puts the loop's own machinery nearer
+/// the signal than its own frames. The interrupt declines there, where an
+/// exception could lose a callback -- a `_start`, and with it a slot.
+#[test]
+fn an_interrupt_declines_inside_a_loop_agent_code_pumps_by_hand() {
+    let mut k = Interpreter::start();
+    let source = "import os\nloop = asyncio.get_running_loop()\nos.write(2, b'PUMPING\\n')\n\
+                  loop._run_once()\n'pumped'";
+    k.submit(1, source);
+    k.await_stderr("PUMPING");
+    // The main thread is the process's leader, so its wait channel is the
+    // process's: blocked in the pumped loop's `select`.
+    let wchan = format!("/proc/{}/wchan", k.child.id());
+    eventually(
+        || {
+            std::fs::read_to_string(&wchan)
+                .ok()
+                .filter(|at| at.contains("poll"))
+        },
+        || format!("the main thread to block in the pumped select ({wchan})"),
+    );
+    k.interrupt(1, true);
+    // The inventory is what the pumped loop runs next; had the interrupt
+    // landed, the result would have come first, as an error.
+    k.loop_turns(2);
+    assert_eq!(text(&k.result_of(1)["output"]), "'pumped'\n");
+}
+
+/// A coroutine an imported module defines has no frame compiled from a
+/// submission, so the walk out from a spin in it reaches the loop's own
+/// dispatch first. Scheduled as a task -- with `create_task` or `gather` -- it
+/// is still agent code, and the interrupt still lands; awaited directly it was
+/// always found through the awaiting submission.
+#[test]
+fn an_interrupt_reaches_a_spin_in_imported_code() {
+    let mut k = Interpreter::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("spinmod.py"),
+        py(r#"
+            import os
+            async def spin(label):
+                os.write(2, label.encode() + b'\n')
+                while True:
+                    pass
+            "#),
+    )
+    .expect("write the module");
+    k.output(
+        1,
+        &format!(
+            "import sys\nsys.path.insert(0, {:?})\nimport spinmod\n\
+             spinner = asyncio.create_task(spinmod.spin('TASK'))",
+            dir.path().display().to_string()
+        ),
+    );
+    k.await_stderr("TASK");
+    k.submit(2, "'next'");
+    k.interrupt(2, false);
+    let result = k.result_of(2);
+    assert_eq!(text(&result["output"]), "'next'\n", "{result}");
+    assert!(
+        background_text(&result, 1).contains(INTERRUPTED),
+        "{result}"
+    );
+
+    for (id, how) in [
+        (3, "await asyncio.gather(spinmod.spin('GATHER'))"),
+        (4, "await spinmod.spin('DIRECT')"),
+    ] {
+        let label = how.split('\'').nth(1).expect("a label");
+        k.submit(id, how);
+        k.await_stderr(label);
+        k.interrupt(id, false);
+        let error = error_of(&k.result_of(id));
+        assert!(error.contains(INTERRUPTED), "{how}: {error}");
+    }
+    assert_eq!(k.output(5, "5"), "5\n");
+}
+
+/// `traceback` reads an exception's `__notes__` guarding against `Exception`
+/// alone, so anything else raised there would otherwise leave the wrapper and
+/// end the execution without a reply.
+#[test]
+fn a_failure_that_cannot_be_formatted_is_still_reported() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        class Loud(Exception):
+            @property
+            def __notes__(self):
+                raise SystemExit('not now')
+        raise Loud()
+        "#);
+    let error = error_of(&k.exec(1, &source));
+    assert!(
+        error.contains("Loud: its traceback could not be formatted"),
+        "{error}"
+    );
+    assert_eq!(k.output(2, "2"), "2\n");
+}
+
+#[test]
+fn only_the_primary_can_be_interrupted() {
+    let mut k = Interpreter::start();
+    k.open("helper");
+    k.send(json!({"t": "interrupt", "agent": "helper", "id": 1}));
+    k.await_stderr("agent 'helper' cannot be interrupted: it is not on the main thread");
+    k.send(json!({"t": "cpu", "agent": "helper", "id": 2}));
+    let reply = k.recv();
+    assert!(reply["t"] == "cpu" && reply["seconds"].is_f64(), "{reply}");
+}
+
+/// `source` indented one level, to sit in a function body.
+fn indent(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}

@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-06` | A runaway execution is survivable, and the user can end one        |
 | `0003-07` | An agent's memory has a ceiling that reports rather than kills     |
 
 **How the agent is addressed, and what it can see**

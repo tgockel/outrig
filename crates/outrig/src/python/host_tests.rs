@@ -13,19 +13,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
-use tokio::io::{
-    AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
-};
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 
 use super::host::{
-    Background, ExecId, Interpreter, InterpreterError, Late, Outcome, PRIMARY, Report, Unknown,
+    Background, Interpreter, InterpreterError, Late, Outcome, PRIMARY, Report, Unknown,
 };
 use super::payload::PAYLOAD;
-use super::testing::{ok, spawn, start_on_host, within};
-
-/// What the fake transport says about itself once it closes.
-const HUNG_UP: &str = "the fake hung up";
+use super::testing::{Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, within};
 
 /// The message of the startup error `started` must be.
 fn startup_error(started: Result<Interpreter, InterpreterError>) -> String {
@@ -161,95 +156,6 @@ async fn an_interpreter_that_cannot_start_says_why() {
 }
 
 // ---------------------------------------------------------------------------- a fake transport
-
-/// The interpreter's end of a transport, scripted by the test.
-struct Fake {
-    requests: Lines<BufReader<ReadHalf<DuplexStream>>>,
-    replies: WriteHalf<DuplexStream>,
-}
-
-type HostEnd = (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>);
-
-impl Fake {
-    fn pair() -> (Self, HostEnd) {
-        let (host, fake) = tokio::io::duplex(1 << 16);
-        let (requests, replies) = tokio::io::split(fake);
-        let fake = Self {
-            requests: BufReader::new(requests).lines(),
-            replies,
-        };
-        (fake, tokio::io::split(host))
-    }
-
-    /// A handle connected to a fake that has greeted.
-    async fn connected() -> (Interpreter, Self) {
-        let (mut fake, host) = Self::pair();
-        fake.send(json!({"t": "ready", "agent": PRIMARY, "version": "3.13"}))
-            .await;
-        let interpreter = within(connect(host))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        (interpreter, fake)
-    }
-
-    async fn send(&mut self, message: Value) {
-        self.replies
-            .write_all(format!("{message}\n").as_bytes())
-            .await
-            .expect("the host reads it");
-    }
-
-    async fn next(&mut self) -> Value {
-        let line = within(self.requests.next_line())
-            .await
-            .expect("the host's requests")
-            .expect("a request");
-        serde_json::from_str(&line).expect("a request is JSON")
-    }
-
-    /// Read the next request, which must be execution `id`'s.
-    async fn exec(&mut self, id: ExecId) {
-        let request = self.next().await;
-        assert!(
-            request["t"] == "exec" && request["id"] == json!(id),
-            "expected execution {id}, got {request}"
-        );
-    }
-
-    async fn result(&mut self, id: ExecId, fields: Value) {
-        let mut result = json!({
-            "t": "result", "agent": PRIMARY, "id": id,
-            "output": "", "dropped": 0, "error": null, "background": [],
-        });
-        for (key, value) in fields.as_object().expect("an object") {
-            result[key] = value.clone();
-        }
-        self.send(result).await;
-    }
-
-    async fn ok(&mut self, id: ExecId, output: &str) {
-        self.result(id, json!({"status": "ok", "output": output}))
-            .await;
-    }
-}
-
-async fn connect((replies, requests): HostEnd) -> Result<Interpreter, InterpreterError> {
-    Interpreter::connect(replies, requests, async { HUNG_UP.to_string() }).await
-}
-
-/// An inventory, answered by the fake. The next request the fake sees must be
-/// it, and once the host has its reply it has read every line before it.
-async fn round_trip(interpreter: &Interpreter, fake: &mut Fake) {
-    let answer = async {
-        let request = fake.next().await;
-        assert_eq!(request["t"], "inv", "expected the inventory, got {request}");
-        let id = request["id"].clone();
-        fake.send(json!({"t": "inv", "agent": PRIMARY, "id": id, "globals": []}))
-            .await;
-    };
-    let (inventory, ()) = tokio::join!(within(interpreter.inventory()), answer);
-    inventory.expect("an inventory");
-}
 
 /// The acceptance case for `unknown`: an unanswered execution keeps its slot
 /// and its id, and the reply, when it comes, is its own.

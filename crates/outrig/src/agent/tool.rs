@@ -7,8 +7,13 @@
 //! host cannot vouch for says so in words that forbid running it again, since
 //! nothing is ever rolled back. Only a submission that could not be made at all
 //! is a tool error.
+//!
+//! The wait is `recovery`'s, so a call that the user interrupts, or whose
+//! code the host finds spinning, still ends with the execution's own outcome
+//! -- and says what was done to it.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::tool::{ToolDyn, ToolError};
@@ -17,6 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::python::host::{Interpreter, Late, Outcome, Report, Unknown};
+use crate::python::recovery::{self, ATTEMPTS, GaveUp, Press, Presses, Timings, Verdict, Waited};
 
 /// What the model calls the tool.
 pub(crate) const NAME: &str = "submit_python";
@@ -48,6 +54,45 @@ pub(crate) type SubmitObserver = Box<dyn Fn(&str) + Send + Sync>;
 /// rather than the observer being passed in.
 pub(crate) type ObserverSlot = Arc<Mutex<Option<SubmitObserver>>>;
 
+/// Where the user's interrupt goes: the execution a call is waiting on, and
+/// the turn that call belongs to. Shared by the tool, the round's hook, and
+/// whoever relays the interrupts, which does so while the round runs.
+#[derive(Clone, Default)]
+pub(crate) struct Interrupts {
+    presses: Presses,
+    /// Set once the user has stopped a call. The turn's later calls are then
+    /// not run, so nothing the model wrote after the stopped call runs before
+    /// it has read how that call ended.
+    turn_stopped: Arc<AtomicBool>,
+}
+
+impl Interrupts {
+    /// Relay an interrupt to the execution a call is waiting on, returning
+    /// what that does as a sentence for the user; `None` if no call is
+    /// waiting.
+    pub(crate) fn press(&self) -> Option<String> {
+        Some(match self.presses.press()? {
+            Press::Stop(id) => format!(
+                "stopping execution {id} -- the model will see how it ended (interrupt again to \
+                 stop waiting for it)"
+            ),
+            Press::GiveUp(id) => format!(
+                "no longer waiting for execution {id}: it keeps the interpreter until it finishes"
+            ),
+        })
+    }
+
+    /// Whether the user has stopped a call in the current turn.
+    pub(crate) fn turn_stopped(&self) -> bool {
+        self.turn_stopped.load(Ordering::SeqCst)
+    }
+
+    /// A new turn starts with nothing stopped.
+    pub(crate) fn clear_turn(&self) {
+        self.turn_stopped.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The tool, holding the interpreter it submits to and the byte ceiling on
 /// what it hands back.
 pub(crate) struct SubmitPython {
@@ -58,6 +103,7 @@ pub(crate) struct SubmitPython {
     /// and lead the next result rather than being lost.
     unreported: Mutex<Vec<Late>>,
     on_submit: ObserverSlot,
+    interrupts: Interrupts,
 }
 
 impl SubmitPython {
@@ -67,12 +113,18 @@ impl SubmitPython {
             result_max_bytes,
             unreported: Mutex::new(Vec::new()),
             on_submit: ObserverSlot::default(),
+            interrupts: Interrupts::default(),
         }
     }
 
     /// The slot this tool reads its observer from.
     pub(crate) fn observer_slot(&self) -> ObserverSlot {
         Arc::clone(&self.on_submit)
+    }
+
+    /// Where presses reach this tool's calls.
+    pub(crate) fn interrupts(&self) -> Interrupts {
+        self.interrupts.clone()
     }
 
     /// As if an earlier result had had no room for `late`.
@@ -98,7 +150,10 @@ impl ToolDyn for SubmitPython {
          rather than as a tool failure, so read it and carry on. Nothing is rolled back: \
          whatever ran before an error happened. The ordinary standard library is here -- \
          pathlib, open(), subprocess, asyncio, json -- operating on the container. Output is \
-         bounded, so print summaries rather than raw data."
+         bounded, so print summaries rather than raw data. Code that keeps the event loop from \
+         turning while it keeps a CPU busy is taken for a runaway after about half a minute \
+         and interrupted, so run long computations with `await asyncio.to_thread(...)`; \
+         waiting on a subprocess or a sleep is not."
             .to_string()
     }
 
@@ -121,14 +176,17 @@ impl ToolDyn for SubmitPython {
             let Args { source } = parse_args(&args)?;
             // Nothing was sent, so this one is a failure of the tool rather than
             // an outcome of the code.
-            let mut execution = self
+            let execution = self
                 .interpreter
                 .submit(&source)
                 .map_err(|e| ToolError::ToolCallError(e.into()))?;
             tracing::debug!(execution = %execution.id(), "submitted");
             // Only source that went to run: a refusal is the model's to read,
-            // not something to show as running.
-            if execution.queued()
+            // not something to show as running. Interrupts reach it from
+            // before it is shown, since that is what a person interrupts.
+            let queued = execution.queued();
+            let _waiting = queued.then(|| self.interrupts.presses.waiting_on(execution.id()));
+            if queued
                 && let Some(observer) = &*self
                     .on_submit
                     .lock()
@@ -136,7 +194,18 @@ impl ToolDyn for SubmitPython {
             {
                 observer(&source);
             }
-            let outcome = execution.outcome().await;
+            let settled = recovery::settle(
+                &self.interpreter,
+                execution,
+                &self.interrupts.presses,
+                &Timings::default(),
+            )
+            .await;
+            // From what was done rather than from the press, which may have
+            // lost the race to the outcome and done nothing.
+            if settled.waited.user_stopped {
+                self.interrupts.turn_stopped.store(true, Ordering::SeqCst);
+            }
             // Taken after the outcome, so anything that arrived while this ran
             // is reported now rather than a call later -- after whatever an
             // earlier result had no room for, which is older.
@@ -146,7 +215,12 @@ impl ToolDyn for SubmitPython {
                 .unwrap_or_else(PoisonError::into_inner);
             let mut late = std::mem::take(&mut *unreported);
             late.extend(self.interpreter.take_late());
-            let (text, rest) = render(late, &outcome, self.result_max_bytes);
+            let (text, rest) = render(
+                late,
+                &settled.outcome,
+                settled.waited,
+                self.result_max_bytes,
+            );
             *unreported = rest;
             Ok(text)
         })
@@ -160,8 +234,9 @@ const EXCEPTION_LINE_MAX: usize = 300;
 /// a later call.
 const UNREPORTED_NOTICE_MAX: usize = 96;
 
-/// What the model reads for `outcome`, and for any results that arrived with
-/// nobody waiting for them, in at most `max` bytes.
+/// What the model reads for `outcome`, with what the host did to it while it
+/// waited, and for any results that arrived with nobody waiting for them, in
+/// at most `max` bytes.
 ///
 /// It comes in two parts. The status says how each execution ended -- raised,
 /// refused, unknown and not to be re-run -- and is kept whole. The detail is
@@ -176,8 +251,13 @@ const UNREPORTED_NOTICE_MAX: usize = 96;
 /// order, while they fit; those that do not are counted in the status and
 /// handed back, for the caller to report next time. At the smallest ceiling
 /// config allows there is room for the current status and at least one.
-pub(crate) fn render(mut late: Vec<Late>, outcome: &Outcome, max: usize) -> (String, Vec<Late>) {
-    let current = render_outcome(outcome);
+pub(crate) fn render(
+    mut late: Vec<Late>,
+    outcome: &Outcome,
+    waited: Waited,
+    max: usize,
+) -> (String, Vec<Late>) {
+    let current = render_outcome(outcome, waited);
     let mut status = String::new();
     if let Some(line) = &current.status {
         status.push_str(line);
@@ -211,7 +291,7 @@ pub(crate) fn render(mut late: Vec<Late>, outcome: &Outcome, max: usize) -> (Str
     }
     detail.push_str(&current.detail);
     for record in &late {
-        let rendered = render_outcome(&record.outcome).detail;
+        let rendered = render_outcome(&record.outcome, Waited::default()).detail;
         if !rendered.is_empty() {
             push_block(
                 &mut detail,
@@ -248,12 +328,59 @@ fn summary(outcome: &Outcome) -> String {
     }
 }
 
-fn render_outcome(outcome: &Outcome) -> Rendered {
+/// What a runaway's status adds, so the model does not write another.
+const RUNAWAY_ADVICE: &str = "Run long computations with `await asyncio.to_thread(...)`, which \
+     keeps the loop turning.";
+
+/// What stopping Python leaves running.
+const ORPHANS: &str = "Stopping Python does not stop the processes or threads it started, which \
+     may still be running.";
+
+/// What the host did while it waited, then how the code ended -- `raised`, or
+/// run to completion -- as one status; `None` when the host did nothing.
+///
+/// A runaway interrupt is described without naming its target. It may have
+/// ended this code, a task another execution left running, or neither, since
+/// code can catch it; the outcome and the output say which.
+fn stopped(waited: Waited, raised: Option<&str>) -> Option<String> {
+    const RUNAWAY: &str = "the event loop stopped answering while a CPU stayed busy, and OutRig \
+         interrupted the code spinning on it";
+    Some(
+        match (waited.user_stopped, waited.runaway_interrupted, raised) {
+            (false, false, _) => return None,
+            (true, false, Some(raised)) => {
+                format!(
+                    "[the user interrupted this call, and this code raised {raised}. {ORPHANS}]"
+                )
+            }
+            (true, false, None) => {
+                "[the user interrupted this call, but it ran to completion]".into()
+            }
+            (false, true, Some(raised)) => {
+                format!("[this code raised {raised}: {RUNAWAY}. {RUNAWAY_ADVICE}]")
+            }
+            (false, true, None) => {
+                format!(
+                    "[during this call {RUNAWAY}; the call then ran to completion. {RUNAWAY_ADVICE}]"
+                )
+            }
+            (true, true, ended) => format!(
+                "[the user interrupted this call, and {RUNAWAY}; {}. {ORPHANS} {RUNAWAY_ADVICE}]",
+                match ended {
+                    Some(raised) => format!("this code raised {raised}"),
+                    None => "the call then ran to completion".to_string(),
+                }
+            ),
+        },
+    )
+}
+
+fn render_outcome(outcome: &Outcome, waited: Waited) -> Rendered {
     match outcome {
         Outcome::Ok(report) => {
             let text = render_report(report);
             Rendered {
-                status: None,
+                status: stopped(waited, None),
                 detail: if text.trim().is_empty() {
                     NO_OUTPUT.to_string()
                 } else {
@@ -264,11 +391,36 @@ fn render_outcome(outcome: &Outcome) -> Rendered {
         Outcome::Error { report, traceback } => {
             let mut detail = render_report(report);
             push_block(&mut detail, traceback);
+            let raised = exception_line(traceback);
             Rendered {
-                status: Some(format!("[this code raised {}]", exception_line(traceback))),
+                status: Some(
+                    stopped(waited, Some(raised))
+                        .unwrap_or_else(|| format!("[this code raised {raised}]")),
+                ),
                 detail,
             }
         }
+        Outcome::Refused { holder } if let Some(verdict) = waited.holder => Rendered {
+            status: Some(format!(
+                "Not run: execution {holder} still holds the interpreter, which runs one \
+                 execution at a time, and nothing is waiting for it any more. {} Nothing from \
+                 this call ran.",
+                match verdict {
+                    Verdict::Spinning => format!(
+                        "OutRig found it spinning and has interrupted it; if that ends it, its \
+                         result will be reported with a later call. {RUNAWAY_ADVICE}"
+                    ),
+                    Verdict::Blocked => "It is blocked in a call such as a subprocess wait or \
+                                         a sleep, and frees the interpreter when that returns."
+                        .into(),
+                    Verdict::Turning => "It is suspended on an await that has not resolved.".into(),
+                    Verdict::Starved => "The interpreter is not answering at all: native code \
+                                         is holding it, and nothing can interrupt that."
+                        .into(),
+                }
+            )),
+            detail: String::new(),
+        },
         Outcome::Refused { holder } => Rendered {
             status: Some(format!(
                 "Not run: execution {holder} has not finished, and the interpreter runs one \
@@ -288,9 +440,19 @@ fn render_outcome(outcome: &Outcome) -> Rendered {
         },
         Outcome::Unknown(Unknown::Unresolved { id }) => Rendered {
             status: Some(format!(
-                "The outcome of execution {id} is unknown: the host stopped waiting for it. It \
-                 may still be running, and holds the interpreter until it finishes. Do not run \
-                 it again; its result will be reported with a later call."
+                "The outcome of execution {id} is unknown: {}. It may still be running, and \
+                 holds the interpreter until it finishes, so later calls are refused until \
+                 then. Do not run it again; its result will be reported with a later call.",
+                match waited.gave_up {
+                    Some(GaveUp::User) => {
+                        "the user interrupted it twice, and the host stopped waiting for it".into()
+                    }
+                    Some(GaveUp::Runaway) => format!(
+                        "its event loop kept spinning through {ATTEMPTS} interrupts, and the \
+                         host stopped waiting for it"
+                    ),
+                    None => "the host stopped waiting for it".to_string(),
+                }
             )),
             detail: String::new(),
         },

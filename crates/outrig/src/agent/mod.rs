@@ -28,7 +28,7 @@ use crate::python::host::Interpreter;
 use self::build::RigAgent;
 use self::resolve::{LlmResolveError, ResolvedAgent};
 use self::round::RoundEnd;
-use self::tool::{ObserverSlot, SubmitPython};
+use self::tool::{Interrupts, ObserverSlot, SubmitPython};
 
 /// An agent that acts by writing Python, driven one round at a time.
 ///
@@ -58,6 +58,9 @@ pub struct PythonAgent {
     /// Shared with the tool, which calls what [`PythonAgent::on_submit`] puts
     /// here.
     on_submit: ObserverSlot,
+    /// Shared with the tool and each round's hook; what
+    /// [`PythonAgent::interrupter`] presses.
+    interrupts: Interrupts,
 }
 
 impl PythonAgent {
@@ -129,6 +132,25 @@ impl PythonAgent {
             .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(observer));
     }
 
+    /// A function that stops the Python the current round is waiting on --
+    /// what Ctrl-C does -- callable from another task while
+    /// [`PythonAgent::round`] runs.
+    ///
+    /// The first call cancels that execution, and interrupts it too if its
+    /// event loop has stopped turning; the model then reads how it ended, and
+    /// the round goes on. A second call on the same execution stops waiting
+    /// for it: it keeps the interpreter until it finishes, and its result
+    /// reaches the model later. Each returns what it did, as a sentence for
+    /// the user.
+    ///
+    /// It returns `None` when no Python is running -- the model is being
+    /// called, or no round is -- and does nothing. Dropping the round's future
+    /// is how to stop one there.
+    pub fn interrupter(&self) -> impl Fn() -> Option<String> + Send + Sync + 'static {
+        let interrupts = self.interrupts.clone();
+        move || interrupts.press()
+    }
+
     /// Drive one round: `prompt`, the model and whatever Python it submits, and
     /// the reply.
     ///
@@ -141,12 +163,18 @@ impl PythonAgent {
     /// because what they did stands -- nothing is rolled back -- and the error
     /// says to continue rather than resend.
     ///
-    /// A round whose future is dropped before it returns -- the REPL's Ctrl-C --
-    /// keeps its completed tool calls and their results the same way.
+    /// A round whose future is dropped before it returns keeps its completed
+    /// tool calls and their results the same way. Python it was waiting on
+    /// keeps running, so stopping that is [`PythonAgent::interrupter`]'s.
     pub async fn round(&mut self, prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let RoundEnd { reply, stopped } = self
             .agent
-            .round(prompt, &mut self.history, self.tool_call_max)
+            .round(
+                prompt,
+                &mut self.history,
+                self.tool_call_max,
+                &self.interrupts,
+            )
             .await?;
         Ok(match stopped {
             None => reply,
@@ -177,6 +205,7 @@ impl PythonAgent {
         let python_version = interpreter.version().to_string();
         let tool = SubmitPython::new(interpreter, resolved.tool_result_max_bytes);
         let on_submit = tool.observer_slot();
+        let interrupts = tool.interrupts();
         let preamble = orientation::preamble(workspace, resolved.preamble.as_deref());
         let built = build::build_agent(
             resolved,
@@ -192,6 +221,7 @@ impl PythonAgent {
             python_version,
             container_name: container_name.to_string(),
             on_submit,
+            interrupts,
         })
     }
 }

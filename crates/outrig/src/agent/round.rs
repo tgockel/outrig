@@ -16,7 +16,7 @@ use rig::completion::{CompletionModel, Message, Prompt, PromptError};
 
 use super::AgentError;
 use super::build::RigAgent;
-use super::tool;
+use super::tool::{self, Interrupts};
 
 /// How a round ended.
 pub(crate) struct RoundEnd {
@@ -36,15 +36,20 @@ impl RigAgent {
     /// failure is an error. It leaves `history` as it was when the round had
     /// run no Python; otherwise it keeps the tool calls that completed, since
     /// what they did stands and nothing is rolled back. A round whose future is
-    /// dropped before it returns -- Ctrl-C at the REPL -- keeps them the same
-    /// way, as it is dropped.
+    /// dropped before it returns -- Ctrl-C at the REPL while no Python runs --
+    /// keeps them the same way, as it is dropped.
+    ///
+    /// An interrupt relayed through `interrupts` while a call waits on Python
+    /// stops that execution, and the round goes on: the model reads how it
+    /// ended. The turn's later calls are not run.
     pub(crate) async fn round(
         &self,
         prompt: &str,
         history: &mut Vec<Message>,
         tool_call_max: usize,
+        interrupts: &Interrupts,
     ) -> Result<RoundEnd, AgentError> {
-        let hook = RoundHook::new(tool_call_max);
+        let hook = RoundHook::new(tool_call_max, interrupts.clone());
         match self {
             RigAgent::OpenAi(agent) => run_round(agent, prompt, history, hook).await,
             RigAgent::Anthropic(agent) => run_round(agent, prompt, history, hook).await,
@@ -185,6 +190,10 @@ const CALL_UNFINISHED: &str = "[outrig: this call had not returned when the roun
 /// What a call the round ended before reaching reads as.
 const CALL_NOT_RUN: &str = "[outrig: not run -- the round ended before this call started.]";
 
+/// What a call reads as when the user stopped an earlier one in its turn.
+const CALL_STOPPED_TURN: &str = "[outrig] not run: the user interrupted an earlier call in this \
+     turn. Read how that call ended, then decide whether this one is still wanted.";
+
 /// Per-round hook: counts tool calls against the cap, stops the loop once it is
 /// spent, hands the tool's output to the model as the text it is, and journals
 /// what the round has done that rig has not yet handed back.
@@ -200,6 +209,7 @@ struct RoundHook {
     stopped: Arc<AtomicBool>,
     max: usize,
     journal: Arc<Mutex<Journal>>,
+    interrupts: Interrupts,
 }
 
 /// The round as far as it has got, kept for when it ends without rig handing
@@ -224,12 +234,13 @@ struct Journal {
 }
 
 impl RoundHook {
-    fn new(max: usize) -> Self {
+    fn new(max: usize, interrupts: Interrupts) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(AtomicBool::new(false)),
             max,
             journal: Arc::default(),
+            interrupts,
         }
     }
 
@@ -323,6 +334,7 @@ impl<M: CompletionModel> AgentHook<M> for RoundHook {
             StepEvent::CompletionCall {
                 prompt, history, ..
             } => {
+                self.interrupts.clear_turn();
                 let mut journal = self.journal();
                 journal.sent = history.iter().chain([prompt]).cloned().collect();
                 journal.reply = None;
@@ -339,6 +351,10 @@ impl<M: CompletionModel> AgentHook<M> for RoundHook {
             } => {
                 let mut journal = self.journal();
                 journal.started += 1;
+                // Not counted against the cap: it did not run.
+                if self.interrupts.turn_stopped() {
+                    return Flow::skip(CALL_STOPPED_TURN);
+                }
                 if self.calls.fetch_add(1, Ordering::SeqCst) >= self.max {
                     return Flow::skip(format!(
                         "[outrig] tool call not executed: per-round tool-call max ({}) \

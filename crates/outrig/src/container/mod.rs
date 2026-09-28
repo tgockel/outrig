@@ -999,6 +999,21 @@ impl Container {
         process::spawn_stdio(self.build_exec_argv(cmd, options)).await
     }
 
+    /// [`Self::exec_stdio`], with the `podman exec` client in a process group
+    /// of its own, so a Ctrl-C at the terminal does not reach it.
+    ///
+    /// The client exits on `SIGINT`, and the process it started then sees
+    /// its stdin close. That is fatal for a process meant to outlive the
+    /// interrupt, such as the session's Python interpreter, whose caller
+    /// forwards the user's Ctrl-C deliberately instead.
+    pub(crate) async fn exec_stdio_in_own_group(
+        &self,
+        cmd: &[String],
+        options: &ExecOptions,
+    ) -> Result<Child> {
+        process::spawn_stdio(self.build_exec_argv(cmd, options).in_own_process_group()).await
+    }
+
     /// [`Self::exec_stdio`], driven to completion: stdout and stderr are
     /// drained concurrently and returned with the exit status. A non-zero
     /// exit is reported in [`Output::status`], not as an error -- the command

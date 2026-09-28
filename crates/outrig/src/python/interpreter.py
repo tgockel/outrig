@@ -27,6 +27,11 @@ Four things here are load-bearing rather than incidental:
 - **Output is bounded at the descriptor, not at `print`.** Each execution's pipe is drained on
   its own thread against `OUTPUT_MAX`, and a result never waits for a descendant that still
   holds the pipe open.
+- **An interrupt lands only in agent code.** The host's `interrupt` is handled on the reader
+  thread, because a wedged loop drains no queue, and becomes a SIGINT aimed at the main thread.
+  The handler raises only where the stack shows code a submission wrote, never in the loop's own
+  bookkeeping or halfway through a protocol line. A `cancel` goes the other way, through the
+  loop, and is the remedy for an execution suspended on an await rather than for a wedge.
 """
 
 import ast
@@ -41,9 +46,11 @@ import io
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import types
 
@@ -208,6 +215,11 @@ class _Execution:
         self.kernel = kernel
         self.id = exec_id
         self.task = None
+        # Whether the task has taken its first step. A cancel that arrives before then is held
+        # here instead of delivered: a coroutine cancelled before it starts never enters the
+        # wrapper's `try`, and would never report.
+        self.started = False
+        self.cancel_requested = False
         # The write end's lifetime, so nothing writes to or duplicates a number that has been
         # closed and reused. Held only around descriptor operations, never around agent code.
         self._fd_lock = threading.Lock()
@@ -517,12 +529,31 @@ def _format_error(exc):
 
     The frames above it are this program's, and Python 3.13 quotes source for `-c` code, so
     keeping them would put the interpreter's own lines in front of every error. A compile error
-    has no frame of the submission's at all, and is reported as the exception alone.
+    has no frame of the submission's at all, and is reported as the exception alone. Nor is the
+    SIGINT handler's frame kept, where an interrupt ends the list: the interrupt is the result,
+    and where the handler raised it is not.
+
+    Formatting reads the exception itself, which is agent code. `traceback` guards `__str__`
+    against anything, but its read of `__notes__` only against `Exception`, and a metaclass can
+    answer for the type's own names. Whatever escapes those -- a `SystemExit`, or an interrupt
+    aimed at a property that loops -- is caught here, so a failed execution always has something
+    to report.
     """
-    tb = exc.__traceback__
-    while tb is not None and tb.tb_frame.f_code.co_filename != "<execution>":
-        tb = tb.tb_next
-    return "".join(traceback.format_exception(type(exc), exc, tb))
+    try:
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_frame.f_code.co_filename != "<execution>":
+            tb = tb.tb_next
+        report = traceback.TracebackException(type(exc), exc, tb)
+        handler = _on_sigint.__code__
+        last = report.stack[-1] if report.stack else None
+        if last and (last.filename, last.name) == (handler.co_filename, handler.co_name):
+            report.stack.pop()
+        return "".join(report.format())
+    except BaseException as e:
+        return (
+            f"{_type_name(type(exc))}: its traceback could not be formatted "
+            f"({_type_name(type(e))} while formatting it)\n"
+        )
 
 
 _MISSING = object()
@@ -551,6 +582,14 @@ class Kernel:
         self._slot_lock = threading.Lock()
         self._holder = None
         self.running = None
+        # The thread the loop runs on, for its CPU clock and, for the primary, for aiming a
+        # signal. Set before the thread starts.
+        self.thread = None
+        # `(exec_id, runaway)` while an interrupt is on its way to the handler, which consumes
+        # it: one signal, one attempt. Then what the handler raised, the task it raised in, and
+        # the execution that task belongs to, until whatever catches it has billed it.
+        self._interrupting = None
+        self._landed = None
         self._bg_lock = threading.Lock()
         self._bg = collections.deque()
         self._bg_len = 0
@@ -568,8 +607,35 @@ class Kernel:
             except BaseException as e:
                 # A `SystemExit` or `KeyboardInterrupt` raised in a background task escapes the
                 # loop rather than its task. It has ended that task; it must not end the agent.
-                _diag(f"agent {self.agent!r}: {type(e).__name__} escaped its event loop")
+                if not self._interrupted_task(e):
+                    _diag(f"agent {self.agent!r}: {type(e).__name__} escaped its event loop")
         _diag(f"agent {self.agent!r}: its event loop was closed")
+
+    def _interrupted_task(self, exc):
+        """Report `exc` if it is an interrupt that ended a task rather than an execution's body.
+
+        The task was holding the loop -- which is why the interrupt went where it did -- and it
+        belongs to the execution that started it, so that is who is told, through the same route
+        the task's own output takes. Retrieving the exception keeps asyncio from reporting the
+        same death a second time when the task is collected; letting go of what the handler kept
+        is what allows it to be collected at all.
+        """
+        landed, self._landed = self._landed, None
+        if landed is None or landed[0] is not exc:
+            return False
+        _, task, owner = landed
+        if task is not None:
+            with contextlib.suppress(BaseException):
+                task.exception()
+        text = f"[outrig interrupted a task that was holding the event loop]\n{_format_error(exc)}"
+        if owner is None:
+            _diag(f"agent {self.agent!r}: {text}")
+            return True
+        try:
+            owner.write(text.encode("utf-8", "backslashreplace"))
+        except OSError as e:
+            _diag(f"agent {self.agent!r}: {text} (not billed: {e})")
+        return True
 
     def _reply(self, exec_id, status, **fields):
         result = {"output": "", "dropped": 0, "error": None, "background": [], **fields}
@@ -608,10 +674,12 @@ class Kernel:
             self._release()
             self._reply(exec_id, "error", error=f"the execution could not start: {e!r}")
             return
-        self.running = execution
-        execution.task = self.loop.create_task(
-            self._run(execution, source), name=f"execution-{exec_id}"
+        # A `Task` rather than `create_task`, which would consult a task factory the agent can
+        # set -- an eager one would run the body inside this callback.
+        execution.task = asyncio.Task(
+            self._run(execution, source), loop=self.loop, name=f"execution-{exec_id}"
         )
+        self.running = execution
 
     async def _run(self, execution, source):
         """Run one execution to completion and report explicitly.
@@ -619,18 +687,32 @@ class Kernel:
         Completion is tracked for the whole submission -- never inferred from printed output, and
         never from one particular `await`.
         """
+        execution.started = True
         _CURRENT.set(execution)
         error = None
         try:
+            if execution.cancel_requested:
+                raise asyncio.CancelledError("stopped before it started")
             self.globals["__outrig_echo__"] = _echo
             result = eval(_compile(source), self.globals)  # noqa: S307 -- this is the feature
             if asyncio.iscoroutine(result):
                 await result
+        except asyncio.CancelledError as e:
+            # Named, because it is a `BaseException` that an ordinary handler misses, and it is a
+            # result: the host's remedy for a suspended await, or a cancellation the code let
+            # through. The task carries on to report it.
+            error = self._failure(e)
         except BaseException as e:
-            error = _format_error(e)
-            if len(error) > OUTPUT_MAX:
-                error = error[:OUTPUT_MAX] + f"\n[traceback truncated at {OUTPUT_MAX} bytes]"
+            # Everything else the body raised, `KeyboardInterrupt` included. The handler raises
+            # one only inside agent code, so one arriving here is this execution's -- its body
+            # was interrupted, or it awaited a task that was -- and never one meant to end the
+            # interpreter. Letting any exception out would end the task with no reply, leaving
+            # the host holding a slot this side has freed.
+            error = self._failure(e)
         finally:
+            # Spent either way. What the handler kept would otherwise hold an interrupted
+            # frame -- and whatever a runaway built in it -- until the next interrupt.
+            self._interrupting = self._landed = None
             try:
                 output, dropped = execution.finish()
             except Exception as e:
@@ -646,6 +728,76 @@ class Kernel:
             error=error,
             background=self.take_background(),
         )
+
+    def _failure(self, exc):
+        """A failed execution's report. The interrupt that may have caused it is spent."""
+        self._interrupting = self._landed = None
+        error = _format_error(exc)
+        if len(error) > OUTPUT_MAX:
+            error = error[:OUTPUT_MAX] + f"\n[traceback truncated at {OUTPUT_MAX} bytes]"
+        return error
+
+    def cancel(self, exec_id):
+        """Cancel `exec_id`'s task, if it still holds the slot. Runs on the reader thread.
+
+        Delivered through the loop, since a task is cancelled at its next suspension point -- so
+        this reaches an execution suspended on an await and does nothing for one that has stopped
+        yielding, which is what `interrupt` is for. A request for an execution that has already
+        finished is the ordinary race of a Ctrl-C with a result, and is dropped without comment.
+        """
+        if self._holds(exec_id):
+            self.loop.call_soon_threadsafe(self._cancel, exec_id)
+
+    def _holds(self, exec_id):
+        with self._slot_lock:
+            return self._holder == exec_id
+
+    def _cancel(self, exec_id):
+        execution = self.running
+        if execution is None or execution.id != exec_id:
+            return
+        if not execution.started:
+            execution.cancel_requested = True
+            return
+        execution.task.cancel()
+
+    def interrupt(self, exec_id, runaway):
+        """Aim a SIGINT at the loop's thread for `exec_id`. Runs on the reader thread.
+
+        Handled here rather than through the loop, whose queue is exactly what a wedged loop is
+        not draining. The signal is sent to the main thread itself: `signal.raise_signal` would
+        signal this one, and a main thread blocked in `waitpid` or `sleep` would never wake to
+        run the handler. `runaway` widens where it may land -- see `_on_sigint`.
+        """
+        if self is not _primary:
+            # Python runs signal handlers on the main thread alone, and only the primary is
+            # there. A wedged sub-agent is contained, not recoverable.
+            _diag(f"agent {self.agent!r} cannot be interrupted: it is not on the main thread")
+            return
+        if not self._holds(exec_id):
+            return
+        if signal.getsignal(signal.SIGINT) is not _on_sigint:
+            _diag(
+                f"execution {exec_id!r} cannot be interrupted: SIGINT's handler has been "
+                f"replaced, so only a cancel can reach it"
+            )
+            return
+        self._interrupting, self._landed = (exec_id, runaway), None
+        signal.pthread_kill(self.thread.ident, signal.SIGINT)
+
+    def cpu(self, request_id):
+        """Report the CPU time the loop's thread has used, in seconds. Runs on the reader thread.
+
+        Answered here rather than on the loop, so it answers while the loop is not turning: what
+        tells a loop spinning in Python from one blocked in a system call, such as the wait in a
+        healthy `subprocess.run`. `None` when the clock cannot be read.
+        """
+        try:
+            seconds = time.clock_gettime(time.pthread_getcpuclockid(self.thread.ident))
+        except Exception as e:
+            _diag(f"agent {self.agent!r}: its CPU clock could not be read: {e!r}")
+            seconds = None
+        _send({"t": "cpu", "agent": self.agent, "id": request_id, "seconds": seconds})
 
     def background(self, exec_id, data):
         """Hold `data` for the next result, keeping the most recent `BG_MAX` bytes overall."""
@@ -713,6 +865,96 @@ class Kernel:
         _send({"t": "inv", "agent": self.agent, "id": request_id, "globals": rows})
 
 
+# ---------------------------------------------------------------------------- interrupts
+
+# The kernel on the main thread, the only thread Python runs a signal handler on.
+_primary = None
+
+
+def _on_sigint(signum, frame):
+    """Turn an armed interrupt into a `KeyboardInterrupt` in the agent code holding the loop.
+
+    Runs on the main thread, between two bytecodes or as a blocking call there returns early. It
+    takes no lock and writes nothing, because the main thread may be anywhere, a lock or a write
+    of its own included. It raises only when all three of these hold, and otherwise returns and
+    leaves the main thread exactly where it was:
+
+    - An interrupt is armed and the execution it names still holds the slot. A SIGINT nobody
+      armed -- agent code running `pkill -INT python3` -- changes nothing.
+    - Walking out from where the signal landed, code a submission wrote comes before any of the
+      machinery below -- or the walk reaches the loop's dispatch from inside a task an agent
+      started, which is agent code however it was compiled: a coroutine an imported module
+      defines, scheduled with `create_task` or `gather`. Otherwise the main thread is choosing
+      the next callback, writing a protocol line, or reporting a result, where an exception would
+      lose a callback or tear a line -- or it is idle, and there is nothing to interrupt.
+    - That code is the named execution's, including a task it started; or the execution has not
+      started, so whatever holds the loop is what keeps it from starting; or the host found the
+      loop spinning, which justifies ending whichever agent code is doing it. Without one of
+      these, a user's interrupt for a suspended execution could end a healthy task belonging to
+      another.
+    """
+    kernel = _primary
+    armed, kernel._interrupting = kernel._interrupting, None
+    if armed is None:
+        return
+    exec_id, runaway = armed
+    if kernel._holder != exec_id:
+        return
+    running = kernel.running
+    if (
+        not runaway
+        and running is not None
+        and running.id == exec_id
+        and running.started
+        and _CURRENT.get() is not running
+    ):
+        return
+    while frame is not None:
+        code = frame.f_code
+        if code.co_filename == "<execution>":
+            break
+        if code in _MACHINERY:
+            if code is not _HANDLE_RUN or not _in_agent_task(kernel):
+                return
+            break
+        frame = frame.f_back
+    else:
+        return
+    exc = KeyboardInterrupt("interrupted by outrig")
+    kernel._landed = (exc, asyncio.current_task(kernel.loop), _CURRENT.get())
+    raise exc
+
+
+def _in_agent_task(kernel):
+    """Whether the loop is stepping a task some agent code started.
+
+    The only tasks this program starts are the executions' own wrappers, so any other task is
+    agent code's doing -- including one whose coroutine a module defines rather than a submission.
+    """
+    task = asyncio.current_task(kernel.loop)
+    return task is not None and getattr(task.get_coro(), "cr_code", None) is not _WRAPPER
+
+
+# Machinery that can sit nearer the signal than agent code's frames; see `_on_sigint`. Every
+# callback the loop runs, this program's own included, runs beneath `Handle._run`, so the loop's
+# two dispatch frames cover them all -- including when agent code pumps the loop by hand. What else
+# agent code triggers synchronously and must not be interrupted is the fork hooks. This program's
+# output routing, by contrast, is deliberately absent: a runaway that prints spends most of its
+# time there, and must still be interruptible.
+_MACHINERY = frozenset(
+    fn.__code__
+    for fn in (
+        asyncio.base_events.BaseEventLoop._run_once,
+        asyncio.events.Handle._run,
+        _before_fork,
+        _after_fork_in_parent,
+        _after_fork_in_child,
+    )
+)
+_HANDLE_RUN = asyncio.events.Handle._run.__code__
+_WRAPPER = Kernel._run.__code__
+
+
 # ---------------------------------------------------------------------------- routing
 
 def _open(agent):
@@ -721,14 +963,37 @@ def _open(agent):
     if agent in _kernels:
         raise ValueError(f"agent {agent!r} is already open")
     kernel = Kernel(agent)
+    kernel.thread = threading.Thread(target=kernel.serve, name=f"kernel-{agent}", daemon=True)
     try:
-        threading.Thread(target=kernel.serve, name=f"kernel-{agent}", daemon=True).start()
+        kernel.thread.start()
     except BaseException:
         sys.modules.pop(kernel.module.__name__, None)
         kernel.loop.close()
         raise
     _kernels[agent] = kernel
     kernel.announce()
+
+
+def _exec(kernel, request_id, message):
+    source = message.get("src")
+    if not isinstance(source, str):
+        raise ValueError(f"exec {request_id} for {kernel.agent!r} has no source")
+    kernel.admit(request_id, source)
+
+
+# What each message addressed to an agent does, with the id it carries. `inv` is answered on the
+# agent's loop; the rest are handled here, on the reader thread.
+_ROUTES = {
+    "exec": _exec,
+    "inv": lambda kernel, request_id, _: kernel.loop.call_soon_threadsafe(
+        kernel.inventory, request_id
+    ),
+    "cpu": lambda kernel, request_id, _: kernel.cpu(request_id),
+    "cancel": lambda kernel, request_id, _: kernel.cancel(request_id),
+    "interrupt": lambda kernel, request_id, message: kernel.interrupt(
+        request_id, message.get("runaway") is True
+    ),
+}
 
 
 def _route(line):
@@ -740,7 +1005,8 @@ def _route(line):
     if kind == "open":
         _open(agent)
         return
-    if kind not in ("exec", "inv"):
+    handle = _ROUTES.get(kind) if isinstance(kind, str) else None
+    if handle is None:
         raise ValueError(f"unknown message type {kind!r}")
     kernel = _kernels.get(agent) if isinstance(agent, str) else None
     if kernel is None:
@@ -748,13 +1014,7 @@ def _route(line):
     request_id = message.get("id")
     if type(request_id) is not int:
         raise ValueError(f"{kind} for {agent!r} has no integer id")
-    if kind == "inv":
-        kernel.loop.call_soon_threadsafe(kernel.inventory, request_id)
-        return
-    source = message.get("src")
-    if not isinstance(source, str):
-        raise ValueError(f"exec {request_id} for {agent!r} has no source")
-    kernel.admit(request_id, source)
+    handle(kernel, request_id, message)
 
 
 def _read():
@@ -782,8 +1042,13 @@ def main():
     if len(sys.argv) != 2 or not _valid_agent(sys.argv[1]):
         _diag(f"usage: python3 -I -c <program> <agent-id>; got {sys.argv[1:]!r}")
         os._exit(2)
+    global _primary
     primary = Kernel(sys.argv[1])
+    primary.thread = threading.current_thread()
     _kernels[primary.agent] = primary
+    _primary = primary
+    # Before the reader starts, so no interrupt can arrive with nothing to handle it.
+    signal.signal(signal.SIGINT, _on_sigint)
     primary.announce()
     threading.Thread(target=_read, name="reader", daemon=True).start()
     primary.serve()

@@ -31,6 +31,8 @@ use outrig::config::{Config, ImageConfig};
 use outrig::error::IoPathExt;
 use outrig::image::{self, ImageTag};
 use outrig::{EmbeddedMcpPolicy, LaunchSpec, Outrig, PythonAgent};
+use tokio::io::BufReader;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
 
 use crate::builtin_image;
@@ -388,10 +390,32 @@ async fn shut_down(outrig: Outrig) {
 /// Hand typed lines to the agent until the user leaves.
 ///
 /// The agent sits behind an async mutex so a round can borrow it across its
-/// awaits. A Ctrl-C drops the round's future, and with it the guard, so the
-/// agent -- its conversation and its interpreter -- stays with the session
-/// rather than going down with the future.
+/// awaits. A Ctrl-C while the round waits on Python goes to that Python
+/// through [`PythonAgent::interrupter`], and the round carries on, since the
+/// model reads how the code ended. Otherwise the REPL does what it always
+/// does: at the prompt a fresh line, and mid-round it drops the round's
+/// future, and with it the guard, so the agent -- its conversation and its
+/// interpreter -- stays with the session rather than going down with the
+/// future.
+///
+/// SIGINT is received through one listener for the whole session rather than
+/// a fresh `ctrl_c()` per wait, which would miss a press landing between two
+/// of them -- and a quick second press is the one that stops waiting.
 async fn repl(agent: PythonAgent) -> Result<i32> {
+    let interrupt = agent.interrupter();
+    let sigint = Mutex::new(signal(SignalKind::interrupt())?);
+    let on_interrupt = || {
+        let (sigint, interrupt) = (&sigint, &interrupt);
+        async move {
+            let mut sigint = sigint.lock().await;
+            while sigint.recv().await.is_some() {
+                match interrupt() {
+                    Some(said) => eprintln!("\n[outrig] {said}"),
+                    None => return,
+                }
+            }
+        }
+    };
     let agent = Mutex::new(agent);
     let on_prompt = |line: String| {
         let agent = &agent;
@@ -408,7 +432,17 @@ async fn repl(agent: PythonAgent) -> Result<i32> {
             })
         }
     };
-    Repl::run("", &[], on_prompt, |_, _| async { None }).await?;
+    Repl::run_with(
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+        tokio::io::stderr(),
+        on_interrupt,
+        "",
+        &[],
+        on_prompt,
+        |_, _| async { None },
+    )
+    .await?;
     Ok(0)
 }
 

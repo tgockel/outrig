@@ -15,7 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stderr as it starts running. It starts no MCP server and no sidecar, since the model could not
   call them and a server in the primary container would sit beside the interpreter as the same
   user, holding its resolved secrets. Its session is recorded like `run`'s. It takes `--agent`,
-  `--model`, `--image` (a configured image-config only), and `--session-dir`.
+  `--model`, `--image` (a configured image-config only), and `--session-dir`. Ctrl-C while its
+  Python runs stops that Python -- cancelled, or interrupted if it has stopped yielding -- and the
+  model reads how it ended; a second Ctrl-C stops waiting for it. With no Python running, Ctrl-C
+  ends the round as it does in `run`. Python that spins without yielding is interrupted after
+  about half a minute on its own.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

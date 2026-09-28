@@ -9,9 +9,13 @@ use std::future::Future;
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde_json::{Value, json};
+use tokio::io::{
+    AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
+};
 use tokio::process::Child;
 
-use super::host::{ARGS, Interpreter, Outcome, PRIMARY, Report};
+use super::host::{ARGS, ExecId, Interpreter, InterpreterError, Outcome, PRIMARY, Report};
 use super::payload;
 
 /// How long any one step may take before a test fails rather than hangs.
@@ -55,6 +59,108 @@ pub(crate) async fn start_on_host() -> Interpreter {
     within(Interpreter::from_child(spawn(Some(PRIMARY)).await))
         .await
         .unwrap_or_else(|e| panic!("{e}"))
+}
+
+// ---------------------------------------------------------------------------- a fake transport
+
+/// What the fake transport says about itself once it closes.
+pub(crate) const HUNG_UP: &str = "the fake hung up";
+
+/// The interpreter's end of a transport, scripted by the test.
+pub(crate) struct Fake {
+    requests: Lines<BufReader<ReadHalf<DuplexStream>>>,
+    pub(crate) replies: WriteHalf<DuplexStream>,
+}
+
+pub(crate) type HostEnd = (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>);
+
+impl Fake {
+    pub(crate) fn pair() -> (Self, HostEnd) {
+        let (host, fake) = tokio::io::duplex(1 << 16);
+        let (requests, replies) = tokio::io::split(fake);
+        let fake = Self {
+            requests: BufReader::new(requests).lines(),
+            replies,
+        };
+        (fake, tokio::io::split(host))
+    }
+
+    /// A handle connected to a fake that has greeted.
+    pub(crate) async fn connected() -> (Interpreter, Self) {
+        let (mut fake, host) = Self::pair();
+        fake.send(json!({"t": "ready", "agent": PRIMARY, "version": "3.13"}))
+            .await;
+        let interpreter = within(connect(host))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        (interpreter, fake)
+    }
+
+    pub(crate) async fn send(&mut self, message: Value) {
+        self.replies
+            .write_all(format!("{message}\n").as_bytes())
+            .await
+            .expect("the host reads it");
+    }
+
+    pub(crate) async fn next(&mut self) -> Value {
+        let line = within(self.requests.next_line())
+            .await
+            .expect("the host's requests")
+            .expect("a request");
+        serde_json::from_str(&line).expect("a request is JSON")
+    }
+
+    /// Read the next request, which must be of `kind`.
+    pub(crate) async fn expect(&mut self, kind: &str) -> Value {
+        let request = self.next().await;
+        assert_eq!(request["t"], kind, "expected {kind}, got {request}");
+        request
+    }
+
+    /// Read the next request, which must be execution `id`'s.
+    pub(crate) async fn exec(&mut self, id: ExecId) {
+        let request = self.expect("exec").await;
+        assert_eq!(
+            request["id"],
+            json!(id),
+            "expected execution {id}, got {request}"
+        );
+    }
+
+    /// Answer the next request, which must be an inventory, with an empty one.
+    pub(crate) async fn answer_inventory(&mut self) {
+        let request = self.expect("inv").await;
+        self.send(json!({"t": "inv", "agent": PRIMARY, "id": request["id"], "globals": []}))
+            .await;
+    }
+
+    pub(crate) async fn result(&mut self, id: ExecId, fields: Value) {
+        let mut result = json!({
+            "t": "result", "agent": PRIMARY, "id": id,
+            "output": "", "dropped": 0, "error": null, "background": [],
+        });
+        for (key, value) in fields.as_object().expect("an object") {
+            result[key] = value.clone();
+        }
+        self.send(result).await;
+    }
+
+    pub(crate) async fn ok(&mut self, id: ExecId, output: &str) {
+        self.result(id, json!({"status": "ok", "output": output}))
+            .await;
+    }
+}
+
+pub(crate) async fn connect((replies, requests): HostEnd) -> Result<Interpreter, InterpreterError> {
+    Interpreter::connect(replies, requests, async { HUNG_UP.to_string() }).await
+}
+
+/// An inventory, answered by the fake. The next request the fake sees must be
+/// it, and once the host has its reply it has read every line before it.
+pub(crate) async fn round_trip(interpreter: &Interpreter, fake: &mut Fake) {
+    let (inventory, ()) = tokio::join!(within(interpreter.inventory()), fake.answer_inventory());
+    inventory.expect("an inventory");
 }
 
 /// An image that ships no Python, so only the payload can answer.

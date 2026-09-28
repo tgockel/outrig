@@ -30,9 +30,13 @@
 //! A grace is worth something only while this runtime is alive. A runtime
 //! shutting down inside one drops the reap task, `kill_on_drop` escalates
 //! immediately, and the child is back to being killed outright. Ctrl-C is not
-//! covered by this mechanism at all and does not need to be: the terminal
-//! delivers `SIGINT` to the whole foreground process group, so the child has
-//! a catchable signal from the kernel before outrig does anything.
+//! covered by this mechanism at all: the terminal delivers `SIGINT` to the
+//! whole foreground process group, so the child has a catchable signal from
+//! the kernel before outrig does anything. That is right for a child that
+//! should stop when the user does, and wrong for one that must outlive a
+//! Ctrl-C outrig handles itself -- a `podman exec` client exits on `SIGINT`,
+//! and the process it started sees its stdin close. Such a child is started
+//! with [`Cmd::in_own_process_group`].
 //!
 //! So the bound a caller who never passes a stop signal gets is **terminated
 //! synchronously, reaped as soon as the runtime is next driven** -- measured
@@ -121,6 +125,9 @@ const STREAM_READ_CHUNK: usize = 8 * 1024;
 pub(crate) struct Cmd {
     pub(crate) program: &'static str,
     pub(crate) args: Vec<OsString>,
+    /// Whether the child starts in a process group of its own; see
+    /// [`Cmd::in_own_process_group`].
+    own_process_group: bool,
 }
 
 impl Cmd {
@@ -128,7 +135,21 @@ impl Cmd {
         Self {
             program,
             args: Vec::new(),
+            own_process_group: false,
         }
+    }
+
+    /// Start the child in a process group of its own, out of reach of the
+    /// `SIGINT` a terminal sends its whole foreground group on Ctrl-C.
+    ///
+    /// For a child whose caller handles Ctrl-C itself and needs the child to
+    /// outlive it. The module's usual arrangement -- the child takes the
+    /// terminal's signal alongside outrig -- is wrong there: a `podman exec`
+    /// client exits on `SIGINT`, and the process it started sees its stdin
+    /// close.
+    pub(crate) fn in_own_process_group(mut self) -> Self {
+        self.own_process_group = true;
+        self
     }
 
     pub(crate) fn arg<S: AsRef<OsStr>>(mut self, arg: S) -> Self {
@@ -152,6 +173,9 @@ impl Cmd {
     pub(crate) fn to_tokio_command(&self) -> Command {
         let mut c = Command::new(self.program);
         c.args(&self.args);
+        if self.own_process_group {
+            c.process_group(0);
+        }
         c
     }
 

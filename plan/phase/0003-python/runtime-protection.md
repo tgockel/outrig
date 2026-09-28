@@ -5,8 +5,10 @@ terminates, a print in a loop, a recursion that never bottoms out -- and none of
 attack. It still has to be survivable, because an agent that can brick its own session on a bad
 comprehension is not usable.
 
-Part of this is already designed and proven on the prototype. That part is recorded here so it
-is ported deliberately rather than rediscovered. The rest is a later milestone.
+Part of this was designed and proven on the prototype, and is recorded here so it was ported
+deliberately rather than rediscovered. The interrupt, the probe, and the cancel have since been
+built (`0003-06`); "What the port does" records how, and where the port departs from the
+prototype. The rest is a later milestone.
 
 ## The wedge, and why it is the hard one
 
@@ -108,43 +110,10 @@ did not. The interpreter sets 8 MiB, the main thread's, for every thread started
 a subagent's, its reader, and any the agent starts -- so a subagent is no easier to crash than the
 primary. The cost is address space rather than memory, which `RLIMIT_AS` counts.
 
-## What is still unsolved
+## Two failures, two remedies
 
-**A thread blocked in a call Python cannot break into.** `time.sleep`, a blocking read, a long
-C call in a built-in module. Python takes an asynchronous exception at a bytecode boundary, and
-there is no bytecode boundary coming. Nothing short of stopping the container frees it, and the
-host learns of it only by the absence of a result. This is the documented final containment
-action and it stays that way.
-
-**A wedged subagent, which is contained but not recoverable.** The interrupt above reaches the
-main thread, and subagents are not on it. A subagent that wedges is gone: the host learns of it
-from the absence of a result, the application marks its endpoints failed, and its parent is told.
-The thread keeps spinning until the session ends. Its siblings survive -- measured at 50% of
-compute throughput and a worst-case event-loop tick of 5.1 ms beside one wedge -- but that is the
-cost of *one*. N of them leave the rest 1/(N+1) of a core, so a long session degrades rather than
-fails. Recovering a wedged subagent needs an interpreter per agent or subinterpreters, and
-`agent-placement.md` records why neither is taken here.
-
-**Resource limits, of which memory is now partly answered.** Nothing constrains CPU or process
-count, and the container's cgroups are shared with every other tool in it, so those consequences are
-not confined to the interpreter. Memory is different, because agents share a process: without a
-ceiling, one agent's `[x] * 10**12` OOM-kills the interpreter and ends every agent's session.
-`RLIMIT_AS`, set once at interpreter start, converts that into a `MemoryError` raised in the
-allocating thread, which returns as that agent's error result with a traceback -- the same recovery
-shape the interrupt path has. Measured against a 512 MiB ceiling: the outsized allocation raised
-immediately, a gradual one raised after 484 MiB, and the interpreter was alive and usable afterwards
-in both cases.
-
-State its limits honestly. The ceiling is process-wide, so it degrades every agent while it is
-pinned -- measured: an ordinary `import json` on another thread raises `MemoryError` too, until
-the memory is released. It makes an OOM legible instead of arriving as a dead interpreter with no
-explanation; it is not per-agent isolation. And `os._exit(0)` remains uncontained: one line of
-generated code ends the session. Operator-controlled CPU and process limits stay a later
-milestone.
-
-**A second failure, needing a second mechanism.** Everything above recovers a *wedge*: a loop that
-has stopped turning. An execution suspended on an await that never resolves is the opposite
-failure and the interrupt does not recover it.
+Everything above recovers a *wedge*: a loop that has stopped turning. An execution suspended on an
+await that never resolves is the opposite failure and the interrupt does not recover it.
 
 Measured on the payload. With the execution parked on a future and the loop turning normally, the
 SIGINT does not land in the execution at all -- the main thread is inside the event loop rather
@@ -202,19 +171,197 @@ correlation until a terminal reply arrives or the execution is explicitly record
 Dropping the host's future *and* sending a cancel loses the reply that says whether the slot came
 back, and a request that arrives late must not land on whatever execution is running by then.
 
-**In the prototype the user can trigger neither**, which the first milestone changes. As ported,
-the interrupt message has one sender -- the probe -- and the REPL's Ctrl-C never reaches the
-interpreter at all; it drops the host's side of the turn. That is fine
-for a wedge, which the probe detects on its own. It is not fine for a suspended await, which the
+**In the prototype the user could trigger neither**, which the first milestone changes. There,
+the interrupt message had one sender -- the probe -- and the REPL's Ctrl-C never reached the
+interpreter at all; it dropped the host's side of the turn. That is fine for a wedge, which the
+probe detects on its own. It is not fine for a suspended await, which the
 probe correctly reports as healthy: from outside, a dead wait and a legitimately long one are
 identical, and only the user knows which. So Ctrl-C has to reach the interpreter and request a
 cancel. `runtime.wait` escapes this on its own, since a message raises `MessageAvailable`, but a
 bare `await` does not watch channels and is a reasonable thing to write
 (`execution-and-rounds.md`).
 
+## What the port does
+
+Built in `0003-06`. It keeps the prototype's shape -- an `interrupt` handled on the reader thread,
+a probe before acting -- and departs from it in four places, each for a measured reason.
+
+**The signal is aimed at the main thread.** `signal.raise_signal` called from the reader thread
+delivers the signal to the reader thread, since `raise(3)` is thread-directed. The handler still
+runs on the main thread, but only at its next bytecode boundary, so a main thread blocked in a
+system call never wakes to run it: measured, `time.sleep(2)` ran its full two seconds.
+`signal.pthread_kill` aimed at the main thread interrupts the call itself, and PEP 475 runs the
+handler before retrying it. Measured: `time.sleep`, `Event.wait`, and `Thread.join` broke as soon
+as it was sent, and `subprocess.run(["sleep", "3"])` a quarter of a second later, which is
+`Popen.wait`'s own grace for a child to exit. On the main thread, then, a `time.sleep`, a
+blocking read, and a synchronous `subprocess.run` are no longer calls Python cannot break into.
+
+**The handler raises only into agent code.** It takes no lock and writes nothing, since the main
+thread may be anywhere, and it raises `KeyboardInterrupt` only when all three of these hold:
+
+- An interrupt is armed, and the execution it names still holds the slot. A SIGINT nobody armed --
+  agent code running `pkill -INT python3` -- changes nothing.
+- Walking out from where the signal landed, a frame compiled from a submission comes before the
+  loop's dispatch frames or the fork hooks. Every callback the loop runs, the interpreter's own
+  included, runs beneath them, so an idle loop, a result being written, a callback being chosen:
+  each declines. This is what keeps an interrupt out of `_send`, where it would tear a protocol
+  line, and out of `_run_once`, where it would lose a callback. The one exception is a walk that
+  reaches the dispatch from inside a task agent code started: that is agent code however it was
+  compiled, such as a coroutine an imported module defines, scheduled with `create_task` or
+  `gather`. The only tasks the interpreter starts are the executions' own wrappers.
+- The code is the named execution's, including a task it started; or the execution has not
+  started, so whatever holds the loop is what keeps it from starting; or the host has judged the
+  loop a runaway, which justifies ending whatever agent code spins on it. Without one of these, a
+  user's interrupt for a suspended execution could end another's healthy task.
+
+So the third row of the SIGINT table neither exits nor escapes the loop any more: an interrupt
+aimed at an execution suspended on an await declines, and a cancel is the remedy.
+
+**A cancel is delivered through the loop, and is never lost.** `cancel` is handled on the reader
+thread too and goes to the loop with `call_soon_threadsafe`, where it cancels the execution's
+task. A task cancelled before its first step would throw into a coroutine that never entered its
+own `try`, and would never report; the loop instead marks the execution, which then reports
+`CancelledError` -- "stopped before it started" -- without running anything. The wrapper names
+`CancelledError` as a result. It also still catches everything else, because an exception that
+left it would end the task with no reply while the host held a slot the interpreter had freed --
+and on the port no `KeyboardInterrupt` that reaches it is one that should end the interpreter:
+the handler raises only into agent code, so one arriving there came from the execution's own
+body, or from awaiting a task an interrupt ended. Formatting the traceback runs agent code too
+(`traceback` guards `__str__` against anything, but `__notes__` only against `Exception`), so it
+is guarded the same way.
+
+**The probe asks two questions.** The inventory, answered on the loop, says whether the loop is
+turning. A second request, answered on the reader thread, reports the CPU time of the thread
+running the loop. A loop that does not answer while its thread is idle is blocked in a system
+call, which may be perfectly healthy; one that does not answer while its thread burns CPU is
+spinning. Measured, as a share of one CPU across the probe:
+
+| the loop's thread                     | share |
+|---------------------------------------|-------|
+| blocked in `sleep` or `waitpid`       | 0.000 |
+| spinning, alone                       | 1.0   |
+| spinning, beside one CPU-bound thread | 0.505 |
+| spinning, beside two                  | 0.336 |
+| spinning, beside three                | 0.252 |
+
+A spinning thread gets only its share of the GIL, so the line is drawn at 0.1: far above idle, and
+below any plausible number of busy siblings.
+
+### When the host acts
+
+**On its own, only against a runaway.** From 30 seconds after submission and every 30 seconds
+after, the host checks. A loop that answers is healthy however long the execution has run. A loop
+that does not answer with its thread idle -- a synchronous `subprocess.run`, a `time.sleep`, a
+blocking read -- is left alone, since the failed probe is no evidence about the child. A loop that
+does not answer while its thread stays busy is interrupted with the widest scope, and checked
+again five seconds later rather than concluded about: the interrupt may have ended a task another
+execution left spinning, and this one may be healthy. A probe the loop has not answered is waited
+on again rather than sent again, so a loop blocked for an hour does not return to a queue of them;
+one it answered before a check began is dropped, since it says the loop turned then, not now.
+After three interrupts that each leave the loop spinning, the host stops waiting -- the execution
+is `unknown`, keeps its slot, and the model is told why. The host never cancels on its own, so a
+suspended execution keeps its slot indefinitely.
+
+**For the user, anything goes.** Ctrl-C during a call cancels the execution -- cheap, and the
+right remedy for a suspended one -- and checks. A loop that does not answer is interrupted too:
+with the widest scope if its thread is busy, and otherwise aimed at the execution's own blocking
+call, since a person may legitimately stop healthy work. The model then reads how the code ended,
+and the round goes on; the turn's later calls are not run, since the model wrote them before it
+knew. A second Ctrl-C on the same execution stops waiting for it, after a last second's look for
+an outcome already on its way. A press is acted on at once, even in the middle of a check. What
+the user did is recorded apart from what the host did, so a stop the code survived still stops
+the turn when the host goes on to interrupt it as a runaway. Each press counts against the
+execution it was made during, so a press racing a result never reaches the next one. An answered
+probe is not proof the cancel was delivered -- `task.cancel()` schedules a wake-up that lands a
+loop turn after the probe's reply -- and nothing relies on it.
+
+**Behind an abandoned execution.** A submission refused behind an execution nobody waits for any
+more is the host's one chance to look at that execution again. It checks, interrupts it if it is
+spinning, and tells the model what it found.
+
+### Every shape, and what happens
+
+- **A wedge in the execution's body.** Interrupted, by the host after a check or by Ctrl-C. An
+  error result with a traceback; the slot is freed, and the next submission runs.
+- **An await that never resolves.** The host never acts, since the loop answers. Ctrl-C cancels
+  it: `CancelledError`, and the slot is freed.
+- **A spin in code an imported module defines.** Awaited from a submission, it is found through
+  the submission's frames. Run as a task -- `create_task`, `gather` -- it is found as a task agent
+  code started. Either way it is interrupted like any other.
+- **A task an earlier execution left running wedges, with nothing in the foreground.** Nothing
+  notices until the next submission, which is admitted but cannot start. Its check, or Ctrl-C,
+  interrupts the task. The task ends with `KeyboardInterrupt` as its exception, reported once,
+  billed to the execution that started it. The submission then runs -- or, if Ctrl-C was pressed,
+  reports that it was stopped before it started.
+- **The same, while another execution is suspended.** The host's interrupt ends the task, and the
+  suspended execution keeps waiting, not marked a runaway. With Ctrl-C, its cancel lands once the
+  loop turns again. Every id stays its own.
+- **Native code holding the GIL.** The reader thread cannot run, so nothing can be armed and the
+  CPU request goes unanswered. The host says so once and keeps waiting, since a large `sorted` is
+  long rather than endless; Ctrl-C twice stops waiting. If it never returns, this is session
+  failure, and named as such. It covers GIL-holding loops that do check for signals, such as `re`
+  backtracking, since the signal is never sent. A call that releases the GIL -- `hashlib` or
+  `zlib` on a large input -- reads as quiet and busy, and the interrupt lands as it returns.
+- **A synchronous `subprocess.run`.** The host sees an idle thread and leaves it. Ctrl-C breaks
+  the wait; `run` kills its direct child, and what that child started keeps running, which the
+  result says. The killed child stays a zombie until the next spawn. A bare `Popen(...).wait()`
+  does not kill even the child.
+- **`os.system`.** musl's `system()` ignores SIGINT process-wide for as long as it waits, so an
+  interrupt sent then is discarded. A later check sends another.
+- **Agent code that blocks or replaces SIGINT.** Blocked with `pthread_sigmask`, the signal waits
+  to be unblocked. Replaced, the reader thread notices before arming and says so, and only a
+  cancel can reach the execution.
+- **Agent code that pumps the loop by hand.** The loop's own frames come before the agent's, so the
+  interrupt declines there, where it could lose a callback. Only a cancel can reach it.
+- **An interrupt the code catches.** The host tries three times, then stops waiting; a second
+  Ctrl-C stops waiting at once.
+- **Nothing executing.** Nothing is sent. A request naming an execution that holds nothing changes
+  nothing, and neither does a SIGINT nobody armed.
+
+The interpreter's `podman exec` client runs in a process group of its own. Left in outrig's, it
+took the terminal's SIGINT on every Ctrl-C -- at the prompt too -- and exited, and the interpreter
+exited with it when its stdin closed: measured, the session's next submission found the
+interpreter gone.
+
+## What is still unsolved
+
+**A call Python cannot break into.** On the main thread a signal breaks a system call, so the
+primary's `time.sleep` or blocking read can be interrupted. What remains is native code that holds
+the GIL, `os.system`, and any call on another thread: Python takes an asynchronous exception at a
+bytecode boundary, and there is none coming. Nothing short of stopping the container frees them,
+and the host learns of them only by the absence of a result. This is the documented final
+containment action and it stays that way.
+
+**A wedged subagent, which is contained but not recoverable.** The interrupt above reaches the
+main thread, and subagents are not on it. A subagent that wedges is gone: the host learns of it
+from the absence of a result, the application marks its endpoints failed, and its parent is told.
+The thread keeps spinning until the session ends. Its siblings survive -- measured at 50% of
+compute throughput and a worst-case event-loop tick of 5.1 ms beside one wedge -- but that is the
+cost of *one*. N of them leave the rest 1/(N+1) of a core, so a long session degrades rather than
+fails. Recovering a wedged subagent needs an interpreter per agent or subinterpreters, and
+`agent-placement.md` records why neither is taken here.
+
+**Resource limits, of which memory is now partly answered.** Nothing constrains CPU or process
+count, and the container's cgroups are shared with every other tool in it, so those consequences are
+not confined to the interpreter. Memory is different, because agents share a process: without a
+ceiling, one agent's `[x] * 10**12` OOM-kills the interpreter and ends every agent's session.
+`RLIMIT_AS`, set once at interpreter start, converts that into a `MemoryError` raised in the
+allocating thread, which returns as that agent's error result with a traceback -- the same recovery
+shape the interrupt path has. Measured against a 512 MiB ceiling: the outsized allocation raised
+immediately, a gradual one raised after 484 MiB, and the interpreter was alive and usable afterwards
+in both cases.
+
+State its limits honestly. The ceiling is process-wide, so it degrades every agent while it is
+pinned -- measured: an ordinary `import json` on another thread raises `MemoryError` too, until
+the memory is released. It makes an OOM legible instead of arriving as a dead interpreter with no
+explanation; it is not per-agent isolation. And `os._exit(0)` remains uncontained: one line of
+generated code ends the session. Operator-controlled CPU and process limits stay a later
+milestone.
+
 **Descendant processes.** Generated code may start subprocesses. Interrupting the execution that
-started one does not stop it, and it may hold the capture pipe open after its parent execution
-has been reported.
+started one does not stop it -- `subprocess.run` kills its direct child and no further -- and it
+may hold the capture pipe open after its parent execution has been reported. The result of an
+execution the user stopped says so.
 
 **Output flooding as a denial of the session.** Output is bounded per execution, and
 between-execution output is bounded separately so a chatty background task cannot displace the
@@ -223,16 +370,14 @@ that writes continuously keeps the drain thread busy indefinitely.
 
 ## For the first milestone
 
-The interrupt path and the liveness probe come across with the port. They are not optional
-polish: without them the first `while True:` ends the session, and an agent that cannot survive
-its own mistakes cannot be evaluated.
+The interrupt path and the liveness probe came across with the port (`0003-06`). They are not
+optional polish: without them the first `while True:` ends the session, and an agent that cannot
+survive its own mistakes cannot be evaluated.
 
-Retaining the foreground execution's task handle joins them, and so does the Ctrl-C path that
+Retaining the foreground execution's task handle joined them, and so did the Ctrl-C path that
 uses it. They are small -- a binding instead of a discarded future, and a request the REPL already
 has a key for -- and without them an ordinary bare `await` on something that never resolves ends
-the session's usefulness while every diagnostic reports health. Deferring them would mean shipping
-a first interactive milestone where that is true, which is worth saying out loud if it is what
-gets chosen.
+the session's usefulness while every diagnostic reports health.
 
 `RLIMIT_AS` joins them, for the same reason rather than as an early start on resource limits.
 Co-hosting makes memory the one resource an agent can exhaust on everyone else's behalf, and the

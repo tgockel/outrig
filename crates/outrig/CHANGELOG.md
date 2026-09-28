@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   started agent runs on. `on_submit` registers an observer that sees each submission's source as
   the interpreter accepts it.
 
+  `PythonAgent::interrupter` returns a function another task can call while a round runs -- what
+  Ctrl-C does. The first call cancels the Python the round is waiting on, and interrupts it too if
+  its event loop has stopped turning; the model reads how it ended and the round goes on, with the
+  turn's later calls not run. A second call stops waiting for it. With no Python running it
+  returns `None` and does nothing. Separately, code that keeps its event loop from turning while a
+  CPU stays busy is taken for a runaway after about half a minute and interrupted without anyone
+  asking, while code waiting on a subprocess, a sleep, or a read is left to finish. The
+  interpreter's `podman exec` client runs in a process group of its own, so the terminal's Ctrl-C
+  does not end it.
+
   **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
   shape will change without a deprecation while the agent loop is built out. It has no retry or
   failover yet, and an alias naming several models runs against the first.
