@@ -183,7 +183,7 @@ style = "mistralrs"
 [models.phi3-fast]
 provider   = "local"
 model-id   = "microsoft/Phi-3-mini-4k-instruct-gguf"
-model-file = "Phi-3-mini-4k-instruct-q4.gguf"   # required when the repo has multiple GGUFs
+model-file = "Phi-3-mini-4k-instruct-q4.gguf"   # required; the GGUF's path inside the repo
 # revision      = "main"   # optional; pin a git ref for reproducibility
 # context-length = 4096    # optional; override the model's default context window
 # device         = "cuda"  # optional; defaults to "cpu"
@@ -194,8 +194,10 @@ and caches it under `<XDG_CACHE_HOME>/outrig/models/` (override with the top-lev
 `model-cache-root` config key; see [Reference -> Config](../reference/config.md)). Subsequent
 runs reuse the cached file.
 
-`model-file` is optional only when the repo ships exactly one `.gguf`. Repos that publish
-several quantizations (`-q4`, `-q5_k_m`, `-f16`, etc.) require an explicit pick.
+`model-file` is required with `model-id`, even when the repo ships a single `.gguf`; most
+publish several quantizations (`-q4`, `-q5_k_m`, `-f16`, etc.) to pick from. It is the file's
+path inside the repo, so a quantization kept in a directory of its own names the directory
+too: `model-file = "Q4_K_M/model-Q4_K_M.gguf"`.
 
 ### From a local path
 

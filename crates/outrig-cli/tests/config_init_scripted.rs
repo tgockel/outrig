@@ -308,18 +308,16 @@ async fn mistralrs_falls_back_to_free_form_when_hf_errors() {
     );
 }
 
-/// Drive the mistralrs local-path branch, giving `path_answers` at the
-/// `model-path` prompt, and return the written config along with everything
-/// the prompt printed.
-async fn write_local_path_config(target: &Path, path_answers: &str) -> (String, String) {
-    // style=mistralrs, name=local, no extra provider, define a model,
-    // name=phi, provider=local, no auto-download, then the path answers,
-    // blank context-length, no extra models, use as default-model.
-    let script = format!("mistralrs\nlocal\nn\n\nphi\nlocal\nn\n{path_answers}\n\nn\n\n");
-    let (mut prompt, mut stderr_r) = scripted_prompt(script.as_bytes()).await;
-    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+/// Run `config init` on `script` against `hf`, and return the written config
+/// along with everything the prompt printed.
+async fn write_config(
+    target: &Path,
+    script: &[u8],
+    hf: &mut StubHfTreeFetcher,
+) -> (String, String) {
+    let (mut prompt, mut stderr_r) = scripted_prompt(script).await;
 
-    timeout(TEST_TIMEOUT, run_with(false, target, &mut prompt, &mut hf))
+    timeout(TEST_TIMEOUT, run_with(false, target, &mut prompt, hf))
         .await
         .expect("run_with must not hang")
         .expect("run_with must succeed");
@@ -329,6 +327,150 @@ async fn write_local_path_config(target: &Path, path_answers: &str) -> (String, 
     let mut shown = String::new();
     stderr_r.read_to_string(&mut shown).await.unwrap();
     (std::fs::read_to_string(target).unwrap(), shown)
+}
+
+/// A listing that succeeds but holds no GGUF reaches the same free-form
+/// prompt rather than ending setup, and its answer is saved like a pick. The
+/// prompt line asks for a path inside the repo, which is what a quantization
+/// kept in a directory of its own needs.
+#[tokio::test]
+async fn mistralrs_falls_back_to_free_form_when_listing_has_no_gguf() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // The script of the error fallback above, answering the free-form prompt
+    // with a nested path.
+    let script =
+        b"mistralrs\nlocal\nn\n\nphi\nlocal\n\nsome/repo\n\nQ4_K_M/model-Q4_K_M.gguf\n\nn\n\n";
+    let mut hf = StubHfTreeFetcher::with_files(["README.md", "config.json"]);
+
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+
+    assert!(
+        shown.contains("? GGUF model-file (path inside the HF repo): "),
+        "prompt line does not ask for a path inside the repo:\n{shown}"
+    );
+    Config::load_from_str(&text)
+        .unwrap()
+        .validate(None)
+        .unwrap();
+    assert!(
+        text.contains("model-file = [\"Q4_K_M/model-Q4_K_M.gguf\"]"),
+        "missing free-form-prompt model-file:\n{text}"
+    );
+}
+
+/// A quantization kept in a directory of its own is offered at its full
+/// path, beside the repo's root files, and written with its directory
+/// whether it was picked by number or by the path as listed.
+#[tokio::test]
+async fn writes_mistralrs_config_with_nested_model_file_pick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Path order puts the `Q4_K_M/` shards ahead of the root file ('Q' sorts
+    // before 'm'), so `1` and the second shard's path pick both shards.
+    let script = b"mistralrs\nlocal\nn\n\nqwen\nlocal\n\nsome/repo\n\n\
+                   1,Q4_K_M/model-Q4_K_M-00002-of-00002.gguf\n\nn\n\n";
+    let mut hf = StubHfTreeFetcher::with_files([
+        "model-Q8_0.gguf",
+        "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf",
+        "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf",
+        "README.md",
+    ]);
+
+    let (text, _) = write_config(&target, script, &mut hf).await;
+
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+    assert_eq!(
+        cfg.models["qwen"].model_file,
+        Some(vec![
+            "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf".into(),
+            "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf".into(),
+        ]),
+        "picker didn't write both nested shards:\n{text}"
+    );
+}
+
+/// Enter at the picker takes the first file that is a whole model by itself.
+/// A directory such as `BF16/` sorts ahead of the root files, and the shard it
+/// would put first is no model alone: saved by itself, it downloads in full
+/// and then fails to load.
+#[tokio::test]
+async fn picker_default_skips_split_shards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Enter at the picker, after the blank revision.
+    let script = b"mistralrs\nlocal\nn\n\ngemma\nlocal\n\nsome/repo\n\n\n\nn\n\n";
+    let mut hf = StubHfTreeFetcher::with_files([
+        "BF16/model-BF16-00001-of-00002.gguf",
+        "BF16/model-BF16-00002-of-00002.gguf",
+        "model-IQ4_NL.gguf",
+        "model-Q4_K_M.gguf",
+    ]);
+
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+
+    assert!(
+        shown.contains("? Pick GGUF file(s) from the repo [default: model-IQ4_NL.gguf]: "),
+        "the default is not the first whole model:\n{shown}"
+    );
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+    assert_eq!(
+        cfg.models["gemma"].model_file,
+        Some(vec!["model-IQ4_NL.gguf".into()]),
+        "Enter didn't take the first whole model:\n{text}"
+    );
+}
+
+/// A repo of nothing but shards offers no default: Enter asks again, and the
+/// pick has to name the shards.
+#[tokio::test]
+async fn picker_has_no_default_when_every_file_is_a_shard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("config.toml");
+
+    // Enter at the picker, then both `Q4_K_M/` shards.
+    let script = b"mistralrs\nlocal\nn\n\nds\nlocal\n\nsome/repo\n\n\n1,2\n\nn\n\n";
+    let mut hf = StubHfTreeFetcher::with_files([
+        "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf",
+        "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf",
+        "Q8_0/model-Q8_0-00001-of-00002.gguf",
+        "Q8_0/model-Q8_0-00002-of-00002.gguf",
+    ]);
+
+    let (text, shown) = write_config(&target, script, &mut hf).await;
+
+    assert_eq!(
+        shown.matches("? Pick GGUF file(s) from the repo: ").count(),
+        2,
+        "Enter must ask again, with no default offered:\n{shown}"
+    );
+    let cfg = Config::load_from_str(&text).unwrap();
+    cfg.validate(None).unwrap();
+    assert_eq!(
+        cfg.models["ds"].model_file,
+        Some(vec![
+            "Q4_K_M/model-Q4_K_M-00001-of-00002.gguf".into(),
+            "Q4_K_M/model-Q4_K_M-00002-of-00002.gguf".into(),
+        ]),
+        "picker didn't write both shards:\n{text}"
+    );
+}
+
+/// Drive the mistralrs local-path branch, giving `path_answers` at the
+/// `model-path` prompt, and return the written config along with everything
+/// the prompt printed.
+async fn write_local_path_config(target: &Path, path_answers: &str) -> (String, String) {
+    // style=mistralrs, name=local, no extra provider, define a model,
+    // name=phi, provider=local, no auto-download, then the path answers,
+    // blank context-length, no extra models, use as default-model.
+    let script = format!("mistralrs\nlocal\nn\n\nphi\nlocal\nn\n{path_answers}\n\nn\n\n");
+    let mut hf = StubHfTreeFetcher::with_files(Vec::<&str>::new());
+    write_config(target, script.as_bytes(), &mut hf).await
 }
 
 /// Neither prompt backend prints a free-text field's description unasked, so

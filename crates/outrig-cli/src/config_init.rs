@@ -169,21 +169,27 @@ const MODEL_PATH_FIELD: Field = Field {
     doc_link: "doc/concepts/in-process-llm.md#from-a-local-path",
 };
 
+// As with `MODEL_PATH_FIELD`, the shape of the answer is in `name`: a
+// quantization kept in a directory of its own is named with the directory,
+// and a bare filename for one fails only when the download is attempted.
 const MODEL_FILE_FIELD: Field = Field {
-    name: "GGUF model-file",
-    description: "Filename inside the HF repo, e.g. \
-                  qwen2.5-coder-1.5b-instruct-q4_k_m.gguf. Used to pick \
-                  one quantization out of a multi-file repo.",
+    name: "GGUF model-file (path inside the HF repo)",
+    description: "Path of the GGUF file inside the HF repo, directory included, e.g. \
+                  qwen2.5-coder-1.5b-instruct-q4_k_m.gguf or \
+                  Q4_K_M/model-Q4_K_M.gguf. Used to pick one quantization out of a \
+                  multi-file repo.",
     options: &[],
     doc_link: "doc/concepts/in-process-llm.md",
 };
 
 const MODEL_FILE_PICK_FIELD: Field = Field {
     name: "Pick GGUF file(s) from the repo",
-    description: "Comma-separated numbers (e.g. `1,3`) or filenames. Pick \
+    description: "Comma-separated numbers (e.g. `1,3`) or paths as listed. Pick \
                   multiple only when one quantization is split across \
-                  shards (model-00001-of-00003.gguf, ...). The first \
-                  option is the default.",
+                  shards (model-00001-of-00003.gguf, ...), and then pick \
+                  every shard. The default is the first file that is a \
+                  whole model by itself; a shard never is, so a repo of \
+                  nothing but shards has no default.",
     options: &[],
     doc_link: "doc/concepts/in-process-llm.md",
 };
@@ -525,12 +531,14 @@ async fn prompt_mistralrs_model(
 }
 
 /// Discover GGUF files in `model_id` via `hf` and pick one or more. On a
-/// successful query: 0 files -> error, 1 file -> auto-pick (status line,
-/// no prompt), many -> render a numbered list (with sizes) and prompt
-/// for a comma-separated choice (numbers or filenames). On any HF error
-/// (offline, build without `mistralrs`, transient outage), fall back to
-/// the free-form `MODEL_FILE_FIELD` text prompt so the flow still
-/// completes.
+/// successful query: 1 file -> auto-pick (status line, no prompt), many ->
+/// render a numbered list (with sizes) and prompt for a comma-separated
+/// choice (numbers or paths), defaulting to the first file that is a whole
+/// model rather than a shard. No file, or any HF error (offline, build
+/// without `local-llm`, transient outage), falls back to the free-form
+/// `MODEL_FILE_FIELD` text prompt so the flow still completes -- the
+/// listing is a convenience, and a user who knows the path can still give
+/// it.
 ///
 /// Multi-select supports split-quantization repos where one quantization
 /// is sharded across multiple `model-NNNNN-of-NNNNN.gguf` files;
@@ -544,21 +552,19 @@ async fn resolve_model_file(
     let files = match hf.list_files(model_id, revision).await {
         Ok(siblings) => crate::hf::filter_gguf(siblings),
         Err(e) => {
-            eprintln!(
-                "[outrig] could not list files in {model_id:?} ({e}); \
-                 enter the GGUF filename manually."
-            );
-            return ask_required(prompt, &MODEL_FILE_FIELD)
-                .await
-                .map(|s| vec![s]);
+            let why = format!("could not list files in {model_id:?} ({e})");
+            return ask_model_file(prompt, &why).await;
         }
     };
 
     match files.as_slice() {
-        [] => Err(OutrigError::Configuration(format!(
-            "HF repo {model_id:?} contains no .gguf files; pick a different model-id"
-        ))
-        .into()),
+        [] => {
+            let why = format!(
+                "no .gguf file anywhere in {model_id:?} at revision {:?}",
+                revision.unwrap_or("main")
+            );
+            ask_model_file(prompt, &why).await
+        }
         [only] => {
             let label = format_file_label(only);
             eprintln!("[outrig] found one GGUF in {model_id:?}: {label}; using it");
@@ -570,18 +576,32 @@ async fn resolve_model_file(
             for (i, file) in many.iter().enumerate() {
                 eprintln!("  {:>idx_w$}: {}", i + 1, format_file_label(file));
             }
+            // Enter takes the first file that is a whole model by itself. One
+            // shard of a split quantization never is: saved alone, it downloads
+            // in full and then fails to load. A directory such as `BF16/` can
+            // sort ahead of a repo's root files, so the first entry often is one.
+            let default = many
+                .iter()
+                .find(|f| !crate::hf::is_split_shard(&f.path))
+                .map_or("", |f| f.path.as_str());
             loop {
-                let answer = prompt
-                    .ask_string(&MODEL_FILE_PICK_FIELD, many[0].path.as_str())
-                    .await?;
-                let trimmed = answer.trim();
-                if trimmed.is_empty() {
-                    return Ok(vec![many[0].path.clone()]);
-                }
-                match parse_pick_input(trimmed, many) {
+                let answer = prompt.ask_string(&MODEL_FILE_PICK_FIELD, default).await?;
+                let picks = match answer.trim() {
+                    "" if default.is_empty() => {
+                        eprintln!(
+                            "[outrig] every file listed is one shard of a split \
+                             quantization, so there is no default; pick all the \
+                             shards of the one you want"
+                        );
+                        continue;
+                    }
+                    "" => default,
+                    picks => picks,
+                };
+                match parse_pick_input(picks, many) {
                     Ok(picked) => return Ok(picked),
                     Err(bad) => eprintln!(
-                        "[outrig] {bad:?} is not a number 1..={} or a filename in the list",
+                        "[outrig] {bad:?} is not a number 1..={} or a path in the list",
                         many.len()
                     ),
                 }
@@ -590,7 +610,16 @@ async fn resolve_model_file(
     }
 }
 
-/// Render one row of the picker: filename plus a parenthesized
+/// The free-form `model-file` prompt, for when the listing offers nothing
+/// to pick from; `why` says what it found instead.
+async fn ask_model_file(prompt: &mut impl PromptSource, why: &str) -> Result<Vec<String>> {
+    eprintln!("[outrig] {why}; enter the model-file manually.");
+    ask_required(prompt, &MODEL_FILE_FIELD)
+        .await
+        .map(|s| vec![s])
+}
+
+/// Render one row of the picker: path plus a parenthesized
 /// human-readable size when known. Centralized so the auto-pick status
 /// line and the multi-line picker share a format.
 fn format_file_label(file: &crate::hf::HfFile) -> String {
@@ -601,7 +630,7 @@ fn format_file_label(file: &crate::hf::HfFile) -> String {
 }
 
 /// Parse a comma-separated picker answer against `files`. Each token is
-/// either a 1-based index or a literal filename match. Whitespace around
+/// either a 1-based index or a literal path match. Whitespace around
 /// tokens is ignored. Returns the unique paths in the order the user
 /// specified, deduplicated. Returns `Err(bad)` with the first
 /// unrecognized token.

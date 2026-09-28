@@ -585,7 +585,7 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 | `provider`       | string  | yes\*\*  | --       | Name of a `style = "mistralrs"` provider.    |
 | `model-id`       | string  | one of\* | --       | HF repo id, e.g. `microsoft/Phi-3-mini-...`. |
 | `model-path`     | path    | one of\* | --       | Local path to a GGUF file.                   |
-| `model-file`     | str/arr | with `id`| --       | GGUF filename(s) inside the HF repo.         |
+| `model-file`     | str/arr | with `id`| --       | GGUF path(s) inside the HF repo.             |
 | `revision`       | string  | no       | `"main"` | HF git ref to pin. With `model-id`.          |
 | `context-length` | integer | no       | model    | Override the model's default context window. |
 | `device`         | string  | no       | `"cpu"`  | One of `cpu`, `cuda`, `cuda:N`, `metal`.     |

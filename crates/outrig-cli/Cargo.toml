@@ -54,7 +54,7 @@ dialoguer          = { workspace = true, default-features = true, features = ["f
 directories        = { workspace = true, default-features = true }
 futures-util       = { workspace = true, default-features = true }
 heck               = { workspace = true, default-features = true }
-hf-hub             = { workspace = true, optional = true }
+hf-hub             = { workspace = true, optional = true, features = ["tokio"] }
 indexmap           = { workspace = true, default-features = true, optional = true }
 jiff               = { workspace = true, default-features = true }
 mistralrs-core     = { workspace = true, optional = true }

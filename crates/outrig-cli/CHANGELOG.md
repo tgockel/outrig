@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Anthropic model failed at its head on every later call and stayed on its fallback. Reasoning
   Anthropic did not issue, a local model's included, is now left out of what it is sent; text,
   tool calls, and Anthropic's own thinking are sent as before.
+- **The GGUF picker lists files in a repo's subdirectories.** With `local-llm`, the picker that
+  `outrig config init` and `outrig init` offer after a Hugging Face `model-id` listed only the
+  repo's top level, so a quantization kept in a directory of its own was never offered. A repo
+  holding only those, like `unsloth/DeepSeek-R1-GGUF`, was refused as holding no `.gguf` files,
+  and setup ended there without writing a config. The picker now lists the whole repo and writes
+  each pick's path inside it, directory included. Enter takes the first file that is a whole
+  model by itself: never one shard of a split quantization, which would download in full and
+  then fail to load, and nothing at all when the repo holds only shards. A listing with no
+  `.gguf` file now drops to the manual `model-file` prompt instead of ending setup. A revision
+  containing `/`, like the `refs/pr/N` Hugging Face gives a pull request, now lists too; it used
+  to fail and fall back to that prompt.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
