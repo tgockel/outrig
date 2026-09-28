@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interpreter's `podman exec` client runs in a process group of its own, so the terminal's Ctrl-C
   does not end it.
 
+  The interpreter lowers its own `RLIMIT_DATA` soft limit at start, to half the memory the
+  container can see: its cgroup's limit, or `MemTotal`. Python that allocates past it gets a
+  `MemoryError` the model reads, instead of the kernel killing the interpreter, and freeing what
+  it held makes the interpreter usable again. The ceiling is the whole interpreter's rather than
+  one agent's. Every program the Python starts inherits it, and since the hard limit is left as it
+  was, one that needs more can raise its own.
+
   **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
   shape will change without a deprecation while the agent loop is built out. It has no retry or
   failover yet, and an alias naming several models runs against the first.

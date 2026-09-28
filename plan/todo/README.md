@@ -97,12 +97,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**Surviving what the agent writes**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-07` | An agent's memory has a ceiling that reports rather than kills     |
-
 **How the agent is addressed, and what it can see**
 
 | Task      | What it settles                                                    |

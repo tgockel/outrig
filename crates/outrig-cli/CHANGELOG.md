@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python runs stops that Python -- cancelled, or interrupted if it has stopped yielding -- and the
   model reads how it ended; a second Ctrl-C stops waiting for it. With no Python running, Ctrl-C
   ends the round as it does in `run`. Python that spins without yielding is interrupted after
-  about half a minute on its own.
+  about half a minute on its own. Python that allocates past its memory ceiling, half of what the
+  container can see, gets a `MemoryError` the model reads rather than ending the session;
+  programs it starts inherit the ceiling, and can raise their own.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

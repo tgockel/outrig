@@ -19,7 +19,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, setrlimit};
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::sysinfo::sysinfo;
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 
@@ -145,16 +147,37 @@ struct Interpreter {
 
 impl Interpreter {
     fn start() -> Self {
-        let mut child = Command::new(python())
+        Self::spawn(None)
+    }
+
+    /// The interpreter under a memory ceiling of `bytes`: a soft `RLIMIT_DATA`
+    /// already in place when it starts, which it keeps rather than raising to
+    /// its own. Far quicker to reach than half the machine.
+    fn start_with_ceiling(bytes: u64) -> Self {
+        Self::spawn(Some(bytes))
+    }
+
+    fn spawn(ceiling: Option<u64>) -> Self {
+        let mut command = Command::new(python());
+        command
             .args(ARGS)
             .arg(PRIMARY)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // A group of its own, so `Drop` reaches the children tests start.
-            .process_group(0)
-            .spawn()
-            .expect("the interpreter starts");
+            .process_group(0);
+        if let Some(bytes) = ceiling {
+            let (_, hard) = getrlimit(Resource::RLIMIT_DATA).expect("RLIMIT_DATA");
+            // SAFETY: the closure runs between fork and exec, and makes one
+            // async-signal-safe call that neither allocates nor takes a lock.
+            unsafe {
+                command.pre_exec(move || {
+                    setrlimit(Resource::RLIMIT_DATA, bytes, hard).map_err(std::io::Error::from)
+                });
+            }
+        }
+        let mut child = command.spawn().expect("the interpreter starts");
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
@@ -848,18 +871,23 @@ fn agents_run_at_the_same_time() {
     k.open("sub");
     let flag = Flag::new();
     let waits = format!("{}\n'primary saw it'", flag.awaited());
-    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src": waits}));
+    k.submit(1, &waits);
     let raises = format!("open({}, 'w').close()\n'sub raised it'", flag.py());
-    k.send(json!({"t": "exec", "agent": "sub", "id": 1, "src": raises}));
+    k.submit_in("sub", 1, &raises);
 
     // Either may report first.
     let results = [k.recv(), k.recv()];
-    let from = |agent: &str| {
-        let result = results.iter().find(|m| m["agent"] == agent);
-        result.unwrap_or_else(|| panic!("no result from {agent}: {results:?}"))
-    };
-    assert_eq!(from("sub")["output"], "'sub raised it'\n");
-    assert_eq!(from(PRIMARY)["output"], "'primary saw it'\n");
+    assert_eq!(result_from(&results, "sub")["output"], "'sub raised it'\n");
+    assert_eq!(
+        result_from(&results, PRIMARY)["output"],
+        "'primary saw it'\n"
+    );
+}
+
+/// The one of `results` from `agent`.
+fn result_from<'a>(results: &'a [Value], agent: &str) -> &'a Value {
+    let result = results.iter().find(|m| m["agent"] == agent);
+    result.unwrap_or_else(|| panic!("no result from {agent}: {results:?}"))
 }
 
 // ---------------------------------------------------------------------------- attribution
@@ -1123,9 +1151,14 @@ fn closing_stdin_ends_the_interpreter_even_mid_execution() {
 // ---------------------------------------------------------------------------- interrupts
 
 impl Interpreter {
+    /// Submit `source` to `agent` without waiting for its result.
+    fn submit_in(&mut self, agent: &str, id: u64, source: &str) {
+        self.send(json!({"t": "exec", "agent": agent, "id": id, "src": source}));
+    }
+
     /// Submit `source` to the primary without waiting for its result.
     fn submit(&mut self, id: u64, source: &str) {
-        self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}));
+        self.submit_in(PRIMARY, id, source);
     }
 
     fn cancel(&mut self, id: u64) {
@@ -1620,4 +1653,289 @@ fn indent(source: &str) -> String {
         .map(|line| format!("    {line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ---------------------------------------------------------------------------- memory
+
+/// A ceiling a test can reach in a second or two.
+const CEILING: u64 = 256 << 20;
+
+/// Ordinary work that needs tens of mebibytes: a million-element list.
+const ORDINARY: &str = "len(list(range(10**6)))";
+
+/// Python that grows global `name` until memory runs out, a mebibyte at a
+/// time.
+fn grown_coarsely(name: &str) -> String {
+    format!("{name} = []\nwhile True:\n    {name}.append(bytearray(1 << 20))")
+}
+
+/// The same, a small string at a time: the growth that leaves the least room
+/// behind it, and the one that stopped the interpreter from reporting at all
+/// until it held memory back for itself.
+fn grown_finely(name: &str) -> String {
+    format!("{name} = []\nwhile True:\n    {name}.append(str(len({name})) * 3)")
+}
+
+/// The error of a result that ran out of memory. Its traceback is not checked:
+/// an allocation that took the last of the room can leave CPython none to
+/// build one with.
+fn out_of_memory(result: &Value) -> String {
+    let error = error_of(result);
+    assert!(error.contains("MemoryError"), "{error}");
+    error
+}
+
+/// The ceiling the interpreter sets itself on this machine, by its rule
+/// restated: half the smaller of the cgroup's limit and the machine's memory,
+/// and never above a soft limit already in place.
+fn derived_ceiling() -> u64 {
+    let cgroup = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok()?.trim().parse().ok());
+    let total = sysinfo().expect("sysinfo").ram_total();
+    let half = cgroup.chain([total]).min().expect("a size") / 2;
+    let (soft, _) = getrlimit(Resource::RLIMIT_DATA).expect("RLIMIT_DATA");
+    half.min(soft)
+}
+
+/// A limit as the Python below prints it.
+fn limit(value: u64) -> String {
+    if value == RLIM_INFINITY {
+        "unlimited".into()
+    } else {
+        value.to_string()
+    }
+}
+
+#[test]
+fn an_outsized_allocation_is_an_error_result_and_the_next_submission_runs() {
+    let mut k = Interpreter::start();
+    let error = out_of_memory(&k.exec(1, "x = [0] * 10**12"));
+    assert!(error.contains("File \"<execution>\""), "{error}");
+    assert_eq!(k.output(2, "1 + 1"), "2\n");
+}
+
+#[test]
+fn a_gradual_allocation_raises_at_the_ceiling_and_recovers_once_released() {
+    for (grown, traced) in [(grown_coarsely("x"), true), (grown_finely("x"), false)] {
+        let mut k = Interpreter::start_with_ceiling(CEILING);
+        let error = out_of_memory(&k.exec(1, &grown));
+        assert!(!traced || error.contains("File \"<execution>\""), "{error}");
+        // `x` still holds everything the ceiling allowed, and this still runs.
+        assert_eq!(k.output(2, "x = None\n'released'"), "'released'\n");
+        assert_eq!(k.output(3, ORDINARY), "1000000\n");
+    }
+}
+
+#[test]
+fn running_out_again_before_releasing_is_still_reported() {
+    // What a model plausibly does next: try again, or try something else,
+    // before letting go of what the first attempt still holds.
+    let mut k = Interpreter::start_with_ceiling(CEILING);
+    out_of_memory(&k.exec(1, &grown_finely("x")));
+    // With `x` still held, `y` gets whatever is left.
+    out_of_memory(&k.exec(2, &grown_finely("y")));
+    // The first attempt again, which lets go of `x` only to fill the room once more: what bricked
+    // a reserve taken back only once there was room to spare.
+    out_of_memory(&k.exec(3, &grown_finely("x")));
+    assert_eq!(k.output(4, "x = y = None\n'released'"), "'released'\n");
+    assert_eq!(k.output(5, ORDINARY), "1000000\n");
+}
+
+#[test]
+fn output_written_at_the_ceiling_is_drained_and_counted_once() {
+    // The drain once read into a buffer it allocated per read. At the ceiling that failed and
+    // ended the drain, leaving every writer -- the body among them -- blocked on a full pipe, and
+    // the result never came. Then, running out part-way through a read, it counted the whole read
+    // dropped while keeping some of it.
+    let mut k = Interpreter::start_with_ceiling(CEILING);
+    // Enough, at the last, to fill the pipe several times over.
+    let writes = [(7, 2341), (16, 1024), (64, 256), (1000, 16), (4096, 64)];
+    for (id, (size, count)) in (1..).zip(writes) {
+        let pin_then_write = py(&format!(
+            r#"
+            import sys
+            out = b'y' * {size}
+            x = []
+            for size in (1 << 20, 1 << 16, 1 << 12):
+                try:
+                    while True:
+                        x.append(bytearray(size))
+                except MemoryError:
+                    pass
+            for _ in range({count}):
+                sys.stdout.buffer.write(out)
+            x = None
+            "#
+        ));
+        let result = k.exec(id, &pin_then_write);
+        assert_eq!(result["status"], "ok", "{result}");
+        let kept = text(&result["output"]).len();
+        let dropped = result["dropped"].as_u64().expect("a count");
+        let dropped = usize::try_from(dropped).expect("fits");
+        assert_eq!(kept + dropped, size * count, "{result}");
+    }
+    assert_eq!(k.output(10, ORDINARY), "1000000\n");
+}
+
+#[test]
+fn an_execution_awaiting_at_the_ceiling_is_still_woken() {
+    // asyncio drops a callback it has no memory to schedule. When that was a task's wakeup, the
+    // task never ran again -- not even to take a cancel -- and its execution never reported. The
+    // host's probe while it waits is what used the last of the room.
+    let mut k = Interpreter::start_with_ceiling(CEILING);
+    let pin_then_await = py(r#"
+        import os
+        x = []
+        for size in (1 << 20, 1 << 16, 1 << 12):
+            try:
+                while True:
+                    x.append(bytearray(size))
+            except MemoryError:
+                pass
+        os.write(2, b'PINNED\n')
+        await asyncio.sleep(1)
+        x = None
+        'woke'
+        "#);
+    k.submit(1, &pin_then_await);
+    k.await_stderr("PINNED");
+    k.loop_turns(50);
+    let woke = k.result_of(1);
+    assert_eq!(woke["output"], "'woke'\n", "{woke}");
+    assert_eq!(k.output(2, ORDINARY), "1000000\n");
+}
+
+#[test]
+fn a_sibling_fails_while_the_ceiling_is_pinned_and_recovers_after() {
+    // The ceiling is the process's, not an agent's. This is the limit of it,
+    // pinned so that it cannot quietly be forgotten.
+    let mut k = Interpreter::start_with_ceiling(CEILING);
+    k.open("sub");
+    let gate = py(r#"
+        import sys, threading, types
+        gate = types.ModuleType('gate')
+        gate.pinned, gate.release = threading.Event(), threading.Event()
+        sys.modules['gate'] = gate
+        "#);
+    assert_eq!(k.output(1, &gate), "");
+
+    // Started before the ceiling is pinned, so it already has what an
+    // execution needs to run.
+    let wait_then_work = py(&format!(
+        r#"
+        import gate
+        assert gate.pinned.wait({timeout}), 'never pinned'
+        {ORDINARY}
+        "#,
+        timeout = TIMEOUT.as_secs(),
+    ));
+    k.submit_in("sub", 1, &wait_then_work);
+    // All but two mebibytes, held until the sub-agent says to let go.
+    let pin = py(&format!(
+        r#"
+        import gate
+        held = []
+        try:
+            while True:
+                held.append(bytearray(1 << 20))
+        except MemoryError:
+            pass
+        del held[-2:]
+        gate.pinned.set()
+        assert gate.release.wait({timeout}), 'never released'
+        del held
+        'released'
+        "#,
+        timeout = TIMEOUT.as_secs(),
+    ));
+    k.submit(1, &pin);
+
+    let failed = k.recv();
+    assert!(failed["agent"] == "sub" && failed["id"] == 1, "{failed}");
+    out_of_memory(&failed);
+
+    // Still pinned; the reserve is what lets this one start.
+    k.submit_in("sub", 2, "import gate\ngate.release.set()");
+    let results = [k.recv(), k.recv()];
+    assert_eq!(result_from(&results, "sub")["status"], "ok", "{results:?}");
+    assert_eq!(result_from(&results, PRIMARY)["output"], "'released'\n");
+
+    assert_eq!(k.output_in("sub", 3, ORDINARY), "1000000\n");
+}
+
+#[test]
+fn an_execd_child_inherits_the_ceiling_and_can_lift_its_own() {
+    let (_, hard) = getrlimit(Resource::RLIMIT_DATA).expect("RLIMIT_DATA");
+    let (space_soft, space_hard) = getrlimit(Resource::RLIMIT_AS).expect("RLIMIT_AS");
+    let report = py(r#"
+        import subprocess, sys
+        CHILD = """
+        import resource
+        def show(which):
+            return ' '.join('unlimited' if v == resource.RLIM_INFINITY else str(v)
+                            for v in resource.getrlimit(which))
+        print(show(resource.RLIMIT_DATA), show(resource.RLIMIT_AS))
+        resource.setrlimit(resource.RLIMIT_DATA, (resource.getrlimit(resource.RLIMIT_DATA)[1],) * 2)
+        print(show(resource.RLIMIT_DATA))
+        """
+        child = subprocess.run([sys.executable, '-c', CHILD], check=True)
+        "#);
+    for (mut k, ceiling) in [
+        (Interpreter::start_with_ceiling(CEILING), CEILING),
+        (Interpreter::start(), derived_ceiling()),
+    ] {
+        // The soft limit is the ceiling; the hard one and the address space
+        // are as the interpreter found them. Lifting its own is up to the
+        // child, and needs no privilege.
+        let expected = format!(
+            "{} {} {} {}\n{} {}\n",
+            limit(ceiling),
+            limit(hard),
+            limit(space_soft),
+            limit(space_hard),
+            limit(hard),
+            limit(hard),
+        );
+        assert_eq!(k.output(1, &report), expected);
+    }
+}
+
+#[test]
+fn a_real_build_runs_under_the_ceiling() {
+    // What the ceiling reaches besides Python: a toolchain whose threads and
+    // allocators reserve far more than they use. Under an inherited
+    // 512 MiB, `cargo build` of this fails.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest = "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                    [workspace]\n";
+    std::fs::write(dir.path().join("Cargo.toml"), manifest).expect("write Cargo.toml");
+    std::fs::create_dir(dir.path().join("src")).expect("create src");
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .expect("write main.rs");
+    let build = py(&format!(
+        r#"
+        import os, subprocess
+        build = subprocess.run(
+            [{cargo:?}, 'build', '--offline', '--quiet'],
+            cwd={dir:?},
+            env={{**os.environ, 'CARGO_TARGET_DIR': os.path.join({dir:?}, 'target')}},
+            capture_output=True,
+            text=True,
+        )
+        print(build.returncode)
+        if build.returncode:
+            print(build.stderr[-4000:])
+        "#,
+        cargo = env!("CARGO"),
+        dir = dir.path().to_str().expect("a UTF-8 temp path"),
+    ));
+    let mut k = Interpreter::start();
+    assert_eq!(k.output(1, &build), "0\n");
 }

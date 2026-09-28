@@ -77,6 +77,8 @@ tar    = { workspace = true }
 ureq   = { workspace = true, features = ["rustls"] }
 
 [dev-dependencies]
+# `resource` starts the interpreter under a memory ceiling of the test's choosing.
+nix      = { workspace = true, features = ["resource"] }
 reqwest  = { workspace = true, features = ["json", "rustls"] }
 sha2     = { workspace = true }
 # `test-util` pauses the clock so the interceptor's sniff window can be driven

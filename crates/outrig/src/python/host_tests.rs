@@ -426,6 +426,13 @@ mod e2e {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, "1 + 1").await, ok("2\n"));
+        // The memory ceiling, read from what the container sees -- its cgroup
+        // and its memory -- and inherited by a program the interpreter starts.
+        let ceiling = "import resource, subprocess\n\
+                       soft = resource.getrlimit(resource.RLIMIT_DATA)[0]\n\
+                       shell = subprocess.run(['sh', '-c', 'ulimit -d'], capture_output=True)\n\
+                       print(soft != resource.RLIM_INFINITY, int(shell.stdout) == soft // 1024)";
+        assert_eq!(run(&interpreter, ceiling).await, ok("True True\n"));
         drop(interpreter);
         container
             .stop(Duration::from_secs(2))

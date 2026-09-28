@@ -304,6 +304,13 @@ Python that keeps its event loop from turning while a CPU stays busy, such as `w
 is interrupted after about half a minute without anyone pressing anything, and the model reads
 the traceback. Code waiting on a subprocess, a sleep, or a read is left to finish.
 
+Python that allocates more memory than its ceiling -- half of what the container can see -- gets
+a `MemoryError` rather than being killed, and the model reads that too. The ceiling is the whole
+interpreter's: until the memory is let go, by `del` or by rebinding the name, anything else the
+Python tries to allocate fails as well. Programs it starts inherit the same ceiling, each for
+itself, and one that needs more can raise its own with `ulimit -d unlimited`. Python that calls
+`os._exit` still ends the session.
+
 `run-new` does not yet take `run`'s `--env`, `--network`, `--volume`, `--max-tool-calls`, or
 `--max-tool-result-bytes`. The config keys behind the last two, `tool-call-max` and
 `tool-result-max`, apply, as do `[network]` and `[workspace]`. `-v` writes no

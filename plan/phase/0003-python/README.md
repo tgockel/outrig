@@ -17,11 +17,11 @@ misread: a round may last as long as the work does, and a slow `await` inside on
 calls at all.
 
 Two more, because one word was doing both jobs. The **interpreter** is the process: one per
-session, holding the protocol, the reader thread, and the address-space ceiling. A **kernel** is
+session, holding the protocol, the reader thread, and the memory ceiling. A **kernel** is
 one agent's execution environment inside it -- its namespace, its event loop, its endpoints, its
 execution slot. The sense is Jupyter's, where a kernel is a namespace you submit code to, with the
 caveat that Jupyter's are separate processes and these are threads sharing one. Earlier drafts
-used "kernel" for the process, which read badly beside `RLIMIT_AS` and signals.
+used "kernel" for the process, which read badly beside a process-wide memory ceiling and signals.
 
 Only the new loop and these documents adopt any of this; `outrig-cli` keeps its own.
 

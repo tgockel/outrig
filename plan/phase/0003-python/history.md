@@ -60,7 +60,7 @@ runtime.context.promote(failed[-2:])
 The shapes above are illustrative; the signatures are not settled here.
 
 Holding it whole is the simple choice rather than the clever one. The cost is interpreter memory
-proportional to the session, under the same address-space ceiling as everything else
+proportional to the session, under the same memory ceiling as everything else
 (`agent-placement.md`). If that becomes a problem the fallback is known -- mirror each turn's
 shape and fetch bodies on demand -- and it is a change to one side of the protocol rather than to
 the idea.

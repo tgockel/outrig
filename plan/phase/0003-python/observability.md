@@ -142,7 +142,7 @@ retires a workaround -- today the failover chain's state is recovered by prefix-
 grows, and the first entries are already known: a tool result truncated (`rig_tool.rs` writes a
 marker into model-visible text and counts nothing); the effective `max-tokens` ceiling, which never
 escapes `build_agent`; agent lifecycle, including an agent that wedged past recovery; an interrupt
-sent and a liveness probe that failed; a `MemoryError` raised by the address-space ceiling.
+sent and a liveness probe that failed; a `MemoryError` raised by the memory ceiling.
 
 **A promotion is an event**, and not an optional one. `history.md` lets an agent move something
 from its full history into the context the provider sees. Without a record of that, the stream

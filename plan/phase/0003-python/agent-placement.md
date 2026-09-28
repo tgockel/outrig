@@ -30,14 +30,14 @@ without being rewritten, and the interpreter is being ported regardless.
   |   reader thread  -- NDJSON in on _PROTO_IN, routed by agent id      |
   |   _PROTO_OUT     -- NDJSON out, behind one writer lock              |
   |   fd 1, fd 2     -- the exec's stderr: the unattributed bucket      |
-  |   RLIMIT_AS      -- one ceiling, shared by every agent              |
+  |   RLIMIT_DATA    -- one ceiling, shared by every agent              |
   +---------------------------------------------------------------------+
 ```
 
 Each agent owns a session module registered in `sys.modules`, a runtime, its channel endpoints, a
 backlog of background output, an event loop, and an execution slot; each execution in it owns a
 pipe. That bundle is the agent's **kernel**; the process hosting them all is the **interpreter**,
-and it owns the protocol descriptors, the reader thread, the address-space ceiling, and the signal
+and it owns the protocol descriptors, the reader thread, the memory ceiling, and the signal
 handler. Which of those two lists a thing falls into is the whole of this page.
 
 A channel between two co-hosted agents never reaches the host, but `messages.md` governs it
@@ -187,20 +187,21 @@ the threads never go away, so a long session degrades rather than fails.
 
 ## Memory is a session-wide resource
 
-Threads contain a runaway loop. They do not contain a runaway allocation: `[x] * 10**12` in any
-agent would have the process OOM-killed and every agent with it.
+Threads contain a runaway loop. They do not contain a runaway allocation: a list any agent grows
+until the machine runs out has the process OOM-killed, and every agent with it.
 
-`RLIMIT_AS`, set once at interpreter start, converts that into a `MemoryError` raised in the
-allocating thread, which returns as that agent's error result with a traceback -- the same recovery
-shape the interrupt path already has. Measured against a 512 MiB ceiling: the outsized allocation
-raised immediately, a gradual one raised after 484 MiB, and the interpreter was alive and usable
-afterwards in both cases.
+A memory ceiling, `RLIMIT_DATA` set once at interpreter start, converts that into a `MemoryError`
+raised in the allocating thread, which returns as that agent's error result with a traceback --
+the same recovery shape the interrupt path already has. `runtime-protection.md` records how it was
+built: the knob, the value, what the programs an agent starts inherit, and the reserve the
+interpreter holds back so that running out can still be reported.
 
 The ceiling is process-wide and the consequence is worse than "the greedy agent gets an error."
-Measured: while one agent sits pinned at the ceiling, an ordinary `import json` on another thread
-raises `MemoryError` too. Recovery is automatic once the memory is released, but for as long as it
-is held, every agent in the session is degraded. This is an improvement on an unexplained OOM
-kill, not an isolation mechanism, and it should not be described as one.
+Measured: while one agent sits pinned at the ceiling, ordinary work on another thread -- an
+import, a million-element list -- raises `MemoryError` too. Recovery is automatic once the memory
+is released, but for as long as it is held, every agent in the session is degraded. This is an
+improvement on an unexplained OOM kill, not an isolation mechanism, and it should not be described
+as one.
 
 `os._exit(0)` remains uncontained. It is one line of generated code and it ends the session.
 
@@ -246,10 +247,6 @@ environment, or signals -- the four things that actually bite.
 
 - Whether a wedged subagent should ever be recoverable. Subinterpreters are the only real route
   and the answer above is why they are not taken yet.
-- What the `RLIMIT_AS` ceiling should be, and whether it is operator-configurable. A ceiling that
-  is too low turns ordinary work into `MemoryError` for everyone.
-- Whether `RLIMIT_AS` or `RLIMIT_DATA` is the right knob. `AS` is simpler and is awkward for
-  mmap-heavy code.
 - Whether an agent can ever be placed in a process of its own -- a per-agent escalation rather
   than a global choice. Nothing here forecloses it, and the protocol's agent id is what would
   make it invisible to both halves.

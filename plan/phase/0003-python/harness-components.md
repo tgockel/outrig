@@ -39,7 +39,7 @@ phase.
   | container/  lifecycle, exec, mounts        |         | interpreter process    |
   | mcp/        clients, proxy                 |         |  reader thread         |
   | config/     Agent, Model, LlmProvider      |         |  _PROTO_IN/_OUT, fd 1  |
-  | network/    interceptor                    |         |  RLIMIT_AS             |
+  | network/    interceptor                    |         |  RLIMIT_DATA           |
   +--------------------------------------------+         |                        |
                                                          |  per agent, per thread:|
                                                          |   session module in    |
@@ -122,7 +122,7 @@ Ported from the prototype rather than redesigned, with one change of shape. Ther
 process per session, started through `podman exec -i` and spoken to in NDJSON -- and it hosts one
 agent per thread rather than being one agent. Each agent owns a session module, an event loop, its
 channel endpoints, a backlog of background output, and an execution slot; the process owns the
-protocol descriptors, the reader thread, the address-space ceiling, and the signal handler. The
+protocol descriptors, the reader thread, the memory ceiling, and the signal handler. The
 primary agent runs on the main thread, because that is the only thread an interrupt can reach.
 `agent-placement.md` decides all of this and records what it costs. The interpreter itself is a
 static build mounted read-only, so the image needs nothing -- not a Python, not a shell, not a libc
@@ -141,5 +141,5 @@ report it; the interrupt mechanism and the liveness probe that recover from it a
 `runtime-protection.md`, and they come across with the port rather than after it. Co-hosting
 bounds how far that reaches and also how far the cure reaches -- a wedged subagent costs its
 siblings throughput rather than stopping them, and cannot itself be freed. Descendant processes
-and output rate remain a later milestone; the address-space ceiling does not, because without it
+and output rate remain a later milestone; the memory ceiling does not, because without it
 one agent's allocation ends the session.

@@ -8,7 +8,7 @@ output. The process owns what they share: the protocol descriptors, the reader t
 routes messages by agent id, and the descriptors executed code writes to. The primary agent's
 kernel runs on the main thread, because that is the only thread a signal handler runs on.
 
-Four things here are load-bearing rather than incidental:
+Five things here are load-bearing rather than incidental:
 
 - **The protocol never shares a descriptor with the program.** Both protocol streams are moved
   aside at start. fd 0 then reads `/dev/null`, and fds 1 and 2 are the exec's stderr, which the
@@ -32,6 +32,10 @@ Four things here are load-bearing rather than incidental:
   The handler raises only where the stack shows code a submission wrote, never in the loop's own
   bookkeeping or halfway through a protocol line. A `cancel` goes the other way, through the
   loop, and is the remedy for an execution suspended on an await rather than for a wedge.
+- **Running out of memory is a result, not the end of the process.** A ceiling set at start
+  turns an allocation past it into a `MemoryError` in the thread that made it, and a reserve held
+  while agent code runs leaves room to report it with. It is not isolation, for the reasons the
+  memory section below gives.
 """
 
 import ast
@@ -44,7 +48,9 @@ import functools
 import inspect
 import io
 import json
+import mmap
 import os
+import resource
 import select
 import signal
 import subprocess
@@ -132,8 +138,12 @@ def _clean(value):
 _send_lock = threading.Lock()
 
 
+def _encode(message):
+    return (json.dumps(_clean(message)) + "\n").encode("utf-8")
+
+
 def _send(message):
-    line = (json.dumps(_clean(message)) + "\n").encode("utf-8")
+    line = _with_room(_encode, message)
     with _send_lock:
         _write_all(_PROTO_OUT, line)
 
@@ -236,10 +246,16 @@ class _Execution:
 
     def _drained_pipe(self, sentinel):
         """A new pipe with a thread draining it into this execution; returns the write end."""
+        # Made here rather than in the thread, where running out of memory would end the thread
+        # before it had read anything.
+        buffer = bytearray(1 << 16)
         read, write = os.pipe()
         try:
             threading.Thread(
-                target=self._drain, args=(read, sentinel), name=f"drain-{self.id}", daemon=True
+                target=self._drain,
+                args=(read, sentinel, buffer),
+                name=f"drain-{self.id}",
+                daemon=True,
             ).start()
         except BaseException:
             os.close(read)
@@ -247,7 +263,7 @@ class _Execution:
             raise
         return write
 
-    def _drain(self, fd, sentinel):
+    def _drain(self, fd, sentinel, buffer):
         """Read one pipe until everything holding it has closed it.
 
         Bytes before `sentinel` are the body's own output. The sentinel is written when the body
@@ -255,56 +271,141 @@ class _Execution:
         sentinel, every byte is of that second kind.
 
         This thread has to outlive anything that goes wrong in it: a pipe nobody drains blocks
-        its writers, and one of them may be holding the lock its execution needs to report.
+        its writers, and one of them may be holding the lock its execution needs to report. So it
+        reads into `buffer`, which it brought with it, and what it then has no memory to keep is
+        counted as dropped rather than left in the pipe. It does not give the reserve back to keep
+        more: agent code runs meanwhile, and would take the reserve instead. And whatever ends the
+        thread closes the pipe, so a writer gets an error rather than waiting for ever.
+
+        Every byte is kept or counted dropped, once. Where there is not even the memory to count,
+        a byte goes uncounted rather than counted twice.
         """
-        pending = b""
-        while True:
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError as e:
-                _diag(f"execution {self.id!r}: reading its output failed: {e!r}")
-                break
-            if not chunk:
-                break
-            try:
-                if sentinel is None:
-                    self._take(chunk)
-                    continue
-                pending += chunk
-                head, found, tail = pending.partition(sentinel)
-                if found:
-                    self._take(head)
-                    self._end_body()
-                    sentinel, pending = None, b""
-                    if tail:
-                        self._take(tail)
-                elif len(pending) >= len(sentinel):
-                    # Hold back enough that a sentinel split across two reads is still found.
-                    keep = len(sentinel) - 1
-                    self._take(pending[:-keep])
-                    pending = pending[-keep:]
-            except Exception as e:
-                _diag(f"execution {self.id!r}: attributing its output failed: {e!r}")
+        view = memoryview(buffer)
+        into = [buffer]
+        # The end of the body's output so far, held back in case it begins the sentinel.
+        held = b""
         try:
-            if pending:
-                self._take(pending)
-        except Exception as e:
-            _diag(f"execution {self.id!r}: attributing its output failed: {e!r}")
-        self._end_body()
-        os.close(fd)
+            while True:
+                try:
+                    count = os.readv(fd, into)
+                except OSError as e:
+                    _diag(f"execution {self.id!r}: reading its output failed: {e!r}")
+                    break
+                if not count:
+                    break
+                try:
+                    if sentinel is None:
+                        self._pass(view, 0, count)
+                        continue
+                    held = self._split(view, count, sentinel, held)
+                    if held is None:
+                        sentinel, held = None, b""
+                except MemoryError:
+                    # No memory even to count what was lost. What was held back goes uncounted
+                    # with it, since some of it may already have been passed on.
+                    held = b""
+                except Exception as e:
+                    _diag(f"execution {self.id!r}: attributing its output failed: {e!r}")
+            self._pass(held, 0, len(held))
+        finally:
+            os.close(fd)
+            self._end_body()
+
+    def _split(self, view, count, sentinel, held):
+        """Pass on `view`'s first `count` bytes, read after `held`, while the body's output could
+        still end at `sentinel`. Returns the bytes to hold back now, or `None` once it has ended.
+
+        The sentinel is looked for in place, so that nothing larger than it is copied to find it.
+        """
+        size = len(sentinel)
+        try:
+            # One that began in what was held back ends in the first bytes of this read.
+            start = (held + view[: min(count, size - 1)]).find(sentinel)
+        except MemoryError:
+            start = -1
+        if start >= 0:
+            self._pass(held, 0, start)
+            self._end_body()
+            self._pass(view, start + size - len(held), count)
+            return None
+        found = view.obj.find(sentinel, 0, count)
+        if found >= 0:
+            self._pass(held, 0, len(held))
+            self._pass(view, 0, found)
+            self._end_body()
+            self._pass(view, found + size, count)
+            return None
+        # All but the last `size - 1` bytes of `held` and this read are the body's; those are held
+        # back, taken before anything is passed on so that each byte goes one way only.
+        hold = min(size - 1, len(held) + count)
+        cut = len(held) + count - hold
+        try:
+            if cut >= len(held):
+                tail = bytes(view[cut - len(held) : count])
+            else:
+                tail = held[cut:] + view[:count]
+        except MemoryError:
+            tail = None
+        if cut >= len(held):
+            self._pass(held, 0, len(held))
+            self._pass(view, 0, cut - len(held))
+        else:
+            self._pass(held, 0, cut)
+        if tail is None:
+            self._lose(hold)
+            return b""
+        return tail
+
+    def _pass(self, data, start, end):
+        """Attribute `data[start:end]`, or count it dropped if there is no memory to copy it out.
+
+        Each byte once: `_take` keeps all of what it is given or none of it.
+        """
+        if start >= end:
+            return
+        try:
+            part = bytes(data[start:end])
+        except MemoryError:
+            self._lose(end - start)
+            return
+        try:
+            self._take(part)
+        except MemoryError:
+            self._lose(len(part))
 
     def _take(self, data):
+        """Attribute `data`: all of it, or -- raising `MemoryError` -- none of it."""
         with self._buf_lock:
             if not self._drained.is_set():
                 kept = data[: OUTPUT_MAX - len(self._captured)]
+                dropped = self._dropped + len(data) - len(kept)
                 self._captured += kept
-                self._dropped += len(data) - len(kept)
+                self._dropped = dropped
                 return
         self.kernel.background(self.id, data)
 
+    def _lose(self, count):
+        """Count `count` bytes the drain had no memory to keep as dropped.
+
+        Raises nothing: the drain has to carry on, and nobody to tell.
+        """
+        try:
+            with self._buf_lock:
+                if not self._drained.is_set():
+                    self._dropped += count
+                    return
+            self.kernel.lose(self.id, count)
+        except MemoryError:
+            pass
+
     def _end_body(self):
         with self._buf_lock:
-            self._drained.set()
+            try:
+                self._drained.set()
+            except MemoryError:
+                # Set all the same: only waking a waiter failed, and `finish` does not wait for
+                # ever.
+                pass
 
     def _spent(self, data):
         """Count `data` as dropped if the budget is already spent.
@@ -473,7 +574,13 @@ def _attributed_exception(loop, context):
     collected, and "Exception in callback" from its loop, with no execution in context either
     way; it would land in the unattributed bucket. The task or callback still carries the context
     it was created in, which names the execution -- and its traceback is often the whole story.
+
+    Running out of memory in the loop's own work gives the reserve back first. Reading its wakeup
+    pipe fails that way while agent code holds memory at the ceiling, and would fail again at once
+    on every turn for as long as it did.
     """
+    if isinstance(context.get("exception"), MemoryError):
+        _give_reserve()
     source = context.get("task") or context.get("future") or context.get("handle")
     get_context = getattr(source, "get_context", None)
     token = _CURRENT.set(None if get_context is None else get_context().get(_CURRENT))
@@ -481,6 +588,128 @@ def _attributed_exception(loop, context):
         loop.default_exception_handler(context)
     finally:
         _CURRENT.reset(token)
+
+
+# ---------------------------------------------------------------------------- memory
+
+# Agents share this process, so without a ceiling one agent's runaway allocation would have the
+# kernel kill it and every agent with it. The ceiling is `RLIMIT_DATA`, which counts private
+# writable memory -- the heap, thread stacks -- and not file mappings or address space reserved and
+# never made writable, which is how a JVM or V8 starts. Past it an allocation raises `MemoryError`
+# in the thread that made it, and the execution reports it like any other failure.
+#
+# It is a ceiling, not isolation. It is the process's, so while one agent holds memory up to it
+# every agent's allocations fail too, until that memory is let go. Shared anonymous memory
+# (`mmap.mmap(-1, n)` without `MAP_PRIVATE`) is not counted. And `os._exit` ends the session
+# whatever the ceiling.
+
+
+def _memory_visible():
+    """The memory this process can use, in bytes.
+
+    Its cgroup's limit where it has one -- cgroup v2's `memory.max`, else v1's -- and never more
+    than the machine has, which is `MemTotal`. A limit on a cgroup above the container's own is not
+    visible from here.
+    """
+    found = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")]
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        # "max" when unlimited, which is not a number either.
+        with contextlib.suppress(OSError, ValueError), open(path) as f:
+            found.append(int(f.read()))
+    return min(found)
+
+
+def _set_ceiling():
+    """Lower `RLIMIT_DATA`'s soft limit to half the memory the container can see.
+
+    Half, so the interpreter runs out before the machine does and the kernel's OOM killer is not
+    what answers; and half of what is there, so the ceiling grows with the machine as the
+    programs an agent runs do. A lower soft limit already in place is kept.
+
+    Every process the interpreter starts inherits the soft limit as a ceiling of its own -- in a
+    threaded process there is no safe point between fork and exec to hand a child anything else.
+    So the hard limit is left where it was: a program that needs more can lift its own, with
+    `ulimit -d unlimited` or `resource.setrlimit`.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
+    ceiling = _memory_visible() // 2
+    if soft != resource.RLIM_INFINITY:
+        ceiling = min(ceiling, soft)
+    try:
+        resource.setrlimit(resource.RLIMIT_DATA, (ceiling, hard))
+    except (OSError, ValueError) as e:
+        _diag(f"no memory ceiling: setting it to {ceiling} bytes failed: {e!r}")
+
+
+# Memory held back for the interpreter's own work. Agent code can use everything up to the
+# ceiling, and would then leave nothing to report with -- no room to format a traceback, to start
+# the thread the next execution's output needs, or to free the slot, which would refuse every
+# submission after. So the reserve is held while agent code runs and given back while the
+# interpreter works for itself: starting an execution, reading a request, reporting a result.
+#
+# Its maps are never written, so they count against the ceiling without costing memory. Taking
+# them back can succeed in part: while agent code pins memory at the ceiling, the next execution
+# runs with what is left, and fails at once unless it frees something first.
+RESERVE = 32 << 20
+RESERVE_PIECE = 1 << 20  # what is taken back at a time when all of it will not fit
+_reserve = []
+_reserve_lock = threading.Lock()
+
+
+def _give_reserve():
+    """Give the reserve back, so the interpreter's own work has room."""
+    with _reserve_lock:
+        while _reserve:
+            _reserve.pop().close()
+
+
+def _hold_reserve(sparing=0):
+    """Take back as much of the reserve as fits, before agent code runs again.
+
+    In one map when all of it fits, which is the usual case, and a piece at a time when not.
+    `sparing` bytes are left free after it, if they are free now.
+    """
+    with _reserve_lock:
+        try:
+            spared = mmap.mmap(-1, sparing, flags=mmap.MAP_PRIVATE) if sparing else None
+        except (OSError, MemoryError):
+            return
+        missing = RESERVE - sum(map(len, _reserve))
+        for size in (missing, RESERVE_PIECE):
+            while missing >= size > 0:
+                try:
+                    _reserve.append(mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE))
+                except (OSError, MemoryError):
+                    break
+                missing -= size
+        if spared is not None:
+            spared.close()
+
+
+def _with_room(fn, *args):
+    """`fn(*args)`, tried once more with the reserve given back if memory ran out."""
+    try:
+        return fn(*args)
+    except MemoryError:
+        _give_reserve()
+    return fn(*args)
+
+
+class _Loop(asyncio.SelectorEventLoop):
+    """An event loop that does not lose a wakeup for want of memory.
+
+    A future that completes schedules its callbacks -- a task's wakeup among them -- with
+    `call_soon`, and asyncio drops one it could not schedule. The task waiting on it then never
+    runs again, not even to take a cancel, and its execution never reports. So scheduling is the
+    interpreter's work too, and runs on the reserve when it has to.
+    """
+
+    def call_soon(self, callback, *args, context=None):
+        try:
+            return super().call_soon(callback, *args, context=context)
+        except MemoryError:
+            _give_reserve()
+        return super().call_soon(callback, *args, context=context)
 
 
 # ---------------------------------------------------------------------------- kernels
@@ -538,7 +767,11 @@ def _format_error(exc):
     answer for the type's own names. Whatever escapes those -- a `SystemExit`, or an interrupt
     aimed at a property that loops -- is caught here, so a failed execution always has something
     to report.
+
+    Formatted on the reserve: the failure may be that memory ran out, and the traceback still holds
+    whatever its frames had built.
     """
+    _give_reserve()
     try:
         tb = exc.__traceback__
         while tb is not None and tb.tb_frame.f_code.co_filename != "<execution>":
@@ -567,7 +800,7 @@ class Kernel:
 
     def __init__(self, agent):
         self.agent = agent
-        self.loop = asyncio.new_event_loop()
+        self.loop = _Loop()
         self.loop.set_exception_handler(_attributed_exception)
         self.module = types.ModuleType(_module_name(agent))
         self.globals = self.module.__dict__
@@ -606,9 +839,15 @@ class Kernel:
                 self.loop.run_forever()
             except BaseException as e:
                 # A `SystemExit` or `KeyboardInterrupt` raised in a background task escapes the
-                # loop rather than its task. It has ended that task; it must not end the agent.
-                if not self._interrupted_task(e):
-                    _diag(f"agent {self.agent!r}: {type(e).__name__} escaped its event loop")
+                # loop rather than its task. It has ended that task; it must not end the agent --
+                # and nor must running out of memory while saying so, which for the primary would
+                # return from `main` and end the process. A `try` rather than `suppress`, which
+                # would allocate.
+                try:
+                    if not self._interrupted_task(e):
+                        _diag(f"agent {self.agent!r}: {type(e).__name__} escaped its event loop")
+                except MemoryError:
+                    pass
         _diag(f"agent {self.agent!r}: its event loop was closed")
 
     def _interrupted_task(self, exc):
@@ -668,9 +907,13 @@ class Kernel:
             self._holder = None
 
     def _start(self, exec_id, source):
+        # Starting is the interpreter's own work, and runs on the reserve: the thread that drains
+        # the execution's output needs a stack, and the loop goes on to read its wakeup before the
+        # body runs. The body takes the reserve back.
+        _give_reserve()
         try:
             execution = _Execution(self, exec_id)
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, MemoryError) as e:
             self._release()
             self._reply(exec_id, "error", error=f"the execution could not start: {e!r}")
             return
@@ -694,7 +937,11 @@ class Kernel:
             if execution.cancel_requested:
                 raise asyncio.CancelledError("stopped before it started")
             self.globals["__outrig_echo__"] = _echo
-            result = eval(_compile(source), self.globals)  # noqa: S307 -- this is the feature
+            code = _with_room(_compile, source)
+            # Agent code runs with the reserve held, so that whatever it does to memory there is
+            # some left to report it with.
+            _hold_reserve()
+            result = eval(code, self.globals)  # noqa: S307 -- this is the feature
             if asyncio.iscoroutine(result):
                 await result
         except asyncio.CancelledError as e:
@@ -710,24 +957,39 @@ class Kernel:
             # the host holding a slot this side has freed.
             error = self._failure(e)
         finally:
+            # From here the interpreter works for itself, on the reserve.
+            _give_reserve()
             # Spent either way. What the handler kept would otherwise hold an interrupted
             # frame -- and whatever a runaway built in it -- until the next interrupt.
             self._interrupting = self._landed = None
+            # Before anything that allocates, so nothing that fails below can leave it held.
+            self.running = None
+            self._release()
             try:
                 output, dropped = execution.finish()
             except Exception as e:
                 _diag(f"execution {execution.id!r}: collecting its output failed: {e!r}")
                 output, dropped = "", 0
-            self.running = None
-            self._release()
-        self._reply(
-            execution.id,
-            "ok" if error is None else "error",
-            output=output,
-            dropped=dropped,
-            error=error,
-            background=self.take_background(),
-        )
+        try:
+            self._reply(
+                execution.id,
+                "ok" if error is None else "error",
+                output=output,
+                dropped=dropped,
+                error=error,
+                background=self.take_background(),
+            )
+        except MemoryError:
+            # Agent code still running -- a task, a thread -- took the room back. What the
+            # execution wrote is lost; that it ended is not.
+            self._reply(
+                execution.id,
+                "error",
+                error=error or "MemoryError: memory ran out while this result was reported\n",
+            )
+        # Sparing a piece: the loop goes idle now, and its own machinery -- reading its wakeup
+        # pipe, answering a probe -- must not find the ceiling where agent code left it.
+        _hold_reserve(sparing=RESERVE_PIECE)
 
     def _failure(self, exc):
         """A failed execution's report. The interrupt that may have caused it is spent."""
@@ -800,22 +1062,36 @@ class Kernel:
         _send({"t": "cpu", "agent": self.agent, "id": request_id, "seconds": seconds})
 
     def background(self, exec_id, data):
-        """Hold `data` for the next result, keeping the most recent `BG_MAX` bytes overall."""
+        """Hold `data` for the next result, keeping the most recent `BG_MAX` bytes overall.
+
+        All of it, or -- raising `MemoryError` -- none of it. Each step of the trim changes nothing
+        until everything it needs is allocated, so a byte is held or counted dropped, never both;
+        a trim that runs out leaves the backlog over its bound until the next one.
+        """
         if not data:
             # Zero bytes count nothing against the bound, so they must not take a place either.
             return
         with self._bg_lock:
-            self._bg.append((exec_id, data))
-            self._bg_len += len(data)
-            while self._bg_len > BG_MAX:
-                owner, oldest = self._bg[0]
-                cut = min(self._bg_len - BG_MAX, len(oldest))
-                if cut == len(oldest):
-                    self._bg.popleft()
-                else:
-                    self._bg[0] = (owner, oldest[cut:])
-                self._bg_len -= cut
-                self._bg_dropped[owner] += cut
+            entry, total = (exec_id, data), self._bg_len + len(data)
+            self._bg.append(entry)
+            self._bg_len = total
+            with contextlib.suppress(MemoryError):
+                while self._bg_len > BG_MAX:
+                    owner, oldest = self._bg[0]
+                    cut = min(self._bg_len - BG_MAX, len(oldest))
+                    rest = (owner, oldest[cut:]) if cut < len(oldest) else None
+                    remaining = self._bg_len - cut
+                    self._bg_dropped[owner] += cut
+                    if rest is None:
+                        self._bg.popleft()
+                    else:
+                        self._bg[0] = rest
+                    self._bg_len = remaining
+
+    def lose(self, exec_id, count):
+        """Count `count` bytes of `exec_id`'s background output as dropped."""
+        with self._bg_lock:
+            self._bg_dropped[exec_id] += count
 
     def take_background(self):
         """What other executions wrote since the last result, grouped by the one responsible.
@@ -1017,6 +1293,16 @@ def _route(line):
     handle(kernel, request_id, message)
 
 
+def _handle(line):
+    """Route one protocol line, or say why it could not be."""
+    if not line.strip():
+        return
+    try:
+        _with_room(_route, line)
+    except Exception as e:
+        _diag(f"ignored a message: {e}")
+
+
 def _read():
     """Read the host's messages off the protocol descriptor and route them by agent id.
 
@@ -1025,13 +1311,19 @@ def _read():
     """
     try:
         with os.fdopen(_PROTO_IN, "rb") as stream:
-            for line in stream:
-                if not line.strip():
-                    continue
+            while True:
                 try:
-                    _route(line)
-                except Exception as e:
-                    _diag(f"ignored a message: {e}")
+                    line = stream.readline()
+                    if not line:
+                        return
+                    _handle(line)
+                except MemoryError:
+                    # Agent code holds the memory. A line that failed to read whole within the
+                    # stream's buffer is read again once the reserve is given back, and waited on
+                    # if even that is not enough; one that had been read is lost, which costs less
+                    # than ending the session over it.
+                    _give_reserve()
+                    time.sleep(0.01)
     finally:
         # The host is gone. Exiting here rather than on a kernel's loop means a loop that has
         # stopped turning cannot keep the process alive after its session has ended.
@@ -1043,6 +1335,8 @@ def main():
         _diag(f"usage: python3 -I -c <program> <agent-id>; got {sys.argv[1:]!r}")
         os._exit(2)
     global _primary
+    # Before any agent exists, and every process it starts inherits it.
+    _set_ceiling()
     primary = Kernel(sys.argv[1])
     primary.thread = threading.current_thread()
     _kernels[primary.agent] = primary

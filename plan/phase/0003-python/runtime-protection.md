@@ -8,7 +8,8 @@ comprehension is not usable.
 Part of this was designed and proven on the prototype, and is recorded here so it was ported
 deliberately rather than rediscovered. The interrupt, the probe, and the cancel have since been
 built (`0003-06`); "What the port does" records how, and where the port departs from the
-prototype. The rest is a later milestone.
+prototype. The memory ceiling followed (`0003-07`), and "The memory ceiling, as built" does the
+same for it. The rest is a later milestone.
 
 ## The wedge, and why it is the hard one
 
@@ -108,7 +109,8 @@ overflowed it and killed the interpreter with `SIGSEGV`, every agent with it, be
 recursion limit could raise `RecursionError`. Measured on the payload: 1 MiB still crashed, 2 MiB
 did not. The interpreter sets 8 MiB, the main thread's, for every thread started after it boots --
 a subagent's, its reader, and any the agent starts -- so a subagent is no easier to crash than the
-primary. The cost is address space rather than memory, which `RLIMIT_AS` counts.
+primary. The cost is address space rather than resident memory, though the memory ceiling
+counts all of it.
 
 ## Two failures, two remedies
 
@@ -323,6 +325,117 @@ took the terminal's SIGINT on every Ctrl-C -- at the prompt too -- and exited, a
 exited with it when its stdin closed: measured, the session's next submission found the
 interpreter gone.
 
+## The memory ceiling, as built
+
+Threads contain a runaway loop, not a runaway allocation. A list one agent grows until the machine
+runs out has the kernel kill the interpreter, and every agent with it. The prototype's answer was
+one call at boot: `RLIMIT_AS` at 512 MiB, under which an outsized allocation raised at once and a
+gradual one after 484 MiB. Built in `0003-07`, the port keeps the shape -- a limit the interpreter
+sets on itself before any agent exists -- and departs from it in four places, each for a measured
+reason. Measured with the payload on a 32-core, 125 GiB host.
+
+**The knob is `RLIMIT_DATA`.** Inside the interpreter the two behave alike: at 512 MiB, gradual
+growth raised at 484 MiB under `AS` and 504 MiB under `DATA`, and an outsized request raised at
+once under both. They differ in what else they count, which matters because every program the
+agent starts inherits the limit (below), and many reserve address space far beyond what they use.
+`AS` counts every reservation. `DATA` counts private writable memory -- the heap, thread stacks --
+and not file mappings, nor space reserved and never made writable. The smallest ceiling, of
+256 MiB and each power of two to 8 GiB, that each program ran under:
+
+| program                            | `RLIMIT_AS`      | `RLIMIT_DATA` |
+|------------------------------------|------------------|---------------|
+| `cc` on a one-line C file          | 256 MiB          | 256 MiB       |
+| `go version`, `node -e`            | 1 GiB            | 256 MiB       |
+| `node` creating a wasm memory      | none up to 8 GiB | 256 MiB       |
+| `rustc`, or `cargo build`, a hello | 4 GiB            | 2 GiB         |
+| `java -version`                    | 8 GiB            | 4 GiB         |
+
+Java's is the JVM committing a sixty-fourth of the machine for its first heap, so it grows with
+the host. What `DATA` misses is shared anonymous memory -- `mmap.mmap(-1, n)` without
+`MAP_PRIVATE` -- which it does not count.
+
+**The value is half the memory the container can see**: the smaller of its cgroup's limit
+(`memory.max`, or v1's `memory.limit_in_bytes`) and `MemTotal`. OutRig sets no memory limit on the
+container, whose `memory.max` reads `max`, so today that is half the machine. Half, so that the
+interpreter runs out before the machine does; of what is there, so that the ceiling grows with the
+machine as the programs above do. The prototype's 512 MiB passed on to them would have failed
+every row but the first. A lower soft limit already in place is kept. The value is not
+configurable: a config key is a surface, and nobody has needed another number.
+
+It is growth that the ceiling is for. Without one, `[x] * 10**12` raises anyway -- the kernel's
+overcommit heuristic refuses a single request larger than the machine -- but a 100 GiB list was
+allocated in full.
+
+**Programs the agent starts inherit it, each on its own.** A limit passes across fork and exec, and
+a threaded process has no safe point between them to hand a child anything else: `preexec_fn` is
+documented unsafe with threads, raising the process's limit around a spawn lifts it for every
+other thread too, and a wrapper in front of each program breaks how `Popen` reports one that does
+not exist. So the soft limit is the policy for descendants as well, and the hard limit is left
+where it was. A lowered hard limit could not be raised again by an unprivileged process; one left
+high lets a program that needs more lift its own, with `ulimit -d unlimited` or
+`resource.setrlimit`. It is a ceiling per process rather than a share of one, so it bounds nothing
+about their sum; the container's memory still does that.
+
+**A reserve, so that running out can still be reported.** One call at boot was not enough. Growing
+a list a small string at a time leaves nothing behind it, and against the port the interpreter then
+could not format the traceback, and the next execution ran out in its own cleanup before it freed
+the slot -- so every submission after was refused, and the session was over in all but name.
+Coarser growth, an outsized request, and growth inside a comprehension, whose list is freed as the
+error unwinds, all reported cleanly. Fine growth into a global did not.
+
+So the interpreter holds 32 MiB back, mapped and never written: counted against the ceiling, costing
+no memory. Agent code runs with it held. The interpreter gives it back when it works for itself --
+formatting a failure, collecting output and reporting, starting an execution, scheduling a callback,
+encoding a message, reading a request -- and takes back what fits before the next body: in one map
+when all of it fits, and a mebibyte at a time when not. After each result it takes back what fits
+while leaving a mebibyte free, since the loop goes idle then and its own machinery must not find the
+ceiling where agent code left it. Taking it back in part is the point. While agent code pins memory
+at the ceiling, the next execution runs with almost nothing left, and fails at once unless it frees
+something first, which `x = None` and `del x` do without allocating. Measured with the reserve,
+every shape above reported with its traceback, the release that followed ran, and later work
+succeeded -- including running out a second time before releasing anything.
+
+Giving and taking it costs a trivial submission about a tenth of its round trip. Thirty-two maps
+remade for every execution cost 60 percent, which is why it is one map when it can be.
+
+**Two threads of the interpreter's own run while agent code does,** and neither can use the
+reserve without handing it to that code. Both once stopped for good at the ceiling, found in review.
+
+- *The drain.* It read each chunk of an execution's output into a buffer it allocated per read.
+  At the ceiling that raised, the thread ended with the pipe still open, and every writer -- the
+  body among them -- blocked on a full pipe; an interrupt could not help, since reporting writes to
+  that pipe too. The drain now reads into a buffer it is given before it starts, counts as dropped
+  what it has no memory to keep, and closes the pipe however it ends, so a writer gets an error
+  rather than waiting for ever. Its first cut then counted a whole read dropped when it ran out
+  part-way through one, keeping some of it too, so a result could report more bytes than were
+  written. Now every step keeps all of a range or none of it, and only what it lets go is counted:
+  each byte once, and uncounted rather than twice where there is no memory even to count it.
+- *The event loop.* A completing future schedules its callbacks with `call_soon`, and asyncio
+  drops one it cannot allocate. When that was an awaiting execution's wakeup, the task never ran
+  again -- not even to take a cancel -- and its slot stayed held. Reading the loop's wakeup pipe
+  failed the same way, and was retried on every turn. The interpreter's loop now gives the reserve
+  back and tries `call_soon` once more, and its exception handler gives it back on a `MemoryError`,
+  so a failed wakeup read is followed by one that works.
+
+Beneath the reserve, what must not depend on memory does not. The slot is freed before anything in
+the report allocates. A result that still cannot be sent whole is sent as its error alone. A reader
+thread that cannot read waits rather than ending the process, and a loop that cannot report an
+exception escaping it carries on.
+
+What the ceiling does not do:
+
+- **Isolate one agent from another.** The ceiling is the process's. While one agent holds memory up
+  to it, every agent's allocations fail: pinned by a test, a sibling's million-element list raises
+  `MemoryError` until the holder lets go, and then runs.
+- **Keep the reserve for the agent whose report needs it.** It is one pool. While one agent's report
+  has it given back, another agent's running code can take it.
+- **Guarantee a traceback, or the output.** A traceback CPython had no room to build is reported as
+  `MemoryError` alone, and output written at the ceiling is counted as dropped rather than kept. A
+  request line longer than the reader's buffer that runs out halfway is lost.
+- **Keep the loop turning once the reserve is spent.** Agent code that goes on holding memory at
+  the ceiling after the reserve has been given back to its loop can starve that loop again.
+- **Stop `os._exit(0)`,** which ends the session whatever the ceiling.
+
 ## What is still unsolved
 
 **A call Python cannot break into.** On the main thread a signal breaks a system call, so the
@@ -341,22 +454,11 @@ cost of *one*. N of them leave the rest 1/(N+1) of a core, so a long session deg
 fails. Recovering a wedged subagent needs an interpreter per agent or subinterpreters, and
 `agent-placement.md` records why neither is taken here.
 
-**Resource limits, of which memory is now partly answered.** Nothing constrains CPU or process
-count, and the container's cgroups are shared with every other tool in it, so those consequences are
-not confined to the interpreter. Memory is different, because agents share a process: without a
-ceiling, one agent's `[x] * 10**12` OOM-kills the interpreter and ends every agent's session.
-`RLIMIT_AS`, set once at interpreter start, converts that into a `MemoryError` raised in the
-allocating thread, which returns as that agent's error result with a traceback -- the same recovery
-shape the interrupt path has. Measured against a 512 MiB ceiling: the outsized allocation raised
-immediately, a gradual one raised after 484 MiB, and the interpreter was alive and usable afterwards
-in both cases.
-
-State its limits honestly. The ceiling is process-wide, so it degrades every agent while it is
-pinned -- measured: an ordinary `import json` on another thread raises `MemoryError` too, until
-the memory is released. It makes an OOM legible instead of arriving as a dead interpreter with no
-explanation; it is not per-agent isolation. And `os._exit(0)` remains uncontained: one line of
-generated code ends the session. Operator-controlled CPU and process limits stay a later
-milestone.
+**Resource limits besides memory.** Nothing constrains CPU or process count, and the container's
+cgroups are shared with every other tool in it, so those consequences are not confined to the
+interpreter. Memory has its ceiling, which makes running out legible rather than preventing it and
+is not per-agent isolation (above). `os._exit(0)` remains uncontained: one line of generated code
+ends the session. Operator-controlled CPU and process limits stay a later milestone.
 
 **Descendant processes.** Generated code may start subprocesses. Interrupting the execution that
 started one does not stop it -- `subprocess.run` kills its direct child and no further -- and it
@@ -379,9 +481,10 @@ uses it. They are small -- a binding instead of a discarded future, and a reques
 has a key for -- and without them an ordinary bare `await` on something that never resolves ends
 the session's usefulness while every diagnostic reports health.
 
-`RLIMIT_AS` joins them, for the same reason rather than as an early start on resource limits.
-Co-hosting makes memory the one resource an agent can exhaust on everyone else's behalf, and the
-ceiling is a single call at boot. The rest of the limits work stays where it was.
+The memory ceiling joined them too (`0003-07`), for the same reason rather than as an early start
+on resource limits: co-hosting makes memory the one resource an agent can exhaust on everyone
+else's behalf. It turned out not to be the single call at boot it was planned as -- running out
+has to leave room to say so -- but the rest of the limits work stays where it was.
 
 Everything else on this page is a later milestone, and the acceptance criterion for that
 milestone is worth stating now: a session survives a runaway execution without the operator
