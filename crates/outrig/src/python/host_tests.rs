@@ -17,7 +17,8 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use super::host::{
-    Background, Interpreter, InterpreterError, Late, Outcome, PRIMARY, Report, Unknown,
+    Background, Counts, Interpreter, InterpreterError, Late, MESSAGE_MAX, Outcome, PRIMARY, Report,
+    Unknown,
 };
 use super::payload::PAYLOAD;
 use super::testing::{Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, within};
@@ -28,6 +29,15 @@ fn startup_error(started: Result<Interpreter, InterpreterError>) -> String {
         Err(InterpreterError::Startup(message)) => message,
         Err(other) => panic!("expected a startup error, got: {other}"),
         Ok(_) => panic!("expected a startup error, but it started"),
+    }
+}
+
+/// The reason of the refusal `result` must be.
+fn refused<T>(result: Result<T, InterpreterError>) -> String {
+    match result {
+        Err(InterpreterError::Refused(reason)) => reason,
+        Err(other) => panic!("expected a refusal, got: {other}"),
+        Ok(_) => panic!("expected a refusal, but it went through"),
     }
 }
 
@@ -387,6 +397,128 @@ async fn a_greeting_that_is_not_the_primarys_ready_is_a_startup_error() {
         let message = startup_error(within(connect(host)).await);
         assert!(message.contains("greeted with"), "{greeting}: {message}");
     }
+}
+
+// ---------------------------------------------------------------------------- the user channel
+
+/// A post is on the wire as soon as it is made, before anyone awaits it, and
+/// behind what was sent before it. Its future is the interpreter's answer: how
+/// many then wait, or why it was refused.
+#[tokio::test]
+async fn a_post_is_queued_when_made_and_answered_with_the_count() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let first = interpreter.post("user", "hello").expect("queued");
+    let second = interpreter.post("user", "again").expect("queued");
+
+    let request = fake.expect("msg").await;
+    assert_eq!(request["agent"], PRIMARY);
+    assert_eq!(request["channel"], "user");
+    assert_eq!(request["body"], "hello");
+    let again = fake.expect("msg").await;
+    assert_eq!(again["body"], "again");
+
+    fake.send(json!({"t": "msg", "agent": PRIMARY, "id": request["id"], "pending": 3}))
+        .await;
+    fake.send(json!({"t": "msg", "agent": PRIMARY, "id": again["id"], "error": "full"}))
+        .await;
+    assert_eq!(within(first).await.expect("delivered"), 3);
+    assert_eq!(refused(within(second).await), "full");
+}
+
+/// A message past the bound is refused on the host, and never sent.
+#[tokio::test]
+async fn a_post_past_the_bound_is_refused_without_being_sent() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let reason = refused(
+        interpreter
+            .post("user", &"x".repeat(MESSAGE_MAX + 1))
+            .map(|_| ()),
+    );
+    assert!(reason.contains("past the"), "{reason}");
+    // The next request on the wire is the inventory, not the message.
+    round_trip(&interpreter, &mut fake).await;
+}
+
+#[tokio::test]
+async fn pending_counts_come_back_by_channel() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let (pending, ()) = tokio::join!(within(interpreter.pending()), async {
+        let request = fake.expect("pending").await;
+        let counts = json!({"user": {"pending": 2, "delivered": 5}});
+        fake.send(
+            json!({"t": "pending", "agent": PRIMARY, "id": request["id"], "channels": counts}),
+        )
+        .await;
+    });
+    let pending = pending.expect("answered");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending["user"],
+        Counts {
+            pending: 2,
+            delivered: 5
+        }
+    );
+}
+
+/// What the agent sends the user arrives in the order it was sent. A send on
+/// another channel, or one no subscriber is there for, goes nowhere, and is
+/// acknowledged at once so the agent is not held back waiting on it. The
+/// subscriber hears the interpreter exit as the end of its stream.
+#[tokio::test]
+async fn sends_reach_the_subscriber_in_order_until_the_interpreter_exits() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    fake.send(json!({"t": "send", "agent": PRIMARY, "channel": "user", "body": "unheard"}))
+        .await;
+    // Acknowledged at once: nothing on the host will receive it, and the
+    // agent must not wait for that.
+    assert_eq!(fake.expect("received").await["channel"], "user");
+
+    let mut sent = interpreter.subscribe();
+    for body in ["one", "two"] {
+        fake.send(json!({"t": "send", "agent": PRIMARY, "channel": "user", "body": body}))
+            .await;
+    }
+    fake.send(json!({"t": "send", "agent": PRIMARY, "channel": "work", "body": "elsewhere"}))
+        .await;
+    fake.send(json!({"t": "send", "agent": PRIMARY, "channel": "user", "body": "three"}))
+        .await;
+    for want in ["one", "two", "three"] {
+        assert_eq!(within(sent.recv()).await.as_deref(), Some(want));
+    }
+
+    drop(fake);
+    assert_eq!(within(sent.recv()).await, None);
+    assert_eq!(
+        &*gone(interpreter.post("user", "anyone?").map(|_| ())),
+        HUNG_UP
+    );
+    assert!(
+        within(interpreter.subscribe().recv()).await.is_none(),
+        "a subscriber after the exit hears nothing"
+    );
+}
+
+/// A message the agent sent is acknowledged when the user receives it, not
+/// when it arrives: the acknowledgment is what lets the agent send past its
+/// window, so what the host holds is bounded by the user keeping up.
+#[tokio::test]
+async fn a_send_is_acknowledged_when_the_user_receives_it() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let mut sent = interpreter.subscribe();
+    for body in ["one", "two"] {
+        fake.send(json!({"t": "send", "agent": PRIMARY, "channel": "user", "body": body}))
+            .await;
+    }
+    // Both arrived, and nothing was acknowledged.
+    round_trip(&interpreter, &mut fake).await;
+
+    assert_eq!(within(sent.recv()).await.as_deref(), Some("one"));
+    let ack = fake.expect("received").await;
+    assert_eq!(ack["agent"], PRIMARY);
+    assert_eq!(ack["channel"], "user");
+    // One receive, one acknowledgment.
+    round_trip(&interpreter, &mut fake).await;
 }
 
 // ---------------------------------------------------------------------------- through podman

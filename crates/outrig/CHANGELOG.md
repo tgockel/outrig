@@ -11,18 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`PythonAgent`, an agent that acts by writing Python.** `PythonAgent::start` takes a launched
   `Outrig`, resolves a model from the `Config` as `outrig run` does, and starts a Python
-  interpreter in the session's primary container. `PythonAgent::round` drives one prompt. The
+  interpreter in the session's primary container. `PythonAgent::round` drives one round. The
   model's only tool submits source to that interpreter, so names it binds persist from round to
   round. Errors are boxed `std::error::Error`s. A round that fails after running Python keeps what
-  it ran in the conversation, because nothing is rolled back, and its error says to continue
-  rather than resend. So does a round whose future is dropped, such as by a Ctrl-C, at the moment
-  it is dropped -- including the calls of an unfinished batch that had returned. Every other call
-  in that batch is answered with a note that it had not returned or had not started, since a
-  provider refuses a call without its result.
+  it ran in the conversation, because nothing is rolled back, and its error says to send another
+  message rather than repeat one. So does a round whose future is dropped, such as by a Ctrl-C,
+  at the moment it is dropped -- including the calls of an unfinished batch that had returned.
+  Every other call in that batch is answered with a note that it had not returned or had not
+  started, since a provider refuses a call without its result.
 
-  The system prompt opens with a short orientation: the one tool is the only way to act, the
-  working directory is the workspace, and the interpreter cannot install packages. The agent's
-  configured `preamble` follows it.
+  The user reaches the agent through its `user` channel, not through the prompt.
+  `PythonAgent::user_channel` returns a `UserChannel`, whose `send` queues text for the agent and
+  whose `receive` yields what the agent's code sends back -- including from a task still running
+  after its round ended. `round` takes no prompt: it tells the model how many messages wait,
+  never what they say, and returns `None` without calling the model when nothing new has
+  arrived. A message arriving mid-round is announced at the head of the next tool result, and one
+  a failed round announced is announced again. In the interpreter, `runtime.channels["user"]`
+  offers `receive()`, which returns a `Delivery` with `.body`, `.sender`, and `.received_at`;
+  `send(text)`; and `pending()`. A channel's contract is checked against the serializable subset
+  when it is made, a channel holds 256 unread messages and refuses the next, and a message is at
+  most 1 MiB. The agent's sends run at most 16 ahead of `UserChannel::receive`, and past that its
+  code waits, so a caller receives while a round runs. `UserChannel::receive_waiting` takes what
+  the agent has already sent without waiting for more, for a caller about to leave; it never
+  waits, not even behind a `receive` outstanding on a clone.
+
+  The system prompt opens with a short orientation: the one tool is the only way to act, how the
+  user's messages arrive and how to answer them, the working directory is the workspace, and the
+  interpreter cannot install packages. The agent's configured `preamble` follows it.
 
   `PythonAgent::check` runs `start`'s model resolution without starting anything, so a caller can
   fail before pulling an image. `model`, `python_version`, and `container_name` report what a

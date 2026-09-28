@@ -12,6 +12,7 @@ use rig::tool::{ToolDyn, ToolError};
 use serde_json::json;
 
 use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
+use super::channel::Announcer;
 use super::mock_http::{self, CannedResponse, MODEL, RecordedRequest, failure, submit, text_reply};
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
@@ -90,23 +91,38 @@ async fn agent_over(
     (agent, requests)
 }
 
-async fn round(agent: &mut PythonAgent, prompt: &str) -> String {
-    within(agent.round(prompt))
+/// Send `message` on the agent's user channel, as a person typing it does.
+async fn post(agent: &PythonAgent, message: &str) {
+    within(agent.user_channel().send(message))
         .await
-        .unwrap_or_else(|e| panic!("the round failed: {e}"))
+        .unwrap_or_else(|e| panic!("the message was not delivered: {e}"));
 }
 
-/// The system prompt `request` carried, whether rig sent it as one string or
-/// as text blocks.
-fn system_prompt(request: &RecordedRequest) -> String {
-    match &request.body["system"] {
+/// Send `message`, then run the round it starts.
+async fn round(agent: &mut PythonAgent, message: &str) -> String {
+    post(agent, message).await;
+    within(agent.round())
+        .await
+        .unwrap_or_else(|e| panic!("the round failed: {e}"))
+        .expect("a message was waiting, so a round ran")
+}
+
+/// The text of a message's `content`, or the system prompt, whether rig sent
+/// it as one string or as blocks. Blocks without text are skipped.
+fn text_of(content: &serde_json::Value) -> String {
+    match content {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(blocks) => blocks
             .iter()
-            .map(|block| block["text"].as_str().expect("a text block"))
+            .filter_map(|block| block["text"].as_str())
             .collect(),
-        other => panic!("no system prompt: {other}"),
+        other => panic!("no text: {other}"),
     }
+}
+
+/// The system prompt `request` carried.
+fn system_prompt(request: &RecordedRequest) -> String {
+    text_of(&request.body["system"])
 }
 
 /// The text of the `tool_result` for `id` in `request`, as the model reads it.
@@ -256,12 +272,13 @@ async fn a_failed_model_call_keeps_the_python_the_round_ran() {
     )
     .await;
 
-    let err = within(agent.round("set x"))
+    post(&agent, "set x").await;
+    let err = within(agent.round())
         .await
         .expect_err("the second model call failed");
     let err = err.to_string();
     assert!(
-        err.contains("already run Python") && err.contains("rather than resending"),
+        err.contains("already run Python") && err.contains("rather than repeating one"),
         "{err}"
     );
     assert_eq!(round(&mut agent, "continue").await, "carried on");
@@ -287,12 +304,13 @@ async fn a_failed_first_model_call_leaves_the_conversation_alone() {
     )
     .await;
 
-    let err = within(agent.round("hello"))
+    post(&agent, "hello").await;
+    let err = within(agent.round())
         .await
         .expect_err("the model call failed")
         .to_string();
     assert!(
-        err.starts_with("agent prompt failed:") && !err.contains("already run Python"),
+        err.starts_with("agent round failed:") && !err.contains("already run Python"),
         "{err}"
     );
     assert_eq!(round(&mut agent, "hello").await, "ok");
@@ -409,10 +427,11 @@ async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
         requests.recv().await.expect("the first model call");
         requests.recv().await.expect("the second model call");
     };
+    post(&agent, "set x").await;
     tokio::select! {
         biased;
         () = within(second_call) => {}
-        _ = agent.round("set x") => panic!("the round returned before it could be dropped"),
+        _ = agent.round() => panic!("the round returned before it could be dropped"),
     }
     assert!(
         !agent.history.is_empty(),
@@ -465,10 +484,11 @@ async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
         starts.recv().await.expect("the first call");
         starts.recv().await.expect("the second call");
     };
+    post(&agent, "run three").await;
     tokio::select! {
         biased;
         () = within(inside_the_second) => {}
-        _ = agent.round("run three") => panic!("the round returned before it could be dropped"),
+        _ = agent.round() => panic!("the round returned before it could be dropped"),
     }
 
     assert_eq!(round(&mut agent, "continue").await, "carried on");
@@ -510,10 +530,11 @@ async fn the_observer_is_not_told_of_a_refused_submission() {
         let _ = started.send(());
     });
 
+    post(&agent, "sleep").await;
     tokio::select! {
         biased;
         _ = within(starts.recv()) => {}
-        _ = agent.round("sleep") => panic!("the round returned before it could be dropped"),
+        _ = agent.round() => panic!("the round returned before it could be dropped"),
     }
     assert_eq!(round(&mut agent, "go on").await, "refused");
 
@@ -614,13 +635,339 @@ async fn the_agent_names_its_model_and_its_python() {
     );
 }
 
+// ---------------------------------------------------------------------------- the user channel
+
+/// The text of the last user message `request` carried.
+fn last_user_text(request: &RecordedRequest) -> String {
+    let message = request.body["messages"]
+        .as_array()
+        .expect("a messages array")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap_or_else(|| panic!("no user message in {:#}", request.body));
+    text_of(&message["content"])
+}
+
+/// Every recorded request, as the text on the wire.
+fn wire(recorded: &[RecordedRequest]) -> String {
+    recorded
+        .iter()
+        .map(|request| request.body.to_string())
+        .collect()
+}
+
+/// A message is announced by channel and count, and `pending()` answers with
+/// a count: the model learns one is waiting, and nothing it is sent carries
+/// what the message says. Asserted on every request the model received.
+#[tokio::test]
+async fn pending_reports_a_count_without_the_body_reaching_the_model() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_PENDING",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_count", "runtime.channels['user'].pending()"),
+            text_reply("one is waiting"),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        round(&mut agent, "the secret is xyzzy").await,
+        "one is waiting"
+    );
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    assert_eq!(
+        last_user_text(&recorded[0]),
+        "[outrig] 1 message is waiting on runtime.channels[\"user\"]."
+    );
+    assert_eq!(tool_result(&recorded[1], "toolu_count"), "1\n");
+    assert!(
+        !wire(&recorded).contains("xyzzy"),
+        "the body reached the model: {recorded:#?}"
+    );
+}
+
+/// Receiving takes a message; being told of it does not. A message the model
+/// declines to read stays queued, and the next round counts it with the new
+/// one. Reading both leaves nothing, and with nothing new there is no round.
+#[tokio::test]
+async fn receiving_consumes_and_an_announcement_does_not() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_CONSUME",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            text_reply("not now"),
+            submit(
+                "toolu_read",
+                "ch = runtime.channels['user']\na = await ch.receive()\nb = await ch.receive()\n\
+                 print(a.body, b.body, a.sender, ch.pending())",
+            ),
+            text_reply("read both"),
+        ],
+    )
+    .await;
+
+    assert_eq!(round(&mut agent, "first").await, "not now");
+    assert!(
+        within(agent.round())
+            .await
+            .expect("no model call to fail")
+            .is_none(),
+        "nothing new arrived, so no round runs"
+    );
+    assert_eq!(round(&mut agent, "second").await, "read both");
+    assert!(
+        within(agent.round())
+            .await
+            .expect("no model call to fail")
+            .is_none()
+    );
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 3, "{recorded:#?}");
+    assert_eq!(
+        last_user_text(&recorded[1]),
+        "[outrig] 2 messages are waiting on runtime.channels[\"user\"]."
+    );
+    assert_eq!(
+        tool_result(&recorded[2], "toolu_read"),
+        "first second user 0\n"
+    );
+}
+
+/// Messages reach the agent's code in the order they were sent, and what it
+/// sends back reaches the user in the order it sent it. Each send is counted
+/// with those already waiting.
+#[tokio::test]
+async fn messages_and_replies_keep_their_order() {
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_ORDER",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_echo",
+                "ch = runtime.channels['user']\nfor _ in range(3):\n    \
+                 await ch.send((await ch.receive()).body.upper())",
+            ),
+            text_reply("echoed"),
+        ],
+    )
+    .await;
+    let user = agent.user_channel();
+    for (n, text) in ["one", "two", "three"].into_iter().enumerate() {
+        let waiting = within(user.send(text)).await.expect("delivered");
+        assert_eq!(waiting, n + 1);
+    }
+
+    let reply = within(agent.round()).await.expect("the round ran");
+    assert_eq!(reply.as_deref(), Some("echoed"));
+    for want in ["ONE", "TWO", "THREE"] {
+        assert_eq!(within(user.receive()).await.as_deref(), Some(want));
+    }
+}
+
+/// A task the round's code leaves running can still reach the user once the
+/// round is over: a send is the one way code running after the model stopped
+/// writing has.
+#[tokio::test]
+async fn a_send_from_a_background_task_reaches_the_user_after_the_round() {
+    let release = Running::new();
+    let (mut agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_BACKGROUND_SEND",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_later",
+                &format!(
+                    "import os\nasync def later():\n    \
+                     while not os.path.exists({:?}):\n        await asyncio.sleep(0.01)\n    \
+                     await runtime.channels['user'].send('done later')\n\
+                     task = asyncio.create_task(later())",
+                    release.path()
+                ),
+            ),
+            text_reply("started it"),
+        ],
+    )
+    .await;
+    let user = agent.user_channel();
+
+    assert_eq!(round(&mut agent, "start it").await, "started it");
+    std::fs::write(release.path(), b"").expect("release the task");
+    assert_eq!(within(user.receive()).await.as_deref(), Some("done later"));
+}
+
+/// Taking what is waiting never waits, even behind a receive another clone
+/// has outstanding: messages arriving now are that receive's to take.
+#[tokio::test]
+async fn taking_what_is_waiting_does_not_wait_behind_a_listener() {
+    let (agent, _requests) = agent_over(
+        "OUTRIG_TEST_AGENT_SNAPSHOT",
+        MODEL,
+        "max-tokens = 4096",
+        vec![text_reply("unused")],
+    )
+    .await;
+    let user = agent.user_channel();
+    let listener = user.clone();
+    let listening = listener.receive();
+    tokio::pin!(listening);
+    assert!(futures_util::poll!(&mut listening).is_pending());
+
+    assert!(user.receive_waiting().is_empty());
+}
+
+/// A message sent while the round's code runs is announced at the head of the
+/// next result the model reads, by count -- counting the one that opened the
+/// round, still unread -- and survives a result cut to the ceiling. The model
+/// has then been told, so no round follows for it.
+#[tokio::test]
+async fn a_message_arriving_mid_round_is_announced_in_the_next_result() {
+    let running = Running::new();
+    let release = Running::new();
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_MID_ROUND",
+        MODEL,
+        "max-tokens = 4096\ntool-result-max = 1024",
+        vec![
+            submit(
+                "toolu_wait",
+                &running.then(&format!(
+                    "import os\nwhile not os.path.exists({:?}):\n    \
+                     await asyncio.sleep(0.01)\nprint('a' * 5000)",
+                    release.path()
+                )),
+            ),
+            text_reply("told"),
+        ],
+    )
+    .await;
+    let user = agent.user_channel();
+    let meanwhile = async {
+        running.reached().await;
+        user.send("the password is xyzzy").await.expect("delivered");
+        std::fs::write(release.path(), b"").expect("release the code");
+    };
+    let (reply, ()) = tokio::join!(round(&mut agent, "go"), within(meanwhile));
+    assert_eq!(reply, "told");
+    assert!(
+        within(agent.round())
+            .await
+            .expect("no model call to fail")
+            .is_none(),
+        "the model was told in the result"
+    );
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    let result = tool_result(&recorded[1], "toolu_wait");
+    assert!(
+        result.starts_with("[2 messages are waiting on runtime.channels[\"user\"]]\naaa"),
+        "{result}"
+    );
+    assert!(
+        result.len() <= 1024 && result.contains("[outrig: tool result truncated]"),
+        "{} bytes: {result}",
+        result.len()
+    );
+    assert!(!wire(&recorded).contains("xyzzy"));
+}
+
+/// A round whose model call fails before it ran anything leaves the model
+/// unaware of what it announced, so the next round announces it again -- with
+/// nothing new sent in between.
+#[tokio::test]
+async fn an_announcement_the_model_never_read_is_made_again() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_ANNOUNCE_AGAIN",
+        MODEL,
+        "max-tokens = 4096",
+        vec![failure(500), text_reply("ok")],
+    )
+    .await;
+
+    post(&agent, "hello").await;
+    within(agent.round())
+        .await
+        .expect_err("the model call failed");
+    let reply = within(agent.round())
+        .await
+        .expect("the second call answers");
+    assert_eq!(reply.as_deref(), Some("ok"));
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    assert_eq!(
+        last_user_text(&recorded[1]),
+        "[outrig] 1 message is waiting on runtime.channels[\"user\"]."
+    );
+}
+
+/// A call whose code has finished is not lost when its round is dropped while
+/// the interpreter is asked what waits -- the one thing a call still awaits
+/// after its code reports. Its outcome reaches the model as a late result, as
+/// one nobody was waiting for does.
+#[tokio::test]
+async fn a_round_dropped_while_asking_what_waits_keeps_the_calls_outcome() {
+    let asked = Running::new();
+    // The interpreter's next question about what waits goes unanswered, once,
+    // and marks the moment it arrives.
+    let withhold = format!(
+        "import __main__\n\
+         def withheld(kernel, request_id, message):\n    \
+         __main__._ROUTES['pending'] = __main__._pending\n    \
+         open({:?}, 'w').close()\n\
+         __main__._ROUTES['pending'] = withheld\n\
+         print('the outcome')",
+        asked.path()
+    );
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_DROPPED_ASKING",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_withheld", &withhold),
+            submit("toolu_next", "1 + 1"),
+            text_reply("carried on"),
+        ],
+    )
+    .await;
+
+    post(&agent, "go").await;
+    tokio::select! {
+        biased;
+        () = within(asked.reached()) => {}
+        _ = agent.round() => panic!("the round returned before it could be dropped"),
+    }
+    assert_eq!(round(&mut agent, "continue").await, "carried on");
+
+    let recorded = mock_http::drain(&mut requests);
+    let next = tool_result(recorded.last().expect("a request"), "toolu_next");
+    assert!(
+        next.contains("has since finished: it ran to completion") && next.contains("the outcome"),
+        "{next}"
+    );
+}
+
 // ---------------------------------------------------------------------------- the tool
+
+/// The tool alone, over `interpreter`, at the smallest ceiling config allows.
+fn tool_over(interpreter: crate::python::host::Interpreter) -> SubmitPython {
+    SubmitPython::new(interpreter.clone(), 1024, Announcer::new(interpreter))
+}
 
 /// Arguments the schema does not allow are the model's mistake to fix, so
 /// they fail as arguments, and nothing is submitted.
 #[tokio::test]
 async fn malformed_arguments_are_a_tool_error() {
-    let tool = SubmitPython::new(start_on_host().await, 1024);
+    let tool = tool_over(start_on_host().await);
     for args in [
         "",
         "{}",
@@ -854,7 +1201,7 @@ async fn the_tool_reports_every_late_result_across_calls() {
             outcome: raised("", &format!("ValueError: {}", "z".repeat(400))),
         })
         .collect();
-    let tool = SubmitPython::new(start_on_host().await, 1024).with_unreported(late);
+    let tool = tool_over(start_on_host().await).with_unreported(late);
     let mut reported = String::new();
     for _ in 0..2 {
         let text = within(tool.call(json!({ "source": "None" }).to_string()))
@@ -1214,6 +1561,13 @@ impl Running {
     fn then(&self, source: &str) -> String {
         format!("open({:?}, 'w').close()\n{source}", self.path())
     }
+
+    /// Wait for the file to exist.
+    async fn reached(&self) {
+        while !self.path().exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 /// Run `prompt` as a round, pressing Ctrl-C `presses` times once `running`
@@ -1226,9 +1580,7 @@ async fn round_pressed(
 ) -> (String, Vec<Option<String>>) {
     let interrupt = agent.interrupter();
     let pressing = async {
-        while !running.path().exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        running.reached().await;
         (0..presses).map(|_| interrupt()).collect()
     };
     tokio::join!(round(agent, prompt), within(pressing))

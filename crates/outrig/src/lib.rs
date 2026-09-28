@@ -46,7 +46,7 @@ mod repo;
 mod supervise;
 mod tool_name;
 
-pub use agent::PythonAgent;
+pub use agent::{PythonAgent, UserChannel};
 pub use config::{
     CapabilityProfile, MountAccess, NetworkAction, NetworkEntry, NetworkMode, NetworkPolicy,
     NetworkPolicyBuilder, SidecarView, SidecarWorkspaceAccess,

@@ -37,6 +37,9 @@ const OUTPUT_MAX: usize = 16 * 1024;
 const BG_MAX: usize = 2 * 1024;
 const REPR_MAX: usize = 1000;
 const INVENTORY_MAX: usize = 200;
+const QUEUE_MAX: usize = 256;
+const MESSAGE_MAX: usize = 1 << 20;
+const SEND_WINDOW: usize = 16;
 
 /// Polls `check` until it answers, failing after [`TIMEOUT`] with what it
 /// was waiting for.
@@ -279,11 +282,22 @@ impl Interpreter {
         self.output_in(PRIMARY, id, source)
     }
 
+    /// Send `request`, and return its answer, which must be the very next
+    /// message: of the same kind, for the same agent and id.
+    fn ask(&mut self, request: Value) -> Value {
+        self.send(request.clone());
+        let answer = self.recv();
+        assert!(
+            ["t", "agent", "id"]
+                .iter()
+                .all(|key| answer[key] == request[key]),
+            "expected the answer to {request}, got: {answer}"
+        );
+        answer
+    }
+
     fn inventory(&mut self, id: u64) -> Vec<(String, String)> {
-        self.send(json!({"t": "inv", "agent": PRIMARY, "id": id}));
-        let reply = self.recv();
-        assert!(reply["t"] == "inv" && reply["id"] == id, "got: {reply}");
-        reply["globals"]
+        self.ask(json!({"t": "inv", "agent": PRIMARY, "id": id}))["globals"]
             .as_array()
             .expect("globals")
             .iter()
@@ -623,7 +637,7 @@ fn the_inventory_lists_the_models_names_and_not_the_kernels() {
             .map(|(n, t)| (n.to_string(), t.to_string()))
             .collect()
     };
-    // `asyncio` and `__outrig_echo__` are bound at boot and are not listed.
+    // `asyncio`, `runtime`, and `__outrig_echo__` are bound at boot and are not listed.
     assert_eq!(
         k.inventory(2),
         rows(&[("count", "int"), ("json", "module"), ("weights", "dict")])
@@ -1938,4 +1952,460 @@ fn a_real_build_runs_under_the_ceiling() {
     ));
     let mut k = Interpreter::start();
     assert_eq!(k.output(1, &build), "0\n");
+}
+
+// ---------------------------------------------------------------------------- channels
+
+impl Interpreter {
+    /// Post `body` on `agent`'s user channel as request `id`, and return the
+    /// answer.
+    fn post_to(&mut self, agent: &str, id: u64, body: Value) -> Value {
+        self.ask(json!({"t": "msg", "agent": agent, "id": id, "channel": "user", "body": body}))
+    }
+
+    fn post(&mut self, id: u64, body: Value) -> Value {
+        self.post_to(PRIMARY, id, body)
+    }
+
+    /// What `agent` has waiting, and has ever had delivered, by channel.
+    fn pending_in(&mut self, agent: &str, id: u64) -> Value {
+        self.ask(json!({"t": "pending", "agent": agent, "id": id}))["channels"].take()
+    }
+}
+
+/// A posted message is counted from the moment it is answered, stays counted
+/// however often the count is asked for, and leaves the count only when code
+/// receives it -- in the order it was sent, and never twice.
+#[test]
+fn a_message_waits_until_code_receives_it_once_and_in_order() {
+    let mut k = Interpreter::start();
+    assert_eq!(
+        k.post(1, json!("first")),
+        json!({"t": "msg", "agent": PRIMARY, "id": 1, "pending": 1})
+    );
+    assert_eq!(k.post(2, json!("second"))["pending"], 2);
+    let two = json!({"user": {"pending": 2, "delivered": 2}});
+    assert_eq!(k.pending_in(PRIMARY, 3), two);
+    assert_eq!(k.output(4, "runtime.channels['user'].pending()"), "2\n");
+    assert_eq!(k.pending_in(PRIMARY, 5), two, "counting took nothing");
+
+    let read = py(r#"
+        d = await runtime.channels['user'].receive()
+        print(d.body, d.sender, d.received_at.tzinfo, runtime.channels['user'].pending())
+        "#);
+    assert_eq!(k.output(6, &read), "first user UTC 1\n");
+    assert_eq!(k.output(7, &read), "second user UTC 0\n");
+    // Received, but still counted as delivered: that is how a new message is
+    // told from one the model has heard of.
+    assert_eq!(
+        k.pending_in(PRIMARY, 8),
+        json!({"user": {"pending": 0, "delivered": 2}})
+    );
+}
+
+/// A receive with nothing queued waits for the next message rather than
+/// failing. One that is cancelled while it waits takes nothing with it: the
+/// message goes to the next receive.
+#[test]
+fn a_receive_waits_and_a_cancelled_one_takes_nothing() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        py(r#"
+        ch = runtime.channels['user']
+        gone = asyncio.create_task(ch.receive())
+        await asyncio.sleep(0)
+        gone.cancel()
+        waiting = asyncio.create_task(ch.receive())
+        await asyncio.sleep(0)
+        "#)
+        .as_str(),
+    );
+    assert_eq!(k.post(2, json!("hello"))["pending"], 1);
+    assert_eq!(
+        k.output(3, "(await waiting).body, gone.cancelled(), ch.pending()"),
+        "('hello', True, 0)\n"
+    );
+}
+
+/// What the agent sends reaches the host as text, one line per message, in
+/// the order it was sent and ahead of the result of the code that sent it.
+#[test]
+fn sends_reach_the_host_in_order_ahead_of_the_result() {
+    let mut k = Interpreter::start();
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src":
+        "for word in ['one', 'two', 'three']:\n    await runtime.channels['user'].send(word)"}));
+    for word in ["one", "two", "three"] {
+        assert_eq!(
+            k.recv(),
+            json!({"t": "send", "agent": PRIMARY, "channel": "user", "body": word})
+        );
+    }
+    let result = k.recv();
+    assert!(
+        result["t"] == "result" && result["status"] == "ok",
+        "{result}"
+    );
+}
+
+/// The user channel carries text both ways. A message of any other type is
+/// refused, whichever way it goes, and nothing is queued or sent.
+#[test]
+fn the_user_channel_carries_text_both_ways() {
+    let mut k = Interpreter::start();
+    let refused = k.post(1, json!(42));
+    assert_eq!(
+        refused["error"], "channel 'user' receives str, not int",
+        "{refused}"
+    );
+    assert!(refused.get("pending").is_none(), "{refused}");
+    k.send(json!({"t": "msg", "agent": PRIMARY, "id": 2, "channel": "nope", "body": "x"}));
+    assert_eq!(k.recv()["error"], "agent 'primary' has no channel 'nope'");
+
+    let result = k.exec(3, "await runtime.channels['user'].send(42)");
+    assert_eq!(result["status"], "error", "{result}");
+    assert!(
+        text(&result["error"]).ends_with("TypeError: channel 'user' sends str, not int\n"),
+        "{result}"
+    );
+    assert_eq!(
+        k.pending_in(PRIMARY, 4),
+        json!({"user": {"pending": 0, "delivered": 0}}),
+        "a refused message was never delivered"
+    );
+    // The contract is there to read, as a peer reads it.
+    assert_eq!(
+        k.output(
+            5,
+            "runtime.channels['user'].receives, runtime.channels['user'].sends"
+        ),
+        "((<class 'str'>,), (<class 'str'>,))\n"
+    );
+}
+
+/// A channel holds a bounded number of unread messages, and the one past the
+/// bound is refused saying so, not dropped. Reading one makes room.
+#[test]
+fn a_full_channel_refuses_rather_than_dropping() {
+    let mut k = Interpreter::start();
+    for id in 1..=QUEUE_MAX as u64 {
+        assert_eq!(k.post(id, json!(format!("m{id}")))["pending"], id);
+    }
+    let refused = k.post(1000, json!("one too many"));
+    assert_eq!(
+        refused["error"],
+        format!("channel 'user' already holds {QUEUE_MAX} unread messages")
+    );
+    assert_eq!(
+        k.output(1001, "(await runtime.channels['user'].receive()).body"),
+        "'m1'\n"
+    );
+    assert_eq!(
+        k.post(1002, json!("now there is room"))["pending"],
+        QUEUE_MAX
+    );
+}
+
+/// The agent runs ahead of the user by `SEND_WINDOW` messages and no further:
+/// past that, a send waits in the agent's own code until the host says one was
+/// received. A fast producer is held back there, under the interpreter's
+/// memory ceiling, rather than piling up in the host's memory.
+#[test]
+fn a_send_waits_once_the_user_is_a_window_behind() {
+    let mut k = Interpreter::start();
+    let total = SEND_WINDOW + 2;
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src":
+        format!("for i in range({total}):\n    await runtime.channels['user'].send(str(i))")}));
+    for n in 0..SEND_WINDOW {
+        assert_eq!(k.recv()["body"], n.to_string());
+    }
+    // The next send waits, and the loop, not waiting, answers first.
+    k.inventory(2);
+    for n in SEND_WINDOW..total {
+        k.send(json!({"t": "received", "agent": PRIMARY, "id": 100 + n, "channel": "user"}));
+        assert_eq!(k.recv()["body"], n.to_string());
+    }
+    let result = k.recv();
+    assert!(
+        result["t"] == "result" && result["status"] == "ok",
+        "{result}"
+    );
+}
+
+/// Python defining `CopyFailsOnce`, a list whose next `copy()` runs out of
+/// memory, and making it the user endpoint's list of waiting sends.
+const SENDERS_COPY_FAILS_ONCE: &str = r#"
+ch = runtime.channels['user']
+class CopyFailsOnce(list):
+    failed = False
+    def copy(self):
+        if not CopyFailsOnce.failed:
+            CopyFailsOnce.failed = True
+            raise MemoryError
+        return list(self)
+ch._senders = CopyFailsOnce()
+"#;
+
+/// Running out of memory while taking in an acknowledgment, before it counts,
+/// is retried rather than swallowed: the room it makes is not lost, and the
+/// send waiting for that room goes out.
+#[test]
+fn memory_running_out_before_an_acknowledgment_counts_loses_no_room() {
+    let mut k = Interpreter::start();
+    let source = format!(
+        "{SENDERS_COPY_FAILS_ONCE}\nfor i in range({}):\n    await ch.send(str(i))",
+        SEND_WINDOW + 1
+    );
+    k.send(json!({"t": "exec", "agent": PRIMARY, "id": 1, "src": source}));
+    for n in 0..SEND_WINDOW {
+        assert_eq!(k.recv()["body"], n.to_string());
+    }
+    k.inventory(2);
+    k.send(json!({"t": "received", "agent": PRIMARY, "id": 3, "channel": "user"}));
+    assert_eq!(k.recv()["body"], SEND_WINDOW.to_string());
+    let result = k.recv();
+    assert!(
+        result["t"] == "result" && result["status"] == "ok",
+        "{result}"
+    );
+}
+
+/// A send that fails to go out gives its room back, even if memory runs out
+/// while it does, and raises what it failed with.
+#[test]
+fn a_send_that_fails_gives_its_room_back() {
+    let mut k = Interpreter::start();
+    let source = format!(
+        "{SENDERS_COPY_FAILS_ONCE}\n{}",
+        py(r#"
+        import __main__
+        real = __main__._write_line
+        def broken(line):
+            __main__._write_line = real
+            raise OSError('the pipe broke')
+        __main__._write_line = broken
+        try:
+            await ch.send('lost')
+        except OSError as e:
+            print(e)
+        print(ch._unreceived)
+        "#)
+    );
+    assert_eq!(k.output(1, &source), "the pipe broke\n0\n");
+}
+
+/// A message the agent sends is bounded as it is sent: one past the bound
+/// raises in the code that sent it, and nothing reaches the host.
+#[test]
+fn a_send_past_the_bound_raises_and_sends_nothing() {
+    let mut k = Interpreter::start();
+    let result = k.exec(
+        1,
+        &format!("await runtime.channels['user'].send('x' * {MESSAGE_MAX})"),
+    );
+    assert_eq!(result["status"], "error", "{result}");
+    assert!(
+        text(&result["error"]).contains(&format!("past the {MESSAGE_MAX} a channel carries")),
+        "{result}"
+    );
+}
+
+/// A contract is checked when the channel is made, not when a message first
+/// crosses it: a type outside the serializable subset is refused then, named,
+/// with the field it sits in when it is nested in a dataclass.
+#[test]
+fn a_contract_outside_the_serializable_subset_is_refused_at_construction() {
+    let mut k = Interpreter::start();
+    let refusals = k.output(
+        1,
+        &py(r#"
+        import __main__
+        from dataclasses import dataclass
+        from typing import Optional
+
+        @dataclass
+        class Tagged:
+            name: str
+            tags: set[int]
+
+        @dataclass
+        class Outer:
+            inner: Tagged
+
+        @dataclass
+        class Unresolvable:
+            thing: 'NoSuchType'
+
+        for contract in (bytes, list, dict[int, str], tuple[str, int], Tagged, Outer, Unresolvable,
+                         str | bytes):
+            try:
+                __main__.Endpoint('primary', 'x', receives=contract, sends=str)
+                print('accepted', contract)
+            except TypeError as e:
+                print(e)
+        "#),
+    );
+    let lines: Vec<&str> = refusals.lines().collect();
+    let refused = |named: &str| format!("channel 'x' cannot receive {named}, which is outside");
+    assert!(lines[0].starts_with(&refused("bytes")), "{refusals}");
+    assert!(lines[1].starts_with(&refused("list")), "{refusals}");
+    assert!(
+        lines[2].starts_with(&refused("dict[int, str]")),
+        "{refusals}"
+    );
+    assert!(
+        lines[3].starts_with(&refused("tuple[str, int]")),
+        "{refusals}"
+    );
+    assert!(
+        lines[4].starts_with(&refused("set[int] (field 'tags' of Tagged)")),
+        "{refusals}"
+    );
+    assert!(
+        lines[5].starts_with(&refused("set[int] (field 'tags' of Tagged)")),
+        "nested one dataclass down: {refusals}"
+    );
+    assert!(
+        lines[6].starts_with(
+            "channel 'x' cannot receive Unresolvable, whose field types cannot be \
+                              resolved: NameError"
+        ),
+        "{refusals}"
+    );
+    assert!(lines[7].starts_with(&refused("bytes")), "{refusals}");
+    assert_eq!(lines.len(), 8, "{refusals}");
+
+    let accepted = k.output(
+        2,
+        &py(r#"
+        from typing import Optional
+
+        @dataclass
+        class Node:
+            value: float
+            children: list['Node']
+            parent: Optional['Node'] = None
+
+        @dataclass
+        class Row:
+            name: str
+            scores: dict[str, float]
+            node: Node | None
+
+        for contract in (str, list[int], dict[str, float], Row | None, (int, bool), ()):
+            print(__main__.Endpoint('primary', 'x', receives=contract, sends=contract))
+        "#),
+    );
+    assert_eq!(
+        accepted,
+        "<endpoint 'x': receives str, sends str, 0 pending>\n\
+         <endpoint 'x': receives list[int], sends list[int], 0 pending>\n\
+         <endpoint 'x': receives dict[str, float], sends dict[str, float], 0 pending>\n\
+         <endpoint 'x': receives Row | None, sends Row | None, 0 pending>\n\
+         <endpoint 'x': receives int | bool, sends int | bool, 0 pending>\n\
+         <endpoint 'x': receives nothing, sends nothing, 0 pending>\n"
+    );
+}
+
+/// Every agent has a user channel of its own: a message to one is not counted
+/// by another.
+#[test]
+fn each_agent_has_its_own_user_channel() {
+    let mut k = Interpreter::start();
+    k.open("helper");
+    assert_eq!(
+        k.post_to("helper", 1, json!("for the helper"))["pending"],
+        1
+    );
+    assert_eq!(
+        k.pending_in(PRIMARY, 2),
+        json!({"user": {"pending": 0, "delivered": 0}})
+    );
+    assert_eq!(
+        k.output_in(
+            "helper",
+            3,
+            "(await runtime.channels['user'].receive()).body"
+        ),
+        "'for the helper'\n"
+    );
+}
+
+/// A receive whose loop has closed cannot be woken. The message is still
+/// queued exactly once and the host still told so, and the next receive takes
+/// it.
+#[test]
+fn a_receive_that_cannot_be_woken_costs_nothing() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+        import threading
+        ch = runtime.channels['user']
+        def orphan():
+            loop = asyncio.new_event_loop()
+            loop.create_task(ch.receive())
+            loop.run_until_complete(asyncio.sleep(0.01))
+            loop.close()
+        thread = threading.Thread(target=orphan)
+        thread.start()
+        thread.join()
+        "#),
+    );
+    assert_eq!(k.post(2, json!("still here"))["pending"], 1);
+    k.await_stderr("a waiting receive or send could not be woken");
+    assert_eq!(
+        k.output(3, "(await ch.receive()).body, ch.pending()"),
+        "('still here', 0)\n"
+    );
+}
+
+/// A message is queued once, whatever fails after it is. Memory running out
+/// once it is queued -- here, while reporting a receive that could not be
+/// woken -- is not `_handle`'s to retry, which would queue the message again.
+#[test]
+fn memory_running_out_after_a_message_is_queued_does_not_queue_it_twice() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+        import contextlib, threading
+        ch = runtime.channels['user']
+        def orphan():
+            loop = asyncio.new_event_loop()
+            loop.create_task(ch.receive())
+            loop.run_until_complete(asyncio.sleep(0.01))
+            loop.close()
+        thread = threading.Thread(target=orphan)
+        thread.start()
+        thread.join()
+        # Building a `suppress` is an allocation; the reader's next one fails.
+        real_suppress = contextlib.suppress
+        def once_on_the_reader(*exceptions):
+            if threading.current_thread().name != 'reader':
+                return real_suppress(*exceptions)
+            contextlib.suppress = real_suppress
+            raise MemoryError
+        contextlib.suppress = once_on_the_reader
+        "#),
+    );
+    assert_eq!(k.post(2, json!("once"))["pending"], 1);
+    assert_eq!(
+        k.pending_in(PRIMARY, 3),
+        json!({"user": {"pending": 1, "delivered": 1}})
+    );
+}
+
+/// An interrupt never lands inside a protocol line, which agent code writes
+/// when it sends: a line cut short would swallow the next.
+#[test]
+fn a_send_is_machinery_an_interrupt_does_not_land_in() {
+    let mut k = Interpreter::start();
+    assert_eq!(
+        k.output(
+            1,
+            "import __main__\n__main__._write_line.__code__ in __main__._MACHINERY"
+        ),
+        "True\n"
+    );
 }

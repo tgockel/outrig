@@ -272,6 +272,24 @@ stay bound from one message to the next. The interpreter is a static build OutRi
 read-only, so the image needs no Python of its own; it carries the standard library and cannot
 install packages. Each submission's source is printed on stderr as it starts running.
 
+**What you type is a message, not a prompt.** Each line goes onto the agent's `user` channel,
+`runtime.channels["user"]` in its Python, and the model is told how many messages are waiting
+there -- never what they say. It reads one by running code that receives it, and answers by
+sending on the same channel. A line typed while the agent is still working is queued the same
+way, and `[outrig] queued for the agent (N waiting)` says so; it does not start a second round.
+The model hears of it in the next result its code returns, or in a round of its own once the
+current one ends. A channel holds 256 unread messages and refuses the next, saying so; a message
+is at most 1 MiB either way.
+
+stdout carries only what the agent sends on the channel -- including a send from code still
+running after its round ended, which is printed when it arrives, at the prompt or not. The agent
+is held to the terminal's pace: its code waits once it is 16 messages ahead of what has been
+printed. When input ends -- the end of piped input, or Ctrl-D -- the lines typed before it that
+were refused are reported and what the agent had already sent is printed, then `run-new` exits; a
+task still sending is not waited for. The
+model's own text is commentary and goes to stderr with everything else, so `outrig run-new >
+out.txt` keeps exactly the messages the agent meant you to have.
+
 **No MCP server and no sidecar starts**, including servers an image declares in its
 `org.outrig.mcp` label; startup names the configured ones it left out. The model could not call
 them, and a server placed in the primary container would run beside the interpreter as the same
@@ -289,8 +307,10 @@ starts the container and the interpreter, and prints the image, the model, and t
 version. The session is recorded like any other, so `outrig ls`, `discard`, and `clean` see it;
 its record is written once the interpreter is up, under the name of the container it runs in.
 
-The REPL is `run`'s, with only `/help` and `/quit`. A failed round is reported and the session
-carries on.
+The only slash commands are `/help` and `/quit`, and a blank line is ignored. A failed round is
+reported and the session carries on; the messages it had not read are still waiting, so a line
+typed next is announced with them. If the interpreter exits -- Python that calls `os._exit`, say
+-- nothing typed could reach the agent any more, and the session ends with exit status 1.
 
 Ctrl-C while the agent's Python runs stops that Python, and the round carries on: the code is
 cancelled, or interrupted if it has stopped yielding, and the model reads how it ended. Stopping

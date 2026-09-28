@@ -46,13 +46,15 @@ audience, so "no new disclosure" was always too strong for a file that outlives 
 The interpreter protocol is NDJSON and the host reads both halves of every exchange, so the
 expensive part of watching an agent is already paid:
 
-| message  | direction     | what it already carries                              |
-|----------|---------------|------------------------------------------------------|
-| `exec`   | host → interp | the source an agent submitted                        |
-| `result` | interp → host | status, bounded output, and the traceback            |
-| `inv`    | both          | a bounded name-and-type listing of what the agent holds |
-| `msg`    | host → interp | a message arriving on the `user` channel             |
-| `send`   | interp → host | a message the agent sent                             |
+| message    | direction     | what it already carries                                 |
+|------------|---------------|---------------------------------------------------------|
+| `exec`     | host → interp | the source an agent submitted                           |
+| `result`   | interp → host | status, bounded output, and the traceback               |
+| `inv`      | both          | a bounded name-and-type listing of what the agent holds |
+| `msg`      | both          | a message on the `user` channel; answered with a count  |
+| `pending`  | both          | how many messages wait unread, by channel               |
+| `send`     | interp → host | a message the agent sent                                |
+| `received` | host → interp | that the user took one, which paces the agent's sends   |
 
 `inv` is already requested every thirty seconds by the liveness probe in `runtime-protection.md`,
 so a periodic inventory costs nothing that is not already spent.
@@ -65,8 +67,8 @@ the interpreter sends because someone is watching rather than because delivery r
 That is a real cost co-hosting created, and it is the one place this subject is not free.
 
 It is cheap in the way that matters, though: `messages.md` restricts a contract to the
-serializable subset, so every body already has a JSON form, and `receive_delivery()` already
-carries the sender and the arrival time.
+serializable subset, so every body already has a JSON form, and the `Delivery` that `receive()`
+returns already carries the sender and the arrival time.
 
 ## One stream, not one file per subject
 

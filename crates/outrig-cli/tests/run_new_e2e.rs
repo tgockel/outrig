@@ -1,29 +1,38 @@
 //! `outrig run-new` end to end: the binary, a real podman, an image with no
 //! Python in it, and a scripted Anthropic endpoint standing in for the model.
 //!
-//! One session is driven the way a person drives it -- a line, the reply, a
+//! Sessions are driven the way a person drives them -- a line, the reply, a
 //! Ctrl-C at the prompt, a line whose Python never finishes and a Ctrl-C to
-//! stop it, another line -- and everything is asserted from outside: what
-//! reached the model, what the terminal showed, and what the session left on
-//! disk. Each Ctrl-C is sent to outrig's whole process group, as a terminal
-//! sends it, so it reaches every child outrig did not move out of the way.
+//! stop it, a line typed while the agent's code is still running -- and
+//! everything is asserted from outside: what reached the model, what the
+//! terminal showed, and what the session left on disk. Each Ctrl-C is sent to
+//! outrig's whole process group, as a terminal sends it, so it reaches every
+//! child outrig did not move out of the way.
+//!
+//! The model's own text is commentary, on stderr; stdout carries only what the
+//! agent sends the user on its channel.
 
 #![cfg(feature = "e2e")]
 
 mod common;
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use common::{CannedResponse, RecordedRequest, drain_recorded, start_mock_http, stream_lines};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a step has once the session is up. Short, so a line that never
+/// reaches the agent fails the test rather than waiting out the whole budget.
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const KEY_VAR: &str = "OUTRIG_TEST_RUN_NEW_KEY";
 /// Named by the primary MCP server's `env` and never set: starting that server
 /// would fail on resolving it.
@@ -113,20 +122,137 @@ image-name = "docker.io/library/alpine:latest"
     repo
 }
 
-/// Read `stdout` until a line contains `want`.
-async fn read_until<R: tokio::io::AsyncBufRead + Unpin>(stdout: &mut R, want: &str) {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = timeout(TEST_TIMEOUT, stdout.read_line(&mut line))
-            .await
-            .unwrap_or_else(|_| panic!("no {want:?} on stdout in time"))
-            .expect("read stdout");
-        assert!(n > 0, "stdout closed before {want:?}");
-        if line.contains(want) {
-            return;
+/// A running `outrig run-new`, its output mirrored into sinks as it arrives,
+/// so a hang or an early exit shows why.
+struct Session {
+    child: Child,
+    pid: String,
+    stdin: ChildStdin,
+    stdout: Arc<Mutex<String>>,
+    stderr: Arc<Mutex<String>>,
+    streams: [JoinHandle<()>; 2],
+}
+
+impl Session {
+    fn start(repo: &Path, sessions: &Path) -> Self {
+        Self::spawn(repo, sessions, None)
+    }
+
+    /// With `stdout_pause`, stdout is read a line at a time with that pause
+    /// after each: a terminal slower than the agent writing to it.
+    fn spawn(repo: &Path, sessions: &Path, stdout_pause: Option<Duration>) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .args(["--global-config"])
+            .arg(repo.join("no-such-global.toml"))
+            .arg("--session-root")
+            .arg(sessions)
+            .arg("run-new")
+            .current_dir(repo)
+            .env(KEY_VAR, "sk-ant-mock-key")
+            .env_remove(SECRET_VAR)
+            .env("OUTRIG_LOG", "info")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            // A group of its own, led by outrig, as a shell's foreground job is.
+            .process_group(0)
+            .spawn()
+            .expect("spawn outrig");
+        let pid = child.id().expect("a pid").to_string();
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = Arc::new(Mutex::new(String::new()));
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let child_stdout = child.stdout.take().expect("stdout");
+        let streams = [
+            match stdout_pause {
+                None => tokio::spawn(stream_lines(child_stdout, Arc::clone(&stdout), "stdout")),
+                Some(pause) => tokio::spawn(read_slowly(child_stdout, Arc::clone(&stdout), pause)),
+            },
+            tokio::spawn(stream_lines(
+                child.stderr.take().expect("stderr"),
+                Arc::clone(&stderr),
+                "stderr",
+            )),
+        ];
+        Self {
+            child,
+            pid,
+            stdin,
+            stdout,
+            stderr,
+            streams,
         }
     }
+
+    async fn type_line(&mut self, line: &str) {
+        self.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("typed");
+    }
+
+    /// Wait for outrig to exit, and return how, with what each stream carried.
+    /// With `close_input`, input ends first, as Ctrl-D ends it; otherwise it
+    /// stays open, as a terminal's does, and outrig has to exit on its own.
+    async fn exit(self, close_input: bool) -> (std::process::ExitStatus, String, String) {
+        let Self {
+            mut child,
+            stdin,
+            stdout,
+            stderr,
+            streams,
+            ..
+        } = self;
+        let open = (!close_input).then_some(stdin);
+        let status = timeout(STEP_TIMEOUT, child.wait())
+            .await
+            .expect("exits")
+            .expect("wait");
+        drop(open);
+        for stream in streams {
+            stream.await.expect("drained");
+        }
+        let text = |sink: Arc<Mutex<String>>| sink.lock().expect("unpoisoned").clone();
+        (status, text(stdout), text(stderr))
+    }
+}
+
+/// Read `stdout` into `sink` a line at a time, pausing after each.
+async fn read_slowly(stdout: ChildStdout, sink: Arc<Mutex<String>>, pause: Duration) {
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        {
+            let mut sink = sink.lock().expect("unpoisoned");
+            sink.push_str(&line);
+            sink.push('\n');
+        }
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// Wait up to `within` for `done`, which `what` names.
+async fn wait_until(within: Duration, what: &str, done: impl Fn() -> bool) {
+    timeout(within, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {what} within {within:?}"));
+}
+
+/// Wait up to `within` for `sink` to hold `want`.
+async fn wait_for(sink: &Mutex<String>, want: &str, within: Duration) {
+    let holds = || sink.lock().expect("unpoisoned").contains(want);
+    wait_until(within, &format!("{want:?}"), holds).await;
+}
+
+/// Wait up to `within` for `path` to exist.
+async fn wait_for_file(path: &Path, within: Duration) {
+    wait_until(within, &path.display().to_string(), || path.exists()).await;
 }
 
 fn podman_names(filter: &str) -> String {
@@ -172,68 +298,30 @@ async fn names_survive_rounds_and_ctrl_c_stops_python_not_the_session() {
     let repo = repo(addr);
     let sessions = tempfile::tempdir().expect("a session root");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_outrig"))
-        .args(["--global-config"])
-        .arg(repo.path().join("no-such-global.toml"))
-        .arg("--session-root")
-        .arg(sessions.path())
-        .arg("run-new")
-        .current_dir(repo.path())
-        .env(KEY_VAR, "sk-ant-mock-key")
-        .env_remove(SECRET_VAR)
-        .env("OUTRIG_LOG", "info")
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("no_proxy", "127.0.0.1,localhost")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        // A group of its own, led by outrig, as a shell's foreground job is.
-        .process_group(0)
-        .spawn()
-        .expect("spawn outrig");
-    let pid = child.id().expect("a pid").to_string();
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
-    // Mirrored as it arrives, so a hang or an early exit shows why.
-    let stderr_sink = Arc::new(Mutex::new(String::new()));
-    let stderr_task = tokio::spawn(stream_lines(
-        child.stderr.take().expect("stderr"),
-        Arc::clone(&stderr_sink),
-        "stderr",
-    ));
+    let mut session = Session::start(repo.path(), sessions.path());
 
-    stdin.write_all(b"bind x\n").await.expect("first line");
-    read_until(&mut stdout, "bound x").await;
+    session.type_line("bind x").await;
+    wait_for(&session.stderr, "bound x", TEST_TIMEOUT).await;
 
     // At the prompt now. One Ctrl-C there is a fresh line, not an exit.
-    ctrl_c(&pid);
+    ctrl_c(&session.pid);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // A wait that will never finish, stopped once it is running.
-    stdin.write_all(b"wait\n").await.expect("second line");
-    let running = repo.path().join("running");
-    timeout(TEST_TIMEOUT, async {
-        while !running.exists() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the wait is running");
-    ctrl_c(&pid);
-    read_until(&mut stdout, "stopped the wait").await;
+    session.type_line("wait").await;
+    wait_for_file(&repo.path().join("running"), STEP_TIMEOUT).await;
+    ctrl_c(&session.pid);
+    wait_for(&session.stderr, "stopped the wait", STEP_TIMEOUT).await;
 
-    stdin.write_all(b"use x\n").await.expect("third line");
-    read_until(&mut stdout, "x + 1 is 42").await;
-    drop(stdin);
+    session.type_line("use x").await;
+    wait_for(&session.stderr, "x + 1 is 42", STEP_TIMEOUT).await;
 
-    let status = timeout(TEST_TIMEOUT, child.wait())
-        .await
-        .expect("exits after EOF")
-        .expect("wait");
-    stderr_task.await.expect("stderr drained");
-    let stderr = stderr_sink.lock().expect("unpoisoned").clone();
+    let (status, stdout, stderr) = session.exit(true).await;
     assert!(status.success(), "{status}");
+    assert_eq!(
+        stdout, "",
+        "the agent sent nothing, and its commentary is on stderr"
+    );
 
     // Startup: nothing MCP started, and Python came up.
     assert!(
@@ -297,4 +385,224 @@ async fn names_survive_rounds_and_ctrl_c_stops_python_not_the_session() {
         "the container is gone"
     );
     assert!(dirs[0].join("logs").is_dir());
+}
+
+/// The last user message `request` carried, as text.
+fn last_user_text(request: &RecordedRequest) -> String {
+    let message = request.body["messages"]
+        .as_array()
+        .expect("a messages array")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("a user message");
+    match &message["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        other => panic!("no user text: {other}"),
+    }
+}
+
+/// A typed line is a message the agent's code reads, not a prompt the model
+/// reads: the model is told one is waiting, and nothing it is sent carries what
+/// the user typed. A second line typed while the first round's code is still
+/// running -- no Ctrl-C -- reaches that same code, which is only possible if
+/// input is read while a round runs. What the agent sends back is what lands on
+/// stdout, including a send from a task that outlived its round.
+///
+/// Two Ctrl-Cs at the prompt then end the session with input still open: the
+/// read always in flight does not hold the process open.
+#[tokio::test]
+async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_terminal() {
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_read",
+            "ch = runtime.channels['user']\nfirst = await ch.receive()\n\
+             open('reading', 'w').close()\nsecond = await ch.receive()\n\
+             await ch.send(first.body + '|' + second.body)",
+        ),
+        text_reply("read both"),
+        submit(
+            "toolu_later",
+            "import os\nasync def later():\n    while not os.path.exists('release'):\n        \
+             await asyncio.sleep(0.05)\n    await runtime.channels['user'].send('done later')\n\
+             task = asyncio.create_task(later())",
+        ),
+        text_reply("started it"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("alpha-7").await;
+    wait_for_file(&repo.path().join("reading"), TEST_TIMEOUT).await;
+    // The first round's code is waiting on its second receive.
+    session.type_line("bravo-7").await;
+    wait_for(&session.stdout, "alpha-7|bravo-7\n", STEP_TIMEOUT).await;
+    wait_for(&session.stderr, "read both", STEP_TIMEOUT).await;
+
+    session.type_line("charlie-7").await;
+    wait_for(&session.stderr, "started it", STEP_TIMEOUT).await;
+    std::fs::write(repo.path().join("release"), b"").expect("release the task");
+    wait_for(&session.stdout, "done later\n", STEP_TIMEOUT).await;
+
+    ctrl_c(&session.pid);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ctrl_c(&session.pid);
+    let (status, stdout, stderr) = session.exit(false).await;
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        stdout, "alpha-7|bravo-7\ndone later\n",
+        "stdout is the agent's sends alone"
+    );
+    assert!(
+        stderr.contains("[outrig] queued for the agent (1 waiting)"),
+        "the line typed mid-round was queued, and said so: {stderr}"
+    );
+
+    // Two model calls per round and no more: the mock repeats its last answer,
+    // so only the count would show a round the second line started.
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 4, "{recorded:#?}");
+    for opening in [&recorded[0], &recorded[2]] {
+        assert_eq!(
+            last_user_text(opening),
+            "[outrig] 1 message is waiting on runtime.channels[\"user\"]."
+        );
+    }
+    let wire: String = recorded.iter().map(|r| r.body.to_string()).collect();
+    for typed in ["alpha-7", "bravo-7", "charlie-7"] {
+        assert!(!wire.contains(typed), "{typed} reached the model");
+    }
+}
+
+/// Once the interpreter has exited, nothing typed could reach the agent, so
+/// the session ends -- with input still open -- and says why.
+#[tokio::test]
+async fn the_session_ends_when_the_interpreter_exits() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit("toolu_exit", "import os\nos._exit(3)"),
+        text_reply("it is gone"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("exit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("it is gone"),
+        "the round finished first: {stderr}"
+    );
+    assert!(
+        stderr.contains("[outrig] the Python interpreter exited; the session is over"),
+        "{stderr}"
+    );
+}
+
+/// A flood of messages from the agent does not crowd out the round or what
+/// the user types. The terminal here is slower than the agent, so there is
+/// always a message waiting to be written; the round still reports, and
+/// `/quit` still ends the session.
+#[tokio::test]
+async fn a_flood_of_sends_does_not_starve_the_round_or_input() {
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_flood",
+            "async def flood():\n    while True:\n        \
+             await runtime.channels['user'].send('tick ' + 'x' * 1000)\n\
+             flooding = asyncio.create_task(flood())",
+        ),
+        text_reply("flooding"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::spawn(repo.path(), sessions.path(), Some(Duration::from_millis(1)));
+
+    session.type_line("go").await;
+    wait_for(&session.stdout, "tick ", TEST_TIMEOUT).await;
+    wait_for(&session.stderr, "flooding", STEP_TIMEOUT).await;
+    session.type_line("/quit").await;
+    let (status, _, stderr) = session.exit(false).await;
+    assert!(status.success(), "{status}: {stderr}");
+}
+
+/// Input ending is a graceful exit, and a graceful exit shows everything the
+/// agent had already sent. Here a task the round left sends a burst, all of it
+/// at once, to a terminal slower than the agent, and input ends while most of
+/// the burst is still waiting to be shown; every message reaches stdout, in
+/// order.
+#[tokio::test]
+async fn end_of_input_shows_everything_already_sent() {
+    const BURST: usize = 12;
+    let (addr, _requests) = start_mock_http(vec![
+        submit(
+            "toolu_burst",
+            &format!(
+                "import os\nasync def burst():\n    while not os.path.exists('release'):\n        \
+                 await asyncio.sleep(0.01)\n    for i in range({BURST}):\n        \
+                 await runtime.channels['user'].send(f'm{{i}} ' + 'x' * 32000)\n\
+                 task = asyncio.create_task(burst())"
+            ),
+        ),
+        text_reply("armed"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::spawn(
+        repo.path(),
+        sessions.path(),
+        Some(Duration::from_millis(10)),
+    );
+
+    session.type_line("go").await;
+    wait_for(&session.stderr, "armed", TEST_TIMEOUT).await;
+    std::fs::write(repo.path().join("release"), b"").expect("release the burst");
+    wait_for(&session.stdout, "m0 ", STEP_TIMEOUT).await;
+    let (status, stdout, stderr) = session.exit(true).await;
+    assert!(status.success(), "{status}: {stderr}");
+    let shown: Vec<&str> = stdout
+        .lines()
+        .map(|line| line.split(' ').next().expect("a word"))
+        .collect();
+    let sent: Vec<String> = (0..BURST).map(|i| format!("m{i}")).collect();
+    assert_eq!(shown, sent);
+}
+
+/// Lines refused as input ends are still reported: the answer to what was
+/// typed is shown before a graceful exit, as what the agent sent is.
+#[tokio::test]
+async fn lines_refused_as_input_ends_are_still_reported() {
+    const REFUSED: usize = 10;
+    let (addr, requests) = start_mock_http(vec![text_reply("unused")]).await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    wait_for(&session.stderr, "(Ctrl-D to exit", TEST_TIMEOUT).await;
+    for _ in 0..REFUSED {
+        session.type_line(&"x".repeat((1 << 20) + 1)).await;
+    }
+    let (status, _, stderr) = session.exit(true).await;
+    assert!(status.success(), "{status}: {stderr}");
+    assert_eq!(
+        stderr
+            .matches("[outrig] error: not delivered: the message is 1048577 bytes")
+            .count(),
+        REFUSED,
+        "{stderr}"
+    );
+    let mut requests = requests;
+    assert!(
+        drain_recorded(&mut requests).is_empty(),
+        "nothing was delivered, so no round ran"
+    );
 }

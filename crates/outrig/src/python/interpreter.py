@@ -3,10 +3,11 @@
 Started by `podman exec -i` inside the session container, with the primary agent's id as its
 one argument, and spoken to in NDJSON: requests on stdin, replies on stdout, every message in
 both directions naming the agent it concerns. Each agent is a **kernel** -- a session module,
-an event loop on a thread of its own, an execution slot, and a bounded backlog of background
-output. The process owns what they share: the protocol descriptors, the reader thread that
-routes messages by agent id, and the descriptors executed code writes to. The primary agent's
-kernel runs on the main thread, because that is the only thread a signal handler runs on.
+an event loop on a thread of its own, an execution slot, a bounded backlog of background output,
+and the endpoints of its channels, bound as `runtime.channels`. The process owns what they
+share: the protocol descriptors, the reader thread that routes messages by agent id, and the
+descriptors executed code writes to. The primary agent's kernel runs on the main thread, because
+that is the only thread a signal handler runs on.
 
 Five things here are load-bearing rather than incidental:
 
@@ -44,10 +45,13 @@ import builtins
 import collections
 import contextlib
 import contextvars
+import dataclasses
+import datetime
 import functools
 import inspect
 import io
 import json
+import math
 import mmap
 import os
 import resource
@@ -59,6 +63,7 @@ import threading
 import time
 import traceback
 import types
+import typing
 
 # ---------------------------------------------------------------------------- limits
 
@@ -142,10 +147,19 @@ def _encode(message):
     return (json.dumps(_clean(message)) + "\n").encode("utf-8")
 
 
-def _send(message):
-    line = _with_room(_encode, message)
+def _write_line(line):
+    """Write one encoded protocol line, whole.
+
+    Agent code reaches this through `Endpoint.send`, so it is in `_MACHINERY`: an interrupt that
+    lands here is dropped rather than raised, since a line cut short would glue the next one --
+    perhaps an answer the host is waiting for -- onto its tail.
+    """
     with _send_lock:
         _write_all(_PROTO_OUT, line)
+
+
+def _send(message):
+    _write_line(_with_room(_encode, message))
 
 
 # ---------------------------------------------------------------------------- output
@@ -793,6 +807,345 @@ _MISSING = object()
 
 # A type's own name, read without consulting its metaclass, which could run agent code.
 _type_name = type.__dict__["__name__"].__get__
+_type_qualname = type.__dict__["__qualname__"].__get__
+
+
+# ---------------------------------------------------------------------------- channels
+
+# A channel carries typed messages between two endpoints, each named locally. Today the other end
+# of every channel is the host: an agent's `user` channel, carrying text both ways. A message from
+# the host is queued on the reader thread, so `pending()` is exact even while the agent's loop is
+# not turning; a message to it is one protocol line. Each endpoint also counts every message ever
+# delivered to it, which is how the host tells a new arrival from one it has already announced.
+#
+# The host says when the user has received each message an endpoint sent, and a send waits while
+# `SEND_WINDOW` are unreceived. So an agent that sends faster than the user reads is held back in
+# its own code, under this process's memory ceiling, rather than piling messages up in the host's.
+
+QUEUE_MAX = 256  # unread messages one endpoint holds
+MESSAGE_MAX = 1 << 20  # bytes of the protocol line one sent message becomes
+SEND_WINDOW = 16  # messages one endpoint sends ahead of the other end receiving them
+
+# What a contract may name: the types with an obvious JSON form, and what is built from them.
+_SCALARS = (str, bool, int, float, type(None))
+_UNIONS = (typing.Union, types.UnionType)
+
+_SUBSET = (
+    "str, bool, int, float, None, list[T], dict[str, T], unions of these, and dataclasses whose "
+    "fields are all of these"
+)
+
+
+def _describe(t):
+    """A type as a contract error names it: `bytes`, `set[int]`, `Row`."""
+    if t is type(None):
+        return "None"
+    if typing.get_origin(t) is None and isinstance(t, type):
+        return _type_qualname(t)
+    return repr(t).removeprefix("typing.")
+
+
+def _describe_all(contract):
+    return " | ".join(map(_describe, contract)) if contract else "nothing"
+
+
+def _contract(declared, where):
+    """One direction's contract, as the tuple of types it admits.
+
+    `declared` is a type, a union of types, or a tuple of them, `()` for a direction that carries
+    nothing. Every type must be in the serializable subset, checked here rather than at the first
+    send: anything else raises `TypeError` naming the type, and the field it is in when it is
+    nested in a dataclass.
+    """
+    members = declared if isinstance(declared, tuple) else _union_members(declared)
+    for member in members:
+        _check_subset(member, where, "", set())
+    return tuple(type(None) if member is None else member for member in members)
+
+
+def _union_members(t):
+    return typing.get_args(t) if typing.get_origin(t) in _UNIONS else (t,)
+
+
+def _check_subset(t, where, inside, seen):
+    """Raise `TypeError` unless `t` is in the serializable subset. `inside` names the field."""
+    if t is None or t in _SCALARS:
+        return
+    origin, args = typing.get_origin(t), typing.get_args(t)
+    if origin in _UNIONS:
+        for member in args:
+            _check_subset(member, where, inside, seen)
+        return
+    if origin is list and len(args) == 1:
+        _check_subset(args[0], where, inside, seen)
+        return
+    if origin is dict and len(args) == 2 and args[0] is str:
+        _check_subset(args[1], where, inside, seen)
+        return
+    if origin is None and isinstance(t, type) and dataclasses.is_dataclass(t):
+        # A dataclass that refers to itself is checked once.
+        if t in seen:
+            return
+        seen.add(t)
+        for field, hint in _dataclass_fields(t, where):
+            _check_subset(hint, where, f" (field {field!r} of {_type_qualname(t)})", seen)
+        return
+    raise TypeError(
+        f"{where} {_describe(t)}{inside}, which is outside the subset a channel can carry: "
+        f"{_SUBSET}"
+    )
+
+
+def _dataclass_fields(t, where):
+    """`(name, type)` for each of dataclass `t`'s fields, its annotations resolved."""
+    try:
+        hints = typing.get_type_hints(t)
+    except Exception as e:
+        raise TypeError(
+            f"{where} {_type_qualname(t)}, whose field types cannot be resolved: "
+            f"{_type_name(type(e))}: {e}"
+        ) from None
+    return [(field.name, hints.get(field.name, field.type)) for field in dataclasses.fields(t)]
+
+
+def _conforms(value, t):
+    """Whether `value` is of contract type `t`.
+
+    By exact type, so a subclass carrying behavior does not pass as its base and `True` is not an
+    `int`; an `int` does pass as a `float`, as it does in Python's own annotations. Only a
+    dataclass's fields are read, and only by the agent's own `send`: a body from the host is plain
+    JSON, never a dataclass instance, so checking one runs no agent code.
+    """
+    if t is type(None):
+        return value is None
+    if t is float:
+        return type(value) in (int, float) and math.isfinite(value)
+    if t in _SCALARS:
+        return type(value) is t
+    origin, args = typing.get_origin(t), typing.get_args(t)
+    if origin in _UNIONS:
+        return any(_conforms(value, member) for member in args)
+    if origin is list:
+        return type(value) is list and all(_conforms(item, args[0]) for item in value)
+    if origin is dict:
+        return type(value) is dict and all(
+            type(key) is str and _conforms(item, args[1]) for key, item in value.items()
+        )
+    return type(value) is t and all(
+        _conforms(getattr(value, field), hint) for field, hint in _dataclass_fields(t, "")
+    )
+
+
+class _Refused(Exception):
+    """A message the host sent that its endpoint does not take. Nothing was queued."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Delivery:
+    """One message taken from an endpoint.
+
+    `body` is the message itself, `sender` who sent it -- `"user"` on the user channel -- and
+    `received_at` when it arrived, in UTC.
+    """
+
+    body: object
+    sender: str
+    received_at: datetime.datetime
+
+
+def _wake(waiter):
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+def _wake_all(waiters, channel):
+    """Wake each of `waiters`, an iterator taken before the change they wait on was made.
+
+    Raises nothing. The change has been made, and `_handle` retries a message whose handling ran
+    out of memory, which would make it twice. So nothing here is left to allocate outside a `try`:
+    not the iterator, which the caller took, and not a `suppress`.
+    """
+    for waiter in waiters:
+        try:
+            _with_room(waiter.get_loop().call_soon_threadsafe, _wake, waiter)
+        except BaseException as e:
+            # Its loop has closed, or there is no memory even to schedule the wakeup.
+            try:
+                _diag(f"channel {channel!r}: a waiting receive or send could not be woken: {e!r}")
+            except BaseException:
+                pass
+
+
+class Endpoint:
+    """One end of a channel: `await receive()`, `await send(message)`, and `pending()`.
+
+    The channel's contract -- what may travel each way -- was fixed when it was made, and reads as
+    `receives` and `sends`. Messages arrive in the order they were sent.
+    """
+
+    def __init__(self, agent, name, *, receives, sends):
+        self._receives = _contract(receives, f"channel {name!r} cannot receive")
+        self._sends = _contract(sends, f"channel {name!r} cannot send")
+        self._agent = agent
+        self._name = name
+        self._lock = threading.Lock()
+        self._queue = collections.deque()
+        # Every message ever queued here, received or not.
+        self._delivered = 0
+        # Messages sent that the other end has not yet received.
+        self._unreceived = 0
+        # Futures of receives waiting for a message, and of sends waiting for room in the window,
+        # each on its own loop.
+        self._receivers = []
+        self._senders = []
+
+    @property
+    def receives(self):
+        """The types a message arriving here may have."""
+        return self._receives
+
+    @property
+    def sends(self):
+        """The types a message sent from here may have."""
+        return self._sends
+
+    def __repr__(self):
+        return (
+            f"<endpoint {self._name!r}: receives {_describe_all(self._receives)}, sends "
+            f"{_describe_all(self._sends)}, {self.pending()} pending>"
+        )
+
+    def pending(self):
+        """How many messages are waiting to be received. Takes none of them."""
+        with self._lock:
+            return len(self._queue)
+
+    def _counts(self):
+        """How many messages wait, and how many have ever been delivered, as of one moment."""
+        with self._lock:
+            return {"pending": len(self._queue), "delivered": self._delivered}
+
+    async def receive(self):
+        """Take the next message, waiting until there is one, as a `Delivery`.
+
+        `.body` is the message itself. Receiving removes it: no later receive sees it again.
+        """
+        return await self._when(self._receivers, self._take)
+
+    def _take(self):
+        return self._queue.popleft() if self._queue else None
+
+    def _take_room(self):
+        if self._unreceived < SEND_WINDOW:
+            self._unreceived += 1
+            return True
+        return None
+
+    async def _when(self, waiters, take):
+        """Wait until `take()`, called under the lock, gives something other than `None`, and
+        return it. A waiting call parks a future in `waiters`, woken to try again."""
+        loop = asyncio.get_running_loop()
+        while True:
+            with self._lock:
+                taken = take()
+                if taken is not None:
+                    return taken
+                waiter = loop.create_future()
+                waiters.append(waiter)
+            try:
+                await waiter
+            finally:
+                with self._lock, contextlib.suppress(ValueError):
+                    waiters.remove(waiter)
+
+    async def send(self, message):
+        """Send `message` to the other end.
+
+        It returns once the message is on its way: accepted for delivery, not yet read. At most
+        `SEND_WINDOW` messages are on their way unreceived, and a send past that waits until the
+        other end receives one. Sending does not end anything -- not the round, and not the code
+        that sends.
+        """
+        if not any(_conforms(message, t) for t in self._sends):
+            raise TypeError(
+                f"channel {self._name!r} sends {_describe_all(self._sends)}, not "
+                f"{_type_name(type(message))}"
+            )
+        # Encoded here rather than on the reserve: running out of memory while building the
+        # agent's own message is the agent's to see.
+        line = _encode({"t": "send", "agent": self._agent, "channel": self._name, "body": message})
+        if len(line) > MESSAGE_MAX:
+            raise ValueError(
+                f"this message is {len(line)} bytes as sent, past the {MESSAGE_MAX} a channel "
+                f"carries; send less, or send it in parts"
+            )
+        await self._when(self._senders, self._take_room)
+        try:
+            _write_line(line)
+        except BaseException:
+            # Not sent, so it takes no room -- on the reserve if it has to be, since room that is
+            # never given back is lost to the channel for good.
+            _with_room(self._received)
+            raise
+
+    def _received(self):
+        """The other end received a message this endpoint sent, which makes room for another.
+
+        Only what comes before the room is made can raise -- running out of memory, with nothing
+        changed, so the caller can try again. After it nothing raises, so a retry never makes the
+        room twice.
+        """
+        with self._lock:
+            wake = iter(self._senders.copy())
+            if self._unreceived:
+                self._unreceived -= 1
+        _wake_all(wake, self._name)
+
+    def _deliver(self, body, sender):
+        """Queue `body` from `sender` and return how many messages then wait. Reader thread only.
+
+        Raises `_Refused` for a body the contract does not take or a queue that is full, having
+        queued nothing. The append is the last step that can fail, so a retry after running out
+        of memory never queues a message twice; waking the receivers comes after, and cannot undo
+        it.
+        """
+        if not any(_conforms(body, t) for t in self._receives):
+            raise _Refused(
+                f"channel {self._name!r} receives {_describe_all(self._receives)}, not "
+                f"{_type_name(type(body))}"
+            )
+        delivery = Delivery(body, sender, datetime.datetime.now(datetime.timezone.utc))
+        with self._lock:
+            if len(self._queue) >= QUEUE_MAX:
+                raise _Refused(f"channel {self._name!r} already holds {QUEUE_MAX} unread messages")
+            count, delivered = len(self._queue) + 1, self._delivered + 1
+            wake = iter(self._receivers.copy())
+            self._queue.append(delivery)
+            # Only rebinding after the append, which cannot fail.
+            self._delivered = delivered
+        # Every receiver, since each re-checks and one may have been cancelled in the meantime.
+        _wake_all(wake, self._name)
+        return count
+
+
+class Runtime:
+    """What this agent reaches beyond its own names.
+
+    `runtime.channels` maps a name to the endpoint of a channel. `runtime.channels["user"]` is how
+    the user reaches you and you reach them: see `help(type(runtime.channels["user"]))`.
+    """
+
+    def __init__(self, channels):
+        self._channels = types.MappingProxyType(channels)
+
+    @property
+    def channels(self):
+        """This agent's channel endpoints, by name. Read-only."""
+        return self._channels
+
+    def __repr__(self):
+        return f"<runtime: channels {', '.join(map(repr, self._channels))}>"
+
 
 
 class Kernel:
@@ -806,6 +1159,10 @@ class Kernel:
         self.globals = self.module.__dict__
         self.globals["__builtins__"] = builtins
         self.globals["asyncio"] = asyncio
+        # The user's channel carries text both ways. Every agent has one, and the host is at the
+        # other end of it.
+        self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
+        self.globals["runtime"] = Runtime(self.channels)
         sys.modules[self.module.__name__] = self.module
         # Names bound at boot are infrastructure, not the model's work. Hidden by identity, so a
         # name the model rebinds is listed again.
@@ -1214,14 +1571,16 @@ def _in_agent_task(kernel):
 # Machinery that can sit nearer the signal than agent code's frames; see `_on_sigint`. Every
 # callback the loop runs, this program's own included, runs beneath `Handle._run`, so the loop's
 # two dispatch frames cover them all -- including when agent code pumps the loop by hand. What else
-# agent code triggers synchronously and must not be interrupted is the fork hooks. This program's
-# output routing, by contrast, is deliberately absent: a runaway that prints spends most of its
-# time there, and must still be interruptible.
+# agent code triggers synchronously and must not be interrupted is a protocol line on its way out,
+# which `Endpoint.send` writes, and the fork hooks. This program's output routing, by contrast, is
+# deliberately absent: a runaway that prints spends most of its time there, and must still be
+# interruptible.
 _MACHINERY = frozenset(
     fn.__code__
     for fn in (
         asyncio.base_events.BaseEventLoop._run_once,
         asyncio.events.Handle._run,
+        _write_line,
         _before_fork,
         _after_fork_in_parent,
         _after_fork_in_child,
@@ -1257,10 +1616,60 @@ def _exec(kernel, request_id, message):
     kernel.admit(request_id, source)
 
 
+def _msg(kernel, request_id, message):
+    """Queue a message from the user on one of the agent's channels, and say how many then wait.
+
+    Always answered, since the host waits for the answer. Everything that can fail before the
+    message is queued is retried whole by `_handle` when memory ran out; nothing after it is, so a
+    message is never queued twice.
+    """
+    channel = message.get("channel")
+    endpoint = kernel.channels.get(channel) if isinstance(channel, str) else None
+    try:
+        if endpoint is None:
+            raise _Refused(f"agent {kernel.agent!r} has no channel {channel!r}")
+        pending = endpoint._deliver(message.get("body"), "user")
+    except _Refused as e:
+        _send({"t": "msg", "agent": kernel.agent, "id": request_id, "error": str(e)})
+        return
+    # Queued: from here nothing may reach `_handle`, whose retry would queue it again, so the
+    # guards allocate nothing of their own.
+    try:
+        _send({"t": "msg", "agent": kernel.agent, "id": request_id, "pending": pending})
+    except BaseException as e:
+        try:
+            _diag(f"message {request_id!r} was queued, but saying so failed: {e!r}")
+        except BaseException:
+            pass
+
+
+def _received(kernel, _, message):
+    """The user received a message the agent sent on a channel, which makes room for another.
+
+    Running out of memory before the room is made reaches `_handle`, which tries again on the
+    reserve: the host says so once, and room lost here would be lost for good.
+    """
+    channel = message.get("channel")
+    endpoint = kernel.channels.get(channel) if isinstance(channel, str) else None
+    if endpoint is None:
+        raise ValueError(f"agent {kernel.agent!r} has no channel {channel!r}")
+    endpoint._received()
+
+
+def _pending(kernel, request_id, _):
+    """Say how many messages wait on each of the agent's channels, and how many have ever been
+    delivered to it, reading none of them."""
+    channels = {name: endpoint._counts() for name, endpoint in kernel.channels.items()}
+    _send({"t": "pending", "agent": kernel.agent, "id": request_id, "channels": channels})
+
+
 # What each message addressed to an agent does, with the id it carries. `inv` is answered on the
 # agent's loop; the rest are handled here, on the reader thread.
 _ROUTES = {
     "exec": _exec,
+    "msg": _msg,
+    "pending": _pending,
+    "received": _received,
     "inv": lambda kernel, request_id, _: kernel.loop.call_soon_threadsafe(
         kernel.inventory, request_id
     ),

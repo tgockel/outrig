@@ -11,6 +11,10 @@
 //! The wait is `recovery`'s, so a call that the user interrupts, or whose
 //! code the host finds spinning, still ends with the execution's own outcome
 //! -- and says what was done to it.
+//!
+//! A message the user sent while the call ran is announced at the head of its
+//! result, by channel and count: the model reads that it is waiting, and reads
+//! the message itself only with code.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +25,8 @@ use rig::wasm_compat::WasmBoxedFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::python::host::{Interpreter, Late, Outcome, Report, Unknown};
+use super::channel::Announcer;
+use crate::python::host::{ExecId, Interpreter, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{self, ATTEMPTS, GaveUp, Press, Presses, Timings, Verdict, Waited};
 
 /// What the model calls the tool.
@@ -104,16 +109,23 @@ pub(crate) struct SubmitPython {
     unreported: Mutex<Vec<Late>>,
     on_submit: ObserverSlot,
     interrupts: Interrupts,
+    /// What the model has been told of what waits on the agent's channels.
+    announcer: Announcer,
 }
 
 impl SubmitPython {
-    pub(crate) fn new(interpreter: Interpreter, result_max_bytes: usize) -> Self {
+    pub(crate) fn new(
+        interpreter: Interpreter,
+        result_max_bytes: usize,
+        announcer: Announcer,
+    ) -> Self {
         Self {
             interpreter,
             result_max_bytes,
             unreported: Mutex::new(Vec::new()),
             on_submit: ObserverSlot::default(),
             interrupts: Interrupts::default(),
+            announcer,
         }
     }
 
@@ -125,6 +137,21 @@ impl SubmitPython {
     /// Where presses reach this tool's calls.
     pub(crate) fn interrupts(&self) -> Interrupts {
         self.interrupts.clone()
+    }
+
+    /// A line saying what waits on the agent's channels, if anything arrived
+    /// since the model was last told, or nothing. Never an error: the result
+    /// matters more, and an announcement missed here is made by a later call
+    /// or the next round.
+    async fn announcement(&self) -> String {
+        match self.announcer.arrived().await {
+            Ok(Some(text)) => format!("[{text}]\n"),
+            Ok(None) => String::new(),
+            Err(e) => {
+                tracing::debug!("not announcing what waits: {e}");
+                String::new()
+            }
+        }
     }
 
     /// As if an earlier result had had no room for `late`.
@@ -180,12 +207,13 @@ impl ToolDyn for SubmitPython {
                 .interpreter
                 .submit(&source)
                 .map_err(|e| ToolError::ToolCallError(e.into()))?;
-            tracing::debug!(execution = %execution.id(), "submitted");
+            let id = execution.id();
+            tracing::debug!(execution = %id, "submitted");
             // Only source that went to run: a refusal is the model's to read,
             // not something to show as running. Interrupts reach it from
             // before it is shown, since that is what a person interrupts.
             let queued = execution.queued();
-            let _waiting = queued.then(|| self.interrupts.presses.waiting_on(execution.id()));
+            let waiting = queued.then(|| self.interrupts.presses.waiting_on(id));
             if queued
                 && let Some(observer) = &*self
                     .on_submit
@@ -206,6 +234,17 @@ impl ToolDyn for SubmitPython {
             if settled.waited.user_stopped {
                 self.interrupts.turn_stopped.store(true, Ordering::SeqCst);
             }
+            // Nothing is waiting on Python from here, so a press while the
+            // interpreter is asked what waits finds no call and drops the round.
+            drop(waiting);
+            // The outcome is this call's alone until it is handed back, and the
+            // question below is an await: kept as a late result if the round
+            // is dropped there, as one nobody waited for is.
+            let unhanded = Unhanded::new(&self.interpreter, id, &settled.outcome);
+            // Asked before the lock below is taken, which cannot be held across
+            // an await.
+            let announcement = self.announcement().await;
+            unhanded.handed();
             // Taken after the outcome, so anything that arrived while this ran
             // is reported now rather than a call later -- after whatever an
             // earlier result had no room for, which is older.
@@ -215,15 +254,54 @@ impl ToolDyn for SubmitPython {
                 .unwrap_or_else(PoisonError::into_inner);
             let mut late = std::mem::take(&mut *unreported);
             late.extend(self.interpreter.take_late());
+            // Ahead of the rest and outside its bound, so no cut takes it.
             let (text, rest) = render(
                 late,
                 &settled.outcome,
                 settled.waited,
-                self.result_max_bytes,
+                self.result_max_bytes.saturating_sub(announcement.len()),
             );
             *unreported = rest;
-            Ok(text)
+            Ok(if announcement.is_empty() {
+                text
+            } else {
+                announcement + &text
+            })
         })
+    }
+}
+
+/// An outcome a call holds between its code reporting and its result being
+/// handed back. Dropped in between -- its round was dropped -- it is kept for a
+/// later call to report as a late result: the execution is over, so no reply
+/// is coming to report it instead.
+struct Unhanded<'a> {
+    interpreter: &'a Interpreter,
+    late: Option<Late>,
+}
+
+impl<'a> Unhanded<'a> {
+    fn new(interpreter: &'a Interpreter, id: ExecId, outcome: &Outcome) -> Self {
+        // An outcome with nothing to report, or one still to come as a late
+        // reply, needs no keeping.
+        let late = matches!(outcome, Outcome::Ok(_) | Outcome::Error { .. }).then(|| Late {
+            id,
+            outcome: outcome.clone(),
+        });
+        Self { interpreter, late }
+    }
+
+    /// The result is being handed back; nothing to keep.
+    fn handed(mut self) {
+        self.late = None;
+    }
+}
+
+impl Drop for Unhanded<'_> {
+    fn drop(&mut self) {
+        if let Some(late) = self.late.take() {
+            self.interpreter.keep_late(late);
+        }
     }
 }
 

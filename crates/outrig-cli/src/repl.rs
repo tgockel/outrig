@@ -65,7 +65,7 @@ pub(crate) fn compose_help(commands: &[HelpEntry]) -> String {
     buf
 }
 
-const INTERRUPT_NOTICE: &[u8] = b"\n[outrig] interrupted\n";
+pub(crate) const INTERRUPT_NOTICE: &[u8] = b"\n[outrig] interrupted\n";
 
 pub struct Repl;
 
@@ -225,7 +225,7 @@ async fn ctrl_c_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn write_stderr_line<E>(stderr: &mut E, text: &str) -> Result<()>
+pub(crate) async fn write_stderr_line<E>(stderr: &mut E, text: &str) -> Result<()>
 where
     E: AsyncWrite + Unpin,
 {

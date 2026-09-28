@@ -1,6 +1,10 @@
 //! The agent loop: resolve a model, build an agent whose only tool submits
 //! Python to the session's interpreter, and drive rounds.
 //!
+//! The user reaches the agent through its `user` channel ([`UserChannel`]),
+//! not through the prompt. A round opens by telling the model how many
+//! messages wait there, and its code reads them.
+//!
 //! A copy of `outrig-cli`'s loop rather than a move of it, so the 0.2.x line
 //! keeps editing its own without conflict; `plan/phase/0003-python/` records
 //! why. rig stays a private dependency: nothing rig-typed crosses
@@ -8,6 +12,7 @@
 //! at the point it is caught.
 
 mod build;
+mod channel;
 mod orientation;
 mod resolve;
 mod round;
@@ -16,6 +21,7 @@ mod tool;
 use std::error::Error;
 use std::path::Path;
 use std::sync::PoisonError;
+use std::time::Duration;
 
 use rig::completion::{Message, PromptError};
 use rig::tool::ToolDyn;
@@ -23,9 +29,12 @@ use rig::tool::ToolDyn;
 use crate::Outrig;
 use crate::config::Config;
 use crate::error::OutrigError;
-use crate::python::host::Interpreter;
+use crate::python::host::{Interpreter, InterpreterError};
+
+pub use self::channel::UserChannel;
 
 use self::build::RigAgent;
+use self::channel::Announcer;
 use self::resolve::{LlmResolveError, ResolvedAgent};
 use self::round::RoundEnd;
 use self::tool::{Interrupts, ObserverSlot, SubmitPython};
@@ -61,6 +70,11 @@ pub struct PythonAgent {
     /// Shared with the tool and each round's hook; what
     /// [`PythonAgent::interrupter`] presses.
     interrupts: Interrupts,
+    /// The user's end of the agent's `user` channel, handed out by
+    /// [`PythonAgent::user_channel`].
+    user: UserChannel,
+    /// What the model has been told of what waits there. Shared with the tool.
+    announcer: Announcer,
 }
 
 impl PythonAgent {
@@ -151,36 +165,58 @@ impl PythonAgent {
         move || interrupts.press()
     }
 
-    /// Drive one round: `prompt`, the model and whatever Python it submits, and
-    /// the reply.
+    /// The user's end of the agent's `user` channel: how what the user types
+    /// reaches the agent, and how what the agent sends reaches them. Every
+    /// call hands out the same channel.
+    pub fn user_channel(&self) -> UserChannel {
+        self.user.clone()
+    }
+
+    /// Drive one round, if anything was sent on the user channel since the
+    /// model was last told what waits there: the model, told how many messages
+    /// wait -- never what they say -- and whatever Python it submits, then its
+    /// reply. `None`, without calling the model, when nothing new arrived or
+    /// the agent's code has already read what did.
     ///
-    /// A round cut short by the tool-call cap keeps what it managed, so the
-    /// next prompt carries on from it, and its reply ends `(round ended:
+    /// A message arriving while the round runs is announced in the next result
+    /// the model reads. One arriving after the last of them is left for the
+    /// next call, which is why a caller asks again once a round ends.
+    ///
+    /// The reply is the model's own text: commentary, where a message the agent
+    /// means the user to have is one it sends. A round cut short by the
+    /// tool-call cap keeps what it managed, and its reply ends `(round ended:
     /// <reason>)`.
     ///
     /// An error leaves the conversation as it was if the round had run no
     /// Python. If it had, the completed tool calls and their results are kept,
-    /// because what they did stands -- nothing is rolled back -- and the error
-    /// says to continue rather than resend.
+    /// because what they did stands -- nothing is rolled back. Either way the
+    /// messages the round did not read are still waiting, and the next round
+    /// announces them again.
     ///
     /// A round whose future is dropped before it returns keeps its completed
     /// tool calls and their results the same way. Python it was waiting on
     /// keeps running, so stopping that is [`PythonAgent::interrupter`]'s.
-    pub async fn round(&mut self, prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    pub async fn round(&mut self) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+        let Some(announcement) = self.announcer.opening().await? else {
+            return Ok(None);
+        };
         let RoundEnd { reply, stopped } = self
             .agent
             .round(
-                prompt,
+                &format!("[outrig] {announcement}."),
                 &mut self.history,
                 self.tool_call_max,
                 &self.interrupts,
             )
             .await?;
-        Ok(match stopped {
+        // Only now: a round that failed or was dropped may have left the
+        // model unaware of what it announced, and the next one says it again.
+        self.announcer.keep();
+        Ok(Some(match stopped {
             None => reply,
             Some(reason) if reply.trim().is_empty() => format!("(round ended: {reason})"),
             Some(reason) => format!("{reply}\n(round ended: {reason})"),
-        })
+        }))
     }
 
     /// [`PythonAgent::start`] over an interpreter the caller started on the
@@ -203,7 +239,13 @@ impl PythonAgent {
         workspace: Option<&Path>,
     ) -> Result<Self, AgentError> {
         let python_version = interpreter.version().to_string();
-        let tool = SubmitPython::new(interpreter, resolved.tool_result_max_bytes);
+        let announcer = Announcer::new(interpreter.clone());
+        let user = UserChannel::new(interpreter.clone());
+        let tool = SubmitPython::new(
+            interpreter,
+            resolved.tool_result_max_bytes,
+            announcer.clone(),
+        );
         let on_submit = tool.observer_slot();
         let interrupts = tool.interrupts();
         let preamble = orientation::preamble(workspace, resolved.preamble.as_deref());
@@ -222,6 +264,8 @@ impl PythonAgent {
             container_name: container_name.to_string(),
             on_submit,
             interrupts,
+            user,
+            announcer,
         })
     }
 }
@@ -239,14 +283,28 @@ pub(crate) enum AgentError {
     #[error(transparent)]
     Outrig(#[from] OutrigError),
 
-    #[error("agent prompt failed: {0}")]
+    #[error(transparent)]
+    Interpreter(#[from] InterpreterError),
+
+    /// The interpreter did not say what waits on the agent's channels.
+    #[error("the Python interpreter did not say what messages are waiting within {0:?}")]
+    Unanswered(Duration),
+
+    /// A model call failed before the round ran any Python. The messages it
+    /// announced are still waiting.
+    #[error(
+        "agent round failed: {0}. The messages it was told of are still waiting; send another \
+         to try again"
+    )]
     Prompt(String),
 
     /// A model call failed after the round had run Python. What ran is kept
-    /// in the conversation, so resending the prompt would ask for it again.
+    /// in the conversation, and a message that repeated an earlier one would
+    /// ask for it again.
     #[error(
-        "agent prompt failed after this round had already run Python: {0}. What it ran is kept \
-         in the conversation -- send a prompt to continue rather than resending this one"
+        "agent round failed after it had already run Python: {0}. What it ran is kept in the \
+         conversation, and the messages it did not read are still waiting -- send another to \
+         continue rather than repeating one"
     )]
     PromptAfterWork(String),
 }

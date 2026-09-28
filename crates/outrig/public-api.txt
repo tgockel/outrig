@@ -1190,8 +1190,9 @@ pub fn outrig::PythonAgent::interrupter(&self) -> impl core::ops::function::Fn()
 pub fn outrig::PythonAgent::model(&self) -> &str
 pub fn outrig::PythonAgent::on_submit(&mut self, impl core::ops::function::Fn(&str) + core::marker::Send + core::marker::Sync + 'static)
 pub fn outrig::PythonAgent::python_version(&self) -> &str
-pub async fn outrig::PythonAgent::round(&mut self, &str) -> core::result::Result<alloc::string::String, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
+pub async fn outrig::PythonAgent::round(&mut self) -> core::result::Result<core::option::Option<alloc::string::String>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub async fn outrig::PythonAgent::start(&outrig::Outrig, &outrig::config::Config, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<outrig::PythonAgent, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
+pub fn outrig::PythonAgent::user_channel(&self) -> outrig::UserChannel
 #[non_exhaustive] pub struct outrig::SecuritySpec
 pub outrig::SecuritySpec::capabilities: outrig::CapabilitySpec
 pub outrig::SecuritySpec::devices: alloc::vec::Vec<alloc::string::String>
@@ -1233,6 +1234,11 @@ pub struct outrig::Transcript
 impl outrig::Transcript
 pub async fn outrig::Transcript::create(&std::path::Path, bool) -> outrig::error::Result<Self>
 pub async fn outrig::Transcript::line(&self, &'static str, &str) -> std::io::error::Result<()>
+pub struct outrig::UserChannel
+impl outrig::UserChannel
+pub async fn outrig::UserChannel::receive(&self) -> core::option::Option<alloc::string::String>
+pub fn outrig::UserChannel::receive_waiting(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn outrig::UserChannel::send(&self, &str) -> impl core::future::future::Future<Output = core::result::Result<usize, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>> + core::marker::Send + 'static
 #[non_exhaustive] pub struct outrig::WorkspaceSpec
 pub outrig::WorkspaceSpec::container: std::path::PathBuf
 pub outrig::WorkspaceSpec::host: std::path::PathBuf

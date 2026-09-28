@@ -1,10 +1,12 @@
 //! `outrig run-new`: an interactive session whose agent acts by writing Python.
 //!
-//! The loop lives in `outrig` ([`PythonAgent`]); this module is the terminal
-//! around it. It shares [`Repl`] with `outrig run` and none of `run`'s session
-//! setup, because only [`Outrig::launch`] mounts the interpreter's payload --
-//! so the session is launched through the library facade, and `run`'s code is
-//! left exactly as it was.
+//! The loop lives in `outrig` ([`PythonAgent`]); this module and `converse`
+//! are the terminal around it. It shares none of `run`'s session setup,
+//! because only [`Outrig::launch`] mounts the interpreter's payload -- so the
+//! session is launched through the library facade, and `run`'s code is left
+//! exactly as it was. Nor does it share `run`'s REPL, which reads a line only
+//! between rounds: here what the user types reaches the agent's `user`
+//! channel while a round runs, too.
 //!
 //! **No MCP server and no sidecar starts.** The model's one tool submits
 //! Python, so nothing could call them. A primary-placed server would also run
@@ -31,16 +33,14 @@ use outrig::config::{Config, ImageConfig};
 use outrig::error::IoPathExt;
 use outrig::image::{self, ImageTag};
 use outrig::{EmbeddedMcpPolicy, LaunchSpec, Outrig, PythonAgent};
-use tokio::io::BufReader;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Mutex;
 
 use crate::builtin_image;
 use crate::cli::session_setup::ProgressSpan;
 use crate::error::{CliError, OutrigError, Result};
 use crate::paths::{default_session_root, repo_root_from_config_path};
-use crate::repl::Repl;
 use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
+
+mod converse;
 
 #[derive(Debug, Parser)]
 pub struct RunNewArgs {
@@ -174,7 +174,7 @@ pub async fn execute(
     );
     agent.on_submit(|source| eprint!("{}", render_submission(source)));
 
-    let outcome = repl(agent).await;
+    let outcome = converse::converse(agent).await;
 
     shut_down(outrig).await;
     let exit = outcome.as_ref().copied().unwrap_or(1);
@@ -385,65 +385,6 @@ async fn shut_down(outrig: Outrig) {
     if let Err(e) = outrig.shutdown().await {
         eprintln!("[outrig] warning: shutting the session down: {e}");
     }
-}
-
-/// Hand typed lines to the agent until the user leaves.
-///
-/// The agent sits behind an async mutex so a round can borrow it across its
-/// awaits. A Ctrl-C while the round waits on Python goes to that Python
-/// through [`PythonAgent::interrupter`], and the round carries on, since the
-/// model reads how the code ended. Otherwise the REPL does what it always
-/// does: at the prompt a fresh line, and mid-round it drops the round's
-/// future, and with it the guard, so the agent -- its conversation and its
-/// interpreter -- stays with the session rather than going down with the
-/// future.
-///
-/// SIGINT is received through one listener for the whole session rather than
-/// a fresh `ctrl_c()` per wait, which would miss a press landing between two
-/// of them -- and a quick second press is the one that stops waiting.
-async fn repl(agent: PythonAgent) -> Result<i32> {
-    let interrupt = agent.interrupter();
-    let sigint = Mutex::new(signal(SignalKind::interrupt())?);
-    let on_interrupt = || {
-        let (sigint, interrupt) = (&sigint, &interrupt);
-        async move {
-            let mut sigint = sigint.lock().await;
-            while sigint.recv().await.is_some() {
-                match interrupt() {
-                    Some(said) => eprintln!("\n[outrig] {said}"),
-                    None => return,
-                }
-            }
-        }
-    };
-    let agent = Mutex::new(agent);
-    let on_prompt = |line: String| {
-        let agent = &agent;
-        async move {
-            // A failed round is reported and the session carries on:
-            // `PythonAgent`'s own errors say whether to resend or continue,
-            // and either needs a prompt to type it at.
-            Ok(match agent.lock().await.round(&line).await {
-                Ok(reply) => reply,
-                Err(e) => {
-                    eprintln!("[outrig] error: {e}");
-                    String::new()
-                }
-            })
-        }
-    };
-    Repl::run_with(
-        BufReader::new(tokio::io::stdin()),
-        tokio::io::stdout(),
-        tokio::io::stderr(),
-        on_interrupt,
-        "",
-        &[],
-        on_prompt,
-        |_, _| async { None },
-    )
-    .await?;
-    Ok(0)
 }
 
 struct Banner<'a> {

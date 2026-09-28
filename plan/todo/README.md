@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-08` | The user reaches the agent through a channel, not a prompt         |
 | `0003-09` | `runtime.wait` mirrors `asyncio.wait` and watches the channels     |
 | `0003-10` | The agent can ask what it holds and what it cannot import          |
 | `0003-11` | The full conversation lives in Python; a view goes to the provider |

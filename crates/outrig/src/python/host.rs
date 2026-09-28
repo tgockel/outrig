@@ -33,6 +33,21 @@
 //! Choosing between them is `recovery`'s, from [`Interpreter::inventory`],
 //! answered on the loop, and [`Interpreter::cpu`], answered beside it.
 //!
+//! # The user's channel
+//!
+//! The host is the other end of the agent's `user` channel.
+//! [`Interpreter::post`] queues a message on it, and the interpreter answers
+//! once it has been queued, with how many then wait -- or with why it was
+//! refused, having queued nothing. [`Interpreter::pending`] asks for each
+//! channel's counts: what waits, and everything ever delivered, which tells a
+//! new arrival from an old one. Both are answered on the interpreter's reader
+//! thread rather than the agent's loop, so they answer while the loop is not
+//! turning. What the agent sends comes back unasked, in order, to whoever
+//! [`Interpreter::subscribe`]d. Each message is acknowledged when the subscriber
+//! receives it, and the interpreter lets an agent run only a window of messages
+//! ahead of those acknowledgments, so what the host holds for the user is
+//! bounded by the user keeping up rather than by the agent's pace.
+//!
 //! # What owns what
 //!
 //! The [`Child`] here is the host-side `podman exec` client, not the
@@ -43,7 +58,7 @@
 //! it exits on the SIGINT a terminal's Ctrl-C sends its group, and the
 //! interpreter would see its stdin close with it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -99,6 +114,14 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// Prefix of the lines the interpreter itself writes to stderr.
 const DIAGNOSTIC: &str = "outrig-interpreter:";
+
+/// The agent's channel the host is the other end of.
+pub(crate) const USER: &str = "user";
+
+/// The longest message posted to a channel, in bytes. `interpreter.py` bounds
+/// what the agent sends by the same `MESSAGE_MAX`, measured on the protocol line
+/// a send becomes.
+pub(crate) const MESSAGE_MAX: usize = 1 << 20;
 
 /// Names one submission, for the life of the interpreter. Host-assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -171,6 +194,18 @@ pub(crate) struct Inventory {
     pub(crate) globals: Vec<(String, String)>,
 }
 
+/// One of the agent's channels, as the interpreter counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) struct Counts {
+    /// Messages waiting unread.
+    pub(crate) pending: usize,
+    /// Every message ever delivered to it, read or not.
+    pub(crate) delivered: u64,
+}
+
+/// Each of the agent's channels, by name.
+pub(crate) type Channels = BTreeMap<String, Counts>;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InterpreterError {
     /// `podman exec` itself could not be started.
@@ -181,6 +216,9 @@ pub(crate) enum InterpreterError {
     /// The interpreter can no longer be reached; nothing was sent.
     #[error("the Python interpreter is gone: {0}")]
     Gone(Arc<str>),
+    /// A message the channel did not take. Nothing was queued.
+    #[error("not delivered: {0}")]
+    Refused(String),
 }
 
 /// A handle on a session's interpreter, addressing its primary agent. Cheap
@@ -218,6 +256,8 @@ struct Table {
     /// Requests other than executions, by id, until answered.
     queries: HashMap<ExecId, Query>,
     late: Vec<Late>,
+    /// Where the agent's messages to the user go, once someone subscribed.
+    outbox: Option<mpsc::UnboundedSender<String>>,
     /// Why nothing more can be sent, once that is so.
     ended: Option<Arc<str>>,
 }
@@ -231,6 +271,9 @@ struct Slot {
 enum Query {
     Inventory(oneshot::Sender<Inventory>),
     Cpu(oneshot::Sender<Option<f64>>),
+    /// A posted message: how many then waited, or why it was refused.
+    Post(oneshot::Sender<Result<usize, String>>),
+    Pending(oneshot::Sender<Channels>),
 }
 
 /// One protocol line from the interpreter, which names the agent it concerns.
@@ -257,6 +300,22 @@ enum Reply {
     Cpu {
         id: ExecId,
         seconds: Option<f64>,
+    },
+    /// The answer to a posted message, which carries one of the two.
+    Msg {
+        id: ExecId,
+        pending: Option<usize>,
+        error: Option<String>,
+    },
+    Pending {
+        id: ExecId,
+        channels: Channels,
+    },
+    /// A message the agent sent, which nothing asked for.
+    #[serde(rename = "send")]
+    Sent {
+        channel: String,
+        body: String,
     },
     #[serde(other)]
     Other,
@@ -340,7 +399,12 @@ impl Interpreter {
         let table = Arc::new(Mutex::new(Table::default()));
         let (lines, queued) = mpsc::unbounded_channel();
         tokio::spawn(write_requests(requests, queued, Arc::clone(&table)));
-        tokio::spawn(read_replies(replies, Arc::clone(&table), ended));
+        tokio::spawn(read_replies(
+            replies,
+            Arc::clone(&table),
+            lines.downgrade(),
+            ended,
+        ));
         Ok(Self {
             table,
             lines,
@@ -407,6 +471,70 @@ impl Interpreter {
         self.query("cpu", Query::Cpu).await
     }
 
+    /// Queue `body` on the agent's `channel`.
+    ///
+    /// It is queued for the interpreter when this returns, behind everything
+    /// sent before it, so a later [`Interpreter::pending`] counts it. The
+    /// future says whether the channel took it, and how many messages then
+    /// waited; a refusal is [`InterpreterError::Refused`], and one past
+    /// [`MESSAGE_MAX`] is refused here, without being sent.
+    pub(crate) fn post(
+        &self,
+        channel: &str,
+        body: &str,
+    ) -> Result<
+        impl Future<Output = Result<usize, InterpreterError>> + Send + 'static,
+        InterpreterError,
+    > {
+        if body.len() > MESSAGE_MAX {
+            return Err(InterpreterError::Refused(format!(
+                "the message is {} bytes, past the {MESSAGE_MAX} a channel carries",
+                body.len()
+            )));
+        }
+        let receiver = self.request(
+            json!({"t": "msg", "channel": channel, "body": body}),
+            Query::Post,
+        )?;
+        let table = Arc::clone(&self.table);
+        Ok(async move {
+            answer(&table, receiver)
+                .await?
+                .map_err(InterpreterError::Refused)
+        })
+    }
+
+    /// Each of the agent's channels: what waits unread, and what was ever
+    /// delivered. A message posted before this is asked is counted.
+    pub(crate) async fn pending(&self) -> Result<Channels, InterpreterError> {
+        self.query("pending", Query::Pending).await
+    }
+
+    /// Where the messages the agent sends to the user arrive, in the order
+    /// it sent them. One subscriber at a time: subscribing again ends the
+    /// previous one, as the interpreter exiting does. A message is held until
+    /// received, and the agent is held back while a window of them are.
+    pub(crate) fn subscribe(&self) -> Sent {
+        let (outbox, receiver) = mpsc::unbounded_channel();
+        let mut table = lock(&self.table);
+        if table.ended.is_none() {
+            table.outbox = Some(outbox);
+        }
+        Sent {
+            receiver,
+            interpreter: self.clone(),
+        }
+    }
+
+    /// Tell the interpreter the user received a message the agent sent on
+    /// `channel`, which makes room for the agent to send another.
+    fn received(&self, channel: &str) {
+        let mut table = lock(&self.table);
+        if table.open().is_ok() {
+            acknowledge(&mut table, &self.lines, channel);
+        }
+    }
+
     /// Send a request of `kind` and wait for its answer, which `waiting`
     /// says how to deliver.
     async fn query<T>(
@@ -414,17 +542,26 @@ impl Interpreter {
         kind: &str,
         waiting: fn(oneshot::Sender<T>) -> Query,
     ) -> Result<T, InterpreterError> {
+        let receiver = self.request(json!({"t": kind}), waiting)?;
+        answer(&self.table, receiver).await
+    }
+
+    /// Queue the request `fields`, addressed to the primary under an id of its
+    /// own, and register `waiting` for its answer.
+    fn request<T>(
+        &self,
+        mut fields: Value,
+        waiting: fn(oneshot::Sender<T>) -> Query,
+    ) -> Result<oneshot::Receiver<T>, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
-        {
-            let mut table = lock(&self.table);
-            table.open()?;
-            let id = table.next_id();
-            self.send(json!({"t": kind, "agent": PRIMARY, "id": id}))?;
-            table.queries.insert(id, waiting(waiter));
-        }
-        receiver
-            .await
-            .map_err(|_| InterpreterError::Gone(lock(&self.table).cause()))
+        let mut table = lock(&self.table);
+        table.open()?;
+        let id = table.next_id();
+        fields["agent"] = json!(PRIMARY);
+        fields["id"] = json!(id);
+        self.send(fields)?;
+        table.queries.insert(id, waiting(waiter));
+        Ok(receiver)
     }
 
     /// Ask the interpreter to cancel execution `id`'s task, which raises
@@ -473,6 +610,12 @@ impl Interpreter {
             .map(|slot| slot.id)
     }
 
+    /// Keep `late` to be reported with a later result, as a reply that arrived
+    /// with nobody waiting for it is.
+    pub(crate) fn keep_late(&self, late: Late) {
+        lock(&self.table).late.push(late);
+    }
+
     /// Results that arrived after their callers stopped waiting, oldest first.
     /// Each is reported once.
     pub(crate) fn take_late(&self) -> Vec<Late> {
@@ -485,6 +628,36 @@ impl Interpreter {
         self.lines
             .send(format!("{message}\n"))
             .map_err(|_| InterpreterError::Gone("its stdin closed".into()))
+    }
+}
+
+/// The messages the agent sends the user, from [`Interpreter::subscribe`].
+pub(crate) struct Sent {
+    receiver: mpsc::UnboundedReceiver<String>,
+    interpreter: Interpreter,
+}
+
+impl Sent {
+    /// The next message the agent sent, acknowledged as received; `None` once
+    /// the interpreter has exited and every one has been received.
+    /// Cancel-safe.
+    pub(crate) async fn recv(&mut self) -> Option<String> {
+        let body = self.receiver.recv().await?;
+        self.interpreter.received(USER);
+        Some(body)
+    }
+
+    /// Every message waiting now, each acknowledged, without waiting for
+    /// more. Those it makes room for, and any arriving meanwhile, are left.
+    pub(crate) fn recv_waiting(&mut self) -> Vec<String> {
+        let waiting = self.receiver.len();
+        let taken: Vec<String> = (0..waiting)
+            .map_while(|_| self.receiver.try_recv().ok())
+            .collect();
+        for _ in &taken {
+            self.interpreter.received(USER);
+        }
+        taken
     }
 }
 
@@ -607,6 +780,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Queue the line telling the interpreter a message the agent sent on
+/// `channel` was received.
+fn acknowledge(table: &mut Table, lines: &mpsc::UnboundedSender<String>, channel: &str) {
+    let id = table.next_id();
+    let received = json!({"t": "received", "agent": PRIMARY, "id": id, "channel": channel});
+    let _ = lines.send(format!("{received}\n"));
+}
+
+/// A request's answer, or why none can come.
+async fn answer<T>(
+    table: &Mutex<Table>,
+    receiver: oneshot::Receiver<T>,
+) -> Result<T, InterpreterError> {
+    receiver
+        .await
+        .map_err(|_| InterpreterError::Gone(lock(table).cause()))
+}
+
 /// Read the interpreter's first line, which must be the primary's `ready`, and
 /// return the version it names.
 async fn greeting<R: AsyncBufRead + Unpin>(replies: &mut R) -> Result<String, String> {
@@ -659,15 +850,22 @@ async fn write_requests<W: AsyncWrite + Unpin>(
 
 /// Read and correlate replies until the interpreter's output closes, then
 /// settle what is still outstanding as [`Unknown::Exited`].
-async fn read_replies<R, E>(mut replies: R, table: Arc<Mutex<Table>>, ended: E)
-where
+///
+/// `lines` is the writer's queue, held weakly so that the reader does not keep
+/// the interpreter's stdin open once every handle is gone.
+async fn read_replies<R, E>(
+    mut replies: R,
+    table: Arc<Mutex<Table>>,
+    lines: mpsc::WeakUnboundedSender<String>,
+    ended: E,
+) where
     R: AsyncBufRead + Unpin,
     E: Future<Output = String>,
 {
     let mut line = Vec::new();
     loop {
         match next_line(&mut replies, &mut line, REPLY_LINE_MAX).await {
-            Ok(Some(0)) => dispatch(&table, &line),
+            Ok(Some(0)) => dispatch(&table, &lines, &line),
             Ok(Some(cut)) => tracing::warn!(
                 "ignored a line of more than {REPLY_LINE_MAX} bytes from the Python interpreter \
                  ({cut} bytes over)"
@@ -684,8 +882,13 @@ where
         line.shrink_to(REPLY_BUFFER_KEPT);
     }
     // Nothing new is sent from here on; the full account follows once the
-    // client has exited.
-    lock(&table).ended = Some("its output closed".into());
+    // client has exited. Nothing more will be sent to the user either, so
+    // their receiver ends now rather than after the grace.
+    {
+        let mut table = lock(&table);
+        table.ended = Some("its output closed".into());
+        table.outbox = None;
+    }
     let cause: Arc<str> = ended.await.into();
     let mut table = lock(&table);
     table.ended = Some(Arc::clone(&cause));
@@ -699,7 +902,7 @@ where
     table.queries.clear();
 }
 
-fn dispatch(table: &Mutex<Table>, line: &[u8]) {
+fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, line: &[u8]) {
     let Envelope { agent, reply } = match serde_json::from_slice(line) {
         Ok(envelope) => envelope,
         Err(e) => {
@@ -725,6 +928,40 @@ fn dispatch(table: &Mutex<Table>, line: &[u8]) {
             }
             _ => tracing::warn!("ignored CPU reading {id}, which nothing asked for"),
         },
+        Reply::Msg { id, pending, error } => match lock(table).queries.remove(&id) {
+            Some(Query::Post(waiter)) => {
+                let _ = waiter.send(match (pending, error) {
+                    (_, Some(error)) => Err(error),
+                    (Some(pending), None) => Ok(pending),
+                    (None, None) => Err("the interpreter answered without saying".to_string()),
+                });
+            }
+            _ => tracing::warn!("ignored the answer to message {id}, which nothing posted"),
+        },
+        Reply::Pending { id, channels } => match lock(table).queries.remove(&id) {
+            Some(Query::Pending(waiter)) => {
+                let _ = waiter.send(channels);
+            }
+            _ => tracing::warn!("ignored pending counts {id}, which nothing asked for"),
+        },
+        Reply::Sent { channel, body } => {
+            let mut table = lock(table);
+            let held = channel == USER
+                && table
+                    .outbox
+                    .as_ref()
+                    .is_some_and(|outbox| outbox.send(body).is_ok());
+            if !held {
+                tracing::warn!(
+                    "dropped a message the agent sent on {channel:?}: nothing on the host reads it"
+                );
+                // Acknowledged all the same: no receive is coming, and the
+                // agent must not wait for one.
+                if let Some(lines) = lines.upgrade() {
+                    acknowledge(&mut table, &lines, &channel);
+                }
+            }
+        }
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",

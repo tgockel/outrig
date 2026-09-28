@@ -12,7 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`outrig run-new`, a preview session whose agent acts by writing Python.** The model's one
   tool runs source in a persistent interpreter inside the session's container, so names it binds
   carry from one message to the next. The image needs no Python. Each submission is shown on
-  stderr as it starts running. It starts no MCP server and no sidecar, since the model could not
+  stderr as it starts running. What you type is a message on the agent's `user` channel rather
+  than a prompt: the model is told how many wait, and its code reads them. A line typed while a
+  round runs is queued for it, and says so, rather than waiting for the round to end. stdout
+  carries only what the agent sends on the channel, a send from code that outlived its round
+  included; the model's own text goes to stderr. If the interpreter exits, the session ends with
+  status 1. It starts no MCP server and no sidecar, since the model could not
   call them and a server in the primary container would sit beside the interpreter as the same
   user, holding its resolved secrets. Its session is recorded like `run`'s. It takes `--agent`,
   `--model`, `--image` (a configured image-config only), and `--session-dir`. Ctrl-C while its

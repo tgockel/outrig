@@ -35,8 +35,8 @@ runtime.channels["work"]
 
 An endpoint offers exactly three operations:
 
-- `await endpoint.receive()` -- take the next message, waiting if there is none. Removes it
-  from the queue. See "Routing and attribution" for the form that also carries the sender.
+- `await endpoint.receive()` -- take the next message, waiting if there is none, as a
+  `Delivery`. Removes it from the queue. See "Routing and attribution" for its shape.
 - `await endpoint.send(message)` -- hand a message to the channel. Success means accepted for
   delivery, not processed by the recipient.
 - `endpoint.pending()` -- how many messages are queued. Consumes nothing.
@@ -96,21 +96,21 @@ declared.
 Sender and destination identity come from the application, not from fields inside the message.
 A body that claims to be from another agent is a body with a field in it.
 
-Which raises the question of what `receive()` hands back. Two calls rather than an envelope on
-every message:
+So `receive()` hands back an envelope, always:
 
 ```python
-body     = await endpoint.receive()           # the message itself
-delivery = await endpoint.receive_delivery()  # .body, plus .sender and .received_at
+delivery = await endpoint.receive()
+delivery.body         # the message itself
+delivery.sender       # who sent it -- "user" on the user channel
+delivery.received_at  # when it arrived, in UTC
 ```
 
-The common case stays readable -- `print(await ch.receive())` shows the message, not a wrapper
-around it -- and code that needs attribution asks for it. Both consume; they are two shapes of
-the same operation, not a peek and a take.
-
-**This is a proposal, not a settled call.** The alternative is one method returning an envelope
-always, which is more uniform and makes every simple use noisier. It should be decided before
-the first channel task is written, because it is in the signature.
+**Decided in `0003-08`: one method returning a `Delivery`, over two.** An earlier draft proposed a
+body-only `receive()` beside a `receive_delivery()` for attribution, which kept
+`print(await ch.receive())` down to the message. The envelope was chosen for uniformity: one
+operation with one shape, where the pair would have been two shapes of the same take, and code
+that starts needing the sender does not have to change the call it makes. The cost is `.body` on
+every simple use.
 
 ## Delivery rules
 
