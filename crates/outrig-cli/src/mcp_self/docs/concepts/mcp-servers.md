@@ -427,22 +427,26 @@ Both servers outrig exposes -- the session proxy (`outrig mcp`) and the self-des
 (`outrig mcp self`) -- advertise an explicit list of MCP protocol revisions rather than deferring
 to whatever the underlying SDK happens to know:
 
-| Revision     | Served |
-| ------------ | ------ |
-| `2024-11-05` | yes    |
-| `2025-03-26` | yes    |
-| `2025-06-18` | yes    |
-| `2025-11-25` | yes    |
-| `2026-07-28` | yes    |
+| Revision     | Requested in           |
+| ------------ | ---------------------- |
+| `2024-11-05` | `initialize`           |
+| `2025-03-26` | `initialize`           |
+| `2025-06-18` | `initialize`           |
+| `2025-11-25` | `initialize`           |
+| `2026-07-28` | each request's `_meta` |
 
 The list is pinned deliberately. An SDK upgrade that teaches the library a newer revision would
 otherwise widen what outrig agrees to speak without anyone checking that outrig actually meets the
 new revision's requirements -- and a revision can add *mandatory* response fields, which turns a
-silent widening into a client that cannot load any tools at all. A client asking for a revision
-outside this list is answered with the server's own default -- `2025-11-25` today -- which is
-always one of the pinned revisions. Note that this is a fallback rather than a step down: a
-client asking for something older than anything listed is answered in a *newer* revision, not an
-older one.
+silent widening into a client that cannot load any tools at all.
+
+`2026-07-28` replaced the `initialize` handshake with metadata on every request: a client speaking
+it names the revision in each request's `_meta` and is answered in it. An `initialize` asking for
+anything the handshake cannot grant -- a revision outside this list, or `2026-07-28` and later --
+is answered in `2025-11-25`, the newest revision that has a handshake. Note that this is a fallback
+rather than a step down: a client asking for something older than anything listed is answered in a
+*newer* revision, not an older one. A revision named per request has no fallback: one outside the
+list is refused with an error that lists the revisions served.
 
 From `2026-07-28` onward, list results must carry cache metadata (SEP-2549): how long the result
 may be treated as fresh, and who may cache it. Both servers tag `tools/list` accordingly:

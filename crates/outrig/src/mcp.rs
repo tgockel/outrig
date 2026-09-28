@@ -536,7 +536,7 @@ mod tests {
         )
     }
 
-    /// All eight `ServiceError` variants rmcp 3.1.0 declares, named one by
+    /// All eight `ServiceError` variants rmcp 3.4.1 declares, named one by
     /// one, because the classifier's wildcard means the list is the only
     /// record of what was classified on purpose. Also pins that the SDK's
     /// wording crosses the boundary verbatim: `kind` is the contract,

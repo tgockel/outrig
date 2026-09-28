@@ -24,7 +24,7 @@ use rmcp::model::{
     Implementation, ListPromptsRequestMethod, ListPromptsResult,
     ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ServerCapabilities, ServerInfo, Tool,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
@@ -157,7 +157,7 @@ struct ProxyInner<C> {
     clients: Vec<C>,
     tools: Vec<ToolEntry>,
     by_public_name: HashMap<String, usize>,
-    server_info: ServerInfo,
+    server_config: ServerConfig,
 }
 
 /// MCP server fronting a pool of backing clients. Generic over the client
@@ -326,7 +326,7 @@ impl<C: BackingClient> ProxyServer<C> {
             });
         }
 
-        let server_info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let server_config = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("outrig", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Tools are namespaced as <server>__<tool>; the prefix identifies which \
@@ -338,7 +338,7 @@ impl<C: BackingClient> ProxyServer<C> {
                 clients,
                 tools,
                 by_public_name,
-                server_info,
+                server_config,
             }),
         })
     }
@@ -428,8 +428,8 @@ impl<C: BackingClient> ProxyServer<C> {
 }
 
 impl<C: BackingClient> ServerHandler for ProxyServer<C> {
-    fn get_info(&self) -> ServerInfo {
-        self.inner.server_info.clone()
+    fn get_info(&self) -> ServerConfig {
+        self.inner.server_config.clone()
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {

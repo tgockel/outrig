@@ -56,5 +56,5 @@ kind of reason. 0002-47 narrowed `OutrigError`'s rmcp payloads to an outrig-owne
 `McpSessionError`, which classifies `rmcp::service::ServiceError` into an `McpFailureKind`.
 `ServiceError` is `#[non_exhaustive]`, so the mapping carries a wildcard: a variant a later rmcp
 adds classifies as `Other` and compiles silently. `every_rmcp_service_error_is_classified` names
-all eight variants rmcp 3.1.0 declares, so the list of what was classified deliberately is in the
+all eight variants rmcp 3.4.1 declares, so the list of what was classified deliberately is in the
 tree -- but nothing fails when a ninth appears. Check both on the same upgrade.

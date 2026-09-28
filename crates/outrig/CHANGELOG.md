@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **rmcp 3.4.1 or newer is required**, up from 3.1.0. rmcp is public here through
+  `outrig::mcp_proxy`, and rmcp 3.4 deprecated the `ServerInfo` alias `ProxyServer::get_info`
+  was spelled with. It now returns `rmcp::model::ServerConfig`, the name that replaces it. Both
+  alias `InitializeResult`, so no caller changes, and one that still spells `ServerInfo` gets
+  rmcp's deprecation warning rather than an error. The newer rmcp also changes what a served
+  `ProxyServer` negotiates. `2026-07-28` replaced the `initialize` handshake with per-request
+  metadata, so an `initialize` asking for that revision is now answered in `2025-11-25`, the
+  server's default. A client speaking `2026-07-28` names it in each request's `_meta` instead
+  and is answered in it. `SUPPORTED_PROTOCOL_VERSIONS` governs those requests too: one naming a
+  revision outside the list is refused rather than answered in a fallback.
+
 ### Fixed
 
 - **An image rebuilds when an uncommitted file in its build context changes.** When the context

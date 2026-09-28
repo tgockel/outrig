@@ -11,7 +11,7 @@ sanitize(&"s".repeat(57), "a/")
   == "sssssssssssssssssssssssssssssssssssssssssssssssssssssssss_4012cd"
 ```
 
-That contradicts the proxy's own `ServerInfo` instructions, which tell a model that "the prefix
+That contradicts the proxy's own `ServerConfig` instructions, which tell a model that "the prefix
 identifies which backing MCP server hosts the tool". `is_valid_mcp_server_name`
 (`crates/outrig/src/config/validate.rs`) is `^[a-zA-Z][a-zA-Z0-9_-]*$` with no length bound, so
 a config can reach this.
@@ -32,7 +32,7 @@ Either the prefix survives, or nothing claims it does.
 
 - **Pick one.** Bound MCP server-name length in config validation, so a name that cannot
   survive prefixing is rejected where it is declared and the error names the limit; or qualify
-  the `ServerInfo` instructions so the prefix is described as the usual case rather than a
+  the `ServerConfig` instructions so the prefix is described as the usual case rather than a
   guarantee. The first is the better contract if a bound can be chosen without breaking an
   existing config; a bound around 24 leaves room for a useful tool name at every width.
 - **Whichever is chosen, say it in `doc/reference/config.md`**, beside the server-name regex.

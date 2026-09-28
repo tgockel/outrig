@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`outrig mcp` and `outrig mcp self` answer an `initialize` asking for `2026-07-28` in
+  `2025-11-25`.** That revision replaced the handshake with per-request metadata, so an
+  `initialize` cannot grant it; the MCP SDK enforces that since the move to rmcp 3.4. A client
+  speaking `2026-07-28` names it in every request's `_meta` and is answered in it. A revision
+  named that way that outrig does not serve is refused with an error listing the ones it does.
+
 ### Fixed
 
 - **`--config .agents/outrig/config.toml` takes `.` as the repo root**, as its `./`-prefixed
@@ -56,6 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.gguf` file now drops to the manual `model-file` prompt instead of ending setup. A revision
   containing `/`, like the `refs/pr/N` Hugging Face gives a pull request, now lists too; it used
   to fail and fall back to that prompt.
+- **`outrig mcp --listen` no longer strands a client whose `initialize` asks for a revision
+  outside the served list.** The request was routed by the revision it asked for, so one sorting
+  at or after `2026-07-28` took the stateless path and got no `Mcp-Session-Id`, yet was answered
+  in `2025-11-25`, a revision that needs one. Its next request was refused with `422`. Every
+  `initialize` now opens a session.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
