@@ -163,8 +163,8 @@ The same shape shows up beyond `set_result`: a model that cannot act on a tool e
 re-emit the identical call rather than try something else. Within a subagent round, OutRig counts
 consecutive failures of the same tool called with **identical arguments**. The second such failure
 gets a note appended to the tool result saying that repeating will not change the outcome; the
-fourth ends the round. Changing the arguments, or any call that succeeds, resets the count -- a
-subagent taking the hint is making progress, not looping.
+fourth ends the round, and its result says so. Changing the arguments, or any call that succeeds,
+resets the count -- a subagent taking the hint is making progress, not looping.
 
 A round ended this way publishes nothing, so its parent is told the reason it stopped rather than
 the bare "stopped without calling `outrig__set_result`". The same is true of a round that runs out

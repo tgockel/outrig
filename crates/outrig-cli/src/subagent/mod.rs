@@ -1502,18 +1502,21 @@ mod tests {
         .to_string()
     }
 
-    /// An assistant message calling `name`, with `arguments` as the JSON string
-    /// the wire carries them in.
-    fn tool_call_message(name: &str, arguments: &str) -> serde_json::Value {
-        serde_json::json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": format!("call_{name}"),
-                "type": "function",
-                "function": {"name": name, "arguments": arguments}
-            }]
-        })
+    /// An assistant message making one tool call per `(name, arguments)` in
+    /// `calls`, with the arguments as the JSON string the wire carries them in.
+    fn tool_call_message(calls: &[(&str, &str)]) -> serde_json::Value {
+        let calls: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                serde_json::json!({
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                })
+            })
+            .collect();
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": calls})
     }
 
     /// A completion that always asks for the `blocking` tool, so every round
@@ -1522,7 +1525,7 @@ mod tests {
     /// The header is set by hand rather than through `axum::Json`, which would
     /// mean turning on axum's `json` feature for one test.
     async fn mock_tool_call() -> ([(&'static str, &'static str); 1], String) {
-        let body = completion(tool_call_message("blocking", "{}"), "tool_calls");
+        let body = completion(tool_call_message(&[("blocking", "{}")]), "tool_calls");
         ([("content-type", "application/json")], body)
     }
 
@@ -1624,6 +1627,31 @@ mod tests {
             self.body.to_string().matches(text).count()
         }
 
+        /// Assert that each assistant message's tool calls are answered, in
+        /// order, by the `tool` messages directly after it -- OpenAI and
+        /// Anthropic reject any request whose history breaks that. Positional
+        /// rather than a lookup by id: the scripted responses reuse their ids,
+        /// so a lookup would find an earlier call's answer for a call that has
+        /// none.
+        fn assert_tool_calls_answered(&self) {
+            let messages = self.body["messages"].as_array().expect("messages");
+            for (index, message) in messages.iter().enumerate() {
+                let Some(calls) = message["tool_calls"].as_array() else {
+                    continue;
+                };
+                let asked: Vec<_> = calls.iter().map(|call| &call["id"]).collect();
+                let answered: Vec<_> = messages[index + 1..]
+                    .iter()
+                    .take_while(|next| next["role"] == "tool")
+                    .map(|next| &next["tool_call_id"])
+                    .collect();
+                assert_eq!(
+                    answered, asked,
+                    "the tool calls in message {index} are not answered right after it"
+                );
+            }
+        }
+
         /// Answer with a plain reply and no tool call, which makes this the
         /// round's last model call.
         fn reply(self, text: &str) {
@@ -1634,9 +1662,22 @@ mod tests {
         /// Answer with an `outrig__set_result` call, so another model call
         /// follows it.
         fn set_result(self, body: &str) {
-            let arguments = serde_json::json!({"status": "result", "body": body}).to_string();
+            self.set_results(&[body]);
+        }
+
+        /// Answer with one `outrig__set_result` call per body, all in the one
+        /// message, the way a model batches calls in a single step.
+        fn set_results(self, bodies: &[&str]) {
             let name = crate::builtin_tool::name_of("set_result");
-            let message = tool_call_message(&name, &arguments);
+            let arguments: Vec<String> = bodies
+                .iter()
+                .map(|body| serde_json::json!({"status": "result", "body": body}).to_string())
+                .collect();
+            let calls: Vec<(&str, &str)> = arguments
+                .iter()
+                .map(|arguments| (name.as_str(), arguments.as_str()))
+                .collect();
+            let message = tool_call_message(&calls);
             self.respond(StatusCode::OK, completion(message, "tool_calls"));
         }
 
@@ -2243,6 +2284,104 @@ mod tests {
         };
         let (outcome, ()) = tokio::join!(registry.get_result("probe"), script);
         assert_eq!(outcome, Ok(Outcome::Result("fresh".to_string())));
+    }
+
+    /// Wait for `probe`'s round to end without a report, and check that the
+    /// repeat breaker is what the parent is told ended it.
+    async fn assert_stopped_by_the_breaker(registry: &SubagentRegistry) {
+        let outcome = tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe"))
+            .await
+            .expect("the breaker ends the round without another model call");
+        let name = crate::builtin_tool::name_of("set_result");
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Error(format!(
+                "subagent stopped before reporting: {name} failed 4 times in a row \
+                 with identical arguments"
+            )))
+        );
+    }
+
+    /// #231: the repeat breaker ended the round from inside the call that
+    /// tripped it, before rig had committed that call's result, so the
+    /// subagent's history ended in a tool call nothing answered. OpenAI and
+    /// Anthropic refuse every request carrying one, so the parent's redirect
+    /// failed, and every round after it, until the subagent was released.
+    #[tokio::test]
+    async fn a_subagent_the_repeat_breaker_stopped_can_still_be_redirected() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 8).await;
+        // A blank body fails the same way every time.
+        for _ in 0..4 {
+            provider.next_call().await.set_result("   ");
+        }
+        assert_stopped_by_the_breaker(&registry).await;
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions("so the turn was ended here"),
+            1,
+            "the call that tripped the breaker is answered with why the round ended"
+        );
+        call.reply("summary");
+    }
+
+    /// A model can batch several calls into one step. Those after the call
+    /// that trips the breaker do not run, just as none did when the breaker
+    /// ended the round on the spot -- here, a report that would otherwise have
+    /// been published. Each is still answered, saying it did not run.
+    async fn a_call_batched_after_the_breaker_does_not_run(tool_call_max: usize) {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, tool_call_max).await;
+        for _ in 0..3 {
+            provider.next_call().await.set_result("   ");
+        }
+        provider
+            .next_call()
+            .await
+            .set_results(&["   ", "the report"]);
+        assert_stopped_by_the_breaker(&registry).await;
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions("tool call not executed"),
+            1,
+            "the batched call is answered, saying it did not run"
+        );
+        call.reply("summary");
+    }
+
+    #[tokio::test]
+    async fn a_call_batched_after_the_breaker_is_skipped() {
+        a_call_batched_after_the_breaker_does_not_run(8).await;
+    }
+
+    /// At a cap of four, the batched call is over the cap as well. The breaker
+    /// tripped first, so its reason is the one the parent is told.
+    #[tokio::test]
+    async fn the_breaker_outranks_a_cap_reached_in_the_same_batch() {
+        a_call_batched_after_the_breaker_does_not_run(4).await;
+    }
+
+    /// Like the cap, the breaker ends a round at its next model call without
+    /// making it, so a steer queued during the call that tripped it never
+    /// reached the model, and runs as the next round.
+    #[tokio::test]
+    async fn a_steer_cut_off_by_the_repeat_breaker_runs_as_the_next_round() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 8).await;
+        for _ in 0..3 {
+            provider.next_call().await.set_result("   ");
+        }
+        let call = provider.next_call().await;
+        steer(&registry);
+        call.set_result("   ");
+
+        let call = provider.next_call().await;
+        assert_eq!(call.last_text(), STEER, "the steer starts the next round");
+        call.reply("ok");
     }
 
     #[tokio::test(start_paused = true)]

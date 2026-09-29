@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   straight after the send, answered with how the old round stopped instead of waiting for the
   new one. A subagent now stays working while a round is waiting, and a message sent to an idle
   one ends that stop at once.
+- **A subagent the repeat breaker stopped can still be redirected.** The breaker ends a
+  subagent's round once the same tool call has failed four times in a row, and it left that
+  fourth call without a result in the subagent's history. OpenAI and Anthropic reject a history
+  in that shape, so every later round on the subagent failed, including one started by
+  `outrig__subagent_send`, until the subagent was released. The fourth call now gets its result,
+  with a note that the round ended there, before the round stops.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

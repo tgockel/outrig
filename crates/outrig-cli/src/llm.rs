@@ -2511,6 +2511,16 @@ pub struct OutrigPromptHook {
     /// Present for subagents only, which is what keeps the breaker off the
     /// primary agent's loop. See [`RepeatTracker`].
     repeats: Option<Arc<std::sync::Mutex<RepeatTracker>>>,
+    /// The breaker's stop reason, once it has tripped, held until the next
+    /// model call ends the round.
+    ///
+    /// Not a terminate from the failing call's result: rig records a batch's
+    /// results only once the whole batch settles, so the history it hands
+    /// back would end in a tool call with no result -- which OpenAI and
+    /// Anthropic reject on every later round (#231). Kept apart from
+    /// `stop_reason` until then, so a cancellation rig raises for itself in
+    /// between is not taken for this stop.
+    breaker_stop: Arc<std::sync::OnceLock<String>>,
     /// Why this hook asked the loop to stop, once it has.
     ///
     /// Recorded here rather than recovered from the cancellation rig reports,
@@ -2531,6 +2541,7 @@ impl OutrigPromptHook {
             label: None,
             injections: None,
             repeats: None,
+            breaker_stop: Arc::default(),
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -2587,6 +2598,9 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
             StepEvent::CompletionCall { history, .. } => {
+                if let Some(reason) = self.breaker_stop.get() {
+                    return self.stop(reason.clone());
+                }
                 if self.cap_reached.load(Ordering::SeqCst) {
                     // Bare reason, no "ending turn": `handle_prompt_error`
                     // prints it and a subagent's parent is shown it, so a
@@ -2596,7 +2610,7 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                 }
                 // Steers are re-applied on every model call, not just the one
                 // after they arrive: the patch is per-turn and non-sticky.
-                // Asked only past the cap check above: asking counts them as
+                // Asked only past the stop checks above: asking counts them as
                 // delivered (see `InjectionSource`).
                 if let Some(source) = &self.injections {
                     let steers = source();
@@ -2611,6 +2625,19 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
             StepEvent::ToolCall {
                 tool_name, args, ..
             } => {
+                // The round ends at its next model call, so what the model
+                // batched after the call that tripped the breaker must not
+                // run. Rig runs a batch's calls one at a time, so "after" is
+                // call order. Ahead of the cap, so the skip is not counted
+                // against it and the breaker stays the reason the round
+                // reports.
+                if let Some(reason) = self.breaker_stop.get() {
+                    return Flow::skip(format!(
+                        "[outrig] tool call not executed: {reason}, so the turn was \
+                         ended before this call could run. Repeat the tool call if \
+                         still needed."
+                    ));
+                }
                 let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if n > self.max {
                     self.cap_reached.store(true, Ordering::SeqCst);
@@ -2655,10 +2682,21 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                     // No trace of its own: `handle_prompt_error` prints every
                     // terminate reason, and the round driver passes this one to
                     // the parent as the cause it stopped.
-                    RepeatVerdict::Stop => self.stop(format!(
-                        "{tool_name} failed {REPEAT_TERMINATE_AT} times in a row with \
-                         identical arguments"
-                    )),
+                    RepeatVerdict::Stop => {
+                        let reason = format!(
+                            "{tool_name} failed {REPEAT_TERMINATE_AT} times in a row with \
+                             identical arguments"
+                        );
+                        let answer = format!(
+                            "{result}\n\n[outrig] {reason}, so the turn was ended here. \
+                             Repeating it will not change the outcome -- change the \
+                             arguments or do something else."
+                        );
+                        // Set once at most: every call after this one is
+                        // skipped above, and a skip is not a failure.
+                        let _ = self.breaker_stop.set(reason);
+                        Flow::rewrite_result(answer)
+                    }
                 }
             }
             _ => Flow::cont(),
