@@ -2422,6 +2422,10 @@ fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Mess
 /// Called on *every* model call in the turn, because rig's `RequestPatch` is
 /// per-turn and non-sticky -- a steer applied once would vanish from the next
 /// call.
+///
+/// Calling it counts what it returns as delivered, so it is called only for a
+/// model call that is going to be made. Steers handed to a call that never
+/// happened would be folded into history as though the model had seen them.
 pub type InjectionSource = Arc<dyn Fn() -> Vec<Message> + Send + Sync>;
 
 /// Consecutive identical failures before the model is told that repeating the
@@ -2592,6 +2596,8 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                 }
                 // Steers are re-applied on every model call, not just the one
                 // after they arrive: the patch is per-turn and non-sticky.
+                // Asked only past the cap check above: asking counts them as
+                // delivered (see `InjectionSource`).
                 if let Some(source) = &self.injections {
                     let steers = source();
                     if !steers.is_empty() {

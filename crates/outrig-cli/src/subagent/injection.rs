@@ -15,18 +15,40 @@
 //! - Queued steers are *read*, not drained, on every model call. Dropping one
 //!   after a single turn would make it vanish from the next call in the same
 //!   round.
-//! - The round's driver folds them into the subagent's own `Vec<Message>` when
-//!   the round ends, since rig never persisted them and the following round
-//!   would otherwise not remember being steered.
+//! - The round's driver folds the steers a model call carried into the
+//!   subagent's own `Vec<Message>` when the round ends, since rig never
+//!   persisted them and the following round would otherwise not remember
+//!   being steered.
+//!
+//! A round can take a steer only while a model call is still to come, and
+//! which call is the last is unknown until the agent loop returns. So the
+//! round stops taking steers at that moment, under the same lock
+//! [`SubagentShared::accept`] decides under. From then on a prompt queues as a
+//! round of its own, behind any already waiting. A steer queued during the last
+//! call reached no model:
+//!
+//! - Unless the round failed, the steer joins that queue as a round of its own.
+//!   Nothing was queued while the round took steers, so this puts it behind
+//!   every prompt sent before it and ahead of every one sent after, in the
+//!   order the parent sent them. The subagent does not go idle while a round
+//!   is waiting.
+//! - A failed round starts nothing on its own: its parent is told, and decides
+//!   what comes next. The steer is folded in with the rest, to reach the model
+//!   with that.
+//!
+//! Either way, no steer outlives its round.
+//!
+//! [`SubagentShared::accept`]: super::state::SubagentShared::accept
 
 use rig::completion::Message;
+
+/// The line a steer opens with; see [`steer_message`].
+pub(crate) const STEER_HEADER: &str = "[message from the agent that launched you]";
 
 /// Marks the text as coming from the parent rather than from the subagent's
 /// own task, so a steer is not mistaken for part of the original assignment.
 pub fn steer_message(text: &str) -> Message {
-    Message::user(format!(
-        "[message from the agent that launched you]\n{text}"
-    ))
+    Message::user(format!("{STEER_HEADER}\n{text}"))
 }
 
 #[cfg(test)]

@@ -69,6 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at or after `2026-07-28` took the stateless path and got no `Mcp-Session-Id`, yet was answered
   in `2025-11-25`, a revision that needs one. Its next request was refused with `422`. Every
   `initialize` now opens a session.
+- **A message sent to a subagent as it finishes a round reaches it.** `outrig__subagent_send`
+  answered `injected into the round in flight` for a subagent whose round had already made its
+  last model call, and the message never reached the model. The subagent went idle, and the
+  message surfaced only if a later round ran, attached to that round's work. It now runs as a
+  round of its own, in the order it was sent, behind any message already waiting. If the round
+  failed instead, the message is kept for the parent's next prompt.
+- **A subagent with a round waiting no longer reads as stopped.** A subagent whose round ended
+  without `outrig__set_result`, and that was already sent another message, went idle between
+  the two rounds. `outrig__get_result` or `outrig__wait_results` in that gap, such as one made
+  straight after the send, answered with how the old round stopped instead of waiting for the
+  new one. A subagent now stays working while a round is waiting, and a message sent to an idle
+  one ends that stop at once.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

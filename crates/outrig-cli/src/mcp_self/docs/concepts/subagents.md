@@ -207,7 +207,10 @@ outrig__get_result({"name": "audit-mcp"})
 Finishing a round does not end a subagent. It goes idle with its history intact, and
 `outrig__subagent_send` reopens it -- to follow up on a result, or to redirect one that is still
 working. A running subagent sees the message at its next step, so the parent never has to know
-whether it is busy. Idle subagents live until released or until the session ends.
+whether it is busy. One already past its last step when the message arrives runs it as a round of
+its own instead. Rounds run in the order their messages were sent, and a subagent with one waiting
+is not idle: reading its result waits for that round rather than returning how the last one
+stopped. Idle subagents live until released or until the session ends.
 
 `outrig__subagent_release` takes the whole list or none of it. If any name in the call is unknown
 -- or named twice -- nothing is released and every subagent in that call stays live, with its
