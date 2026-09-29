@@ -821,6 +821,9 @@ _type_qualname = type.__dict__["__qualname__"].__get__
 # The host says when the user has received each message an endpoint sent, and a send waits while
 # `SEND_WINDOW` are unreceived. So an agent that sends faster than the user reads is held back in
 # its own code, under this process's memory ceiling, rather than piling messages up in the host's.
+#
+# `runtime.wait` watches every endpoint and takes nothing: a message arriving wakes it as it wakes
+# a waiting receive, and it raises while any message waits unread.
 
 QUEUE_MAX = 256  # unread messages one endpoint holds
 MESSAGE_MAX = 1 << 20  # bytes of the protocol line one sent message becomes
@@ -953,6 +956,24 @@ class Delivery:
     received_at: datetime.datetime
 
 
+class MessageAvailable(BaseException):
+    """Raised by `runtime.wait` while a message waits unread on one of this agent's channels.
+
+    The wait ends, and nothing else does: the message is still queued for a receive, and what the
+    wait was given is still running. `channels` names the channels holding messages.
+
+    A `BaseException`, as `asyncio.CancelledError` is, so that an `except Exception:` written
+    around a wait does not swallow it. Catch it by name, as `runtime.MessageAvailable`.
+    """
+
+    def __init__(self, channels):
+        self.channels = tuple(channels)
+        where = ", ".join(f"runtime.channels[{json.dumps(name)}]" for name in self.channels)
+        super().__init__(
+            f"input is waiting on {where}; it has not been read, and the wait cancelled nothing"
+        )
+
+
 def _wake(waiter):
     if not waiter.done():
         waiter.set_result(None)
@@ -994,8 +1015,8 @@ class Endpoint:
         self._delivered = 0
         # Messages sent that the other end has not yet received.
         self._unreceived = 0
-        # Futures of receives waiting for a message, and of sends waiting for room in the window,
-        # each on its own loop.
+        # Futures of receives waiting for a message -- and of waits watching for one, which take
+        # nothing -- and of sends waiting for room in the window, each on its own loop.
         self._receivers = []
         self._senders = []
 
@@ -1057,6 +1078,22 @@ class Endpoint:
             finally:
                 with self._lock, contextlib.suppress(ValueError):
                     waiters.remove(waiter)
+
+    def _watch(self, waiter):
+        """Whether a message is waiting here, taking none of them. If none is, `waiter` is woken
+        when one arrives, as a waiting receive is, until `_unwatch` takes it back."""
+        with self._lock:
+            if self._queue:
+                return True
+            self._receivers.append(waiter)
+            return False
+
+    def _unwatch(self, waiter):
+        """Stop waking `waiter`, if it was watching. Checked rather than caught, so it raises
+        nothing: a `ValueError` to catch would be one more allocation."""
+        with self._lock:
+            if waiter in self._receivers:
+                self._receivers.remove(waiter)
 
     async def send(self, message):
         """Send `message` to the other end.
@@ -1128,12 +1165,21 @@ class Endpoint:
         return count
 
 
+# What `return_when` may be: asyncio's own constants, which in CPython are strings.
+_RETURN_WHEN = (asyncio.FIRST_COMPLETED, asyncio.FIRST_EXCEPTION, asyncio.ALL_COMPLETED)
+
+
 class Runtime:
     """What this agent reaches beyond its own names.
 
     `runtime.channels` maps a name to the endpoint of a channel. `runtime.channels["user"]` is how
     the user reaches you and you reach them: see `help(type(runtime.channels["user"]))`.
+
+    `await runtime.wait(fs)` waits as `asyncio.wait` does and watches every channel while it
+    waits: see `help(runtime.wait)`.
     """
+
+    MessageAvailable = MessageAvailable
 
     def __init__(self, channels):
         self._channels = types.MappingProxyType(channels)
@@ -1143,9 +1189,93 @@ class Runtime:
         """This agent's channel endpoints, by name. Read-only."""
         return self._channels
 
+    async def wait(self, fs, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        """Wait for the futures in `fs` as `asyncio.wait` does, watching every channel meanwhile.
+
+        It returns for asyncio's reasons and raises for the runtime's. `(done, pending)` comes
+        back, two sets, once the futures satisfy `return_when` -- `asyncio.FIRST_COMPLETED`,
+        `FIRST_EXCEPTION`, or `ALL_COMPLETED` -- or once `timeout` seconds have passed. A timeout
+        cancels nothing and raises no `TimeoutError`, so `done` may be empty; giving up on what is
+        still pending is a separate act. A task that failed is done, and its exception is in
+        `task.exception()` rather than raised here.
+
+        While a message waits unread on any channel, one there before the call included, it
+        raises `runtime.MessageAvailable` instead, even if the futures are done as well. The
+        message is still queued for a receive, and nothing in `fs` is cancelled, so a later wait
+        can wait on them again. Nor are they cancelled when the code waiting here is, as a task it
+        awaited directly would be.
+
+        `fs` holds futures -- tasks, usually -- not coroutines. Name them, as in
+        `asyncio.create_task(watch(), name="ci")`, so `done` says which is which.
+        """
+        # asyncio's own checks, in its own words, so what the mirror refuses is what asyncio does.
+        if asyncio.isfuture(fs) or asyncio.iscoroutine(fs):
+            raise TypeError(f"expect a list of futures, not {type(fs).__name__}")
+        if not fs:
+            raise ValueError("Set of Tasks/Futures is empty.")
+        if return_when not in _RETURN_WHEN:
+            raise ValueError(f"Invalid return_when value: {return_when}")
+        fs = set(fs)
+        if any(asyncio.iscoroutine(f) for f in fs):
+            raise TypeError("Passing coroutines is forbidden, use tasks explicitly.")
+        # An iterator is not known to be empty until it is read. asyncio trips an assertion here.
+        if not fs:
+            raise ValueError("Set of Tasks/Futures is empty.")
+        loop = asyncio.get_running_loop()
+        # Woken for asyncio's reasons, as the waiter in `asyncio.tasks._wait` is: by the timer, or
+        # by the one callback each future gets, which counts completions as they come. So `N`
+        # futures finishing one at a time cost `N` callbacks, not a look at every future still
+        # pending each time one does.
+        finished = loop.create_future()
+        timer = None if timeout is None else loop.call_later(timeout, _wake, finished)
+        remaining = len(fs)
+
+        def completed(f):
+            nonlocal remaining
+            remaining -= 1
+            # asyncio's own test. Only `FIRST_EXCEPTION` reads an exception, which marks it
+            # retrieved, as asyncio's reading does.
+            if (
+                remaining <= 0
+                or return_when == asyncio.FIRST_COMPLETED
+                or (
+                    return_when == asyncio.FIRST_EXCEPTION
+                    and not f.cancelled()
+                    and f.exception() is not None
+                )
+            ):
+                _wake(finished)
+
+        for f in fs:
+            f.add_done_callback(completed)
+        try:
+            while True:
+                # Read again on each pass, so a channel added during the wait is watched from the
+                # next one on.
+                endpoints = list(self._channels.items())
+                arrived = loop.create_future()
+                try:
+                    # Input first, so it wins over futures that are done and a timeout that has
+                    # passed; and without suspending, so code that catches this and waits again
+                    # spins where the runaway probe detects it.
+                    waiting = [name for name, endpoint in endpoints if endpoint._watch(arrived)]
+                    if waiting:
+                        raise MessageAvailable(waiting)
+                    if finished.done():
+                        done = {f for f in fs if f.done()}
+                        return done, fs - done
+                    await asyncio.wait({finished, arrived}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    for _, endpoint in endpoints:
+                        endpoint._unwatch(arrived)
+        finally:
+            if timer is not None:
+                timer.cancel()
+            for f in fs:
+                f.remove_done_callback(completed)
+
     def __repr__(self):
         return f"<runtime: channels {', '.join(map(repr, self._channels))}>"
-
 
 
 class Kernel:

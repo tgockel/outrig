@@ -583,6 +583,8 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
     let system = system_prompt(&mock_http::drain(&mut requests)[0]);
     assert!(
         system.starts_with("You act on this project by writing Python.")
+            && system.contains("`runtime.wait` is `asyncio.wait`")
+            && system.contains("`runtime.MessageAvailable`, which `except Exception` does not")
             && system.contains("`pip install` does not work")
             && system.ends_with("\n\nYou write Python."),
         "{system}"
@@ -878,6 +880,68 @@ async fn a_message_arriving_mid_round_is_announced_in_the_next_result() {
         result.len()
     );
     assert!(!wire(&recorded).contains("xyzzy"));
+}
+
+/// A message sent while the round's code waits in `runtime.wait` ends the
+/// wait and not the work: the model reads that a message waits and why its
+/// code stopped, the code it runs next reads the message and finds the
+/// operation still running, and all of it is one round.
+#[tokio::test]
+async fn a_message_ends_a_wait_and_the_round_goes_on() {
+    let parked = Running::new();
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_REDIRECT",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit(
+                "toolu_wait",
+                &format!(
+                    "await runtime.channels['user'].receive()\n\
+                     forever = asyncio.create_task(asyncio.Event().wait(), name='forever')\n\
+                     {}\ndone, pending = await runtime.wait({{forever}})",
+                    parked.when_parked()
+                ),
+            ),
+            submit(
+                "toolu_read",
+                "print((await runtime.channels['user'].receive()).body, forever.done())",
+            ),
+            text_reply("redirected"),
+        ],
+    )
+    .await;
+    let user = agent.user_channel();
+    let meanwhile = async {
+        parked.reached().await;
+        user.send("change of plan").await.expect("delivered");
+    };
+    let (reply, ()) = tokio::join!(round(&mut agent, "wait for it"), within(meanwhile));
+    assert_eq!(reply, "redirected");
+    assert!(
+        within(agent.round())
+            .await
+            .expect("no model call to fail")
+            .is_none(),
+        "the model was told in the result, so no round follows"
+    );
+
+    // The mock repeats its last answer, so only the count would show a
+    // second round.
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 3, "{recorded:#?}");
+    let waited = tool_result(&recorded[1], "toolu_wait");
+    assert!(
+        waited.starts_with(
+            "[1 message is waiting on runtime.channels[\"user\"]]\n[this code raised \
+             MessageAvailable: input is waiting on runtime.channels[\"user\"]"
+        ),
+        "{waited}"
+    );
+    assert_eq!(
+        tool_result(&recorded[2], "toolu_read"),
+        "change of plan False\n"
+    );
 }
 
 /// A round whose model call fails before it ran anything leaves the model
@@ -1560,6 +1624,15 @@ impl Running {
     /// `source`, run once the file exists.
     fn then(&self, source: &str) -> String {
         format!("open({:?}, 'w').close()\n{source}", self.path())
+    }
+
+    /// Python that creates the file once the loop turns again. Put just before
+    /// an `await`, it is created once that await has suspended.
+    fn when_parked(&self) -> String {
+        format!(
+            "asyncio.get_running_loop().call_soon(lambda: open({:?}, 'w').close())",
+            self.path()
+        )
     }
 
     /// Wait for the file to exist.

@@ -6,7 +6,9 @@
 //! output is bounded is already in `submit_python`'s description, which the
 //! model also reads every round, so it is not repeated here. How the user
 //! reaches it is not, and every round opens on a count of messages that only
-//! makes sense with it.
+//! makes sense with it. `runtime.wait` is that page's worked example: its
+//! signature is `asyncio.wait`'s on purpose, so nothing in it says that it
+//! watches the channels and raises while a message waits.
 
 use std::path::Path;
 
@@ -25,7 +27,13 @@ pub(crate) fn preamble(workspace: Option<&Path>, configured: Option<&str>) -> St
          takes the next one, whose `.body` is its text, and `.pending()` counts them. `await \
          runtime.channels[\"user\"].send(text)` sends the user a message. What you write \
          yourself is commentary; send what you mean the user to have. A send is also the only \
-         way code still running after you stop writing can reach them.\n\n",
+         way code still running after you stop writing can reach them.\n\n\
+         `runtime.wait` is `asyncio.wait` -- the same arguments, the same `(done, pending)` \
+         back, and a timeout that cancels nothing -- except that while a message waits unread, \
+         one there before the call included, it raises `runtime.MessageAvailable`, which \
+         `except Exception` does not catch. The message stays queued and the tasks keep \
+         running. A bare `await` is not ended by a message, and when the user interrupts your \
+         code, what it awaits is cancelled; `runtime.wait` leaves those tasks running.\n\n",
     );
     if let Some(workspace) = workspace {
         text.push_str(&format!(

@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry from one message to the next. The image needs no Python. Each submission is shown on
   stderr as it starts running. What you type is a message on the agent's `user` channel rather
   than a prompt: the model is told how many wait, and its code reads them. A line typed while a
-  round runs is queued for it, and says so, rather than waiting for the round to end. stdout
+  round runs is queued for it, and says so, rather than waiting for the round to end. One typed
+  while the agent's Python waits in `runtime.wait` ends that wait, not the work it was waiting on,
+  and the model reads it in the same round. stdout
   carries only what the agent sends on the channel, a send from code that outlived its round
   included; the model's own text goes to stderr. If the interpreter exits, the session ends with
   status 1. It starts no MCP server and no sidecar, since the model could not

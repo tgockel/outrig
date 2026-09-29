@@ -480,6 +480,64 @@ async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_termina
     }
 }
 
+/// What `runtime.wait` is for, through the binary: a wait on something that
+/// will never finish yields to a line typed while it waits, the operation it
+/// was waiting on is still running afterwards, and the model carries on in the
+/// same round.
+#[tokio::test]
+async fn a_typed_line_ends_a_wait_and_the_round_goes_on() {
+    let (addr, mut requests) = start_mock_http(vec![
+        submit(
+            "toolu_wait",
+            "await runtime.channels['user'].receive()\n\
+             forever = asyncio.create_task(asyncio.Event().wait(), name='forever')\n\
+             asyncio.get_running_loop().call_soon(lambda: open('waiting', 'w').close())\n\
+             done, pending = await runtime.wait({forever})",
+        ),
+        submit(
+            "toolu_read",
+            "print((await runtime.channels['user'].receive()).body, forever.done())",
+        ),
+        text_reply("redirected"),
+    ])
+    .await;
+    let repo = repo(addr);
+    let sessions = tempfile::tempdir().expect("a session root");
+    let mut session = Session::start(repo.path(), sessions.path());
+
+    session.type_line("alpha-9").await;
+    // Created once the wait has suspended.
+    wait_for_file(&repo.path().join("waiting"), TEST_TIMEOUT).await;
+    session.type_line("bravo-9").await;
+    wait_for(&session.stderr, "redirected", STEP_TIMEOUT).await;
+
+    let (status, stdout, stderr) = session.exit(true).await;
+    assert!(status.success(), "{status}: {stderr}");
+    assert_eq!(stdout, "", "the agent sent nothing");
+    assert!(
+        stderr.contains("[outrig] queued for the agent (1 waiting)"),
+        "the line typed mid-wait was queued, and said so: {stderr}"
+    );
+
+    // One round, three model calls: the mock repeats its last answer, so only
+    // the count would show a second round.
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 3, "{recorded:#?}");
+    let waited = tool_result(&recorded[1], "toolu_wait");
+    assert!(
+        waited.starts_with(
+            "[1 message is waiting on runtime.channels[\"user\"]]\n[this code raised \
+             MessageAvailable: input is waiting on runtime.channels[\"user\"]"
+        ),
+        "{waited}"
+    );
+    assert_eq!(
+        tool_result(&recorded[2], "toolu_read"),
+        "bravo-9 False\n",
+        "the second line reached the code, and the operation outlived the wait"
+    );
+}
+
 /// Once the interpreter has exited, nothing typed could reach the agent, so
 /// the session ends -- with input still open -- and says why.
 #[tokio::test]

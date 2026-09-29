@@ -35,9 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the agent has already sent without waiting for more, for a caller about to leave; it never
   waits, not even behind a `receive` outstanding on a clone.
 
+  `runtime.wait(fs, *, timeout=None, return_when=ALL_COMPLETED)` is `asyncio.wait` that also
+  watches the agent's channels. It returns `(done, pending)` when `return_when` is met or the
+  timeout passes, and a timeout cancels nothing and raises no `TimeoutError`; a task that failed
+  comes back in `done`. While a message waits unread on any channel it raises
+  `runtime.MessageAvailable` instead -- a `BaseException`, so `except Exception` does not catch
+  it -- and leaves the message queued and the operations running. Cancelling the code that waits
+  does not cancel them either, where a task that code awaited directly is cancelled with it.
+
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
-  user's messages arrive and how to answer them, the working directory is the workspace, and the
-  interpreter cannot install packages. The agent's configured `preamble` follows it.
+  user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
+  the working directory is the workspace, and the interpreter cannot install packages. The
+  agent's configured `preamble` follows it.
 
   `PythonAgent::check` runs `start`'s model resolution without starting anything, so a caller can
   fail before pulling an image. `model`, `python_version`, and `container_name` report what a

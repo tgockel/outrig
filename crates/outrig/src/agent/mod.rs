@@ -179,8 +179,10 @@ impl PythonAgent {
     /// the agent's code has already read what did.
     ///
     /// A message arriving while the round runs is announced in the next result
-    /// the model reads. One arriving after the last of them is left for the
-    /// next call, which is why a caller asks again once a round ends.
+    /// the model reads, and ends a `runtime.wait` the round's code is in: that
+    /// call returns, and the round goes on. One arriving after the last of them
+    /// is left for the next call, which is why a caller asks again once a round
+    /// ends.
     ///
     /// The reply is the model's own text: commentary, where a message the agent
     /// means the user to have is one it sends. A round cut short by the

@@ -237,13 +237,19 @@ reasons -- an operator checking in, a limit coming into view, a condition it is 
 agent's behalf -- is the same category and takes the same path. The agent does not have to
 enumerate them, and adding one later does not change a signature.
 
+**Decided in `0003-09`: `MessageAvailable` derives from `BaseException`**, as
+`asyncio.CancelledError` has since Python 3.8, and is reached as `runtime.MessageAvailable`. As an
+`Exception`, a stray `except Exception:` around a wait would swallow the redirection, and the
+agent would run on past a message it never saw. Worse, input wins and nothing is consumed, so a
+loop that caught it and waited again would never return. Code that means to catch it names it.
+
 Three consequences, all improvements:
 
-**The return shape changes.** Today `runtime.wait(operation)` returns that operation's result or
-raises its exception. With N operations "the result" is not well defined, and `(done, pending)` is
-what a Python programmer already expects. The three properties the design depends on are
-untouched: input still wins over a completed operation, the operation is still not cancelled, and
-a pending message is still not consumed.
+**The return shape changes.** The prototype's `runtime.wait(operation)` returned that
+operation's result or raised its exception. With N operations "the result" is not well defined,
+and `(done, pending)` is what a Python programmer already expects. The three properties the design
+depends on are untouched: input still wins over a completed operation, the operation is still not
+cancelled, and a pending message is still not consumed.
 
 **Bare coroutines are refused, for a better reason.** `messages.md` already required a future
 rather than a coroutine because a coroutine cannot be awaited twice. Asyncio now refuses them
@@ -275,14 +281,11 @@ is `Task-7` everywhere it appears.
   decide something.
 - Whether a very long round wants any operator visibility of its own. Nothing is wrong with a
   round that lasts an hour, but nothing currently says it is happening either.
-- Whether `MessageAvailable` should derive from `BaseException` rather than `Exception`. A stray
-  `except Exception:` around a wait swallows it today and lets the agent run on past a redirection
-  it never saw.
 
 ## Unverified
 
 - `asyncio.wait`'s signature, the string-valued `return_when` constants, `Task.get_name()`, and
   the coroutine `TypeError` were checked against the pinned payload.
-- That a long await behaves as described is read from the prototype's `Runtime.wait`, which loops
-  on `asyncio.wait(..., FIRST_COMPLETED)` over the operation and a message event. It was not
-  exercised against a genuinely long-running operation.
+- That a long await behaves as described. `0003-09`'s tests wait on operations that never finish,
+  and end the wait with a message, a cancel, and a timeout, in the interpreter and through
+  `run-new`; none lasts longer than a test step, so a wait of hours has still not been run.

@@ -281,6 +281,14 @@ The model hears of it in the next result its code returns, or in a round of its 
 current one ends. A channel holds 256 unread messages and refuses the next, saying so; a message
 is at most 1 MiB either way.
 
+**A line typed while the agent waits ends the wait, not the work.** The agent's Python waits on
+slow work with `runtime.wait`, which is Python's `asyncio.wait` except that it also watches the
+agent's channels: while a message waits unread, it raises `MessageAvailable` instead of waiting.
+So a line typed during a wait ends it, and the model, told a message is waiting, reads it and
+decides what to do next, in the same round. What the wait was on keeps running, and a later wait
+can wait on it again. Python waiting with a bare `await` is not ended by a message; Ctrl-C stops
+it.
+
 stdout carries only what the agent sends on the channel -- including a send from code still
 running after its round ended, which is printed when it arrives, at the prompt or not. The agent
 is held to the terminal's pace: its code waits once it is 16 messages ahead of what has been
@@ -314,11 +322,13 @@ typed next is announced with them. If the interpreter exits -- Python that calls
 
 Ctrl-C while the agent's Python runs stops that Python, and the round carries on: the code is
 cancelled, or interrupted if it has stopped yielding, and the model reads how it ended. Stopping
-Python does not stop the processes it started. A second Ctrl-C on the same code stops waiting for
-it instead; it keeps the interpreter until it finishes, later submissions are refused until then,
-and its result reaches the model with a later call. Ctrl-C while no Python runs -- the model is
-being called -- ends the round and returns to the prompt, and what the round had already run
-stays in the conversation. At the prompt, one Ctrl-C starts a fresh line and a second exits.
+Python does not stop the processes it started, nor the tasks it was waiting on through
+`runtime.wait`; a task it awaited directly is cancelled with it. A second Ctrl-C on the same code
+stops waiting for it instead; it keeps the interpreter until it finishes, later submissions are
+refused until then, and its result reaches the model with a later call. Ctrl-C while no Python
+runs -- the model is being called -- ends the round and returns to the prompt, and what the round
+had already run stays in the conversation. At the prompt, one Ctrl-C starts a fresh line and a
+second exits.
 
 Python that keeps its event loop from turning while a CPU stays busy, such as `while True: pass`,
 is interrupted after about half a minute without anyone pressing anything, and the model reads

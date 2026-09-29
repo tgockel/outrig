@@ -2409,3 +2409,397 @@ fn a_send_is_machinery_an_interrupt_does_not_land_in() {
         "True\n"
     );
 }
+
+// ---------------------------------------------------------------------------- waiting
+
+/// Python that writes `PARKED <id>` on stderr once the loop turns again. Put
+/// just before an `await`, it is written once that await has suspended.
+fn parked(id: u64) -> String {
+    format!("import os\nasyncio.get_running_loop().call_soon(os.write, 2, b'PARKED {id}\\n')")
+}
+
+impl Interpreter {
+    /// Submit `source` as execution `id`, and return once it has written
+    /// [`parked`]`(id)`: suspended in the await that follows it.
+    fn park(&mut self, id: u64, source: &str) {
+        self.submit(id, source);
+        self.await_stderr(&format!("PARKED {id}\n"));
+    }
+
+    /// Post `body` on the primary's channel `channel` as request `id`, while
+    /// execution `waiting` is parked on a wait the post ends, and return the
+    /// post's answer and that execution's result. The reader thread answers
+    /// the post and the loop reports the result, so either can come first.
+    fn post_waking(&mut self, id: u64, channel: &str, body: Value, waiting: u64) -> (Value, Value) {
+        self.send(
+            json!({"t": "msg", "agent": PRIMARY, "id": id, "channel": channel, "body": body}),
+        );
+        let (first, second) = (self.recv(), self.recv());
+        let (answer, result) = if first["t"] == "msg" {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        assert!(
+            answer["t"] == "msg" && answer["id"] == id,
+            "expected the answer to {id}, got: {answer}"
+        );
+        assert!(
+            result["t"] == "result" && result["id"] == waiting,
+            "expected the result of {waiting}, got: {result}"
+        );
+        (answer, result)
+    }
+}
+
+/// `runtime.wait` is spelled exactly as `asyncio.wait` is, so nothing in the
+/// signature says it also watches the channels: the preamble has to.
+#[test]
+fn a_wait_has_asyncios_signature() {
+    let mut k = Interpreter::start();
+    assert_eq!(
+        k.output(
+            1,
+            "import inspect\ninspect.signature(runtime.wait) == inspect.signature(asyncio.wait)"
+        ),
+        "True\n"
+    );
+}
+
+/// Two operations and `FIRST_COMPLETED`: the wait returns once the first has
+/// finished and not before, with the other in `pending`, where it goes on
+/// running.
+#[test]
+fn first_completed_returns_the_first_and_leaves_the_other_running() {
+    let mut k = Interpreter::start();
+    let flag = Flag::new();
+    let source = format!(
+        "async def released():\n{}\nfirst = asyncio.create_task(released(), name='first')\n\
+         second = asyncio.create_task(asyncio.Event().wait(), name='second')\n{}\n\
+         done, pending = await runtime.wait({{first, second}}, \
+         return_when=asyncio.FIRST_COMPLETED)\n\
+         [t.get_name() for t in done], [t.get_name() for t in pending]",
+        indent(&flag.awaited()),
+        parked(1),
+    );
+    k.park(1, &source);
+    // Still waiting: the loop answers, and nothing was reported before it.
+    k.loop_turns(2);
+    flag.raise();
+    let result = k.result_of(1);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(text(&result["output"]), "(['first'], ['second'])\n");
+    assert_eq!(
+        k.output(
+            3,
+            "second.done(), second.cancelled(), runtime.channels['user']._receivers"
+        ),
+        "(False, False, [])\n"
+    );
+}
+
+/// `ALL_COMPLETED` is the default, and `FIRST_EXCEPTION` returns at the first
+/// failure, as asyncio's do.
+#[test]
+fn all_completed_is_the_default_and_first_exception_returns_at_a_failure() {
+    let mut k = Interpreter::start();
+    let output = k.output(
+        1,
+        &py(r#"
+            async def fails():
+                raise ValueError('boom')
+            a = asyncio.create_task(asyncio.sleep(0), name='a')
+            b = asyncio.create_task(asyncio.sleep(0), name='b')
+            done, pending = await runtime.wait([a, b])
+            print(sorted(t.get_name() for t in done), pending)
+            failed = asyncio.create_task(fails(), name='failed')
+            slow = asyncio.create_task(asyncio.Event().wait(), name='slow')
+            done, pending = await runtime.wait({failed, slow}, return_when=asyncio.FIRST_EXCEPTION)
+            print([t.get_name() for t in done], [t.get_name() for t in pending])
+            "#),
+    );
+    assert_eq!(output, "['a', 'b'] set()\n['failed'] ['slow']\n");
+}
+
+/// A timeout returns what is done and what is not. It raises nothing and
+/// cancels nothing: what is pending goes on running.
+#[test]
+fn a_timeout_returns_without_raising_or_cancelling() {
+    let mut k = Interpreter::start();
+    let output = k.output(
+        1,
+        &py(r#"
+            quick = asyncio.create_task(asyncio.sleep(0), name='quick')
+            slow = asyncio.create_task(asyncio.Event().wait(), name='slow')
+            done, pending = await runtime.wait({quick, slow}, timeout=0.05)
+            print([t.get_name() for t in done], [t.get_name() for t in pending])
+            done, pending = await runtime.wait({slow}, timeout=0)
+            print(done, [t.get_name() for t in pending], slow.cancelled())
+            "#),
+    );
+    assert_eq!(output, "['quick'] ['slow']\nset() ['slow'] False\n");
+    assert_eq!(
+        k.output(2, "slow.done(), runtime.channels['user']._receivers"),
+        "(False, [])\n"
+    );
+}
+
+/// A task that failed is a completed task: it comes back in `done`, its
+/// exception there to read, rather than raised out of the wait.
+#[test]
+fn a_failed_task_comes_back_done_rather_than_raised() {
+    let mut k = Interpreter::start();
+    let result = k.exec(
+        1,
+        &py(r#"
+            async def fails():
+                raise ValueError('boom')
+            failed = asyncio.create_task(fails(), name='failed')
+            done, pending = await runtime.wait({failed})
+            done == {failed}, pending, failed.exception()
+            "#),
+    );
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(
+        text(&result["output"]),
+        "(True, set(), ValueError('boom'))\n"
+    );
+}
+
+/// A message arriving ends a wait on something that will never finish. It
+/// raises, naming the channel, and takes nothing: the message still waits to
+/// be received, and the operation is still running.
+#[test]
+fn a_message_ends_a_wait_naming_its_channel_and_takes_nothing() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        "op = asyncio.create_task(asyncio.Event().wait(), name='op')",
+    );
+    k.park(2, &format!("{}\nawait runtime.wait({{op}})", parked(2)));
+    let (answer, result) = k.post_waking(3, "user", json!("hello"), 2);
+    assert_eq!(answer["pending"], 1, "{answer}");
+    let error = error_of(&result);
+    assert!(
+        error.ends_with(
+            "MessageAvailable: input is waiting on runtime.channels[\"user\"]; it has not been \
+             read, and the wait cancelled nothing\n"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        k.output(
+            4,
+            "ch = runtime.channels['user']\nop.done(), op.cancelled(), ch.pending(), ch._receivers"
+        ),
+        "(False, False, 1, [])\n"
+    );
+    assert_eq!(k.output(5, "(await ch.receive()).body"), "'hello'\n");
+}
+
+/// `MessageAvailable` is a `BaseException`, so the `except Exception:` an agent
+/// wraps around its work does not swallow a redirection.
+#[test]
+fn except_exception_does_not_catch_message_available() {
+    let mut k = Interpreter::start();
+    assert_eq!(k.post(1, json!("stop"))["pending"], 1);
+    let result = k.exec(
+        2,
+        &py(r#"
+            op = asyncio.create_task(asyncio.Event().wait())
+            try:
+                await runtime.wait({op})
+            except Exception:
+                print('swallowed')
+            "#),
+    );
+    assert!(
+        error_of(&result).contains("\nMessageAvailable: input is waiting"),
+        "{result}"
+    );
+    assert_eq!(result["output"], "", "{result}");
+}
+
+/// Input wins: a message queued before the wait makes it raise even though the
+/// task it waits on has already finished. Code that names the exception
+/// catches it, the message stays queued, and the result stays in the task.
+#[test]
+fn input_wins_over_a_finished_task() {
+    let mut k = Interpreter::start();
+    assert_eq!(k.post(1, json!("stop"))["pending"], 1);
+    let source = py(r#"
+        finished = asyncio.create_task(asyncio.sleep(0, 'result'))
+        await finished
+        try:
+            await runtime.wait({finished})
+        except runtime.MessageAvailable as e:
+            print(e.channels, finished.result(), runtime.channels['user'].pending())
+        "#);
+    assert_eq!(k.output(2, &source), "('user',) result 1\n");
+}
+
+/// Input also wins when it arrives with the completion that would have ended
+/// the wait: both land before the wait next looks, and it raises rather than
+/// returning.
+#[test]
+fn input_wins_when_it_arrives_with_a_completion() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        op = asyncio.get_running_loop().create_future()
+        def both():
+            op.set_result('result')
+            runtime.channels['user']._deliver('now', 'user')
+        asyncio.get_running_loop().call_soon(both)
+        try:
+            await runtime.wait({op})
+        except runtime.MessageAvailable as e:
+            print(e.channels, op.result())
+        "#);
+    assert_eq!(k.output(1, &source), "('user',) result\n");
+}
+
+/// A message a receive already waiting takes first does not end the wait:
+/// woken, the wait finds nothing unread and goes on waiting, and returns when
+/// its operation does.
+#[test]
+fn a_message_another_receive_takes_does_not_end_the_wait() {
+    let mut k = Interpreter::start();
+    let flag = Flag::new();
+    k.output(
+        1,
+        &format!(
+            "async def released():\n{}\nop = asyncio.create_task(released())\n\
+             reader = asyncio.create_task(runtime.channels['user'].receive())\n\
+             await asyncio.sleep(0)",
+            indent(&flag.awaited())
+        ),
+    );
+    k.park(
+        2,
+        &format!(
+            "{}\ndone, pending = await runtime.wait({{op}})\nlen(done), (await reader).body",
+            parked(2)
+        ),
+    );
+    assert_eq!(k.post(3, json!("for the reader"))["pending"], 1);
+    flag.raise();
+    let result = k.result_of(2);
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(text(&result["output"]), "(1, 'for the reader')\n");
+}
+
+/// Every channel the agent has is watched, not the user's alone: one added to
+/// the kernel is watched with no change to the wait, and a message on it
+/// raises naming it. So a wake the host adds later takes the same path.
+#[test]
+fn a_wait_watches_every_channel_the_agent_has() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            import __main__
+            __main__._kernels['primary'].channels['control'] = __main__.Endpoint(
+                'primary', 'control', receives=str, sends=str)
+            op = asyncio.create_task(asyncio.Event().wait())
+            "#),
+    );
+    k.park(2, &format!("{}\nawait runtime.wait({{op}})", parked(2)));
+    let (answer, result) = k.post_waking(3, "control", json!("check in"), 2);
+    assert_eq!(answer["pending"], 1, "{answer}");
+    assert!(
+        error_of(&result)
+            .contains("MessageAvailable: input is waiting on runtime.channels[\"control\"];"),
+        "{result}"
+    );
+}
+
+/// Cancelling an execution reaches a task it awaits directly, and not one it
+/// waits on through `runtime.wait`, as `execution-and-rounds.md` measured. A
+/// Ctrl-C that stops a wait leaves the work it was waiting on running.
+#[test]
+fn a_cancelled_wait_leaves_its_operation_running_where_a_bare_await_does_not() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        "waited = asyncio.create_task(asyncio.Event().wait())\n\
+         awaited = asyncio.create_task(asyncio.Event().wait())",
+    );
+    for (id, how) in [(2, "await runtime.wait({waited})"), (3, "await awaited")] {
+        k.park(id, &format!("{}\n{how}", parked(id)));
+        k.cancel(id);
+        let error = error_of(&k.result_of(id));
+        assert!(error.contains("CancelledError"), "{error}");
+    }
+    assert_eq!(
+        k.output(
+            4,
+            "waited.cancelled(), awaited.cancelled(), runtime.channels['user']._receivers"
+        ),
+        "(False, True, [])\n"
+    );
+}
+
+/// What asyncio refuses, the wait refuses in asyncio's words: a coroutine,
+/// inside `fs` or as it; a lone future; nothing to wait on, an iterator that
+/// turns out empty included; and a `return_when` asyncio lacks.
+#[test]
+fn a_wait_refuses_what_asyncio_refuses() {
+    let mut k = Interpreter::start();
+    let refusals = k.output(
+        1,
+        &py(r#"
+            async def job():
+                pass
+            coro = job()
+            future = asyncio.get_running_loop().create_future()
+            for refused in (
+                lambda: runtime.wait([coro]),
+                lambda: runtime.wait(coro),
+                lambda: runtime.wait(future),
+                lambda: runtime.wait([]),
+                lambda: runtime.wait(iter(())),
+                lambda: runtime.wait([future], return_when='SOMETIMES'),
+            ):
+                try:
+                    await refused()
+                except (TypeError, ValueError) as e:
+                    print(type(e).__name__, e)
+            coro.close()
+            "#),
+    );
+    assert_eq!(
+        refusals,
+        "TypeError Passing coroutines is forbidden, use tasks explicitly.\n\
+         TypeError expect a list of futures, not coroutine\n\
+         TypeError expect a list of futures, not Future\n\
+         ValueError Set of Tasks/Futures is empty.\n\
+         ValueError Set of Tasks/Futures is empty.\n\
+         ValueError Invalid return_when value: SOMETIMES\n"
+    );
+}
+
+/// A wait registers with each future once, however they finish: `N` futures
+/// finishing one loop turn apart cost it `N` callbacks, as they cost
+/// `asyncio.wait`, rather than a pass over every future still pending each
+/// time one finishes.
+#[test]
+fn a_wait_registers_with_each_future_once() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        class Counted(asyncio.Future):
+            registered = 0
+            def add_done_callback(self, fn, *, context=None):
+                Counted.registered += 1
+                super().add_done_callback(fn, context=context)
+        loop = asyncio.get_running_loop()
+        futures = [Counted(loop=loop) for _ in range(100)]
+        async def finish_one_per_turn():
+            for f in futures:
+                f.set_result(None)
+                await asyncio.sleep(0)
+        finishing = asyncio.create_task(finish_one_per_turn())
+        done, pending = await runtime.wait(futures)
+        len(done), len(pending), Counted.registered
+        "#);
+    assert_eq!(k.output(1, &source), "(100, 0, 100)\n");
+}

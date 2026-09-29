@@ -18,6 +18,10 @@ suspended on an await that never resolves -- one that caught the cancel from the
 say -- refuses every later submission for the rest of the session, and the model can only report
 it.
 
+Since `0003-09`, a holder suspended in `runtime.wait` is freed by the next line the user types,
+which raises `MessageAvailable` in it -- unless its code catches that too. A holder suspended on
+a bare `await` is not, and that is the case left here.
+
 ## Shape
 
 - A user-facing stop for the held slot. Ctrl-C at the prompt while an execution holds the slot
