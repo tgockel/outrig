@@ -888,3 +888,115 @@ async fn mcp_attach_exits_when_host_stops_container() {
         "stderr should explain host container stop: {stderr}"
     );
 }
+
+/// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
+/// assert it fails with the undeclared-server error. Returns the session
+/// records left under `session_root`.
+async fn run_mcp_with_undeclared_env_server(
+    session_root: &Path,
+    repo: &Path,
+    args: &[&str],
+) -> Vec<Session> {
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .arg("--session-root")
+            .arg(session_root)
+            .arg("mcp")
+            .args(args)
+            .args(["--env", "no_such_server:DEBUG=1"])
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+    .expect("run outrig mcp");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "outrig mcp should fail; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("image 'smoke' has no MCP server 'no_such_server'"),
+        "stderr should name the undeclared server: {stderr}"
+    );
+    SessionStore::new(session_root.to_path_buf())
+        .list()
+        .expect("list sessions")
+        .sessions
+}
+
+/// An undeclared `--env SERVER:` name is refused after the session record
+/// exists and its container runs; the refusal still finalizes the record and
+/// stops the container (#182).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_env_for_undeclared_server_finalizes_session_and_stops_container() {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let listed = run_mcp_with_undeclared_env_server(sessions.path(), repo_dir.path(), &[]).await;
+    assert_eq!(listed.len(), 1, "expected one session record: {listed:?}");
+    let session = &listed[0];
+    assert_eq!(session.exit_code, Some(1), "{session:?}");
+    assert!(session.ended_at.is_some(), "{session:?}");
+
+    let ps = Command::new("podman")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("name={}", session.container_name))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        leftovers.trim().is_empty(),
+        "container `{}` is still alive: {leftovers}",
+        session.container_name
+    );
+}
+
+/// The same refusal under `--attach` finalizes only the attacher's own record
+/// and leaves the borrowed container running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_attach_env_for_undeclared_server_leaves_borrowed_container_running() {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+
+    let image = ensure_fixture_image().await;
+    let container = start_fixture_container(&image, repo_dir.path()).await;
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let host_sid = create_host_session(sessions.path(), repo_dir.path(), &container, &image);
+
+    let listed = run_mcp_with_undeclared_env_server(
+        sessions.path(),
+        repo_dir.path(),
+        &["--attach", host_sid.as_str()],
+    )
+    .await;
+    let attacher = listed
+        .iter()
+        .find(|session| session.id != host_sid)
+        .expect("attacher writes its own session record");
+    assert_eq!(attacher.exit_code, Some(1), "{attacher:?}");
+    assert!(attacher.ended_at.is_some(), "{attacher:?}");
+    let host = listed
+        .iter()
+        .find(|session| session.id == host_sid)
+        .expect("host session record");
+    assert_eq!(
+        host.ended_at, None,
+        "attacher must not end the host session"
+    );
+
+    assert!(
+        Container::is_running(container.name())
+            .await
+            .expect("podman inspect"),
+        "failed attacher must not stop the borrowed container"
+    );
+    container.stop(Duration::from_secs(2)).await.expect("stop");
+}

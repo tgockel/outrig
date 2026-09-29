@@ -87,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in that shape, so every later round on the subagent failed, including one started by
   `outrig__subagent_send`, until the subagent was released. The fourth call now gets its result,
   with a note that the round ended there, before the round stops.
+- **A run refused for an unknown `--env` server no longer lists as running.** `outrig run` and
+  `outrig mcp` refused a `--env SERVER:KEY=VALUE` whose `SERVER` the image does not declare only
+  after writing the session record and starting the container, and then exited without
+  finalizing the record: `outrig ls` showed the failed run with no exit code and a duration that
+  kept growing, and its containers were left to a detached removal. The name is now checked as
+  soon as the MCP table is merged, before any sidecar starts, and the refusal ends the session
+  like any other startup failure: exit code 1, containers stopped, and a container borrowed with
+  `--attach` left running. `outrig mcp show-merged`, which ignored such a name, now refuses it.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

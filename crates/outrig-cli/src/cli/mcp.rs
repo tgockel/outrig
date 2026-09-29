@@ -178,19 +178,9 @@ async fn serve(
         session: _,
         repo_root: _,
     } = setup;
+    // Nothing between here and `teardown` may return early: `teardown` is
+    // the only thing that finalizes the session record.
     let mut runtime = SessionRuntime::new(watcher, network, containers);
-
-    // Validate per-server env entries against the full merged plan (a
-    // skipped sidecar's servers are still declared names).
-    for name in cli_env.per_server_names() {
-        if !mcp_plan.servers.contains_key(name) {
-            return Err(OutrigError::Configuration(format!(
-                "--env {name}:...: image '{}' has no MCP server '{name}'",
-                image_cfg_name
-            ))
-            .into());
-        }
-    }
 
     let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(

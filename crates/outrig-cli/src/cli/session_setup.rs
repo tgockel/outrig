@@ -129,7 +129,8 @@ pub struct SessionSetupArgs<'a> {
     /// `outrig mcp show-merged`, which plans placement (including sidecar
     /// label merges) without launching sidecar containers.
     pub start_sidecars: bool,
-    /// CLI `--env` overlay entries. Consulted during setup only for
+    /// CLI `--env` overlay entries. Setup rejects a `SERVER:` prefix the
+    /// merged plan does not declare, and resolves the overlay only for
     /// entrypoint-stdio sidecars, whose env must be resolved at container
     /// create time (`podman start` carries no `--env`); exec-stdio servers
     /// keep resolving at connect time in [`connect_mcp_clients`].
@@ -647,6 +648,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         instance_salt: &instance_salt,
         cfg: &cfg,
         repo_root: &repo_root,
+        image_cfg_name: &image_cfg_name,
         image_cfg: &image_cfg,
         image_tag: &image_tag,
         sid: &sid,
@@ -717,6 +719,7 @@ struct SidecarPhaseArgs<'a> {
     repo_root: &'a Path,
     /// See [`SessionContainers::instance_salt`].
     instance_salt: &'a str,
+    image_cfg_name: &'a str,
     image_cfg: &'a ImageConfig,
     image_tag: &'a ImageTag,
     sid: &'a SessionId,
@@ -792,8 +795,8 @@ pub(crate) async fn launch_declared_sidecar(
 }
 
 /// Build the placement plan (config + primary and sidecar label merges),
-/// start `start = "auto"` sidecars, and attach the network interceptor to
-/// every running container.
+/// check `--env SERVER:` names against it, start `start = "auto"` sidecars,
+/// and attach the network interceptor to every running container.
 ///
 /// Failure routing: image-ensure / start / bootstrap / interceptor-attach
 /// failures on a sidecar follow its `on-failure` (`warn` logs, drops the
@@ -854,6 +857,11 @@ async fn setup_sidecars_and_network(
 
         to_start.push((name, tag, sc));
     }
+
+    // Every label has merged, so the plan is complete. Checked here rather
+    // than after `setup` returns so an undeclared name takes `setup`'s abort
+    // path, which stops the containers and finalizes the session record.
+    check_env_servers(args.cli_env, &plan, args.image_cfg_name)?;
 
     // Phase C -- start the auto sidecars concurrently, inserting in name order.
     start_auto_sidecars(&plan, &args, to_start, containers).await?;
@@ -937,6 +945,25 @@ async fn resolve_sidecar_images(
     .await
     .into_iter()
     .collect()
+}
+
+/// Reject an `--env SERVER:KEY=VALUE` naming a server the full merged plan
+/// does not declare. A server in a sidecar the session does not start still
+/// counts: a manual sidecar's servers get the overlay from `/sidecar add`.
+fn check_env_servers(
+    cli_env: &CliEnvEntries,
+    plan: &SessionMcpPlan,
+    image_cfg_name: &str,
+) -> Result<()> {
+    for name in cli_env.per_server_names() {
+        if !plan.servers.contains_key(name) {
+            return Err(OutrigError::Configuration(format!(
+                "--env {name}:...: image '{image_cfg_name}' has no MCP server '{name}'"
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Start the `start = "auto"` sidecars concurrently, then insert them into
@@ -1701,5 +1728,46 @@ mod tests {
                 .contains("image-config \"\" does not match any [images.<name>]"),
             "unexpected error: {err}"
         );
+    }
+
+    /// [`check_env_servers`] against a plan declaring `fs` on the primary and
+    /// `lint` in a `start = "manual"` sidecar the session does not start.
+    fn check_env(raw: &[&str]) -> Result<()> {
+        let cfg: Config = toml::from_str(
+            r#"
+[sidecars.lint]
+image = "mcp-lint-img"
+start = "manual"
+
+[images.x]
+dockerfile = "D"
+context = "."
+
+[images.x.mcp]
+fs   = ["mcp-fs", "/w"]
+lint = { command = ["mcp-lint"], sidecar = "lint" }
+"#,
+        )
+        .expect("config parses");
+        let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+        let raw: Vec<String> = raw.iter().map(|entry| entry.to_string()).collect();
+        let cli_env = CliEnvEntries::parse(&raw).expect("--env entries parse");
+        check_env_servers(&cli_env, &plan, "x")
+    }
+
+    #[test]
+    fn an_env_server_the_plan_does_not_declare_is_rejected() {
+        let err = check_env(&["fs:A=1", "nope:DEBUG=1"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "configuration: --env nope:...: image 'x' has no MCP server 'nope'"
+        );
+    }
+
+    #[test]
+    fn declared_servers_global_entries_and_no_entries_pass_the_env_check() {
+        check_env(&["fs:A=1", "lint:B=2"]).expect("a manual sidecar's server is declared");
+        check_env(&["GLOBAL=1"]).expect("a global entry names no server");
+        check_env(&[]).expect("an empty overlay names no server");
     }
 }

@@ -147,24 +147,14 @@ pub async fn execute(
         attached: _,
         session: _,
     } = setup;
+    // Nothing between here and `teardown` may return early: `teardown` is
+    // the only thing that finalizes the session record.
     let mut runtime = SessionRuntime::new(watcher, network, containers);
     // Shared from here on: the subagent registry keeps a handle so a launch can
     // re-resolve the agent against another `[models.<name>]`, against the same
     // merged config the session resolved from.
     let cfg = Arc::new(cfg);
     let cache_root = model_cache_root(cfg.model_cache_root.as_deref());
-
-    // Validate per-server env entries against the full merged plan (a
-    // skipped sidecar's servers are still declared names).
-    for name in cli_env.per_server_names() {
-        if !mcp_plan.servers.contains_key(name) {
-            return Err(OutrigError::Configuration(format!(
-                "--env {name}:...: image '{}' has no MCP server '{name}'",
-                image_cfg_name
-            ))
-            .into());
-        }
-    }
 
     let outcome: Result<i32> = run_inner(RunInnerArgs {
         cfg: Arc::clone(&cfg),
