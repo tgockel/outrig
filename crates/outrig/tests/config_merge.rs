@@ -4090,6 +4090,162 @@ image = "docker.io/library/alpine:3"
         );
     }
 
+    /// Run the calling test's `body` in a child copy of this test binary whose
+    /// `HOME` is a fresh tempdir, and hand `body` that directory. A `~` test
+    /// can't take its home from the invoking user: a sandbox builder's `HOME`
+    /// need not exist, what is under a real one is no fixture of ours, and
+    /// before Rust 1.90 `std::env::home_dir` reads an empty `HOME` otherwise
+    /// than the resolver does. Nor can it set `HOME` in this process, where
+    /// `set_var` races the tests running beside it.
+    fn with_temp_home(body: impl FnOnce(&Path)) {
+        const CHILD_HOME: &str = "OUTRIG_TEST_CHILD_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            return body(Path::new(&home));
+        }
+        // libtest runs every test on a thread named for it.
+        let test = std::thread::current()
+            .name()
+            .expect("libtest names each test's thread")
+            .to_owned();
+        let home = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact"])
+            .env("HOME", home.path())
+            .env(CHILD_HOME, home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Ran, not just exited 0: a filter that matched nothing would too.
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {test} ... ok")),
+            "{test} failed in a child with HOME={}:\n{stdout}{}",
+            home.path().display(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A leading `~` is the invoking user's home directory, for every path the
+    /// one rule serves and whether or not the entry came from a file. The
+    /// sidecar mount is the config reference's own example, which resolved to
+    /// `<repo>/~/.cache/example` and so could never load (#187). `model-path`
+    /// takes the repo root as its base, but only for a relative path.
+    #[test]
+    fn a_leading_tilde_resolves_under_the_home_directory() {
+        with_temp_home(|home| {
+            let root = Path::new("/srv/repo");
+
+            let cfg = parse(
+                r#"
+[sidecars.tools]
+image = "docker.io/library/alpine:3"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "~/.cache/example"
+  container-path = "/cache"
+
+[providers.local]
+style = "mistralrs"
+
+[models.home]
+provider   = "local"
+model-path = "~/models/local.gguf"
+"#,
+            );
+            assert_eq!(
+                cfg.sidecars["tools"].mounts[0].resolved_host_path(root),
+                home.join(".cache/example"),
+            );
+            assert_eq!(
+                cfg.models["home"].resolved_model_path(root),
+                Some(home.join("models/local.gguf")),
+            );
+
+            let mount = MountConfig::new("~/data", "/data", MountAccess::ReadOnly);
+            assert_eq!(mount.resolved_host_path(root), home.join("data"));
+
+            let mut workspace = Workspace::default();
+            workspace.set_host_path("~");
+            assert_eq!(workspace.resolved_host_path(root), home);
+
+            let image = ImageConfig::from_dockerfile("~/img/Dockerfile", "~/img");
+            assert_eq!(
+                image.resolved_build_paths(root),
+                (home.join("img/Dockerfile"), home.join("img")),
+            );
+        });
+    }
+
+    /// `~` ignores the declaring file's directory the way an absolute path
+    /// does, so one value means one directory from either file, and the
+    /// existence check looks there.
+    #[test]
+    fn a_tilde_mount_means_home_from_either_file() {
+        with_temp_home(|home| {
+            fs::create_dir(home.join("shared")).unwrap();
+            let (repo, _global, global_cfg) = repo_and_global(
+                r#"
+[[workspace.mounts]]
+host-path      = "~/shared"
+container-path = "/global-shared"
+"#,
+            );
+            write_repo_cfg(
+                repo.path(),
+                r#"
+[[workspace.mounts]]
+host-path      = "~/shared"
+container-path = "/repo-shared"
+"#,
+            );
+
+            let cfg = Config::load(repo.path(), Some(&global_cfg))
+                .expect("a `~` mount is checked under the home directory");
+            let mounts = &cfg.workspace.mounts;
+            assert_eq!(mounts.len(), 2, "global mounts precede repo mounts");
+            for mount in mounts {
+                assert_eq!(mount.resolved_host_path(repo.path()), home.join("shared"));
+            }
+        });
+    }
+
+    /// The negative twin: a directory really named `~` beside the config no
+    /// longer satisfies a `~/...` mount, which is the reading #187's example
+    /// fell into, and the home here is empty. The message still names the path
+    /// as declared, now that the declared path means what it says.
+    #[test]
+    fn a_literal_tilde_directory_does_not_satisfy_a_tilde_mount() {
+        with_temp_home(|_| {
+            let repo = tempdir().unwrap();
+            fs::create_dir_all(repo.path().join("~/cache")).unwrap();
+            write_repo_cfg(
+                repo.path(),
+                r#"
+[[workspace.mounts]]
+host-path      = "~/cache"
+container-path = "/cache"
+"#,
+            );
+
+            let err = expect_load_validation_err(Config::load(repo.path(), None).unwrap_err());
+            match err {
+                ConfigValidationError::WorkspaceMountHostMissing {
+                    path, declared_in, ..
+                } => {
+                    assert_eq!(
+                        path,
+                        std::path::PathBuf::from("~/cache"),
+                        "the reported path stays the raw config value",
+                    );
+                    assert_eq!(
+                        declared_in,
+                        Some(repo.path().join(".agents/outrig/config.toml")),
+                    );
+                }
+                other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
+            }
+        });
+    }
+
     /// Repo-declared entries keep resolving exactly as before, and a hand-built
     /// entry that never saw `Config::load` records no source and falls back to
     /// the passed root. That fallback is what keeps every existing library

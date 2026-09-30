@@ -1103,6 +1103,14 @@ Absolute paths are used as-is and ignore the rule entirely. This applies to
 both `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`. Because `[workspace]` merges per key,
 a `host-path` inherited from the global file resolves beside that file, not from the repo root.
 
+A path whose first component is `~` starts from your home directory instead: `~` alone is the
+home directory, and `~/.cache/example` a directory inside it. Like an absolute path, it means the
+same place whichever file declares it. The `~` has to be the whole first component, so
+`~alice/src` is an ordinary relative path, and `./~/src` reaches a directory really named `~`.
+Nothing else is expanded: the `${VAR}` form that `api-key`, `build-args`, and MCP `env` accept is
+literal in a path. Your home directory is `$HOME`, or your passwd entry's when `HOME` is unset or
+empty; without either, `~` is an ordinary directory name too.
+
 Provenance is recorded, not written back. A merged config is a flattened snapshot: re-serializing
 one emits each inherited path as the literal text its source file used, without the base
 directory that text was resolved against. Writing that snapshot out and loading it as a repo
@@ -1115,7 +1123,7 @@ and context live beside `~/.outrig/config.toml` and are found from any repo on t
 exception is repo-relative rather than file-relative: `[models.<name>].model-path` resolves
 against the repo root no matter which file declared it, and does so for the existence check and
 for the load alike. A *global* `[models.<name>]` with a relative `model-path` therefore follows
-whichever repo is current, so give that one an absolute path. See
+whichever repo is current, so give that one an absolute or `~` path. See
 [Validation rules](#validation-rules).
 
 Because provenance is recorded per entry, a diagnostic about a config-declared path names the
@@ -1274,7 +1282,8 @@ image-config in the merged config but does not require agent/model/provider wiri
   single string (one GGUF file) or an array of strings (a multi-shard
   quantization, e.g. `*-00001-of-00003.gguf`). `revision` is optional and
   only meaningful with `model-id`. A `model-path`, if set, must exist on
-  disk relative to the repo root (or be absolute); the repo root is also
+  disk relative to the repo root (or be absolute, or start with `~` for
+  your home directory); the repo root is also
   the base it is opened against when the model loads, whatever directory
   `outrig` was invoked from. `identifier` is not
   allowed on mistralrs models. `device`, if set, must be one of `cpu`, `cuda`,
@@ -1307,8 +1316,9 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An entrypoint host hosts exactly one MCP server and must be `start = "auto"`.
 - `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
   placement keys: labels declare exec-stdio servers, whose arguments belong in `command`.
-- `dockerfile` and `context` must exist on disk, resolved against the declaring file's directory
-  (build path only). The error names both the path as written and the file that declared it.
+- `dockerfile` and `context` must exist on disk, resolved against the declaring file's directory,
+  or your home directory for a leading `~` (build path only). The error names both the path as
+  written and the file that declared it.
 - Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
@@ -1347,7 +1357,8 @@ image-config in the merged config but does not require agent/model/provider wiri
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
 - `workspace.host-path` and every `workspace.mounts[*].host-path`, if validated with a repo root,
   must exist and be a directory. Relative host paths resolve against the declaring file's
-  directory; an undeclared `workspace.host-path` is `.`, the repo root.
+  directory, and a leading `~` is your home directory; an undeclared `workspace.host-path` is
+  `.`, the repo root.
 - Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`.

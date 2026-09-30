@@ -168,6 +168,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A `host-path` that names a file rather than a directory is refused the same way. The default
   `.` is checked too, as the repo root, so `--config <root>/.agents/outrig/config.toml` with a
   `<root>` that doesn't exist now stops at load rather than at `podman run`.
+- **A `~` at the start of a config path is your home directory.** The sidecar example in the
+  config reference and the containers page mounts `host-path = "~/.cache/example"`, and a config
+  holding it could never load: `~` was taken as a directory of that name beside the config, and
+  the error said `"~/.cache/example" does not exist` even when it did. `~` alone, or as the first
+  component of a path, now stands for your home directory in `dockerfile`, `context`,
+  `model-path`, and every `host-path`, from either config file, and in `--volume` and a
+  standalone `image.toml`'s `[build]` paths. `~user/...` is not expanded, and neither is
+  `${VAR}`.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

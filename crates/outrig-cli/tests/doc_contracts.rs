@@ -54,6 +54,46 @@ fn the_mcp_pages_minimal_config_parses() {
     });
 }
 
+/// The sidecar examples on the config reference and the containers page mount
+/// `~/.cache/example`, and `outrig mcp self` hands both pages to agents as well
+/// as readers. Until `~` meant the home directory, that resolved to
+/// `<repo>/~/.cache/example`, so a config holding either example could never
+/// load (#187). A host path that resolves to a `~`-named directory under the
+/// repo is that contradiction again, whatever the examples go on to name. Only
+/// under the repo: the home directory's own name may start with `~`.
+#[test]
+fn the_sidecar_mount_examples_resolve_as_written() {
+    let repo = Path::new("/srv/repo");
+    for (page, heading) in [
+        ("doc/reference/config.md", "\n## `[sidecars.<sc>]`\n"),
+        ("doc/concepts/containers.md", "\n## Sidecar containers\n"),
+    ] {
+        let path = workspace_root().join(page);
+        let markdown =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let example = fenced_block_after(&markdown, heading, "toml");
+        let cfg = Config::load_from_str(&example)
+            .and_then(|cfg| cfg.validate(None).map(|()| cfg))
+            .unwrap_or_else(|e| panic!("the sidecar example in {page} does not load: {e}"));
+
+        let mounts: Vec<_> = cfg.sidecars.values().flat_map(|sc| &sc.mounts).collect();
+        assert!(
+            !mounts.is_empty(),
+            "the sidecar example in {page} mounts nothing"
+        );
+        for mount in mounts {
+            let resolved = mount.resolved_host_path(repo);
+            assert!(
+                !resolved
+                    .strip_prefix(repo)
+                    .is_ok_and(|rest| rest.to_string_lossy().starts_with('~')),
+                "{page}: host-path {:?} resolves to {resolved:?}",
+                mount.host_path(),
+            );
+        }
+    }
+}
+
 /// The Dockerfile the image page shows is the one `outrig image add` writes
 /// for the page's own walkthrough: the default base, `rust, node`, and the
 /// default `fs`. The page is a copy, and `outrig mcp self` and `outrig design

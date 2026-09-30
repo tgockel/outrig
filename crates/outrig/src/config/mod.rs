@@ -11,6 +11,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use nix::unistd::{Uid, User};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -200,13 +201,43 @@ fn source_base_dir<'a>(source: Option<&'a ConfigSource>, repo_root: &'a Path) ->
     source.map_or(repo_root, ConfigSource::base_dir)
 }
 
-/// Resolve `path` against `base`, leaving absolute paths alone. The one rule,
-/// shared by every config-declared host path.
+/// Resolve `path` against `base`: a leading `~` is the invoking user's home
+/// directory, an absolute path is used as-is, and anything else joins `base`.
+/// The one rule, shared by every config-declared host path.
 pub(crate) fn resolve_against(base: &Path, path: &Path) -> PathBuf {
+    let path = expand_tilde(path, home_dir().as_deref());
     if path.is_absolute() {
-        path.to_path_buf()
+        path
     } else {
         base.join(path)
+    }
+}
+
+/// The invoking user's home directory: `HOME`, or the passwd entry's when
+/// `HOME` is unset or empty. Not `std::env::home_dir`, which takes an empty
+/// `HOME` as the answer before Rust 1.90, and the MSRV is 1.88.
+fn home_dir() -> Option<PathBuf> {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => Some(home.into()),
+        _ => User::from_uid(Uid::current())
+            .ok()
+            .flatten()
+            .map(|user| user.dir),
+    }
+}
+
+/// `path` with a leading `~` component replaced by `home`, and anything else
+/// as written. Only a whole `~` component counts, so `~user/...` stays a
+/// relative path and `./~` names a directory that is really called `~`. With
+/// no `home`, or one that is not absolute, `~` is an ordinary directory name,
+/// and [`resolve_against`] joins it onto the base like any other.
+fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
+    let home = home.filter(|home| home.is_absolute());
+    match (path.strip_prefix("~"), home) {
+        // `home.join("")` would add a trailing separator to a bare `~`.
+        (Ok(rest), Some(home)) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -958,14 +989,15 @@ impl Model {
     }
 
     /// [`model_path`](field@Self::model_path) made absolute against
-    /// `repo_root`, or `None` for a row that sets no path.
+    /// `repo_root`, or under the home directory when its first component is
+    /// `~`, or `None` for a row that sets no path.
     ///
     /// The base is the repo root rather than the directory of the file that
     /// declared the row, which makes `models.<n>` the one exception to the rule
     /// [`ConfigSource`] states for every other config-declared path. The
     /// consequence to know: a global `[models.<n>]` with a relative
     /// `model-path` resolves it under whichever repo is current, so name an
-    /// absolute path there.
+    /// absolute or `~/` path there.
     ///
     /// Both [`Config::validate`] and the CLI's model resolution go through
     /// here, which is the point: one place chooses the base.
@@ -1214,9 +1246,9 @@ impl Workspace {
     }
 
     /// [`host_path`](Self::host_path) made absolute against the directory of
-    /// the config file that declared it. A hand-built or default workspace
-    /// falls back to `repo_root`, preserving the library API's existing
-    /// behavior.
+    /// the config file that declared it, or under the home directory when its
+    /// first component is `~`. A hand-built or default workspace falls back to
+    /// `repo_root`, preserving the library API's existing behavior.
     pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
         resolve_against(
             source_base_dir(self.source.as_ref(), repo_root),
@@ -1321,8 +1353,10 @@ impl MountConfig {
     }
 
     /// `host_path` made absolute, against the directory of the file that
-    /// declared it. `repo_root` is the fallback for an entry with no recorded
-    /// source, which is every hand-built [`MountConfig`].
+    /// declared it, or under the home directory when its first component is
+    /// `~`.
+    /// `repo_root` is the fallback for an entry with no recorded source, which
+    /// is every hand-built [`MountConfig`].
     ///
     /// Global and repo mount lists are *concatenated* by [`merge`], so one base
     /// directory provably cannot be right for every element of the result --
@@ -2149,7 +2183,8 @@ impl ImageConfig {
     }
 
     /// `dockerfile` and `context` made absolute against
-    /// [`base_dir`](Self::base_dir). Like [`source`](Self::source), this is
+    /// [`base_dir`](Self::base_dir), or under the home directory for a path
+    /// whose first component is `~`. Like [`source`](Self::source), this is
     /// only callable once validation has established the build shape.
     pub fn resolved_build_paths(&self, repo_root: &Path) -> (PathBuf, PathBuf) {
         let base = self.base_dir(repo_root);
@@ -2453,4 +2488,47 @@ where
             StringOrVec::Multi(ss) => ss,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expand(path: &str) -> PathBuf {
+        expand_tilde(Path::new(path), Some(Path::new("/home/you")))
+    }
+
+    /// Compared as strings: `PathBuf` equality ignores a trailing separator,
+    /// which `home.join("")` would leave behind.
+    #[test]
+    fn a_bare_tilde_is_the_home_directory_itself() {
+        assert_eq!(expand("~").as_os_str(), "/home/you");
+        assert_eq!(expand("~/").as_os_str(), "/home/you");
+    }
+
+    #[test]
+    fn a_leading_tilde_component_is_replaced_by_home() {
+        assert_eq!(
+            expand("~/.cache/example"),
+            Path::new("/home/you/.cache/example")
+        );
+    }
+
+    #[test]
+    fn only_a_whole_leading_tilde_component_expands() {
+        for path in ["~alice/src", "./~/src", "src/~", "/abs/~", "relative"] {
+            assert_eq!(expand(path), Path::new(path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn without_an_absolute_home_a_tilde_is_an_ordinary_name() {
+        for home in [None, Some(Path::new("")), Some(Path::new("relative/home"))] {
+            assert_eq!(
+                expand_tilde(Path::new("~/src"), home),
+                Path::new("~/src"),
+                "{home:?}",
+            );
+        }
+    }
 }

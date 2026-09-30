@@ -210,12 +210,13 @@ model-path = "/var/cache/outrig/models/llama-3-8b-instruct.q4.gguf"
 ```
 
 Use this when you want to pre-stage the model yourself -- in CI, in air-gapped environments,
-or when you want to manage the cache directory by hand. `model-path` may be absolute or
-relative to the repo root -- and the repo root is the base for both halves: the one the
-existence check runs against and the one the weights are opened against, whatever directory
-`outrig` was invoked from. A relative path in a *global* config follows whichever repo is
-current rather than sitting beside that file, which is the one place `models` departs from
-[the usual rule](../reference/config.md#path-resolution); name an absolute path there.
+or when you want to manage the cache directory by hand. `model-path` may be absolute, start
+with `~` for your home directory, or be relative to the repo root -- and the repo root is the
+base for both halves: the one the existence check runs against and the one the weights are
+opened against, whatever directory `outrig` was invoked from. A relative path in a *global*
+config follows whichever repo is current rather than sitting beside that file, which is the one
+place `models` departs from [the usual rule](../reference/config.md#path-resolution); name an
+absolute or `~` path there.
 
 ### One or the other, not both
 

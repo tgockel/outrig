@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and is answered in it. `SUPPORTED_PROTOCOL_VERSIONS` governs those requests too: one naming a
   revision outside the list is refused rather than answered in a fallback.
 
+- **A config path that starts with `~` resolves under the home directory.** A `~` first component
+  in `dockerfile`, `context`, `model-path`, or any workspace, mount, or sidecar-mount `host-path`
+  now stands for the invoking user's home directory -- `HOME`, or the passwd entry's when `HOME`
+  is unset or empty, whichever Rust built the crate -- in `resolved_host_path`,
+  `resolved_build_paths`, and `resolved_model_path`. It named a directory called `~` under the
+  path's base, so the sidecar mount in the config reference's own example, `~/.cache/example`,
+  could never load. Every host path takes the one rule, so hand-built entries,
+  `LaunchSpec::from_config`, the paths `Outrig::launch` builds from, and `image::build_standalone`
+  expand it too. Only a whole `~` component counts: `~user/...` stays relative, and with no
+  absolute home directory `~` keeps its old meaning.
+
 ### Fixed
 
 - **`Config::validate` checks the primary `[workspace].host-path` on disk.** Given a repo root,

@@ -408,9 +408,9 @@ start      = "auto"             # "auto" (default)  | "manual"
 on-failure = "abort"            # "abort" (default) | "warn"
 
 [[sidecars.tools.mounts]]
-host-path      = "~/.cache/example"
+host-path      = "~/.cache/example"  # ~ is your home directory
 container-path = "/cache"
-access         = "read-write"   # "read-only" (default) | "read-write"
+access         = "read-write"        # "read-only" (default) | "read-write"
 ```
 
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first

@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec};
+use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec, resolve_against};
 use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_to_labels};
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
@@ -593,9 +593,10 @@ pub async fn ensure_tagged_image_for(
 
 /// Build a standalone image project with buildah, tagging the result `tag` and
 /// stamping `labels` (the project's config, serialized to OCI labels) into the
-/// image metadata. `dockerfile` and `context` are resolved relative to
-/// `project_dir`. Stderr from buildah is streamed to `tracing::info!` with the
-/// `[buildah]` prefix.
+/// image metadata. `dockerfile` and `context` resolve against `project_dir` by
+/// the rule every config path follows, so a leading `~` is the home directory.
+/// Stderr from buildah is streamed to `tracing::info!` with the `[buildah]`
+/// prefix.
 ///
 /// Unlike [`ensure_image`], there is no content-addressed cache probe: a
 /// standalone build tags a stable caller-named ref (e.g. `rust-dev`), not a
@@ -615,8 +616,8 @@ pub async fn build_standalone(
     no_cache: bool,
     labels: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let dockerfile = project_dir.join(dockerfile);
-    let context = project_dir.join(context);
+    let dockerfile = resolve_against(project_dir, dockerfile);
+    let context = resolve_against(project_dir, context);
     // The cleanup `into_temp_tag` runs below is an *untag* on the success
     // path: `tag_image` has by then given the image a second name, so
     // removing the temporary one leaves the image under the caller's. On the
@@ -1077,7 +1078,7 @@ fn build_image_cmd(
 
 /// Assemble a `buildah build --tag <tag> --file <dockerfile> [--no-cache]
 /// [--build-arg ...] [--label ...] <context>` command. `dockerfile` and
-/// `context` are absolute (already joined with their base dir). Used directly
+/// `context` are already resolved, through [`resolve_against`]. Used directly
 /// by standalone image builds; repo-local builds first build a temporary image,
 /// then stamp merged OutRig labels in a final metadata-only commit.
 ///

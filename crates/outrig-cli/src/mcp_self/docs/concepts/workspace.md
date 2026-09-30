@@ -130,10 +130,12 @@ access         = "read-write"
 becomes the container workdir.
 
 Extra `workspace.mounts` entries are for supporting directories: sibling repos, generated docs,
-SDK checkouts, model artifacts, or caches. Relative extra host paths resolve against the repo
-root, just like the primary workspace. Their container paths must be absolute, cannot be `/`, and
-must not duplicate the primary workspace or another extra mount. Exact duplicates fail during
-config validation instead of relying on podman mount ordering.
+SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root
+when the repo config declares it, and beside the global config when that file does; a leading `~`
+is your home directory. See [path resolution](../reference/config.md#path-resolution). Their
+container paths must be absolute, cannot be `/`, and must not duplicate the primary workspace or
+another extra mount. Exact duplicates fail during config validation instead of relying on podman
+mount ordering.
 
 Extra mounts default to `access = "read-only"`. Use `access = "read-write"` only when the agent
 really should mutate that host directory, such as a scratch cache under `/var/tmp`.
