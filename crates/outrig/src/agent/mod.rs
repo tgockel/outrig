@@ -5,6 +5,11 @@
 //! not through the prompt. A round opens by telling the model how many
 //! messages wait there, and its code reads them.
 //!
+//! The conversation is kept whole in a store ([`History`]) the rounds commit
+//! to, and mirrored into the interpreter for the agent's code to read. Each
+//! model call is sent a view of it: the first rounds, the most recent, and
+//! what the agent promoted.
+//!
 //! A copy of `outrig-cli`'s loop rather than a move of it, so the 0.2.x line
 //! keeps editing its own without conflict; `plan/phase/0003-python/` records
 //! why. rig stays a private dependency: nothing rig-typed crosses
@@ -13,6 +18,7 @@
 
 mod build;
 mod channel;
+mod history;
 mod orientation;
 mod resolve;
 mod round;
@@ -23,7 +29,7 @@ use std::path::Path;
 use std::sync::PoisonError;
 use std::time::Duration;
 
-use rig::completion::{Message, PromptError};
+use rig::completion::PromptError;
 use rig::tool::ToolDyn;
 
 use crate::Outrig;
@@ -35,6 +41,7 @@ pub use self::channel::UserChannel;
 
 use self::build::RigAgent;
 use self::channel::Announcer;
+use self::history::{History, Window};
 use self::resolve::{LlmResolveError, ResolvedAgent};
 use self::round::RoundEnd;
 use self::tool::{Interrupts, ObserverSlot, SubmitPython};
@@ -51,7 +58,8 @@ use self::tool::{Interrupts, ObserverSlot, SubmitPython};
 /// agent loop is being built out.
 pub struct PythonAgent {
     agent: RigAgent,
-    history: Vec<Message>,
+    /// The whole conversation, which rounds commit to as they go.
+    history: History,
     tool_call_max: usize,
     /// The output-token ceiling the model is held to: the configured one,
     /// filled in or lowered to what the model publishes.
@@ -189,24 +197,32 @@ impl PythonAgent {
     /// tool-call cap keeps what it managed, and its reply ends `(round ended:
     /// <reason>)`.
     ///
-    /// An error leaves the conversation as it was if the round had run no
-    /// Python. If it had, the completed tool calls and their results are kept,
-    /// because what they did stands -- nothing is rolled back. Either way the
-    /// messages the round did not read are still waiting, and the next round
-    /// announces them again.
+    /// The model is sent the conversation's first two rounds, the six before
+    /// this one, this one whole, and any turn the agent's code promoted. The
+    /// rest stays in the interpreter, where the agent's code reads all of it,
+    /// and the opening line says how many turns were left out.
     ///
-    /// A round whose future is dropped before it returns keeps its completed
-    /// tool calls and their results the same way. Python it was waiting on
-    /// keeps running, so stopping that is [`PythonAgent::interrupter`]'s.
+    /// The conversation belongs to the agent rather than to the round, which
+    /// commits each turn as it completes. An error leaves the conversation as
+    /// it was if the round had run no Python. If it had, the completed tool
+    /// calls and their results are kept, because what they did stands --
+    /// nothing is rolled back. Either way the messages the round did not read
+    /// are still waiting, and the next round announces them again.
+    ///
+    /// A round whose future is dropped before it returns keeps everything
+    /// before it and its completed tool calls the same way. Python it was
+    /// waiting on keeps running, so stopping that is
+    /// [`PythonAgent::interrupter`]'s.
     pub async fn round(&mut self) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
         let Some(announcement) = self.announcer.opening().await? else {
             return Ok(None);
         };
+        let opening = orientation::opening(&announcement, self.history.omitted());
         let RoundEnd { reply, stopped } = self
             .agent
             .round(
-                &format!("[outrig] {announcement}."),
-                &mut self.history,
+                &opening,
+                &self.history,
                 self.tool_call_max,
                 &self.interrupts,
             )
@@ -243,6 +259,8 @@ impl PythonAgent {
         let python_version = interpreter.version().to_string();
         let announcer = Announcer::new(interpreter.clone());
         let user = UserChannel::new(interpreter.clone());
+        let window = Window::DEFAULT;
+        let history = History::new(interpreter.clone(), window);
         let tool = SubmitPython::new(
             interpreter,
             resolved.tool_result_max_bytes,
@@ -250,7 +268,7 @@ impl PythonAgent {
         );
         let on_submit = tool.observer_slot();
         let interrupts = tool.interrupts();
-        let preamble = orientation::preamble(workspace, resolved.preamble.as_deref());
+        let preamble = orientation::preamble(workspace, resolved.preamble.as_deref(), window);
         let built = build::build_agent(
             resolved,
             &preamble,
@@ -258,7 +276,7 @@ impl PythonAgent {
         )?;
         Ok(Self {
             agent: built.agent,
-            history: Vec::new(),
+            history,
             tool_call_max: resolved.tool_call_max,
             max_tokens: built.max_tokens,
             model: resolved.candidate.model_name.clone(),

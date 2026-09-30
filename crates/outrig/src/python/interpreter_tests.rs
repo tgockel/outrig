@@ -2835,6 +2835,172 @@ fn a_wait_registers_with_each_future_once() {
     assert_eq!(k.output(1, &source), "(100, 0, 100)\n");
 }
 
+// ---------------------------------------------------------------------------- history
+
+impl Interpreter {
+    /// Push turn `id`, with one call per `(source, result)`, as the host
+    /// commits one. Nothing answers.
+    fn push_turn(&mut self, id: u64, round: u64, calls: &[(&str, &str)]) {
+        let calls: Vec<Value> = calls
+            .iter()
+            .map(|(source, result)| json!({"source": source, "result": result}))
+            .collect();
+        self.send(json!({
+            "t": "turn", "agent": PRIMARY, "id": id,
+            "round": round, "prompt": (id == 0).then_some("go"), "text": format!("turn {id}"),
+            "calls": calls,
+        }));
+    }
+}
+
+/// What the host pushes is held as ordinary Python data: frozen, readable with
+/// any expression, and printed small.
+#[test]
+fn turns_the_host_pushes_read_as_python_data() {
+    let mut k = Interpreter::start();
+    k.push_turn(0, 1, &[("x = 1", "(no output)"), ("print(x)", "1\n")]);
+    k.push_turn(1, 1, &[]);
+    let scan = py(r#"
+        [(t.id, t.round, t.prompt, t.text, [(c.source, c.result) for c in t.calls])
+         for t in runtime.history.turns]
+        "#);
+    assert_eq!(
+        k.output(1, &scan),
+        "[(0, 1, 'go', 'turn 0', [('x = 1', '(no output)'), ('print(x)', '1\\n')]), \
+         (1, 1, None, 'turn 1', [])]\n"
+    );
+    assert_eq!(
+        k.output(2, "runtime.history, runtime.history.turns[0]"),
+        "(<history: 2 turns over 1 rounds>, <turn 0, round 1: 2 calls, 6 characters of text>)\n"
+    );
+    let result = k.exec(3, "runtime.history.turns[0].text = 'rewritten'");
+    assert!(
+        text(&result["error"]).contains("FrozenInstanceError"),
+        "{result}"
+    );
+}
+
+/// A turn is held once, and only after the last one held: a repeat or one
+/// arriving out of order is dropped, and a turn whose line never arrived
+/// leaves a gap rather than stopping the ones after it.
+#[test]
+fn a_turn_is_held_once_and_a_lost_one_leaves_a_gap() {
+    let mut k = Interpreter::start();
+    for id in [0, 0, 2, 1, 3] {
+        k.push_turn(id, 1, &[]);
+    }
+    k.send(json!({"t": "turn", "agent": PRIMARY, "id": 4, "round": 1, "calls": "no"}));
+    k.await_stderr("turn 4 for 'primary' is not a turn");
+    assert_eq!(
+        k.output(1, "[t.id for t in runtime.history.turns]"),
+        "[0, 2, 3]\n"
+    );
+}
+
+/// `turns` is a snapshot: a turn committed while a scan runs is not added to
+/// what the scan is reading.
+#[test]
+fn a_scan_sees_the_turns_there_when_it_began() {
+    let mut k = Interpreter::start();
+    k.push_turn(0, 1, &[]);
+    k.output(1, "seen = runtime.history.turns");
+    k.push_turn(1, 1, &[]);
+    assert_eq!(
+        k.output(2, "len(seen), len(runtime.history.turns)"),
+        "(1, 2)\n"
+    );
+}
+
+/// Memory running out after a turn is held is `_handle`'s to retry, which
+/// runs the whole route again; the turn is still held once.
+#[test]
+fn memory_running_out_after_a_turn_is_held_does_not_hold_it_twice() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+        import threading
+        history = runtime.history
+        real_add = type(history)._add
+        calls = []
+        def held_then_out_of_memory(turn):
+            calls.append(threading.current_thread().name)
+            real_add(history, turn)
+            if len(calls) == 1:
+                raise MemoryError
+        history._add = held_then_out_of_memory
+        "#),
+    );
+    k.push_turn(0, 1, &[]);
+    assert_eq!(
+        k.output(2, "[t.id for t in runtime.history.turns], calls"),
+        "([0], ['reader', 'reader'])\n",
+        "tried twice, held once"
+    );
+}
+
+/// A promotion goes to the host as the ids of the turns it names, however
+/// they were named, ahead of the result of the code that made it.
+#[test]
+fn a_promotion_reaches_the_host_as_ids_ahead_of_the_result() {
+    let mut k = Interpreter::start();
+    k.push_turn(0, 1, &[]);
+    k.push_turn(1, 1, &[]);
+    k.submit(
+        1,
+        "turns = runtime.history.turns\nruntime.context.promote(turns[1], 0, [turns[1]])",
+    );
+    assert_eq!(
+        k.recv(),
+        json!({"t": "promote", "agent": PRIMARY, "turns": [0, 1]})
+    );
+    let result = k.result_of(1);
+    assert!(
+        result["status"] == "ok" && text(&result["output"]).is_empty(),
+        "{result}"
+    );
+    assert_eq!(
+        k.output(2, "runtime.context.promoted, runtime.context"),
+        "((0, 1), <context: 2 turns promoted>)\n"
+    );
+}
+
+/// A promotion names turns that are there, by a turn or its id, or it is
+/// refused whole and nothing is sent: the next message is the result.
+#[test]
+fn a_promotion_of_anything_but_a_turn_that_is_there_is_refused() {
+    let mut k = Interpreter::start();
+    k.push_turn(0, 1, &[]);
+    for (id, (source, error)) in [
+        (
+            "runtime.context.promote(0, 7)",
+            "ValueError: no finished turn has id 7",
+        ),
+        (
+            "runtime.context.promote(True)",
+            "TypeError: a turn or a turn's id, not bool",
+        ),
+        (
+            "runtime.context.promote('0')",
+            "TypeError: a turn or a turn's id, not str",
+        ),
+        (
+            "runtime.context.promote(0.5)",
+            "TypeError: a turn or a turn's id, not float",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = k.exec(id as u64 + 1, source);
+        assert!(
+            result["status"] == "error" && text(&result["error"]).ends_with(&format!("{error}\n")),
+            "{source}: {result}"
+        );
+    }
+    assert_eq!(k.output(9, "runtime.context.promoted"), "()\n");
+}
+
 // ---------------------------------------------------------------------------- what the agent can ask
 
 /// The echo renders inside the execution that asked, so a `__repr__` that
@@ -2907,6 +3073,22 @@ fn help_describes_a_runtime_object_within_its_bound() {
     assert!(
         python.contains("Compiled code never loads") && python.contains("image_python"),
         "{python}"
+    );
+    let history = k.output(8, "help(runtime.history)");
+    assert!(
+        history.contains("Your whole conversation, a turn at a time")
+            && history.contains("costs no context"),
+        "{history}"
+    );
+    let context = k.output(9, "help(runtime.context)");
+    assert!(
+        context.contains("promote(self, *turns)") && context.contains("in its place"),
+        "{context}"
+    );
+    let runtime = k.output(10, "help(runtime)");
+    assert!(
+        !runtime.contains("[help cut at") && runtime.contains("runtime.context.promote(turn)"),
+        "{runtime}"
     );
 
     // All of asyncio is some 225 KB; the answer is cut at a line, and says

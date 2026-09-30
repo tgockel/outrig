@@ -12,17 +12,26 @@
 //!
 //! What this interpreter can import is here too, because the failure it heads
 //! off -- installing a compiled package, and finding it will not load -- costs
-//! a round to learn by trying. The rest is in docstrings: the orientation names
+//! a round to learn by trying. So is what each model call is sent of the
+//! conversation: an agent that cannot see the middle of it would not know to
+//! look for it. The rest is in docstrings: the orientation names
 //! `help(runtime)` and `runtime.python`, and those say the details.
 
 use std::path::Path;
+
+use super::history::Window;
 
 /// The orientation, then `configured` after a blank line when there is one.
 ///
 /// `workspace` is where the interpreter's working directory is: the primary's
 /// `-w`, which is its workspace mount. Without one there is nothing true to
-/// say about it, so the line is left out.
-pub(crate) fn preamble(workspace: Option<&Path>, configured: Option<&str>) -> String {
+/// say about it, so the line is left out. `window` is what each model call is
+/// sent of the conversation.
+pub(crate) fn preamble(
+    workspace: Option<&Path>,
+    configured: Option<&str>,
+    window: Window,
+) -> String {
     let mut text = String::from(
         "You act on this project by writing Python. Your one tool, `submit_python`, runs code in \
          a persistent interpreter inside the project's container; it is the only way to read a \
@@ -40,6 +49,15 @@ pub(crate) fn preamble(workspace: Option<&Path>, configured: Option<&str>) -> St
          running. A bare `await` is not ended by a message, and when the user interrupts your \
          code, what it awaits is cancelled; `runtime.wait` leaves those tasks running.\n\n",
     );
+    let Window { first, recent } = window;
+    text.push_str(&format!(
+        "Your whole conversation is in `runtime.history.turns`, a `Turn` for each of your model \
+         calls, holding what you wrote and each call's source and result. Reading it from code \
+         costs no context: only what you print is seen. Each call is sent less than all of it: \
+         the first {first} rounds, the {recent} before this one, this one, and any turn you name \
+         with `runtime.context.promote(turn)`. A round begins each time you are told messages \
+         are waiting, and its opening line says how many earlier turns are left out.\n\n"
+    ));
     if let Some(workspace) = workspace {
         text.push_str(&format!(
             "Your working directory is {}, which holds the project's files; its Python modules \
@@ -60,4 +78,19 @@ pub(crate) fn preamble(workspace: Option<&Path>, configured: Option<&str>) -> St
         text.push_str(configured);
     }
     text
+}
+
+/// The line that opens a round: what waits, told by `announcement`, and how
+/// many earlier turns its model calls are not sent, which the orientation
+/// promises to say.
+pub(crate) fn opening(announcement: &str, omitted: usize) -> String {
+    match omitted {
+        0 => format!("[outrig] {announcement}."),
+        1 => {
+            format!("[outrig] {announcement}. 1 earlier turn is not shown; runtime.history has it.")
+        }
+        n => format!(
+            "[outrig] {announcement}. {n} earlier turns are not shown; runtime.history has them."
+        ),
+    }
 }

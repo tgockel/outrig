@@ -53,8 +53,13 @@ higher there. A round's tool calls are Python run in the session interpreter, an
 back, so a conversation that forgot them invites running them again.
 
 The PR review would not let that wait, so the copy took route 2 before landing.
-- `RoundHook` (`agent/round.rs`) keeps what each model call after the first was sent: rig's own
-  `history` and `prompt`, not a reconstruction. A failed call splices it in and says to continue.
+- `RoundHook` (`agent/round.rs`) kept what each model call after the first was sent: rig's own
+  `history` and `prompt`, not a reconstruction. A failed call spliced it in and said to continue.
 - A failure on the first call still leaves the history alone.
+
+`0003-11` then made the hook's copy *the* copy, the condition route 2 was waiting on. The store
+(`agent/history.rs`) owns the conversation, rig is handed nothing from before the round, and the
+hook commits each turn as it completes, so there is no second list to splice and nothing to
+compare. A failed call finds the turns before it already kept.
 
 `agent/agent_tests.rs` pins both cases. The CLI's loop is unchanged and still wants the same fix.

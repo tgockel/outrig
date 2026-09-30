@@ -230,9 +230,13 @@ new protocol message, and the query vocabulary becomes a surface to design and m
 
 - How the model learns the window exists. An agent that cannot see the middle will not know to go
   looking for it, and whatever tells it costs context on every round. A line in the preamble, a
-  marker where the cut is, and a count are all candidates and none is obviously right.
+  marker where the cut is, and a count are all candidates and none is obviously right. `0003-11`
+  took the preamble line and the count, in a round's opening line, and its `## Decisions` say
+  why not the marker.
 - Whether the default window is configurable, and in what unit. Rounds read well and a tool-heavy
-  round is not a predictable size.
+  round is not a predictable size. `0003-11` fixed it at the first two rounds and the six before
+  the current one, with no setting: that belongs to `0003-12`'s budget, which has to pick a unit
+  anyway.
 - What the user gets beyond `/reset` -- a way to see what the model is currently being sent would
   answer a question that is currently unanswerable.
 - Whether a promotion is visible to the model as an event in its own context, or silently changes
@@ -246,8 +250,13 @@ new protocol message, and the query vocabulary becomes a surface to design and m
   provider reasoning metadata, empty content, and gateway rewriting are all candidates to break it
   too. This is an acceptance gate rather than a caveat: exercise a shortened `RequestPatch.history`
   against each supported adapter with representative fixtures, and publish the supported subset
-  plus an intelligible error for what falls outside it.
+  plus an intelligible error for what falls outside it. A promotion makes one such case certain:
+  a turn that is not its round's first opens on an assistant message, so it follows another
+  assistant message. Anthropic's API merges the pair and OpenAI's accepts it; a strict gateway may
+  not.
 - The memory cost of mirroring a long session's history into the interpreter was not measured. It is
   the assumption behind holding the store whole, and the fallback exists because it might be wrong.
 - `RequestPatch.history` was read from rig 0.40's documentation and from `injection.rs`'s use of
-  it, not exercised with a shorter list than rig supplied.
+  it, not exercised with a shorter list than rig supplied. `0003-11` now sends one on every model
+  call, and its tests assert the result on the wire -- through the Anthropic adapter, against a
+  mock. The OpenAI adapter and a live endpoint are still unexercised, which is the gate above.

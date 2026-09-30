@@ -48,6 +48,16 @@
 //! ahead of those acknowledgments, so what the host holds for the user is
 //! bounded by the user keeping up rather than by the agent's pace.
 //!
+//! # The conversation
+//!
+//! [`Interpreter::push_turn`] mirrors each turn of the agent's conversation
+//! into the interpreter as it is committed, where `runtime.history` reads it.
+//! Nothing answers. What comes back unasked is a promotion: the ids of turns
+//! the agent wants sent to the model again, handed to whatever
+//! [`Interpreter::on_promote`] registered. A promotion's line is written before
+//! the result of the execution that made it, so it has been handed over by the
+//! time that execution's outcome is here.
+//!
 //! # What owns what
 //!
 //! The [`Child`] here is the host-side `podman exec` client, not the
@@ -267,9 +277,14 @@ struct Table {
     late: Vec<Late>,
     /// Where the agent's messages to the user go, once someone subscribed.
     outbox: Option<mpsc::UnboundedSender<String>>,
+    /// Where the agent's promotions go, once something registered for them.
+    on_promote: Option<Promoted>,
     /// Why nothing more can be sent, once that is so.
     ended: Option<Arc<str>>,
 }
+
+/// What a promotion is handed to: the ids of the turns it names.
+type Promoted = Arc<dyn Fn(Vec<u64>) + Send + Sync>;
 
 struct Slot {
     id: ExecId,
@@ -326,6 +341,10 @@ enum Reply {
     Sent {
         channel: String,
         body: String,
+    },
+    /// Turns the agent promoted, which nothing asked for either.
+    Promote {
+        turns: Vec<u64>,
     },
     #[serde(other)]
     Other,
@@ -630,6 +649,26 @@ impl Interpreter {
     /// Each is reported once.
     pub(crate) fn take_late(&self) -> Vec<Late> {
         std::mem::take(&mut lock(&self.table).late)
+    }
+
+    /// Mirror turn `id` of the agent's conversation into the interpreter, as
+    /// `fields` plus its id. Nothing answers.
+    pub(crate) fn push_turn(&self, id: u64, mut fields: Value) {
+        let table = lock(&self.table);
+        if table.open().is_ok() {
+            fields["t"] = json!("turn");
+            fields["agent"] = json!(PRIMARY);
+            fields["id"] = json!(id);
+            let _ = self.send(fields);
+        }
+    }
+
+    /// Hand each promotion the agent makes to `promoted`, in the order it made
+    /// them. Called on the reader task, and never under this handle's lock, so
+    /// `promoted` may take locks of its own that are held around a
+    /// [`Interpreter::push_turn`]. Registering again replaces it.
+    pub(crate) fn on_promote(&self, promoted: impl Fn(Vec<u64>) + Send + Sync + 'static) {
+        lock(&self.table).on_promote = Some(Arc::new(promoted));
     }
 
     fn send(&self, message: Value) -> Result<(), InterpreterError> {
@@ -970,6 +1009,15 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
                 if let Some(lines) = lines.upgrade() {
                     acknowledge(&mut table, &lines, &channel);
                 }
+            }
+        }
+        Reply::Promote { turns } => {
+            // Taken out first: whoever it is may take a lock held around a
+            // push, which takes this one.
+            let promoted = lock(table).on_promote.clone();
+            match promoted {
+                Some(promoted) => promoted(turns),
+                None => tracing::warn!("ignored a promotion: nothing on the host takes one"),
             }
         }
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),

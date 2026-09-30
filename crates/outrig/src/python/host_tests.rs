@@ -10,7 +10,7 @@
 //! the reader to have caught up, an inventory round-trip orders it, since
 //! replies are read in the order they were written.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
@@ -525,6 +525,75 @@ async fn a_send_is_acknowledged_when_the_user_receives_it() {
     assert_eq!(ack["channel"], "user");
     // One receive, one acknowledgment.
     round_trip(&interpreter, &mut fake).await;
+}
+
+// ---------------------------------------------------------------------------- the conversation
+
+/// A turn goes out under its own id, with the fields it was given, and nothing
+/// answers it. Once the interpreter has gone, nothing more is pushed.
+#[tokio::test]
+async fn a_turn_is_pushed_under_its_id_and_not_once_the_interpreter_is_gone() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    interpreter.push_turn(0, json!({"round": 1, "text": "hello"}));
+    let turn = fake.expect("turn").await;
+    assert_eq!(
+        turn,
+        json!({"t": "turn", "agent": PRIMARY, "id": 0, "round": 1, "text": "hello"})
+    );
+
+    drop(fake);
+    let cause = gone(within(interpreter.pending()).await);
+    assert_eq!(&*cause, HUNG_UP);
+    // Nothing to write to, and nothing panics for want of it.
+    interpreter.push_turn(1, json!({"round": 1}));
+}
+
+/// What `on_promote` registered is handed each promotion as it arrives, in
+/// order and as the agent named it: what a promotion names is the store's to
+/// judge.
+#[tokio::test]
+async fn promotions_are_handed_over_in_order() {
+    let (interpreter, mut fake) = Fake::connected().await;
+    let (promoted, handed) = recorder();
+    interpreter.on_promote(promoted);
+    fake.send(json!({"t": "promote", "agent": PRIMARY, "turns": [2, 0, 1000]}))
+        .await;
+    fake.send(json!({"t": "promote", "agent": PRIMARY, "turns": [2]}))
+        .await;
+    round_trip(&interpreter, &mut fake).await;
+    assert_eq!(*handed.lock().expect("handed"), [vec![2, 0, 1000], vec![2]]);
+}
+
+/// A promotion made by an execution has been handed over by the time that
+/// execution's outcome is here: its line is written ahead of the result, and
+/// the host reads in order. That is what lets it reach the round's next model
+/// call.
+#[tokio::test]
+async fn a_promotion_is_handed_over_before_the_execution_that_made_it_ends() {
+    let interpreter = start_on_host().await;
+    let (promoted, handed) = recorder();
+    interpreter.on_promote(promoted);
+    interpreter.push_turn(
+        0,
+        json!({"round": 1, "prompt": "go", "text": "", "calls": []}),
+    );
+    let outcome = run(
+        &interpreter,
+        "runtime.context.promote(runtime.history.turns[0])",
+    )
+    .await;
+    assert_eq!(outcome, ok(""));
+    assert_eq!(*handed.lock().expect("handed"), [vec![0]]);
+}
+
+/// Every promotion a handler was handed, in order.
+type Handed = Arc<Mutex<Vec<Vec<u64>>>>;
+
+/// A promotion handler that records what it is handed.
+fn recorder() -> (impl Fn(Vec<u64>) + Send + Sync + 'static, Handed) {
+    let handed = Handed::default();
+    let record = Arc::clone(&handed);
+    (move |ids| record.lock().expect("handed").push(ids), handed)
 }
 
 // ---------------------------------------------------------------------------- through podman

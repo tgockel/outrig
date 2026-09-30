@@ -301,6 +301,16 @@ decides what to do next, in the same round. What the wait was on keeps running, 
 can wait on it again. Python waiting with a bare `await` is not ended by a message; Ctrl-C stops
 it.
 
+**The model is sent part of the conversation; the agent's Python holds all of it.** A round is
+the agent's work on the messages waiting when it starts. Each model call is sent the session's
+first two rounds, the six before the current one, and the current one whole. Everything is in
+`runtime.history.turns`, one entry per model call with what the model wrote and each
+submission's source and result, so the agent's code can search the whole conversation without it
+costing the model any context. `runtime.context.promote(turn)` adds a turn back to what the model
+is sent, in its original place, from the next model call on. When a round's model calls leave
+turns out, the line that opens the round says how many. The whole conversation stays in the
+interpreter for the rest of the session, under the same memory ceiling as everything else.
+
 stdout carries only what the agent sends on the channel -- including a send from code still
 running after its round ended, which is printed when it arrives, at the prompt or not. The agent
 is held to the terminal's pace: its code waits once it is 16 messages ahead of what has been
@@ -338,9 +348,9 @@ Python does not stop the processes it started, nor the tasks it was waiting on t
 `runtime.wait`; a task it awaited directly is cancelled with it. A second Ctrl-C on the same code
 stops waiting for it instead; it keeps the interpreter until it finishes, later submissions are
 refused until then, and its result reaches the model with a later call. Ctrl-C while no Python
-runs -- the model is being called -- ends the round and returns to the prompt, and what the round
-had already run stays in the conversation. At the prompt, one Ctrl-C starts a fresh line and a
-second exits.
+runs -- the model is being called -- ends the round and returns to the prompt. The conversation
+keeps everything before the round, and what the round had already run. At the prompt, one Ctrl-C
+starts a fresh line and a second exits.
 
 Python that keeps its event loop from turning while a CPU stays busy, such as `while True: pass`,
 is interrupted after about half a minute without anyone pressing anything, and the model reads

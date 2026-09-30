@@ -55,11 +55,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pip install` works for pure-Python packages only -- along with the image's own Python as the
   place to run such code.
 
+  The conversation is kept whole, and each model call is sent part of it. `round` commits each
+  turn -- one model call and the tool results it asked for -- as it completes, so a round that
+  fails or is dropped has already kept every turn before it. Each turn is mirrored into the
+  interpreter, where `runtime.history.turns` holds it as a frozen `Turn` with `id`, `round`,
+  `prompt`, `text`, and `calls`, each a `Call` with `source` and `result`. The agent's code can
+  scan it there at no cost in context. A model call is sent the conversation's first two rounds,
+  the six before the current one, the current one whole, and each turn the agent named with
+  `runtime.context.promote(...)`, in its original place. A promotion made while code runs reaches
+  the round's next model call, and the line that opens a round says how many earlier turns it
+  leaves out.
+
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
   user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
-  the working directory is the workspace, `pip install` adds pure-Python packages and nothing
-  compiled loads, and `help(runtime)` describes the rest. The agent's configured `preamble`
-  follows it.
+  what each model call is sent of the conversation and where the rest is, the working directory
+  is the workspace, `pip install` adds pure-Python packages and nothing compiled loads, and
+  `help(runtime)` describes the rest. The agent's configured `preamble` follows it.
 
   `PythonAgent::check` runs `start`'s model resolution without starting anything, so a caller can
   fail before pulling an image. `model`, `python_version`, and `container_name` report what a

@@ -5,17 +5,26 @@
 //! machinery -- labels, steering, the repeat breaker -- is not here, and
 //! neither is anything that recovers from a failing endpoint, which arrives
 //! with retry.
+//!
+//! The conversation is the store's ([`History`]), not the round's. rig is
+//! handed nothing from before the round, so everything it holds, and hands
+//! back on success or in an error, is the round's own messages; on every model
+//! call the hook puts the view of what came before in front of them. Nothing
+//! rig returns is compared against the store. The round's turns are committed
+//! as they complete, so a round that fails or is dropped has already kept
+//! every turn it finished.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::OneOrMany;
-use rig::agent::{Agent, AgentHook, Flow, HookContext, StepEvent, StepEventKind};
+use rig::agent::{Agent, AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
 use rig::completion::message::{AssistantContent, ToolResult, ToolResultContent, UserContent};
 use rig::completion::{CompletionModel, Message, Prompt, PromptError};
 
 use super::AgentError;
 use super::build::RigAgent;
+use super::history::{self, History};
 use super::tool::{self, Interrupts};
 
 /// How a round ended.
@@ -28,16 +37,16 @@ pub(crate) struct RoundEnd {
 }
 
 impl RigAgent {
-    /// Run one round against `history`, extending it with everything the round
-    /// emitted.
+    /// Run one round that `prompt` opens, committing its turns to `history`
+    /// as they complete.
     ///
     /// A round cut short -- the tool-call cap, or rig's own turn budget -- keeps
     /// what it managed, so the next prompt can carry on from it. Any other
-    /// failure is an error. It leaves `history` as it was when the round had
-    /// run no Python; otherwise it keeps the tool calls that completed, since
-    /// what they did stands and nothing is rolled back. A round whose future is
-    /// dropped before it returns -- Ctrl-C at the REPL while no Python runs --
-    /// keeps them the same way, as it is dropped.
+    /// failure is an error. It leaves the store as it was when the round had
+    /// run no Python; otherwise the store keeps the tool calls that completed,
+    /// since what they did stands and nothing is rolled back. A round whose
+    /// future is dropped before it returns -- Ctrl-C at the REPL while no
+    /// Python runs -- keeps them the same way, as it is dropped.
     ///
     /// An interrupt relayed through `interrupts` while a call waits on Python
     /// stops that execution, and the round goes on: the model reads how it
@@ -45,22 +54,24 @@ impl RigAgent {
     pub(crate) async fn round(
         &self,
         prompt: &str,
-        history: &mut Vec<Message>,
+        history: &History,
         tool_call_max: usize,
         interrupts: &Interrupts,
     ) -> Result<RoundEnd, AgentError> {
-        let hook = RoundHook::new(tool_call_max, interrupts.clone());
+        // The one message both hold: rig's first, and the store's opening.
+        let opening = Message::user(prompt);
+        history.begin_round(opening.clone());
+        let hook = RoundHook::new(tool_call_max, interrupts.clone(), history.clone());
         match self {
-            RigAgent::OpenAi(agent) => run_round(agent, prompt, history, hook).await,
-            RigAgent::Anthropic(agent) => run_round(agent, prompt, history, hook).await,
+            RigAgent::OpenAi(agent) => run_round(agent, opening, hook).await,
+            RigAgent::Anthropic(agent) => run_round(agent, opening, hook).await,
         }
     }
 }
 
 async fn run_round<M: CompletionModel + 'static>(
     agent: &Agent<M>,
-    prompt: &str,
-    history: &mut Vec<Message>,
+    opening: Message,
     hook: RoundHook,
 ) -> Result<RoundEnd, AgentError> {
     // rig's own budget is a backstop set above the hook's, so the hook -- with
@@ -69,55 +80,54 @@ async fn run_round<M: CompletionModel + 'static>(
     let max_turns = hook.max + 2;
     // Cloned rather than moved: the clone shares the hook's state, so it can
     // still be asked afterwards whether the stop was OutRig's doing.
-    let observer = hook.clone();
     let mut unfinished = KeptIfDropped {
-        history,
-        hook: observer.clone(),
+        hook: hook.clone(),
         armed: true,
     };
     let result = agent
-        .prompt(prompt.to_string())
-        .history(unfinished.history.clone())
+        .prompt(opening)
+        // Nothing from before the round: the hook sends that, on every call.
+        .history(Vec::<Message>::new())
         .max_turns(max_turns)
         .add_hook(hook)
         .extended_details()
         .await;
     unfinished.armed = false;
-    let history = &mut *unfinished.history;
+    let hook = &unfinished.hook;
 
     match result {
         Ok(response) => {
-            let messages = response
-                .messages
-                .expect("rig populates messages on extended_details");
-            history.extend(messages);
+            hook.flush(
+                &response
+                    .messages
+                    .expect("rig populates messages on extended_details"),
+            );
             // A hook stop normally surfaces as an error, but reading the reason
             // back unconditionally means a stop can never be lost to a path
             // that ends the run cleanly instead.
             Ok(RoundEnd {
                 reply: response.output,
-                stopped: observer.stop_reason(),
+                stopped: hook.stop_reason(),
             })
         }
-        Err(err) => stopped_short(err, history, &observer),
+        Err(err) => stopped_short(err, hook),
     }
 }
 
-/// Holds a round's history while the round is in flight, and splices in what
-/// the round ran if it is dropped there. rig works on a copy, so without this
-/// a dropped round would leave the conversation saying its Python never ran
-/// while the interpreter holds what it did.
-struct KeptIfDropped<'a> {
-    history: &'a mut Vec<Message>,
+/// Keeps what a round was running when its future is dropped. rig works on a
+/// copy of the round, so without this a dropped round would leave the
+/// conversation saying its latest Python never ran while the interpreter holds
+/// what it did.
+struct KeptIfDropped {
     hook: RoundHook,
     /// Cleared once the round has returned and its own ending takes over.
     armed: bool,
 }
 
-impl Drop for KeptIfDropped<'_> {
+impl Drop for KeptIfDropped {
     fn drop(&mut self) {
         if self.armed {
-            self.hook.keep_what_ran(self.history);
+            self.hook.keep_what_ran();
         }
     }
 }
@@ -131,15 +141,11 @@ impl Drop for KeptIfDropped<'_> {
 ///
 /// An error after the round has run Python keeps what it ran. Most errors
 /// carry no history -- a failed model call is `CompletionError`, which has
-/// none -- so what is kept is what the hook journaled: see
+/// none -- so what is kept is what the hook committed and journaled: see
 /// [`RoundHook::keep_what_ran`]. Dropping it would leave the interpreter
 /// holding what the calls did and the conversation saying they never ran,
 /// which is how a resent prompt runs a `git push` twice.
-fn stopped_short(
-    err: PromptError,
-    history: &mut Vec<Message>,
-    hook: &RoundHook,
-) -> Result<RoundEnd, AgentError> {
+fn stopped_short(err: PromptError, hook: &RoundHook) -> Result<RoundEnd, AgentError> {
     let (reason, chat_history) = match (err, hook.stop_reason()) {
         (PromptError::PromptCancelled { chat_history, .. }, Some(ours)) => (ours, chat_history),
         (
@@ -151,14 +157,14 @@ fn stopped_short(
             _,
         ) => (cap_reason(max_turns), *chat_history),
         (other, _) => {
-            return Err(if hook.keep_what_ran(history) {
+            return Err(if hook.keep_what_ran() {
                 AgentError::PromptAfterWork(other.to_string())
             } else {
                 other.into()
             });
         }
     };
-    extend_history_with_new_suffix(history, chat_history);
+    hook.flush(&chat_history);
     Ok(RoundEnd {
         reply: String::new(),
         stopped: Some(reason),
@@ -167,17 +173,6 @@ fn stopped_short(
 
 fn cap_reason(max: usize) -> String {
     format!("tool-call iteration max ({max}) reached")
-}
-
-/// Append what `returned` adds to `history`. rig hands back the *whole*
-/// history on an error path, so the prefix already held is skipped.
-fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Message>) {
-    let existing_len = history.len();
-    if returned.len() >= existing_len && returned[..existing_len] == history[..] {
-        history.extend(returned.into_iter().skip(existing_len));
-    } else {
-        history.extend(returned);
-    }
 }
 
 /// What a call that had started, but not returned, reads as when a round ends
@@ -195,8 +190,10 @@ const CALL_STOPPED_TURN: &str = "[outrig] not run: the user interrupted an earli
      turn. Read how that call ended, then decide whether this one is still wanted.";
 
 /// Per-round hook: counts tool calls against the cap, stops the loop once it is
-/// spent, hands the tool's output to the model as the text it is, and journals
-/// what the round has done that rig has not yet handed back.
+/// spent, hands the tool's output to the model as the text it is, commits the
+/// round's turns as they complete, sends each model call the view of what came
+/// before the round, and journals what the round has done that is not a turn
+/// yet.
 ///
 /// Cloned by rig per request; the shared state keeps one round's calls
 /// counting against the same cap.
@@ -210,16 +207,29 @@ struct RoundHook {
     max: usize,
     journal: Arc<Mutex<Journal>>,
     interrupts: Interrupts,
+    /// Where the round's turns are committed.
+    history: History,
 }
 
-/// The round as far as it has got, kept for when it ends without rig handing
-/// back its history: a failed model call, or the round's future dropped.
-#[derive(Default)]
+/// The round as far as it has got: how much of it is in the store, and the
+/// model call not yet a turn there, kept for when the round ends without rig
+/// handing back its messages -- a failed model call, or the round's future
+/// dropped.
 struct Journal {
-    /// What the latest model call was sent: the history before it, then its
-    /// prompt.
-    sent: Vec<Message>,
-    /// That call's reply, once rig accepted it, while its tool calls run.
+    /// How many of the round's messages the store holds. At least one: rig's
+    /// first is the round's opening, which the store holds from the start.
+    committed: usize,
+    /// Whether any call has started this round. Until one has, nothing the
+    /// round did stands, and the conversation is left as it was.
+    ran: bool,
+    /// The latest model call. Taken when what it ran is kept.
+    latest: Latest,
+}
+
+/// The round's latest model call, while it is not yet a turn in the store.
+#[derive(Default)]
+struct Latest {
+    /// Its reply, once rig accepted it, while its tool calls run.
     reply: Option<OneOrMany<AssistantContent>>,
     /// How many of the reply's tool calls have started.
     started: usize,
@@ -228,19 +238,35 @@ struct Journal {
     /// `tool_concurrency`, which this loop does not change -- so the n-th
     /// result answers the n-th call.
     results: Vec<String>,
-    /// Whether any call has started this round. Until one has, nothing the
-    /// round did stands, and the conversation is left as it was.
-    ran: bool,
+}
+
+impl Journal {
+    /// Commit what of `round` -- the round's messages, as rig holds them at a
+    /// turn's end -- the store does not hold yet, as the turns it makes up.
+    /// rig only ever appends to a round, so a count says where the rest
+    /// begins, and only the rest is copied.
+    fn commit<'a>(&mut self, round: impl Iterator<Item = &'a Message>, history: &History) {
+        let rest: Vec<Message> = round.skip(self.committed).cloned().collect();
+        for turn in history::split_turns(rest) {
+            self.committed += turn.len();
+            history.commit(turn);
+        }
+    }
 }
 
 impl RoundHook {
-    fn new(max: usize, interrupts: Interrupts) -> Self {
+    fn new(max: usize, interrupts: Interrupts, history: History) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(AtomicBool::new(false)),
             max,
-            journal: Arc::default(),
+            journal: Arc::new(Mutex::new(Journal {
+                committed: 1,
+                ran: false,
+                latest: Latest::default(),
+            })),
             interrupts,
+            history,
         }
     }
 
@@ -248,28 +274,30 @@ impl RoundHook {
         self.journal.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Extend `history` with what the round did, if it ran any tool call, and
-    /// say whether it did. What is kept is taken, so a round is kept at most
-    /// once.
+    /// End the round with what of `round` -- every message of the round, as
+    /// rig handed them back at its end -- is not in the store yet.
+    fn flush(&self, round: &[Message]) {
+        self.journal().commit(round.iter(), &self.history);
+        self.history.finish_round();
+    }
+
+    /// Commit what the round's latest model call did, if the round ran any
+    /// tool call, and say whether it did. What is kept is taken, so it is kept
+    /// at most once. The turns the round finished are in the store already.
     ///
-    /// That is what the latest model call was sent and, when that call's
-    /// tool calls were still running, its reply and one result for every call
-    /// in it: the result of each that returned, and for the rest a note that
-    /// it had not returned or had not started. A provider refuses a tool call
-    /// without its result, and a call left out would leave the model unaware
-    /// of code that ran.
-    fn keep_what_ran(&self, history: &mut Vec<Message>) -> bool {
-        let Journal {
-            mut sent,
+    /// That is, when the call's tool calls were still running, its reply and
+    /// one result for every call in it: the result of each that returned, and
+    /// for the rest a note that it had not returned or had not started. A
+    /// provider refuses a tool call without its result, and a call left out
+    /// would leave the model unaware of code that ran.
+    fn keep_what_ran(&self) -> bool {
+        let mut journal = self.journal();
+        let Latest {
             reply,
             started,
             results,
-            ran,
-        } = std::mem::take(&mut *self.journal());
-        if !ran {
-            return false;
-        }
-        if let Some(reply) = reply {
+        } = std::mem::take(&mut journal.latest);
+        if let (true, Some(reply)) = (journal.ran, reply) {
             let answers: Vec<UserContent> = reply
                 .iter()
                 .filter_map(|content| match content {
@@ -290,16 +318,16 @@ impl RoundHook {
                     })
                 })
                 .collect();
-            sent.push(Message::Assistant {
+            let mut turn = vec![Message::Assistant {
                 id: None,
                 content: reply,
-            });
+            }];
             if let Ok(answers) = OneOrMany::many(answers) {
-                sent.push(Message::User { content: answers });
+                turn.push(Message::User { content: answers });
             }
+            self.history.commit(turn);
         }
-        extend_history_with_new_suffix(history, sent);
-        true
+        journal.ran
     }
 
     /// Why this hook stopped the loop, if it did. The cap is the only reason
@@ -324,7 +352,7 @@ impl<M: CompletionModel> AgentHook<M> for RoundHook {
 
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         if let StepEvent::ToolResult { result, .. } = &event {
-            self.journal().results.push(result.to_string());
+            self.journal().latest.results.push(result.to_string());
         }
         match event {
             StepEvent::CompletionCall { .. } if self.calls.load(Ordering::SeqCst) > self.max => {
@@ -332,25 +360,32 @@ impl<M: CompletionModel> AgentHook<M> for RoundHook {
                 Flow::terminate(cap_reason(self.max))
             }
             StepEvent::CompletionCall {
-                prompt, history, ..
+                prompt,
+                history: round,
+                ..
             } => {
                 self.interrupts.clear_turn();
-                let mut journal = self.journal();
-                journal.sent = history.iter().chain([prompt]).cloned().collect();
-                journal.reply = None;
-                journal.started = 0;
-                journal.results.clear();
-                Flow::cont()
+                // What rig holds is whole turns by now, since a call is made
+                // only once the last one's tool calls have returned.
+                {
+                    let mut journal = self.journal();
+                    journal.commit(round.iter().chain([prompt]), &self.history);
+                    journal.latest = Latest::default();
+                }
+                // rig holds only the round, and sends `prompt` after this.
+                let mut sent = self.history.view();
+                sent.extend_from_slice(round);
+                Flow::patch_request(RequestPatch::new().history(sent))
             }
             StepEvent::ModelTurnFinished { content, .. } => {
-                self.journal().reply = Some(content.clone());
+                self.journal().latest.reply = Some(content.clone());
                 Flow::cont()
             }
             StepEvent::ToolCall {
                 tool_name, args, ..
             } => {
                 let mut journal = self.journal();
-                journal.started += 1;
+                journal.latest.started += 1;
                 // Not counted against the cap: it did not run.
                 if self.interrupts.turn_stopped() {
                     return Flow::skip(CALL_STOPPED_TURN);

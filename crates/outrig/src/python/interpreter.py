@@ -1005,8 +1005,9 @@ _PYTHON = Python()
 _HELP_GUIDE = (
     "help(x) describes x -- a function's signature and docstring, a class's methods, a module's "
     f"contents -- in at most {HELP_MAX} characters. help(runtime) describes what OutRig gives "
-    "you: your channels, runtime.wait, and runtime.names(). help(runtime.python) says what this "
-    "interpreter can import, and where code that needs more can run."
+    "you: your channels, runtime.wait, runtime.names(), and your conversation, in runtime.history "
+    "and runtime.context. help(runtime.python) says what this interpreter can import, and where "
+    "code that needs more can run."
 )
 
 
@@ -1163,6 +1164,139 @@ _MISSING = object()
 # A type's own name, read without consulting its metaclass, which could run agent code.
 _type_name = type.__dict__["__name__"].__get__
 _type_qualname = type.__dict__["__qualname__"].__get__
+
+
+# ---------------------------------------------------------------------------- history
+
+# The host keeps the agent's conversation, a turn at a time, and pushes each turn here as it
+# commits it: one model call, what the model wrote, and each call it made with the result it read.
+# Held here it is ordinary data, so the agent's code can read all of it and only what that code
+# prints is seen. What each model call is sent of it is the host's to assemble; a promotion is how
+# the agent asks for a turn to be sent again, and names it by id, never by content.
+
+
+@dataclasses.dataclass(frozen=True)
+class Call:
+    """One call the model made: the `source` it submitted, and the `result` it read back."""
+
+    source: str
+    result: str
+
+    def __repr__(self):
+        return f"<call: {len(self.source)} characters of source, {len(self.result)} of result>"
+
+
+@dataclasses.dataclass(frozen=True)
+class Turn:
+    """One model call and the calls it made, as the model saw them.
+
+    `id` names the turn for good, and is what `runtime.context.promote` takes. `round` counts the
+    conversation's rounds from 1. `prompt` is the line that opened the round, on its first turn,
+    and `None` on the rest. `text` is what the model wrote, and `calls` each call it made, with the
+    result it read -- clipped where the model's was.
+    """
+
+    id: int
+    round: int
+    prompt: str | None
+    text: str
+    calls: tuple[Call, ...]
+
+    def __repr__(self):
+        return (
+            f"<turn {self.id}, round {self.round}: {len(self.calls)} calls, {len(self.text)} "
+            f"characters of text>"
+        )
+
+
+class History:
+    """Your whole conversation, a turn at a time: `runtime.history.turns`.
+
+    A turn is one model call and the calls it made. `turns` holds every turn that has finished,
+    oldest first, as `Turn` objects -- the round in progress too, up to its latest call. Reading
+    it costs no context: only what your code prints is seen, so scan it with ordinary Python and
+    print what you need. It is a tuple, and a turn finishing later is not added to one already
+    read, so a scan sees what was there when it started.
+
+    Not every turn is sent to the model on every call: see `help(runtime.context)`.
+    """
+
+    def __init__(self):
+        self._turns = ()
+
+    @property
+    def turns(self):
+        """Every finished turn, oldest first, as a tuple of `Turn`."""
+        return self._turns
+
+    def __repr__(self):
+        turns = self._turns
+        rounds = turns[-1].round if turns else 0
+        return f"<history: {len(turns)} turns over {rounds} rounds>"
+
+    def _add(self, turn):
+        """Hold `turn`, which the host committed. Reader thread only.
+
+        A turn is held only if it comes after the last one held. So a retry after running out of
+        memory never holds one twice, and a turn whose line was lost leaves a gap in the ids
+        rather than stopping every later one. Rebinding is the last step.
+        """
+        turns = self._turns
+        if turns and turn.id <= turns[-1].id:
+            return
+        self._turns = turns + (turn,)
+
+
+class Context:
+    """What each model call is sent of your conversation.
+
+    Each call is sent the first rounds of the conversation, the most recent ones, and the round in
+    progress, whole. Everything else stays in `runtime.history.turns`, unsent, until you promote
+    it: `runtime.context.promote(turn)`. A promoted turn is sent in its place in the
+    conversation, not at the end, from the next model call on -- in this round, if your code
+    promotes it while it runs.
+    """
+
+    def __init__(self, agent, history):
+        self._agent = agent
+        self._history = history
+        self._lock = threading.Lock()
+        self._promoted = set()
+
+    @property
+    def promoted(self):
+        """The ids of the turns you have promoted, in order."""
+        with self._lock:
+            return tuple(sorted(self._promoted))
+
+    def promote(self, *turns):
+        """Send `turns` to the model from its next call on, each in its place in the conversation.
+
+        Each is a `Turn` from `runtime.history.turns`, a turn's id, or an iterable of those. A turn
+        is named by its id, so a copy promotes what the original said. Promoting a turn again
+        changes nothing.
+        """
+        ids = set()
+        for item in turns:
+            many = not isinstance(item, (Turn, int)) and hasattr(type(item), "__iter__")
+            for one in item if many else (item,):
+                if isinstance(one, Turn):
+                    ids.add(one.id)
+                elif type(one) is int:
+                    ids.add(one)
+                else:
+                    raise TypeError(f"a turn or a turn's id, not {_type_name(type(one))}")
+        held = {turn.id for turn in self._history.turns}
+        unknown = sorted(ids - held)
+        if unknown:
+            raise ValueError(f"no finished turn has id {', '.join(map(str, unknown))}")
+        if ids:
+            _write_line(_encode({"t": "promote", "agent": self._agent, "turns": sorted(ids)}))
+            with self._lock:
+                self._promoted |= ids
+
+    def __repr__(self):
+        return f"<context: {len(self.promoted)} turns promoted>"
 
 
 # ---------------------------------------------------------------------------- channels
@@ -1535,20 +1669,36 @@ class Runtime:
 
     `runtime.names()` lists what you have bound, with the type of each value.
 
+    `runtime.history.turns` is your whole conversation, to read with ordinary Python at no cost in
+    context: see `help(runtime.history)`. Not all of it is sent to the model on each call, and
+    `runtime.context.promote(turn)` sends a turn again: see `help(runtime.context)`.
+
     `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
     packages, and nothing compiled loads -- and where code that needs more can run.
     """
 
     MessageAvailable = MessageAvailable
 
-    def __init__(self, channels, held):
+    def __init__(self, channels, held, history, context):
         self._channels = types.MappingProxyType(channels)
         self._held = held
+        self._history = history
+        self._context = context
 
     @property
     def channels(self):
         """This agent's channel endpoints, by name. Read-only."""
         return self._channels
+
+    @property
+    def history(self):
+        """Your whole conversation, a turn at a time."""
+        return self._history
+
+    @property
+    def context(self):
+        """What each model call is sent of your conversation, and how to add to it."""
+        return self._context
 
     @property
     def python(self):
@@ -1667,7 +1817,10 @@ class Kernel:
         # The user's channel carries text both ways. Every agent has one, and the host is at the
         # other end of it.
         self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
-        self.globals["runtime"] = Runtime(self.channels, self.held)
+        self.history = History()
+        self.globals["runtime"] = Runtime(
+            self.channels, self.held, self.history, Context(agent, self.history)
+        )
         sys.modules[self.module.__name__] = self.module
         # Names bound at boot are infrastructure, not the model's work. Hidden by identity, so a
         # name the model rebinds is listed again.
@@ -2180,6 +2333,36 @@ def _received(kernel, _, message):
     endpoint._received()
 
 
+def _turn(kernel, turn_id, message):
+    """Hold a turn of the agent's conversation, which the host committed, for `runtime.history`.
+
+    Not answered. The turn is built whole before anything changes, and `History._add` rebinds last,
+    so `_handle`'s retry after running out of memory never holds it twice.
+    """
+    number, prompt, text, calls = (message.get(key) for key in ("round", "prompt", "text", "calls"))
+    if (
+        type(number) is not int
+        or not isinstance(prompt, (str, type(None)))
+        or not isinstance(text, str)
+        or not isinstance(calls, list)
+        or not all(
+            isinstance(call, dict)
+            and isinstance(call.get("source"), str)
+            and isinstance(call.get("result"), str)
+            for call in calls
+        )
+    ):
+        raise ValueError(f"turn {turn_id} for {kernel.agent!r} is not a turn")
+    turn = Turn(
+        turn_id,
+        number,
+        prompt,
+        text,
+        tuple(Call(call["source"], call["result"]) for call in calls),
+    )
+    kernel.history._add(turn)
+
+
 def _inventory(kernel, request_id, message):
     """List what the agent holds, on its loop, from past the name `after` when that is given."""
     after = message.get("after")
@@ -2202,6 +2385,7 @@ _ROUTES = {
     "msg": _msg,
     "pending": _pending,
     "received": _received,
+    "turn": _turn,
     "inv": _inventory,
     "cpu": lambda kernel, request_id, _: kernel.cpu(request_id),
     "cancel": lambda kernel, request_id, _: kernel.cancel(request_id),

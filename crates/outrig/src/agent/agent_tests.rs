@@ -6,6 +6,7 @@
 //! itself. The e2e module at the end starts the interpreter through podman,
 //! which is the one path the rest skips.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use rig::tool::{ToolDyn, ToolError};
@@ -13,6 +14,7 @@ use serde_json::json;
 
 use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
+use super::history::Window;
 use super::mock_http::{self, CannedResponse, MODEL, RecordedRequest, failure, submit, text_reply};
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
@@ -107,6 +109,18 @@ async fn round(agent: &mut PythonAgent, message: &str) -> String {
         .expect("a message was waiting, so a round ran")
 }
 
+/// Send `message`, then run the round it starts until `reached`, and drop it
+/// there, as Ctrl-C at the REPL does. `biased` polls `reached` first, so a
+/// round that could return in the same poll is dropped all the same.
+async fn dropped_round(agent: &mut PythonAgent, message: &str, reached: impl Future) {
+    post(agent, message).await;
+    tokio::select! {
+        biased;
+        _ = within(reached) => {}
+        _ = agent.round() => panic!("the round returned before it could be dropped"),
+    }
+}
+
 /// The text of a message's `content`, or the system prompt, whether rig sent
 /// it as one string or as blocks. Blocks without text are skipped.
 fn text_of(content: &serde_json::Value) -> String {
@@ -125,11 +139,16 @@ fn system_prompt(request: &RecordedRequest) -> String {
     text_of(&request.body["system"])
 }
 
-/// The text of the `tool_result` for `id` in `request`, as the model reads it.
-fn tool_result(request: &RecordedRequest, id: &str) -> String {
-    let block = request.body["messages"]
+/// The messages `request` carried, as the provider received them.
+fn messages(request: &RecordedRequest) -> &[serde_json::Value] {
+    request.body["messages"]
         .as_array()
         .expect("a messages array")
+}
+
+/// The text of the `tool_result` for `id` in `request`, as the model reads it.
+fn tool_result(request: &RecordedRequest, id: &str) -> String {
+    let block = messages(request)
         .iter()
         .filter_map(|message| message["content"].as_array())
         .flatten()
@@ -184,7 +203,7 @@ async fn submitted_source_runs_and_its_output_reaches_the_model() {
     assert_eq!(tool_result(&recorded[1], "toolu_1"), "x is 42\n");
 
     // The second round opens on the first one's four messages plus its prompt.
-    let second_round = recorded[2].body["messages"].as_array().expect("messages");
+    let second_round = messages(&recorded[2]);
     assert_eq!(second_round.len(), 5, "{second_round:#?}");
     assert_eq!(
         tool_result(&recorded[3], "toolu_2"),
@@ -316,8 +335,8 @@ async fn a_failed_first_model_call_leaves_the_conversation_alone() {
     assert_eq!(round(&mut agent, "hello").await, "ok");
 
     let recorded = mock_http::drain(&mut requests);
-    let messages = recorded[1].body["messages"].as_array().expect("messages");
-    assert_eq!(messages.len(), 1, "{messages:#?}");
+    let sent = messages(&recorded[1]);
+    assert_eq!(sent.len(), 1, "{sent:#?}");
 }
 
 /// rig reads a tool's output as JSON when it can, and an object carrying
@@ -427,14 +446,10 @@ async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
         requests.recv().await.expect("the first model call");
         requests.recv().await.expect("the second model call");
     };
-    post(&agent, "set x").await;
-    tokio::select! {
-        biased;
-        () = within(second_call) => {}
-        _ = agent.round() => panic!("the round returned before it could be dropped"),
-    }
-    assert!(
-        !agent.history.is_empty(),
+    dropped_round(&mut agent, "set x", second_call).await;
+    assert_eq!(
+        agent.history.len(),
+        1,
         "what the round ran is kept as it is dropped, not a round later"
     );
 
@@ -484,12 +499,7 @@ async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
         starts.recv().await.expect("the first call");
         starts.recv().await.expect("the second call");
     };
-    post(&agent, "run three").await;
-    tokio::select! {
-        biased;
-        () = within(inside_the_second) => {}
-        _ = agent.round() => panic!("the round returned before it could be dropped"),
-    }
+    dropped_round(&mut agent, "run three", inside_the_second).await;
 
     assert_eq!(round(&mut agent, "continue").await, "carried on");
     let recorded = mock_http::drain(&mut requests);
@@ -530,12 +540,7 @@ async fn the_observer_is_not_told_of_a_refused_submission() {
         let _ = started.send(());
     });
 
-    post(&agent, "sleep").await;
-    tokio::select! {
-        biased;
-        _ = within(starts.recv()) => {}
-        _ = agent.round() => panic!("the round returned before it could be dropped"),
-    }
+    dropped_round(&mut agent, "sleep", starts.recv()).await;
     assert_eq!(round(&mut agent, "go on").await, "refused");
 
     assert_eq!(
@@ -613,7 +618,11 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
 
 #[test]
 fn the_orientation_names_the_workspace_when_there_is_one() {
-    let text = super::orientation::preamble(Some(std::path::Path::new("/workspace")), None);
+    let text = super::orientation::preamble(
+        Some(std::path::Path::new("/workspace")),
+        None,
+        Window::DEFAULT,
+    );
     assert!(
         text.contains(
             "Your working directory is /workspace, which holds the project's files; its Python \
@@ -646,9 +655,7 @@ async fn the_agent_names_its_model_and_its_python() {
 
 /// The text of the last user message `request` carried.
 fn last_user_text(request: &RecordedRequest) -> String {
-    let message = request.body["messages"]
-        .as_array()
-        .expect("a messages array")
+    let message = messages(request)
         .iter()
         .rev()
         .find(|message| message["role"] == "user")
@@ -1009,12 +1016,7 @@ async fn a_round_dropped_while_asking_what_waits_keeps_the_calls_outcome() {
     )
     .await;
 
-    post(&agent, "go").await;
-    tokio::select! {
-        biased;
-        () = within(asked.reached()) => {}
-        _ = agent.round() => panic!("the round returned before it could be dropped"),
-    }
+    dropped_round(&mut agent, "go", asked.reached()).await;
     assert_eq!(round(&mut agent, "continue").await, "carried on");
 
     let recorded = mock_http::drain(&mut requests);
@@ -1023,6 +1025,344 @@ async fn a_round_dropped_while_asking_what_waits_keeps_the_calls_outcome() {
         next.contains("has since finished: it ran to completion") && next.contains("the outcome"),
         "{next}"
     );
+}
+
+// ---------------------------------------------------------------------------- the conversation
+
+/// Where the first message carrying `needle` sits in `request`, if one does.
+fn position(request: &RecordedRequest, needle: &str) -> Option<usize> {
+    messages(request)
+        .iter()
+        .position(|message| message.to_string().contains(needle))
+}
+
+/// A window of the first round and the one before the round in progress, so
+/// a conversation of four rounds already leaves one out.
+const NARROW: Window = Window {
+    first: 1,
+    recent: 1,
+};
+
+/// The Python that finds the turn a result mentioning `7f3a` came back in,
+/// written so that the source never says what the result did.
+const FIND_THE_NEEDLE: &str =
+    "[t for t in runtime.history.turns if any('7f3a' in c.result for c in t.calls)]";
+
+/// An agent on the [`NARROW`] window, three rounds into `script`, and what
+/// those rounds sent.
+async fn three_narrow_rounds(
+    var: &str,
+    script: Vec<CannedResponse>,
+) -> (
+    PythonAgent,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+    Vec<RecordedRequest>,
+) {
+    let (mut agent, mut requests) = agent_over(var, MODEL, "max-tokens = 4096", script).await;
+    agent.history.set_window(NARROW);
+    for message in ["one", "two", "three"] {
+        round(&mut agent, message).await;
+    }
+    let earlier = mock_http::drain(&mut requests);
+    (agent, requests, earlier)
+}
+
+/// Three rounds' script, the second of which read back a needle: by the
+/// fourth, on the narrow window, the second is out of view.
+fn needle_rounds(fourth: Vec<CannedResponse>) -> Vec<CannedResponse> {
+    let mut script = vec![
+        text_reply("first round"),
+        submit("toolu_needle", "print('needle-' + '7f3a')"),
+        text_reply("second round"),
+        text_reply("third round"),
+    ];
+    script.extend(fourth);
+    script
+}
+
+/// Reading the whole conversation from Python costs the model nothing: a round
+/// the view has left out is found by code, and only what that code printed is
+/// sent. Asserted on the wire, where the needle never appears.
+#[tokio::test]
+async fn a_scan_of_the_history_costs_no_context() {
+    let (mut agent, mut requests, earlier) = three_narrow_rounds(
+        "OUTRIG_TEST_AGENT_SCAN",
+        needle_rounds(vec![
+            submit("toolu_scan", &format!("[t.id for t in {FIND_THE_NEEDLE}]")),
+            text_reply("found it"),
+        ]),
+    )
+    .await;
+    assert!(
+        wire(&earlier).contains("needle-7f3a"),
+        "the needle was read back once, in its own round"
+    );
+
+    assert_eq!(round(&mut agent, "find it").await, "found it");
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    // Nothing reads the messages, so they pile up; the note is what matters.
+    let opening = last_user_text(&recorded[0]);
+    assert!(
+        opening.ends_with(". 2 earlier turns are not shown; runtime.history has them."),
+        "{opening}"
+    );
+    assert_eq!(
+        tool_result(&recorded[1], "toolu_scan"),
+        "[1]\n",
+        "the scan found the second round's first turn"
+    );
+    assert!(
+        !wire(&recorded).contains("needle-7f3a"),
+        "the scanned turn reached the model: {recorded:#?}"
+    );
+}
+
+/// A turn the agent's code promotes is sent from the next model call on --
+/// the same round's, since the code ran in it -- and in its original place:
+/// after the first round, before the one the window keeps, not at the end.
+#[tokio::test]
+async fn a_promoted_turn_is_sent_in_its_place_from_the_next_call() {
+    let (mut agent, mut requests, _) = three_narrow_rounds(
+        "OUTRIG_TEST_AGENT_PROMOTE",
+        needle_rounds(vec![
+            submit(
+                "toolu_promote",
+                &format!("runtime.context.promote({FIND_THE_NEEDLE})"),
+            ),
+            text_reply("promoted"),
+        ]),
+    )
+    .await;
+
+    assert_eq!(round(&mut agent, "bring it back").await, "promoted");
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    assert_eq!(position(&recorded[0], "needle-7f3a"), None);
+
+    let after = &recorded[1];
+    // The first round's two messages, the promoted turn's three, the third
+    // round's two, and this round's call so far.
+    assert_eq!(
+        messages(after).len(),
+        2 + 3 + 2 + 3,
+        "{:#?}",
+        messages(after)
+    );
+    let first = position(after, "first round").expect("the first round");
+    let needle = position(after, "needle-7f3a").expect("the promoted turn");
+    let third = position(after, "third round").expect("the third round");
+    assert!(
+        first < needle && needle < third,
+        "in its place: {first} < {needle} < {third}"
+    );
+    assert_eq!(
+        position(after, "second round"),
+        None,
+        "only the turn promoted, not the rest of its round"
+    );
+}
+
+/// The view is sent on every model call of a round, not only the first: rig
+/// holds the round alone, so a call the view was not applied to would lose
+/// everything before it, and one it was applied to wrongly would regain what
+/// the window leaves out.
+#[tokio::test]
+async fn the_view_is_sent_on_every_call_of_a_round() {
+    let (mut agent, mut requests, _) = three_narrow_rounds(
+        "OUTRIG_TEST_AGENT_EVERY_CALL",
+        vec![
+            text_reply("first round"),
+            text_reply("pruned-bd81"),
+            text_reply("third round"),
+            submit("toolu_a", "a = 1"),
+            submit("toolu_b", "b = 2"),
+            text_reply("done"),
+        ],
+    )
+    .await;
+
+    round(&mut agent, "go").await;
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 3, "{recorded:#?}");
+    let view = &messages(&recorded[0])[..4];
+    for (n, request) in recorded.iter().enumerate() {
+        let sent = messages(request);
+        assert_eq!(sent.len(), 5 + 2 * n, "call {n}: {sent:#?}");
+        assert_eq!(&sent[..4], view, "call {n} opens on the same view");
+        assert_eq!(position(request, "pruned-bd81"), None, "call {n}");
+    }
+    assert!(text_of(&view[1]["content"]).contains("first round"));
+    assert!(text_of(&view[3]["content"]).contains("third round"));
+}
+
+/// Nothing rig hands back is spliced against the store, so a round ending
+/// in any of the ways that once did so leaves every turn in it once and
+/// brings back none the view left out: the tool-call cap, whose error carries
+/// the round; a model call failing after Python ran; and a round dropped
+/// mid-call.
+#[tokio::test]
+async fn a_pruned_view_does_not_bring_back_what_it_left_out() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_NO_RESURRECTION",
+        MODEL,
+        "max-tokens = 4096\ntool-call-max = 1",
+        vec![
+            text_reply("first round"),
+            text_reply("second round"),
+            submit("toolu_a", "a = 1"),
+            submit("toolu_b", "b = 2"),
+            submit("toolu_c", "c = 3"),
+            failure(500),
+            submit("toolu_d", "d = 4"),
+            text_reply("never read"),
+            text_reply("done"),
+        ],
+    )
+    .await;
+    agent.history.set_window(NARROW);
+    round(&mut agent, "one").await;
+    round(&mut agent, "two").await;
+    assert_eq!(
+        round(&mut agent, "capped").await,
+        "(round ended: tool-call iteration max (1) reached)"
+    );
+    assert_eq!(agent.history.len(), 4, "the capped round's two turns, once");
+
+    post(&agent, "fails").await;
+    within(agent.round())
+        .await
+        .expect_err("the second model call failed");
+    assert_eq!(agent.history.len(), 5, "the failed round's finished turn");
+
+    mock_http::drain(&mut requests);
+    let second_call = async {
+        requests.recv().await.expect("the first model call");
+        requests.recv().await.expect("the second model call");
+    };
+    dropped_round(&mut agent, "dropped", second_call).await;
+    assert_eq!(agent.history.len(), 6, "the dropped round's finished turn");
+
+    round(&mut agent, "done?").await;
+    assert_eq!(agent.history.len(), 7);
+    let last = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the last round's request");
+    // The first round, the dropped round's turn, and this round's prompt.
+    assert_eq!(messages(&last).len(), 2 + 3 + 1, "{:#?}", messages(&last));
+    for gone in ["second round", "toolu_a", "toolu_b", "toolu_c"] {
+        assert_eq!(position(&last, gone), None, "{gone} came back");
+    }
+    assert_eq!(tool_result(&last, "toolu_d"), "(no output)");
+    assert!(
+        last_user_text(&last).ends_with("4 earlier turns are not shown; runtime.history has them."),
+        "{}",
+        last_user_text(&last)
+    );
+}
+
+/// The window the model is told about is the one it gets: the first two
+/// rounds and the six before the current one, so the tenth round is the first
+/// to leave one out, and says so.
+#[tokio::test]
+async fn the_default_window_leaves_out_the_third_round_of_ten() {
+    let script = (1..=10)
+        .map(|n| text_reply(&format!("round-{n}.")))
+        .collect();
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_WINDOW",
+        MODEL,
+        "max-tokens = 4096",
+        script,
+    )
+    .await;
+    for n in 1..=10 {
+        round(&mut agent, &format!("message {n}")).await;
+    }
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 10);
+
+    let ninth = &recorded[8];
+    assert_eq!(
+        messages(ninth).len(),
+        2 * 8 + 1,
+        "the ninth is sent everything"
+    );
+    assert!(
+        !last_user_text(ninth).contains("earlier turn"),
+        "{}",
+        last_user_text(ninth)
+    );
+
+    let tenth = &recorded[9];
+    assert_eq!(messages(tenth).len(), 2 * 8 + 1);
+    assert_eq!(position(tenth, "round-3."), None);
+    for kept in [1, 2, 4, 9] {
+        assert!(
+            position(tenth, &format!("round-{kept}.")).is_some(),
+            "round {kept}"
+        );
+    }
+    let opening = last_user_text(tenth);
+    assert!(
+        opening.ends_with(". 1 earlier turn is not shown; runtime.history has it."),
+        "{opening}"
+    );
+}
+
+/// `plan/next/repl-interrupt-history-loss.md`, in `run-new`: interrupting a
+/// round -- which drops its future, while the model is being called or while
+/// Python runs -- no longer takes the conversation with it. The store owns
+/// it, not the round.
+#[tokio::test]
+async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_INTERRUPTED",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_first", "x = 1\nprint('first')"),
+            text_reply("set"),
+            // Dropped while the model is called.
+            text_reply("never read"),
+            // Dropped while its Python runs.
+            submit("toolu_slow", "print('started')\nawait asyncio.sleep(3600)"),
+            text_reply("carried on"),
+        ],
+    )
+    .await;
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_submit(move |source| {
+        let _ = started.send(source.to_string());
+    });
+    assert_eq!(round(&mut agent, "set x").await, "set");
+    starts.recv().await.expect("the first round's call");
+    mock_http::drain(&mut requests);
+
+    dropped_round(
+        &mut agent,
+        "interrupted while the model is called",
+        requests.recv(),
+    )
+    .await;
+    dropped_round(&mut agent, "interrupted while Python runs", starts.recv()).await;
+
+    assert_eq!(round(&mut agent, "still there?").await, "carried on");
+    let last = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the last round's request");
+    assert_eq!(
+        tool_result(&last, "toolu_first"),
+        "first\n",
+        "run-new's loop (`PythonAgent::round`) lost the conversation to an interrupted round"
+    );
+    assert!(
+        tool_result(&last, "toolu_slow").contains("had not returned when the round ended"),
+        "{}",
+        tool_result(&last, "toolu_slow")
+    );
+    // The first round's four, the interrupted Python's three, and this prompt.
+    assert_eq!(messages(&last).len(), 4 + 3 + 1, "{:#?}", messages(&last));
 }
 
 // ---------------------------------------------------------------------------- the tool

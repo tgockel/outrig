@@ -31,3 +31,15 @@ would take nothing with it.
   follow-up turn observes the prior history rather than an empty one (needs
   a hook to observe what `on_prompt` receives, or a run.rs-level test around
   the closure).
+
+## `run-new`'s loop does not have it
+
+`0003-11` gave `PythonAgent` a store that owns the conversation, so a round borrows nothing it
+could take down with it. rig is handed only the round, each turn is committed as it completes,
+and a dropped round's guard commits the turn it was in. Interrupting a `run-new` round -- while
+the model is called or while its Python runs -- leaves everything before the round, and what the
+round finished. `agent_tests.rs`'s `run_new_keeps_the_conversation_when_a_round_is_interrupted`
+pins both.
+
+`run` and `run-legacy` still take the `mem::take` path in `outrig-cli`'s `run_repl`, and still
+lose the conversation, so this entry stays open for them.

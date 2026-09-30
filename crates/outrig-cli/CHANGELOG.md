@@ -25,9 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--model`, `--image` (a configured image-config only), and `--session-dir`. Ctrl-C while its
   Python runs stops that Python -- cancelled, or interrupted if it has stopped yielding -- and the
   model reads how it ended; a second Ctrl-C stops waiting for it. With no Python running, Ctrl-C
-  ends the round as it does in `run`. Python that spins without yielding is interrupted after
-  about half a minute on its own. Python that allocates past its memory ceiling, half of what the
-  container can see, gets a `MemoryError` the model reads rather than ending the session;
+  ends the round, and unlike `run`'s, the conversation before it is kept. Each model call is sent
+  the session's first two rounds, the six before the current one, and the current one; the
+  agent's Python holds the whole conversation in `runtime.history`, and
+  `runtime.context.promote` sends a turn again. Python that spins without yielding is interrupted
+  after about half a minute on its own. Python that allocates past its memory ceiling, half of
+  what the container can see, gets a `MemoryError` the model reads rather than ending the session;
   programs it starts inherit the ceiling, and can raise their own. The agent's Python imports
   modules from the workspace, and `pip install` from it adds pure-Python packages that import at
   once; a package with compiled parts cannot load, and the error says so.
