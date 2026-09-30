@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use outrig::config::Config;
+use outrig_cli::image_setup::render::{self, BaseImage, McpServer, Toolchain};
 
 /// `doc/` lives at the workspace root; this crate's manifest dir is
 /// `crates/outrig-cli`. Same walk as `prompt_doc_sync.rs`.
@@ -51,4 +52,29 @@ fn the_mcp_pages_minimal_config_parses() {
             page.display()
         )
     });
+}
+
+/// The Dockerfile the image page shows is the one `outrig image add` writes
+/// for the page's own walkthrough: the default base, `rust, node`, and the
+/// default `fs`. The page is a copy, and `outrig mcp self` and `outrig design
+/// prompt` hand it to whatever designs an image, so a template fix that misses
+/// it goes on being taught -- as #183's `/root/.cargo` install was.
+#[test]
+fn the_image_pages_dockerfile_is_what_image_add_writes() {
+    let page = workspace_root().join("doc/usage/image.md");
+    let markdown =
+        std::fs::read_to_string(&page).unwrap_or_else(|e| panic!("{}: {e}", page.display()));
+    let shown = fenced_block_after(&markdown, "\n## `outrig image add`\n", "Dockerfile");
+    let written = render::render(
+        BaseImage::DebianBookwormSlim,
+        &[Toolchain::Rust, Toolchain::Node],
+        &[McpServer::Fs],
+    );
+
+    assert_eq!(
+        shown,
+        written,
+        "the Dockerfile {} shows is not the one `outrig image add` writes for its walkthrough",
+        page.display()
+    );
 }

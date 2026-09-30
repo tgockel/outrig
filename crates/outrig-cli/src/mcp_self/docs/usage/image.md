@@ -130,7 +130,7 @@ matching `[images.<name>]` block without being limited to the built-in template 
 
 ### What gets written
 
-`.agents/outrig/images/hello-outrig-standard/Dockerfile` (excerpt):
+`.agents/outrig/images/hello-outrig-standard/Dockerfile`:
 
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
@@ -141,9 +141,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # rust toolchain
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-       | sh -s -- -y --default-toolchain stable --profile default
-ENV PATH=/root/.cargo/bin:$PATH
+       | sh -s -- -y --no-modify-path --default-toolchain stable \
+                  --profile minimal --component rustfmt,clippy \
+ && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # node toolchain
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -161,6 +165,14 @@ The Dockerfile is generic -- no `USER` directive, no hard-coded UID, and nothing
 user management. outrig sets up a user matching your host UID/GID at run time, writing the
 entries into the container from the host (see
 [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping)).
+
+That user is not root, so the `rust` toolchain installs under `/usr/local`, as the official `rust`
+images do, with `RUSTUP_HOME` and `CARGO_HOME` set and left writable (see
+[Concepts -> Containers](../concepts/containers.md#dont-set-up-a-user-in-the-dockerfile)): cargo
+keeps its registry cache in `CARGO_HOME`, and rustup installs any toolchain a project's
+`rust-toolchain.toml` pins into `RUSTUP_HOME`. To add to either -- `rustup component add`,
+`cargo install` -- extend that `RUN` ahead of its `chmod`; a `RUN` of its own leaves what it adds
+writable by root alone.
 
 Appended to `.agents/outrig/config.toml`:
 

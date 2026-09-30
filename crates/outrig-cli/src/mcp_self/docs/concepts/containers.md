@@ -74,6 +74,15 @@ works unchanged. What it does need is the two files to already exist and a writa
 base so minimal that it ships neither cannot be bootstrapped, and neither can one without the
 `sleep` the section above describes.
 
+What the image installs has to work for that user. The build runs as root, but outrig execs
+nothing as root: every exec gets your UID and `HOME=/home/<user>` (see
+[What outrig sets in an exec](#what-outrig-sets-in-an-exec)). Install tools under a shared prefix
+such as `/usr/local`, not into root's home, which is `0700`. A tool that keeps its state under
+`$HOME` by default -- rustup, nvm, pyenv, `pip install --user` -- needs that state pointed at the
+prefix as well, or at run time it looks under your home and finds nothing there; and whatever it
+writes as it works, as cargo does its registry cache, has to be writable by you. The `rust`
+toolchain [`outrig image add`](../usage/image.md#what-gets-written) generates does all of this.
+
 ### Install MCP servers
 
 The image needs to contain the binaries and dependencies for every MCP server you reference in

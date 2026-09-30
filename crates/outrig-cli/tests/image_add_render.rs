@@ -32,6 +32,30 @@ fn assert_invariants(out: &str, base: BaseImage, toolchains: &[Toolchain], mcps:
         "[{label}] generated Dockerfile must not set a USER:\n{out}",
     );
 
+    // Every exec runs as the host UID, which cannot enter root's `0700` home --
+    // also spelled `$HOME` or `~` at build time.
+    for root_home in ["/root", "$HOME", "~/"] {
+        assert!(
+            !out.contains(root_home),
+            "[{label}] generated Dockerfile must not install under root's home \
+             ({root_home}):\n{out}",
+        );
+    }
+
+    // Set after the install, or not at all, these leave the toolchain in
+    // `/root` without the Dockerfile ever saying so.
+    if toolchains.contains(&Toolchain::Rust) {
+        let (before_install, _) = out
+            .split_once("sh.rustup.rs")
+            .unwrap_or_else(|| panic!("[{label}] no rustup install:\n{out}"));
+        for var in ["RUSTUP_HOME=", "CARGO_HOME="] {
+            assert!(
+                before_install.contains(var),
+                "[{label}] {var} must be set before rustup installs:\n{out}",
+            );
+        }
+    }
+
     // OutRig writes the runtime user's entries into the container itself, so
     // the generated image must not carry `useradd`/`groupadd` on its account.
     let user_tooling = match base {

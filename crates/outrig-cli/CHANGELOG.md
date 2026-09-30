@@ -95,6 +95,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   soon as the MCP table is merged, before any sidecar starts, and the refusal ends the session
   like any other startup failure: exit code 1, containers stopped, and a container borrowed with
   `--attach` left running. `outrig mcp show-merged`, which ignored such a name, now refuses it.
+- **The `rust` toolchain `outrig image add` generates works as you.** The generated Dockerfile
+  installed rustup into root's home and put only `/root/.cargo/bin` on `PATH`, but outrig execs
+  nothing as root: every exec gets your UID and `HOME=/home/<user>`. `/root` is `0700`, so
+  `cargo` was `Permission denied`, and where it could be reached, rustup looked for its
+  toolchains under that `HOME` and reported that it could not choose a version of cargo to run.
+  The image built cleanly either way. The toolchain now installs where the official `rust` images
+  put it, with `RUSTUP_HOME=/usr/local/rustup` and `CARGO_HOME=/usr/local/cargo` both writable,
+  so cargo can fill its registry cache as you. It is also the `minimal` profile plus `rustfmt`
+  and `clippy`, the components `image add` lists, where it was the `default` profile: the image
+  no longer carries the offline docs `rustup doc` opens, about 0.9 GB. `outrig init`, which runs
+  `image add`, gets the same toolchain. `outrig design prompt` shows it in both Rust examples, and
+  its rules now say to install tools outside root's home. A Dockerfile generated earlier keeps its
+  old lines; replace its `# rust toolchain` section with the one in `doc/usage/image.md`.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
