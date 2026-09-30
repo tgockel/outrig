@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ends the round as it does in `run`. Python that spins without yielding is interrupted after
   about half a minute on its own. Python that allocates past its memory ceiling, half of what the
   container can see, gets a `MemoryError` the model reads rather than ending the session;
-  programs it starts inherit the ceiling, and can raise their own.
+  programs it starts inherit the ceiling, and can raise their own. The agent's Python imports
+  modules from the workspace, and `pip install` from it adds pure-Python packages that import at
+  once; a package with compiled parts cannot load, and the error says so.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 

@@ -58,6 +58,20 @@ schema, and every object an agent might eventually touch. Those are `help()`.
 A concise orientation plus `help()` beats an exhaustive preamble, and it degrades better: a model
 that does not know something can find out, and one that does is not charged for the reminder.
 
+**Decided in `0003-10`: both, split by this rule.** The preamble keeps what is needed every round
+-- how the user's messages arrive, that waiting watches channels, that `pip install` adds
+pure-Python packages and nothing compiled loads -- and one sentence naming `help(runtime)`, where
+the rest is: the manifest, `runtime.names()`, and each object's own docstring. Docstrings work
+only if the model thinks to look, and that one sentence is what tells it to.
+
+**Decided in `0003-10`: `help()` is replaced by a bounded one.** Checked in the static build,
+pydoc renders signatures and docstrings, marks a coroutine function `async` -- which answers
+"must this be awaited" -- and writes plain text, since nothing in the interpreter is a terminal.
+What it lacked was a bound: all of `asyncio` is 225 KB. The replacement renders through pydoc,
+cuts at 8 KiB, on a line where it can, with a note saying to ask about one member instead, and
+answers a bare `help()` with a short guide rather than an interactive utility reading
+`/dev/null`.
+
 ## Capability is a contract, not a discovery
 
 The interpreter is a static CPython mounted read-only, which is what makes the feature work in an
@@ -78,7 +92,26 @@ it might route around. Publish instead:
   work is not forbidden, only forbidden *in this heap*.
 
 Pure-Python imports from the workspace do work, and that is worth testing explicitly rather than
-assuming, because it is the case an agent will reach for first.
+assuming, because it is the case an agent will reach for first. The interpreter runs isolated
+(`-I`), which leaves the working directory off `sys.path`, so the workspace is put back on it --
+after the standard library, so that a project file named like a standard module cannot replace
+one the interpreter program imports later.
+
+**Decided in `0003-10`: installing pure-Python packages works.** OutRig's security model allows
+the agent to install, and the payload carries pip. What stood in the way was placement: pip could
+not write into the read-only payload, so it installed into the user site, which an isolated
+interpreter never reads. The interpreter now reads it, made at start so that a package pip adds
+mid-session imports without a restart, and puts the payload's `pip` -- alone, so `python3` still
+means the image's -- first on the `PATH` its programs inherit. A compiled package is still the
+wall above, and `plan/next/use-the-images-python.md` records the route around it: running the
+agent's interpreter on the image's own Python.
+
+**Decided in `0003-10`: the manifest is `runtime.python`**, whose repr answers in one paragraph
+and whose docstring carries the rest. It deliberately has no per-module "would this import"
+check: optional compiled accelerators and missing pure-Python dependencies make any answer short
+of importing unreliable, and `importlib.util.find_spec` already says whether a module is there at
+all. The diagnostic is applied where a failure is reported rather than in the import system, so a
+library probing an optional import behaves as it would anywhere.
 
 ## Large values stay whole
 
@@ -95,15 +128,10 @@ reason processing data larger than the context window is possible at all.
   signature is not locally knowable, so `help()` on one either lies or round-trips.
 - Whether the active-work inventory belongs here or in `work.md`. "What am I waiting on" is a
   discovery question and a lifecycle question at the same time.
-- How much of the runtime guide is a preamble and how much is a module docstring the agent reads
-  on demand. The second is cheaper and only works if the model thinks to look.
 - Whether the inventory should ever render values, given a bounded and explicit request. The safe
   baseline says no; usefulness pulls the other way.
 
 ## Unverified
 
-- That `help()` and `inspect` behave normally in the static build was not checked. They should --
-  nothing here needs a compiled module -- but the payload has surprised this phase once already
-  with `ctypes`.
 - The claim that a model reaches for `help()` unprompted is an assumption about behavior, not a
   measurement, and it is the assumption this page's economics rest on.

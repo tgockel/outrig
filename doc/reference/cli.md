@@ -269,8 +269,20 @@ outrig run-new [--agent <name>]
 The model has one tool, `submit_python`, which runs source in a persistent CPython inside the
 session's primary container, with the workspace as its working directory. Names the agent binds
 stay bound from one message to the next. The interpreter is a static build OutRig mounts
-read-only, so the image needs no Python of its own; it carries the standard library and cannot
-install packages. Each submission's source is printed on stderr as it starts running.
+read-only, so the image needs no Python of its own. Each submission's source is printed on stderr
+as it starts running.
+
+**What the agent's Python can import.** The standard library, and modules in the workspace, which
+come after the standard library on `sys.path`. `pip install`, run from the agent's code, adds
+pure-Python packages: `pip` there is the interpreter's own, not the image's, and it installs into
+the container user's site under their home, where the running interpreter finds the package at
+once -- and where a Python 3.13 in the image, if there is one, finds it too. Fetching one
+needs the network and CA certificates the image and `[network]` allow. Compiled code never loads
+in a static interpreter, so numpy and other packages with compiled parts do not import however
+they are installed, and the error the model reads says so and names the image's own Python, if it
+has one, as the place to run such code. In its Python, `runtime.python` summarizes this,
+`runtime.names()` lists what the agent has bound, and `help(x)` describes anything in at most
+8 KiB.
 
 **What you type is a message, not a prompt.** Each line goes onto the agent's `user` channel,
 `runtime.channels["user"]` in its Python, and the model is told how many messages are waiting

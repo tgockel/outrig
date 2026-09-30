@@ -177,7 +177,8 @@ impl ToolDyn for SubmitPython {
          rather than as a tool failure, so read it and carry on. Nothing is rolled back: \
          whatever ran before an error happened. The ordinary standard library is here -- \
          pathlib, open(), subprocess, asyncio, json -- operating on the container. Output is \
-         bounded, so print summaries rather than raw data. Code that keeps the event loop from \
+         bounded, but the values behind it are not: keep a large value bound to a name and print \
+         the part you need. Code that keeps the event loop from \
          turning while it keeps a CPU busy is taken for a runaway after about half a minute \
          and interrupted, so run long computations with `await asyncio.to_thread(...)`; \
          waiting on a subprocess or a sleep is not."

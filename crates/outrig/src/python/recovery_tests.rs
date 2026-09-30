@@ -76,8 +76,7 @@ async fn turning(fake: &mut Fake) {
 /// A check that finds an earlier, unanswered probe answered at last.
 async fn turning_again(fake: &mut Fake, probe: &Value) {
     cpu(fake, 1.0).await;
-    fake.send(json!({"t": "inv", "agent": PRIMARY, "id": probe["id"], "globals": []}))
-        .await;
+    fake.inventory(&probe["id"]).await;
 }
 
 async fn submitted(interpreter: &Interpreter, fake: &mut Fake) -> Execution {
@@ -290,8 +289,7 @@ async fn a_probe_answered_before_a_check_is_no_evidence_for_it() {
     let (interpreter, mut fake, id, settled, _waiting) = settling_one(&presses).await;
 
     let earlier = quiet(&mut fake, 1.0, 1.0).await;
-    fake.send(json!({"t": "inv", "agent": PRIMARY, "id": earlier["id"], "globals": []}))
-        .await;
+    fake.inventory(&earlier["id"]).await;
     // Read by the host, in order, before anything after it.
     round_trip(&interpreter, &mut fake).await;
 

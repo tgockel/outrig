@@ -80,8 +80,11 @@ use super::payload::PAYLOAD_MOUNT;
 const PROGRAM: &str = include_str!("interpreter.py");
 
 /// What the payload's `python3` is started with, ahead of the agent id. `-I`
-/// isolates it: no `PYTHON*` variable, user site, or other configuration the
-/// image carries reaches it.
+/// isolates it: no `PYTHON*` variable or other configuration the image carries
+/// reaches it, and neither the working directory nor the user site is on
+/// `sys.path` until the program puts them there, after the standard library
+/// (`_open_imports`). The user site's location still follows `HOME` and
+/// `PYTHONUSERBASE`, as pip's does, since pip installs there.
 pub(super) const ARGS: [&str; 3] = ["-I", "-c", PROGRAM];
 
 /// The primary agent's id: the program's one argument, and the agent every
@@ -189,9 +192,15 @@ pub(crate) struct Late {
 }
 
 /// What the agent's namespace holds: names and type names, nothing evaluated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Bounded, and says so: `total` counts every name held, and `more` those
+/// sorted after the last of `globals`, so a listing cut short is never taken
+/// for the whole.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct Inventory {
     pub(crate) globals: Vec<(String, String)>,
+    pub(crate) total: usize,
+    pub(crate) more: usize,
 }
 
 /// One of the agent's channels, as the interpreter counts it.
@@ -295,7 +304,8 @@ enum Reply {
     Result(WireResult),
     Inv {
         id: ExecId,
-        globals: Vec<(String, String)>,
+        #[serde(flatten)]
+        inventory: Inventory,
     },
     Cpu {
         id: ExecId,
@@ -916,9 +926,9 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
     }
     match reply {
         Reply::Result(result) => lock(table).settle(result),
-        Reply::Inv { id, globals } => match lock(table).queries.remove(&id) {
+        Reply::Inv { id, inventory } => match lock(table).queries.remove(&id) {
             Some(Query::Inventory(waiter)) => {
-                let _ = waiter.send(Inventory { globals });
+                let _ = waiter.send(inventory);
             }
             _ => tracing::warn!("ignored inventory {id}, which nothing asked for"),
         },

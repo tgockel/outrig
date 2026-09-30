@@ -126,16 +126,23 @@ async fn a_result_counts_what_it_dropped_and_carries_earlier_output() {
     );
 }
 
+/// A listing cut short says so: how many names there are, and how many it
+/// left out.
 #[tokio::test]
-async fn the_inventory_names_what_the_namespace_holds() {
+async fn the_inventory_names_what_the_namespace_holds_and_counts_the_rest() {
     let interpreter = start_on_host().await;
-    assert_eq!(run(&interpreter, "answer = 42").await, ok(""));
+    let bind = "answer = 42\nglobals().update({f'v{i:03}': i for i in range(250)})";
+    assert_eq!(run(&interpreter, bind).await, ok(""));
     let inventory = within(interpreter.inventory()).await.expect("an inventory");
     assert!(
         inventory
             .globals
             .contains(&("answer".to_string(), "int".to_string())),
         "{inventory:?}"
+    );
+    assert_eq!(
+        (inventory.globals.len(), inventory.total, inventory.more),
+        (200, 251, 51)
     );
 }
 
@@ -368,8 +375,7 @@ async fn lines_the_host_cannot_place_are_ignored() {
         "t": "result", "agent": "other", "id": id, "status": "ok", "output": "not ours",
     }))
     .await;
-    fake.send(json!({"t": "inv", "agent": PRIMARY, "id": 999, "globals": []}))
-        .await;
+    fake.inventory(&json!(999)).await;
     fake.ok(id, "1\n").await;
 
     assert_eq!(within(execution.outcome()).await, ok("1\n"));
@@ -529,7 +535,7 @@ mod e2e {
     use crate::container::{Container, ContainerLaunchSpec};
     use crate::image::ImageTag;
     use crate::python::payload;
-    use crate::python::testing::{ALPINE, pull_alpine};
+    use crate::python::testing::{ALPINE, PIP_PROBE, pull_alpine};
 
     /// A running alpine with its user bootstrapped, and the payload mounted
     /// as every session mounts it when `with_payload`.
@@ -565,6 +571,28 @@ mod e2e {
                        shell = subprocess.run(['sh', '-c', 'ulimit -d'], capture_output=True)\n\
                        print(soft != resource.RLIM_INFINITY, int(shell.stdout) == soft // 1024)";
         assert_eq!(run(&interpreter, ceiling).await, ok("True True\n"));
+        drop(interpreter);
+        container
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("the container stops");
+    }
+
+    /// The payload is read-only in a session, so a plain `pip install` puts a
+    /// package in the user site -- which the interpreter reads, so it imports
+    /// at once, with no restart and no `--user`.
+    #[tokio::test]
+    async fn a_plain_pip_install_imports_at_once_in_a_session_container() {
+        let container = alpine(true).await;
+        let interpreter = within(Interpreter::start(&container))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
+        let installed = "pip('install', '--no-index', wheel('/tmp', 'outrig_probe'))\n\
+                         import outrig_probe\n\
+                         home = os.path.expanduser('~/.local/')\n\
+                         print(outrig_probe.ANSWER, outrig_probe.__file__.startswith(home))";
+        assert_eq!(run(&interpreter, installed).await, ok("42 True\n"));
         drop(interpreter);
         container
             .stop(Duration::from_secs(2))

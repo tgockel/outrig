@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 
 use super::host::{ARGS, PRIMARY};
 use super::payload;
+use super::testing::{PIP_PROBE, host_home};
 
 /// How long any one reply may take. Generous for a loaded CI runner; nothing
 /// here comes close.
@@ -37,6 +38,7 @@ const OUTPUT_MAX: usize = 16 * 1024;
 const BG_MAX: usize = 2 * 1024;
 const REPR_MAX: usize = 1000;
 const INVENTORY_MAX: usize = 200;
+const HELP_MAX: usize = 8 * 1024;
 const QUEUE_MAX: usize = 256;
 const MESSAGE_MAX: usize = 1 << 20;
 const SEND_WINDOW: usize = 16;
@@ -148,29 +150,49 @@ struct Interpreter {
     ready: Value,
 }
 
+/// How a test starts the interpreter. By default: in the test's working
+/// directory, with [`host_home`] as `HOME`, under the ceiling it sets itself.
+#[derive(Default)]
+struct Start<'a> {
+    /// A soft `RLIMIT_DATA` already in place when it starts.
+    ceiling: Option<u64>,
+    /// Its working directory, which it takes for the workspace.
+    dir: Option<&'a Path>,
+    /// Its `HOME`, under which pip installs.
+    home: Option<&'a Path>,
+}
+
 impl Interpreter {
     fn start() -> Self {
-        Self::spawn(None)
+        Self::spawn(&Start::default())
     }
 
     /// The interpreter under a memory ceiling of `bytes`: a soft `RLIMIT_DATA`
     /// already in place when it starts, which it keeps rather than raising to
     /// its own. Far quicker to reach than half the machine.
     fn start_with_ceiling(bytes: u64) -> Self {
-        Self::spawn(Some(bytes))
+        Self::spawn(&Start {
+            ceiling: Some(bytes),
+            ..Start::default()
+        })
     }
 
-    fn spawn(ceiling: Option<u64>) -> Self {
+    fn spawn(start: &Start) -> Self {
         let mut command = Command::new(python());
         command
             .args(ARGS)
             .arg(PRIMARY)
+            .env("HOME", start.home.map_or_else(host_home, Path::to_path_buf))
+            .env_remove("PYTHONUSERBASE")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // A group of its own, so `Drop` reaches the children tests start.
             .process_group(0);
-        if let Some(bytes) = ceiling {
+        if let Some(dir) = start.dir {
+            command.current_dir(dir);
+        }
+        if let Some(bytes) = start.ceiling {
             let (_, hard) = getrlimit(Resource::RLIMIT_DATA).expect("RLIMIT_DATA");
             // SAFETY: the closure runs between fork and exec, and makes one
             // async-signal-safe call that neither allocates nor takes a lock.
@@ -296,8 +318,17 @@ impl Interpreter {
         answer
     }
 
+    /// An inventory's whole reply, from past the name `after` when given.
+    fn inventory_page(&mut self, id: u64, after: Option<&str>) -> Value {
+        let mut request = json!({"t": "inv", "agent": PRIMARY, "id": id});
+        if let Some(after) = after {
+            request["after"] = json!(after);
+        }
+        self.ask(request)
+    }
+
     fn inventory(&mut self, id: u64) -> Vec<(String, String)> {
-        self.ask(json!({"t": "inv", "agent": PRIMARY, "id": id}))["globals"]
+        self.inventory_page(id, None)["globals"]
             .as_array()
             .expect("globals")
             .iter()
@@ -2802,4 +2833,374 @@ fn a_wait_registers_with_each_future_once() {
         len(done), len(pending), Counted.registered
         "#);
     assert_eq!(k.output(1, &source), "(100, 0, 100)\n");
+}
+
+// ---------------------------------------------------------------------------- what the agent can ask
+
+/// The echo renders inside the execution that asked, so a `__repr__` that
+/// never returns wedges that execution alone, and the interrupt ends it. The
+/// inventory renders outside any, so it names the value without calling it.
+#[test]
+fn a_looping_repr_wedges_only_its_execution_and_the_inventory_still_answers() {
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(r#"
+            import os
+            class Loop:
+                def __repr__(self):
+                    os.write(2, b'IN REPR\n')
+                    while True:
+                        pass
+            x = Loop()
+            "#),
+    );
+    k.submit(2, "x");
+    k.await_stderr("IN REPR");
+    k.interrupt(2, false);
+    let error = error_of(&k.result_of(2));
+    assert!(error.contains(INTERRUPTED), "{error}");
+    let held = k.inventory(3);
+    assert!(held.contains(&("x".into(), "Loop".into())), "{held:?}");
+    assert_eq!(k.output(5, "runtime.names()['x']"), "'Loop'\n");
+}
+
+/// A listing past the cap says how many names there are and how many it
+/// left out, and the next page starts after its last name.
+#[test]
+fn an_over_cap_inventory_counts_what_it_left_out_and_offers_the_rest() {
+    let mut k = Interpreter::start();
+    k.output(1, "globals().update({f'v{i:03}': i for i in range(250)})");
+    let first = k.inventory_page(2, None);
+    let rows = first["globals"].as_array().expect("globals");
+    assert_eq!(rows.len(), INVENTORY_MAX);
+    assert_eq!((&first["total"], &first["more"]), (&json!(250), &json!(50)));
+    let last = text(&rows[INVENTORY_MAX - 1][0]);
+    assert_eq!(last, "v199");
+
+    let rest = k.inventory_page(3, Some(&last));
+    let rows = rest["globals"].as_array().expect("globals");
+    assert_eq!((rows.len(), text(&rows[0][0])), (50, "v200".to_string()));
+    assert_eq!((&rest["total"], &rest["more"]), (&json!(250), &json!(0)));
+
+    // The agent's own listing is a value, so it is whole; the runtime's
+    // names are not in it.
+    assert_eq!(
+        k.output(
+            4,
+            "names = runtime.names()\nlen(names), names['v249'], 'asyncio' in names, 'runtime' in names"
+        ),
+        "(250, 'int', False, False)\n"
+    );
+}
+
+#[test]
+fn help_describes_a_runtime_object_within_its_bound() {
+    let mut k = Interpreter::start();
+    let wait = k.output(1, "help(runtime.wait)");
+    assert!(
+        wait.contains("async wait(fs, *, timeout=None, return_when='ALL_COMPLETED')")
+            && wait.contains("Wait for the futures in `fs` as `asyncio.wait` does"),
+        "{wait}"
+    );
+    let python = k.output(2, "help(runtime.python)");
+    assert!(
+        python.contains("Compiled code never loads") && python.contains("image_python"),
+        "{python}"
+    );
+
+    // All of asyncio is some 225 KB; the answer is cut at a line, and says
+    // how to ask for less.
+    let result = k.exec(3, "help(asyncio)");
+    assert_eq!(result["dropped"], 0, "{result}");
+    let asyncio = text(&result["output"]);
+    let (kept, marker) = asyncio
+        .rsplit_once("[help cut at ")
+        .unwrap_or_else(|| panic!("no cut marker: {asyncio}"));
+    assert!(
+        kept.chars().count() <= HELP_MAX && kept.ends_with('\n'),
+        "{kept}"
+    );
+    assert!(marker.contains("help(x.name)"), "{marker}");
+
+    // No interactive utility to read /dev/null: a guide, and back.
+    assert!(
+        k.output(4, "help()").starts_with("help(x) describes x"),
+        "{}",
+        k.stderr()
+    );
+    assert!(k.output(5, "help('for')").contains("The \"for\" statement"));
+
+    // A module search writes its matches to the answer, after its heading and within the bound.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let synopsis = format!("outrigsearchprobe {}", "x".repeat(2 * HELP_MAX));
+    std::fs::write(
+        dir.path().join("outrig_search_probe.py"),
+        format!("\"\"\"{synopsis}\"\"\"\n"),
+    )
+    .expect("write");
+    k.output(6, &format!("import sys\nsys.path.append({:?})", dir.path()));
+    let search = k.output(7, "help('modules outrigsearchprobe')");
+    let (kept, marker) = search
+        .rsplit_once("[help cut at ")
+        .unwrap_or_else(|| panic!("no cut marker: {search}"));
+    assert!(
+        kept.chars().count() <= HELP_MAX
+            && kept.starts_with("\nHere is a list of modules")
+            && kept.contains("outrig_search_probe - outrigsearchprobe xxx"),
+        "{kept}"
+    );
+    assert!(marker.contains("help(x.name)"), "{marker}");
+}
+
+/// Each failure whose reason is this interpreter says so, and what else is
+/// wrong with an import is left as Python put it.
+#[test]
+fn a_failed_import_says_why_when_the_reason_is_this_interpreter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Carries this interpreter's suffix on every architecture, so it is found
+    // and then cannot be loaded.
+    std::fs::write(dir.path().join("native.abi3.so"), b"not really").expect("write");
+    // Built for glibc, so it is not even found.
+    std::fs::write(
+        dir.path()
+            .join("glibc_only.cpython-313-x86_64-linux-gnu.so"),
+        b"",
+    )
+    .expect("write");
+    let package = dir.path().join("purepkg");
+    std::fs::create_dir(&package).expect("mkdir");
+    std::fs::write(package.join("__init__.py"), b"").expect("write");
+    std::fs::write(
+        package.join("_speedups.cpython-313-x86_64-linux-gnu.so"),
+        b"",
+    )
+    .expect("write");
+
+    let mut k = Interpreter::start();
+    k.output(1, &format!("import sys\nsys.path.append({:?})", dir.path()));
+    let explained = [
+        ("import native", "cannot import 'native': "),
+        ("import glibc_only", "cannot import 'glibc_only': "),
+        (
+            "import purepkg._speedups",
+            "cannot import 'purepkg._speedups': ",
+        ),
+    ];
+    for (id, (source, head)) in (2..).zip(explained) {
+        let error = error_of(&k.exec(id, source));
+        let line = error.lines().last().expect("an exception line");
+        assert!(
+            line.contains(head)
+                && line.contains(
+                    ".so is compiled code, and this interpreter cannot load compiled code"
+                )
+                && line.contains("through subprocess, or as a service."),
+            "{error}"
+        );
+    }
+    let absent = error_of(&k.exec(5, "import numpy_outrig_absent"));
+    assert!(
+        absent.lines().last().is_some_and(|line| line.starts_with(
+            "ModuleNotFoundError: No module named 'numpy_outrig_absent'. If a pure-Python \
+             package provides it, `pip install` that package"
+        )),
+        "{absent}"
+    );
+    // Explained through a cause, as the traceback shows it.
+    let chained = error_of(&k.exec(
+        6,
+        "try:\n    import numpy_outrig_absent\nexcept ImportError as e:\n    raise RuntimeError('needs it') from e",
+    ));
+    assert!(chained.contains("`pip install` that package"), "{chained}");
+
+    // Left alone: a submodule a pure package lacks, a platform's missing
+    // standard module, and what code that catches the error sees itself.
+    let missing = error_of(&k.exec(7, "import purepkg.missing"));
+    assert!(
+        missing.ends_with("ModuleNotFoundError: No module named 'purepkg.missing'\n"),
+        "{missing}"
+    );
+    let winreg = error_of(&k.exec(8, "import winreg"));
+    assert!(
+        winreg.ends_with("ModuleNotFoundError: No module named 'winreg'\n"),
+        "{winreg}"
+    );
+    assert_eq!(
+        k.output(
+            9,
+            "try:\n    import other_outrig_absent\nexcept ImportError as e:\n    print(e)"
+        ),
+        "No module named 'other_outrig_absent'\n"
+    );
+
+    // A task nobody awaited is reported by asyncio's handler, and explained there too.
+    k.output(
+        10,
+        &py(r#"
+            async def needs():
+                await asyncio.sleep(0)
+                import background_outrig_absent
+            asyncio.ensure_future(needs())
+            None
+            "#),
+    );
+    let result = k.exec(11, "import gc\ngc.collect()\nawait asyncio.sleep(0)\nNone");
+    let billed = background_text(&result, 10);
+    assert!(billed.contains("`pip install` that package"), "{result}");
+}
+
+/// Explaining a failed import reads a namespace package's path as importlib last computed it.
+/// Iterating it would compute it again once its parent's path had changed, through every path
+/// hook and finder the agent installed, outside the execution that installed them.
+#[test]
+fn explaining_a_failed_import_runs_no_finder_the_agent_installed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (hooked, namespace, later) = (
+        dir.path().join("hooked"),
+        dir.path().join("namespace"),
+        dir.path().join("later"),
+    );
+    for path in [&hooked, &namespace.join("nspkg"), &later] {
+        std::fs::create_dir_all(path).expect("mkdir");
+    }
+    let mut k = Interpreter::start();
+    k.output(
+        1,
+        &py(&format!(
+            r#"
+            import sys
+            HOOKED, NAMESPACE, LATER = {hooked:?}, {namespace:?}, {later:?}
+            calls, armed = [], [False]
+            class Finder:
+                def find_spec(self, name, target=None):
+                    if armed[0]:
+                        calls.append(name)
+                    return None
+            def hook(path):
+                if path == HOOKED:
+                    return Finder()
+                raise ImportError(path)
+            sys.path_hooks.insert(0, hook)
+            sys.path += [HOOKED, NAMESPACE]
+            import nspkg
+            "#
+        )),
+    );
+    let failed = error_of(&k.exec(
+        2,
+        &py(r#"
+            try:
+                import nspkg.missing
+            finally:
+                armed[0] = True
+                sys.path.append(LATER)
+            "#),
+    ));
+    assert!(
+        failed.ends_with("ModuleNotFoundError: No module named 'nspkg.missing'\n"),
+        "{failed}"
+    );
+    assert_eq!(k.output(3, "calls"), "[]\n");
+}
+
+/// The case an agent reaches for first: a module of the project's own. The
+/// workspace follows the standard library, so a file named like a standard
+/// module does not replace it.
+#[test]
+fn a_pure_python_module_in_the_workspace_imports() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("wsmod.py"),
+        b"X = 'from the workspace'\n",
+    )
+    .expect("write");
+    std::fs::write(workspace.path().join("colorsys.py"), b"SHADOWED = True\n").expect("write");
+    let mut k = Interpreter::spawn(&Start {
+        dir: Some(workspace.path()),
+        ..Start::default()
+    });
+    assert_eq!(
+        k.output(1, "import wsmod\nwsmod.X"),
+        "'from the workspace'\n"
+    );
+    assert_eq!(
+        k.output(2, "import colorsys\nhasattr(colorsys, 'rgb_to_hsv')"),
+        "True\n"
+    );
+    assert_eq!(
+        k.output(3, "print(runtime.python.workspace)"),
+        format!("{}\n", workspace.path().display())
+    );
+}
+
+/// `pip` on `PATH` is the interpreter's own, and what it installs imports in
+/// the running interpreter, without a restart. `--user` is explicit only
+/// because the payload is writable on the host, and this test must not write
+/// into it; in a session it is read-only, and pip picks the user site itself,
+/// which the e2e suite checks.
+#[test]
+fn pip_installs_a_pure_package_that_imports_at_once() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let wheels = tempfile::tempdir().expect("tempdir");
+    // pip runs in the workspace, and a project's own files are not pip's: one named `pip.py`
+    // would run in its place, and one named `types.py` would stop it starting.
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(workspace.path().join("pip.py"), b"print('not pip')\n").expect("write");
+    std::fs::write(workspace.path().join("types.py"), b"X = 42\n").expect("write");
+    let mut k = Interpreter::spawn(&Start {
+        dir: Some(workspace.path()),
+        home: Some(home.path()),
+        ..Start::default()
+    });
+    k.output(1, PIP_PROBE);
+    // Variables an image sets for its own Python, which would stop this one's pip starting, or
+    // stop it installing to the user site. Its own Python still gets them.
+    k.output(
+        4,
+        "os.environ.update(PYTHONHOME='/nonexistent', PYTHONNOUSERSITE='1')\n\
+         subprocess.run(['sh', '-c', 'test \"$PYTHONHOME\" = /nonexistent'], check=True)\n\
+         None",
+    );
+    let installed = format!(
+        "pip('install', '--user', '--no-index', wheel({wheels:?}, 'outrig_probe'))\n\
+         import outrig_probe, shutil\n\
+         (outrig_probe.ANSWER, outrig_probe.__file__.startswith({home:?}), \
+          shutil.which('pip') == os.path.expanduser('~/.local/share/outrig/bin/pip'))",
+        wheels = wheels.path(),
+        home = home.path(),
+    );
+    assert_eq!(k.output(2, &installed), "(42, True, True)\n");
+    // `--target` is not in the way either.
+    let target = format!(
+        "import sys\n\
+         pip('install', '--no-index', '--target', {target:?}, wheel({wheels:?}, 'outrig_target'))\n\
+         sys.path.append({target:?})\n\
+         import outrig_target\n\
+         outrig_target.ANSWER",
+        target = wheels.path().join("target"),
+        wheels = wheels.path(),
+    );
+    assert_eq!(k.output(3, &target), "42\n");
+}
+
+/// Bounding what the model sees of a value does not bound the value: it
+/// stays whole in Python, and a later execution reads any part of it exactly.
+#[test]
+fn a_value_larger_than_the_context_stays_whole_and_only_its_observation_is_cut() {
+    let mut k = Interpreter::start();
+    let size = (8 << 20) + 3;
+    k.output(1, "big = 'x' * (8 << 20) + 'END'");
+    let echo = k.output(2, "big");
+    assert!(
+        echo.len() < REPR_MAX + 64 && echo.ends_with(&format!("... [{} chars]\n", size + 2)),
+        "{echo}"
+    );
+    let printed = k.exec(3, "print(big)");
+    assert_eq!(text(&printed["output"]).len(), OUTPUT_MAX);
+    assert_eq!(printed["dropped"], size + 1 - OUTPUT_MAX, "{printed}");
+    assert_eq!(
+        k.output(4, "len(big), big[-3:], big[4_000_000:4_000_003]"),
+        format!("({size}, 'END', 'xxx')\n")
+    );
 }

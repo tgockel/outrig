@@ -6,6 +6,7 @@
 //! the real interpreter this way.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -36,6 +37,14 @@ pub(crate) fn ok(output: &str) -> Outcome {
     })
 }
 
+/// The `HOME` an interpreter run on the host gets unless its test gives one of
+/// its own: one directory per user under the system's temporary directory.
+/// The interpreter makes pip's user site under `HOME` as it starts, and that
+/// must never land in the real home of whoever runs the tests.
+pub(crate) fn host_home() -> PathBuf {
+    std::env::temp_dir().join(format!("outrig-test-home-{}", nix::unistd::getuid()))
+}
+
 /// The payload's interpreter, started as `Interpreter::start` starts it but on
 /// the host, with `agent` as its argument when there is one.
 pub(super) async fn spawn(agent: Option<&str>) -> Child {
@@ -46,6 +55,8 @@ pub(super) async fn spawn(agent: Option<&str>) -> Child {
     tokio::process::Command::new(python)
         .args(ARGS)
         .args(agent)
+        .env("HOME", host_home())
+        .env_remove("PYTHONUSERBASE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,8 +142,15 @@ impl Fake {
     /// Answer the next request, which must be an inventory, with an empty one.
     pub(crate) async fn answer_inventory(&mut self) {
         let request = self.expect("inv").await;
-        self.send(json!({"t": "inv", "agent": PRIMARY, "id": request["id"], "globals": []}))
-            .await;
+        self.inventory(&request["id"]).await;
+    }
+
+    /// An empty inventory, as the answer to request `id`.
+    pub(crate) async fn inventory(&mut self, id: &Value) {
+        self.send(json!({
+            "t": "inv", "agent": PRIMARY, "id": id, "globals": [], "total": 0, "more": 0
+        }))
+        .await;
     }
 
     pub(crate) async fn result(&mut self, id: ExecId, fields: Value) {
@@ -174,3 +192,35 @@ pub(crate) async fn pull_alpine() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
 }
+
+// ---------------------------------------------------------------------------- pip
+
+/// Python binding `wheel(directory, module)`, which writes a pure-Python wheel
+/// whose one module holds `ANSWER = 42` and returns its path, and `pip(*args)`,
+/// which runs the `pip` on `PATH` and raises with everything it said if it
+/// fails. A wheel installed with `--no-index` needs no network.
+pub(crate) const PIP_PROBE: &str = r#"
+import os, subprocess, zipfile
+
+def wheel(directory, module):
+    dist = f"{module}-1.0.dist-info"
+    path = os.path.join(directory, f"{module}-1.0-py3-none-any.whl")
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(f"{module}.py", "ANSWER = 42\n")
+        z.writestr(f"{dist}/METADATA", f"Metadata-Version: 2.1\nName: {module}\nVersion: 1.0\n")
+        z.writestr(
+            f"{dist}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: outrig-tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        z.writestr(f"{dist}/RECORD", "")
+    return path
+
+def pip(*args):
+    run = subprocess.run(
+        ["pip", "--isolated", "--disable-pip-version-check", "--no-cache-dir", *args],
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode:
+        raise RuntimeError(f"pip {args} exited {run.returncode}:\n{run.stdout}{run.stderr}")
+"#;

@@ -585,7 +585,9 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
         system.starts_with("You act on this project by writing Python.")
             && system.contains("`runtime.wait` is `asyncio.wait`")
             && system.contains("`runtime.MessageAvailable`, which `except Exception` does not")
-            && system.contains("`pip install` does not work")
+            && system.contains("`pip install` adds pure-Python packages, which import at once")
+            && system.contains("Nothing compiled loads here")
+            && system.contains("`help(runtime)` describes what OutRig gives you.")
             && system.ends_with("\n\nYou write Python."),
         "{system}"
     );
@@ -613,7 +615,10 @@ async fn the_system_prompt_is_the_orientation_then_the_configured_preamble() {
 fn the_orientation_names_the_workspace_when_there_is_one() {
     let text = super::orientation::preamble(Some(std::path::Path::new("/workspace")), None);
     assert!(
-        text.contains("Your working directory is /workspace, which holds the project's files."),
+        text.contains(
+            "Your working directory is /workspace, which holds the project's files; its Python \
+             modules import too."
+        ),
         "{text}"
     );
 }

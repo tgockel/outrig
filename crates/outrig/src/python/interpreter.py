@@ -48,6 +48,7 @@ import contextvars
 import dataclasses
 import datetime
 import functools
+import importlib
 import inspect
 import io
 import json
@@ -56,7 +57,10 @@ import mmap
 import os
 import resource
 import select
+import shlex
+import shutil
 import signal
+import site
 import subprocess
 import sys
 import threading
@@ -70,7 +74,8 @@ import typing
 OUTPUT_MAX = 16 * 1024  # bytes of one execution's own output
 BG_MAX = 2 * 1024  # bytes of other executions' output held for the next result, tail kept
 REPR_MAX = 1000  # one echoed value, or one inventory entry
-INVENTORY_MAX = 200  # global names listed
+INVENTORY_MAX = 200  # global names listed in one inventory
+HELP_MAX = 8 * 1024  # characters of one `help()` answer
 DRAIN_TIMEOUT = 5.0  # seconds a result waits for its pipe to reach the end of the body's output
 
 # musl gives a thread 128 KiB of stack, far short of what CPython's recursion limits assume: deep
@@ -595,6 +600,11 @@ def _attributed_exception(loop, context):
     """
     if isinstance(context.get("exception"), MemoryError):
         _give_reserve()
+    try:
+        _explain_imports(context.get("exception"))
+    except BaseException as e:
+        # Named by its type, read around its metaclass: its repr is anyone's code.
+        _diag(f"a failed import could not be explained: {_type_name(type(e))}")
     source = context.get("task") or context.get("future") or context.get("handle")
     get_context = getattr(source, "get_context", None)
     token = _CURRENT.set(None if get_context is None else get_context().get(_CURRENT))
@@ -726,6 +736,345 @@ class _Loop(asyncio.SelectorEventLoop):
         return super().call_soon(callback, *args, context=context)
 
 
+# ---------------------------------------------------------------------------- imports
+
+# What the agent imports, besides the standard library: modules in the workspace, and packages
+# `pip install` adds. Running isolated (`-I`) keeps both off `sys.path`, so `_open_imports` puts
+# them back, after the standard library, so that a project file named like a standard module --
+# `types.py` -- cannot replace one this program imports later.
+#
+# `pip` is the payload's own. The payload is mounted read-only, so pip installs into the user site
+# instead, `~/.local/lib/python3.13/site-packages`, which is on `sys.path` from the start. It is
+# made here if it is missing: an import that finds no directory at a path remembers that, and would
+# not look again when pip later made one there. Its `.pth` files are not read, so nothing
+# installed runs when the interpreter starts.
+#
+# Compiled code never loads. This is a static build, with no way to load a shared object, so a
+# compiled module fails however it was installed -- as `Dynamic loading not supported` when its
+# file carries this interpreter's suffix, and as a bare "No module named" when it was built for
+# another. `_explain_imports` says so where a failure is reported.
+
+# The directory the interpreter started in: the workspace, since the host starts it there.
+_WORKSPACE = None
+# This interpreter's version, as the host is told it and the agent reads it.
+_VERSION = sys.version.split()[0]
+
+
+# The `pip` on the agent's `PATH`: this interpreter's pip, started clear of every `PYTHON*`
+# variable but `PYTHONUSERBASE`. The image sets the others for its own Python, and one such as
+# `PYTHONHOME` stops this one starting at all; `PYTHONUSERBASE` says where pip installs, which this
+# interpreter reads as well. Cleared for pip and what it starts in turn, such as a build, and for
+# nothing else the agent runs, so the image's Python still gets them. The first Python runs
+# isolated, so they cannot stop it either. The second runs with `-P`, since `-m` would otherwise put
+# the working directory -- the workspace -- ahead of everything, where a project's `pip.py` would
+# run instead of pip and its `types.py` would stop it starting; not `-I`, which would also turn off
+# the user site pip falls back to.
+_PIP = """#!/bin/sh
+exec {python} -I -c '
+import os, sys
+env = {{k: v for k, v in os.environ.items() if not k.startswith("PYTHON") or k == "PYTHONUSERBASE"}}
+os.execve(sys.executable, [sys.executable, "-P", "-m", "pip", *sys.argv[1:]], env)
+' "$@"
+"""
+
+
+def _open_imports():
+    """Put the workspace and pip's install location on `sys.path`, and pip on `PATH`.
+
+    `pip` goes first on `PATH`, from a directory of its own under the user base, so it means this
+    interpreter's pip while `python3` still means the image's own Python; the scripts pip installs
+    follow it. Every process the interpreter starts inherits the `PATH`, and nothing else in the
+    container sees it.
+
+    That `pip` is `_PIP`, not the payload's own script, which would start this Python in whatever
+    `PYTHON*` variables the image sets for its own.
+    """
+    global _WORKSPACE
+    try:
+        _WORKSPACE = os.getcwd()
+        sys.path.append(_WORKSPACE)
+    except OSError as e:
+        _diag(f"the working directory is not importable: {e!r}")
+    user_site = site.getusersitepackages()
+    try:
+        os.makedirs(user_site, exist_ok=True)
+    except OSError as e:
+        _diag(f"packages pip installs will not import: {user_site} could not be made: {e!r}")
+    sys.path.append(user_site)
+    front = []
+    pip = os.path.join(site.getuserbase(), "share", "outrig", "bin")
+    script = _PIP.format(python=shlex.quote(sys.executable)).encode()
+    try:
+        os.makedirs(pip, exist_ok=True)
+        for name in ("pip", "pip3", f"pip{sys.version_info.major}.{sys.version_info.minor}"):
+            # Written beside the script and renamed over it, so an interpreter starting at the same
+            # time under the same `HOME` never finds it missing or half written.
+            path, made = os.path.join(pip, name), os.path.join(pip, f".{name}.{os.getpid()}")
+            fd = os.open(made, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o755)
+            try:
+                _write_all(fd, script)
+            finally:
+                os.close(fd)
+            os.replace(made, path)
+        front.append(pip)
+    except OSError as e:
+        _diag(f"`pip` is not on PATH: {e!r}")
+    front.append(os.path.join(site.getuserbase(), "bin"))
+    os.environ["PATH"] = os.pathsep.join([*front, os.environ.get("PATH", os.defpath)])
+
+
+def _image_python():
+    """The image's own Python: the first `python3` or `python` on `PATH` that is not this one."""
+    ours = os.path.realpath(sys.prefix) + os.sep
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found and not os.path.realpath(found).startswith(ours):
+            return found
+    return None
+
+
+# What every explanation of a failed import says, and how one already explained is recognized.
+_NO_COMPILED = "this interpreter cannot load compiled code"
+# A compiled module's file, built for any interpreter: this one's suffixes all end in `.so`.
+_COMPILED_SUFFIXES = (".so", ".pyd")
+# What a namespace package's `__path__` is.
+_NamespacePath = importlib._bootstrap_external._NamespacePath
+
+
+def _elsewhere():
+    """Where code that needs compiled packages can run, as a sentence."""
+    found = _image_python()
+    python = f"the image's own Python, {found}," if found else "a Python the image provides"
+    return (
+        f"Code that needs a compiled package can run with {python} through subprocess, or as a "
+        f"service."
+    )
+
+
+def _compiled_file(name):
+    """A compiled file where module `name` would be, or `None`.
+
+    Looked for where the import looked: its package's `__path__`, or `sys.path` for a top-level
+    module. Read without running agent code: the package is taken only if it is a plain module, and
+    its path only if it is a list, or importlib's namespace path as it last computed it --
+    iterating one computes it again when its parent's path has changed, through every path hook
+    and finder the agent installed.
+    """
+    parent, _, leaf = name.rpartition(".")
+    if parent:
+        package = sys.modules.get(parent)
+        if type(package) is not types.ModuleType:
+            return None
+        where = package.__dict__.get("__path__")
+    else:
+        where = sys.path
+    if type(where) is _NamespacePath:
+        where = where._path
+    if type(where) is not list:
+        return None
+    prefix = f"{leaf}."
+    for directory in list(where):
+        if type(directory) is not str:
+            continue
+        try:
+            entries = os.listdir(directory or ".")
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.startswith(prefix) and entry.endswith(_COMPILED_SUFFIXES):
+                return os.path.join(directory, entry)
+    return None
+
+
+def _explain_import(exc):
+    """Rewrite a failed import's message to say why it failed here, if the reason is this
+    interpreter: compiled code, or a top-level module that is nowhere. Only `ImportError` and
+    `ModuleNotFoundError` themselves are read, never a subclass, so no agent code runs."""
+    kind = type(exc)
+    if kind is not ImportError and kind is not ModuleNotFoundError:
+        return
+    name, message = exc.name, exc.msg
+    if type(name) is not str or type(message) is not str or _NO_COMPILED in message:
+        return
+    path = exc.path
+    if kind is ImportError:
+        compiled = path if type(path) is str and path.endswith(_COMPILED_SUFFIXES) else None
+        if compiled is None:
+            return
+    else:
+        compiled = _compiled_file(name)
+    if compiled is not None:
+        text = (
+            f"cannot import {name!r}: {compiled} is compiled code, and {_NO_COMPILED}, however it "
+            f"is installed. {_elsewhere()}"
+        )
+    elif "." not in name and name not in sys.stdlib_module_names:
+        text = (
+            f"{message}. If a pure-Python package provides it, `pip install` that package and "
+            f"import it again. A package with compiled parts will not import however it is "
+            f"installed: {_NO_COMPILED}. {_elsewhere()}"
+        )
+    else:
+        return
+    exc.msg = text
+    exc.args = (text,)
+
+
+_cause_of = BaseException.__dict__["__cause__"].__get__
+_context_of = BaseException.__dict__["__context__"].__get__
+_members_of = BaseExceptionGroup.__dict__["exceptions"].__get__
+
+
+def _explain_imports(exc):
+    """Explain each failed import a traceback of `exc` would show: `exc`, its causes and contexts,
+    and an exception group's members. Read through `BaseException`'s own descriptors, so a
+    property an agent's exception class defines is never run.
+
+    Done where a failure is reported rather than in the import system, so a library that tries an
+    optional import behaves as it would anywhere, and an import that works costs nothing. An agent
+    that catches the error and prints it sees Python's own message.
+    """
+    seen = set()
+    stack = [exc]
+    while stack and len(seen) < 100:
+        exc = stack.pop()
+        if exc is None or id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        _explain_import(exc)
+        stack += (_cause_of(exc), _context_of(exc))
+        if issubclass(type(exc), BaseExceptionGroup):
+            stack += _members_of(exc)
+
+
+class Python:
+    """What this interpreter can run, readable before an import is tried.
+
+    It is OutRig's own CPython, built static and mounted read-only, so it runs in an image that
+    has no Python of its own.
+
+    - The standard library imports, but for modules of other platforms such as `winreg`.
+      `importlib.util.find_spec(name)` says whether a module is anywhere on `sys.path` without
+      importing it.
+    - `pip install` adds pure-Python packages, which import at once, with no restart. This `pip`
+      is the interpreter's own: it installs into the user site, which is on `sys.path`, and puts a
+      package's scripts on `PATH`. An image Python of the same version reads that user site too.
+      `pip install --target DIR` works as well, once `DIR` is appended to `sys.path`.
+    - Modules in the workspace -- the directory the interpreter started in, `workspace` below --
+      import too. It comes after the standard library on `sys.path`, so a file of yours named like
+      a standard module does not replace it.
+    - Compiled code never loads: this is a static build, with no way to load a shared object. A
+      package with compiled parts -- numpy, pandas, pydantic, lxml, cryptography -- does not
+      import however it is installed, and `ctypes` imports but cannot load a library.
+    - Code that needs such a package runs with the image's own Python, `image_python` below,
+      through `subprocess`, where `python3 -m pip` installs for that Python. Or it runs as a
+      service.
+    """
+
+    @property
+    def version(self):
+        """This interpreter's version, as `"3.13.15"`."""
+        return _VERSION
+
+    @property
+    def workspace(self):
+        """The directory this interpreter started in, whose modules import; `None` if unknown."""
+        return _WORKSPACE
+
+    @property
+    def image_python(self):
+        """The image's own Python on `PATH`, or `None` if it has none there."""
+        return _image_python()
+
+    def __repr__(self):
+        workspace = "" if _WORKSPACE is None else f" ({_WORKSPACE})"
+        return (
+            f"<python: OutRig's static CPython {self.version}, with the standard library. `pip "
+            f"install` adds pure-Python packages, which import at once, and modules in the "
+            f"workspace{workspace} import too. Compiled code never loads, so numpy, pandas, and "
+            f"other packages with compiled parts do not import however they are installed. "
+            f"{_elsewhere()} help(runtime.python) says more.>"
+        )
+
+
+_PYTHON = Python()
+
+
+# ---------------------------------------------------------------------------- help
+
+_HELP_GUIDE = (
+    "help(x) describes x -- a function's signature and docstring, a class's methods, a module's "
+    f"contents -- in at most {HELP_MAX} characters. help(runtime) describes what OutRig gives "
+    "you: your channels, runtime.wait, and runtime.names(). help(runtime.python) says what this "
+    "interpreter can import, and where code that needs more can run."
+)
+
+
+@functools.cache
+def _pydoc_helper():
+    """pydoc's `Helper`, writing every answer to its output.
+
+    Its search, `help('modules <key>')`, prints each match itself instead, past the bound and ahead
+    of its own heading. Redirecting `sys.stdout` around it would take other executions' output with
+    it, so the search is done here, as pydoc does it, writing where the rest goes.
+    """
+    import pydoc
+    import warnings
+
+    class Helper(pydoc.Helper):
+        def listmodules(self, key=""):
+            if not key:
+                return super().listmodules()
+            output = self.output
+            output.write(f"\nHere is a list of modules whose name or summary contains {key!r}.\n\n")
+
+            def found(path, name, synopsis):
+                if name.endswith(".__init__"):
+                    name = f"{name.removesuffix('.__init__')} (package)"
+                output.write(f"{name} - {synopsis}\n" if synopsis else f"{name}\n")
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                pydoc.ModuleScanner().run(found, key, onerror=lambda name: None)
+
+    return Helper
+
+
+class _Help:
+    """`help(x)`: what `pydoc` says of `x` -- its signature and docstring, and its members' --
+    in at most `HELP_MAX` characters.
+
+    Replaces `site`'s, whose `help()` starts an interactive utility that would read `/dev/null`,
+    and whose answers are as long as the thing described: all of `asyncio` is 225 KB. It runs in
+    the execution that asked, like any other code the agent calls.
+    """
+
+    def __repr__(self):
+        return "Type help(x) for help about x, or help() for where to start."
+
+    def __call__(self, *request):
+        if not request:
+            print(_HELP_GUIDE)
+            return
+        import pydoc
+
+        answer = io.StringIO()
+        _pydoc_helper()(input=io.StringIO(), output=answer)(*request)
+        text = answer.getvalue()
+        if len(text) > HELP_MAX:
+            # At a line break if one falls in the bound's second half, so a single long line --
+            # one module's summary -- is cut rather than dropped whole.
+            cut = text.rfind("\n", HELP_MAX // 2, HELP_MAX) + 1 or HELP_MAX
+            text = (
+                f"{text[:cut]}[help cut at {cut} of {len(text)} characters: ask about one member, "
+                f"as help(x.name), or read inspect.signature(x) or x.__doc__]\n"
+            )
+        sys.stdout.write(text)
+
+
+builtins.help = _Help()
+
+
 # ---------------------------------------------------------------------------- kernels
 
 _kernels = {}
@@ -783,9 +1132,15 @@ def _format_error(exc):
     to report.
 
     Formatted on the reserve: the failure may be that memory ran out, and the traceback still holds
-    whatever its frames had built.
+    whatever its frames had built. A failed import this interpreter is the reason for is explained
+    first, and one that cannot be is reported as Python put it.
     """
     _give_reserve()
+    try:
+        _explain_imports(exc)
+    except BaseException as e:
+        # Named by its type, read around its metaclass: its repr is anyone's code.
+        _diag(f"a failed import could not be explained: {_type_name(type(e))}")
     try:
         tb = exc.__traceback__
         while tb is not None and tb.tb_frame.f_code.co_filename != "<execution>":
@@ -1177,17 +1532,37 @@ class Runtime:
 
     `await runtime.wait(fs)` waits as `asyncio.wait` does and watches every channel while it
     waits: see `help(runtime.wait)`.
+
+    `runtime.names()` lists what you have bound, with the type of each value.
+
+    `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
+    packages, and nothing compiled loads -- and where code that needs more can run.
     """
 
     MessageAvailable = MessageAvailable
 
-    def __init__(self, channels):
+    def __init__(self, channels, held):
         self._channels = types.MappingProxyType(channels)
+        self._held = held
 
     @property
     def channels(self):
         """This agent's channel endpoints, by name. Read-only."""
         return self._channels
+
+    @property
+    def python(self):
+        """What this interpreter can import, and where code that needs more can run."""
+        return _PYTHON
+
+    def names(self):
+        """Every name you have bound, as `{name: type name}`, sorted by name.
+
+        The runtime's own names are left out, until you rebind one. Only names and the types of
+        values are read -- no `repr()`, property, or iterator runs -- so it answers whatever the
+        values are. Look at a value itself with an expression of your own.
+        """
+        return dict(self._held())
 
     async def wait(self, fs, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
         """Wait for the futures in `fs` as `asyncio.wait` does, watching every channel meanwhile.
@@ -1292,7 +1667,7 @@ class Kernel:
         # The user's channel carries text both ways. Every agent has one, and the host is at the
         # other end of it.
         self.channels = {"user": Endpoint(agent, "user", receives=str, sends=str)}
-        self.globals["runtime"] = Runtime(self.channels)
+        self.globals["runtime"] = Runtime(self.channels, self.held)
         sys.modules[self.module.__name__] = self.module
         # Names bound at boot are infrastructure, not the model's work. Hidden by identity, so a
         # name the model rebinds is listed again.
@@ -1316,7 +1691,7 @@ class Kernel:
         self._bg_dropped = collections.Counter()
 
     def announce(self):
-        _send({"t": "ready", "agent": self.agent, "version": sys.version.split()[0]})
+        _send({"t": "ready", "agent": self.agent, "version": _VERSION})
 
     def serve(self):
         """Run this kernel's loop on the calling thread for the life of the process."""
@@ -1603,29 +1978,48 @@ class Kernel:
             for owner, parts in grouped.items()
         ]
 
-    def inventory(self, request_id):
+    def held(self):
+        """What the agent has bound, as `(name, type name)` pairs sorted by name.
+
+        Reads only the namespace's keys and the type of each value. Nothing here calls `repr()`, a
+        property, a descriptor, or an iterator -- all of those can execute code, block, or flood --
+        so it answers whatever the values are, and whoever asks.
+        """
+        return sorted(
+            (name, _type_name(type(value)))
+            for name, value in list(self.globals.items())
+            if type(name) is str
+            and not name.startswith("__")
+            and self._boot.get(name, _MISSING) is not value
+        )
+
+    def inventory(self, request_id, after):
         """A bounded listing of what the session holds, always answered.
 
-        Reports only names and type names. Nothing here calls `repr()`, a property, a descriptor,
-        or an iterator -- all of those can execute code, block, or flood.
+        The first `INVENTORY_MAX` names sorted after `after`, or from the first when it is `None`,
+        with how many names there are in all and how many come after the last one listed. So a
+        listing that stops short says so, and the next one starts from its last name.
         """
-        rows = []
+        rows, total, more = [], 0, 0
         try:
-            held = [
-                (name, value)
-                for name, value in list(self.globals.items())
-                if type(name) is str
-                and not name.startswith("__")
-                and self._boot.get(name, _MISSING) is not value
-            ]
-            held.sort(key=lambda row: row[0])
-            rows = [
-                [name[:REPR_MAX], _type_name(type(value))[:REPR_MAX]]
-                for name, value in held[:INVENTORY_MAX]
-            ]
+            held = self.held()
+            total = len(held)
+            if after is not None:
+                held = [row for row in held if row[0] > after]
+            more = max(len(held) - INVENTORY_MAX, 0)
+            rows = [[name[:REPR_MAX], kind[:REPR_MAX]] for name, kind in held[:INVENTORY_MAX]]
         except Exception as e:
             _diag(f"agent {self.agent!r}: the inventory failed: {e!r}")
-        _send({"t": "inv", "agent": self.agent, "id": request_id, "globals": rows})
+        _send(
+            {
+                "t": "inv",
+                "agent": self.agent,
+                "id": request_id,
+                "globals": rows,
+                "total": total,
+                "more": more,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------- interrupts
@@ -1786,6 +2180,14 @@ def _received(kernel, _, message):
     endpoint._received()
 
 
+def _inventory(kernel, request_id, message):
+    """List what the agent holds, on its loop, from past the name `after` when that is given."""
+    after = message.get("after")
+    kernel.loop.call_soon_threadsafe(
+        kernel.inventory, request_id, after if isinstance(after, str) else None
+    )
+
+
 def _pending(kernel, request_id, _):
     """Say how many messages wait on each of the agent's channels, and how many have ever been
     delivered to it, reading none of them."""
@@ -1800,9 +2202,7 @@ _ROUTES = {
     "msg": _msg,
     "pending": _pending,
     "received": _received,
-    "inv": lambda kernel, request_id, _: kernel.loop.call_soon_threadsafe(
-        kernel.inventory, request_id
-    ),
+    "inv": _inventory,
     "cpu": lambda kernel, request_id, _: kernel.cpu(request_id),
     "cancel": lambda kernel, request_id, _: kernel.cancel(request_id),
     "interrupt": lambda kernel, request_id, message: kernel.interrupt(
@@ -1876,6 +2276,7 @@ def main():
     global _primary
     # Before any agent exists, and every process it starts inherits it.
     _set_ceiling()
+    _open_imports()
     primary = Kernel(sys.argv[1])
     primary.thread = threading.current_thread()
     _kernels[primary.agent] = primary

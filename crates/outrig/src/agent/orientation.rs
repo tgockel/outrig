@@ -3,12 +3,17 @@
 //!
 //! It carries only what an agent cannot learn by looking and will need every
 //! round (`plan/phase/0003-python/discovery.md`). That names persist and that
-//! output is bounded is already in `submit_python`'s description, which the
-//! model also reads every round, so it is not repeated here. How the user
-//! reaches it is not, and every round opens on a count of messages that only
-//! makes sense with it. `runtime.wait` is that page's worked example: its
-//! signature is `asyncio.wait`'s on purpose, so nothing in it says that it
-//! watches the channels and raises while a message waits.
+//! output is bounded while values are not is already in `submit_python`'s
+//! description, which the model also reads every round, so it is not repeated
+//! here. How the user reaches it is not, and every round opens on a count of
+//! messages that only makes sense with it. `runtime.wait` is that page's
+//! worked example: its signature is `asyncio.wait`'s on purpose, so nothing in
+//! it says that it watches the channels and raises while a message waits.
+//!
+//! What this interpreter can import is here too, because the failure it heads
+//! off -- installing a compiled package, and finding it will not load -- costs
+//! a round to learn by trying. The rest is in docstrings: the orientation names
+//! `help(runtime)` and `runtime.python`, and those say the details.
 
 use std::path::Path;
 
@@ -37,14 +42,18 @@ pub(crate) fn preamble(workspace: Option<&Path>, configured: Option<&str>) -> St
     );
     if let Some(workspace) = workspace {
         text.push_str(&format!(
-            "Your working directory is {}, which holds the project's files.\n\n",
+            "Your working directory is {}, which holds the project's files; its Python modules \
+             import too.\n\n",
             workspace.display()
         ));
     }
     text.push_str(
-        "The interpreter is a static CPython with the standard library and nothing more. `pip \
-         install` does not work, and a third-party module with compiled parts cannot be imported \
-         here. Programs the container's image provides are reachable through `subprocess`.",
+        "The interpreter is OutRig's own static CPython, with the standard library. `pip install` \
+         adds pure-Python packages, which import at once. Nothing compiled loads here, so numpy and other packages with compiled parts \
+         do not import however they are installed; `runtime.python` says what can run here and \
+         where such code can run instead. Programs the container's image provides are reachable \
+         through `subprocess`. `help(x)` describes anything, and `help(runtime)` describes what \
+         OutRig gives you.",
     );
     if let Some(configured) = configured {
         text.push_str("\n\n");

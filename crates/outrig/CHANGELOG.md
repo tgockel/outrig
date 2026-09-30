@@ -43,10 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it -- and leaves the message queued and the operations running. Cancelling the code that waits
   does not cancel them either, where a task that code awaited directly is cancelled with it.
 
+  The agent can find out what it has and what it can run. `runtime.names()` returns every name
+  its code has bound, with the type of each value, read without calling `repr()` or anything else
+  the agent wrote. `help(x)` is Python's, cut at 8 KiB with a note on asking for less, and
+  `help()` prints a short guide instead of starting pydoc's interactive utility.
+  `runtime.python` says what the interpreter can import and where code that needs more can run.
+  Modules in the workspace import, after the standard library. Plain `pip install` adds
+  pure-Python packages: `pip` is the interpreter's own, it installs into the user site, and the
+  package imports without a restart. Compiled code cannot load in the static interpreter, and a
+  failed import says so -- naming the compiled file, or for a module found nowhere, saying that
+  `pip install` works for pure-Python packages only -- along with the image's own Python as the
+  place to run such code.
+
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
   user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
-  the working directory is the workspace, and the interpreter cannot install packages. The
-  agent's configured `preamble` follows it.
+  the working directory is the workspace, `pip install` adds pure-Python packages and nothing
+  compiled loads, and `help(runtime)` describes the rest. The agent's configured `preamble`
+  follows it.
 
   `PythonAgent::check` runs `start`'s model resolution without starting anything, so a caller can
   fail before pulling an image. `model`, `python_version`, and `container_name` report what a

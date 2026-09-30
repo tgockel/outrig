@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-10` | The agent can ask what it holds and what it cannot import          |
 | `0003-11` | The full conversation lives in Python; a view goes to the provider |
 | `0003-12` | The view is budgeted, and promotion has settled semantics          |
 
