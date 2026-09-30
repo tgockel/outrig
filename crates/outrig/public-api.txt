@@ -14,6 +14,14 @@ pub outrig::config::ApiKeyError::NotPresent
 pub outrig::config::ApiKeyError::NotPresent::var: alloc::string::String
 pub outrig::config::ApiKeyError::NotUnicode
 pub outrig::config::ApiKeyError::NotUnicode::var: alloc::string::String
+#[non_exhaustive] pub enum outrig::config::BuildImageNameError
+pub outrig::config::BuildImageNameError::Empty
+pub outrig::config::BuildImageNameError::InvalidCharacter
+pub outrig::config::BuildImageNameError::InvalidCharacter::character: char
+pub outrig::config::BuildImageNameError::InvalidSeparator
+pub outrig::config::BuildImageNameError::InvalidSeparator::separator: alloc::string::String
+pub outrig::config::BuildImageNameError::SeparatorAtEdge
+pub outrig::config::BuildImageNameError::SeparatorAtEdge::separator: char
 #[non_exhaustive] pub enum outrig::config::CapabilityProfile
 pub outrig::config::CapabilityProfile::Default
 pub outrig::config::CapabilityProfile::DropAll
@@ -596,6 +604,7 @@ pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32
 pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32
 pub const outrig::config::TOOL_RESULT_MAX_CEILING_BYTES: u32
 pub const outrig::config::TOOL_RESULT_MAX_FLOOR_BYTES: u32
+pub fn outrig::config::check_build_image_name(&str) -> core::result::Result<(), outrig::config::BuildImageNameError>
 pub fn outrig::config::merge(outrig::config::Config, outrig::config::Config) -> outrig::config::Config
 pub mod outrig::container
 pub mod outrig::container::embedded

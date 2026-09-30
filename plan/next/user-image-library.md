@@ -39,11 +39,10 @@ repo-local image-config.
   `global_config_path_with` (`crates/outrig-cli/src/paths.rs:125`). The `--global-config` case is
   what makes this testable without touching a real `$HOME`.
 - **Indexing** at config load: scan `<root>/*/image.toml`. The directory name is the image-config
-  name and must satisfy the existing `^[a-zA-Z][a-zA-Z0-9_-]*$` project-name check
-  (`plan/done/phase/0001-bootstrap/tasks/0001-70-standalone-image-init.md`) -- it has to be both a
-  clean image-ref token and a valid TOML bare key. Each hit synthesizes a build-shape
-  `[images.<name>]` entry whose `ConfigSource` is the project directory
-  (`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md`).
+  name and must satisfy `outrig::config::check_build_image_name`, the rule `image init` checks
+  project names with since #184 -- each hit is a build image, so its name is the repository podman
+  tags it with. Each hit synthesizes a build-shape `[images.<name>]` entry whose `ConfigSource` is
+  the project directory (`plan/done/phase/0002-sidecars/tasks/0002-20-config-path-provenance.md`).
 - **Precedence**, low to high: scanned library < global `[images.*]` < repo `[images.*]`. Same
   name-keyed, whole-entry, repo-wins rule as every other map in `merge.rs`.
 - **Shadow diagnostic**: when a higher layer overrides a library project, warn and name both

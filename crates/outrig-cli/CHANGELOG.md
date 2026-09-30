@@ -118,6 +118,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such as `images = "legacy"` or `[[images]]`, is refused before the first prompt, where it
   panicked too. Nothing is written until every prompt is answered, and a config that can't be
   written leaves the Dockerfile unwritten too.
+- **`outrig image add` refuses a name it can't build.** The name was used as given, while the
+  block it writes is held to the build-image rule when the config loads. `outrig image add
+  RustDev` wrote a Dockerfile and an `[images.RustDev]` block that `outrig build` and `outrig run`
+  then refused, and every image-config in the file stopped loading with it. A name like `../x` or
+  `/tmp/x` put the Dockerfile outside `.agents/outrig/images/`. The name must now be one the image
+  can be built under: lowercase letters and digits, separated by one `.`, one or two `_`, or a run
+  of `-`. One passed as `<name>` that isn't is refused before the first prompt, even with
+  `--force`, and nothing is written. One typed at the prompt, `outrig init`'s included, is asked
+  for again. Either way the error is the one loading a config with that block gives, and says
+  what is wrong with the name. The prompt's `?` help used to advertise a rule that allowed
+  uppercase. A repo folder whose name holds a letter outside ASCII now suggests `standard` rather
+  than a name Enter could never get past.
+- **`outrig image init` refuses a name its image can't be tagged with.** The directory name
+  becomes the image's ref, which podman requires be lowercase, yet `RustDev` passed, and
+  `outrig image build` then failed to tag the image. The name now follows the same rule as `image
+  add`'s. That also admits names the old rule refused, such as `rust.dev` or `2024-tools`; the
+  generated README quotes a dotted name in its `[images."rust.dev"]` header. A name of 64 hex
+  digits is refused, whatever it starts with: the ref carries no tag, and podman reads it as an
+  image ID.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

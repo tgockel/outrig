@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`config::check_build_image_name(name)`** checks a name against the rule `Config::validate`
+  holds a build image's `[images.<name>]` key to, so a tool that writes such a block can check
+  the name before it does. It returns a `BuildImageNameError`, a non-exhaustive enum saying what
+  is wrong: the name is empty, holds a character a repository can't, starts or ends with a
+  separator, or separates its parts with a run podman refuses. `outrig image add` and `outrig
+  image init` check their names with it, and `ConfigValidationError::BuildImageNameInvalid`
+  explains a name the way it does.
+
 ### Changed
 
 - **rmcp 3.4.1 or newer is required**, up from 3.1.0. rmcp is public here through
@@ -113,6 +123,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays armed unless the removal worked or buildah reports the target as not there, and a
   refusal is logged as a warning and reissued in the background under the guard's usual bounded
   retries. The build's own result is returned either way.
+
+- **A build image's name is held to the separators podman accepts.** The name becomes the
+  repository of the image's tag, and the rule let any run of `.`, `_`, and `-` separate its
+  parts. `a..b`, `a._b`, `a-.b`, and `a___b` validated, and `outrig build` and `outrig run` then
+  failed when buildah refused the tag as an "invalid reference format". Parts are now separated
+  by one `.`, one or two `_`, or a run of `-`, as in podman's reference grammar. A name this
+  newly refuses could never have been built. The error now names what is wrong -- the character
+  or the separator -- rather than restating the whole rule.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 

@@ -8,10 +8,10 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigSource, ConfigValidationError, ImageConfig, LlmProvider, McpServerSpec,
-    MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode,
-    NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
-    merge,
+    BuildImageNameError, Config, ConfigSource, ConfigValidationError, ImageConfig, LlmProvider,
+    McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry,
+    NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView,
+    SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
@@ -367,11 +367,74 @@ context    = "ctx"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        // The message says what `check_build_image_name` does about the name.
+        assert!(
+            err.to_string()
+                .starts_with("image \"Bad Name\": a build image's name becomes its repository, which can't hold 'B'"),
+            "{err}"
+        );
         match err {
             ConfigValidationError::BuildImageNameInvalid { image } => {
                 assert_eq!(image, "Bad Name");
             }
             other => panic!("expected BuildImageNameInvalid, got: {other:?}"),
+        }
+    }
+
+    /// Each way a name fails says which. The separators are podman's:
+    /// `podman image exists` (podman 5.7) refuses `a..b`, `a._b`, `a-.b`, and
+    /// `a___b` as an "invalid reference format", and parses every accepted
+    /// name here. A name is a single component, so nothing path-shaped passes.
+    #[test]
+    fn check_build_image_name_says_what_is_wrong() {
+        use BuildImageNameError as E;
+
+        for name in ["a.b", "a_b", "a__b", "a--b", "1abc", "rust-dev"] {
+            assert_eq!(check_build_image_name(name), Ok(()), "{name:?}");
+        }
+        let separator = |run: &str| E::InvalidSeparator {
+            separator: run.to_string(),
+        };
+        for (name, want) in [
+            ("", E::Empty),
+            ("RustDev", E::InvalidCharacter { character: 'R' }),
+            ("a/b", E::InvalidCharacter { character: '/' }),
+            ("../a", E::InvalidCharacter { character: '/' }),
+            ("/abs", E::InvalidCharacter { character: '/' }),
+            (".", E::SeparatorAtEdge { separator: '.' }),
+            ("..", E::SeparatorAtEdge { separator: '.' }),
+            ("-a", E::SeparatorAtEdge { separator: '-' }),
+            ("a-", E::SeparatorAtEdge { separator: '-' }),
+            ("a..b", separator("..")),
+            ("a._b", separator("._")),
+            ("a-.b", separator("-.")),
+            ("a___b", separator("___")),
+        ] {
+            assert_eq!(check_build_image_name(name), Err(want), "{name:?}");
+        }
+    }
+
+    /// The check is written out so it can say what's wrong, and accepts
+    /// exactly the grammar its docs give: every name of up to five characters
+    /// from an alphabet that reaches each way to fail.
+    #[test]
+    fn check_build_image_name_accepts_exactly_its_grammar() {
+        let grammar = regex::Regex::new(r"^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$").unwrap();
+        let mut names = vec![String::new()];
+        let mut longest = names.clone();
+        for _ in 0..5 {
+            longest = longest
+                .iter()
+                .flat_map(|name| "a1._-A/".chars().map(move |c| format!("{name}{c}")))
+                .collect();
+            names.extend(longest.iter().cloned());
+        }
+        for name in &names {
+            assert_eq!(
+                check_build_image_name(name).is_ok(),
+                grammar.is_match(name),
+                "{name:?}"
+            );
         }
     }
 

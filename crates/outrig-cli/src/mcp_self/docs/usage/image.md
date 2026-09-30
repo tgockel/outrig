@@ -46,12 +46,20 @@ outrig image add [<name>] [--force]
 | `<name>`        | prompted | Image-config name (becomes `[images.<name>]`).              |
 | `--force`       | off      | Overwrite existing Dockerfile/config entries for this name. |
 
+The name keys the `[images.<name>]` block, names the Dockerfile's directory, and becomes the
+repository of the image built from it, so it must be lowercase letters and digits, separated by
+one `.`, one or two `_`, or a run of `-` (e.g. `rust-dev`; see
+[Reference -> Config](../reference/config.md#validation-rules)). A `<name>` that isn't is refused
+before the first prompt, even with `--force`, and nothing is written; one typed at the prompt is
+asked for again.
+
 ### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
 Enter at any prompt for an explanation of what's being asked plus the available options.
 The default image-config name is `<repo-folder>-standard` (kebab-cased), so the example
-below assumes a `hello-outrig` repo.
+below assumes a `hello-outrig` repo. A folder name with a letter outside ASCII, which no image
+name can hold, suggests `standard` instead.
 
 ```sh
 $ cd hello-outrig
@@ -238,9 +246,10 @@ outrig image init [<dir>] [--force]
 | `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
 | `--force`       | off         | Overwrite the generated files if they already exist. |
 
-The directory name must match `^[a-zA-Z][a-zA-Z0-9_-]*$` (e.g. `rust-dev`). A target that
-resolves to no usable name is rejected; `.` and the no-argument form use the current
-directory's name.
+The directory name becomes the image's ref, so it follows the same rule as an `image add` name:
+lowercase letters and digits, separated by one `.`, one or two `_`, or a run of `-` (e.g.
+`rust-dev`), though not 64 hex digits, which podman reads as an image ID. A target that resolves
+to no usable name is rejected; `.` and the no-argument form use the current directory's name.
 
 ### What gets written
 

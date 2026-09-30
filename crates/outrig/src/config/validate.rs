@@ -79,11 +79,7 @@ pub enum ConfigValidationError {
     #[error("image {image:?} mcp server {server:?} has empty command")]
     EmptyMcpCommand { image: String, server: String },
 
-    #[error(
-        "image {image:?}: a build image's name becomes its container image \
-         repository, so it must match ^[a-z0-9]+([._-]+[a-z0-9]+)*$ \
-         (lowercase alphanumeric, separated by `.`, `_`, or `-`)"
-    )]
+    #[error("image {image:?}: {}", build_image_name_reason(image))]
     BuildImageNameInvalid { image: String },
 
     #[error("image {image:?}: neither `image-name` nor `dockerfile`+`context` is set")]
@@ -628,7 +624,7 @@ pub(super) fn validate_with_options(
         // `image-name` field as the tag, so their block key is just a label.
         // `validate_image_source` ran above, so `source()` won't panic here.
         if matches!(image.source(), ImageSourceRef::Build { .. })
-            && !is_valid_build_image_name(image_name)
+            && check_build_image_name(image_name).is_err()
         {
             return Err(ConfigValidationError::BuildImageNameInvalid {
                 image: image_name.clone(),
@@ -1482,10 +1478,91 @@ pub(crate) fn is_valid_mcp_server_name(server: &str) -> bool {
     mcp_server_name_re().is_match(server)
 }
 
-/// A build image's config name becomes the repository of its container image
-/// tag (`<name>:<hash>`), so it must be a valid lowercase repository component.
-pub(crate) fn is_valid_build_image_name(name: &str) -> bool {
-    build_image_name_re().is_match(name)
+/// Why a name can't key a build image's `[images.<name>]` block, from
+/// [`check_build_image_name`].
+///
+/// The name becomes the repository of the image's tag (`<name>:<hash>`), so it
+/// is held to the path-component grammar of podman's image references:
+/// lowercase letters and digits, separated by one `.`, one or two `_`, or a
+/// run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum BuildImageNameError {
+    /// The name is empty.
+    #[error("a build image's name can't be empty")]
+    Empty,
+
+    /// The name holds `character`, which is none of a lowercase ASCII letter,
+    /// a digit, `.`, `_`, or `-`. The first such character is reported.
+    #[error(
+        "a build image's name becomes its repository, which can't hold {character:?}: \
+         only lowercase letters, digits, `.`, `_`, and `-`"
+    )]
+    InvalidCharacter { character: char },
+
+    /// The name starts or ends with the separator `separator`.
+    #[error(
+        "a build image's name becomes its repository, which must start and end with a \
+         lowercase letter or digit, not {separator:?}"
+    )]
+    SeparatorAtEdge { separator: char },
+
+    /// Between two of its parts, the name has the run of separators
+    /// `separator`, which is none of one `.`, one or two `_`, or a run of `-`.
+    #[error(
+        "a build image's name becomes its repository, which can't separate its parts \
+         with {separator:?}: only one `.`, one or two `_`, or a run of `-`"
+    )]
+    InvalidSeparator { separator: String },
+}
+
+/// Checks that `name` can key a build image's `[images.<name>]` block, the one
+/// that sets `dockerfile` and `context`, and says what's wrong when it can't.
+/// An `image-name` block's key is only a label and isn't held to this.
+///
+/// A name that passes is also a single path component: it's neither `.` nor
+/// `..`, and it holds no `/`.
+pub fn check_build_image_name(name: &str) -> Result<(), BuildImageNameError> {
+    let is_separator = |c: char| matches!(c, '.' | '_' | '-');
+    if name.is_empty() {
+        return Err(BuildImageNameError::Empty);
+    }
+    if let Some(character) = name
+        .chars()
+        .find(|&c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || is_separator(c)))
+    {
+        return Err(BuildImageNameError::InvalidCharacter { character });
+    }
+    if let Some(separator) = [name.chars().next(), name.chars().next_back()]
+        .into_iter()
+        .flatten()
+        .find(|&c| is_separator(c))
+    {
+        return Err(BuildImageNameError::SeparatorAtEdge { separator });
+    }
+    // Every run of separators sits between two parts now, and has to be a
+    // single one of the grammar's.
+    if let Some(run) = name
+        .split(|c: char| !is_separator(c))
+        .filter(|run| !run.is_empty())
+        .find(|run| !matches!(*run, "." | "_" | "__") && run.bytes().any(|b| b != b'-'))
+    {
+        return Err(BuildImageNameError::InvalidSeparator {
+            separator: run.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// What [`check_build_image_name`] says is wrong with `image`, for the
+/// message of [`ConfigValidationError::BuildImageNameInvalid`], which can't
+/// carry the error without breaking its shape; #243 does that for 0.3.0.
+fn build_image_name_reason(image: &str) -> String {
+    match check_build_image_name(image) {
+        Err(reason) => reason.to_string(),
+        // Only an error built by hand names a name that passes.
+        Ok(()) => "a build image's name must be a valid image repository".to_string(),
+    }
 }
 
 pub(crate) fn mcp_command_is_empty(spec: &McpServerSpec) -> bool {
@@ -1744,13 +1821,6 @@ fn sidecar_name_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$").expect("sidecar-name regex compiles")
-    })
-}
-
-fn build_image_name_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"^[a-z0-9]+([._-]+[a-z0-9]+)*$").expect("build image-name regex compiles")
     })
 }
 

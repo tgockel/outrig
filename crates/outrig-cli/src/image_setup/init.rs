@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer};
 use crate::paths::write_atomic;
+use outrig::config::check_build_image_name;
 
 /// Scaffold a standalone image project in `dir` (relative to `cwd`, or `cwd`
 /// itself when `dir` is `None`). The project name -- used as the `image.ref`
@@ -70,23 +71,25 @@ fn derive_name(target_dir: &Path) -> Result<String> {
                 target_dir.display()
             ))
         })?;
-    if !is_valid_project_name(name) {
+    // The name becomes the image's ref, the repository `image build` tags it
+    // with, so it's held to the same rule as a build image's name.
+    if let Err(reason) = check_build_image_name(name) {
         return Err(OutrigError::Configuration(format!(
-            "{name:?} is not a valid image name (must match ^[a-zA-Z][a-zA-Z0-9_-]*$); \
-             rename the directory or pass a valid name."
+            "{name:?} is not a valid image name: {reason}; rename the directory or pass a \
+             valid name."
+        ))
+        .into());
+    }
+    // Unlike a build image's, this ref carries no tag, and a bare one of 64
+    // hex digits is an image ID to podman, which refuses it as a name.
+    if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(OutrigError::Configuration(format!(
+            "{name:?} is not a valid image name: it becomes the image's ref, and podman \
+             reads 64 hex digits as an image ID; rename the directory or pass a valid name."
         ))
         .into());
     }
     Ok(name.to_string())
-}
-
-/// `^[a-zA-Z][a-zA-Z0-9_-]*$` -- the same shape `image add` documents for
-/// image names. Keeps the generated `image.toml` ref a clean token and the
-/// README's `[images.<name>]` a valid TOML bare key.
-fn is_valid_project_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Render the standalone Dockerfile: the curated Debian-slim + filesystem-MCP
@@ -112,6 +115,9 @@ fn render_image_toml(name: &str) -> String {
 }
 
 fn render_readme(name: &str) -> String {
+    // A `.` in the name would nest a table in `[images.<name>]`, so the key is
+    // quoted when it has to be. The `image-name` value is a string either way.
+    let key = toml_edit::Key::new(name);
     // One source line per output line keeps the prose free of string-continuation
     // whitespace surprises; lines are long but this is generated Markdown, not a doc/ page.
     format!(
@@ -135,10 +141,10 @@ fn render_readme(name: &str) -> String {
          \n\
          ## Use it from a repo\n\
          \n\
-         Reference the built image from a repo's `.agents/outrig/config.toml` with `image-name`. The MCP servers are declared by the image labels, so no `[images.{name}.mcp]` block is needed:\n\
+         Reference the built image from a repo's `.agents/outrig/config.toml` with `image-name`. The MCP servers are declared by the image labels, so no `[images.{key}.mcp]` block is needed:\n\
          \n\
          ```toml\n\
-         [images.{name}]\n\
+         [images.{key}]\n\
          image-name = \"{name}\"\n\
          ```\n"
     )
@@ -209,11 +215,50 @@ mod tests {
         );
     }
 
+    /// Podman refuses both as an image's ref: an uppercase repository, and a
+    /// separator its reference grammar has no room for.
     #[test]
     fn invalid_directory_name_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = run(tmp.path(), Some(Path::new("123-foo")), false).unwrap_err();
-        assert!(err.to_string().contains("not a valid image name"), "{err}");
+        for name in ["RustDev", "a..b"] {
+            let err = run(tmp.path(), Some(Path::new(name)), false).unwrap_err();
+            assert!(err.to_string().contains("not a valid image name"), "{err}");
+            assert!(!tmp.path().join(name).exists(), "{name}");
+        }
+    }
+
+    /// The ref is written without a tag, and buildah refuses a bare 64 hex
+    /// digits as a name ("cannot specify 64-byte hexadecimal strings"), so
+    /// neither passes, though the build-image rule allows both.
+    #[test]
+    fn an_image_id_shaped_name_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["1".repeat(64), "a".repeat(64)] {
+            let err = run(tmp.path(), Some(Path::new(&name)), false).unwrap_err();
+            assert!(err.to_string().contains("as an image ID"), "{err}");
+            assert!(!tmp.path().join(&name).exists(), "{name}");
+        }
+    }
+
+    /// A `.` is allowed in the name, so the README's table header quotes it
+    /// rather than nesting a table.
+    #[test]
+    fn a_dotted_name_scaffolds_a_readme_that_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(tmp.path(), Some(Path::new("rust.dev")), false).unwrap();
+        let proj = tmp.path().join("rust.dev");
+
+        let image_toml = read(&proj.join("image.toml"));
+        assert!(image_toml.contains("ref = \"rust.dev\""), "{image_toml}");
+        assert!(validate_image_toml(&image_toml).valid, "{image_toml}");
+
+        let readme = read(&proj.join("README.md"));
+        let (_, rest) = readme.split_once("```toml\n").expect("a toml block");
+        let (snippet, _) = rest.split_once("```").expect("a closed toml block");
+        assert_eq!(snippet, "[images.\"rust.dev\"]\nimage-name = \"rust.dev\"\n");
+        let cfg = Config::load_from_str(snippet).expect("the snippet parses");
+        cfg.validate(None).expect("the snippet validates");
+        assert!(cfg.images.contains_key("rust.dev"), "{snippet}");
     }
 
     #[test]

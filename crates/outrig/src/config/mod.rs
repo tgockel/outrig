@@ -17,7 +17,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub use api_key::{ApiKeyError, ApiKeyRef};
 pub use env_value::{EnvValue, EnvValueError};
 pub use merge::merge;
-pub use validate::{ConfigValidationError, MountRuleViolation};
+pub use validate::{
+    BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
+};
 pub(crate) use validate::{
     check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
     is_valid_mcp_server_name, mcp_command_is_empty,

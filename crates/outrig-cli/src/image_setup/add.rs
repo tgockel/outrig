@@ -13,7 +13,8 @@
 
 use std::path::Path;
 
-use toml_edit::{Array, Decor, DocumentMut, InlineTable, Item, Table, Value};
+use heck::ToKebabCase;
+use toml_edit::{Array, Decor, DocumentMut, InlineTable, Item, Key, Table, Value};
 
 use crate::error::{OutrigError, Result};
 use crate::image_setup::render::{self, BaseImage, McpServer, Toolchain};
@@ -22,6 +23,7 @@ use crate::init::repo as init_repo;
 use crate::paths::{
     global_config_path, image_dir, image_dir_rel, repo_config_path, write_atomic_all,
 };
+use outrig::config::{ConfigValidationError, check_build_image_name};
 use outrig::error::IoPathExt;
 
 /// CLI entry point. Resolves the repo root from `cwd` (walking up, with a
@@ -37,6 +39,11 @@ pub async fn run(
     name: Option<String>,
     force: bool,
 ) -> Result<()> {
+    // Ahead of the bootstrap, which would walk a fresh repo through its
+    // prompts and write its config before `run_with` refused the name.
+    if let Some(name) = &name {
+        check_name(name).map_err(OutrigError::from)?;
+    }
     let global_path = global_config_path(global_override);
     let mut prompt = prompt::auto();
     let mut hf = crate::hf::auto();
@@ -50,11 +57,13 @@ pub async fn run(
 
 /// Drives the interactive flow against an arbitrary `PromptSource`.
 ///
-/// The config is read and its `images` checked before any prompt, and the
-/// idempotency probe (Dockerfile path + existing `[images.<name>]` block)
-/// runs right after the name, so neither a config this can't extend nor an
-/// accidental re-run burns through the user's input before bailing. Nothing
-/// is written until every answer is in.
+/// The config is read and its `images` checked before any prompt. A
+/// `name_arg` that can't name a build image is refused next, `--force` or
+/// not; one typed at the prompt is asked for again. The idempotency probe
+/// (Dockerfile path + existing `[images.<name>]` block) runs right after the
+/// name, so neither a config this can't extend nor an accidental re-run
+/// burns through the user's input before bailing. Nothing is written until
+/// every answer is in.
 pub async fn run_with(
     repo_root: &Path,
     name_arg: Option<String>,
@@ -66,12 +75,14 @@ pub async fn run_with(
     let images = images_table(&mut doc, &cfg_path)?;
 
     let name = match name_arg {
-        Some(n) => n,
-        None => {
-            let default = init_repo::default_image_name(repo_root);
-            prompt.ask_string(&NAME_FIELD, &default).await?
+        Some(n) => {
+            check_name(&n).map_err(OutrigError::from)?;
+            n
         }
+        None => ask_name(prompt, repo_root).await?,
     };
+    // The key as the config spells it: quoted when the name holds a `.`.
+    let key = Key::new(name.as_str());
 
     let dockerfile_path = image_dir(repo_root, &name).join("Dockerfile");
 
@@ -85,7 +96,7 @@ pub async fn run_with(
         }
         if images.contains_key(&name) {
             return Err(OutrigError::Configuration(format!(
-                "[images.{name}] already exists in {}; pass --force to overwrite.",
+                "[images.{key}] already exists in {}; pass --force to overwrite.",
                 cfg_path.display()
             ))
             .into());
@@ -120,15 +131,15 @@ pub async fn run_with(
         display_rel(&dockerfile_path, repo_root)
     );
     eprintln!(
-        "[outrig] added [images.{name}] block to {}",
+        "[outrig] added [images.{key}] block to {}",
         display_rel(&cfg_path, repo_root)
     );
     if mcps.is_empty() {
-        eprintln!("[outrig] [images.{name}.mcp] is empty");
+        eprintln!("[outrig] [images.{key}.mcp] is empty");
     } else {
         let names: Vec<&str> = mcps.iter().map(|m| m.as_str()).collect();
         eprintln!(
-            "[outrig] added [images.{name}.mcp] entries: {}",
+            "[outrig] added [images.{key}.mcp] entries: {}",
             names.join(", ")
         );
     }
@@ -138,9 +149,12 @@ pub async fn run_with(
 
 // ---- prompt fields --------------------------------------------------------
 
-pub(crate) const NAME_FIELD: Field = Field {
+const NAME_FIELD: Field = Field {
     name: "Image name",
-    description: "Used as the [images.<name>] key. Must match `^[a-zA-Z][a-zA-Z0-9_-]*$`.",
+    description: "Names the image-config: its [images.<name>] key, its directory under \
+                  .agents/outrig/images/, and the repository of the image built from it. \
+                  Lowercase letters and digits, separated by one `.`, one or two `_`, or \
+                  a run of `-`, e.g. `rust-dev`.",
     options: &[],
     doc_link: "doc/usage/image.md",
 };
@@ -220,6 +234,46 @@ const DEFAULT_MCP_INDEX: usize = 0;
 const _: () = assert!(matches!(McpServer::ALL[DEFAULT_MCP_INDEX], McpServer::Fs));
 
 // ---- helpers --------------------------------------------------------------
+
+/// Asks for the image-config name, suggesting [`default_image_name`], until
+/// the answer is one [`check_name`] accepts, so a typo costs a retype rather
+/// than the run. The bootstrap in `init::repo` asks through here too, since
+/// it writes the answer as `default-image`.
+pub(crate) async fn ask_name(prompt: &mut impl PromptSource, repo_root: &Path) -> Result<String> {
+    let default = default_image_name(repo_root);
+    loop {
+        let name = prompt.ask_string(&NAME_FIELD, &default).await?;
+        match check_name(&name) {
+            Ok(()) => return Ok(name),
+            Err(e) => eprintln!("[outrig] {e}"),
+        }
+    }
+}
+
+/// `<repo-folder-kebab>-standard`, so the image (and `default-image`)
+/// carries the repo's identity by default. Falls back to plain
+/// `"standard"` when that isn't a name the image can take: the path has
+/// no usable last component, or the folder's name holds a letter outside
+/// ASCII, as `café` does. The prompt would refuse such a default, and
+/// Enter would never get past it.
+fn default_image_name(repo_root: &Path) -> String {
+    repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| format!("{}-standard", s.to_kebab_case()))
+        .filter(|name| check_build_image_name(name).is_ok())
+        .unwrap_or_else(|| "standard".to_string())
+}
+
+/// Refuses a name the block `image add` writes can't be keyed by, with the
+/// error a load of the config would give, so the two explain a name alike.
+/// A name that passes is also one component of the path it names under
+/// `.agents/outrig/images/`.
+fn check_name(name: &str) -> std::result::Result<(), ConfigValidationError> {
+    check_build_image_name(name).map_err(|_| ConfigValidationError::BuildImageNameInvalid {
+        image: name.to_string(),
+    })
+}
 
 fn display_rel<'a>(path: &'a Path, root: &Path) -> std::path::Display<'a> {
     path.strip_prefix(root).unwrap_or(path).display()
@@ -415,6 +469,21 @@ mod tests {
             let coding = after.images.remove("coding").expect("coding is added");
             assert!(coding.mcp.contains_key("fs"), "{seed:?}:\n{text}");
             assert_eq!(after.images, before.images, "{seed:?}:\n{text}");
+        }
+    }
+
+    /// A folder whose name can't make one falls back to `standard`, or the
+    /// prompt would refuse its own default and Enter would never get past it.
+    #[test]
+    fn the_default_image_name_is_one_the_prompt_accepts() {
+        for (folder, want) in [
+            ("/src/My Project", "my-project-standard"),
+            ("/src/hello_outrig", "hello-outrig-standard"),
+            ("/src/café", "standard"),
+            ("/src/___", "standard"),
+            ("/", "standard"),
+        ] {
+            assert_eq!(default_image_name(Path::new(folder)), want, "{folder:?}");
         }
     }
 }

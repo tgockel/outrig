@@ -11,8 +11,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use heck::ToKebabCase;
-
 use crate::config_init;
 use crate::error::{OutrigError, Result};
 use crate::hf::HfTreeFetcher;
@@ -115,10 +113,7 @@ async fn write_repo_config(
 
     eprintln!();
     eprintln!("Configuring your first image");
-    let default_name = default_image_name(repo_root);
-    let image_name = prompt
-        .ask_string(&image_add::NAME_FIELD, &default_name)
-        .await?;
+    let image_name = image_add::ask_name(prompt, repo_root).await?;
     let ws_default = Workspace::default();
     let host_path = prompt
         .ask_string(&HOST_PATH_FIELD, &ws_default.host_path().to_string_lossy())
@@ -347,26 +342,6 @@ struct RepoModelChoices {
 /// agents are named by role, not by repo, so the same default works
 /// regardless of where you run from.
 pub(crate) const DEFAULT_AGENT_NAME: &str = "coder";
-
-/// Suggest `<repo-folder-kebab>-standard` as the default image-config
-/// name, so the image (and `default-image`) carries the repo's
-/// identity by default. Falls back to plain `"standard"` when the path
-/// has no usable last component. Shared with `image_setup::add` so its
-/// name prompt suggests the same value as `default-image` written
-/// here.
-pub(crate) fn default_image_name(repo_root: &Path) -> String {
-    let folder = repo_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_kebab_case())
-        .filter(|s| !s.is_empty());
-    match folder {
-        Some(name) => format!("{name}-standard"),
-        None => "standard".to_string(),
-    }
-}
 
 fn render(
     agent_name: String,

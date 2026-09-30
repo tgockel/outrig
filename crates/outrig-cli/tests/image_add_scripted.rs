@@ -3,8 +3,10 @@
 //! the resulting Dockerfile, the appended `[images.<name>]` block,
 //! idempotency without `--force`, `toml_edit`-style preservation of
 //! surrounding comments, an inline `images` table, the refusal of an
-//! `images` that is not a table before any prompt, and that a config that
-//! can't be written leaves no Dockerfile behind.
+//! `images` that is not a table before any prompt, that a config that
+//! can't be written leaves no Dockerfile behind, and that a name the image
+//! can't be built under is refused as an argument and asked again at a
+//! prompt.
 
 mod common;
 
@@ -35,6 +37,16 @@ fn read_config(root: &Path) -> String {
 
 fn coding_dockerfile(root: &Path) -> PathBuf {
     root.join(".agents/outrig/images/coding/Dockerfile")
+}
+
+/// The names in `dir`, sorted.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 const STANDARD_SEED: &str = "[images.base]\nimage-name = \"debian\"\n";
@@ -479,4 +491,163 @@ async fn a_config_that_cannot_be_written_leaves_a_forced_dockerfile_alone() {
         "# mine\n"
     );
     assert_eq!(read_config(tmp.path()), STANDARD_SEED);
+}
+
+/// #184: names `image add` can't build, passed as an argument. Each is
+/// refused before any prompt, `--force` or not, and nothing is written: not
+/// under `images/`, and not wherever a path-shaped name points.
+#[tokio::test]
+async fn a_name_it_cannot_build_is_refused_before_any_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    seed_repo(&root, STANDARD_SEED);
+    let outside = tmp.path().join("outside");
+    let outside = outside.to_str().unwrap();
+
+    for name in [
+        "RustDev",
+        "",
+        ".",
+        "..",
+        "../../../escape",
+        "a/b",
+        "a..b",
+        outside,
+    ] {
+        for force in [false, true] {
+            // No input: had a prompt come first, it would have failed on EOF
+            // instead.
+            let (mut prompt, _stderr) = scripted_prompt(b"").await;
+            let err = timeout(
+                TEST_TIMEOUT,
+                run_with(&root, Some(name.to_string()), force, &mut prompt),
+            )
+            .await
+            .expect("run_with must not hang")
+            .expect_err("a name it can't build must be refused");
+
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("image {name:?}: a build image's name")),
+                "{name:?}: unexpected error: {msg}"
+            );
+            assert_eq!(read_config(&root), STANDARD_SEED, "{name:?}");
+        }
+    }
+    // `..` and `../../../escape` point above `images/`, and `outside` beside
+    // the repo.
+    assert_eq!(entries(tmp.path()), ["repo"]);
+    assert_eq!(entries(&root), [".agents"]);
+    assert_eq!(entries(&root.join(".agents/outrig")), ["config.toml"]);
+}
+
+/// #184: a name typed at the prompt that `image add` can't build is asked
+/// for again, rather than ending the run.
+#[tokio::test]
+async fn a_prompted_name_it_cannot_build_is_asked_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), "");
+
+    // Name (refused), name, then base, toolchains, mcp -- all defaults.
+    let (mut prompt, _stderr) = scripted_prompt(b"RustDev\nrust-dev\n\n\n\n").await;
+    timeout(TEST_TIMEOUT, run_with(tmp.path(), None, false, &mut prompt))
+        .await
+        .expect("run_with must not hang")
+        .expect("run_with must succeed");
+
+    let images = tmp.path().join(".agents/outrig/images");
+    assert_eq!(entries(&images), ["rust-dev"]);
+    assert!(images.join("rust-dev/Dockerfile").is_file());
+    let text = read_config(tmp.path());
+    let cfg = Config::load_from_str(&text).expect("config must parse");
+    cfg.validate(Some(tmp.path()))
+        .expect("config must validate");
+    assert!(cfg.images.contains_key("rust-dev"), "{text}");
+}
+
+/// #184: the guard is no tighter than the config's own rule. A `.` is
+/// allowed, and the key holding one is quoted.
+#[tokio::test]
+async fn a_dotted_name_is_written_quoted_and_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), STANDARD_SEED);
+    let (mut prompt, _stderr) = scripted_prompt(b"\n\n\n").await;
+    timeout(
+        TEST_TIMEOUT,
+        run_with(tmp.path(), Some("rust.dev".to_string()), false, &mut prompt),
+    )
+    .await
+    .expect("run_with must not hang")
+    .expect("run_with must succeed");
+
+    assert!(
+        tmp.path()
+            .join(".agents/outrig/images/rust.dev/Dockerfile")
+            .is_file()
+    );
+    let text = read_config(tmp.path());
+    assert!(text.contains("[images.\"rust.dev\"]"), "{text}");
+    let cfg = Config::load_from_str(&text).expect("config must parse");
+    cfg.validate(Some(tmp.path()))
+        .expect("config must validate");
+    assert!(cfg.images.contains_key("rust.dev"), "{text}");
+}
+
+/// #184: the bootstrap asks for the name through the same prompt, so the
+/// `default-image` it writes is a name the image can take.
+#[tokio::test]
+async fn the_bootstraps_name_prompt_asks_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("myproj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+
+    // Configure-now, agent name, preamble, image name (refused), image
+    // name, workspace x2, then the image-add defaults: base, toolchains, mcp.
+    let script = b"\n\n\nRustDev\nrust-dev\n\n\n\n\n\n";
+    let (mut prompt, _stderr) = scripted_prompt(script).await;
+    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
+
+    timeout(TEST_TIMEOUT, async {
+        let (repo_root, bootstrapped_name) =
+            resolve_or_bootstrap(&cwd, &global, &mut prompt, &mut hf).await?;
+        run_with(&repo_root, bootstrapped_name, false, &mut prompt).await
+    })
+    .await
+    .expect("fallback flow must not hang")
+    .expect("fallback flow must succeed");
+
+    let cfg = Config::load_from_str(&read_config(&cwd)).expect("repo config must parse");
+    assert_eq!(cfg.default_image.as_deref(), Some("rust-dev"));
+    assert!(cfg.images.contains_key("rust-dev"));
+    assert!(
+        cwd.join(".agents/outrig/images/rust-dev/Dockerfile")
+            .is_file()
+    );
+}
+
+/// #184: the binary checks a name it was given ahead of the bootstrap a
+/// fresh repo runs first, so it neither asks nor writes anything.
+#[test]
+fn the_binary_refuses_a_name_before_bootstrapping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_outrig"))
+        .arg("--global-config")
+        .arg(tmp.path().join("global.toml"))
+        .args(["image", "add", "RustDev"])
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn outrig image add");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "image \"RustDev\": a build image's name becomes its repository, which can't hold 'R'"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Configure outrig"), "{stderr}");
+    assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
 }

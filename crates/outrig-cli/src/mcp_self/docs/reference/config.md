@@ -1314,9 +1314,10 @@ image-config in the merged config but does not require agent/model/provider wiri
   `dockerfile`/`context` without the other is an error.
 - `image-name` must not be empty.
 - A build-from-Dockerfile `[images.<name>]` block key must be a valid container image
-  repository component -- lowercase alphanumeric separated by `.`, `_`, or `-`
-  (`^[a-z0-9]+([._-]+[a-z0-9]+)*$`) -- because it becomes the built image's repository.
-  Image-name configs are exempt: their block key is just a label.
+  repository component -- lowercase letters and digits, separated by one `.`, one or two `_`,
+  or a run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`), the separators podman accepts --
+  because it becomes the built image's repository. Image-name configs are exempt: their block
+  key is just a label.
 - Every `[images.<name>.security].capability-profile`, if set, must be one of
   `default`, `no-net-raw`, or `drop-all`.
 - Every capability name in `cap-drop` or `cap-add` must be non-empty and match
