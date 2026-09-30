@@ -1,12 +1,14 @@
 //! Integration tests for `outrig image add` driven through scripted
 //! stdin (`tokio::io::duplex`) against tempdir-rooted repo configs. Asserts
 //! the resulting Dockerfile, the appended `[images.<name>]` block,
-//! idempotency without `--force`, and `toml_edit`-style preservation of
-//! surrounding comments.
+//! idempotency without `--force`, `toml_edit`-style preservation of
+//! surrounding comments, an inline `images` table, the refusal of an
+//! `images` that is not a table before any prompt, and that a config that
+//! can't be written leaves no Dockerfile behind.
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::time::timeout;
@@ -26,6 +28,20 @@ fn seed_repo(root: &Path, initial_config: &str) {
     std::fs::create_dir_all(&cfg_dir).unwrap();
     std::fs::write(cfg_dir.join("config.toml"), initial_config).unwrap();
 }
+
+fn read_config(root: &Path) -> String {
+    std::fs::read_to_string(root.join(".agents/outrig/config.toml")).unwrap()
+}
+
+fn coding_dockerfile(root: &Path) -> PathBuf {
+    root.join(".agents/outrig/images/coding/Dockerfile")
+}
+
+const STANDARD_SEED: &str = "[images.base]\nimage-name = \"debian\"\n";
+
+/// The config from #186: valid, and spelling `images` as an inline table.
+const INLINE_SEED: &str = "default-image = \"base\"\n\
+     images = { base = { image-name = \"docker.io/library/debian:bookworm-slim\" } }\n";
 
 #[tokio::test]
 async fn defaults_write_dockerfile_and_config_block() {
@@ -306,4 +322,161 @@ async fn force_preserves_unrelated_blocks_and_comments() {
         cfg_text.contains("dockerfile = \".agents/outrig/images/coding/Dockerfile\""),
         "replaced [images.coding] missing new dockerfile path:\n{cfg_text}",
     );
+}
+
+/// #186: a config spelling `images` as an inline table, which the loader
+/// accepts, is read by the duplicate check and extended by the writer
+/// alike. The two disagreed, and the writer panicked with the Dockerfile
+/// already written.
+#[tokio::test]
+async fn an_inline_images_is_checked_and_extended() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), INLINE_SEED);
+
+    let (mut prompt, _stderr) = scripted_prompt(b"").await;
+    let err = timeout(
+        TEST_TIMEOUT,
+        run_with(tmp.path(), Some("base".to_string()), false, &mut prompt),
+    )
+    .await
+    .expect("run_with must not hang")
+    .expect_err("run_with must refuse an entry the inline table has");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("[images.base] already exists") && msg.contains("--force"),
+        "unexpected error: {msg}",
+    );
+
+    let (mut prompt, _stderr) = scripted_prompt(b"\n\n\n").await;
+    timeout(
+        TEST_TIMEOUT,
+        run_with(tmp.path(), Some("coding".to_string()), false, &mut prompt),
+    )
+    .await
+    .expect("run_with must not hang")
+    .expect("run_with must succeed");
+
+    assert!(coding_dockerfile(tmp.path()).is_file(), "no Dockerfile");
+    let text = read_config(tmp.path());
+    let mut cfg = Config::load_from_str(&text).expect("config must parse");
+    cfg.validate(None).expect("config must validate");
+    let coding = cfg.images.remove("coding").expect("coding is added");
+    assert!(coding.mcp.contains_key("fs"), "{text}");
+    assert_eq!(
+        cfg.images,
+        Config::load_from_str(INLINE_SEED).unwrap().images,
+        "the seed's entries changed:\n{text}",
+    );
+}
+
+/// An `images` that is not a table is refused before the first prompt, even
+/// with `--force`, and nothing is written. These shapes reached the same
+/// panic as an inline table, after the Dockerfile was on disk.
+#[tokio::test]
+async fn an_images_that_is_not_a_table_is_refused_before_any_prompt() {
+    for (seed, found) in [
+        ("images = \"legacy\"\n", "string"),
+        ("images = 3\n", "integer"),
+        ("images = []\n", "array"),
+        ("[[images]]\nimage-name = \"debian\"\n", "array of tables"),
+    ] {
+        assert!(
+            Config::load_from_str(seed).is_err(),
+            "the loader must reject {seed:?} too"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        seed_repo(tmp.path(), seed);
+        // No name and no input: had the name prompt come first, it would
+        // have failed on EOF instead.
+        let (mut prompt, _stderr) = scripted_prompt(b"").await;
+
+        let err = timeout(TEST_TIMEOUT, run_with(tmp.path(), None, true, &mut prompt))
+            .await
+            .expect("run_with must not hang")
+            .expect_err("an images that is not a table must be refused");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`images`") && msg.ends_with(&format!("; got {found}")),
+            "{seed:?}: unexpected error: {msg}"
+        );
+        assert!(
+            !tmp.path().join(".agents/outrig/images").exists(),
+            "{seed:?}: wrote under images/"
+        );
+        assert_eq!(read_config(tmp.path()), seed);
+    }
+}
+
+/// Runs `image add coding` with `.agents/outrig` read-only, so the config
+/// can't be written while the Dockerfile's directory, made up front, can.
+/// `None` when this user isn't held to the mode bits, as root isn't: the
+/// run would succeed and prove nothing.
+async fn add_with_unwritable_config(
+    root: &Path,
+    force: bool,
+) -> Option<outrig_cli::error::Result<()>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let agents = root.join(".agents/outrig");
+    std::fs::create_dir_all(agents.join("images/coding")).unwrap();
+    let writable = std::fs::metadata(&agents).unwrap().permissions();
+    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = if tempfile::NamedTempFile::new_in(&agents).is_err() {
+        let (mut prompt, _stderr) = scripted_prompt(b"\n\n\n").await;
+        Some(
+            timeout(
+                TEST_TIMEOUT,
+                run_with(root, Some("coding".to_string()), force, &mut prompt),
+            )
+            .await,
+        )
+    } else {
+        eprintln!("skipping: permissions not enforced for this user");
+        None
+    };
+    // Before anything can panic: the tempdir can't be removed while read-only.
+    std::fs::set_permissions(&agents, writable).unwrap();
+    result.map(|r| r.expect("run_with must not hang"))
+}
+
+/// A Dockerfile written without its config block would refuse the retry,
+/// so a config that can't be written keeps the Dockerfile from being
+/// written too.
+#[tokio::test]
+async fn a_config_that_cannot_be_written_leaves_no_dockerfile() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), STANDARD_SEED);
+    let Some(result) = add_with_unwritable_config(tmp.path(), false).await else {
+        return;
+    };
+
+    result.expect_err("an unwritable config must fail the run");
+    assert!(
+        !coding_dockerfile(tmp.path()).exists(),
+        "the Dockerfile was written without its config block"
+    );
+    assert_eq!(read_config(tmp.path()), STANDARD_SEED);
+}
+
+/// Under `--force`, a config that can't be written leaves the Dockerfile it
+/// would have replaced as it was.
+#[tokio::test]
+async fn a_config_that_cannot_be_written_leaves_a_forced_dockerfile_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(tmp.path(), STANDARD_SEED);
+    let dockerfile_path = coding_dockerfile(tmp.path());
+    std::fs::create_dir_all(dockerfile_path.parent().unwrap()).unwrap();
+    std::fs::write(&dockerfile_path, "# mine\n").unwrap();
+    let Some(result) = add_with_unwritable_config(tmp.path(), true).await else {
+        return;
+    };
+
+    result.expect_err("an unwritable config must fail the run");
+    assert_eq!(
+        std::fs::read_to_string(&dockerfile_path).unwrap(),
+        "# mine\n"
+    );
+    assert_eq!(read_config(tmp.path()), STANDARD_SEED);
 }

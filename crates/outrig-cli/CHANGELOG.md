@@ -108,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `image add`, gets the same toolchain. `outrig design prompt` shows it in both Rust examples, and
   its rules now say to install tools outside root's home. A Dockerfile generated earlier keeps its
   old lines; replace its `# rust toolchain` section with the one in `doc/usage/image.md`.
+- **`outrig image add` takes an inline `images` table.** A repo config spelling `images` as an
+  inline table, `images = { base = { ... } }`, which outrig loads like any other, made `image add`
+  panic after it had written the new Dockerfile. The config was left without the block, and the
+  Dockerfile then refused a plain retry, while `--force` panicked the same way. `outrig init`,
+  which runs `image add`, did too. The inline table is now rewritten as a standard `[images]`
+  table holding the same entries, with the new `[images.<name>]` block after it; comments between
+  the entries of a multi-line inline table are not kept. An `images` that is not a table at all,
+  such as `images = "legacy"` or `[[images]]`, is refused before the first prompt, where it
+  panicked too. Nothing is written until every prompt is answered, and a config that can't be
+  written leaves the Dockerfile unwritten too.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

@@ -185,6 +185,14 @@ context    = ".agents/outrig/images/hello-outrig-standard"
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
 
+If your config spells `images` as an inline table, `images = { base = { ... } }`, `image add`
+first rewrites it as a standard `[images]` table holding the same entries, since the new blocks
+can't nest inside an inline one. The table lands after your top-level keys. Comments above the
+`images` line and at its end move to the `[images]` header; comments between the entries of a
+multi-line inline table are not kept. An `images` that isn't a table at all, such as
+`images = "legacy"` or `[[images]]`, is refused before the first prompt, even with `--force`, and
+nothing is written.
+
 ### Re-running
 
 Without `--force`, outrig refuses if either the Dockerfile path or the config block already
@@ -198,6 +206,9 @@ error: .agents/outrig/images/hello-outrig-standard/Dockerfile
 
 With `--force`, the Dockerfile is replaced and the `[images.<name>]` block is rewritten in
 place (preserving surrounding TOML).
+
+Nothing is written until every prompt is answered, and a config that can't be written leaves the
+Dockerfile unwritten too, new or replaced, so a retry isn't refused over it.
 
 ## outrig image init
 

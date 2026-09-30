@@ -53,6 +53,27 @@ pub(crate) fn image_dir_rel(name: &str) -> PathBuf {
 }
 
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_all(&[(path, contents)])
+}
+
+/// Writes each file atomically, in order, after staging every one in a temp
+/// file beside its target: creating, writing, or syncing any of them fails
+/// before a single target changes. Only a failed rename can leave the
+/// earlier files written and the later ones not.
+pub(crate) fn write_atomic_all(files: &[(&Path, &str)]) -> Result<()> {
+    let staged = files
+        .iter()
+        .map(|&(path, contents)| stage(path, contents).map(|tmp| (tmp, path)))
+        .collect::<Result<Vec<_>>>()?;
+    for (tmp, path) in staged {
+        tmp.persist(path).map_err(OutrigError::from)?;
+    }
+    Ok(())
+}
+
+/// `contents` in a synced temp file in `path`'s directory, created if
+/// missing. Dropped instead of persisted, the temp file is removed.
+fn stage(path: &Path, contents: &str) -> Result<NamedTempFile> {
     let parent = path.parent().ok_or_else(|| {
         OutrigError::Configuration(format!("path has no parent: {}", path.display()))
     })?;
@@ -60,8 +81,7 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(contents.as_bytes())?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(OutrigError::from)?;
-    Ok(())
+    Ok(tmp)
 }
 
 /// The directory three levels above `repo_cfg`, or `.` when there is none.
@@ -168,6 +188,29 @@ mod tests {
         let config = agents.join("config.toml");
         fs::write(&config, b"# fixture\n").unwrap();
         config
+    }
+
+    /// A file that can't be staged fails the write before any file changes,
+    /// the ones listed ahead of it included, and leaves no temp file behind.
+    #[test]
+    fn write_atomic_all_changes_nothing_when_a_file_cannot_be_staged() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        fs::write(&first, "old").unwrap();
+        // A regular file where the second target's directory would go.
+        let blocker = tmp.path().join("blocker");
+        fs::write(&blocker, "").unwrap();
+
+        write_atomic_all(&[(&first, "new"), (&blocker.join("second"), "new")])
+            .expect_err("the second file's directory can't be created");
+
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old");
+        let mut left: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["blocker", "first"]);
     }
 
     #[test]
