@@ -17,8 +17,8 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
 use super::host::{
-    Background, Counts, Interpreter, InterpreterError, Late, MESSAGE_MAX, Outcome, PRIMARY, Report,
-    Unknown,
+    Background, ContextChange, Counts, Interpreter, InterpreterError, Late, MESSAGE_MAX, Outcome,
+    PRIMARY, Report, Unknown,
 };
 use super::payload::PAYLOAD;
 use super::testing::{Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, within};
@@ -548,31 +548,40 @@ async fn a_turn_is_pushed_under_its_id_and_not_once_the_interpreter_is_gone() {
     interpreter.push_turn(1, json!({"round": 1}));
 }
 
-/// What `on_promote` registered is handed each promotion as it arrives, in
-/// order and as the agent named it: what a promotion names is the store's to
-/// judge.
+/// What `on_context` registered is handed each promotion and demotion as it
+/// arrives, in order and as the agent named it: what a change names is the
+/// store's to judge.
 #[tokio::test]
-async fn promotions_are_handed_over_in_order() {
+async fn promotions_and_demotions_are_handed_over_in_order() {
     let (interpreter, mut fake) = Fake::connected().await;
-    let (promoted, handed) = recorder();
-    interpreter.on_promote(promoted);
+    let (changed, handed) = recorder();
+    interpreter.on_context(changed);
     fake.send(json!({"t": "promote", "agent": PRIMARY, "turns": [2, 0, 1000]}))
+        .await;
+    fake.send(json!({"t": "demote", "agent": PRIMARY, "turns": [0]}))
         .await;
     fake.send(json!({"t": "promote", "agent": PRIMARY, "turns": [2]}))
         .await;
     round_trip(&interpreter, &mut fake).await;
-    assert_eq!(*handed.lock().expect("handed"), [vec![2, 0, 1000], vec![2]]);
+    assert_eq!(
+        *handed.lock().expect("handed"),
+        [
+            ContextChange::Promote(vec![2, 0, 1000]),
+            ContextChange::Demote(vec![0]),
+            ContextChange::Promote(vec![2]),
+        ]
+    );
 }
 
-/// A promotion made by an execution has been handed over by the time that
-/// execution's outcome is here: its line is written ahead of the result, and
-/// the host reads in order. That is what lets it reach the round's next model
-/// call.
+/// A promotion or demotion made by an execution has been handed over by the
+/// time that execution's outcome is here: its line is written ahead of the
+/// result, and the host reads in order. That is what lets it reach the round's
+/// next model call.
 #[tokio::test]
-async fn a_promotion_is_handed_over_before_the_execution_that_made_it_ends() {
+async fn a_change_is_handed_over_before_the_execution_that_made_it_ends() {
     let interpreter = start_on_host().await;
-    let (promoted, handed) = recorder();
-    interpreter.on_promote(promoted);
+    let (changed, handed) = recorder();
+    interpreter.on_context(changed);
     interpreter.push_turn(
         0,
         json!({"round": 1, "prompt": "go", "text": "", "calls": []}),
@@ -583,17 +592,29 @@ async fn a_promotion_is_handed_over_before_the_execution_that_made_it_ends() {
     )
     .await;
     assert_eq!(outcome, ok(""));
-    assert_eq!(*handed.lock().expect("handed"), [vec![0]]);
+    assert_eq!(
+        *handed.lock().expect("handed"),
+        [ContextChange::Promote(vec![0])]
+    );
+    let outcome = run(&interpreter, "runtime.context.demote(0)").await;
+    assert_eq!(outcome, ok(""));
+    assert_eq!(
+        handed.lock().expect("handed").last(),
+        Some(&ContextChange::Demote(vec![0]))
+    );
 }
 
-/// Every promotion a handler was handed, in order.
-type Handed = Arc<Mutex<Vec<Vec<u64>>>>;
+/// Every change a handler was handed, in order.
+type Handed = Arc<Mutex<Vec<ContextChange>>>;
 
-/// A promotion handler that records what it is handed.
-fn recorder() -> (impl Fn(Vec<u64>) + Send + Sync + 'static, Handed) {
+/// A context handler that records what it is handed.
+fn recorder() -> (impl Fn(ContextChange) + Send + Sync + 'static, Handed) {
     let handed = Handed::default();
     let record = Arc::clone(&handed);
-    (move |ids| record.lock().expect("handed").push(ids), handed)
+    (
+        move |change| record.lock().expect("handed").push(change),
+        handed,
+    )
 }
 
 // ---------------------------------------------------------------------------- through podman

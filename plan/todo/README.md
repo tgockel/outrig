@@ -97,12 +97,6 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**How the agent is addressed, and what it can see**
-
-| Task      | What it settles                                                    |
-| --------- | ------------------------------------------------------------------ |
-| `0003-12` | The view is budgeted, and promotion has settled semantics          |
-
 **What a human can see afterwards, and finishing the loop**
 
 | Task      | What it settles                                                    |

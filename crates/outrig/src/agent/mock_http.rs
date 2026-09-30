@@ -5,6 +5,10 @@
 //! crate, which a unit test cannot reach across the crate boundary for. It
 //! asserts on what was *sent*, which is how a round proves what reached the
 //! model.
+//!
+//! It speaks Anthropic's Messages API by default and OpenAI's chat completions
+//! through [`Style`], and accepts any request either way. What a provider
+//! would refuse is [`check_wire`]'s to find.
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,15 +70,205 @@ pub(super) fn text_reply(text: &str) -> CannedResponse {
 
 /// A turn that asks for `submit_python` with `source`.
 pub(super) fn submit(id: &str, source: &str) -> CannedResponse {
-    message(
-        json!([{
-            "type": "tool_use",
-            "id": id,
-            "name": super::tool::NAME,
-            "input": { "source": source },
-        }]),
-        "tool_use",
-    )
+    Style::Anthropic.submit(id, source)
+}
+
+/// Which provider's protocol a canned response speaks, and a config names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Style {
+    Anthropic,
+    OpenAi,
+}
+
+impl Style {
+    pub(super) const ALL: [Style; 2] = [Style::Anthropic, Style::OpenAi];
+
+    /// What `[providers.<name>].style` says for it.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Style::Anthropic => "anthropic",
+            Style::OpenAi => "openai",
+        }
+    }
+
+    /// One text reply, round over.
+    pub(super) fn text(self, text: &str) -> CannedResponse {
+        match self {
+            Style::Anthropic => text_reply(text),
+            Style::OpenAi => chat(json!({"role": "assistant", "content": text}), "stop"),
+        }
+    }
+
+    /// A turn that asks for `submit_python` with `source`.
+    pub(super) fn submit(self, id: &str, source: &str) -> CannedResponse {
+        self.batch(&[(id, source)])
+    }
+
+    /// A turn that asks for `submit_python` once per `(id, source)`.
+    pub(super) fn batch(self, calls: &[(&str, &str)]) -> CannedResponse {
+        match self {
+            Style::Anthropic => message(
+                calls
+                    .iter()
+                    .map(|(id, source)| {
+                        json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": super::tool::NAME,
+                            "input": { "source": source },
+                        })
+                    })
+                    .collect(),
+                "tool_use",
+            ),
+            Style::OpenAi => chat(
+                json!({
+                    "role": "assistant",
+                    "tool_calls": calls
+                        .iter()
+                        .map(|(id, source)| json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": super::tool::NAME,
+                                "arguments": json!({"source": source}).to_string(),
+                            },
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
+                "tool_calls",
+            ),
+        }
+    }
+
+    /// The provider refusing a request with `status`.
+    pub(super) fn failure(self, status: u16) -> CannedResponse {
+        match self {
+            Style::Anthropic => failure(status),
+            Style::OpenAi => CannedResponse {
+                status,
+                body: json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "the mock failed on purpose",
+                    },
+                }),
+            },
+        }
+    }
+}
+
+/// A chat completion choosing `message`, in the shape rig's OpenAI
+/// `CompletionResponse` deserializes.
+fn chat(message: Value, finish_reason: &str) -> CannedResponse {
+    CannedResponse {
+        status: 200,
+        body: json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-mock",
+            "system_fingerprint": null,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "logprobs": null,
+                "finish_reason": finish_reason,
+            }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19 },
+        }),
+    }
+}
+
+/// What [`check_wire`] found in one request's `messages`.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Wire {
+    /// Tool-call ids without their result where the provider requires it, and
+    /// results without the call they answer.
+    pub(super) unpaired: Vec<String>,
+    /// Where a user or assistant message follows another of its role, by index
+    /// into `messages`, with the role.
+    pub(super) adjacent: Vec<(usize, String)>,
+}
+
+/// Check a request `body` against what `style`'s provider requires of the
+/// history every request we send relies on, and say where roles repeat.
+///
+/// - Anthropic: each `tool_use` block is answered by a `tool_result` in the
+///   very next message, and each `tool_result` answers a `tool_use` in the one
+///   before.
+/// - OpenAI: each of an assistant message's `tool_calls` is answered by a
+///   `tool` message before the next message of any other role, and each
+///   `tool` message answers a call of the assistant message before its run.
+pub(super) fn check_wire(style: Style, body: &Value) -> Wire {
+    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let role = |n: usize| messages[n]["role"].as_str().unwrap_or("").to_string();
+    let mut wire = Wire::default();
+    match style {
+        Style::Anthropic => {
+            let blocks = |n: usize, kind: &str, key: &str| -> Vec<String> {
+                messages[n]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block["type"] == kind)
+                    .filter_map(|block| block[key].as_str().map(str::to_string))
+                    .collect()
+            };
+            for n in 0..messages.len() {
+                let answered = if n + 1 < messages.len() {
+                    blocks(n + 1, "tool_result", "tool_use_id")
+                } else {
+                    Vec::new()
+                };
+                for id in blocks(n, "tool_use", "id") {
+                    if !answered.contains(&id) {
+                        wire.unpaired.push(id);
+                    }
+                }
+                let asked = if n > 0 {
+                    blocks(n - 1, "tool_use", "id")
+                } else {
+                    Vec::new()
+                };
+                for id in blocks(n, "tool_result", "tool_use_id") {
+                    if !asked.contains(&id) {
+                        wire.unpaired.push(id);
+                    }
+                }
+            }
+        }
+        Style::OpenAi => {
+            let mut asked: Vec<String> = Vec::new();
+            for message in &messages {
+                if message["role"] == "tool" {
+                    let id = message["tool_call_id"].as_str().unwrap_or("").to_string();
+                    match asked.iter().position(|asked| *asked == id) {
+                        Some(at) => {
+                            asked.remove(at);
+                        }
+                        None => wire.unpaired.push(id),
+                    }
+                    continue;
+                }
+                wire.unpaired.append(&mut asked);
+                asked = message["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call["id"].as_str().map(str::to_string))
+                    .collect();
+            }
+            wire.unpaired.append(&mut asked);
+        }
+    }
+    for n in 1..messages.len() {
+        let here = role(n);
+        if (here == "user" || here == "assistant") && role(n - 1) == here {
+            wire.adjacent.push((n, here));
+        }
+    }
+    wire
 }
 
 /// Start the mock on an ephemeral loopback port. Returns its address and the

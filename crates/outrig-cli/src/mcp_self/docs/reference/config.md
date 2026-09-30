@@ -415,14 +415,15 @@ provider   = "openai"
 identifier = "gpt-4o"
 ```
 
-| Key          | Type    | Required   | Default | Description                              |
-|--------------|---------|------------|---------|------------------------------------------|
-| `provider`   | string  | yes\*      | --      | Name of an entry in `[providers.<name>]`.|
-| `identifier` | string  | yes        | --      | Model id passed to the provider API.     |
-| `max-tokens` | integer | no         | --      | Output-token ceiling per turn, see below.|
+| Key              | Type    | Required | Default | Description                               |
+|------------------|---------|----------|---------|-------------------------------------------|
+| `provider`       | string  | yes\*    | --      | Name of an entry in `[providers.<name>]`. |
+| `identifier`     | string  | yes      | --      | Model id passed to the provider API.      |
+| `max-tokens`     | integer | no       | --      | Output-token ceiling per turn, see below. |
+| `context-window` | integer | no       | --      | The model's whole window in tokens.       |
 
 \* Required unless the entry sets `alias` instead, which forbids every field in this table
--- `max-tokens` included.
+-- `max-tokens` and `context-window` included.
 
 `max-tokens` on a model is the fallback for every agent that uses it;
 `[agents.<name>].max-tokens` wins where it is set. Leaving both unset lets the provider
@@ -432,6 +433,17 @@ about for Anthropic.
 Note the spelling. In config it is `max-tokens`, like every other key; `max_tokens` is
 rejected as an unknown field. The underscored form is what the provider API calls it, so it
 is what appears in a raw error coming back from one.
+
+`context-window` is the model's whole context window in tokens -- a request and its reply
+together -- as the provider publishes it, such as `200000` for current Claude models. It
+configures nothing on the provider's side; it tells `outrig run-new` how much one model call can
+carry. Each call sets aside the reply's ceiling (`max-tokens`, or the lower one the provider
+holds it to) and carries the system prompt and as much of the conversation as fits in the rest.
+Unset, `run-new` assumes a 128,000-token window, sets aside at most a quarter of it for the
+reply, and warns once at startup; it never infers a window from `identifier`. A model with a
+larger window is sent less than it could take until its row says so, and one with a smaller
+window can still refuse a request as too long. A `max-tokens` at or above `context-window` is
+refused when the session starts. `outrig run` ignores the key.
 
 #### anthropic models
 
@@ -1111,10 +1123,10 @@ image-config in the merged config but does not require agent/model/provider wiri
   omitted, `default-model` must be set and must name an existing `[models.<name>]`.
 - Every `models.<name>.provider` must name an existing `[providers.<name>]`.
 - Every `[models.<name>]` must set exactly one of `provider` or `alias`. Setting neither, or
-  setting `alias` alongside any provider-shape field (including `max-tokens`), is an error
-  naming every offending key. Unlike the other model rules, this one and the three below are
-  checked on **every** path, `outrig build` included -- they establish the entry's shape
-  rather than resolve a cross-reference.
+  setting `alias` alongside any provider-shape field (including `max-tokens` and
+  `context-window`), is an error naming every offending key. Unlike the other model rules,
+  this one and the three below are checked on **every** path, `outrig build` included -- they
+  establish the entry's shape rather than resolve a cross-reference.
 - Every `alias` must name at least one model; `alias = []` is an error.
 - Every name in an `alias` must name an existing `[models.<name>]`.
 - Alias entries must not form a cycle. The error names the cycle, e.g. `a -> b -> a`.

@@ -3001,6 +3001,205 @@ fn a_promotion_of_anything_but_a_turn_that_is_there_is_refused() {
     assert_eq!(k.output(9, "runtime.context.promoted"), "()\n");
 }
 
+/// A demotion goes to the host the way a promotion does, ahead of the
+/// result, and `promoted` stops listing the turn. Every turn named is sent,
+/// promoted here or not, since the host may hold a promotion this side never
+/// recorded.
+#[test]
+fn a_demotion_reaches_the_host_ahead_of_the_result_and_promoted_reflects_it() {
+    let mut k = Interpreter::start();
+    k.push_turn(0, 1, &[]);
+    k.push_turn(1, 1, &[]);
+    k.submit(1, "runtime.context.promote(0, 1)");
+    assert_eq!(
+        k.recv(),
+        json!({"t": "promote", "agent": PRIMARY, "turns": [0, 1]})
+    );
+    k.result_of(1);
+    k.submit(2, "runtime.context.demote(runtime.history.turns[1], 0)");
+    assert_eq!(
+        k.recv(),
+        json!({"t": "demote", "agent": PRIMARY, "turns": [0, 1]})
+    );
+    k.result_of(2);
+    assert_eq!(k.output(3, "runtime.context.promoted"), "()\n");
+    k.submit(4, "runtime.context.demote(1)");
+    assert_eq!(
+        k.recv(),
+        json!({"t": "demote", "agent": PRIMARY, "turns": [1]}),
+        "demoting what is not promoted is still said, and changes nothing"
+    );
+    k.result_of(4);
+    for (id, (source, error)) in [
+        (
+            "runtime.context.demote(7)",
+            "ValueError: no finished turn has id 7",
+        ),
+        (
+            "runtime.context.demote(False)",
+            "TypeError: a turn or a turn's id, not bool",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = k.exec(id as u64 + 5, source);
+        assert!(
+            result["status"] == "error" && text(&result["error"]).ends_with(&format!("{error}\n")),
+            "{source}: {result}"
+        );
+    }
+}
+
+/// A promotion and a demotion of one turn made at once, from two threads,
+/// leave the host and `promoted` agreeing: each change is told and recorded as
+/// one step, so whichever reaches the host last is what `promoted` says. The
+/// demotion here is held up just after its line is written, which is where the
+/// two once crossed.
+#[test]
+fn a_promotion_racing_a_demotion_leaves_the_host_and_promoted_agreeing() {
+    let mut k = Interpreter::start();
+    k.push_turn(0, 1, &[]);
+    k.submit(
+        1,
+        &py(r#"
+        import threading, time
+        context = runtime.context
+        names = type(context).promote.__globals__
+        write = names["_write_line"]
+        def slow_after_a_demotion(line):
+            write(line)
+            if b'"demote"' in line:
+                time.sleep(0.3)
+        names["_write_line"] = slow_after_a_demotion
+        try:
+            demoting = threading.Thread(target=context.demote, args=(0,))
+            demoting.start()
+            time.sleep(0.1)
+            context.promote(0)
+            demoting.join()
+        finally:
+            names["_write_line"] = write
+        print(context.promoted)
+        "#),
+    );
+    assert_eq!(
+        k.recv(),
+        json!({"t": "demote", "agent": PRIMARY, "turns": [0]})
+    );
+    assert_eq!(
+        k.recv(),
+        json!({"t": "promote", "agent": PRIMARY, "turns": [0]})
+    );
+    let result = k.result_of(1);
+    assert_eq!(
+        text(&result["output"]),
+        "(0,)\n",
+        "the host holds the promotion, so `promoted` must too: {result}"
+    );
+}
+
+/// A turn the round ended during reads as incomplete, and says so when
+/// printed; a turn whose mark is not a bool is not a turn.
+#[test]
+fn an_incomplete_turn_reads_as_incomplete() {
+    let mut k = Interpreter::start();
+    k.send(json!({
+        "t": "turn", "agent": PRIMARY, "id": 0, "round": 1, "prompt": "go", "text": "",
+        "calls": [{"source": "x", "result": "[outrig: not run]"}], "incomplete": true,
+    }));
+    k.push_turn(1, 1, &[]);
+    k.send(json!({
+        "t": "turn", "agent": PRIMARY, "id": 2, "round": 1, "prompt": null, "text": "",
+        "calls": [], "incomplete": "yes",
+    }));
+    k.await_stderr("turn 2 for 'primary' is not a turn");
+    assert_eq!(
+        k.output(
+            1,
+            "[t.incomplete for t in runtime.history.turns], runtime.history.turns[0]"
+        ),
+        "([True, False], <turn 0, round 1: 1 calls, 0 characters of text, incomplete>)\n"
+    );
+}
+
+/// The measurement gate for keeping the whole conversation in the
+/// interpreter: what a long session of full-size results costs it, measured
+/// against its memory ceiling. The host's side is
+/// `the_host_record_and_the_transport_of_a_long_session_are_measured`.
+#[test]
+fn a_long_sessions_mirror_is_measured_against_the_ceiling() {
+    const TURNS: u64 = 1_000;
+    const RESULT: usize = 16 << 10;
+    let mut k = Interpreter::start();
+    k.output(1, "import tracemalloc; tracemalloc.start()");
+    let result = "r".repeat(RESULT);
+    for id in 0..TURNS {
+        k.push_turn(id, id / 10 + 1, &[("print(x)", &result)]);
+    }
+    let measured = k.output(
+        2,
+        &py(r#"
+        import resource, sys
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        def size(t):
+            parts = (t, t.calls, t.text, t.prompt, *t.calls)
+            return sum(map(sys.getsizeof, parts)) + sum(
+                sys.getsizeof(c.source) + sys.getsizeof(c.result) for c in t.calls
+            )
+        turns = runtime.history.turns
+        walked = sum(map(size, turns)) + sys.getsizeof(turns)
+        ceiling = resource.getrlimit(resource.RLIMIT_DATA)[0]
+        print(len(turns), current, peak, walked, runtime.history._held, ceiling)
+        "#),
+    );
+    let numbers: Vec<u64> = measured
+        .split_whitespace()
+        .map(|n| n.parse().unwrap_or(u64::MAX))
+        .collect();
+    let [turns, current, peak, walked, held, ceiling] = numbers[..] else {
+        panic!("six numbers: {measured}");
+    };
+    let payload = TURNS * RESULT as u64;
+    eprintln!(
+        "{TURNS} turns of {RESULT} bytes: payload {payload}, traced {current} (peak {peak}), \
+         walked {walked}, counted {held}, ceiling {ceiling}"
+    );
+    assert_eq!(turns, TURNS);
+    assert!(walked < payload * 11 / 10, "walked {walked}");
+    assert!(current < payload * 125 / 100, "traced {current}");
+    assert!(
+        peak - current < 8 * RESULT as u64,
+        "a turn at a time is in flight: peak {peak}, current {current}"
+    );
+    assert!(
+        held >= payload && held < walked,
+        "the count is of the text: {held}"
+    );
+}
+
+/// Past an eighth of the ceiling, the mirror says so on stderr, once, and
+/// keeps every turn.
+#[test]
+fn a_mirror_past_an_eighth_of_the_ceiling_is_reported_once() {
+    const RESULT: usize = 256 << 10;
+    let mut k = Interpreter::start_with_ceiling(256 << 20);
+    let result = "r".repeat(RESULT);
+    // 33 MiB of results, past an eighth of 256 MiB, then as much again.
+    for id in 0..264 {
+        k.push_turn(id, 1, &[("print(x)", &result)]);
+    }
+    k.await_stderr("past an eighth of the interpreter's 256 MiB memory ceiling");
+    assert_eq!(k.output(1, "len(runtime.history.turns)"), "264\n");
+    assert_eq!(
+        k.stderr().matches("past an eighth").count(),
+        1,
+        "{}",
+        k.stderr()
+    );
+}
+
 // ---------------------------------------------------------------------------- what the agent can ask
 
 /// The echo renders inside the execution that asked, so a `__repr__` that

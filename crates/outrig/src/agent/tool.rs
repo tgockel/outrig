@@ -51,13 +51,11 @@ fn parse_args(args: &str) -> Result<Args, ToolError> {
     serde_json::from_str(args).map_err(ToolError::JsonError)
 }
 
-/// Told the source of each submission sent to the interpreter to run.
-pub(crate) type SubmitObserver = Box<dyn Fn(&str) + Send + Sync>;
-
-/// Where an observer is put for the tool to find. The tool is handed to rig
-/// when the agent is built, before any observer exists, so the two share this
-/// rather than the observer being passed in.
-pub(crate) type ObserverSlot = Arc<Mutex<Option<SubmitObserver>>>;
+/// Where an observer of `T` is put for whoever tells it to find: by default,
+/// the tool telling of each submission's source as it goes to run. The tool is
+/// handed to rig when the agent is built, before any observer exists, so the
+/// two share this rather than the observer being passed in.
+pub(crate) type ObserverSlot<T = str> = Arc<Mutex<Option<Box<dyn Fn(&T) + Send + Sync>>>>;
 
 /// Where the user's interrupt goes: the execution a call is waiting on, and
 /// the turn that call belongs to. Shared by the tool, the round's hook, and

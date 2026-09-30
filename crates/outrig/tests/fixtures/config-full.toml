@@ -40,9 +40,10 @@ provider   = "openai"
 identifier = "gpt-4o"
 
 [models.claude]
-provider   = "anthropic"
-identifier = "claude-sonnet-4-6"
-max-tokens = 16384
+provider       = "anthropic"
+identifier     = "claude-sonnet-4-6"
+max-tokens     = 16384
+context-window = 200000
 
 [models.local-fast]
 provider   = "local"

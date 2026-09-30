@@ -178,11 +178,13 @@ srv = { command = ["bin", "arg1"] }
             Some("gpt-4o-mini")
         );
         assert_eq!(cfg.models["fast"].max_tokens, None);
+        assert_eq!(cfg.models["fast"].context_window, None);
 
         let claude = &cfg.models["claude"];
         assert_eq!(claude.provider.as_deref(), Some("anthropic"));
         assert_eq!(claude.identifier.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(claude.max_tokens, Some(16384));
+        assert_eq!(claude.context_window, Some(200_000));
 
         // A local model is an ordinary `openai` row pointed at a localhost
         // server; nothing about it is local to outrig.

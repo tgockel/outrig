@@ -302,14 +302,40 @@ can wait on it again. Python waiting with a bare `await` is not ended by a messa
 it.
 
 **The model is sent part of the conversation; the agent's Python holds all of it.** A round is
-the agent's work on the messages waiting when it starts. Each model call is sent the session's
-first two rounds, the six before the current one, and the current one whole. Everything is in
+the agent's work on the messages waiting when it starts. Each model call is chosen the session's
+first two rounds, the six before the current one, and the current one. Everything is in
 `runtime.history.turns`, one entry per model call with what the model wrote and each
 submission's source and result, so the agent's code can search the whole conversation without it
 costing the model any context. `runtime.context.promote(turn)` adds a turn back to what the model
-is sent, in its original place, from the next model call on. When a round's model calls leave
-turns out, the line that opens the round says how many. The whole conversation stays in the
-interpreter for the rest of the session, under the same memory ceiling as everything else.
+is sent, in its original place, from the next model call on, until `runtime.context.demote(turn)`.
+When a round's first call leaves turns out, the line that opens the round says how many. A turn
+the round ended during -- interrupted while its code ran -- has `incomplete` set, and each of its
+calls that had not returned says so rather than claiming it never ran. The whole conversation
+stays in the interpreter for the rest of the session, under the same memory ceiling as
+everything else, and a warning says once when it passes an eighth of that ceiling.
+
+**Each call is held to the model's context window.** `context-window` on the model's row sets it
+(see [Remote-provider models](config.md#remote-provider-models)); without one, 128,000 tokens
+is assumed and startup warns. Before each call, OutRig estimates its size -- about three bytes to
+a token -- against the window, less the reply's `max-tokens` and the system prompt. When what was
+chosen does not fit, the recent rounds go first, from their oldest turn, then the first rounds,
+from their newest, then promotions, oldest first, then the current round's earlier turns; a turn
+too large for what is left is passed over and smaller ones still go. The turn a call answers --
+the model's latest code and its results -- is never left out. When that alone does not fit, the
+call is not made: the round ends with `(round ended: turn N of round R ... is about X tokens, and
+a call to M has room for about Y ...)`, and keeps the turn. The next round leaves it out like any
+other, so the session goes on.
+
+**What a shortened conversation looks like to a provider.** Every call keeps each tool call
+beside its result, which every provider requires. What a cut can do is put two of the user's
+turns or two of the model's in a row: a turn brought back without the rest of its round opens on
+the model's call right after the model's own text, and a round cut short ends on results that the
+next round's opening follows. Anthropic's API carries results as user messages and merges such a
+pair. OpenAI's carries them as `tool` messages, so a prompt after results is no repeat there, and
+it accepts two replies in a row. Both adapters are exercised against a mock, not a live
+endpoint. A provider or gateway that requires turns to alternate -- a Bedrock-backed Claude
+behind an OpenAI-compatible gateway is known to -- can refuse such a call, and when a refused
+call carried one, the error says where.
 
 stdout carries only what the agent sends on the channel -- including a send from code still
 running after its round ended, which is printed when it arrives, at the prompt or not. The agent

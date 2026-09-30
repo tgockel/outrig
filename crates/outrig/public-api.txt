@@ -453,6 +453,7 @@ pub fn outrig::config::ImageConfig::set_build_paths(&mut self, impl core::conver
 pub fn outrig::config::ImageConfig::source(&self) -> outrig::config::ImageSourceRef<'_>
 #[non_exhaustive] pub struct outrig::config::Model
 pub outrig::config::Model::alias: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub outrig::config::Model::context_window: core::option::Option<u32>
 pub outrig::config::Model::identifier: core::option::Option<alloc::string::String>
 pub outrig::config::Model::max_tokens: core::option::Option<u32>
 pub outrig::config::Model::provider: core::option::Option<alloc::string::String>

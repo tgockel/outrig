@@ -16,6 +16,7 @@
 use thiserror::Error;
 
 use super::AgentError;
+use super::budget::Budget;
 use crate::config::{
     Agent, Config, DEFAULT_TOOL_CALL_MAX, DEFAULT_TOOL_RESULT_MAX_BYTES, LlmProvider,
 };
@@ -58,6 +59,25 @@ pub(crate) enum LlmResolveError {
 
     #[error("failed to build rig client: {0}")]
     RigClientBuild(String),
+
+    /// A configured reply ceiling that fills the configured window. The reply
+    /// is part of the window, so nothing would be left for the request.
+    #[error(
+        "{setter} is {max_tokens}, but [models.{model}].context-window is {window}: the reply is \
+         part of the window, so its ceiling must be below it. Set context-window to the model's \
+         whole window, request and reply together, or lower max-tokens"
+    )]
+    ReplyFillsWindow {
+        setter: String,
+        max_tokens: u32,
+        model: String,
+        window: u32,
+    },
+
+    /// What is left of a window, once the reply and the system prompt have
+    /// their share, is too little for a round to run in.
+    #[error("{}", super::budget::too_small(.0))]
+    WindowTooSmall(Budget),
 }
 
 /// Runtime-shaped provider view -- mirrors the config `LlmProvider` enum, but
@@ -87,6 +107,9 @@ pub(crate) struct ResolvedCandidate {
     /// This row's output-token ceiling: the agent's if it set one, this
     /// model's otherwise.
     pub(crate) max_tokens: Option<u32>,
+    /// This row's whole context window, in tokens, when it names one. Each
+    /// candidate has its own, since a smaller model is a smaller window.
+    pub(crate) context_window: Option<u32>,
 }
 
 /// Fully-resolved view of one agent: every knob the agent loop needs to
@@ -254,8 +277,27 @@ pub(crate) fn resolve_agent(
         model_name
     };
 
+    let candidate = resolve_candidate(cfg, agent, concrete)?;
+    // The configured values alone: a ceiling at or above the window is a
+    // contradiction in the file, whatever a provider would have lowered it to.
+    if let (Some(max_tokens), Some(window)) = (candidate.max_tokens, candidate.context_window)
+        && max_tokens >= window
+    {
+        let setter = match (agent_name, agent.max_tokens) {
+            (Some(name), Some(_)) => format!("[agents.{name}].max-tokens"),
+            _ => format!("[models.{concrete}].max-tokens"),
+        };
+        return Err(LlmResolveError::ReplyFillsWindow {
+            setter,
+            max_tokens,
+            model: concrete.to_string(),
+            window,
+        }
+        .into());
+    }
+
     Ok(ResolvedAgent {
-        candidate: resolve_candidate(cfg, agent, concrete)?,
+        candidate,
         preamble: agent.preamble.clone(),
         temperature: agent.temperature,
         tool_call_max: agent
@@ -336,5 +378,6 @@ fn resolve_candidate(
         provider: resolved_provider,
         // The agent's ceiling wins; the model's is the fallback.
         max_tokens: agent.max_tokens.or(model.max_tokens),
+        context_window: model.context_window,
     })
 }

@@ -60,11 +60,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails or is dropped has already kept every turn before it. Each turn is mirrored into the
   interpreter, where `runtime.history.turns` holds it as a frozen `Turn` with `id`, `round`,
   `prompt`, `text`, and `calls`, each a `Call` with `source` and `result`. The agent's code can
-  scan it there at no cost in context. A model call is sent the conversation's first two rounds,
-  the six before the current one, the current one whole, and each turn the agent named with
-  `runtime.context.promote(...)`, in its original place. A promotion made while code runs reaches
-  the round's next model call, and the line that opens a round says how many earlier turns it
-  leaves out.
+  scan it there at no cost in context. A model call is chosen the conversation's first two rounds,
+  the six before the current one, the current one, and each turn the agent named with
+  `runtime.context.promote(...)`, in its original place, until `runtime.context.demote(...)`. A
+  promotion or demotion made while code runs reaches the round's next model call, and the line
+  that opens a round says how many earlier turns its first call leaves out. A turn the round
+  ended during has `Turn.incomplete` set. Past an eighth of the memory ceiling, the interpreter
+  says once on stderr how much the conversation holds.
+
+  Each model call is held to the model's context window, from `Model::context_window` or an
+  assumed 128,000 tokens with a warning, less the reply's ceiling and the system prompt, by an
+  estimate made before the call. What does not fit is left out in a fixed order -- the window's
+  recent rounds, then its first, then promotions, then the round's earlier turns -- and the turn
+  a call answers never is. When that turn alone does not fit, the call is not made: the round
+  ends, keeping it, with a reason naming the turn, and the next round leaves it out. A provider's
+  refusal of a call whose shortened history put one role after itself says so.
 
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
   user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
@@ -97,6 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
   shape will change without a deprecation while the agent loop is built out. It has no retry or
   failover yet, and an alias naming several models runs against the first.
+
+- **`Model::context_window`, `[models.<name>].context-window` in config**: the model's whole
+  context window in tokens, a request and its reply together, as its provider publishes it. It
+  configures nothing on the provider's side; `PythonAgent` holds each model call to it. An alias
+  row refuses it like `max-tokens`, and a `max-tokens` at or above it is refused when an agent is
+  resolved. `outrig run` ignores it.
 
 ### Changed
 

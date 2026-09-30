@@ -798,7 +798,7 @@ pub struct Model {
     /// model (`alias = "opus-5"`) or one name for a set of provider-equivalent
     /// rows (`alias = ["opus-5-bedrock", "opus-5-anthropic"]`); both spellings
     /// deserialize here. Mutually exclusive with every provider-shape field
-    /// above and below, including `max-tokens`.
+    /// above and below, including `max-tokens` and `context-window`.
     #[serde(
         default,
         deserialize_with = "deserialize_string_or_vec_string",
@@ -813,6 +813,14 @@ pub struct Model {
     /// Claude model naming anything else needs this (or the agent's) set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// The model's whole context window in tokens -- a request and its reply
+    /// together -- as its provider publishes it. It configures nothing on the
+    /// provider's side: it tells `outrig run-new` how much of the conversation
+    /// one model call can carry, after holding back room for the reply. Unset,
+    /// an assumed window is used and a warning says so; it is never inferred
+    /// from [`identifier`](field@Self::identifier). `outrig run` ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 impl Model {
@@ -855,19 +863,21 @@ impl Model {
             alias: None,
             identifier: None,
             max_tokens: None,
+            context_window: None,
         }
     }
 
     /// Every provider-shape field this row actually sets, in declaration order.
     ///
     /// Empty for a well-formed alias, which is what makes it the conflict list:
-    /// anything here alongside `alias` is a contradiction, `max-tokens`
-    /// included.
+    /// anything here alongside `alias` is a contradiction, `max-tokens` and
+    /// `context-window` included.
     pub(crate) fn provider_shape_fields(&self) -> Vec<&'static str> {
         [
             (self.provider.is_some(), "provider"),
             (self.identifier.is_some(), "identifier"),
             (self.max_tokens.is_some(), "max-tokens"),
+            (self.context_window.is_some(), "context-window"),
         ]
         .into_iter()
         .filter(|(present, _)| *present)
@@ -900,9 +910,10 @@ impl Model {
 /// serves it, or other models it stands for. Returned by [`Model::source`].
 ///
 /// Deliberately carries only the discriminant: every reader already holds the
-/// `&Model` and reads the provider-shape fields (`identifier`, `max-tokens`)
-/// off it directly, so restating them here would be surface with no
-/// consumer. The per-variant `#[non_exhaustive]` keeps adding one additive.
+/// `&Model` and reads the provider-shape fields (`identifier`, `max-tokens`,
+/// `context-window`) off it directly, so restating them here would be surface
+/// with no consumer. The per-variant `#[non_exhaustive]` keeps adding one
+/// additive.
 #[non_exhaustive]
 pub enum ModelSourceRef<'a> {
     #[non_exhaustive]

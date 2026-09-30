@@ -207,6 +207,9 @@ with different sampling for different tasks (e.g. low temperature for code, high
 brainstorming). `max-tokens` may also be set on the model, which covers every agent pointed at
 it; the agent's value wins where both are set. That matters for Anthropic models, whose API
 requires a ceiling on every request -- see [Native Anthropic](#native-anthropic-style--anthropic).
+`context-window` lives only on the model, because a window belongs to the model a provider
+serves: it tells `outrig run-new` how much of a conversation one call can carry. See
+[Remote-provider models](../reference/config.md#remote-provider-models).
 
 `tool-call-max` also lives on the agent when a role needs longer tool loops. If unset, the agent
 uses the top-level `tool-call-max`, then the compiled-in default of `50`. The max is per user
@@ -317,7 +320,9 @@ behind the `local-llm` build feature. That backend was removed in 0.3: a config 
 `style = "mistralrs"`, sets any of the six weight keys (`model-id`, `model-path`, `model-file`,
 `revision`, `context-length`, `device`), or sets the top-level `model-cache-root` fails to parse.
 Replace the bare provider and its weight-bearing rows with the pair above. The six keys have no
-counterpart on purpose -- the server owns all of them, which is the point of the move. The
+counterpart on purpose -- the server owns all of them, which is the point of the move.
+`context-window` is not `context-length` renamed: it configures nothing on the server, and only
+tells `outrig run-new` the limit the server already has. The
 `[models.<name>]` key is yours: keep whatever the old row was called and every `model = ...`
 reference to it keeps working. Only the row's contents change.
 

@@ -16,6 +16,7 @@
 //! [`PythonAgent`]'s signatures, and [`AgentError`] renders rig's error to text
 //! at the point it is caught.
 
+mod budget;
 mod build;
 mod channel;
 mod history;
@@ -26,7 +27,7 @@ mod tool;
 
 use std::error::Error;
 use std::path::Path;
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use rig::completion::PromptError;
@@ -39,6 +40,7 @@ use crate::python::host::{Interpreter, InterpreterError};
 
 pub use self::channel::UserChannel;
 
+use self::budget::Budget;
 use self::build::RigAgent;
 use self::channel::Announcer;
 use self::history::{History, Window};
@@ -60,6 +62,8 @@ pub struct PythonAgent {
     agent: RigAgent,
     /// The whole conversation, which rounds commit to as they go.
     history: History,
+    /// What each model call may carry of it.
+    budget: Arc<Budget>,
     tool_call_max: usize,
     /// The output-token ceiling the model is held to: the configured one,
     /// filled in or lowered to what the model publishes.
@@ -197,10 +201,20 @@ impl PythonAgent {
     /// tool-call cap keeps what it managed, and its reply ends `(round ended:
     /// <reason>)`.
     ///
-    /// The model is sent the conversation's first two rounds, the six before
-    /// this one, this one whole, and any turn the agent's code promoted. The
-    /// rest stays in the interpreter, where the agent's code reads all of it,
-    /// and the opening line says how many turns were left out.
+    /// Each model call is sent this round, any turn the agent's code promoted
+    /// and has not demoted, and the conversation's first two rounds and the
+    /// six before this one -- as much of that as fits the model's context
+    /// window, after room for the reply. What does not fit goes in that order
+    /// reversed: the window first, nearest the part already left out, then
+    /// promotions, oldest first, then this round's earlier turns. The rest
+    /// stays in the interpreter, where the agent's code reads all of it, and
+    /// the opening line says how many turns were left out.
+    ///
+    /// The turn a call answers -- the model's last tool calls and their
+    /// results -- is never left out. When it cannot fit on its own, the call is
+    /// not made: the round ends, keeping what it did, and its reply ends
+    /// `(round ended: <reason>)` naming the turn. Later rounds leave that turn
+    /// out like any other, so the session goes on.
     ///
     /// The conversation belongs to the agent rather than to the round, which
     /// commits each turn as it completes. An error leaves the conversation as
@@ -217,12 +231,15 @@ impl PythonAgent {
         let Some(announcement) = self.announcer.opening().await? else {
             return Ok(None);
         };
-        let opening = orientation::opening(&announcement, self.history.omitted());
+        let opening = self.history.open_round(&self.budget, |omitted| {
+            orientation::opening(&announcement, omitted)
+        });
         let RoundEnd { reply, stopped } = self
             .agent
             .round(
-                &opening,
+                opening,
                 &self.history,
+                &self.budget,
                 self.tool_call_max,
                 &self.interrupts,
             )
@@ -269,14 +286,34 @@ impl PythonAgent {
         let on_submit = tool.observer_slot();
         let interrupts = tool.interrupts();
         let preamble = orientation::preamble(workspace, resolved.preamble.as_deref(), window);
+        let overhead = budget::overhead(
+            &preamble,
+            [
+                tool.name().as_str(),
+                tool.description().as_str(),
+                &tool.parameters().to_string(),
+            ],
+        );
         let built = build::build_agent(
             resolved,
             &preamble,
             vec![Box::new(tool) as Box<dyn ToolDyn>],
         )?;
+        // After building: the reply's reserve is the ceiling that reaches the
+        // wire, which building may have filled in or lowered.
+        let budget = Budget::new(&resolved.candidate, built.max_tokens, overhead)?;
+        tracing::debug!(
+            model = %budget.model,
+            window = budget.window,
+            assumed = budget.window_assumed,
+            reserve = budget.reserve,
+            overhead = budget.overhead,
+            "each model call is held to this budget"
+        );
         Ok(Self {
             agent: built.agent,
             history,
+            budget: Arc::new(budget),
             tool_call_max: resolved.tool_call_max,
             max_tokens: built.max_tokens,
             model: resolved.candidate.model_name.clone(),

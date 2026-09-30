@@ -24,7 +24,7 @@ fn expect_validation_err(cfg: &Config, repo_root: Option<&Path>) -> ConfigValida
 
 /// The native Anthropic style carries the same connection fields as `openai`
 /// and survives a serialize/parse round trip, including the model-level
-/// `max-tokens` its API needs.
+/// `max-tokens` its API needs and the `context-window` `run-new` budgets to.
 #[test]
 fn anthropic_provider_parses_validates_and_round_trips() {
     let cfg = parse(
@@ -37,9 +37,10 @@ request-timeout-secs = 120
 retry-budget-secs    = 300
 
 [models.sonnet]
-provider   = "claude"
-identifier = "claude-sonnet-4-6"
-max-tokens = 16384
+provider       = "claude"
+identifier     = "claude-sonnet-4-6"
+max-tokens     = 16384
+context-window = 200000
 "#,
     );
     cfg.validate(None).expect("validates");
@@ -59,8 +60,13 @@ max-tokens = 16384
     assert_eq!(*request_timeout_secs, Some(120));
     assert_eq!(*retry_budget_secs, Some(300));
     assert_eq!(cfg.models["sonnet"].max_tokens, Some(16384));
+    assert_eq!(cfg.models["sonnet"].context_window, Some(200_000));
 
     let serialized = toml::to_string(&cfg).expect("serializes");
+    assert!(
+        serialized.contains("context-window = 200000"),
+        "the key round-trips in its documented spelling, got: {serialized}"
+    );
     assert!(
         serialized.contains(r#"style = "anthropic""#),
         "style should round-trip as the documented tag, got: {serialized}"

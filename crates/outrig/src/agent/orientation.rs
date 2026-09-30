@@ -55,8 +55,10 @@ pub(crate) fn preamble(
          calls, holding what you wrote and each call's source and result. Reading it from code \
          costs no context: only what you print is seen. Each call is sent less than all of it: \
          the first {first} rounds, the {recent} before this one, this one, and any turn you name \
-         with `runtime.context.promote(turn)`. A round begins each time you are told messages \
-         are waiting, and its opening line says how many earlier turns are left out.\n\n"
+         with `runtime.context.promote(turn)` until `runtime.context.demote(turn)`. Each call is \
+         also held to the model's context window, which can leave out more, never your latest \
+         call. A round begins each time you are told messages are waiting, and its opening line \
+         says how many earlier turns are left out.\n\n"
     ));
     if let Some(workspace) = workspace {
         text.push_str(&format!(

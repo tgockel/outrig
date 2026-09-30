@@ -12,10 +12,13 @@ use std::sync::{Arc, Mutex};
 use rig::tool::{ToolDyn, ToolError};
 use serde_json::json;
 
+use super::budget::{ASSUMED_CONTEXT_WINDOW, Budget, DEFAULT_REPLY_RESERVE};
 use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
-use super::history::Window;
-use super::mock_http::{self, CannedResponse, MODEL, RecordedRequest, failure, submit, text_reply};
+use super::history::{Manifest, Why, Window};
+use super::mock_http::{
+    self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, submit, text_reply,
+};
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use super::{AgentError, PythonAgent};
@@ -51,12 +54,26 @@ fn load(toml: &str) -> Config {
 /// A config with an `anthropic` provider at `addr` and a `coding` agent whose
 /// block carries `agent_keys`.
 fn config(addr: std::net::SocketAddr, var: &str, identifier: &str, agent_keys: &str) -> Config {
+    config_in(Style::Anthropic, addr, var, identifier, "", agent_keys)
+}
+
+/// A config with a provider of `style` at `addr`, a `sonnet` model on it whose
+/// row carries `model_keys`, and a `coding` agent whose block carries
+/// `agent_keys`.
+fn config_in(
+    style: Style,
+    addr: std::net::SocketAddr,
+    var: &str,
+    identifier: &str,
+    model_keys: &str,
+    agent_keys: &str,
+) -> Config {
     load(&format!(
         r#"
 default-model = "sonnet"
 
 [providers.claude]
-style                = "anthropic"
+style                = "{style}"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 10
@@ -64,11 +81,13 @@ request-timeout-secs = 10
 [models.sonnet]
 provider   = "claude"
 identifier = "{identifier}"
+{model_keys}
 
 [agents.coding]
 preamble = "You write Python."
 {agent_keys}
-"#
+"#,
+        style = style.name(),
     ))
 }
 
@@ -83,8 +102,24 @@ async fn agent_over(
     PythonAgent,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
+    agent_in(Style::Anthropic, var, identifier, "", agent_keys, script).await
+}
+
+/// [`agent_over`] against a provider of `style`, whose model row carries
+/// `model_keys`.
+async fn agent_in(
+    style: Style,
+    var: &str,
+    identifier: &str,
+    model_keys: &str,
+    agent_keys: &str,
+    script: Vec<CannedResponse>,
+) -> (
+    PythonAgent,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
     let (addr, requests) = mock_http::start(script).await;
-    let cfg = config(addr, var, identifier, agent_keys);
+    let cfg = config_in(style, addr, var, identifier, model_keys, agent_keys);
     let interpreter = start_on_host().await;
     let agent = with_key(var, || {
         PythonAgent::with_interpreter(interpreter, &cfg, Some("coding"), None)
@@ -119,6 +154,20 @@ async fn dropped_round(agent: &mut PythonAgent, message: &str, reached: impl Fut
         _ = within(reached) => {}
         _ = agent.round() => panic!("the round returned before it could be dropped"),
     }
+}
+
+/// Send `message`, then drop the round it starts once its second call's
+/// source goes to run -- by when the first call has returned.
+async fn dropped_inside_the_second(agent: &mut PythonAgent, message: &str) {
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_submit(move |source| {
+        let _ = started.send(source.to_string());
+    });
+    let inside_the_second = async {
+        starts.recv().await.expect("the first call");
+        starts.recv().await.expect("the second call");
+    };
+    dropped_round(agent, message, inside_the_second).await;
 }
 
 /// The text of a message's `content`, or the system prompt, whether rig sent
@@ -471,17 +520,11 @@ async fn a_round_dropped_after_it_ran_python_keeps_what_it_ran() {
 /// that it had not returned, the one after with a note that it never started.
 #[tokio::test]
 async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
-    let batch = mock_http::message(
-        json!([
-            { "type": "tool_use", "id": "toolu_a", "name": tool::NAME,
-              "input": { "source": "x = 41\nprint('a ran')" } },
-            { "type": "tool_use", "id": "toolu_b", "name": tool::NAME,
-              "input": { "source": "import time\ntime.sleep(30)" } },
-            { "type": "tool_use", "id": "toolu_c", "name": tool::NAME,
-              "input": { "source": "print('c ran')" } },
-        ]),
-        "tool_use",
-    );
+    let batch = Style::Anthropic.batch(&[
+        ("toolu_a", "x = 41\nprint('a ran')"),
+        ("toolu_b", "import time\ntime.sleep(30)"),
+        ("toolu_c", "print('c ran')"),
+    ]);
     let (mut agent, mut requests) = agent_over(
         "OUTRIG_TEST_AGENT_DROPPED_BATCH",
         MODEL,
@@ -489,17 +532,7 @@ async fn a_round_dropped_mid_batch_keeps_the_calls_that_returned() {
         vec![batch, text_reply("carried on")],
     )
     .await;
-    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
-    agent.on_submit(move |source| {
-        let _ = started.send(source.to_string());
-    });
-
-    // The second source going to run means the first has returned.
-    let inside_the_second = async {
-        starts.recv().await.expect("the first call");
-        starts.recv().await.expect("the second call");
-    };
-    dropped_round(&mut agent, "run three", inside_the_second).await;
+    dropped_inside_the_second(&mut agent, "run three").await;
 
     assert_eq!(round(&mut agent, "continue").await, "carried on");
     let recorded = mock_http::drain(&mut requests);
@@ -1365,6 +1398,589 @@ async fn run_new_keeps_the_conversation_when_a_round_is_interrupted() {
     assert_eq!(messages(&last).len(), 4 + 3 + 1, "{:#?}", messages(&last));
 }
 
+// ---------------------------------------------------------------------------- the budget
+
+/// Every manifest `agent`'s model calls are assembled with, from now on.
+fn manifests(agent: &PythonAgent) -> Arc<Mutex<Vec<Manifest>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    agent
+        .history
+        .on_manifest(move |manifest| record.lock().expect("manifests").push(manifest.clone()));
+    seen
+}
+
+/// How many times `needle` appears in the messages `request` carried.
+fn count(request: &RecordedRequest, needle: &str) -> usize {
+    request.body["messages"].to_string().matches(needle).count()
+}
+
+/// Every source the agent's interpreter accepted, in order, from now on.
+fn sources(agent: &mut PythonAgent) -> Arc<Mutex<Vec<String>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    agent.on_submit(move |source| record.lock().expect("sources").push(source.to_string()));
+    seen
+}
+
+/// The failure this task exists to remove: a turn too large for the model's
+/// window used to be sent anyway, refused, and resent every round after. Now
+/// the call is not made; the round ends naming the turn, keeps it, and the
+/// next round leaves it out and goes on. One execution's output is at most 16
+/// KiB, about 5,500 tokens, so the window here leaves less room than that.
+#[tokio::test]
+async fn a_turn_too_large_for_the_window_ends_its_round_and_later_rounds_go_on() {
+    let (mut agent, mut requests) = agent_in(
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_TOO_LARGE",
+        MODEL,
+        "context-window = 7000",
+        "max-tokens = 1024",
+        vec![
+            submit("toolu_big", "print('x' * 60000)"),
+            text_reply("two"),
+            text_reply("three"),
+        ],
+    )
+    .await;
+    let reply = round(&mut agent, "one").await;
+    assert!(
+        reply.starts_with("(round ended: turn 0 of round 1 -- the model's last call and what it returned -- is about "),
+        "{reply}"
+    );
+    for needle in [
+        "7000-token context window",
+        "1024 reserved for the reply",
+        "stays in runtime.history",
+        "Lower tool-result-max or max-tokens",
+    ] {
+        assert!(reply.contains(needle), "{needle:?} in {reply}");
+    }
+    assert_eq!(agent.history.len(), 1, "the turn is kept");
+    assert_eq!(
+        mock_http::drain(&mut requests).len(),
+        1,
+        "the call was not made"
+    );
+
+    assert_eq!(round(&mut agent, "two").await, "two");
+    let second = mock_http::drain(&mut requests).pop().expect("round two");
+    assert_eq!(count(&second, "xxxxxxxxxx"), 0, "{:#}", second.body);
+    let opening = last_user_text(&second);
+    assert!(
+        opening.ends_with(". 1 earlier turn is not shown; runtime.history has it."),
+        "{opening}"
+    );
+    assert_eq!(round(&mut agent, "three").await, "three");
+    assert_eq!(mock_http::drain(&mut requests).len(), 1);
+}
+
+/// A turn promoted while the window already holds it is sent once, and in its
+/// place; promoting it twice is promoting it once; promoted out of order,
+/// turns go in order.
+#[tokio::test]
+async fn a_promoted_turn_inside_the_window_is_sent_once_and_in_order() {
+    let (mut agent, mut requests, _) = three_narrow_rounds(
+        "OUTRIG_TEST_AGENT_PROMOTE_TWICE",
+        needle_rounds(vec![
+            // Turn 3 is the third round's, inside the window; turn 1 is the
+            // needle's, outside it.
+            submit(
+                "toolu_promote",
+                "runtime.context.promote(3)\nruntime.context.promote(1, 3)",
+            ),
+            text_reply("promoted"),
+        ]),
+    )
+    .await;
+    let seen = manifests(&agent);
+    assert_eq!(round(&mut agent, "promote").await, "promoted");
+    let after = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the second call");
+    assert_eq!(count(&after, "third round"), 1, "{:#}", after.body);
+    assert_eq!(count(&after, "needle-7f3a"), 1, "{:#}", after.body);
+    let first = position(&after, "first round").expect("the first round");
+    let needle = position(&after, "needle-7f3a").expect("the promoted turn");
+    let third = position(&after, "third round").expect("the third round");
+    assert!(
+        first < needle && needle < third,
+        "{first} < {needle} < {third}"
+    );
+
+    let manifest = seen
+        .lock()
+        .expect("manifests")
+        .last()
+        .cloned()
+        .expect("a call");
+    let why: Vec<(usize, Why)> = manifest
+        .carried
+        .into_iter()
+        .filter(|(id, _)| *id < 4)
+        .collect();
+    assert_eq!(
+        why,
+        [(0, Why::First), (1, Why::Promoted), (3, Why::Promoted)]
+    );
+}
+
+/// A demotion takes effect from the next model call, in the same round, and a
+/// turn promoted again is sent again.
+#[tokio::test]
+async fn a_demoted_turn_leaves_the_next_call() {
+    let (mut agent, mut requests, _) = three_narrow_rounds(
+        "OUTRIG_TEST_AGENT_DEMOTE",
+        needle_rounds(vec![
+            submit("toolu_promote", "runtime.context.promote(1)"),
+            submit("toolu_demote", "runtime.context.demote(1)"),
+            submit("toolu_again", "runtime.context.promote(1)"),
+            text_reply("done"),
+        ]),
+    )
+    .await;
+    round(&mut agent, "go").await;
+    let recorded = mock_http::drain(&mut requests);
+    let needles: Vec<usize> = recorded.iter().map(|r| count(r, "needle-7f3a")).collect();
+    assert_eq!(needles, [0, 1, 0, 1]);
+}
+
+/// A turn is promotable once it has committed and not before: the call in
+/// flight is not a turn yet, and by the next call it is.
+#[tokio::test]
+async fn the_turn_in_flight_is_promotable_once_it_commits() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_IN_FLIGHT",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_early", "runtime.context.promote(0)"),
+            submit(
+                "toolu_late",
+                "runtime.context.promote(0)\nprint('promoted')",
+            ),
+            text_reply("done"),
+        ],
+    )
+    .await;
+    round(&mut agent, "go").await;
+    let last = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the last call");
+    assert!(
+        tool_result(&last, "toolu_early").contains("ValueError: no finished turn has id 0"),
+        "{}",
+        tool_result(&last, "toolu_early")
+    );
+    assert_eq!(tool_result(&last, "toolu_late"), "promoted\n");
+}
+
+/// A round that ends while its calls run keeps the ones that returned and a
+/// turn marked incomplete -- in the store the agent's code reads -- and
+/// nothing is run again for it: the only source that runs afterwards is the
+/// next round's own.
+#[tokio::test]
+async fn a_round_ended_mid_batch_keeps_an_incomplete_turn_and_runs_nothing_again() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_INCOMPLETE",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            Style::Anthropic.batch(&[
+                ("toolu_a", "print('a ran')"),
+                ("toolu_b", "import time\ntime.sleep(3)"),
+                ("toolu_c", "print('c ran')"),
+            ]),
+            submit(
+                "toolu_look",
+                "print([(t.id, t.incomplete) for t in runtime.history.turns])",
+            ),
+            text_reply("looked"),
+        ],
+    )
+    .await;
+    dropped_inside_the_second(&mut agent, "run three").await;
+    let sources = sources(&mut agent);
+
+    // The second call keeps the interpreter until it finishes, which the next
+    // round's submission waits out by being refused; so look once it is done.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert_eq!(round(&mut agent, "look").await, "looked");
+    let last = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the last call");
+    // Its result follows word that the call the round stopped waiting for
+    // has since finished.
+    let look = tool_result(&last, "toolu_look");
+    assert!(look.contains("[this call]\n[(0, True)]\n"), "{look}");
+    assert_eq!(
+        *sources.lock().expect("sources"),
+        ["print([(t.id, t.incomplete) for t in runtime.history.turns])"],
+        "nothing of the ended round ran again"
+    );
+}
+
+/// A model call that fails leaves the turns before it whole, and no marker:
+/// there is no turn of its own to mark, and the one before it is complete.
+#[tokio::test]
+async fn a_failed_model_call_leaves_complete_turns_and_no_marker() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_NO_MARKER",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_ran", "print('ran')"),
+            failure(500),
+            submit(
+                "toolu_look",
+                "print([(t.id, t.incomplete) for t in runtime.history.turns])",
+            ),
+            text_reply("looked"),
+        ],
+    )
+    .await;
+    post(&agent, "go").await;
+    let err = within(agent.round()).await.expect_err("the call failed");
+    assert!(!err.to_string().contains("in a row"), "{err}");
+    assert_eq!(round(&mut agent, "look").await, "looked");
+    let last = mock_http::drain(&mut requests)
+        .pop()
+        .expect("the last call");
+    assert_eq!(
+        tool_result(&last, "toolu_look"),
+        "[(0, False)]\n",
+        "the failed round's turn, whole; this round's is not a turn until it ends"
+    );
+}
+
+/// `messages` as `style`'s adapter in rig puts them on the wire.
+fn on_the_wire(style: Style, messages: Vec<rig::completion::Message>) -> Vec<serde_json::Value> {
+    use rig::providers::{anthropic, openai};
+    match style {
+        Style::Anthropic => messages
+            .into_iter()
+            .map(|m| anthropic::completion::Message::try_from(m).expect("converts"))
+            .map(|m| serde_json::to_value(m).expect("serializes"))
+            .collect(),
+        Style::OpenAi => messages
+            .into_iter()
+            .flat_map(|m| Vec::<openai::completion::Message>::try_from(m).expect("converts"))
+            .map(|m| serde_json::to_value(m).expect("serializes"))
+            .collect(),
+    }
+}
+
+/// The messages `request` carried, without the system prompt OpenAI's
+/// protocol carries among them.
+fn conversation(style: Style, request: &RecordedRequest) -> Vec<serde_json::Value> {
+    let skip = usize::from(style == Style::OpenAi);
+    messages(request)[skip..].to_vec()
+}
+
+/// A session that cuts the conversation every way the view can: a turn a
+/// promotion brings back without the rest of its round, a round cut short by
+/// the cap followed by the next opening, the budget dropping this round's
+/// earlier turn, and a round ended mid-batch leaving an incomplete turn.
+async fn every_cut(style: Style, var: &str) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
+    let (mut agent, mut requests) = agent_in(
+        style,
+        var,
+        MODEL,
+        "",
+        "max-tokens = 4096\ntool-call-max = 2",
+        vec![
+            // 1: turn 0.
+            style.text("first"),
+            // 2: turns 1 to 3; turn 2 opens on a call, mid-round.
+            style.submit("call_a", "a = 1"),
+            style.submit("call_b", "b = 2"),
+            style.text("second"),
+            // 3: the cap stops it after turn 6's results.
+            style.submit("call_c", "c = 3"),
+            style.submit("call_d", "d = 4"),
+            style.submit("call_e", "e = 5"),
+            // 4: the promoted turn 2 follows turn 0's text.
+            style.submit("call_p", "runtime.context.promote(2)"),
+            style.text("promoted"),
+            // 5: two large turns, of which the budget sends one at a time.
+            style.submit("call_y", "print('y' * 18000)"),
+            style.submit("call_z", "print('z' * 18000)"),
+            style.text("fifth"),
+            // 6: ended while its second call runs.
+            style.batch(&[
+                ("call_g", "g = 1"),
+                ("call_h", "import time\ntime.sleep(2)"),
+                ("call_i", "i = 1"),
+            ]),
+            // 7.
+            style.text("done"),
+        ],
+    )
+    .await;
+    agent.history.set_window(NARROW);
+    // Room for either of round 5's large turns and what else there is, not
+    // both: the model's own budget, its window shrunk to leave that room.
+    let real = (*agent.budget).clone();
+    let window = real.reserve + u32::try_from(real.overhead).expect("small") + 10_000;
+    agent.budget = Arc::new(Budget { window, ..real });
+    let seen = manifests(&agent);
+    for message in ["one", "two", "three", "four", "five"] {
+        round(&mut agent, message).await;
+    }
+    dropped_inside_the_second(&mut agent, "six").await;
+    round(&mut agent, "seven").await;
+    let recorded = mock_http::drain(&mut requests);
+    let seen = seen.lock().expect("manifests").clone();
+    (agent, recorded, seen)
+}
+
+/// `history.md`'s acceptance gate: a shortened history, exercised against each
+/// adapter. Every request keeps each tool call beside its result, which is
+/// what every provider requires; and where roles repeat is what the manifest
+/// said, which is what a strict provider would refuse.
+#[tokio::test]
+async fn a_shortened_history_keeps_every_call_beside_its_result_on_both_adapters() {
+    for style in Style::ALL {
+        let var = format!("OUTRIG_TEST_AGENT_CUTS_{}", style.name().to_uppercase());
+        let (_, recorded, manifests) = every_cut(style, &var).await;
+        assert_eq!(
+            recorded.len(),
+            manifests.len(),
+            "{style:?}: a manifest a call"
+        );
+        let mut assistant_pairs = 0;
+        let mut user_pairs = 0;
+        for (n, request) in recorded.iter().enumerate() {
+            let wire = check_wire(style, &request.body);
+            assert!(
+                wire.unpaired.is_empty(),
+                "{style:?} call {n}: {wire:?} {:#}",
+                request.body
+            );
+            assistant_pairs += wire
+                .adjacent
+                .iter()
+                .filter(|(_, r)| r == "assistant")
+                .count();
+            user_pairs += wire.adjacent.iter().filter(|(_, r)| r == "user").count();
+        }
+        assert!(
+            assistant_pairs > 0,
+            "{style:?}: the promotion puts a call after text"
+        );
+        match style {
+            // A cut after results puts the next opening after them.
+            Style::Anthropic => assert!(user_pairs > 0, "{style:?}"),
+            // Results are `tool` messages there, which a user message follows.
+            Style::OpenAi => assert_eq!(user_pairs, 0, "{style:?}"),
+        }
+
+        // Round 5's third call left its first large turn out, and carried the
+        // second -- the latest -- whole.
+        let fifth = recorded
+            .iter()
+            .position(|r| count(r, "zzzzzzzzzz") > 0)
+            .expect("round 5's last call");
+        assert_eq!(count(&recorded[fifth], "yyyyyyyyyy"), 0, "{style:?}");
+        let evicted = &manifests[fifth].evicted;
+        assert!(
+            evicted.iter().any(|(_, why)| *why == Why::Round),
+            "{style:?}: {evicted:?}"
+        );
+
+        // The last request carries the incomplete turn, answered in full.
+        let last = recorded.last().expect("round 7");
+        let text = last.body["messages"].to_string();
+        for id in ["call_g", "call_h", "call_i"] {
+            assert!(text.contains(id), "{style:?}: {id}");
+        }
+        assert!(
+            text.contains("had not returned when the round ended"),
+            "{style:?}"
+        );
+    }
+}
+
+/// Each call's manifest, with the store, rebuilds exactly what the provider
+/// received, through each adapter.
+#[tokio::test]
+async fn each_calls_manifest_reconstructs_what_the_provider_received() {
+    for style in Style::ALL {
+        let var = format!("OUTRIG_TEST_AGENT_MANIFEST_{}", style.name().to_uppercase());
+        let (agent, recorded, manifests) = every_cut(style, &var).await;
+        for (n, (request, manifest)) in recorded.iter().zip(&manifests).enumerate() {
+            assert_eq!(manifest.call, n as u64);
+            assert_eq!(manifest.budget, *agent.budget);
+            let rebuilt = on_the_wire(style, agent.history.reconstruct(manifest));
+            assert_eq!(
+                rebuilt,
+                conversation(style, request),
+                "{style:?} call {n}: {manifest:#?}"
+            );
+        }
+    }
+}
+
+/// A provider's refusal of a call whose view put one role after itself says
+/// so, and where; that is the one request shape this loop sends that a strict
+/// provider refuses.
+#[tokio::test]
+async fn a_refused_call_that_carried_a_same_role_pair_says_so() {
+    for style in Style::ALL {
+        let var = format!("OUTRIG_TEST_AGENT_REFUSED_{}", style.name().to_uppercase());
+        let (mut agent, _requests) = agent_in(
+            style,
+            &var,
+            MODEL,
+            "",
+            "max-tokens = 4096",
+            vec![
+                style.text("first"),
+                style.submit("call_a", "a = 1"),
+                style.submit("call_b", "b = 2"),
+                style.text("second"),
+                style.text("third"),
+                style.submit("call_p", "runtime.context.promote(2)"),
+                style.failure(400),
+            ],
+        )
+        .await;
+        agent.history.set_window(NARROW);
+        for message in ["one", "two", "three"] {
+            round(&mut agent, message).await;
+        }
+        post(&agent, "four").await;
+        let err = within(agent.round())
+            .await
+            .expect_err("the provider refused")
+            .to_string();
+        assert!(
+            err.contains(
+                "The conversation it was sent left turns out, which put two of the model's \
+                 replies in a row, where turn 2 begins"
+            ) && err.contains("doc/reference/cli.md"),
+            "{style:?}: {err}"
+        );
+    }
+}
+
+/// The window configured on the model row is the one each call is held to,
+/// through the whole configuration path: parsed, validated, resolved, built,
+/// and on the call's manifest -- with the reply's reserve the ceiling that
+/// reaches the wire, lowered where the provider lowers it.
+#[tokio::test]
+async fn an_explicit_context_window_is_the_budget_a_call_is_held_to() {
+    for (window, agent_keys, reserve) in [
+        (200_000, "max-tokens = 4096", 4_096),
+        // rig publishes 64 000 for this identifier and lowers to it.
+        (1_000_000, "max-tokens = 999999", 64_000),
+    ] {
+        let (mut agent, _requests) = agent_in(
+            Style::Anthropic,
+            "OUTRIG_TEST_AGENT_EXPLICIT_WINDOW",
+            MODEL,
+            &format!("context-window = {window}"),
+            agent_keys,
+            vec![text_reply("ok")],
+        )
+        .await;
+        let budget = &agent.budget;
+        assert_eq!(
+            (
+                budget.model.as_str(),
+                budget.window,
+                budget.window_assumed,
+                budget.reserve
+            ),
+            ("sonnet", window, false, reserve),
+        );
+        let seen = manifests(&agent);
+        round(&mut agent, "go").await;
+        let manifest = seen.lock().expect("manifests")[0].clone();
+        assert_eq!(manifest.budget, *agent.budget, "the call was held to it");
+    }
+}
+
+/// With no window on the model row, one is assumed -- the same whatever the
+/// identifier says -- and the reply's reserve is at most a quarter of it.
+#[tokio::test]
+async fn no_context_window_assumes_one_whatever_the_identifier() {
+    for (style, identifier, reserve) in [
+        (Style::Anthropic, MODEL, ASSUMED_CONTEXT_WINDOW / 4),
+        (
+            Style::Anthropic,
+            UNRECOGNIZED_MODEL,
+            ASSUMED_CONTEXT_WINDOW / 4,
+        ),
+        (Style::OpenAi, "gpt-4o", DEFAULT_REPLY_RESERVE),
+    ] {
+        let (agent, _requests) = agent_in(
+            style,
+            "OUTRIG_TEST_AGENT_ASSUMED_WINDOW",
+            identifier,
+            "",
+            "",
+            vec![style.text("ok")],
+        )
+        .await;
+        let budget = &agent.budget;
+        assert_eq!(
+            (budget.window, budget.window_assumed, budget.reserve),
+            (ASSUMED_CONTEXT_WINDOW, true, reserve),
+            "{identifier}"
+        );
+    }
+}
+
+/// A reply ceiling that fills the window is a contradiction in the file, found
+/// before anything starts; a window too small for the system prompt and the
+/// reply is found as the agent is built.
+#[tokio::test]
+async fn a_window_the_reply_or_the_prompt_fills_is_refused() {
+    const VAR: &str = "OUTRIG_TEST_AGENT_WINDOW_FILLED";
+    let (addr, _requests) = mock_http::start(vec![text_reply("never")]).await;
+    let cfg = config_in(
+        Style::Anthropic,
+        addr,
+        VAR,
+        MODEL,
+        "context-window = 4096",
+        "max-tokens = 4096",
+    );
+    let err = with_key(VAR, || PythonAgent::check(&cfg, Some("coding"), None))
+        .expect_err("the reply fills the window")
+        .to_string();
+    assert!(
+        err.starts_with(
+            "[agents.coding].max-tokens is 4096, but [models.sonnet].context-window is 4096"
+        ),
+        "{err}"
+    );
+
+    let cfg = config_in(
+        Style::Anthropic,
+        addr,
+        VAR,
+        MODEL,
+        "context-window = 3000",
+        "max-tokens = 1000",
+    );
+    with_key(VAR, || PythonAgent::check(&cfg, Some("coding"), None))
+        .expect("nothing in the file is contradictory");
+    let interpreter = start_on_host().await;
+    let err = with_key(VAR, || {
+        PythonAgent::with_interpreter(interpreter, &cfg, Some("coding"), None)
+    })
+    .err()
+    .expect("no room for a round")
+    .to_string();
+    assert!(
+        err.starts_with("model \"sonnet\": a 3000-token context window leaves about ")
+            && err.contains("1000 reserved for the reply"),
+        "{err}"
+    );
+}
+
 // ---------------------------------------------------------------------------- the tool
 
 /// The tool alone, over `interpreter`, at the smallest ceiling config allows.
@@ -1663,6 +2279,7 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
             request_timeout_secs: None,
         },
         max_tokens,
+        context_window: None,
     }
 }
 

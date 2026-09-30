@@ -71,6 +71,15 @@ with every co-hosted agent, so history growth is a way for one agent's long sess
 siblings. Measure the host record, the transport, and the Python mirror separately, and decide the
 response before the growth is real rather than after.
 
+`0003-12` measured it. A thousand turns, each a 16 KiB result -- the most one execution's output
+can be -- are 16.4 MB of text: the host's store holds 16.7 MB of it as JSON, the transport carries
+16.5 MB in lines no longer than one turn, and the mirror holds 16.9 MB as `tracemalloc` counts
+it. So each side costs about what it carries and no side multiplies it. Only the mirror is under
+the ceiling: in a 4 GiB container the ceiling is 2 GiB, and the mirror reaches an eighth of it
+after about fifteen thousand such turns. The response is decided: past an eighth of the ceiling
+the interpreter says so once on stderr, which the host logs as a warning, and keeps everything.
+What comes after the warning is the fallback above, `plan/next/history-bodies-on-demand.md`.
+
 ## The view
 
 What the provider actually receives. By default a window: the first few rounds and the most
@@ -100,6 +109,20 @@ exceed it alone. So the view is assembled against a size estimate rather than a 
 Post-call usage reporting is good calibration and cannot admit the first oversized request safely,
 so the estimate has to happen before the call.
 
+`0003-12` built it, and its `## Decisions` record why each part is as it is:
+
+- The limit is `[models.<name>].context-window`, the model's whole window in tokens. A row that
+  names none is held to an assumed 128,000 with a warning, and never to a window inferred from its
+  identifier. Each candidate has its own.
+- A call's room is the window, less the reply's ceiling -- at most a quarter of an assumed window
+  -- and less the system prompt and tool definition. Tokens are estimated from each message's JSON,
+  a token per three ASCII bytes and one per other character, and counted once per turn.
+- The view is chosen as before, then filled in the order it is kept longest: the round in
+  progress, newest first; promotions, newest first; the first rounds, oldest first; the recent
+  rounds, newest first. A turn that does not fit is passed over, and smaller ones still go.
+- The turn a call answers is never left out. When it alone does not fit, the call is not made, and
+  the round ends naming the turn; the next round is an ordinary one that leaves it out.
+
 What this fixes is worth stating precisely, because an earlier draft of this page overstated it.
 There is no token accounting anywhere in the tree today, so a session that outgrows its window
 sends an oversized request, takes a 400, and -- because `PromptError::CompletionError` carries no
@@ -120,9 +143,9 @@ Python attribute as one.
 The semantics that have to be decided rather than discovered, because the implementation will
 answer them accidentally otherwise:
 
-- **Lifetime.** A promotion persists until removed. The underlying `RequestPatch` is per-turn and
-  non-sticky, so something has to remember; that is an implementation detail and the model-facing
-  promise should not leak it.
+- **Lifetime.** A promotion persists until removed -- `runtime.context.demote(turn)`, since
+  `0003-12`. The underlying `RequestPatch` is per-turn and non-sticky, so something has to
+  remember; that is an implementation detail and the model-facing promise should not leak it.
 - **Idempotence.** Promoting the same turn twice is the same as once.
 - **Order.** Promoted turns appear in their original chronological position, not in promotion
   order. A conversation that jumps backward reads as corruption to a provider and to a human.
@@ -235,12 +258,13 @@ new protocol message, and the query vocabulary becomes a surface to design and m
   why not the marker.
 - Whether the default window is configurable, and in what unit. Rounds read well and a tool-heavy
   round is not a predictable size. `0003-11` fixed it at the first two rounds and the six before
-  the current one, with no setting: that belongs to `0003-12`'s budget, which has to pick a unit
-  anyway.
+  the current one, with no setting. `0003-12` left it so: the budget is in tokens and bounds what
+  the window chooses, so the window's unit no longer has to be the one that keeps a call small.
 - What the user gets beyond `/reset` -- a way to see what the model is currently being sent would
   answer a question that is currently unanswerable.
 - Whether a promotion is visible to the model as an event in its own context, or silently changes
-  what it sees between rounds.
+  what it sees between rounds. It is silent so far; the per-call manifest records what each call
+  carried and why, for a human to read.
 
 ## Unverified
 
@@ -248,15 +272,17 @@ new protocol message, and the query vocabulary becomes a surface to design and m
   universal, but role-alternation rules are not: a Bedrock-backed Claude reached over an
   OpenAI-compatible gateway is already known to be strict about consecutive roles. Tool-call ids,
   provider reasoning metadata, empty content, and gateway rewriting are all candidates to break it
-  too. This is an acceptance gate rather than a caveat: exercise a shortened `RequestPatch.history`
-  against each supported adapter with representative fixtures, and publish the supported subset
-  plus an intelligible error for what falls outside it. A promotion makes one such case certain:
-  a turn that is not its round's first opens on an assistant message, so it follows another
-  assistant message. Anthropic's API merges the pair and OpenAI's accepts it; a strict gateway may
-  not.
-- The memory cost of mirroring a long session's history into the interpreter was not measured. It is
-  the assumption behind holding the store whole, and the fallback exists because it might be wrong.
+  too. A promotion makes one such case certain: a turn that is not its round's first opens on an
+  assistant message, so it follows another assistant message. Anthropic's API merges the pair and
+  OpenAI's accepts it; a strict gateway may not. `0003-12` exercised a shortened history against
+  both adapters, through rig's own conversions and a mock of each: every cut the view makes keeps
+  each call beside its result, and the same-role pairs are where the manifest says. The supported
+  subset is published in `doc/reference/cli.md`, and a refused call that carried a pair says so.
+  No live strict gateway was tried.
 - `RequestPatch.history` was read from rig 0.40's documentation and from `injection.rs`'s use of
-  it, not exercised with a shorter list than rig supplied. `0003-11` now sends one on every model
-  call, and its tests assert the result on the wire -- through the Anthropic adapter, against a
-  mock. The OpenAI adapter and a live endpoint are still unexercised, which is the gate above.
+  it, not exercised with a shorter list than rig supplied. `0003-11` sent one on every model
+  call, and `0003-12` asserts the result on the wire through both adapters, against mocks. A live
+  endpoint is still unexercised.
+- The token estimate. It over-counts code and prose by design; text that tokenizes densely can
+  cost more than it is estimated at, and no provider's reported usage has been compared with it
+  yet (`plan/next/calibrate-the-token-estimate.md`).

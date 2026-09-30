@@ -243,6 +243,22 @@ fn alias_with_max_tokens_fails_validate() {
     );
 }
 
+/// `context-window` is a provider-shape field too: a window belongs to the
+/// model a provider serves, and each of an alias's models has its own.
+#[test]
+fn alias_with_context_window_fails_validate() {
+    let cfg = with_aliases("[models.opus]\nalias = \"haiku-5\"\ncontext-window = 200000\n");
+    let err = expect_validation_err(&cfg, None);
+    assert!(
+        matches!(
+            &err,
+            ConfigValidationError::ModelSourceConflict { fields, .. }
+                if fields.contains(&"context-window")
+        ),
+        "expected ModelSourceConflict naming context-window, got: {err:?}"
+    );
+}
+
 #[test]
 fn model_with_neither_shape_fails_validate() {
     let cfg = with_aliases("[models.opus]\nidentifier = \"claude-opus-5\"\n");

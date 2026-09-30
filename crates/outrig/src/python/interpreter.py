@@ -1172,7 +1172,12 @@ _type_qualname = type.__dict__["__qualname__"].__get__
 # commits it: one model call, what the model wrote, and each call it made with the result it read.
 # Held here it is ordinary data, so the agent's code can read all of it and only what that code
 # prints is seen. What each model call is sent of it is the host's to assemble; a promotion is how
-# the agent asks for a turn to be sent again, and names it by id, never by content.
+# the agent asks for a turn to be sent again, and a demotion how it stops asking, each naming the
+# turn by id, never by content.
+#
+# All of it is held for the rest of the session, under the same memory ceiling as everything
+# else. An eighth of the ceiling is where that is said once on stderr, which the host logs; nothing
+# is let go, and fetching bodies only when read is the response past it.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1194,6 +1199,10 @@ class Turn:
     conversation's rounds from 1. `prompt` is the line that opened the round, on its first turn,
     and `None` on the rest. `text` is what the model wrote, and `calls` each call it made, with the
     result it read -- clipped where the model's was.
+
+    `incomplete` is true when the round ended while the turn's calls ran, so some results are
+    OutRig's note rather than what the code did. A call whose note says it had not returned may
+    still have run, and its outcome may arrive later: do not run it again to find out.
     """
 
     id: int
@@ -1201,11 +1210,13 @@ class Turn:
     prompt: str | None
     text: str
     calls: tuple[Call, ...]
+    incomplete: bool = False
 
     def __repr__(self):
+        incomplete = ", incomplete" if self.incomplete else ""
         return (
             f"<turn {self.id}, round {self.round}: {len(self.calls)} calls, {len(self.text)} "
-            f"characters of text>"
+            f"characters of text{incomplete}>"
         )
 
 
@@ -1223,6 +1234,8 @@ class History:
 
     def __init__(self):
         self._turns = ()
+        self._held = 0  # bytes of text held, roughly
+        self._told = False
 
     @property
     def turns(self):
@@ -1239,22 +1252,47 @@ class History:
 
         A turn is held only if it comes after the last one held. So a retry after running out of
         memory never holds one twice, and a turn whose line was lost leaves a gap in the ids
-        rather than stopping every later one. Rebinding is the last step.
+        rather than stopping every later one. Rebinding is the last step that can lose the turn;
+        after it only its size is counted.
         """
         turns = self._turns
         if turns and turn.id <= turns[-1].id:
             return
+        calls = (text for call in turn.calls for text in (call.source, call.result))
+        size = sum(map(sys.getsizeof, (turn.prompt or "", turn.text, *calls)))
         self._turns = turns + (turn,)
+        self._held += size
+        self._tell_of_size()
+
+    def _tell_of_size(self):
+        """Say once, on stderr, when what is held passes an eighth of the memory ceiling."""
+        if self._told:
+            return
+        ceiling = resource.getrlimit(resource.RLIMIT_DATA)[0]
+        if ceiling == resource.RLIM_INFINITY or self._held <= ceiling // 8:
+            return
+        self._told = True
+        _diag(
+            f"runtime.history holds about {self._held >> 20} MiB, past an eighth of the "
+            f"interpreter's {ceiling >> 20} MiB memory ceiling. It keeps every turn, so a longer "
+            f"session leaves less of the ceiling for the agent's own work."
+        )
 
 
 class Context:
     """What each model call is sent of your conversation.
 
-    Each call is sent the first rounds of the conversation, the most recent ones, and the round in
-    progress, whole. Everything else stays in `runtime.history.turns`, unsent, until you promote
-    it: `runtime.context.promote(turn)`. A promoted turn is sent in its place in the
-    conversation, not at the end, from the next model call on -- in this round, if your code
-    promotes it while it runs.
+    Each call is sent the round in progress, the first rounds of the conversation, and the most
+    recent ones. Everything else stays in `runtime.history.turns`, unsent, until you promote it:
+    `runtime.context.promote(turn)`. A promoted turn is sent in its place in the conversation, not
+    at the end, from the next model call on -- in this round, if your code promotes it while it
+    runs -- until you demote it: `runtime.context.demote(turn)`.
+
+    Each call is also held to the model's context window. When what was chosen does not fit, the
+    window's turns are left out first, those nearest the unsent middle before the rest, then
+    promoted turns, oldest first, then the round's own earlier turns. The turn your latest call
+    made is always sent. So `promoted` is what you asked for, not a promise of what was sent; the
+    line that opens a round says how many turns its first call leaves out.
     """
 
     def __init__(self, agent, history):
@@ -1274,8 +1312,39 @@ class Context:
 
         Each is a `Turn` from `runtime.history.turns`, a turn's id, or an iterable of those. A turn
         is named by its id, so a copy promotes what the original said. Promoting a turn again
-        changes nothing.
+        changes nothing. A promotion lasts until the turn is demoted.
         """
+        self._change("promote", self._ids(turns))
+
+    def demote(self, *turns):
+        """Stop sending `turns` for having been promoted, from the model's next call on.
+
+        Takes what `promote` takes. A demoted turn is still sent while the conversation's window
+        holds it; demoting one that was never promoted changes nothing.
+        """
+        # Every id, not only those recorded as promoted: a promotion interrupted after its line was
+        # written and before it was recorded here is still the host's.
+        self._change("demote", self._ids(turns))
+
+    def _change(self, kind, ids):
+        """Tell the host to `kind` -- promote or demote -- `ids`, and record it here, as one step.
+
+        The line is encoded first, so nothing that can fail sits between telling and recording. Both
+        are done under the lock, so changes made at once from several threads reach the host in
+        the order `promoted` records them, and the two cannot end up disagreeing.
+        """
+        if not ids:
+            return
+        line = _encode({"t": kind, "agent": self._agent, "turns": sorted(ids)})
+        with self._lock:
+            _write_line(line)
+            if kind == "promote":
+                self._promoted |= ids
+            else:
+                self._promoted -= ids
+
+    def _ids(self, turns):
+        """The ids `turns` name, each of a turn that has finished, or raise."""
         ids = set()
         for item in turns:
             many = not isinstance(item, (Turn, int)) and hasattr(type(item), "__iter__")
@@ -1290,10 +1359,7 @@ class Context:
         unknown = sorted(ids - held)
         if unknown:
             raise ValueError(f"no finished turn has id {', '.join(map(str, unknown))}")
-        if ids:
-            _write_line(_encode({"t": "promote", "agent": self._agent, "turns": sorted(ids)}))
-            with self._lock:
-                self._promoted |= ids
+        return ids
 
     def __repr__(self):
         return f"<context: {len(self.promoted)} turns promoted>"
@@ -1670,8 +1736,9 @@ class Runtime:
     `runtime.names()` lists what you have bound, with the type of each value.
 
     `runtime.history.turns` is your whole conversation, to read with ordinary Python at no cost in
-    context: see `help(runtime.history)`. Not all of it is sent to the model on each call, and
-    `runtime.context.promote(turn)` sends a turn again: see `help(runtime.context)`.
+    context: see `help(runtime.history)`. Not all of it is sent to the model on each call:
+    `runtime.context.promote(turn)` sends a turn again until `runtime.context.demote(turn)`, and
+    every call is held to the model's context window: see `help(runtime.context)`.
 
     `runtime.python` says what this interpreter can import -- `pip install` adds pure-Python
     packages, and nothing compiled loads -- and where code that needs more can run.
@@ -2340,8 +2407,10 @@ def _turn(kernel, turn_id, message):
     so `_handle`'s retry after running out of memory never holds it twice.
     """
     number, prompt, text, calls = (message.get(key) for key in ("round", "prompt", "text", "calls"))
+    incomplete = message.get("incomplete", False)
     if (
         type(number) is not int
+        or type(incomplete) is not bool
         or not isinstance(prompt, (str, type(None)))
         or not isinstance(text, str)
         or not isinstance(calls, list)
@@ -2359,6 +2428,7 @@ def _turn(kernel, turn_id, message):
         prompt,
         text,
         tuple(Call(call["source"], call["result"]) for call in calls),
+        incomplete,
     )
     kernel.history._add(turn)
 

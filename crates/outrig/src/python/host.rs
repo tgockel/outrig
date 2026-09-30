@@ -52,11 +52,12 @@
 //!
 //! [`Interpreter::push_turn`] mirrors each turn of the agent's conversation
 //! into the interpreter as it is committed, where `runtime.history` reads it.
-//! Nothing answers. What comes back unasked is a promotion: the ids of turns
-//! the agent wants sent to the model again, handed to whatever
-//! [`Interpreter::on_promote`] registered. A promotion's line is written before
-//! the result of the execution that made it, so it has been handed over by the
-//! time that execution's outcome is here.
+//! Nothing answers. What comes back unasked is a change to what the model is
+//! sent: the ids of turns the agent promoted, or demoted again, handed to
+//! whatever [`Interpreter::on_context`] registered in the order the agent made
+//! them. A change's line is written before the result of the execution that
+//! made it, so it has been handed over by the time that execution's outcome is
+//! here.
 //!
 //! # What owns what
 //!
@@ -277,14 +278,25 @@ struct Table {
     late: Vec<Late>,
     /// Where the agent's messages to the user go, once someone subscribed.
     outbox: Option<mpsc::UnboundedSender<String>>,
-    /// Where the agent's promotions go, once something registered for them.
-    on_promote: Option<Promoted>,
+    /// Where the agent's promotions and demotions go, once something
+    /// registered for them.
+    on_context: Option<ContextChanged>,
     /// Why nothing more can be sent, once that is so.
     ended: Option<Arc<str>>,
 }
 
-/// What a promotion is handed to: the ids of the turns it names.
-type Promoted = Arc<dyn Fn(Vec<u64>) + Send + Sync>;
+/// What a change to the agent's context is handed to.
+type ContextChanged = Arc<dyn Fn(ContextChange) + Send + Sync>;
+
+/// A change the agent made to what its model calls are sent, naming turns by
+/// id. Nothing here checks that the ids are turns the conversation holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextChange {
+    /// Send these turns until they are demoted.
+    Promote(Vec<u64>),
+    /// Stop sending these turns for having been promoted.
+    Demote(Vec<u64>),
+}
 
 struct Slot {
     id: ExecId,
@@ -344,6 +356,9 @@ enum Reply {
     },
     /// Turns the agent promoted, which nothing asked for either.
     Promote {
+        turns: Vec<u64>,
+    },
+    Demote {
         turns: Vec<u64>,
     },
     #[serde(other)]
@@ -663,12 +678,12 @@ impl Interpreter {
         }
     }
 
-    /// Hand each promotion the agent makes to `promoted`, in the order it made
-    /// them. Called on the reader task, and never under this handle's lock, so
-    /// `promoted` may take locks of its own that are held around a
-    /// [`Interpreter::push_turn`]. Registering again replaces it.
-    pub(crate) fn on_promote(&self, promoted: impl Fn(Vec<u64>) + Send + Sync + 'static) {
-        lock(&self.table).on_promote = Some(Arc::new(promoted));
+    /// Hand each promotion and demotion the agent makes to `changed`, in the
+    /// order it made them. Called on the reader task, and never under this
+    /// handle's lock, so `changed` may take locks of its own that are held
+    /// around a [`Interpreter::push_turn`]. Registering again replaces it.
+    pub(crate) fn on_context(&self, changed: impl Fn(ContextChange) + Send + Sync + 'static) {
+        lock(&self.table).on_context = Some(Arc::new(changed));
     }
 
     fn send(&self, message: Value) -> Result<(), InterpreterError> {
@@ -1011,20 +1026,24 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
                 }
             }
         }
-        Reply::Promote { turns } => {
-            // Taken out first: whoever it is may take a lock held around a
-            // push, which takes this one.
-            let promoted = lock(table).on_promote.clone();
-            match promoted {
-                Some(promoted) => promoted(turns),
-                None => tracing::warn!("ignored a promotion: nothing on the host takes one"),
-            }
-        }
+        Reply::Promote { turns } => context_changed(table, ContextChange::Promote(turns)),
+        Reply::Demote { turns } => context_changed(table, ContextChange::Demote(turns)),
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",
             String::from_utf8_lossy(line)
         ),
+    }
+}
+
+/// Hand `change` to whatever registered for it.
+fn context_changed(table: &Mutex<Table>, change: ContextChange) {
+    // Taken out first: whoever it is may take a lock held around a push,
+    // which takes this one.
+    let changed = lock(table).on_context.clone();
+    match changed {
+        Some(changed) => changed(change),
+        None => tracing::warn!("ignored {change:?}: nothing on the host takes one"),
     }
 }
 
