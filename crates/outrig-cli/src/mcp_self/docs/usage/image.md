@@ -90,7 +90,7 @@ by hand, not an exhaustive Dockerfile generator.
   rust    rustup + stable toolchain (cargo, rustfmt, clippy).
   node    Node 20 LTS via NodeSource.
   python  CPython 3.12 with pip and venv.
-  go      Go 1.22.
+  go      Go 1.27.
   none    Just the base image -- nothing extra installed.
 
   See: https://tgockel.github.io/outrig/usage/image.html#known-toolchains
@@ -107,7 +107,7 @@ The toolchain prompt offers curated options that cover the common cases:
 | `rust`   | `rustup` + the stable toolchain, `cargo`, `rustfmt`, `clippy`.    |
 | `node`   | Node 20 LTS via the base image's package manager (or NodeSource). |
 | `python` | CPython 3.12 with `pip` and `venv`.                               |
-| `go`     | Go 1.22.                                                          |
+| `go`     | Go 1.27.                                                          |
 | `none`   | Just the base image.                                              |
 
 You can pick more than one. The Dockerfile is a starting point -- edit it freely afterwards.

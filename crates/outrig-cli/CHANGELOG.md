@@ -137,6 +137,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated README quotes a dotted name in its `[images."rust.dev"]` header. A name of 64 hex
   digits is refused, whatever it starts with: the ref carries no tag, and podman reads it as an
   image ID.
+- **The `go` toolchain `outrig image add` generates runs on AArch64.** The generated Dockerfile
+  downloaded Go's x86-64 archive on every machine, and an archive unpacks whatever it holds: on
+  an AArch64 host the image built cleanly, and `go` then failed with `exec format error` the
+  first time anything ran it. The archive is now chosen at build time for the architecture the
+  image is built on, x86-64 or AArch64, and checked against its published SHA-256 before it is
+  unpacked; on any other architecture the build fails naming it. The toolchain is also
+  Go 1.27.1, where it was 1.22.0, which Go stopped supporting in February 2025. `outrig init`,
+  which runs `image add`, gets the same toolchain. `doc/concepts/containers.md` and the rules
+  `outrig design prompt` gives now say to download a prebuilt binary for the image's
+  architecture. A Dockerfile generated earlier keeps its old lines; replace its `# go toolchain`
+  section with the one `image add` writes now.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

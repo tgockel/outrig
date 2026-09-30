@@ -196,7 +196,7 @@ const TOOLCHAINS: &[(&str, &str)] = &[
     ),
     ("node", "Node 20 LTS via the base image's package manager."),
     ("python", "CPython 3 with pip and venv."),
-    ("go", "Go 1.22."),
+    ("go", "Go 1.27."),
     ("none", "Just the base image -- nothing extra installed."),
 ];
 

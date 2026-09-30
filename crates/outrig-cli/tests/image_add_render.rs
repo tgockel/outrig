@@ -56,6 +56,25 @@ fn assert_invariants(out: &str, base: BaseImage, toolchains: &[Toolchain], mcps:
         }
     }
 
+    // The image is built for the engine's own architecture, and an archive for
+    // the other one unpacks all the same: the build passes and the first run
+    // fails with `exec format error` (#185).
+    for single_arch in ["linux-amd64", "linux-arm64"] {
+        assert!(
+            !out.contains(single_arch),
+            "[{label}] generated Dockerfile must not name a {single_arch} archive:\n{out}",
+        );
+    }
+    if toolchains.contains(&Toolchain::Go) {
+        for needle in ["uname -m", "sha256sum -c"] {
+            assert!(
+                out.contains(needle),
+                "[{label}] the go archive must be chosen by `uname -m` and checked by \
+                 `sha256sum -c`; no `{needle}`:\n{out}",
+            );
+        }
+    }
+
     // OutRig writes the runtime user's entries into the container itself, so
     // the generated image must not carry `useradd`/`groupadd` on its account.
     let user_tooling = match base {

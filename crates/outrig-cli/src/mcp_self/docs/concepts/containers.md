@@ -83,6 +83,17 @@ prefix as well, or at run time it looks under your home and finds nothing there;
 writes as it works, as cargo does its registry cache, has to be writable by you. The `rust`
 toolchain [`outrig image add`](../usage/image.md#what-gets-written) generates does all of this.
 
+### Download for the image's architecture
+
+outrig names no platform when it builds or pulls an image, so the image takes the architecture
+of the machine its engine runs on -- x86-64 or AArch64 -- and a multi-arch base, as every curated
+one is, resolves to that architecture. A tool you download as a prebuilt binary has to follow it
+too: choose the archive at build time, from `uname -m`, rather than from a URL that names
+`amd64`. An archive for the other architecture unpacks all the same, so the build succeeds, and
+the failure waits for the first run of the binary: `exec format error`. The `go` toolchain
+[`outrig image add`](../usage/image.md#known-toolchains) generates chooses its archive this way,
+and fails the build on any other architecture.
+
 ### Install MCP servers
 
 The image needs to contain the binaries and dependencies for every MCP server you reference in

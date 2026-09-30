@@ -89,6 +89,9 @@ pub(crate) fn render_prompt() -> String {
          home; every exec runs as the host UID with `HOME=/home/<user>`. Point state a tool \
          keeps under `$HOME`, such as rustup's `RUSTUP_HOME` and `CARGO_HOME`, at a writable \
          directory under that prefix.\n\
+         - Download a prebuilt binary for the architecture the image builds on, chosen at \
+         build time (for example from `uname -m`), not a fixed `amd64`; OutRig builds for \
+         its engine's own architecture, x86-64 or AArch64.\n\
          - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
          - Prefer `/workspace` as the mounted repo path unless the request says otherwise.\n\
          - Return exact file paths and complete file contents.\n\
@@ -139,6 +142,9 @@ pub(crate) fn render_standalone_prompt() -> String {
          home; every exec runs as the host UID with `HOME=/home/<user>`. Point state a tool \
          keeps under `$HOME`, such as rustup's `RUSTUP_HOME` and `CARGO_HOME`, at a writable \
          directory under that prefix.\n\
+         - Download a prebuilt binary for the architecture the image builds on, chosen at \
+         build time (for example from `uname -m`), not a fixed `amd64`; OutRig builds for \
+         its engine's own architecture, x86-64 or AArch64.\n\
          - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
          - `outrig image build` validates `image.toml` and stamps the config into OCI labels.\n\
          - The Dockerfile must not copy `image.toml` or any OutRig config file into the image.\n\
@@ -385,6 +391,7 @@ mod tests {
             "CMD [\"sleep\", \"infinity\"]",
             "Do not add a Dockerfile `USER`",
             "not in root's `0700` home",
+            "not a fixed `amd64`",
             "ensure it is on `PATH`",
             "stamps the config into OCI labels",
             "must not copy `image.toml`",
