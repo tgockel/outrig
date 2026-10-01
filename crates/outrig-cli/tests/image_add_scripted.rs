@@ -4,9 +4,10 @@
 //! idempotency without `--force`, `toml_edit`-style preservation of
 //! surrounding comments, an inline `images` table, the refusal of an
 //! `images` that is not a table before any prompt, that a config that
-//! can't be written leaves no Dockerfile behind, and that a name the image
+//! can't be written leaves no Dockerfile behind, that a name the image
 //! can't be built under is refused as an argument and asked again at a
-//! prompt.
+//! prompt, and that the bootstrap a fresh repo runs takes a given name as
+//! its `default-image`.
 
 mod common;
 
@@ -54,6 +55,19 @@ const STANDARD_SEED: &str = "[images.base]\nimage-name = \"debian\"\n";
 /// The config from #186: valid, and spelling `images` as an inline table.
 const INLINE_SEED: &str = "default-image = \"base\"\n\
      images = { base = { image-name = \"docker.io/library/debian:bookworm-slim\" } }\n";
+
+/// A global config a merged load accepts: a provider, a model, and that
+/// model as `default-model`.
+const GLOBAL: &str = "default-model = \"fast\"\n\
+     \n\
+     [providers.openai]\n\
+     style = \"openai\"\n\
+     base-url = \"https://api.openai.com/v1\"\n\
+     api-key = \"${OPENAI_API_KEY}\"\n\
+     \n\
+     [models.fast]\n\
+     provider = \"openai\"\n\
+     identifier = \"gpt-4o-mini\"\n";
 
 #[tokio::test]
 async fn defaults_write_dockerfile_and_config_block() {
@@ -211,6 +225,27 @@ async fn force_replaces_both_atomically() {
     );
 }
 
+/// Runs `image add [<name>]` from `cwd` as the binary does: the bootstrap a
+/// repo without a config gets, then the image-add flow, over one scripted
+/// conversation.
+async fn add_from(
+    cwd: &Path,
+    global: &Path,
+    name: Option<&str>,
+    script: &[u8],
+) -> outrig_cli::error::Result<()> {
+    let (mut prompt, _stderr) = scripted_prompt(script).await;
+    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
+    let name = name.map(str::to_string);
+    timeout(TEST_TIMEOUT, async {
+        let (repo_root, name) =
+            resolve_or_bootstrap(cwd, global, name, &mut prompt, &mut hf).await?;
+        run_with(&repo_root, name, false, &mut prompt).await
+    })
+    .await
+    .expect("image add must not hang")
+}
+
 #[tokio::test]
 async fn fallback_yes_bootstraps_repo_config() {
     // tempdir lands under TMPDIR, outside any outrig-configured tree, so
@@ -228,17 +263,9 @@ async fn fallback_yes_bootstraps_repo_config() {
     // container-add defaults (base, toolchains, mcp -- name was already
     // asked during bootstrap) = 9 prompts.
     let script = b"\n\n\n\n\n\n\n\n\n";
-    let (mut prompt, _stderr) = scripted_prompt(script).await;
-    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
-
-    timeout(TEST_TIMEOUT, async {
-        let (repo_root, bootstrapped_name) =
-            resolve_or_bootstrap(&cwd, &global, &mut prompt, &mut hf).await?;
-        run_with(&repo_root, bootstrapped_name, false, &mut prompt).await
-    })
-    .await
-    .expect("fallback flow must not hang")
-    .expect("fallback flow must succeed");
+    add_from(&cwd, &global, None, script)
+        .await
+        .expect("fallback flow must succeed");
 
     let cfg_path = cwd.join(".agents/outrig/config.toml");
     let dockerfile = cwd.join(".agents/outrig/images/myproj-standard/Dockerfile");
@@ -257,6 +284,55 @@ async fn fallback_yes_bootstraps_repo_config() {
     assert!(cfg.agents.contains_key("coder"));
 }
 
+/// #195: given a name, the bootstrap writes it as `default-image` instead of
+/// asking for one, so its config defaults to the image `image add` goes on to
+/// scaffold, and loads beside a global config.
+#[tokio::test]
+async fn fallback_yes_with_a_name_writes_it_as_default_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("myproj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, GLOBAL).unwrap();
+
+    // Configure-now, repo models (n), repo default-model (inherit the
+    // global's), agent name, preamble, workspace x2, then the image-add
+    // defaults: base, toolchains, mcp. No line for an image name: had the
+    // bootstrap asked for one, the run would have failed on EOF.
+    let script = b"\nn\n\n\n\n\n\n\n\n\n";
+    add_from(&cwd, &global, Some("coding"), script)
+        .await
+        .expect("fallback flow must succeed");
+
+    let cfg = Config::load(&cwd, Some(&global)).expect("merged config must load");
+    assert_eq!(cfg.default_image.as_deref(), Some("coding"));
+    assert_eq!(entries(&cwd.join(".agents/outrig/images")), ["coding"]);
+}
+
+/// #195: a repo that has a config isn't bootstrapped, whatever name `image
+/// add` is given, so its `default-image` stays as it was.
+#[tokio::test]
+async fn a_configured_repo_keeps_its_default_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_repo(
+        tmp.path(),
+        &format!("default-image = \"base\"\n\n{STANDARD_SEED}"),
+    );
+    let cwd = tmp.path().join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("global.toml");
+
+    // Only the image-add prompts: base, toolchains, mcp.
+    add_from(&cwd, &global, Some("coding"), b"\n\n\n")
+        .await
+        .expect("image add must succeed");
+
+    let text = read_config(tmp.path());
+    let cfg = Config::load_from_str(&text).expect("config must parse");
+    assert_eq!(cfg.default_image.as_deref(), Some("base"), "{text}");
+    assert!(cfg.images.contains_key("coding"), "{text}");
+}
+
 #[tokio::test]
 async fn fallback_no_returns_no_repo_config() {
     let tmp = tempfile::tempdir().unwrap();
@@ -269,7 +345,7 @@ async fn fallback_no_returns_no_repo_config() {
 
     let err = timeout(
         TEST_TIMEOUT,
-        resolve_or_bootstrap(tmp.path(), &global, &mut prompt, &mut hf),
+        resolve_or_bootstrap(tmp.path(), &global, None, &mut prompt, &mut hf),
     )
     .await
     .expect("fallback must not hang")
@@ -605,17 +681,9 @@ async fn the_bootstraps_name_prompt_asks_again() {
     // Configure-now, agent name, preamble, image name (refused), image
     // name, workspace x2, then the image-add defaults: base, toolchains, mcp.
     let script = b"\n\n\nRustDev\nrust-dev\n\n\n\n\n\n";
-    let (mut prompt, _stderr) = scripted_prompt(script).await;
-    let mut hf = common::StubHfTreeFetcher::with_files(Vec::<&str>::new());
-
-    timeout(TEST_TIMEOUT, async {
-        let (repo_root, bootstrapped_name) =
-            resolve_or_bootstrap(&cwd, &global, &mut prompt, &mut hf).await?;
-        run_with(&repo_root, bootstrapped_name, false, &mut prompt).await
-    })
-    .await
-    .expect("fallback flow must not hang")
-    .expect("fallback flow must succeed");
+    add_from(&cwd, &global, None, script)
+        .await
+        .expect("fallback flow must succeed");
 
     let cfg = Config::load_from_str(&read_config(&cwd)).expect("repo config must parse");
     assert_eq!(cfg.default_image.as_deref(), Some("rust-dev"));

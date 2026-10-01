@@ -152,6 +152,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and ignored them, so a client configuration carrying one looked correct, and an `--env` every
   other `outrig mcp` path refuses as malformed was taken too. Each now exits with an error naming
   the option to remove, as `--image`, `--session-dir`, `--attach`, and `--listen` already did.
+- **`outrig image add <name>` in a fresh repo makes `<name>` its `default-image`.** Where no
+  `.agents/outrig/config.toml` exists yet, `image add` first sets one up through `outrig init`'s
+  prompts, which asked for an image-config name of their own and wrote it as `default-image`;
+  the image-config itself was scaffolded under `<name>`. Accepting the suggested
+  `<repo-folder>-standard` left a `default-image` naming no image-config, so `outrig build` and
+  `outrig run` refused the config. Given a `<name>`, the setup now writes it as `default-image`
+  without asking for one; given none, it asks, and the answer names both. A repo that already
+  has a config keeps its `default-image`.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

@@ -30,8 +30,10 @@ If you run `outrig image add` in a directory without an `.agents/outrig/config.t
 ```
 
 Answering `y` walks the same repo-config prompts that
-[`outrig init`](https://tgockel.github.io/outrig/usage/init.html) uses (workspace, default
-agent, preamble), then continues with the `image add` flow.
+[`outrig init`](https://tgockel.github.io/outrig/usage/init.html) uses (models, default agent,
+preamble, image-config name, workspace), then continues with the `image add` flow for the
+image-config you named. Given a `<name>`, it skips the image-config name prompt: `<name>` is
+both the image-config `image add` scaffolds and the new config's `default-image`.
 Answering `n` exits with the same error a strict `find` would have produced -- run
 `outrig init` later when you're ready.
 

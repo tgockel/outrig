@@ -32,27 +32,20 @@ use outrig::error::IoPathExt;
 /// `PromptSource` is threaded through both halves so the user sees a
 /// single conversation. `global_override` plumbs `--global-config` into
 /// the bootstrap path so the model-section can list models from the
-/// right global config.
+/// right global config. A bootstrap writes `name` as `default-image`, so
+/// a fresh repo defaults to the image added here.
 pub async fn run(
     cwd: &Path,
     global_override: Option<&Path>,
     name: Option<String>,
     force: bool,
 ) -> Result<()> {
-    // Ahead of the bootstrap, which would walk a fresh repo through its
-    // prompts and write its config before `run_with` refused the name.
-    if let Some(name) = &name {
-        check_name(name).map_err(OutrigError::from)?;
-    }
     let global_path = global_config_path(global_override);
     let mut prompt = prompt::auto();
     let mut hf = crate::hf::auto();
-    let (repo_root, bootstrapped_name) =
-        init_repo::resolve_or_bootstrap(cwd, &global_path, &mut prompt, &mut hf).await?;
-    // CLI-provided name wins; otherwise reuse whatever the bootstrap
-    // already asked for.
-    let effective = name.or(bootstrapped_name);
-    run_with(&repo_root, effective, force, &mut prompt).await
+    let (repo_root, name) =
+        init_repo::resolve_or_bootstrap(cwd, &global_path, name, &mut prompt, &mut hf).await?;
+    run_with(&repo_root, name, force, &mut prompt).await
 }
 
 /// Drives the interactive flow against an arbitrary `PromptSource`.
@@ -269,7 +262,7 @@ fn default_image_name(repo_root: &Path) -> String {
 /// error a load of the config would give, so the two explain a name alike.
 /// A name that passes is also one component of the path it names under
 /// `.agents/outrig/images/`.
-fn check_name(name: &str) -> std::result::Result<(), ConfigValidationError> {
+pub(crate) fn check_name(name: &str) -> std::result::Result<(), ConfigValidationError> {
     check_build_image_name(name).map_err(|_| ConfigValidationError::BuildImageNameInvalid {
         image: name.to_string(),
     })

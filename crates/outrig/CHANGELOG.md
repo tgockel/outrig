@@ -147,6 +147,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newly refuses could never have been built. The error now names what is wrong -- the character
   or the separator -- rather than restating the whole rule.
 
+- **The filesystem-view helper builds with Rust 1.99.** The `outrig-enter` launcher declares the
+  libc functions it calls itself, and declared `open` without the `...` that ends its C
+  prototype. The standard library calls `open` too, so Rust 1.99 refuses that declaration by
+  default, and the build script's compile of the launcher failed. The build went on with only a
+  cargo warning, and every `view = "primary"` sidecar then failed to start with "this outrig was
+  built without the filesystem-view helper". `open` is now declared variadic, as in C.
+
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 
 The first release since 0.1.0. It breaks the public Rust surface in most of the ways a 0.1

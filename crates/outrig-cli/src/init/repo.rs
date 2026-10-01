@@ -43,7 +43,7 @@ pub async fn ensure(
         "[outrig] no repo config at {} -- let's create one.",
         cfg_path.display()
     );
-    let name = write_repo_config(repo_root, global_path, prompt, hf).await?;
+    let name = write_repo_config(repo_root, global_path, None, prompt, hf).await?;
     Ok(Some(name))
 }
 
@@ -53,17 +53,25 @@ pub async fn ensure(
 /// returns `cwd`. On no, re-raises `NoRepoConfig` so the exit code and
 /// error string match the previous behavior for scripts that test the
 /// unconfigured case.
-/// Returns the resolved repo root paired with `Some(image_name)` when
-/// this call ran the bootstrap (the user named an image) or `None`
-/// when an existing config was found by walking up.
+/// `name` is the image `image add` was given, if any. One it can't build
+/// is refused before anything is asked or written; otherwise the
+/// bootstrap writes it as `default-image` rather than asking for one.
+/// Returns the resolved repo root paired with `name`, or, when that is
+/// `None` and the bootstrap ran, the name it asked for.
 pub async fn resolve_or_bootstrap(
     cwd: &Path,
     global_path: &Path,
+    name: Option<String>,
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
 ) -> Result<(PathBuf, Option<String>)> {
+    // Ahead of the bootstrap, which would walk a fresh repo through its
+    // prompts and write the name as its `default-image`.
+    if let Some(name) = &name {
+        image_add::check_name(name).map_err(OutrigError::from)?;
+    }
     match find_repo_root_from(cwd) {
-        Ok(root) => Ok((root, None)),
+        Ok(root) => Ok((root, name)),
         Err(OutrigError::NoRepoConfig) => {
             eprintln!(
                 "[outrig] no .agents/outrig/config.toml found in {} or any parent.",
@@ -73,7 +81,7 @@ pub async fn resolve_or_bootstrap(
                 eprintln!("[outrig] skipping; run `outrig init` later to set up.");
                 return Err(OutrigError::NoRepoConfig.into());
             }
-            let name = write_repo_config(cwd, global_path, prompt, hf).await?;
+            let name = write_repo_config(cwd, global_path, name, prompt, hf).await?;
             Ok((cwd.to_path_buf(), Some(name)))
         }
         Err(other) => Err(other.into()),
@@ -83,10 +91,12 @@ pub async fn resolve_or_bootstrap(
 /// Walks the three repo-config sections (image / model / agent),
 /// builds a [`Config`], serializes to TOML, and writes atomically via
 /// [`write_atomic`]. Section headers signal each transition so
-/// the prompts don't bleed together.
+/// the prompts don't bleed together. A given `image_name` is written as
+/// `default-image` without asking for one. Returns the name written.
 async fn write_repo_config(
     repo_root: &Path,
     global_path: &Path,
+    image_name: Option<String>,
     prompt: &mut impl PromptSource,
     hf: &mut impl HfTreeFetcher,
 ) -> Result<String> {
@@ -113,7 +123,10 @@ async fn write_repo_config(
 
     eprintln!();
     eprintln!("Configuring your first image");
-    let image_name = image_add::ask_name(prompt, repo_root).await?;
+    let image_name = match image_name {
+        Some(name) => name,
+        None => image_add::ask_name(prompt, repo_root).await?,
+    };
     let ws_default = Workspace::default();
     let host_path = prompt
         .ask_string(&HOST_PATH_FIELD, &ws_default.host_path().to_string_lossy())
