@@ -75,7 +75,11 @@ include!("elf.rs");
 include!("path_search.rs");
 
 unsafe extern "C" {
-    fn open(path: *const c_char, flags: c_int) -> c_int;
+    // Variadic, as C declares it: the mode only `O_CREAT` reads follows
+    // `flags`. Every call here passes neither, but the standard library links
+    // this same symbol, and since Rust 1.99 a declaration that disagrees with
+    // the runtime's is an error.
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn pread(fd: c_int, buf: *mut c_void, count: usize, offset: i64) -> isize;
     fn chdir(path: *const c_char) -> c_int;

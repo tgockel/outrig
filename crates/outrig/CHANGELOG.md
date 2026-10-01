@@ -174,6 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `localhost` `base-url` -- see
   [Local models](../../doc/concepts/llm-providers.md#local-models).
 
+### Fixed
+
+- **The `outrig-enter` launcher builds on Rust 1.99.** It declared C's `open` without the variadic
+  tail C gives it, and 1.99 rejects a declaration of a symbol the standard library links that
+  disagrees with the runtime's. Without `OUTRIG_REQUIRE_ENTER` the build went on with a warning
+  and `view = "primary"` sidecars unavailable; with it, the build failed.
+
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 
 The first release since 0.1.0. It breaks the public Rust surface in most of the ways a 0.1

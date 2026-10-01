@@ -228,8 +228,10 @@ terms as the audit log that already exists.
     ran when the result was serialized, raised, and the result was never sent. The name is now
     copied to a plain `str` with `str.__str__`, through one helper, `_raised`, used at both raise
     sites. `a_failure_whose_type_name_cannot_be_encoded_is_still_reported` reproduces it on the
-    previous fix. The same review reported a launcher defect that predates this task, filed as
-    `plan/next/launcher-open-is-declared-non-variadic.md`.
+    previous fix. The same review reported a launcher defect that predates this task: `open`
+    declared without its variadic tail, which Rust 1.99 rejects. It was fixed on this branch in
+    a commit of its own once CI's stable toolchain reached 1.99, since nothing could merge
+    without it.
   - `Events::open` appended to a log that already held a recording, numbering from 1 again under
     the same container-derived `source`. A library caller that shuts one agent down and starts
     another on the same `Outrig` would have repeated `(source, id)` pairs, and turn and call ids
