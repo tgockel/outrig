@@ -35,7 +35,10 @@ random hex digits -- sortable, unambiguous across concurrent runs):
         ├── container.log         # buildah/podman transcripts when --verbose is set
         ├── network.jsonl         # network audit/filter records when enabled
         ├── fs.stderr             # MCP "fs" server's captured stderr
-        └── shell.stderr          # MCP "shell" server's captured stderr
+        ├── shell.stderr          # MCP "shell" server's captured stderr
+        ├── subagent-audit.log    # transcript of the subagent "audit"
+        └── subagent-audit/       # transcripts of the subagents "audit" launched
+            └── subagent-scan.log
 ```
 
 `session.json` names every container the session owns: `container_name` for the primary,
@@ -140,6 +143,9 @@ $ outrig logs 20260501T134412-3f2a
   fs       (1.2 KiB)
   shell    (3.4 KiB)
 ```
+
+A file in a subdirectory, like the transcript of a subagent another subagent launched, is listed
+by its path under `logs/`.
 
 Follow a still-running session's log:
 

@@ -239,8 +239,16 @@ Nothing reaches stdout except the primary agent's reply, so `outrig run > out.tx
 only the model's text. Subagent activity shows up two other ways:
 
 - On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name.
-- In `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr logs, holding that
-  subagent's prompts, replies, and published outcomes.
+- In a transcript holding that subagent's prompts, replies, and published outcomes. A subagent the
+  primary launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
+  logs. One launched by a subagent writes into a directory named for its parent, beside the
+  parent's own transcript: `audit`'s subagent `scan` writes `logs/subagent-audit/subagent-scan.log`,
+  and `scan`'s own go in `logs/subagent-audit/subagent-scan/`. Subagents sharing a name under
+  different parents never share a file.
+
+Each launch starts its transcript with a header naming the subagent's whole path, and its model
+when the launch named one, such as `=== subagent audit/scan ===`. A name released and launched
+again appends to the same file, under a header of its own.
 
 Ctrl-C behaves as it always has: it abandons whatever the parent was waiting on and returns you to
 the prompt. Subagents keep running and are still collectable on the next turn -- the same way an

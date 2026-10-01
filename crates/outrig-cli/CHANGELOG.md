@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Subagents sharing a name keep separate transcripts.** A name is unique only among one agent's
+  subagents, so two subagents could each launch an `audit`, and a subagent could give a child its
+  own name, but every subagent wrote `logs/subagent-<name>.log`. Same-named subagents appended to
+  one file, their prompts and outcomes mixed with nothing to tell them apart. A subagent launched
+  by another subagent now writes into a directory named for its parent, such as
+  `logs/subagent-parent-a/subagent-audit.log`; the primary's subagents keep their file names. Each
+  launch starts its transcript with a header naming the subagent's whole path, such as
+  `=== subagent parent-a/audit ===`, including a launch that named no model, which used to write
+  no header. `outrig logs <session>` lists the nested transcripts too.
 - **`--config .agents/outrig/config.toml` takes `.` as the repo root**, as its `./`-prefixed
   spelling always did. A relative path of exactly three components derived the empty path
   instead, so a bare `model-path = "local.gguf"` validated clean and then reached the mistralrs

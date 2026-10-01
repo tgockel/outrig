@@ -78,8 +78,15 @@ pub struct SubagentContext {
     /// The base a re-resolution joins a relative `model-path` to -- the same
     /// one the session resolved against, kept for the same reason `cfg` is.
     pub repo_root: PathBuf,
-    /// Where per-subagent transcripts go, alongside `<server>.stderr`.
+    /// Where per-subagent transcripts go, alongside `<server>.stderr`. The
+    /// session's at every level: a nested transcript's directory comes from
+    /// `ancestry`, not from a different `log_dir`.
     pub log_dir: PathBuf,
+    /// The names leading to the subagents this registry launches, outermost
+    /// first: empty for the session's registry, `["parent-a"]` for the one
+    /// `parent-a` launches through. Names are unique only within one registry,
+    /// so this is what keeps two `audit`s' transcripts apart.
+    pub ancestry: Vec<String>,
     /// The depth of the subagents *this* registry launches. The primary agent
     /// is the root at depth 1, so the session's registry launches at depth 2. A
     /// subagent at depth `D` may launch its own children (at `D + 1`) only while
@@ -173,7 +180,7 @@ impl SubagentRegistry {
     /// launching agent's.
     ///
     /// Returns the [`ModelLabel`] the launch resolved to, `Some` on exactly the
-    /// condition the transcript header is written -- the caller named a model.
+    /// condition the transcript header names a model -- the caller named one.
     /// Handing the label back rather than letting the tool re-derive it from
     /// its own argument is what lets an alias show the hop it took, and is what
     /// makes `ModelLabel`'s claim to carry all three surfaces true.
@@ -249,6 +256,7 @@ impl SubagentRegistry {
             agent,
             shared.clone(),
             self.ctx.log_dir.clone(),
+            self.ctx.ancestry.clone(),
             label,
         ));
         let abort = task.abort_handle();
@@ -609,8 +617,8 @@ pub(crate) fn usable_model_names(cfg: &Config) -> Vec<String> {
 /// transcript header. One value carries all three so they cannot drift.
 ///
 /// `None` wherever the launch inherited the parent's model, which is what keeps
-/// the default path byte-for-byte -- and byte-free in the transcript -- as it
-/// was before this argument existed.
+/// the default path's trace and tool result byte-for-byte as they were before
+/// this argument existed. Its transcript header names the subagent alone.
 ///
 /// Display-only. `name` holds the rendered `alias -> concrete` hop when one was
 /// taken, so it is not a key anything can be looked up by.
@@ -776,6 +784,7 @@ async fn build_subagent_agent(
     let child = if ctx.depth < ctx.resolved.subagent_depth_max {
         let mut child_ctx = ctx.clone();
         child_ctx.depth = ctx.depth + 1;
+        child_ctx.ancestry.push(name.to_string());
         // This subagent is the launching agent now, so its children inherit
         // the model it runs under; left as the clone, a subagent launched onto
         // a named model would hand its children its parent's instead. The
@@ -842,10 +851,11 @@ async fn run_rounds(
     agent: crate::llm::RigAgent,
     shared: Arc<SubagentShared>,
     log_dir: PathBuf,
+    ancestry: Vec<String>,
     label: Option<ModelLabel>,
 ) {
     let mut history = Vec::new();
-    let mut log = transcript::Transcript::open(&log_dir, &name, label.as_ref()).await;
+    let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref()).await;
 
     loop {
         let prompt = shared.next_round().await;
@@ -1181,6 +1191,7 @@ pub(crate) mod fixtures {
             cache_root: PathBuf::from("."),
             repo_root: PathBuf::from("."),
             log_dir: log_dir.path().to_path_buf(),
+            ancestry: Vec::new(),
             depth,
             #[cfg(feature = "local-llm")]
             registry: Arc::new(crate::llm::LlmRegistry::new()),
@@ -1372,7 +1383,7 @@ mod tests {
 
     /// A full tree at the shipped defaults: the session registry's eight
     /// children, and eight grandchildren in each child's private registry.
-    /// Names are globally unique because transcripts share one directory.
+    /// Every branch names its grandchildren alike, as unrelated parents may.
     struct FullTree {
         branches: Vec<Branch>,
     }
@@ -1470,7 +1481,7 @@ mod tests {
 
             let mut leaves = Vec::with_capacity(width);
             for leaf_index in 0..width {
-                let leaf = format!("leaf-{parent_index}-{leaf_index}");
+                let leaf = format!("leaf-{leaf_index}");
                 child
                     .launch(&leaf, None, None, "work".to_string())
                     .await
@@ -2870,8 +2881,8 @@ mod tests {
     }
 
     /// Attribution, transcript half: the header names the model a launch asked
-    /// for, and an inherited launch adds no bytes at all. The trace and tool
-    /// result are the other half, pinned in `builtin_tool`.
+    /// for, and an inherited launch's names the subagent alone. The trace and
+    /// tool result are the other half, pinned in `builtin_tool`.
     #[tokio::test(start_paused = true)]
     async fn the_transcript_header_names_the_model() {
         let (registry, log_dir) = test_registry();
@@ -2902,8 +2913,8 @@ mod tests {
             .await
             .expect("transcript exists");
         assert!(
-            !text.contains("model:"),
-            "an inherited launch must add no header bytes: {text}"
+            text.starts_with("=== subagent plain ===\n"),
+            "an inherited launch's header must name no model: {text}"
         );
     }
 
@@ -2931,6 +2942,52 @@ mod tests {
             ),
             "got: {text}"
         );
+    }
+
+    /// Names are per launching agent, so two parents may each launch an
+    /// `audit`, and an `audit` may launch one of its own. Each keeps a
+    /// transcript of its own, under a header naming its whole path and holding
+    /// only its own prompt. All of them used to append to `subagent-audit.log`.
+    #[tokio::test(start_paused = true)]
+    async fn same_named_subagents_keep_separate_transcripts() {
+        let (registry, log_dir) = test_registry();
+        for parent in ["parent-a", "parent-b", "audit"] {
+            registry
+                .launch(parent, None, None, format!("prompt for {parent}"))
+                .await
+                .expect("launch");
+            // A prompt is recorded before its round runs, so once the round's
+            // result is readable the prompt is on disk.
+            registry.get_result(parent).await.expect("round fails");
+            let child = child_registry(&registry, parent);
+            child
+                .launch("audit", None, None, format!("prompt for {parent}/audit"))
+                .await
+                .expect("each parent may launch its own audit");
+            child.get_result("audit").await.expect("round fails");
+        }
+
+        for (path, file) in [
+            ("parent-a", "subagent-parent-a.log"),
+            ("parent-b", "subagent-parent-b.log"),
+            ("audit", "subagent-audit.log"),
+            ("parent-a/audit", "subagent-parent-a/subagent-audit.log"),
+            ("parent-b/audit", "subagent-parent-b/subagent-audit.log"),
+            ("audit/audit", "subagent-audit/subagent-audit.log"),
+        ] {
+            let text = tokio::fs::read_to_string(log_dir.path().join(file))
+                .await
+                .expect("transcript exists");
+            assert!(
+                text.starts_with(&format!("=== subagent {path} ===\n")),
+                "{file}: {text}"
+            );
+            assert_eq!(text.matches("=== prompt ===").count(), 1, "{file}: {text}");
+            assert!(
+                text.contains(&format!("=== prompt ===\nprompt for {path}\n")),
+                "{file} must hold its own prompt: {text}"
+            );
+        }
     }
 
     /// An alias is usable when *any* candidate is, which is what lets one name

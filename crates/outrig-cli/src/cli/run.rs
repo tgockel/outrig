@@ -297,6 +297,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         cache_root: cache_root.to_path_buf(),
         repo_root: repo_root.to_path_buf(),
         log_dir: log_dir.to_path_buf(),
+        ancestry: Vec::new(),
         // The primary is the root at depth 1, so its subagents live at depth 2.
         depth: 2,
         #[cfg(feature = "local-llm")]

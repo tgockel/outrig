@@ -146,14 +146,28 @@ where
                 .map_err(Into::into);
         }
     };
-    while let Some(ent) = rd.next_entry().await? {
-        let meta = ent.metadata().await?;
-        if !meta.is_file() {
-            continue;
+    // A subagent launched by another subagent writes its transcript into a
+    // `subagent-<parent>/` directory, so the listing descends and names each
+    // file by its path under `logs_dir`.
+    let mut subdirs = Vec::new();
+    loop {
+        while let Some(ent) = rd.next_entry().await? {
+            let meta = ent.metadata().await?;
+            let path = ent.path();
+            if meta.is_dir() {
+                subdirs.push(path);
+            } else if meta.is_file() {
+                let raw = path.strip_prefix(logs_dir).unwrap_or(&path).to_string_lossy();
+                let display = raw.strip_suffix(LOG_SUFFIX).unwrap_or(&raw).to_string();
+                entries.push((display, meta.len()));
+            }
         }
-        let raw = ent.file_name().to_string_lossy().into_owned();
-        let display = raw.strip_suffix(LOG_SUFFIX).unwrap_or(&raw).to_string();
-        entries.push((display, meta.len()));
+        let Some(dir) = subdirs.pop() else {
+            break;
+        };
+        rd = tokio::fs::read_dir(&dir)
+            .await
+            .path_ctx("read directory", &dir)?;
     }
     entries.sort();
 

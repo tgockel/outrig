@@ -401,7 +401,8 @@ nothing: the container set, tool list, and conversation stay as they were.
 The agent can hand scoped work to subagents that share this session's container and tools, using
 the built-in `outrig__` tools. They are on by default; `subagents = false` on the
 `[agents.<name>]` block leaves them out. Their tool calls appear on stderr labeled by name, and
-each one's transcript is written to `<session_dir>/logs/subagent-<name>.log`.
+each one's transcript is written to `<session_dir>/logs/subagent-<name>.log` -- or, for one a
+subagent launched, under a `subagent-<parent>/` directory there.
 
 ```
 > audit the config and the mcp wiring in parallel
