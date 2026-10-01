@@ -89,6 +89,11 @@ fn tool_result(request: &RecordedRequest, id: &str) -> String {
 /// A repo whose image has no Python and whose config declares a primary MCP
 /// server carrying a secret.
 fn repo(addr: std::net::SocketAddr) -> tempfile::TempDir {
+    repo_with(addr, "")
+}
+
+/// [`repo`], its config ending with `extra`.
+fn repo_with(addr: std::net::SocketAddr, extra: &str) -> tempfile::TempDir {
     let repo = tempfile::tempdir().expect("a repo");
     let cfg_dir = repo.path().join(".agents/outrig");
     std::fs::create_dir_all(&cfg_dir).expect("create config dir");
@@ -115,6 +120,8 @@ image-name = "docker.io/library/alpine:latest"
 
   [images.primary.mcp]
   leaky = {{ command = ["/nonexistent-mcp"], env = {{ TOKEN = "${{{SECRET_VAR}}}" }} }}
+
+{extra}
 "#
         ),
     )
@@ -434,7 +441,8 @@ async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_termina
         text_reply("started it"),
     ])
     .await;
-    let repo = repo(addr);
+    // Recorded, so the event log is checked through the binary too.
+    let repo = repo_with(addr, "[events]\nmode = \"record\"");
     let sessions = tempfile::tempdir().expect("a session root");
     let mut session = Session::start(repo.path(), sessions.path());
 
@@ -478,6 +486,38 @@ async fn typed_input_reaches_the_agent_mid_round_and_its_sends_reach_the_termina
     for typed in ["alpha-7", "bravo-7", "charlie-7"] {
         assert!(!wire.contains(typed), "{typed} reached the model");
     }
+
+    // The event log is whole by the time the binary has exited, holds what
+    // the user typed, and is the user's alone.
+    let session_dir = std::fs::read_dir(sessions.path())
+        .expect("the session root")
+        .next()
+        .expect("one session")
+        .expect("an entry")
+        .path();
+    let log = session_dir.join("logs/events.jsonl");
+    let text = std::fs::read_to_string(&log).expect("the event log");
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a whole record"))
+        .collect();
+    assert_eq!(
+        events.last().map(|e| e["type"].clone()),
+        Some(json!("org.outrig.agent.stopped")),
+        "{text}"
+    );
+    let typed: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["type"] == "org.outrig.message.sent" && e["data"]["from"] == "user")
+        .map(|e| &e["data"]["body"])
+        .collect();
+    assert_eq!(
+        typed,
+        [&json!("alpha-7"), &json!("bravo-7"), &json!("charlie-7")]
+    );
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&log).expect("stat").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
 }
 
 /// What `runtime.wait` is for, through the binary: a wait on something that

@@ -14,6 +14,9 @@ retry-budget-secs  = 300
 [network]
 mode = "audit"
 
+[events]
+mode = "record"
+
 [providers.openai]
 style                = "openai"
 base-url             = "https://api.openai.com/v1"

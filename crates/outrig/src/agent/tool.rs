@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::channel::Announcer;
+use crate::events::Event;
 use crate::python::host::{ExecId, Interpreter, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{self, ATTEMPTS, GaveUp, Press, Presses, Timings, Verdict, Waited};
 
@@ -200,6 +201,10 @@ impl ToolDyn for SubmitPython {
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         Box::pin(async move {
             let Args { source } = parse_args(&args)?;
+            let events = self.interpreter.events();
+            // Where a writer that has fallen behind holds the agent up: before
+            // anything runs, rather than once it has.
+            events.ready().await;
             // Nothing was sent, so this one is a failure of the tool rather than
             // an outcome of the code.
             let execution = self
@@ -254,13 +259,21 @@ impl ToolDyn for SubmitPython {
             let mut late = std::mem::take(&mut *unreported);
             late.extend(self.interpreter.take_late());
             // Ahead of the rest and outside its bound, so no cut takes it.
-            let (text, rest) = render(
+            let (text, rest, cut) = render_measured(
                 late,
                 &settled.outcome,
                 settled.waited,
                 self.result_max_bytes.saturating_sub(announcement.len()),
             );
             *unreported = rest;
+            if let Some(Cut { size, max, kept }) = cut {
+                events.emit(Event::ToolResultTruncated {
+                    execid: id,
+                    size,
+                    max,
+                    kept,
+                });
+            }
             Ok(if announcement.is_empty() {
                 text
             } else {
@@ -311,6 +324,27 @@ const EXCEPTION_LINE_MAX: usize = 300;
 /// a later call.
 const UNREPORTED_NOTICE_MAX: usize = 96;
 
+/// [`render_measured`], for a test that has no use for what it cut.
+#[cfg(test)]
+pub(crate) fn render(
+    late: Vec<Late>,
+    outcome: &Outcome,
+    waited: Waited,
+    max: usize,
+) -> (String, Vec<Late>) {
+    let (text, unreported, _) = render_measured(late, outcome, waited, max);
+    (text, unreported)
+}
+
+/// What [`truncate_measured`] cut, as its marker reports it: bytes in, the
+/// bound, and the bytes kept ahead of the marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cut {
+    pub(crate) size: usize,
+    pub(crate) max: usize,
+    pub(crate) kept: usize,
+}
+
 /// What the model reads for `outcome`, with what the host did to it while it
 /// waited, and for any results that arrived with nobody waiting for them, in
 /// at most `max` bytes.
@@ -328,12 +362,14 @@ const UNREPORTED_NOTICE_MAX: usize = 96;
 /// order, while they fit; those that do not are counted in the status and
 /// handed back, for the caller to report next time. At the smallest ceiling
 /// config allows there is room for the current status and at least one.
-pub(crate) fn render(
+///
+/// What the bound cut, if anything, comes back too, for the event log.
+pub(crate) fn render_measured(
     mut late: Vec<Late>,
     outcome: &Outcome,
     waited: Waited,
     max: usize,
-) -> (String, Vec<Late>) {
+) -> (String, Vec<Late>, Option<Cut>) {
     let current = render_outcome(outcome, waited);
     let mut status = String::new();
     if let Some(line) = &current.status {
@@ -379,13 +415,14 @@ pub(crate) fn render(
 
     // Only a ceiling far below config's floor leaves no room past the current
     // status; cut it rather than exceed the bound.
-    let text = if status.len() >= max {
-        truncate_for_llm(&status, max)
+    let (text, cut) = if status.len() >= max {
+        truncate_measured(&status, max)
     } else {
-        status.push_str(&truncate_for_llm(&detail, max - status.len()));
-        status
+        let (detail, cut) = truncate_measured(&detail, max - status.len());
+        status.push_str(&detail);
+        (status, cut)
     };
-    (text, unreported)
+    (text, unreported, cut)
 }
 
 /// One outcome, split into what must survive any bound and what may be cut.
@@ -581,26 +618,39 @@ fn push_block(text: &mut String, block: &str) {
     text.push_str(block);
 }
 
+/// [`truncate_measured`], for a test that has no use for what it cut.
+#[cfg(test)]
+pub(crate) fn truncate_for_llm(result: &str, max: usize) -> String {
+    truncate_measured(result, max).0
+}
+
 /// Bound `result` to `max` bytes, ending a cut one with a marker saying what
-/// was cut and what to do instead.
+/// was cut and what to do instead, and say what was cut.
 ///
 /// Copied from `outrig-cli`'s `rig_tool.rs`, whose marker advises narrowing a
 /// query; this one's advises printing less.
-pub(crate) fn truncate_for_llm(result: &str, max: usize) -> String {
+fn truncate_measured(result: &str, max: usize) -> (String, Option<Cut>) {
     if result.is_empty() || result.len() <= max {
-        return result.to_string();
+        return (result.to_string(), None);
     }
+    let original_len = result.len();
+    let cut_at = |kept| {
+        Some(Cut {
+            size: original_len,
+            max,
+            kept,
+        })
+    };
     if max == 0 {
-        return String::new();
+        return (String::new(), cut_at(0));
     }
 
-    let original_len = result.len();
     let mut cut = max.saturating_sub(truncation_marker(original_len, max, 0).len());
     loop {
         cut = floor_char_boundary(result, cut.min(result.len()));
         let marker = truncation_marker(original_len, max, cut);
         if marker.len() >= max {
-            return truncate_marker(&marker, max);
+            return (truncate_marker(&marker, max), cut_at(0));
         }
 
         let content_budget = max - marker.len();
@@ -609,7 +659,7 @@ pub(crate) fn truncate_for_llm(result: &str, max: usize) -> String {
             truncated.push_str(&result[..cut]);
             truncated.push_str(&marker);
             debug_assert!(truncated.len() <= max);
-            return truncated;
+            return (truncated, cut_at(cut));
         }
 
         cut = content_budget;

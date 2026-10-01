@@ -52,6 +52,7 @@ use tokio::sync::Notify;
 use tokio::time::{Instant, sleep_until, timeout};
 
 use super::host::{ExecId, Execution, Interpreter, InterpreterError, Inventory, Outcome};
+use crate::events::{Event, Held};
 
 /// The share of a CPU the loop's thread must have used across a probe that
 /// went unanswered for the loop to count as spinning.
@@ -141,6 +142,18 @@ pub(crate) enum Verdict {
     Spinning,
     /// Nothing in the interpreter answered: native code holds the GIL.
     Starved,
+}
+
+impl Verdict {
+    /// As the event log names it.
+    fn name(self) -> &'static str {
+        match self {
+            Verdict::Turning => "turning",
+            Verdict::Blocked => "blocked",
+            Verdict::Spinning => "spinning",
+            Verdict::Starved => "starved",
+        }
+    }
 }
 
 /// An execution's outcome, and what the host did while waiting for it.
@@ -279,10 +292,7 @@ pub(crate) async fn settle(
             // that may be on its way.
             let outcome = match timeout(timings.last_look, execution.outcome()).await {
                 Ok(outcome) => outcome,
-                Err(_) => {
-                    waited.gave_up = Some(GaveUp::User);
-                    execution.stop_waiting()
-                }
+                Err(_) => give_up(interpreter, execution, &mut waited, GaveUp::User),
             };
             return Settled { outcome, waited };
         }
@@ -301,9 +311,10 @@ pub(crate) async fn settle(
             // course. The check's probe stays in `probe`, to be waited on
             // again rather than sent again.
             () = presses.pressed(id, handled) => continue,
-            verdict = check(interpreter, &mut probe, wait, timings.cpu) => verdict,
+            verdict = check(interpreter, id, &mut probe, wait, timings.cpu) => verdict,
         };
         next_check = Instant::now() + timings.check_every;
+        probe_failed(interpreter, id, verdict);
         match verdict {
             // Healthy, or at least not spinning: nothing is done on the host's
             // own account.
@@ -324,11 +335,8 @@ pub(crate) async fn settle(
                     "execution {id} is still spinning after {ATTEMPTS} interrupts; no longer \
                      waiting for it"
                 );
-                waited.gave_up = Some(GaveUp::Runaway);
-                return Settled {
-                    outcome: execution.stop_waiting(),
-                    waited,
-                };
+                let outcome = give_up(interpreter, execution, &mut waited, GaveUp::Runaway);
+                return Settled { outcome, waited };
             }
             Verdict::Spinning => {
                 tracing::warn!(
@@ -359,7 +367,8 @@ pub(crate) async fn settle(
 /// interrupt it if it is spinning. What it reports, it reports as a late
 /// result.
 async fn rescue(interpreter: &Interpreter, holder: ExecId, timings: &Timings) -> Verdict {
-    let verdict = check(interpreter, &mut None, timings.probe, timings.cpu).await;
+    let verdict = check(interpreter, holder, &mut None, timings.probe, timings.cpu).await;
+    probe_failed(interpreter, holder, verdict);
     if verdict == Verdict::Spinning {
         tracing::warn!(
             "execution {holder}, which nobody is waiting for, is spinning; interrupting it"
@@ -367,6 +376,34 @@ async fn rescue(interpreter: &Interpreter, holder: ExecId, timings: &Timings) ->
         interpreter.interrupt(holder, true);
     }
     verdict
+}
+
+/// Stop waiting for `execution`, for `why`: say so in `waited`, and record it.
+fn give_up(
+    interpreter: &Interpreter,
+    execution: Execution,
+    waited: &mut Waited,
+    why: GaveUp,
+) -> Outcome {
+    waited.gave_up = Some(why);
+    interpreter.events().emit(Event::ExecAbandoned {
+        execid: execution.id(),
+        why: match why {
+            GaveUp::User => "user",
+            GaveUp::Runaway => "runaway",
+        },
+    });
+    execution.stop_waiting()
+}
+
+/// Record a check of `id`'s loop that found it not turning.
+fn probe_failed(interpreter: &Interpreter, id: ExecId, verdict: Verdict) {
+    if verdict != Verdict::Turning {
+        interpreter.events().emit(Event::ExecProbeFailed {
+            execid: id,
+            verdict: verdict.name(),
+        });
+    }
 }
 
 /// A probe of the loop, sent and not yet answered.
@@ -380,8 +417,12 @@ type Probe<'a> = Pin<Box<dyn Future<Output = Result<Inventory, InterpreterError>
 /// and a loop blocked for an hour would otherwise have a hundred of them to
 /// answer when it returns. One answered before this check began is dropped
 /// instead: it says the loop turned then, not that it turns now.
+///
+/// An answer is what the agent's namespace held while `id` ran, which is
+/// recorded.
 async fn check<'a>(
     interpreter: &'a Interpreter,
+    id: ExecId,
     probe: &mut Option<Probe<'a>>,
     wait: Duration,
     cpu: Duration,
@@ -402,8 +443,11 @@ async fn check<'a>(
         }
         let before = reading().await?;
         let pending = probe.get_or_insert_with(|| Box::pin(interpreter.inventory()));
-        if timeout(wait, pending).await.is_ok() {
+        if let Ok(answer) = timeout(wait, pending).await {
             *probe = None;
+            if let Ok(inventory) = answer {
+                observed(interpreter, id, &inventory);
+            }
             return Ok(Verdict::Turning);
         }
         let after = reading().await?;
@@ -422,6 +466,24 @@ async fn check<'a>(
         })
     };
     measured.await.unwrap_or_else(|verdict| verdict)
+}
+
+/// Record what a probe found the agent's namespace holding while `id` ran.
+fn observed(interpreter: &Interpreter, id: ExecId, inventory: &Inventory) {
+    let events = interpreter.events();
+    if !events.is_on() {
+        return;
+    }
+    events.emit(Event::InventoryObserved {
+        execid: id,
+        names: inventory
+            .globals
+            .iter()
+            .map(|(name, kind)| Held { name, kind })
+            .collect(),
+        total: inventory.total,
+        more: inventory.more,
+    });
 }
 
 #[cfg(test)]

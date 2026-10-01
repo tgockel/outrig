@@ -73,7 +73,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -84,6 +84,7 @@ use tokio::task::JoinHandle;
 
 use crate::container::{Container, ExecOptions};
 use crate::error::OutrigError;
+use crate::events::{Event, Events, PRIMARY_SUBJECT};
 
 use super::payload::PAYLOAD_MOUNT;
 
@@ -132,6 +133,9 @@ const DIAGNOSTIC: &str = "outrig-interpreter:";
 /// The agent's channel the host is the other end of.
 pub(crate) const USER: &str = "user";
 
+/// The host's end of that channel, as the event log names it.
+const USER_END: &str = "user";
+
 /// The longest message posted to a channel, in bytes. `interpreter.py` bounds
 /// what the agent sends by the same `MESSAGE_MAX`, measured on the protocol line
 /// a send becomes.
@@ -161,7 +165,7 @@ pub(crate) struct Report {
 }
 
 /// Output from an earlier execution, delivered with a later result.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct Background {
     pub(crate) id: ExecId,
     pub(crate) output: String,
@@ -252,6 +256,8 @@ pub(crate) struct Interpreter {
     /// The Python version the interpreter greeted with, as `sys.version`'s
     /// first word.
     version: Arc<str>,
+    /// Where what this interpreter's agent does is recorded.
+    events: Events,
 }
 
 /// One submission's handle. Its id is fixed at submission, which is what a
@@ -276,13 +282,17 @@ struct Table {
     /// Requests other than executions, by id, until answered.
     queries: HashMap<ExecId, Query>,
     late: Vec<Late>,
-    /// Where the agent's messages to the user go, once someone subscribed.
-    outbox: Option<mpsc::UnboundedSender<String>>,
+    /// Where the agent's messages to the user go, once someone subscribed,
+    /// each under the id the event log knows it by.
+    outbox: Option<mpsc::UnboundedSender<(ExecId, String)>>,
     /// Where the agent's promotions and demotions go, once something
     /// registered for them.
     on_context: Option<ContextChanged>,
     /// Why nothing more can be sent, once that is so.
     ended: Option<Arc<str>>,
+    /// Where what crosses the protocol is recorded, for what is recorded
+    /// under this lock.
+    events: Events,
 }
 
 /// What a change to the agent's context is handed to.
@@ -301,6 +311,8 @@ pub(crate) enum ContextChange {
 struct Slot {
     id: ExecId,
     waiter: oneshot::Sender<Outcome>,
+    /// When it was sent, which its recorded duration counts from.
+    submitted: Instant,
 }
 
 /// Who is waiting for a request's answer.
@@ -361,6 +373,13 @@ enum Reply {
     Demote {
         turns: Vec<u64>,
     },
+    /// The agent's code took message `message` -- the id it was posted under
+    /// -- from a channel. Sent only once the host has asked to observe, and
+    /// only to say so.
+    Took {
+        channel: String,
+        message: ExecId,
+    },
     #[serde(other)]
     Other,
 }
@@ -372,6 +391,9 @@ struct WireResult {
     status: Status,
     #[serde(flatten)]
     report: Report,
+    /// The type of the exception an execution raised.
+    #[serde(default)]
+    raised: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -388,7 +410,10 @@ impl Interpreter {
     /// The container must have the payload mounted, as every session's
     /// primary does, and its user bootstrapped. Without the payload, podman's
     /// own error is what the startup error carries.
-    pub(crate) async fn start(container: &Container) -> Result<Self, InterpreterError> {
+    pub(crate) async fn start(
+        container: &Container,
+        events: Events,
+    ) -> Result<Self, InterpreterError> {
         let python = format!("{PAYLOAD_MOUNT}/bin/python3");
         let argv: Vec<String> = [python.as_str()]
             .into_iter()
@@ -399,11 +424,15 @@ impl Interpreter {
         let child = container
             .exec_stdio_in_own_group(&argv, &ExecOptions::new())
             .await?;
-        Self::from_child(child).await
+        Self::from_child(child, events).await
     }
 
-    /// Drive the interpreter `child` runs, over its three piped streams.
-    pub(super) async fn from_child(mut child: Child) -> Result<Self, InterpreterError> {
+    /// Drive the interpreter `child` runs, over its three piped streams,
+    /// recording to `events` what crosses them.
+    pub(super) async fn from_child(
+        mut child: Child,
+        events: Events,
+    ) -> Result<Self, InterpreterError> {
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -412,17 +441,21 @@ impl Interpreter {
             ));
         };
         let tail = Arc::new(Mutex::new(VecDeque::new()));
-        let drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&tail)));
-        Self::connect(stdout, stdin, exit_cause(child, drain, tail)).await
+        let drain = tokio::spawn(drain_stderr(stderr, Arc::clone(&tail), events.clone()));
+        Self::connect(stdout, stdin, exit_cause(child, drain, tail), events).await
     }
 
     /// Wait for the greeting on `replies`, then start the reader and writer
     /// tasks. `ended` is awaited once `replies` closes, or the greeting fails,
     /// and says why.
+    ///
+    /// When `events` records, the interpreter is asked to say when the agent's
+    /// code takes a message, which nothing else needs to know.
     pub(super) async fn connect<R, W, E>(
         replies: R,
         requests: W,
         ended: E,
+        events: Events,
     ) -> Result<Self, InterpreterError>
     where
         R: AsyncRead + Send + Unpin + 'static,
@@ -440,8 +473,19 @@ impl Interpreter {
                 return Err(InterpreterError::Startup(format!("{problem}; {cause}")));
             }
         };
-        let table = Arc::new(Mutex::new(Table::default()));
+        let observe = events.is_on();
+        let table = Arc::new(Mutex::new(Table {
+            events: events.clone(),
+            ..Table::default()
+        }));
         let (lines, queued) = mpsc::unbounded_channel();
+        if observe {
+            let id = lock(&table).next_id();
+            let _ = lines.send(format!(
+                "{}\n",
+                json!({"t": "observe", "agent": PRIMARY, "id": id})
+            ));
+        }
         tokio::spawn(write_requests(requests, queued, Arc::clone(&table)));
         tokio::spawn(read_replies(
             replies,
@@ -453,6 +497,7 @@ impl Interpreter {
             table,
             lines,
             version: version.into(),
+            events,
         })
     }
 
@@ -460,6 +505,11 @@ impl Interpreter {
     /// `3.13.15`.
     pub(crate) fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Where this interpreter's agent's events are recorded.
+    pub(crate) fn events(&self) -> &Events {
+        &self.events
     }
 
     /// Submit `source` to run in the agent's namespace.
@@ -475,14 +525,25 @@ impl Interpreter {
         let id = table.next_id();
         let queued = match &table.slot {
             Some(slot) => {
-                let _ = waiter.send(Outcome::Refused { holder: slot.id });
+                let holder = slot.id;
+                table.events.emit(Event::ExecRefused { execid: id, holder });
+                let _ = waiter.send(Outcome::Refused { holder });
                 false
             }
             None => {
+                // Recorded before it is sent, so nothing the execution does
+                // can be recorded ahead of it.
+                table
+                    .events
+                    .emit(Event::ExecSubmitted { execid: id, source });
                 // Queued under the lock, so the wire order is the order the
                 // slot was claimed in.
                 self.send(json!({"t": "exec", "agent": PRIMARY, "id": id, "src": source}))?;
-                table.slot = Some(Slot { id, waiter });
+                table.slot = Some(Slot {
+                    id,
+                    waiter,
+                    submitted: Instant::now(),
+                });
                 true
             }
         };
@@ -536,9 +597,20 @@ impl Interpreter {
                 body.len()
             )));
         }
+        // Recorded before it is sent, so the agent's taking it -- which can
+        // reach the host ahead of the answer to this -- is recorded after.
         let receiver = self.request(
             json!({"t": "msg", "channel": channel, "body": body}),
             Query::Post,
+            |table, id| {
+                table.events.emit(Event::MessageSent {
+                    message: id,
+                    channel,
+                    from: USER_END,
+                    to: PRIMARY_SUBJECT,
+                    body,
+                });
+            },
         )?;
         let table = Arc::clone(&self.table);
         Ok(async move {
@@ -570,10 +642,16 @@ impl Interpreter {
         }
     }
 
-    /// Tell the interpreter the user received a message the agent sent on
-    /// `channel`, which makes room for the agent to send another.
-    fn received(&self, channel: &str) {
+    /// Tell the interpreter the user received `message`, which the agent sent
+    /// on `channel`, which makes room for the agent to send another.
+    fn received(&self, channel: &str, message: ExecId) {
         let mut table = lock(&self.table);
+        table.events.emit(Event::MessageReceived {
+            message,
+            channel,
+            from: PRIMARY_SUBJECT,
+            to: USER_END,
+        });
         if table.open().is_ok() {
             acknowledge(&mut table, &self.lines, channel);
         }
@@ -586,21 +664,24 @@ impl Interpreter {
         kind: &str,
         waiting: fn(oneshot::Sender<T>) -> Query,
     ) -> Result<T, InterpreterError> {
-        let receiver = self.request(json!({"t": kind}), waiting)?;
+        let receiver = self.request(json!({"t": kind}), waiting, |_, _| {})?;
         answer(&self.table, receiver).await
     }
 
     /// Queue the request `fields`, addressed to the primary under an id of its
-    /// own, and register `waiting` for its answer.
+    /// own, and register `waiting` for its answer. `before` is called with the
+    /// id under the lock the request is sent under, before it is sent.
     fn request<T>(
         &self,
         mut fields: Value,
         waiting: fn(oneshot::Sender<T>) -> Query,
+        before: impl FnOnce(&mut Table, ExecId),
     ) -> Result<oneshot::Receiver<T>, InterpreterError> {
         let (waiter, receiver) = oneshot::channel();
         let mut table = lock(&self.table);
         table.open()?;
         let id = table.next_id();
+        before(&mut table, id);
         fields["agent"] = json!(PRIMARY);
         fields["id"] = json!(id);
         self.send(fields)?;
@@ -616,7 +697,11 @@ impl Interpreter {
     /// that has stopped yielding until it yields again. The execution may
     /// catch the cancellation, so this frees nothing: its reply does.
     pub(crate) fn cancel(&self, id: ExecId) {
-        self.stop(id, json!({"t": "cancel", "agent": PRIMARY, "id": id}));
+        self.stop(
+            id,
+            json!({"t": "cancel", "agent": PRIMARY, "id": id}),
+            Event::ExecCancelSent { execid: id },
+        );
     }
 
     /// Ask the interpreter to raise `KeyboardInterrupt` in execution `id`,
@@ -631,14 +716,20 @@ impl Interpreter {
         self.stop(
             id,
             json!({"t": "interrupt", "agent": PRIMARY, "id": id, "runaway": runaway}),
+            Event::ExecInterruptSent {
+                execid: id,
+                runaway,
+            },
         );
     }
 
-    /// Send `message` if `id` still holds the slot. One that no longer does has
-    /// replied, and there is nothing left to stop.
-    fn stop(&self, id: ExecId, message: Value) {
+    /// Send `message` if `id` still holds the slot, recording `sent` if it
+    /// was. One that no longer does has replied, and there is nothing left to
+    /// stop.
+    fn stop(&self, id: ExecId, message: Value, sent: Event<'_>) {
         let table = lock(&self.table);
         if table.open().is_ok() && table.slot.as_ref().is_some_and(|slot| slot.id == id) {
+            table.events.emit(sent);
             let _ = self.send(message);
         }
     }
@@ -697,7 +788,7 @@ impl Interpreter {
 
 /// The messages the agent sends the user, from [`Interpreter::subscribe`].
 pub(crate) struct Sent {
-    receiver: mpsc::UnboundedReceiver<String>,
+    receiver: mpsc::UnboundedReceiver<(ExecId, String)>,
     interpreter: Interpreter,
 }
 
@@ -705,9 +796,13 @@ impl Sent {
     /// The next message the agent sent, acknowledged as received; `None` once
     /// the interpreter has exited and every one has been received.
     /// Cancel-safe.
+    ///
+    /// Waits for room in the event log first: holding the user's side back is
+    /// what holds the agent back, by the window its sends run ahead in.
     pub(crate) async fn recv(&mut self) -> Option<String> {
-        let body = self.receiver.recv().await?;
-        self.interpreter.received(USER);
+        self.interpreter.events().ready().await;
+        let (id, body) = self.receiver.recv().await?;
+        self.interpreter.received(USER, id);
         Some(body)
     }
 
@@ -715,13 +810,16 @@ impl Sent {
     /// more. Those it makes room for, and any arriving meanwhile, are left.
     pub(crate) fn recv_waiting(&mut self) -> Vec<String> {
         let waiting = self.receiver.len();
-        let taken: Vec<String> = (0..waiting)
+        let taken: Vec<(ExecId, String)> = (0..waiting)
             .map_while(|_| self.receiver.try_recv().ok())
             .collect();
-        for _ in &taken {
-            self.interpreter.received(USER);
-        }
         taken
+            .into_iter()
+            .map(|(id, body)| {
+                self.interpreter.received(USER, id);
+                body
+            })
+            .collect()
     }
 }
 
@@ -806,6 +904,30 @@ impl Table {
             .unwrap_or_else(|| "the host stopped reading its replies".into())
     }
 
+    /// Record how `slot`'s execution ended: `status`, what it reported, its
+    /// traceback, and the type of what it raised.
+    fn record_ended(
+        &self,
+        slot: &Slot,
+        status: &'static str,
+        report: &Report,
+        error: Option<&str>,
+        raised: Option<&str>,
+    ) {
+        self.events.emit(Event::ExecCompleted {
+            execid: slot.id,
+            status,
+            duration: slot.submitted.elapsed().as_secs_f64(),
+            output: &report.output,
+            dropped: report.dropped,
+            error,
+            background: &report.background,
+        });
+        if raised == Some("MemoryError") {
+            self.events.emit(Event::MemoryExhausted { execid: slot.id });
+        }
+    }
+
     /// Settle the outstanding execution with its result. A result for any
     /// other id is not this execution's, whatever is running now.
     fn settle(&mut self, result: WireResult) {
@@ -816,6 +938,18 @@ impl Table {
             );
             return;
         };
+        let (status, error) = match &result.status {
+            Status::Ok => ("ok", None),
+            Status::Error { error } => ("error", Some(error.as_str())),
+            Status::Refused { .. } => ("refused", None),
+        };
+        self.record_ended(
+            &slot,
+            status,
+            &result.report,
+            error,
+            result.raised.as_deref(),
+        );
         let outcome = match result.status {
             Status::Ok => Outcome::Ok(result.report),
             Status::Error { error } => Outcome::Error {
@@ -956,7 +1090,16 @@ async fn read_replies<R, E>(
     let cause: Arc<str> = ended.await.into();
     let mut table = lock(&table);
     table.ended = Some(Arc::clone(&cause));
-    if let Some(slot) = table.slot.take() {
+    // Recorded before anyone waiting hears of it, so whoever does finds it
+    // recorded.
+    let slot = table.slot.take();
+    if let Some(slot) = &slot {
+        table.record_ended(slot, "lost", &Report::default(), None, None);
+    }
+    table
+        .events
+        .emit(Event::InterpreterExited { cause: &cause });
+    if let Some(slot) = slot {
         // An exit is not a reply, so a caller no longer waiting gets no `Late`.
         let _ = slot
             .waiter
@@ -992,16 +1135,29 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
             }
             _ => tracing::warn!("ignored CPU reading {id}, which nothing asked for"),
         },
-        Reply::Msg { id, pending, error } => match lock(table).queries.remove(&id) {
-            Some(Query::Post(waiter)) => {
-                let _ = waiter.send(match (pending, error) {
-                    (_, Some(error)) => Err(error),
-                    (Some(pending), None) => Ok(pending),
-                    (None, None) => Err("the interpreter answered without saying".to_string()),
-                });
+        Reply::Msg { id, pending, error } => {
+            let mut table = lock(table);
+            match table.queries.remove(&id) {
+                Some(Query::Post(waiter)) => {
+                    let answer = match (pending, error) {
+                        (_, Some(error)) => Err(error),
+                        (Some(pending), None) => Ok(pending),
+                        (None, None) => Err("the interpreter answered without saying".to_string()),
+                    };
+                    if let Err(reason) = &answer {
+                        table.events.emit(Event::MessageRefused {
+                            message: id,
+                            channel: USER,
+                            from: USER_END,
+                            to: PRIMARY_SUBJECT,
+                            reason,
+                        });
+                    }
+                    let _ = waiter.send(answer);
+                }
+                _ => tracing::warn!("ignored the answer to message {id}, which nothing posted"),
             }
-            _ => tracing::warn!("ignored the answer to message {id}, which nothing posted"),
-        },
+        }
         Reply::Pending { id, channels } => match lock(table).queries.remove(&id) {
             Some(Query::Pending(waiter)) => {
                 let _ = waiter.send(channels);
@@ -1010,12 +1166,27 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
         },
         Reply::Sent { channel, body } => {
             let mut table = lock(table);
+            let id = table.next_id();
+            table.events.emit(Event::MessageSent {
+                message: id,
+                channel: &channel,
+                from: PRIMARY_SUBJECT,
+                to: USER_END,
+                body: &body,
+            });
             let held = channel == USER
                 && table
                     .outbox
                     .as_ref()
-                    .is_some_and(|outbox| outbox.send(body).is_ok());
+                    .is_some_and(|outbox| outbox.send((id, body)).is_ok());
             if !held {
+                table.events.emit(Event::MessageRefused {
+                    message: id,
+                    channel: &channel,
+                    from: PRIMARY_SUBJECT,
+                    to: USER_END,
+                    reason: "nothing on the host reads this channel",
+                });
                 tracing::warn!(
                     "dropped a message the agent sent on {channel:?}: nothing on the host reads it"
                 );
@@ -1028,6 +1199,14 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
         }
         Reply::Promote { turns } => context_changed(table, ContextChange::Promote(turns)),
         Reply::Demote { turns } => context_changed(table, ContextChange::Demote(turns)),
+        Reply::Took { channel, message } => {
+            lock(table).events.emit(Event::MessageReceived {
+                message,
+                channel: &channel,
+                from: USER_END,
+                to: PRIMARY_SUBJECT,
+            });
+        }
         Reply::Ready { .. } => tracing::warn!("ignored a second ready from the primary"),
         Reply::Other => tracing::debug!(
             "ignored a message of a kind this host does not know: {}",
@@ -1036,11 +1215,18 @@ fn dispatch(table: &Mutex<Table>, lines: &mpsc::WeakUnboundedSender<String>, lin
     }
 }
 
-/// Hand `change` to whatever registered for it.
+/// Record `change`, and hand it to whatever registered for it.
 fn context_changed(table: &Mutex<Table>, change: ContextChange) {
     // Taken out first: whoever it is may take a lock held around a push,
     // which takes this one.
-    let changed = lock(table).on_context.clone();
+    let changed = {
+        let table = lock(table);
+        table.events.emit(match &change {
+            ContextChange::Promote(turns) => Event::ContextPromoted { turns },
+            ContextChange::Demote(turns) => Event::ContextDemoted { turns },
+        });
+        table.on_context.clone()
+    };
     match changed {
         Some(changed) => changed(change),
         None => tracing::warn!("ignored {change:?}: nothing on the host takes one"),
@@ -1051,7 +1237,13 @@ fn context_changed(table: &Mutex<Table>, change: ContextChange) {
 /// an exit. Its own diagnostics are warnings. Everything else is output no
 /// execution can be billed for -- `os.write(1, ...)`, `os.system` -- and is
 /// logged at debug so an agent's stray output does not reach the terminal.
-async fn drain_stderr<R: AsyncRead + Unpin>(stderr: R, tail: Arc<Mutex<VecDeque<String>>>) {
+/// Each line is recorded as one or the other, too: output no agent can be
+/// billed for should not vanish.
+async fn drain_stderr<R: AsyncRead + Unpin>(
+    stderr: R,
+    tail: Arc<Mutex<VecDeque<String>>>,
+    events: Events,
+) {
     let mut stderr = BufReader::new(stderr);
     let mut line = Vec::new();
     while let Ok(Some(cut)) = next_line(&mut stderr, &mut line, STDERR_LINE_MAX).await {
@@ -1059,10 +1251,17 @@ async fn drain_stderr<R: AsyncRead + Unpin>(stderr: R, tail: Arc<Mutex<VecDeque<
         if cut > 0 {
             let _ = write!(text, " [{cut} more bytes cut]");
         }
-        if text.starts_with(DIAGNOSTIC) {
-            tracing::warn!("{text}");
-        } else {
-            tracing::debug!("python: {text}");
+        match text.strip_prefix(DIAGNOSTIC) {
+            Some(diagnostic) => {
+                tracing::warn!("{text}");
+                events.emit(Event::InterpreterDiagnostic {
+                    text: diagnostic.trim_start(),
+                });
+            }
+            None => {
+                tracing::debug!("python: {text}");
+                events.emit(Event::OutputUnattributed { text: &text });
+            }
         }
         let mut tail = lock(&tail);
         if tail.len() == STDERR_TAIL_LINES {

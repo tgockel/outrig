@@ -389,10 +389,16 @@ Python tries to allocate fails as well. Programs it starts inherit the same ceil
 itself, and one that needs more can raise its own with `ulimit -d unlimited`. Python that calls
 `os._exit` still ends the session.
 
+With `[events] mode = "record"`, the session records what its agent did in
+`logs/events.jsonl`: each model call and what it was sent, each submission and how it ended, each
+message on the channel, and the tokens each round used (see [Event log](events.md)). At exit the
+file is finished before the container stops, and a warning says how many events it could not
+take, if any.
+
 `run-new` does not yet take `run`'s `--env`, `--network`, `--volume`, `--max-tool-calls`, or
-`--max-tool-result-bytes`. The config keys behind the last two, `tool-call-max` and
-`tool-result-max`, apply, as do `[network]` and `[workspace]`. `-v` writes no
-`logs/container.log` here; `-vv` still turns on trace logging.
+`--max-tool-result-bytes`, nor a flag for `[events]`. The config keys behind the last two,
+`tool-call-max` and `tool-result-max`, apply, as do `[network]`, `[workspace]`, and `[events]`.
+`-v` writes no `logs/container.log` here; `-vv` still turns on trace logging.
 
 ### `outrig mcp`
 

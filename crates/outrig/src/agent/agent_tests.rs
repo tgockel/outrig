@@ -23,9 +23,10 @@ use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resol
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use super::{AgentError, PythonAgent};
 use crate::config::Config;
+use crate::events::{self, Events};
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
-use crate::python::testing::{ok, start_on_host, within};
+use crate::python::testing::{ok, start_on_host, start_on_host_with, within};
 
 const KEY: &str = "sk-ant-mock-key";
 
@@ -118,9 +119,34 @@ async fn agent_in(
     PythonAgent,
     tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
 ) {
+    agent_with(
+        Events::off(),
+        style,
+        var,
+        identifier,
+        model_keys,
+        agent_keys,
+        script,
+    )
+    .await
+}
+
+/// [`agent_in`], recording to `events`.
+async fn agent_with(
+    events: Events,
+    style: Style,
+    var: &str,
+    identifier: &str,
+    model_keys: &str,
+    agent_keys: &str,
+    script: Vec<CannedResponse>,
+) -> (
+    PythonAgent,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
     let (addr, requests) = mock_http::start(script).await;
     let cfg = config_in(style, addr, var, identifier, model_keys, agent_keys);
-    let interpreter = start_on_host().await;
+    let interpreter = start_on_host_with(events).await;
     let agent = with_key(var, || {
         PythonAgent::with_interpreter(interpreter, &cfg, Some("coding"), None)
     })
@@ -1682,7 +1708,17 @@ fn conversation(style: Style, request: &RecordedRequest) -> Vec<serde_json::Valu
 /// the cap followed by the next opening, the budget dropping this round's
 /// earlier turn, and a round ended mid-batch leaving an incomplete turn.
 async fn every_cut(style: Style, var: &str) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
-    let (mut agent, mut requests) = agent_in(
+    every_cut_recorded(style, var, Events::off()).await
+}
+
+/// [`every_cut`], recording to `events`.
+async fn every_cut_recorded(
+    style: Style,
+    var: &str,
+    events: Events,
+) -> (PythonAgent, Vec<RecordedRequest>, Vec<Manifest>) {
+    let (mut agent, mut requests) = agent_with(
+        events,
         style,
         var,
         MODEL,
@@ -2467,6 +2503,388 @@ fn an_alias_runs_against_its_first_reachable_model() {
     );
 }
 
+// ---------------------------------------------------------------------------- the event log
+
+/// Where an event of `kind` is among `kinds`, the first after `from`.
+fn at(kinds: &[String], kind: &str, from: usize) -> usize {
+    kinds[from..]
+        .iter()
+        .position(|k| k == kind)
+        .map(|n| n + from)
+        .unwrap_or_else(|| panic!("no {kind} after event {from}"))
+}
+
+/// What the agent did, in the order it did it, read back from the file it is
+/// in by the time `shutdown` returns: a parseable stream whose records are
+/// numbered by their place in it, carrying the standard attributes and
+/// nothing else. The agent's taking a message, its promotion, and its reply
+/// each land between its code going to run and its code's result, and the
+/// promoted turn is carried by the call after it, as promoted.
+#[tokio::test]
+async fn a_recorded_session_is_the_agents_timeline() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, _requests) = agent_with(
+        events::opened(dir.path()).await,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_EVENTS_TIMELINE",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            text_reply("first"),
+            submit(
+                "toolu_1",
+                "d = await runtime.channels['user'].receive()\n\
+                 runtime.context.promote(0)\n\
+                 await runtime.channels['user'].send('got ' + d.body)",
+            ),
+            text_reply("done"),
+        ],
+    )
+    .await;
+    assert_eq!(round(&mut agent, "hello").await, "first");
+    assert_eq!(round(&mut agent, "promote").await, "done");
+    let user = agent.user_channel();
+    assert_eq!(
+        within(user.receive()).await.as_deref(),
+        Some("got hello"),
+        "the agent's reply"
+    );
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    // Read at once: what shutdown returned after is in the file.
+    let records = events::recorded(dir.path());
+    let kinds = events::kinds(&records);
+    assert_eq!(kinds.first().map(String::as_str), Some("agent.started"));
+    assert_eq!(kinds.last().map(String::as_str), Some("agent.stopped"));
+    for (n, record) in records.iter().enumerate() {
+        assert_eq!(record["id"], (n + 1).to_string(), "{record}");
+        assert_eq!(record["specversion"], "1.0");
+        assert_eq!(record["source"], events::TEST_SOURCE);
+        assert_eq!(record["datacontenttype"], "application/json");
+        let mut keys: Vec<&str> = record
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "data",
+                "datacontenttype",
+                "id",
+                "source",
+                "specversion",
+                "subject",
+                "time",
+                "type",
+            ],
+            "{record}"
+        );
+    }
+
+    let instructions = events::of_kind(&records, "model.instructions");
+    assert_eq!(instructions[0]["max_tokens"], 4096, "the ceiling in force");
+    assert_eq!(instructions[0]["tools"][0]["name"], tool::NAME);
+    assert_eq!(
+        events::of_kind(&records, "round.started"),
+        [&json!({"round": 1}), &json!({"round": 2})]
+    );
+
+    // The second round, in order.
+    let submitted = at(&kinds, "exec.submitted", 0);
+    let took = at(&kinds, "message.received", submitted);
+    let promoted = at(&kinds, "context.promoted", took);
+    let replied = at(&kinds, "message.sent", promoted);
+    let completed = at(&kinds, "exec.completed", replied);
+    let call = at(&kinds, "model.call", completed);
+    let ended = at(&kinds, "model.round.completed", call);
+    assert!(submitted < took && took < promoted && promoted < replied);
+    assert!(replied < completed && completed < call && call < ended);
+    assert_eq!(records[promoted]["data"], json!({"turns": [0]}));
+    assert_eq!(records[completed]["data"]["status"], "ok");
+    assert!(
+        records[call]["data"]["carried"]
+            .as_array()
+            .expect("carried")
+            .contains(&json!({"turn": 0, "why": "promoted"})),
+        "{}",
+        records[call]["data"]
+    );
+
+    // The user's message, by the id it was sent under, taken by the agent's
+    // code; the agent's reply, taken by the user.
+    let sent = events::of_kind(&records, "message.sent");
+    let received = events::of_kind(&records, "message.received");
+    assert_eq!(sent.len(), 3, "two posts and a reply: {sent:#?}");
+    let hello = sent
+        .iter()
+        .find(|m| m["body"] == "hello")
+        .expect("the first post");
+    assert_eq!(hello["from"], "user");
+    assert_eq!(hello["to"], "agent/primary");
+    assert_eq!(
+        records[took]["data"],
+        json!({"message": hello["message"], "channel": "user", "from": "user", "to": "agent/primary"})
+    );
+    let reply = sent
+        .iter()
+        .find(|m| m["body"] == "got hello")
+        .expect("the reply");
+    assert!(
+        received.contains(&&json!({
+            "message": reply["message"],
+            "channel": "user",
+            "from": "agent/primary",
+            "to": "user",
+        })),
+        "{received:#?}"
+    );
+}
+
+/// What a round used is what the provider reported: each call's tokens from
+/// rig's `completion_calls`, the round's from its `usage`, which the loop used
+/// to drop. A round's high-water input is the largest a call reported.
+#[tokio::test]
+async fn token_usage_is_what_the_provider_reported() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, _requests) = agent_with(
+        events::opened(dir.path()).await,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_EVENTS_USAGE",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_1", "1").usage(json!({
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cache_read_input_tokens": 50,
+            })),
+            text_reply("done").usage(json!({"input_tokens": 300, "output_tokens": 20})),
+        ],
+    )
+    .await;
+    round(&mut agent, "count").await;
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let records = events::recorded(dir.path());
+    let ended = events::of_kind(&records, "model.round.completed");
+    let usage = |input, output, total, cached| {
+        json!({
+            "input_tokens": input,
+            "output_tokens": output,
+            "total_tokens": total,
+            "cached_input_tokens": cached,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0,
+        })
+    };
+    assert_eq!(
+        *ended[0],
+        json!({
+            "round": 1,
+            "stopped": null,
+            "usage": usage(400, 30, 480, 50),
+            "calls": [
+                {"index": 0, "usage": usage(100, 10, 160, 50)},
+                {"index": 1, "usage": usage(300, 20, 320, 0)},
+            ],
+            "input_tokens_max": 300,
+        })
+    );
+}
+
+/// The log alone rebuilds what each call sent the provider: every committed
+/// turn's messages, in rig's own form, and each call's manifest naming which
+/// it carried. Exercised across every cut the view makes, through each
+/// adapter, against what the mock received.
+#[tokio::test]
+async fn each_call_is_rebuilt_from_the_event_log_alone() {
+    for style in Style::ALL {
+        let dir = tempfile::tempdir().expect("a log dir");
+        let var = format!(
+            "OUTRIG_TEST_AGENT_EVENTS_REBUILD_{}",
+            style.name().to_uppercase()
+        );
+        let (agent, recorded, _) =
+            every_cut_recorded(style, &var, events::opened(dir.path()).await).await;
+        within(agent.shutdown())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let records = events::recorded(dir.path());
+        let mut turns: Vec<Vec<rig::completion::Message>> = Vec::new();
+        let mut calls = 0;
+        for (kind, record) in events::kinds(&records).iter().zip(&records) {
+            let data = &record["data"];
+            match kind.as_str() {
+                "turn.committed" => {
+                    assert_eq!(data["turn"], turns.len(), "{style:?}: turns in order");
+                    turns.push(
+                        serde_json::from_value(data["messages"].clone())
+                            .expect("rig's own messages"),
+                    );
+                }
+                "model.call" => {
+                    let mut rebuilt: Vec<rig::completion::Message> = data["carried"]
+                        .as_array()
+                        .expect("carried")
+                        .iter()
+                        .flat_map(|chosen| {
+                            let turn = chosen["turn"].as_u64().expect("a turn") as usize;
+                            turns[turn].clone()
+                        })
+                        .collect();
+                    if !data["opening"].is_null() {
+                        rebuilt.push(
+                            serde_json::from_value(data["opening"].clone()).expect("a message"),
+                        );
+                    }
+                    assert_eq!(data["call"], calls, "{style:?}");
+                    assert_eq!(
+                        on_the_wire(style, rebuilt),
+                        conversation(style, &recorded[calls]),
+                        "{style:?} call {calls}: {data:#}"
+                    );
+                    calls += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(calls, recorded.len(), "{style:?}: a manifest a call");
+
+        let preamble = events::of_kind(&records, "model.instructions")[0]["preamble"]
+            .as_str()
+            .expect("a preamble")
+            .to_string();
+        let sent = match style {
+            Style::Anthropic => system_prompt(&recorded[0]),
+            Style::OpenAi => text_of(&messages(&recorded[0])[0]["content"]),
+        };
+        assert_eq!(
+            preamble, sent,
+            "{style:?}: the system prompt every call carries"
+        );
+        let kinds = events::kinds(&records);
+        for kind in ["context.promoted", "model.round.dropped"] {
+            assert!(kinds.iter().any(|k| k == kind), "{style:?}: {kind}");
+        }
+    }
+}
+
+/// With the mode off, there is no log: not an empty one, no file at all, and
+/// nothing a whole session does writes one.
+#[tokio::test]
+async fn with_events_off_no_log_is_written() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let off = Config::load_from_str("").expect("an empty config");
+    let events = super::events_for(&off, dir.path(), "test")
+        .await
+        .expect("off opens nothing");
+    assert!(!events.is_on());
+    let (mut agent, _requests) = agent_with(
+        events,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_EVENTS_OFF",
+        MODEL,
+        "",
+        "max-tokens = 4096",
+        vec![submit("toolu_1", "print(1)"), text_reply("done")],
+    )
+    .await;
+    round(&mut agent, "go").await;
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("list").count(),
+        0,
+        "nothing in the log directory"
+    );
+
+    let on = Config::load_from_str("[events]\nmode = \"record\"\n").expect("parses");
+    let events = super::events_for(&on, dir.path(), "20260921T103000-a1b2")
+        .await
+        .expect("record opens the log");
+    events.emit(crate::events::Event::AgentStopped {});
+    events.close().await.expect("nothing lost");
+    let records = events::recorded(dir.path());
+    assert_eq!(records[0]["source"], "/outrig/session/20260921T103000-a1b2");
+
+    // An agent started again on the session would repeat those events'
+    // `source` and ids, so its start is refused instead.
+    let again = super::events_for(&on, dir.path(), "20260921T103000-a1b2")
+        .await
+        .err()
+        .expect("a second recording in one log")
+        .to_string();
+    assert!(again.contains("already holds a recording"), "{again}");
+}
+
+/// A round that fails says so, with what it used; one that is dropped says so
+/// too; and a result cut to fit says how much was cut.
+#[tokio::test]
+async fn failed_dropped_and_truncated_are_recorded() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, _requests) = agent_with(
+        events::opened(dir.path()).await,
+        Style::Anthropic,
+        "OUTRIG_TEST_AGENT_EVENTS_ENDINGS",
+        MODEL,
+        "",
+        "max-tokens = 4096\ntool-result-max = 1024",
+        vec![
+            failure(500),
+            submit("toolu_big", "print('x' * 5000)"),
+            text_reply("cut"),
+            submit("toolu_slow", "import time\ntime.sleep(1)"),
+            text_reply("never"),
+        ],
+    )
+    .await;
+    post(&agent, "fail").await;
+    within(agent.round()).await.expect_err("the call failed");
+    assert_eq!(round(&mut agent, "big").await, "cut");
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    agent.on_submit(move |_| {
+        let _ = started.send(());
+    });
+    dropped_round(&mut agent, "slow", starts.recv()).await;
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let records = events::recorded(dir.path());
+    let failed = events::of_kind(&records, "model.round.failed");
+    assert_eq!(failed.len(), 1, "{failed:#?}");
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .expect("an error")
+            .contains("agent round failed"),
+        "{}",
+        failed[0]
+    );
+    let truncated = events::of_kind(&records, "tool.result.truncated");
+    assert_eq!(truncated.len(), 1, "{truncated:#?}");
+    assert!(truncated[0]["size"].as_u64().expect("a size") > 5000);
+    assert!(truncated[0]["kept"].as_u64() < truncated[0]["max"].as_u64());
+    let dropped = events::of_kind(&records, "model.round.dropped");
+    assert_eq!(dropped.len(), 1, "{dropped:#?}");
+    assert_eq!(
+        dropped[0]["calls"].as_array().expect("calls").len(),
+        1,
+        "the call that started the slow code"
+    );
+}
+
 // ---------------------------------------------------------------------------- through podman
 
 // ---------------------------------------------------------------------------- Ctrl-C
@@ -2802,6 +3220,8 @@ mod e2e {
     /// The public entry end to end: `start` finds the payload in a launched
     /// session's primary and starts the interpreter there, and what the
     /// model's source reads is the container's filesystem, not the host's.
+    /// Recorded, the session's log directory holds what it did, under the
+    /// session its containers are named for, readable by its owner alone.
     #[tokio::test]
     async fn a_round_runs_its_source_in_the_session_container() {
         pull_alpine().await;
@@ -2823,7 +3243,16 @@ mod e2e {
         ])
         .await;
         let var = "OUTRIG_TEST_AGENT_E2E";
-        let cfg = config(addr, var, MODEL, "max-tokens = 4096");
+        // The model row's keys end the row, so a table after them is the
+        // config's own.
+        let cfg = config_in(
+            Style::Anthropic,
+            addr,
+            var,
+            MODEL,
+            "[events]\nmode = \"record\"",
+            "max-tokens = 4096",
+        );
         unsafe { std::env::set_var(var, KEY) };
         let started = within(PythonAgent::start(&outrig, &cfg, Some("coding"), None)).await;
         unsafe { std::env::remove_var(var) };
@@ -2849,7 +3278,26 @@ mod e2e {
             String::from_utf8_lossy(&release.stdout)
         );
 
-        drop(agent);
+        let container = agent.container_name().to_string();
+        let suffix = outrig.primary().session_suffix().to_string();
+        within(agent.shutdown())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         outrig.shutdown().await.expect("the session shuts down");
+
+        let logs = session.path().join("logs");
+        let records = events::recorded(&logs);
+        assert_eq!(records[0]["source"], format!("/outrig/session/{suffix}"));
+        assert_eq!(
+            events::of_kind(&records, "agent.started")[0]["container"],
+            json!(container)
+        );
+        assert!(!events::of_kind(&records, "exec.submitted").is_empty());
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(logs.join(crate::events::EVENTS_LOG))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

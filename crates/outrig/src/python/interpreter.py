@@ -1080,6 +1080,9 @@ builtins.help = _Help()
 
 _kernels = {}
 
+# Agents whose takes the host has asked to be told of, by id.
+_observed = set()
+
 
 def _module_name(agent):
     return f"outrig_session_{agent}"
@@ -1164,6 +1167,17 @@ _MISSING = object()
 # A type's own name, read without consulting its metaclass, which could run agent code.
 _type_name = type.__dict__["__name__"].__get__
 _type_qualname = type.__dict__["__qualname__"].__get__
+
+
+def _raised(exc):
+    """The name of `exc`'s type, as a plain `str`, for the result that reports it.
+
+    Through `_type_name`, never `__name__`, which a metaclass can make raise; and copied by
+    `str.__str__`, since the name itself can be a `str` subclass whose `encode` raises when the
+    result is sent. Either would end the reply that has to report this, leaving the host's slot
+    held for good.
+    """
+    return str.__str__(_type_name(type(exc)))
 
 
 # ---------------------------------------------------------------------------- history
@@ -1606,7 +1620,22 @@ class Endpoint:
 
         `.body` is the message itself. Receiving removes it: no later receive sees it again.
         """
-        return await self._when(self._receivers, self._take)
+        message, delivery = await self._when(self._receivers, self._take)
+        if self._agent in _observed:
+            # Taken already, so nothing here may raise and lose it: what the host is told is a
+            # record of the take, and a take it never hears of is one the record lacks.
+            try:
+                _write_line(
+                    _encode(
+                        {"t": "took", "agent": self._agent, "channel": self._name, "message": message}
+                    )
+                )
+            except BaseException as e:
+                try:
+                    _diag(f"took a message on {self._name!r}, but saying so failed: {e!r}")
+                except BaseException:
+                    pass
+        return delivery
 
     def _take(self):
         return self._queue.popleft() if self._queue else None
@@ -1693,8 +1722,9 @@ class Endpoint:
                 self._unreceived -= 1
         _wake_all(wake, self._name)
 
-    def _deliver(self, body, sender):
-        """Queue `body` from `sender` and return how many messages then wait. Reader thread only.
+    def _deliver(self, body, sender, message):
+        """Queue `body` from `sender`, posted as `message`, and return how many messages then wait.
+        Reader thread only.
 
         Raises `_Refused` for a body the contract does not take or a queue that is full, having
         queued nothing. The append is the last step that can fail, so a retry after running out
@@ -1712,7 +1742,8 @@ class Endpoint:
                 raise _Refused(f"channel {self._name!r} already holds {QUEUE_MAX} unread messages")
             count, delivered = len(self._queue) + 1, self._delivered + 1
             wake = iter(self._receivers.copy())
-            self._queue.append(delivery)
+            # Beside the id it was posted under, which a take is reported by.
+            self._queue.append((message, delivery))
             # Only rebinding after the append, which cannot fail.
             self._delivered = delivered
         # Every receiver, since each re-checks and one may have been cancelled in the meantime.
@@ -2014,7 +2045,9 @@ class Kernel:
         """
         execution.started = True
         _CURRENT.set(execution)
-        error = None
+        # The traceback, and the type of what was raised: the host records the one it can act on
+        # from the type rather than from how the traceback reads.
+        error = raised = None
         try:
             if execution.cancel_requested:
                 raise asyncio.CancelledError("stopped before it started")
@@ -2030,14 +2063,14 @@ class Kernel:
             # Named, because it is a `BaseException` that an ordinary handler misses, and it is a
             # result: the host's remedy for a suspended await, or a cancellation the code let
             # through. The task carries on to report it.
-            error = self._failure(e)
+            error, raised = self._failure(e), _raised(e)
         except BaseException as e:
             # Everything else the body raised, `KeyboardInterrupt` included. The handler raises
             # one only inside agent code, so one arriving here is this execution's -- its body
             # was interrupted, or it awaited a task that was -- and never one meant to end the
             # interpreter. Letting any exception out would end the task with no reply, leaving
             # the host holding a slot this side has freed.
-            error = self._failure(e)
+            error, raised = self._failure(e), _raised(e)
         finally:
             # From here the interpreter works for itself, on the reserve.
             _give_reserve()
@@ -2059,6 +2092,7 @@ class Kernel:
                 output=output,
                 dropped=dropped,
                 error=error,
+                raised=raised,
                 background=self.take_background(),
             )
         except MemoryError:
@@ -2068,6 +2102,7 @@ class Kernel:
                 execution.id,
                 "error",
                 error=error or "MemoryError: memory ran out while this result was reported\n",
+                raised=raised or "MemoryError",
             )
         # Sparing a piece: the loop goes idle now, and its own machinery -- reading its wakeup
         # pipe, answering a probe -- must not find the ceiling where agent code left it.
@@ -2372,7 +2407,7 @@ def _msg(kernel, request_id, message):
     try:
         if endpoint is None:
             raise _Refused(f"agent {kernel.agent!r} has no channel {channel!r}")
-        pending = endpoint._deliver(message.get("body"), "user")
+        pending = endpoint._deliver(message.get("body"), "user", request_id)
     except _Refused as e:
         _send({"t": "msg", "agent": kernel.agent, "id": request_id, "error": str(e)})
         return
@@ -2441,6 +2476,15 @@ def _inventory(kernel, request_id, message):
     )
 
 
+def _observe(kernel, _request_id, _message):
+    """Say from now on when the agent's code takes a message from one of its channels.
+
+    Nothing needs to know that to deliver one -- the host is told only because it records what the
+    agent does -- so nothing says it until the host asks.
+    """
+    _observed.add(kernel.agent)
+
+
 def _pending(kernel, request_id, _):
     """Say how many messages wait on each of the agent's channels, and how many have ever been
     delivered to it, reading none of them."""
@@ -2456,6 +2500,7 @@ _ROUTES = {
     "pending": _pending,
     "received": _received,
     "turn": _turn,
+    "observe": _observe,
     "inv": _inventory,
     "cpu": lambda kernel, request_id, _: kernel.cpu(request_id),
     "cancel": lambda kernel, request_id, _: kernel.cancel(request_id),

@@ -30,12 +30,13 @@ use std::path::Path;
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use rig::completion::PromptError;
+use rig::completion::{PromptError, ToolDefinition};
 use rig::tool::ToolDyn;
 
 use crate::Outrig;
-use crate::config::Config;
+use crate::config::{Config, EventsMode};
 use crate::error::OutrigError;
+use crate::events::{Event, Events};
 use crate::python::host::{Interpreter, InterpreterError};
 
 pub use self::channel::UserChannel;
@@ -66,11 +67,9 @@ pub struct PythonAgent {
     budget: Arc<Budget>,
     tool_call_max: usize,
     /// The output-token ceiling the model is held to: the configured one,
-    /// filled in or lowered to what the model publishes.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "0003-13 records it as an event")
-    )]
+    /// filled in or lowered to what the model publishes. Recorded as
+    /// `model.instructions` when the agent is built.
+    #[cfg(test)]
     max_tokens: Option<u32>,
     /// The concrete `[models.<name>]` row the agent runs against.
     model: String,
@@ -97,6 +96,13 @@ impl PythonAgent {
     /// names none. `model` overrides the model the agent or `default-model`
     /// would choose. Resolution runs first, so a config that names no usable
     /// model fails before anything starts in the container.
+    ///
+    /// With `[events] mode = "record"`, what the agent does is recorded in
+    /// `events.jsonl` in `outrig`'s log directory, until
+    /// [`PythonAgent::shutdown`]. A log that cannot be opened fails the start:
+    /// the record was asked for. So does one that already holds a recording --
+    /// an agent started again on the same session -- since its events would
+    /// repeat the first recording's ids.
     pub async fn start(
         outrig: &Outrig,
         config: &Config,
@@ -105,7 +111,10 @@ impl PythonAgent {
     ) -> Result<PythonAgent, Box<dyn Error + Send + Sync>> {
         let resolved = resolve::resolve_agent(config, agent, model)?;
         let primary = outrig.primary();
-        let interpreter = Interpreter::start(primary).await?;
+        // The session as its containers name it, which is also what
+        // `network.jsonl` records as its session.
+        let events = events_for(config, outrig.log_dir(), primary.session_suffix()).await?;
+        let interpreter = Interpreter::start(primary, events).await?;
         // A container launched without a workspace holds an empty path.
         let workspace = Some(primary.container_workspace()).filter(|w| !w.as_os_str().is_empty());
         Ok(Self::build(
@@ -231,8 +240,13 @@ impl PythonAgent {
         let Some(announcement) = self.announcer.opening().await? else {
             return Ok(None);
         };
+        let events = self.history.events();
+        events.ready().await;
         let opening = self.history.open_round(&self.budget, |omitted| {
             orientation::opening(&announcement, omitted)
+        });
+        events.emit(Event::RoundStarted {
+            round: self.history.round(),
         });
         let RoundEnd { reply, stopped } = self
             .agent
@@ -252,6 +266,21 @@ impl PythonAgent {
             Some(reason) if reply.trim().is_empty() => format!("(round ended: {reason})"),
             Some(reason) => format!("{reply}\n(round ended: {reason})"),
         }))
+    }
+
+    /// End the agent: record that it stopped, and finish its event log, waiting
+    /// at most two seconds for the file to hold everything the agent did. Call
+    /// it before stopping the session's containers.
+    ///
+    /// An error says how many events the log did not get, and why the first
+    /// was lost. Nothing else is undone or stopped here: dropping the agent is
+    /// what lets its interpreter exit. An agent dropped without this still has
+    /// its log finished, in the background, with nobody told what it lost.
+    pub async fn shutdown(self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let events = self.history.events();
+        events.emit(Event::AgentStopped {});
+        events.close().await?;
+        Ok(())
     }
 
     /// [`PythonAgent::start`] over an interpreter the caller started on the
@@ -286,12 +315,17 @@ impl PythonAgent {
         let on_submit = tool.observer_slot();
         let interrupts = tool.interrupts();
         let preamble = orientation::preamble(workspace, resolved.preamble.as_deref(), window);
+        let definition = ToolDefinition {
+            name: tool.name(),
+            description: tool.description(),
+            parameters: tool.parameters(),
+        };
         let overhead = budget::overhead(
             &preamble,
             [
-                tool.name().as_str(),
-                tool.description().as_str(),
-                &tool.parameters().to_string(),
+                definition.name.as_str(),
+                definition.description.as_str(),
+                &definition.parameters.to_string(),
             ],
         );
         let built = build::build_agent(
@@ -310,11 +344,27 @@ impl PythonAgent {
             overhead = budget.overhead,
             "each model call is held to this budget"
         );
+        let events = history.events();
+        let model = &resolved.candidate.model_name;
+        events.emit(Event::AgentStarted {
+            model,
+            python: &python_version,
+            container: container_name,
+            tool_call_max: resolved.tool_call_max,
+            tool_result_max: resolved.tool_result_max_bytes,
+        });
+        events.emit(Event::ModelInstructions {
+            model,
+            preamble: &preamble,
+            tools: std::slice::from_ref(&definition),
+            max_tokens: built.max_tokens,
+        });
         Ok(Self {
             agent: built.agent,
             history,
             budget: Arc::new(budget),
             tool_call_max: resolved.tool_call_max,
+            #[cfg(test)]
             max_tokens: built.max_tokens,
             model: resolved.candidate.model_name.clone(),
             python_version,
@@ -324,6 +374,18 @@ impl PythonAgent {
             user,
             announcer,
         })
+    }
+}
+
+/// Where an agent of session `session` records its events, as `config` asks:
+/// `<log_dir>/events.jsonl`, or nowhere.
+async fn events_for(config: &Config, log_dir: &Path, session: &str) -> Result<Events, OutrigError> {
+    match config.events.mode() {
+        EventsMode::Record => Events::open(log_dir, format!("/outrig/session/{session}")).await,
+        // `EventsMode` is `#[non_exhaustive]` only outside this crate, so a
+        // mode added later fails to compile here rather than recording
+        // nothing.
+        EventsMode::Off => Ok(Events::off()),
     }
 }
 

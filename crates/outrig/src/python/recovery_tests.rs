@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use super::super::host::{ExecId, Execution, Interpreter, Outcome, PRIMARY, Unknown};
 use super::super::testing::{Fake, ok, round_trip, start_on_host, within};
 use super::{ATTEMPTS, GaveUp, Press, Presses, Settled, Timings, Verdict, Waited, Waiting, settle};
+use crate::events::{kinds, of_kind, opened, recorded};
 
 /// The defaults, with checks close enough together that a test waiting for
 /// the next request is not failed by its own step bound first.
@@ -579,5 +580,61 @@ async fn a_press_ends_an_await_that_never_resolves() {
     assert_eq!(
         settle_real(&interpreter, "1 + 1").await.1.outcome,
         ok("2\n")
+    );
+}
+
+// ---------------------------------------------------------------------------- the event log
+
+/// What the host did while it waited is recorded as it did it: what the
+/// probe found the namespace holding, each probe the loop did not answer, each
+/// interrupt sent, and the giving up.
+#[tokio::test(start_paused = true)]
+async fn what_the_host_did_while_waiting_is_recorded() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let events = opened(dir.path()).await;
+    let (interpreter, mut fake) = Fake::connected_with(events.clone()).await;
+    let execution = submitted(&interpreter, &mut fake).await;
+    let id = execution.id();
+    let presses = Presses::default();
+    let _waiting = presses.waiting_on(id);
+    let settled = settling(&interpreter, execution, &presses, paused());
+
+    turning(&mut fake).await;
+    quiet(&mut fake, 1.0, 6.0).await;
+    fake.expect("interrupt").await;
+    let mut clock = 11.0;
+    for _ in 1..ATTEMPTS {
+        still_quiet(&mut fake, clock, clock + 5.0).await;
+        clock += 10.0;
+        fake.expect("interrupt").await;
+    }
+    still_quiet(&mut fake, clock, clock + 5.0).await;
+    within(settled).await.expect("settled");
+    // The log is closed on a running clock, or its deadline passes at once.
+    tokio::time::resume();
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    let mut expected = vec!["exec.submitted", "inventory.observed"];
+    for _ in 0..ATTEMPTS {
+        expected.extend(["exec.probe.failed", "exec.interrupt.sent"]);
+    }
+    expected.extend(["exec.probe.failed", "exec.abandoned"]);
+    assert_eq!(kinds(&records), expected);
+    assert_eq!(
+        *of_kind(&records, "inventory.observed")[0],
+        json!({"execid": id, "names": [], "total": 0, "more": 0})
+    );
+    assert_eq!(
+        *of_kind(&records, "exec.probe.failed")[0],
+        json!({"execid": id, "verdict": "spinning"})
+    );
+    assert_eq!(
+        *of_kind(&records, "exec.interrupt.sent")[0],
+        json!({"execid": id, "runaway": true})
+    );
+    assert_eq!(
+        *of_kind(&records, "exec.abandoned")[0],
+        json!({"execid": id, "why": "runaway"})
     );
 }

@@ -56,8 +56,9 @@ expensive part of watching an agent is already paid:
 | `send`     | interp → host | a message the agent sent                                |
 | `received` | host → interp | that the user took one, which paces the agent's sends   |
 
-`inv` is already requested every thirty seconds by the liveness probe in `runtime-protection.md`,
-so a periodic inventory costs nothing that is not already spent.
+`inv` is already requested by the liveness probe in `runtime-protection.md` -- every thirty seconds
+while an execution runs, and not otherwise -- so recording its answer costs nothing that is not
+already spent.
 
 **Messages between agents are the exception, and co-hosting is why.** `agent-placement.md` puts
 every agent in one interpreter process, and `messages.md` says a message between two of them never
@@ -96,7 +97,7 @@ line:
  "id": "41",
  "source": "/outrig/session/20260921T103000-a1b2",
  "type": "org.outrig.exec.completed",
- "subject": "agent/root",
+ "subject": "agent/primary",
  "time": "2026-09-21T10:30:07.412Z",
  "datacontenttype": "application/json",
  "data": {"execid": 7, "status": "error", "duration": 1.83,
@@ -258,8 +259,8 @@ it, which `history.md` records.
 
 ## Open questions
 
-- Whether `events.jsonl` is reachable through `outrig logs`. `network.jsonl` deliberately is not,
-  on the grounds that it is not an MCP stderr log, and the same argument applies here.
+- Whether `events.jsonl` is reachable through `outrig logs`. Settled no by `0003-13`, on the
+  grounds `network.jsonl` is not: it is not an MCP stderr log.
 - Whether observability should eventually default on. It is the record a session was supposed to
   be, which argues yes; it is the conversation, which argues for a decision made deliberately.
 - Whether the unowned session-record entries in `plan/next/` belong here --

@@ -19,6 +19,8 @@ use super::Config;
 ///   one. Policy keys (`default`, `allow`, `deny`) are global-only: this
 ///   function never reads them from the repo side, so a repo value carrying
 ///   its own policy cannot widen or inject one, whatever built it.
+/// - `[events].mode` follows repo precedence the same way: a repo that
+///   declares it wins, and one that does not inherits the global choice.
 /// - `[workspace]` primary fields merge per key, like the scalars above: a
 ///   repo declaration wins, otherwise a global one is inherited, otherwise the
 ///   key stays `None` and [`Workspace`](super::Workspace)'s accessors apply
@@ -56,6 +58,9 @@ pub fn merge(global: Config, repo: Config) -> Config {
     let mut network = global.network;
     network.apply_repo_overrides(&repo.network);
 
+    let mut events = global.events;
+    events.apply_repo_overrides(&repo.events);
+
     Config {
         default_image: repo.default_image.or(global.default_image),
         default_agent: repo.default_agent.or(global.default_agent),
@@ -67,6 +72,7 @@ pub fn merge(global: Config, repo: Config) -> Config {
         subagent_width_max: repo.subagent_width_max.or(global.subagent_width_max),
         retry_budget_secs: repo.retry_budget_secs.or(global.retry_budget_secs),
         network,
+        events,
         providers,
         models,
         agents,

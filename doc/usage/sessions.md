@@ -1,10 +1,10 @@
 # Sessions
 
-A session is the on-disk record of one `outrig run` or `outrig mcp` invocation: when it started
-and ended, which image-config it used, what image tag, plus per-MCP-server stderr captured to
-disk. Sessions exist so you can go back and inspect what happened -- they are *not* a staging area
-for workspace changes (outrig writes to your repo directly; see
-[Workspace](../concepts/workspace.md)).
+A session is the on-disk record of one `outrig run`, `outrig run-new`, or `outrig mcp`
+invocation: when it started and ended, which image-config it used, what image tag, plus
+per-MCP-server stderr captured to disk, and -- for `run-new`, when asked -- what its agent did.
+Sessions exist so you can go back and inspect what happened -- they are *not* a staging area for
+workspace changes (outrig writes to your repo directly; see [Workspace](../concepts/workspace.md)).
 
 ## Where sessions live
 
@@ -34,6 +34,7 @@ random hex digits -- sortable, unambiguous across concurrent runs):
     └── logs/
         ├── container.log         # buildah/podman transcripts when --verbose is set
         ├── network.jsonl         # network audit/filter records when enabled
+        ├── events.jsonl          # what a run-new agent did, when [events] records it
         ├── fs.stderr             # MCP "fs" server's captured stderr
         └── shell.stderr          # MCP "shell" server's captured stderr
 ```
@@ -204,6 +205,40 @@ Attaching has the same property from the other side: a failed or interrupted att
 container exactly as it found it, so a container never ends up resolving to a listener that is
 not there.
 
+## The event log
+
+With `[events] mode = "record"` in either config file, `outrig run-new` writes
+`logs/events.jsonl`: what its agent did, one event per line, in the order it happened. Each model
+call and the turns it was sent, each piece of Python the model submitted and how it ended, each
+message on the agent's channel, the tokens each round used, and what OutRig did along the way --
+a Ctrl-C, an interrupt, an execution it stopped waiting for. With the mode off, which is the
+default, there is no file.
+
+```toml
+[events]
+mode = "record"
+```
+
+Every event is a [CloudEvents](https://cloudevents.io/) record whose `data` is OutRig's; the
+[event log reference](../reference/events.md) lists them all, with the rule each one is recorded
+under. Read it directly from the session directory:
+
+```sh
+$ jq -c 'select(.type == "org.outrig.exec.completed") | .data | {execid, status, duration}' \
+    /tmp/my-debug-run/logs/events.jsonl
+```
+
+Like `network.jsonl`, it is not selected with `outrig logs`'s server-name argument: it is not an
+MCP stderr log. Unlike it, the file is readable by its owner only, because it holds what was
+typed to the agent and what the agent sent back. Discarding the session removes it with
+everything else.
+
+The session finishes the file before it stops its containers, so every event is *in the file* by
+the time `run-new` exits, on the same terms as `network.jsonl`: not synced to the disk. If the disk
+cannot keep up, the agent waits for it rather than losing events; a part of OutRig that cannot
+wait, such as the one reading the interpreter's replies, queues its events instead, and any the
+file never got are counted in a warning at exit.
+
 ## `outrig discard`
 
 Delete a session's entire on-disk record (including logs):
@@ -308,14 +343,13 @@ The cutoff is what keeps this away from a build that is running right now, so do
 - **Workspace changes.** outrig uses a direct bind-mount; mutations land on your host filesystem
   in real time. Use `git diff`, `git status`, etc. for review. There is no per-session changeset
   on disk.
-- **Conversation history.** v0 doesn't persist the LLM conversation. If you need a transcript,
-  redirect stdin/stdout (`outrig run < prompts.txt > replies.txt`). `--verbose` captures
-  buildah/podman traces in `container.log`; it is not a conversation transcript.
+- **Conversation history, for `outrig run`.** `run` doesn't persist the LLM conversation. If you
+  need a transcript, redirect stdin/stdout (`outrig run < prompts.txt > replies.txt`).
+  `--verbose` captures buildah/podman traces in `container.log`; it is not a conversation
+  transcript. `outrig run-new` records its conversation in [the event log](#the-event-log) when
+  asked.
 - **API keys.** The bearer token used for the LLM call is never written to disk and never appears
   in tracing output.
-
-> **TODO: Incomplete** -- opt-in transcript capture (per-turn JSON of user/assistant/tool
-> messages) is deferred.
 
 ## Concurrent sessions
 
@@ -331,4 +365,5 @@ you're running two agents on overlapping work.
 - [Concepts -> Workspace](../concepts/workspace.md) -- why there's no per-session changeset.
 - [Reference -> CLI](../reference/cli.md) -- every flag for `ls`, `logs`, `discard`, and
   `clean`.
-- [Reference -> Config](../reference/config.md) -- the `session-root` config key.
+- [Reference -> Config](../reference/config.md) -- the `session-root` and `[events]` config keys.
+- [Reference -> Event log](../reference/events.md) -- every event `events.jsonl` holds.

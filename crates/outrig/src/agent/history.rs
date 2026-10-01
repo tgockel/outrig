@@ -32,7 +32,9 @@ use rig::completion::message::{AssistantContent, ToolCall, ToolResultContent, Us
 use serde_json::{Value, json};
 
 use super::budget::{self, Budget};
+#[cfg(test)]
 use super::tool::ObserverSlot;
+use crate::events::{self, Event};
 use crate::python::host::{ContextChange, Interpreter};
 
 /// Which earlier rounds a model call is sent, besides the turns the agent
@@ -156,6 +158,60 @@ pub(crate) struct Manifest {
     pub(crate) adjacent: Vec<Adjacent>,
 }
 
+impl Manifest {
+    /// As the event log records it.
+    fn event(&self) -> events::ModelCall<'_> {
+        let chosen = |turns: &[(usize, Why)]| {
+            turns
+                .iter()
+                .map(|&(turn, why)| events::Chosen {
+                    turn,
+                    why: why.name(),
+                })
+                .collect()
+        };
+        events::ModelCall {
+            call: self.call,
+            round: self.round,
+            budget: events::CallBudget {
+                model: &self.budget.model,
+                window: self.budget.window,
+                window_assumed: self.budget.window_assumed,
+                reserve: self.budget.reserve,
+                overhead: self.budget.overhead,
+            },
+            estimate: self.estimate,
+            carried: chosen(&self.carried),
+            evicted: chosen(&self.evicted),
+            opening: self.opening.as_ref(),
+            adjacent: self
+                .adjacent
+                .iter()
+                .map(|adjacent| events::Repeat {
+                    turn: adjacent.turn,
+                    role: match adjacent.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Why {
+    /// As the event log names it.
+    fn name(self) -> &'static str {
+        match self {
+            Why::Latest => "latest",
+            Why::Round => "round",
+            Why::Promoted => "promoted",
+            Why::First => "first",
+            Why::Recent => "recent",
+        }
+    }
+}
+
 /// A call that was not made, because what it answers would not fit on its own.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TooLarge {
@@ -221,6 +277,7 @@ pub(crate) struct History {
     store: Arc<Mutex<Store>>,
     /// Where each turn is mirrored.
     interpreter: Interpreter,
+    #[cfg(test)]
     manifests: ObserverSlot<Manifest>,
 }
 
@@ -238,6 +295,7 @@ impl History {
         Self {
             store,
             interpreter,
+            #[cfg(test)]
             manifests: ObserverSlot::default(),
         }
     }
@@ -246,12 +304,14 @@ impl History {
         lock(&self.store)
     }
 
+    /// Where the agent's events are recorded.
+    pub(crate) fn events(&self) -> &events::Events {
+        self.interpreter.events()
+    }
+
     /// Call `observer` with the manifest of each model call, as the call is
     /// about to be made. Replaces any earlier observer.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "0003-13 records it as an event")
-    )]
+    #[cfg(test)]
     pub(crate) fn on_manifest(&self, observer: impl Fn(&Manifest) + Send + Sync + 'static) {
         *lock(&self.manifests) = Some(Box::new(observer));
     }
@@ -266,6 +326,13 @@ impl History {
     /// counting every turn -- both here and when its first call is assembled.
     pub(crate) fn open_round(&self, budget: &Budget, line: impl Fn(usize) -> String) -> Message {
         self.store().open_round(budget.room(), line)
+    }
+
+    /// The number of the round in progress, or of the last one if none is. A
+    /// round is numbered as its first turn commits, so one that ends having
+    /// committed none leaves its number to the next.
+    pub(crate) fn round(&self) -> u32 {
+        self.store().prompt().0
     }
 
     /// Start a round that `opening` opens, costed at its own size.
@@ -292,9 +359,16 @@ impl History {
         }
     }
 
-    /// Under the store's lock, so turns reach the interpreter in id order.
+    /// Under the store's lock, so turns reach the interpreter, and the event
+    /// log, in id order.
     fn commit_in(&self, store: &mut Store, messages: Vec<Message>, incomplete: bool) {
         let (id, turn) = store.commit(messages);
+        self.interpreter.events().emit(Event::TurnCommitted {
+            turn: id,
+            round: turn.round,
+            incomplete,
+            messages: &turn.messages,
+        });
         self.interpreter
             .push_turn(id as u64, mirror(turn.round, &turn.messages, incomplete));
     }
@@ -310,8 +384,13 @@ impl History {
     pub(crate) fn assemble(&self, budget: &Budget) -> Result<(Vec<Message>, Manifest), TooLarge> {
         let (sent, manifest) = self.store().assemble(budget)?;
         // Outside the store's lock: an observer may do anything.
+        #[cfg(test)]
         if let Some(observer) = &*lock(&self.manifests) {
             observer(&manifest);
+        }
+        let events = self.interpreter.events();
+        if events.is_on() {
+            events.emit(Event::ModelCall(manifest.event()));
         }
         tracing::debug!(
             call = manifest.call,

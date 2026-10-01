@@ -1680,6 +1680,51 @@ fn a_failure_that_cannot_be_formatted_is_still_reported() {
     assert_eq!(k.output(2, "2"), "2\n");
 }
 
+/// An exception's type is named from the type itself, never through its
+/// metaclass: one whose metaclass refuses `__name__` would otherwise escape
+/// the wrapper while naming what was raised, and the execution would end with
+/// no reply -- leaving the host's slot held for good.
+#[test]
+fn a_failure_whose_type_hides_its_name_is_still_reported() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        class Meta(type):
+            def __getattribute__(cls, name):
+                if name == '__name__':
+                    raise RuntimeError('no name')
+                return super().__getattribute__(name)
+        class Hostile(Exception, metaclass=Meta):
+            pass
+        raise Hostile()
+        "#);
+    let result = k.exec(1, &source);
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["raised"], "Hostile", "{result}");
+    assert_eq!(k.output(2, "2"), "2\n");
+}
+
+/// What names an exception's type is copied to a plain `str` before it is
+/// sent: a type's `__name__` can be a `str` subclass, and one whose `encode`
+/// raises would otherwise end the reply that carries it, leaving the host's
+/// slot held for good.
+#[test]
+fn a_failure_whose_type_name_cannot_be_encoded_is_still_reported() {
+    let mut k = Interpreter::start();
+    let source = py(r#"
+        class BadName(str):
+            def encode(self, *args, **kwargs):
+                raise RuntimeError('no encoding')
+        class Hostile(Exception):
+            pass
+        Hostile.__name__ = BadName('Hostile')
+        raise Hostile()
+        "#);
+    let result = k.exec(1, &source);
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["raised"], "Hostile", "{result}");
+    assert_eq!(k.output(2, "2"), "2\n");
+}
+
 #[test]
 fn only_the_primary_can_be_interrupted() {
     let mut k = Interpreter::start();
@@ -2679,7 +2724,7 @@ fn input_wins_when_it_arrives_with_a_completion() {
         op = asyncio.get_running_loop().create_future()
         def both():
             op.set_result('result')
-            runtime.channels['user']._deliver('now', 'user')
+            runtime.channels['user']._deliver('now', 'user', 0)
         asyncio.get_running_loop().call_soon(both)
         try:
             await runtime.wait({op})

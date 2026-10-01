@@ -1212,6 +1212,12 @@ impl Outrig {
         &self.container
     }
 
+    /// The directory the session's logs go to -- `network.jsonl`, each
+    /// server's stderr, and the agent loop's `events.jsonl`.
+    pub(crate) fn log_dir(&self) -> &Path {
+        &self.log_dir
+    }
+
     /// Dispatch an MCP `tools/call` to the named server. `server` must
     /// match a key in the effective MCP map; `tool` is the
     /// un-namespaced tool name as it appeared in [`Outrig::tools`].

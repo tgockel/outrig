@@ -55,6 +55,9 @@ const ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// A round in flight, borrowing the agent for as long as it runs.
 type Round<'a> = Pin<Box<dyn Future<Output = std::result::Result<Option<String>, BoxError>> + 'a>>;
 
+/// The agent, behind a lock a round holds across its awaits.
+type Shared<'a> = Mutex<&'a mut PythonAgent>;
+
 /// Run the session until the user leaves -- `/quit`, end of input, or a second
 /// Ctrl-C at the prompt -- or the interpreter exits.
 ///
@@ -69,7 +72,9 @@ type Round<'a> = Pin<Box<dyn Future<Output = std::result::Result<Option<String>,
 /// SIGINT is received through one listener for the whole session rather than
 /// a fresh `ctrl_c()` per wait, which would miss a press landing between two
 /// of them -- and a quick second press is the one that stops waiting.
-pub(super) async fn converse(agent: PythonAgent) -> Result<i32> {
+///
+/// The agent is borrowed, not taken, so the caller can shut it down after.
+pub(super) async fn converse(agent: &mut PythonAgent) -> Result<i32> {
     let user = agent.user_channel();
     let interrupt = agent.interrupter();
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -205,7 +210,7 @@ pub(super) async fn converse(agent: PythonAgent) -> Result<i32> {
 
 /// A round over the agent, which [`PythonAgent::round`] runs only if a message
 /// the model has not been told of is waiting.
-fn start(agent: &Mutex<PythonAgent>) -> Round<'_> {
+fn start<'a>(agent: &'a Shared<'_>) -> Round<'a> {
     Box::pin(async move { agent.lock().await.round().await })
 }
 

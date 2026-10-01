@@ -32,7 +32,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::libc;
 use rand::Rng;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
@@ -47,6 +46,7 @@ use crate::error::{
     IoPathExt, NetworkAttachFailure, NetworkTeardownCause, NetworkTeardownFailure, OutrigError,
     Result,
 };
+use crate::line_sink::{Labels, LineSink, Loss, QUEUE};
 use crate::nsfork;
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::{Reissue, detach_cleanup_chain};
@@ -84,11 +84,6 @@ const RESOLV_DANGLING: u8 = b'L';
 /// is the failure this bound exists to make impossible. A resolver file
 /// anywhere near it is not a resolver file.
 const MAX_RESOLV_SNAPSHOT: usize = 64 * 1024;
-/// How many audit records may be queued ahead of the writer. Bounded so a
-/// stalled log applies backpressure to the connections producing records
-/// instead of growing, and so a session cannot be made to hold an unbounded
-/// number of them by opening connections faster than the disk accepts them.
-const AUDIT_QUEUE: usize = 1024;
 
 /// Bounds on how long one validated answer keeps authorizing an address. The
 /// floor keeps a TTL-0 answer usable by the connection that prompted it; the
@@ -1219,41 +1214,25 @@ where
     Ok(())
 }
 
+/// The network audit log's words for itself, and where it says them.
+static AUDIT_LABELS: Labels = Labels {
+    what: "network audit",
+    claimant: "interceptor",
+    warn: |args| tracing::warn!(target: "outrig::network", "{args}"),
+    error: |args| tracing::error!(target: "outrig::network", "{args}"),
+};
+
+/// The session's `network.jsonl`, as one attachment writes to it: the shared
+/// [`LineSink`], and what each record is stamped with.
 #[derive(Debug, Clone)]
 struct AuditSink {
-    /// Records queued for the session's writer. Bounded, so a sink that
-    /// cannot keep up applies backpressure to the connections producing
-    /// records rather than growing without limit.
-    /// `None` once [`close`](Self::close) has ended the writer.
-    records: Option<mpsc::Sender<AuditJob>>,
+    sink: LineSink<AuditOwner>,
     session_id: String,
     container: String,
-    /// The writer's handle, held only by the session-level sink so `shutdown`
-    /// can end it and wait. `None` on every per-attachment clone.
-    writer: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Which attachment this handle belongs to. Failures are filed under it
     /// rather than under the container's name, which a later attachment can
     /// have again.
     generation: u64,
-    /// Records the writer has been handed and has not answered for, per
-    /// attachment.
-    ///
-    /// The writer is the only thing that knows what is in its queue, and
-    /// stopping it by abort takes that with it -- so the same fact is kept
-    /// where a caller can still read it. Whatever is left here when the writer
-    /// stops is exactly what it accepted and never accounted for, by owner and
-    /// by count.
-    pending: AuditPending,
-    /// What the writer could not write, per attachment: the first failure and
-    /// how many followed it.
-    ///
-    /// A connection's task returning is what `detach` treats as proof its
-    /// record landed, and that holds only once the writer has been drained.
-    /// Bounded on purpose -- one entry per container rather than per record --
-    /// because a container that can open connections can make writing fail as
-    /// often as it likes, and an outage such as `ENOSPC` would otherwise grow
-    /// host memory, and the teardown error, for as long as it lasted.
-    unwritten: AuditLosses,
 }
 
 /// Which attachment a record belongs to: the generation `attach` handed out,
@@ -1261,161 +1240,35 @@ struct AuditSink {
 /// a name comes round again, an attachment does not.
 type AuditOwner = (u64, String);
 
-/// Per attachment: how many of its records were lost, and the failure worth
-/// telling someone about.
-type AuditLosses = Arc<Mutex<BTreeMap<AuditOwner, AuditLoss>>>;
+impl std::ops::Deref for AuditSink {
+    type Target = LineSink<AuditOwner>;
 
-/// Per attachment: how many of its records the writer has taken and not yet
-/// answered for. Zero entries are removed rather than kept.
-type AuditPending = Arc<Mutex<BTreeMap<AuditOwner, u64>>>;
-
-/// One attachment's audit losses: how many records, the failure that broke the
-/// first append, and -- if the log may hold a partial record -- what stopped
-/// the writer proving otherwise.
-#[derive(Debug)]
-struct AuditLoss {
-    records: u64,
-    source: OutrigError,
-    integrity: Option<OutrigError>,
+    fn deref(&self) -> &Self::Target {
+        &self.sink
+    }
 }
 
-/// What the audit writer is asked to do.
-enum AuditJob {
-    /// One record, already encoded, with the container it belongs to and a
-    /// channel the writer answers on once it has dealt with it. The producer
-    /// waits on that, so a connection's task returning still means its record
-    /// is on disk -- the queue moves the bytes out of reach of the producer's
-    /// cancellation without moving the guarantee.
-    Record {
-        who: AuditOwner,
-        line: Vec<u8>,
-        done: tokio::sync::oneshot::Sender<()>,
-    },
-    /// Answer once everything queued ahead of this has been written. This is
-    /// what lets teardown say "every record this attachment owed is on disk"
-    /// rather than assuming it because the connections returned.
-    Drained(tokio::sync::oneshot::Sender<()>),
+impl std::ops::DerefMut for AuditSink {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sink
+    }
 }
 
 impl AuditSink {
     /// Opens the session-level sink. Its container field is empty; each
-    /// attachment writes through a [`for_container`](Self::for_container)
+    /// attachment writes through a [`for_attachment`](Self::for_attachment)
     /// handle so records carry that container's name.
     async fn open(path: PathBuf, session_id: String) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .path_ctx("create directory", parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .path_ctx("open", &path)?;
-        // Claimed exclusively, because the writer's rollback truncates this
-        // file back to where a failed record began -- and `ftruncate` acts on
-        // the inode, not on one descriptor's appends. A second writer's record
-        // sitting past that mark would be destroyed, and its owner would
-        // report a clean teardown having lost it. The lock is advisory and
-        // held by the open file description, so it also refuses a second
-        // interceptor in another process, and the kernel drops it when the
-        // file closes with the writer.
-        //
-        // `flock` on a `tokio::fs::File` is a raw-fd call and does not block:
-        // the non-blocking form is the point, since the answer wanted here is
-        // "someone already has this" rather than a wait.
-        //
-        // Only for a regular file, which is the only thing that truncation
-        // means anything for. A caller who points this at a device or a pipe
-        // has no rollback to protect and no exclusivity to lose -- and the
-        // tests that need every write to fail point it at `/dev/full`, whose
-        // one inode every one of them would otherwise queue behind.
-        //
-        // The exemption is for a file positively known not to be regular. A
-        // `stat` that *failed* says nothing, and taking the exemption on it
-        // would pair a truncating writer with no lock, which is the one
-        // combination this exists to prevent.
-        if claims_exclusively(file.metadata().await).path_ctx("stat", &path)? {
-            // The typed `fcntl::Flock` that replaces this takes *ownership*
-            // of the file and unlocks on drop, and the writer owns a
-            // `tokio::fs::File` it goes on appending to -- so the lock has to
-            // outlive the call that takes it, which is what the raw form does.
-            #[allow(deprecated)]
-            nix::fcntl::flock(
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                nix::fcntl::FlockArg::LockExclusiveNonblock,
-            )
-            .map_err(|e| {
-                OutrigError::Configuration(format!(
-                    "the network audit log {} is already owned by another \
-                     interceptor ({e}); one writer owns it, because the rollback \
-                     that keeps it a sequence of whole records truncates the file",
-                    path.display()
-                ))
-            })?;
-        }
-
-        let unwritten: AuditLosses = Arc::new(Mutex::new(BTreeMap::new()));
-        let pending: AuditPending = Arc::new(Mutex::new(BTreeMap::new()));
-        let (records, queue) = mpsc::channel(AUDIT_QUEUE);
-        // The writer owns the file and is the only thing that touches it, so
-        // no caller's cancellation can land inside a record. It ends when the
-        // last sink handle drops.
-        let writer = tokio::spawn(audit_writer(
-            file,
-            queue,
-            unwritten.clone(),
-            pending.clone(),
-        ));
-
         Ok(Self {
-            writer: Arc::new(Mutex::new(Some(writer))),
-            records: Some(records),
+            sink: LineSink::open(&path, None, QUEUE, &AUDIT_LABELS).await?,
             session_id,
             container: String::new(),
             generation: 0,
-            pending,
-            unwritten,
         })
     }
 
-    /// Waits until every record queued so far has been written.
-    ///
-    /// Teardown calls this after joining an attachment's connections, which is
-    /// what makes "queued so far" mean "everything this attachment owed".
-    /// Bounded: a writer that cannot drain is reported rather than waited on
-    /// forever, since the caller is a `detach` that has to return.
-    async fn drain(&self) -> Result<()> {
-        // One deadline over both halves. Getting the marker *into* the queue
-        // is itself a wait -- the queue is bounded, and a stalled writer with
-        // every slot full never accepts it -- so timing only the answer would
-        // leave `detach` blocked here forever and never reach the resolver and
-        // nft undos behind it.
-        let Some(records) = self.records.as_ref() else {
-            return Ok(());
-        };
-        let queued = tokio::time::timeout(SHUTDOWN_GRACE, async {
-            let (done, wait) = tokio::sync::oneshot::channel();
-            if records.send(AuditJob::Drained(done)).await.is_err() {
-                // The writer is gone; nothing is still queued behind it.
-                return Ok(());
-            }
-            wait.await.map_err(|_| ())
-        })
-        .await;
-        match queued {
-            Ok(Ok(())) => Ok(()),
-            _ => Err(OutrigError::Configuration(format!(
-                "the network audit log did not finish writing within {SHUTDOWN_GRACE:?}"
-            ))),
-        }
-    }
-
-    /// A handle writing to the same file whose records are stamped with
-    /// `container`.
     /// A handle for one attachment, keyed by a generation nothing else can
-    /// reuse.
+    /// reuse, whose records are stamped with `container`.
     ///
     /// Keying failures by container name alone misattributes them across
     /// generations: a drain that timed out leaves the writer still holding a
@@ -1435,72 +1288,6 @@ impl AuditSink {
         self.for_attachment(container, 0)
     }
 
-    /// End the writer and wait for it to finish, so nothing can record a loss
-    /// after the sweep that follows.
-    ///
-    /// Returns what went wrong if it could not be waited out; the sweep runs
-    /// either way, since a writer that will not stop is a reason to report
-    /// rather than a reason to skip collecting what it already recorded.
-    async fn close(&mut self) -> Option<OutrigError> {
-        let writer = self.writer.lock().ok().and_then(|mut w| w.take())?;
-        // Every other handle is gone by now: `shutdown` has taken the
-        // attachments, and this is the session's own. Taking the sender ends
-        // the writer's loop once its queue is empty; a record offered
-        // afterwards has nowhere to go and is reported rather than lost
-        // quietly.
-        self.records.take();
-        // Held by reference, then aborted and joined -- not moved into the
-        // timeout. Dropping a timed-out `JoinHandle` *detaches* the task, and
-        // a detached writer goes on appending and recording losses after the
-        // sweep that was supposed to be the last word on both. This is the
-        // same mistake `terminate` exists to avoid, one level down.
-        let mut writer = writer;
-        let stopped = match tokio::time::timeout(SHUTDOWN_GRACE, &mut writer).await {
-            Ok(Ok(())) => return None,
-            // It ended on its own, badly. Whatever it was holding is as lost
-            // as if it had been stopped, so the same accounting runs.
-            Ok(Err(joined)) => format!("the network audit writer ended abnormally: {joined}"),
-            Err(_) => {
-                writer.abort();
-                let _ = writer.await;
-                format!(
-                    "the network audit writer did not finish within {SHUTDOWN_GRACE:?} \
-                     and was stopped"
-                )
-            }
-        };
-        // Aborting ends the task, not the syscall. `tokio::fs` runs its writes
-        // on a blocking pool, and one already submitted completes whatever
-        // happens to the future awaiting it -- so bytes may still land, and the
-        // rollback that would have undone a partial write will not run because
-        // the task that does it is gone. The log is therefore of unknown
-        // integrity, and that is recorded where the sweep will find it rather
-        // than only described in the error returned here.
-        //
-        // Per owner and by count, from what the writer was actually holding.
-        // One synthetic entry under this sink's own name -- which this used to
-        // record -- named nobody, claimed one record however many were lost,
-        // and left every real owner unreported.
-        self.convert_pending(&stopped);
-        Some(OutrigError::Configuration(format!(
-            "{stopped}; what it still held is unaccounted for"
-        )))
-    }
-
-    /// File everything the writer accepted and never answered for as lost, by
-    /// the attachment that queued it.
-    ///
-    /// Called only once the writer is joined, so nothing can still be moving
-    /// records out of `pending` while this reads it.
-    fn convert_pending(&self, stopped: &str) {
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        for (who, records) in std::mem::take(&mut *pending) {
-            Self::remember_stopped(&self.unwritten, &who, records, stopped);
-        }
-    }
-
     /// Every loss still on the books, whichever attachment incurred it.
     ///
     /// `shutdown`'s sweep. A detach whose drain timed out left its generation
@@ -1508,19 +1295,10 @@ impl AuditSink {
     /// whatever the writer reported afterwards is collected here -- once, at
     /// the end, by the only caller that outlives every attachment.
     fn take_every_unwritten(&self) -> Vec<OutrigError> {
-        let Ok(mut unwritten) = self.unwritten.lock() else {
-            return Vec::new();
-        };
-        std::mem::take(&mut *unwritten)
+        self.sink
+            .take_every_loss()
             .into_iter()
-            .map(
-                |((_, container), loss)| OutrigError::NetworkAuditUnwritten {
-                    container,
-                    integrity: loss.integrity.map(Box::new),
-                    records: loss.records,
-                    source: Box::new(loss.source),
-                },
-            )
+            .map(|((_, container), loss)| audit_unwritten(container, loss))
             .collect()
     }
 
@@ -1528,278 +1306,36 @@ impl AuditSink {
     /// connections have been joined, so everything they were going to write
     /// has been attempted by then.
     fn take_unwritten(&self) -> Vec<OutrigError> {
-        let Ok(mut unwritten) = self.unwritten.lock() else {
-            return Vec::new();
-        };
-        unwritten
-            .remove(&(self.generation, self.container.clone()))
-            .map(|loss| OutrigError::NetworkAuditUnwritten {
-                container: self.container.clone(),
-                integrity: loss.integrity.map(Box::new),
-                records: loss.records,
-                source: Box::new(loss.source),
-            })
+        self.sink
+            .take_loss(&(self.generation, self.container.clone()))
+            .map(|loss| audit_unwritten(self.container.clone(), loss))
             .into_iter()
             .collect()
     }
 
-    /// Queues one record for the writer.
+    /// Queues one record for the writer, and waits until it is in the file.
     ///
-    /// The bytes never leave this task, so nothing a caller does can cut a
-    /// record in half: what gets cancelled here is the *queueing*, which
-    /// leaves a record absent rather than a line truncated. Absent is already
-    /// reported -- a connection cancelled that late is one teardown aborted,
-    /// and says so.
+    /// A connection's task returning is what `detach` treats as proof its
+    /// record landed, which is why this waits for the writer rather than only
+    /// for room in its queue.
     async fn write(&self, record: &AuditRecord) -> Result<()> {
         let mut line = serde_json::to_vec(record)
             .map_err(|e| OutrigError::Configuration(format!("encoding network audit: {e}")))?;
         line.push(b'\n');
-        let (done, written) = tokio::sync::oneshot::channel();
-        let records = self.records.as_ref().ok_or_else(|| {
-            OutrigError::Configuration("the network audit writer has stopped".to_string())
-        })?;
-        let who = (self.generation, self.container.clone());
-        // Capacity first, then the count, then the send -- and no await
-        // between the last two, which is what makes the count mean something.
-        //
-        // The queue is bounded, so offering a record can wait, and a producer
-        // cancelled in that wait used to leave its owner counted for a record
-        // the writer never saw: over-reported if the writer was later stopped,
-        // and silently dropped if it closed cleanly, which is a connection
-        // record missing from the log with nothing saying so. `reserve` is
-        // cancellation-safe -- tokio guarantees nothing was sent if it is
-        // dropped -- and the permit it hands back sends synchronously and
-        // infallibly, so the record is counted only once nothing can stop it
-        // being queued.
-        let Ok(permit) = records.reserve().await else {
-            return Err(OutrigError::Configuration(
-                "the network audit writer has stopped".to_string(),
-            ));
-        };
-        Self::enter_pending(&self.pending, &who);
-        permit.send(AuditJob::Record {
-            who: who.clone(),
-            line,
-            done,
-        });
-        // Deliberately *not* released on this error: the writer took the
-        // record and then died holding it, so it is one of the records
-        // `close` reports, under the owner that is still counted here.
-        written.await.map_err(|_| {
-            OutrigError::Configuration("the network audit writer has stopped".to_string())
-        })
-    }
-
-    fn enter_pending(pending: &Mutex<BTreeMap<AuditOwner, u64>>, who: &AuditOwner) {
-        if let Ok(mut pending) = pending.lock() {
-            *pending.entry(who.clone()).or_insert(0) += 1;
-        }
-    }
-
-    /// Releases one of `who`'s counted records. The writer is the only caller:
-    /// a record is counted when nothing can stop it reaching the queue, so
-    /// from there on the writer is the only thing that can account for it.
-    fn leave_pending(pending: &Mutex<BTreeMap<AuditOwner, u64>>, who: &AuditOwner) {
-        if let Ok(mut pending) = pending.lock()
-            && let std::collections::btree_map::Entry::Occupied(mut held) =
-                pending.entry(who.clone())
-        {
-            *held.get_mut() -= 1;
-            if *held.get() == 0 {
-                held.remove();
-            }
-        }
-    }
-
-    /// Records why the log cannot be trusted for `container`, without
-    /// counting a record as lost on its own: a write that failed has already
-    /// counted itself through [`remember_unwritten`](Self::remember_unwritten),
-    /// and adding to the count here would report the same record twice.
-    fn remember_integrity(
-        unwritten: &Mutex<BTreeMap<AuditOwner, AuditLoss>>,
-        who: &AuditOwner,
-        why: &str,
-    ) {
-        if let Ok(mut unwritten) = unwritten.lock() {
-            let slot = unwritten.entry(who.clone()).or_insert_with(|| AuditLoss {
-                records: 1,
-                source: std::io::Error::other(why.to_string()).into(),
-                integrity: None,
-            });
-            // Alongside the write failure, not instead of it: one says what
-            // broke the append, the other what stopped it being undone, and a
-            // reader needs both to know the file's state.
-            slot.integrity = Some(std::io::Error::other(why.to_string()).into());
-        }
-    }
-
-    /// Records `records` losses for `who`, with the file's integrity in doubt.
-    ///
-    /// The writer stopped holding them, so which one was mid-write is not
-    /// knowable from here -- what is knowable is that the file may hold a
-    /// partial line, and that is a fact about the file rather than about one
-    /// record, so every owner that lost records is told it.
-    fn remember_stopped(
-        unwritten: &Mutex<BTreeMap<AuditOwner, AuditLoss>>,
-        who: &AuditOwner,
-        records: u64,
-        stopped: &str,
-    ) {
-        if let Ok(mut unwritten) = unwritten.lock() {
-            let slot = unwritten.entry(who.clone()).or_insert_with(|| AuditLoss {
-                records: 0,
-                source: std::io::Error::other(format!(
-                    "{stopped}, so these records were never written"
-                ))
-                .into(),
-                integrity: None,
-            });
-            slot.records = slot.records.saturating_add(records);
-            slot.integrity = Some(
-                std::io::Error::other(format!(
-                    "{stopped} with a write in flight, so the log may hold a partial \
-                     record that nothing rolled back"
-                ))
-                .into(),
-            );
-        }
-    }
-
-    fn remember_unwritten(
-        unwritten: &Mutex<BTreeMap<AuditOwner, AuditLoss>>,
-        who: &AuditOwner,
-        error: std::io::Error,
-    ) {
-        if let Ok(mut unwritten) = unwritten.lock() {
-            unwritten
-                .entry(who.clone())
-                .and_modify(|loss| loss.records = loss.records.saturating_add(1))
-                .or_insert_with(|| AuditLoss {
-                    records: 1,
-                    source: error.into(),
-                    integrity: None,
-                });
-        }
+        self.sink
+            .write((self.generation, self.container.clone()), line)
+            .await
     }
 }
 
-/// Whether this file is one the writer has to claim exclusively.
-///
-/// Only a regular file: truncation is what the claim protects, and truncation
-/// means nothing for a device or a pipe -- the tests that need every write to
-/// fail point at `/dev/full`, whose single inode they would otherwise queue
-/// on. A `stat` that *failed* is neither answer: taking the exemption on it
-/// would pair a truncating writer with no lock, which is the one combination
-/// the lock exists to prevent, so it is an error rather than a default.
-fn claims_exclusively(opened: io::Result<std::fs::Metadata>) -> io::Result<bool> {
-    opened.map(|f| f.is_file())
-}
-
-/// The one thing that writes `network.jsonl`.
-///
-/// Owning the file in a single task is what makes a record atomic: no caller's
-/// cancellation reaches the bytes, and there is exactly one writer, so no
-/// interleaving either. It runs until the last sink handle drops.
-///
-/// "Written" here means handed to the filesystem and visible to anything that
-/// reads the file. It is not `fsync`ed: the acknowledgement a producer waits
-/// for says its record is in the file, not that it would survive the host
-/// losing power. Durability would cost a sync per connection on a log that
-/// gets one record per connection, and nothing here promises it.
-async fn audit_writer(
-    mut file: tokio::fs::File,
-    mut queue: mpsc::Receiver<AuditJob>,
-    unwritten: AuditLosses,
-    pending: AuditPending,
-) {
-    // Set when the file may hold a partial record: see the rollback below.
-    // Everything after that point is refused rather than appended -- but still
-    // received, answered and counted, because a caller waiting for its record
-    // is owed an answer and a record refused is still a record lost.
-    let mut poisoned: Option<String> = None;
-    while let Some(job) = queue.recv().await {
-        let AuditJob::Record { who, line, done } = job else {
-            // A drain marker: everything queued ahead of it is written by the
-            // time this is reached, so answering is the whole job. A receiver
-            // that has given up is not an error.
-            if let AuditJob::Drained(done) = job {
-                let _ = done.send(());
-            }
-            continue;
-        };
-
-        if let Some(why) = &poisoned {
-            AuditSink::remember_unwritten(&unwritten, &who, std::io::Error::other(why.clone()));
-            AuditSink::leave_pending(&pending, &who);
-            let _ = done.send(());
-            continue;
-        }
-
-        // Where the file ended before this record. `write_all` is a retry
-        // loop, not an atomic commit: a filesystem can take a prefix and then
-        // fail with `ENOSPC`, and the prefix would make every later record
-        // unparseable. Truncating back to here is what keeps the file a
-        // sequence of whole records even when a write fails partway.
-        let before = match file.metadata().await {
-            Ok(meta) => Some(meta.len()),
-            Err(_) => None,
-        };
-        let written = async {
-            file.write_all(&line).await?;
-            file.flush().await
-        }
-        .await;
-
-        if let Err(e) = written {
-            // Rolling back is what keeps the file a sequence of whole records.
-            // When it cannot be done -- the length before the append was never
-            // read, or the truncation itself failed -- a prefix may be sitting
-            // there, and appending the next record to it would produce a line
-            // nothing can parse. There is no recovering from that by writing
-            // more, so the writer stops: every later record is reported
-            // unwritten rather than added to a file already broken.
-            // Why recovery could not be proved, kept rather than collapsed to
-            // a boolean: if no further record ever arrives, this is the only
-            // thing that will tell a reader the file may be corrupt and what
-            // stopped it being repaired.
-            let recovery = match before {
-                None => Some("the file's length before the record was never read".to_string()),
-                Some(before) => match file.set_len(before).await {
-                    Err(e) => Some(format!("truncating back to {before} failed: {e}")),
-                    Ok(()) => match file.flush().await {
-                        Err(e) => Some(format!("flushing the truncation failed: {e}")),
-                        Ok(()) => None,
-                    },
-                },
-            };
-            tracing::warn!(target: "outrig::network", "network audit write failed: {e}");
-            AuditSink::remember_unwritten(&unwritten, &who, e);
-            if let Some(why) = recovery {
-                tracing::error!(
-                    target: "outrig::network",
-                    "the network audit log may hold a partial record and cannot be \
-                     recovered ({why}); no further records will be written to it"
-                );
-                let integrity = format!(
-                    "the network audit log may hold a partial record that could not be \
-                     rolled back ({why}), so nothing further may be appended to it"
-                );
-                // Replaces the write error this record already recorded
-                // rather than counting a second loss: the same record, and
-                // this is the more useful thing to be told about it. Recorded
-                // now so a teardown that follows immediately still learns the
-                // file is suspect, even if nothing else is ever written.
-                AuditSink::remember_integrity(&unwritten, &who, &integrity);
-                poisoned = Some(integrity);
-            }
-        }
-        // Answered whatever the outcome: the producer is waiting to learn the
-        // record has been dealt with, and a failure it can read back from
-        // `take_unwritten` is dealt with. Released for the same reason -- this
-        // record has been accounted for one way or the other, so it is no
-        // longer one the writer is holding.
-        AuditSink::leave_pending(&pending, &who);
-        let _ = done.send(());
+/// One attachment's audit losses, as the error the interceptor reports them
+/// with.
+fn audit_unwritten(container: String, loss: Loss) -> OutrigError {
+    OutrigError::NetworkAuditUnwritten {
+        container,
+        integrity: loss.integrity.map(|why| Box::new(why.into())),
+        records: loss.records,
+        source: Box::new(loss.source.into()),
     }
 }
 
@@ -3441,6 +2977,13 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt as _;
 
+    /// How many audit records may be queued ahead of the writer: the sink's
+    /// bound, which a stalled log turns into backpressure on the connections
+    /// producing records.
+    const AUDIT_QUEUE: usize = QUEUE;
+
+    type AuditJob = crate::line_sink::Job<AuditOwner>;
+
     /// [`run_step`], holding the tracing gate for as long as it emits.
     ///
     /// `run_step` reaches `run_capture_logged`, whose `spawn`/`exit` callsites
@@ -3952,30 +3495,6 @@ mod tests {
         }
     }
 
-    /// A `stat` that failed is not an answer, and must not be read as one.
-    /// Treating it like a device -- which is what "not a regular file" would
-    /// mean -- spawns a writer that truncates with nothing claiming the file,
-    /// which is the pairing the claim exists to prevent.
-    #[test]
-    fn a_file_this_cannot_identify_is_not_taken_for_a_device() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(NETWORK_LOG);
-        std::fs::write(&path, b"").expect("create");
-
-        assert!(
-            claims_exclusively(std::fs::metadata(&path)).expect("a readable file"),
-            "a regular file is claimed"
-        );
-        assert!(
-            !claims_exclusively(std::fs::metadata("/dev/full")).expect("a readable device"),
-            "and a device is not: there is no truncation to protect"
-        );
-        assert!(
-            claims_exclusively(Err(io::Error::from(io::ErrorKind::PermissionDenied))).is_err(),
-            "and a file this could not identify is neither"
-        );
-    }
-
     /// One writer owns the log, and a second is refused rather than allowed to
     /// destroy the first's records. The writer's rollback truncates the file
     /// back to where a failed record began, and `ftruncate` acts on the inode:
@@ -4115,13 +3634,10 @@ mod tests {
         // none of the timing a real stall would need.
         let (records, _stalled) = mpsc::channel(AUDIT_QUEUE);
         let sink = AuditSink {
-            writer: Arc::new(Mutex::new(None)),
-            records: Some(records),
+            sink: LineSink::queuing_to(records, None, &AUDIT_LABELS),
             session_id: "sid-1".to_string(),
             container: "outrig-a".to_string(),
             generation: 1,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
-            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
         };
         for _ in 0..AUDIT_QUEUE {
             let (done, _) = tokio::sync::oneshot::channel();
@@ -4236,16 +3752,17 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_record_cancelled_before_it_is_queued_is_charged_to_nobody() {
         let (records, _queue) = mpsc::channel(AUDIT_QUEUE);
-        let pending: AuditPending = Arc::new(Mutex::new(BTreeMap::new()));
         let mut sink = AuditSink {
-            writer: Arc::new(Mutex::new(Some(tokio::spawn(std::future::pending())))),
-            records: Some(records),
+            sink: LineSink::queuing_to(
+                records,
+                Some(tokio::spawn(std::future::pending())),
+                &AUDIT_LABELS,
+            ),
             session_id: "sid-1".to_string(),
             container: String::new(),
             generation: 0,
-            pending: pending.clone(),
-            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
         };
+        let pending = sink.pending.clone();
 
         // Filled past the sink, so nothing here is counted and the next
         // producer has to wait for room that is never going to come.
@@ -4300,16 +3817,17 @@ mod tests {
         // A writer that never takes anything off its queue, which is what a
         // wedged one looks like from this side with none of the timing.
         let (records, _queue) = mpsc::channel(AUDIT_QUEUE);
-        let pending: AuditPending = Arc::new(Mutex::new(BTreeMap::new()));
         let mut sink = AuditSink {
-            writer: Arc::new(Mutex::new(Some(tokio::spawn(std::future::pending())))),
-            records: Some(records),
+            sink: LineSink::queuing_to(
+                records,
+                Some(tokio::spawn(std::future::pending())),
+                &AUDIT_LABELS,
+            ),
             session_id: "sid-1".to_string(),
             container: String::new(),
             generation: 0,
-            pending: pending.clone(),
-            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
         };
+        let pending = sink.pending.clone();
 
         // Two attachments, three records: each producer queues one and then
         // waits to be told it landed, which is where a record the writer is
@@ -4546,13 +4064,10 @@ mod tests {
 
         let (records, _queue) = mpsc::channel(1);
         let mut sink = AuditSink {
-            writer: Arc::new(Mutex::new(Some(stuck))),
-            records: Some(records),
+            sink: LineSink::queuing_to(records, Some(stuck), &AUDIT_LABELS),
             session_id: "sid-1".to_string(),
             container: String::new(),
             generation: 0,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
-            unwritten: Arc::new(Mutex::new(BTreeMap::new())),
         };
 
         let closed = sink.close().await;

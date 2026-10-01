@@ -31,3 +31,4 @@
 - [Overview](reference/README.md)
   - [CLI](reference/cli.md)
   - [Config](reference/config.md)
+  - [Event Log](reference/events.md)

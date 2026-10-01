@@ -145,8 +145,7 @@ pub async fn execute(
     // live record without a container.
     if let Err(e) = store.create(&sid, args.session_dir.as_deref(), &mut session) {
         if let Ok((outrig, agent)) = started {
-            drop(agent);
-            shut_down(outrig).await;
+            shut_down(outrig, agent).await;
         }
         return Err(e.into());
     }
@@ -174,9 +173,9 @@ pub async fn execute(
     );
     agent.on_submit(|source| eprint!("{}", render_submission(source)));
 
-    let outcome = converse::converse(agent).await;
+    let outcome = converse::converse(&mut agent).await;
 
-    shut_down(outrig).await;
+    shut_down(outrig, agent).await;
     let exit = outcome.as_ref().copied().unwrap_or(1);
     if let Err(e) = store.finalize(&sid, SystemTime::now(), exit) {
         tracing::warn!(target: "outrig::cli::run_new", "finalizing session {sid}: {e}");
@@ -341,7 +340,7 @@ async fn start(args: Start<'_>) -> Result<(Outrig, PythonAgent)> {
             Ok((outrig, agent))
         }
         Err(e) => {
-            shut_down(outrig).await;
+            stop_containers(outrig).await;
             Err(CliError::PythonAgent(e))
         }
     }
@@ -379,9 +378,19 @@ async fn launch_spec(
     Ok((spec, skipped))
 }
 
-/// Shut the session's containers down, saying so if that fails: by the time
-/// this runs there is nothing left to return an error to.
-async fn shut_down(outrig: Outrig) {
+/// End the session: the agent first, so its event log is finished while the
+/// containers it describes still run, then the containers. Each failure is
+/// said and the rest still runs, since by now there is nothing left to return
+/// an error to.
+async fn shut_down(outrig: Outrig, agent: PythonAgent) {
+    if let Err(e) = agent.shutdown().await {
+        eprintln!("[outrig] warning: {e}");
+    }
+    stop_containers(outrig).await;
+}
+
+/// Shut the session's containers down, saying so if that fails.
+async fn stop_containers(outrig: Outrig) {
     if let Err(e) = outrig.shutdown().await {
         eprintln!("[outrig] warning: shutting the session down: {e}");
     }

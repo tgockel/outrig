@@ -36,6 +36,9 @@ mode = "default"                                      # optional: default, audit
 default = "deny"                                      # optional for filter mode
 allow = ["github.com:443", "*.npmjs.org"]             # optional; global only
 deny  = ["*:22"]                                      # optional; global only
+
+[events]
+mode = "off"                                          # optional: off or record
 ```
 
 | Key                  | Type    | Required               | Where  | Description               |
@@ -53,6 +56,7 @@ deny  = ["*:22"]                                      # optional; global only
 | `network.default`    | string  | no                     | global | Filter fallback action.   |
 | `network.allow`      | array   | no                     | global | Filter allow entries.     |
 | `network.deny`       | array   | no                     | global | Filter deny entries.      |
+| `events.mode`        | string  | no                     | either | Agent event log.          |
 
 `default-agent` is optional. With neither `--agent` nor `default-agent`, `outrig run` starts
 with no agent: no preamble is sent, every knob comes from the top level, and the image cascade
@@ -71,6 +75,7 @@ of the endpoint.
 A `[network]` table that declares no `mode` declares nothing, so it inherits. Network policy
 keys (`default`, `allow`, and `deny`) are global-only because they describe the machine's
 egress policy, not a project preference; a repo config that sets one is rejected at load.
+`[events].mode` merges the same way as `[network].mode`.
 
 `session-root` defaults to `<XDG_DATA_HOME>/outrig/sessions/` (typically
 `~/.local/share/outrig/sessions/`). The CLI flag `--session-root <path>` overrides both the
@@ -204,6 +209,26 @@ name the interceptor validated and `asserted` for one the client claimed.
 override this setting for one fresh session. `--network audit` and `--network filter` are
 rejected with `outrig mcp --attach` because borrowed containers are not retrofitted with a new
 interceptor.
+
+## `[events]`
+
+Whether `outrig run-new` records what its agent did. Off by default:
+
+```toml
+[events]
+mode = "off"
+```
+
+- `off`: record nothing, and write no file.
+- `record`: write every event the agent produces to `<session_dir>/logs/events.jsonl`, readable by
+  its owner only. The
+  [event log reference](https://tgockel.github.io/outrig/reference/events.html) lists what that
+  holds -- including what you type to the agent and what it sends back, and each model call's
+  conversation.
+
+The mode can live in either file, and a repo that declares it wins for that repo, as with
+`[network].mode`. `outrig run` reads the key and records nothing. There is no command-line flag
+for it yet.
 
 ## `[providers.<name>]`
 

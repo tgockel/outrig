@@ -101,7 +101,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-13` | A session records what its agents did, by category                 |
 | `0003-14` | A script renders a session directory to one page                   |
 | `0003-15` | Retry and failover come across from the 0.2.x loop                 |
 | `0003-16` | The docs describe the system that now exists                       |

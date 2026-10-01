@@ -34,6 +34,15 @@ pub(super) struct CannedResponse {
     body: Value,
 }
 
+impl CannedResponse {
+    /// The same response, reporting `usage` -- in the provider's own shape --
+    /// rather than the fixed counts every canned response starts with.
+    pub(super) fn usage(mut self, usage: Value) -> Self {
+        self.body["usage"] = usage;
+        self
+    }
+}
+
 /// A provider failing: `status` with Anthropic's error envelope.
 pub(super) fn failure(status: u16) -> CannedResponse {
     CannedResponse {

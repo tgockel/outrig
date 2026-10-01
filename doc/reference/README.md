@@ -6,6 +6,7 @@ place.
 
 - **[CLI](cli.md)** -- every subcommand and every flag.
 - **[Config](config.md)** -- every key in `.agents/outrig/config.toml`, with types and defaults.
+- **[Event Log](events.md)** -- every event `outrig run-new` records in `events.jsonl`.
 
 For narrative explanations of *why* a key exists or *how* a subcommand fits into a workflow, see
 [Concepts](../concepts/README.md) and [Usage](../usage/README.md).

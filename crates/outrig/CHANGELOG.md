@@ -114,6 +114,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row refuses it like `max-tokens`, and a `max-tokens` at or above it is refused when an agent is
   resolved. `outrig run` ignores it.
 
+- **An agent event log: `[events] mode = "record"`, `EventsConfig`, `EventsMode`, and
+  `PythonAgent::shutdown`.** With the mode on, `PythonAgent::start` writes what its agent does to
+  `events.jsonl` in the launched session's log directory, created readable by its owner only. A
+  log that already holds a recording fails the start instead, so no two events share an identity.
+  Each line is a CloudEvents 1.0 event whose `data` is OutRig's: each model call's manifest and
+  the turns it carried, in rig's message JSON, so the file alone rebuilds what every call sent;
+  each submission and how it ended; each message on the `user` channel, with its body; what each
+  round used in tokens, as the provider reported it; and what the host did -- interrupts,
+  cancels, failed liveness checks, executions it stopped waiting for, `MemoryError`s, and output
+  no execution wrote. `doc/reference/events.md` is the schema, with the rule each event is
+  recorded under. `PythonAgent::shutdown` finishes the file, waiting at most two seconds, and
+  returns how many events it lost and why as its error; an agent dropped without it finishes the
+  file in the background. A writer that falls behind holds up the model loop and the Python
+  tool, and never the parts that cannot wait, which queue their events, up to 4,096, and count
+  what does not fit.
+  The mode merges like `[network].mode`, and `outrig run` ignores it. Event types and the writer
+  are private: the config key and `shutdown` are the whole new surface.
+
 ### Changed
 
 - **`outrig` depends on `rig-core` and `reqwest`**, privately: no type of either appears in the

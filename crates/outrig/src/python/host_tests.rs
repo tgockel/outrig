@@ -18,10 +18,13 @@ use tokio::io::AsyncWriteExt;
 
 use super::host::{
     Background, ContextChange, Counts, Interpreter, InterpreterError, Late, MESSAGE_MAX, Outcome,
-    PRIMARY, Report, Unknown,
+    PRIMARY, Report, USER, Unknown,
 };
 use super::payload::PAYLOAD;
-use super::testing::{Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, within};
+use super::testing::{
+    Fake, HUNG_UP, connect, ok, round_trip, spawn, start_on_host, start_on_host_with, within,
+};
+use crate::events::{Events, kinds, of_kind, opened, recorded};
 
 /// The message of the startup error `started` must be.
 fn startup_error(started: Result<Interpreter, InterpreterError>) -> String {
@@ -165,7 +168,13 @@ async fn an_interpreter_that_exits_mid_execution_is_an_exit_not_an_error() {
 /// The interpreter's own stderr is what explains a failed start.
 #[tokio::test]
 async fn an_interpreter_that_cannot_start_says_why() {
-    let message = startup_error(within(Interpreter::from_child(spawn(None).await)).await);
+    let message = startup_error(
+        within(Interpreter::from_child(
+            spawn(None).await,
+            crate::events::Events::off(),
+        ))
+        .await,
+    );
     assert!(
         message.contains("usage:") && message.contains("exit status: 2"),
         "{message}"
@@ -617,6 +626,172 @@ fn recorder() -> (impl Fn(ContextChange) + Send + Sync + 'static, Handed) {
     )
 }
 
+// ---------------------------------------------------------------------------- the event log
+
+/// A log in a directory of its own, and the directory.
+async fn recording() -> (tempfile::TempDir, Events) {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let events = opened(dir.path()).await;
+    (dir, events)
+}
+
+/// An execution that runs out of memory is recorded as one, beside the result
+/// that says so.
+#[tokio::test]
+async fn an_execution_that_ran_out_of_memory_is_recorded_as_such() {
+    let (dir, events) = recording().await;
+    let (interpreter, mut fake) = Fake::connected_with(events.clone()).await;
+    let mut execution = interpreter.submit("x = [0] * 10**12").expect("submitted");
+    let id = execution.id();
+    fake.exec(id).await;
+    fake.result(
+        id,
+        json!({
+            "status": "error",
+            "error": "Traceback (most recent call last):\n  File \"<agent>\", line 1\nMemoryError\n",
+            "raised": "MemoryError",
+        }),
+    )
+    .await;
+    within(execution.outcome()).await;
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    assert_eq!(
+        kinds(&records),
+        ["exec.submitted", "exec.completed", "memory.exhausted"]
+    );
+    let completed = of_kind(&records, "exec.completed")[0];
+    assert_eq!(completed["status"], "error");
+    assert!(completed["duration"].as_f64().is_some(), "{completed}");
+    assert_eq!(
+        *of_kind(&records, "memory.exhausted")[0],
+        json!({"execid": id})
+    );
+}
+
+/// An interpreter that exits while an execution runs: the execution recorded
+/// as lost, then the exit and what explains it.
+#[tokio::test]
+async fn an_interpreter_that_exits_is_recorded_with_what_it_was_running() {
+    let (dir, events) = recording().await;
+    let (interpreter, mut fake) = Fake::connected_with(events.clone()).await;
+    let mut execution = interpreter.submit("work()").expect("submitted");
+    fake.exec(execution.id()).await;
+    drop(fake);
+    within(execution.outcome()).await;
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    assert_eq!(
+        kinds(&records),
+        ["exec.submitted", "exec.completed", "interpreter.exited"]
+    );
+    assert_eq!(of_kind(&records, "exec.completed")[0]["status"], "lost");
+    assert_eq!(
+        *of_kind(&records, "interpreter.exited")[0],
+        json!({"cause": HUNG_UP})
+    );
+    assert!(
+        records[2].get("subject").is_none(),
+        "the interpreter is no one agent's"
+    );
+}
+
+/// A message the channel refuses is recorded refused, under the id it was
+/// sent under.
+#[tokio::test]
+async fn a_post_the_channel_refuses_is_recorded_refused() {
+    let (dir, events) = recording().await;
+    let (interpreter, mut fake) = Fake::connected_with(events.clone()).await;
+    let answer = interpreter.post(USER, "hi").expect("queued");
+    let request = fake.expect("msg").await;
+    fake.send(json!({"t": "msg", "agent": PRIMARY, "id": request["id"], "error": "full"}))
+        .await;
+    assert_eq!(refused(within(answer).await), "full");
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    assert_eq!(kinds(&records), ["message.sent", "message.refused"]);
+    let refusal = of_kind(&records, "message.refused")[0];
+    assert_eq!(refusal["message"], request["id"]);
+    assert_eq!(refusal["reason"], "full");
+}
+
+/// What reaches the interpreter's stderr is recorded: its own diagnostics as
+/// such, and output no execution wrote -- which no result carries -- as
+/// unattributed, rather than vanishing.
+#[tokio::test]
+async fn output_no_execution_wrote_is_recorded_unattributed() {
+    let (dir, events) = recording().await;
+    let interpreter = start_on_host_with(events.clone()).await;
+    run(
+        &interpreter,
+        "import os\nos.write(1, b'RAW-ONE\\n')\nos.write(2, b'outrig-interpreter: a note\\n')",
+    )
+    .await;
+    let path = dir.path().join(crate::events::EVENTS_LOG);
+    within(async {
+        while !std::fs::read_to_string(&path)
+            .is_ok_and(|text| text.contains("RAW-ONE") && text.contains("a note"))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    events.close().await.expect("nothing lost");
+
+    let records = recorded(dir.path());
+    assert!(
+        of_kind(&records, "output.unattributed").contains(&&json!({"text": "RAW-ONE"})),
+        "{records:#?}"
+    );
+    assert!(
+        of_kind(&records, "interpreter.diagnostic").contains(&&json!({"text": "a note"})),
+        "{records:#?}"
+    );
+}
+
+/// The interpreter says when the agent's code takes a message only once the
+/// host asks it to, which only a recording host does.
+#[tokio::test]
+async fn a_take_is_reported_only_to_a_host_that_observes() {
+    for observing in [false, true] {
+        let (dir, events) = recording().await;
+        let interpreter = if observing {
+            start_on_host_with(events.clone()).await
+        } else {
+            start_on_host().await
+        };
+        within(interpreter.post(USER, "hi").expect("queued"))
+            .await
+            .expect("taken");
+        run(
+            &interpreter,
+            "(await runtime.channels['user'].receive()).body",
+        )
+        .await;
+        round_trip_real(&interpreter).await;
+        events.close().await.expect("nothing lost");
+        let records = if observing {
+            recorded(dir.path())
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            of_kind(&records, "message.received").len(),
+            usize::from(observing),
+            "{records:#?}"
+        );
+    }
+}
+
+/// Wait for the reader to have read every line written before now: an
+/// inventory is answered on the agent's loop, after them.
+async fn round_trip_real(interpreter: &Interpreter) {
+    within(interpreter.inventory()).await.expect("an inventory");
+}
+
 // ---------------------------------------------------------------------------- through podman
 
 #[cfg(feature = "e2e")]
@@ -650,7 +825,7 @@ mod e2e {
     #[tokio::test]
     async fn the_interpreter_starts_in_a_session_container_and_answers() {
         let container = alpine(true).await;
-        let interpreter = within(Interpreter::start(&container))
+        let interpreter = within(Interpreter::start(&container, Events::off()))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, "1 + 1").await, ok("2\n"));
@@ -674,7 +849,7 @@ mod e2e {
     #[tokio::test]
     async fn a_plain_pip_install_imports_at_once_in_a_session_container() {
         let container = alpine(true).await;
-        let interpreter = within(Interpreter::start(&container))
+        let interpreter = within(Interpreter::start(&container, Events::off()))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(run(&interpreter, PIP_PROBE).await, ok(""));
@@ -695,7 +870,7 @@ mod e2e {
     #[tokio::test]
     async fn an_image_without_the_payload_is_a_startup_error_naming_the_cause() {
         let container = alpine(false).await;
-        let message = startup_error(within(Interpreter::start(&container)).await);
+        let message = startup_error(within(Interpreter::start(&container, Events::off())).await);
         assert!(
             message.contains(&format!("{}/bin/python3", payload::PAYLOAD_MOUNT))
                 && !message.contains("did not report ready"),

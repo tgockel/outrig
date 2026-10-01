@@ -8,10 +8,10 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigSource, ConfigValidationError, ImageConfig, LlmProvider, McpServerSpec,
-    MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry, NetworkMode,
-    NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView, SidecarWorkspaceAccess, Workspace,
-    merge,
+    Config, ConfigSource, ConfigValidationError, EventsMode, ImageConfig, LlmProvider,
+    McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry,
+    NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView,
+    SidecarWorkspaceAccess, Workspace, merge,
 };
 use outrig::error::OutrigError;
 
@@ -1897,6 +1897,50 @@ allow = ["github.com:443"]
 
         let merged = merge(global, repo);
         assert_eq!(merged.network.mode(), NetworkMode::Filter);
+    }
+
+    /// `[events].mode` follows the repo the way `[network].mode` does: a repo
+    /// that declares it wins, one that is silent -- or writes only the table
+    /// header -- inherits, and with neither it is off.
+    #[test]
+    fn repo_events_mode_wins_and_silence_inherits() {
+        let record = || parse("[events]\nmode = \"record\"\n");
+        assert_eq!(parse("").events.mode(), EventsMode::Off, "off by default");
+        assert_eq!(merge(record(), parse("")).events.mode(), EventsMode::Record);
+        assert_eq!(
+            merge(record(), parse("[events]\n")).events.mode(),
+            EventsMode::Record,
+            "a bare table declares nothing"
+        );
+        assert_eq!(
+            merge(record(), parse("[events]\nmode = \"off\"\n"))
+                .events
+                .mode(),
+            EventsMode::Off
+        );
+        assert_eq!(merge(parse(""), record()).events.mode(), EventsMode::Record);
+
+        let mut repo = Config::default();
+        repo.events.set_mode(EventsMode::Record);
+        assert_eq!(
+            merge(parse(""), repo).events.mode(),
+            EventsMode::Record,
+            "built in code, as an embedder builds one"
+        );
+    }
+
+    /// `[events]` takes `mode` and nothing else, as every block refuses what it
+    /// does not know.
+    #[test]
+    fn events_block_refuses_an_unknown_key() {
+        let err = Config::load_from_str("[events]\nmode = \"record\"\nbodies = false\n")
+            .expect_err("an unknown key")
+            .to_string();
+        assert!(err.contains("bodies"), "{err}");
+        let err = Config::load_from_str("[events]\nmode = \"everything\"\n")
+            .expect_err("an unknown mode")
+            .to_string();
+        assert!(err.contains("record"), "{err}");
     }
 
     /// `merge` is public and infallible, so it cannot reject a repo value that

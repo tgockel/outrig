@@ -18,6 +18,7 @@ use tokio::process::Child;
 
 use super::host::{ARGS, ExecId, Interpreter, InterpreterError, Outcome, PRIMARY, Report};
 use super::payload;
+use crate::events::Events;
 
 /// How long any one step may take before a test fails rather than hangs.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -67,7 +68,12 @@ pub(super) async fn spawn(agent: Option<&str>) -> Child {
 
 /// A started interpreter addressing the primary agent.
 pub(crate) async fn start_on_host() -> Interpreter {
-    within(Interpreter::from_child(spawn(Some(PRIMARY)).await))
+    start_on_host_with(Events::off()).await
+}
+
+/// [`start_on_host`], recording to `events`.
+pub(crate) async fn start_on_host_with(events: Events) -> Interpreter {
+    within(Interpreter::from_child(spawn(Some(PRIMARY)).await, events))
         .await
         .unwrap_or_else(|e| panic!("{e}"))
 }
@@ -98,12 +104,22 @@ impl Fake {
 
     /// A handle connected to a fake that has greeted.
     pub(crate) async fn connected() -> (Interpreter, Self) {
+        Self::connected_with(Events::off()).await
+    }
+
+    /// [`Fake::connected`], recording to `events`. The host's request to
+    /// observe, which recording sends first, is read here.
+    pub(crate) async fn connected_with(events: Events) -> (Interpreter, Self) {
         let (mut fake, host) = Self::pair();
         fake.send(json!({"t": "ready", "agent": PRIMARY, "version": "3.13"}))
             .await;
-        let interpreter = within(connect(host))
+        let observing = events.is_on();
+        let interpreter = within(connect_with(host, events))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+        if observing {
+            fake.expect("observe").await;
+        }
         (interpreter, fake)
     }
 
@@ -170,8 +186,16 @@ impl Fake {
     }
 }
 
-pub(crate) async fn connect((replies, requests): HostEnd) -> Result<Interpreter, InterpreterError> {
-    Interpreter::connect(replies, requests, async { HUNG_UP.to_string() }).await
+pub(crate) async fn connect(host: HostEnd) -> Result<Interpreter, InterpreterError> {
+    connect_with(host, Events::off()).await
+}
+
+/// [`connect`], recording to `events`.
+pub(crate) async fn connect_with(
+    (replies, requests): HostEnd,
+    events: Events,
+) -> Result<Interpreter, InterpreterError> {
+    Interpreter::connect(replies, requests, async { HUNG_UP.to_string() }, events).await
 }
 
 /// An inventory, answered by the fake. The next request the fake sees must be

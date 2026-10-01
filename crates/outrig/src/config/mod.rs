@@ -238,6 +238,8 @@ pub struct Config {
     pub retry_budget_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "NetworkConfig::is_default")]
     pub network: NetworkConfig,
+    #[serde(default, skip_serializing_if = "EventsConfig::is_default")]
+    pub events: EventsConfig,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, LlmProvider>,
@@ -1592,6 +1594,56 @@ impl NetworkConfig {
     /// [`Workspace::inherit_missing_primary_fields`]: the global side is the
     /// base rather than the fallback, because that asymmetry *is* the trust
     /// rule.
+    fn apply_repo_overrides(&mut self, repo: &Self) {
+        if let Some(mode) = repo.mode {
+            self.mode = Some(mode);
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Whether `outrig run-new` records what its agent did, in
+/// `<session_dir>/logs/events.jsonl`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum EventsMode {
+    /// Record nothing, and write no file.
+    #[default]
+    Off,
+    /// Record every event the agent produces.
+    Record,
+}
+
+/// The `[events]` block: whether a session records its agent's events.
+///
+/// The field is private and `None` when the config did not declare it, as
+/// [`NetworkConfig`]'s `mode` is, so a repo table that declares nothing
+/// inherits the global choice rather than resetting it. Read the effective
+/// value with [`mode`](Self::mode).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[non_exhaustive]
+pub struct EventsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<EventsMode>,
+}
+
+impl EventsConfig {
+    /// The declared `mode`, or [`EventsMode::Off`].
+    pub fn mode(&self) -> EventsMode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// Declare `mode`, as a config file's `[events] mode` does.
+    pub fn set_mode(&mut self, mode: EventsMode) {
+        self.mode = Some(mode);
+    }
+
+    /// A repo's declared `mode` wins; a repo that declares none inherits.
     fn apply_repo_overrides(&mut self, repo: &Self) {
         if let Some(mode) = repo.mode {
             self.mode = Some(mode);

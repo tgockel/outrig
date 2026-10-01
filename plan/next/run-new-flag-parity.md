@@ -14,6 +14,10 @@ through `LaunchSpec::from_config`, which lowers the config and nothing else, so 
   setter, and either grows `outrig::PythonAgent`'s surface. The config keys already apply.
 - `--image` with a local image ref no `[images.<name>]` block names: `from_config` refuses it.
   `LaunchSpec::from_image` plus `with_workspace` would carry it.
+- `--events off|record`, which `0003-13` left out by the maintainer's choice: `[events] mode`
+  is config-only for now. `run`'s `--network` is the model, and `EventsConfig::set_mode` on the
+  loaded config is the whole of it, since `PythonAgent::start` reads the mode from the `Config` it
+  is handed. `run` has no such flag to match, because it records nothing.
 - `--env` has nothing to act on while `run-new` starts no MCP server.
 - `-v` writes `logs/container.log` under `run` because `session_setup` attaches a transcript to
   its containers. `Outrig` has no transcript to attach.

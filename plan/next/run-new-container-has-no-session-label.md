@@ -13,7 +13,11 @@
 container whose record has been deleted. A `run-new` killed with SIGKILL leaves a running
 container that only `podman rm` removes.
 
-The session id and the container's suffix also differ, which `run`'s never do.
+The session id and the container's suffix also differ, which `run`'s never do. `0003-13`'s
+`events.jsonl` inherits that: its CloudEvents `source` is `/outrig/session/<suffix>`, matching the
+session `network.jsonl` records, and so not the id `session.json` and `outrig ls` show. A reader
+links them through `session.json`'s `container_name`. Once the two ids agree, `source` names the
+session the way the rest of the CLI does, with no change to the log.
 
 ## Shape
 

@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[models.<name>].context-window`**, the model's whole context window in tokens, which
   `run-new` holds each model call to. It configures nothing on the provider's side, and `run`
   ignores it.
+- **`[events] mode = "record"`**, which has `run-new` record what its agent did in
+  `<session_dir>/logs/events.jsonl`: each model call and the conversation it was sent, each
+  submission and how it ended, each message on the channel, and the tokens each round used. The
+  file is readable by its owner only, and finished before the container stops; a warning at exit
+  counts any events it could not take. Off by default, with no flag yet, and `run` ignores it.
+  `doc/reference/events.md` lists every event.
 - **`outrig run-legacy`**, another name for `outrig run`. `run` itself is unchanged; the alias
   lets a script name the MCP-tool agent explicitly before `run` moves to the Python one.
 
