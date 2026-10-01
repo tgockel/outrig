@@ -1,9 +1,9 @@
 # Observability
 
-What a human can see of a running system. Sessions already exist for this -- `doc/usage/sessions.md`
-opens by saying they are there "so you can go back and inspect what happened" -- but what they
-record is the container, its connections, and the servers' stderr. The agent itself is absent, and
-the same page still admits it at `:294`:
+What a human can see of a running system, and what a program that owns a session can read from it.
+Sessions already exist for this -- `doc/usage/sessions.md` opens by saying they are there "so you
+can go back and inspect what happened" -- but what they record is the container, its connections,
+and the servers' stderr. The agent itself is absent, and the same page still admits it at `:317`:
 
 > **TODO: Incomplete** -- opt-in transcript capture (per-turn JSON of user/assistant/tool
 > messages) is deferred.
@@ -11,14 +11,18 @@ the same page still admits it at `:294`:
 This page is the answer to that, widened by what a Python agent makes visible. Three decisions are
 settled before anything else, because they bound the whole subject:
 
-- **The session directory is the interface.** Nothing listens. What a session already writes is
-  what an observer reads, and the only new thing is another file beside `network.jsonl`.
+- **One stream in memory, and the session directory is one of its readers.** A session publishes
+  its events to an in-memory stream, and subscribers read it in the owner's process: an embedder
+  through the session API (`embedding.md`), and the CLI through a subscriber that writes
+  `logs/events.jsonl` beside `network.jsonl`. Nothing listens: a subscriber is code the owner runs,
+  not a connection anyone can open.
 - **Reading is read-only.** Nothing an observer does perturbs the session it observes. No message
-  is injected, no execution is interrupted, no expression is evaluated.
+  is injected, no execution is interrupted, no expression is evaluated -- and a subscriber that
+  falls behind loses events, counted, rather than slowing the session down.
 - **Nothing is captured richer than its category allows.** Three categories, below, each with its
   own rule. An execution clipped to 16 KiB is recorded as 16 KiB, with the same truncation marker.
 
-The third one carries the weight, and it started as a single rule -- "the record holds exactly what
+The third one matters most, and it started as a single rule -- "the record holds exactly what
 the model saw" -- which the event set below already breaks. `messages.md` is explicit that a model
 can be told a message exists without its body entering its context, and generated code can receive
 a body and never print it. So recording message bodies is capture that rule does not license, and
@@ -34,8 +38,16 @@ it adds no reach a model did not have, because a model that saw it could already
 execution is awaiting, resource events. Not model-visible, so it needs its own justification
 rather than inheriting one.
 
-**Integration audit** -- policy decisions and bounded call metadata, which is `call-inspection.md`'s
-subject and carries its warning: the most useful field is also the one most likely to hold a secret.
+**Integration audit** -- what crossed the hosted-object boundary and what was decided about it
+(`hosted-objects.md`, `boundary-policy.md`). A hosted request is recorded as events that share its
+id: its receipt, published before dispatch, with bounded previews of its arguments; its decision --
+the rule's action, the evaluator's verdict, or the approver's answer -- with the effective policy's
+version, a digest of the rules in force; its dispatch; and its outcome. A request never dispatched
+has no dispatch event. The category carries the warning any call log carries: the most useful
+field, the arguments, is also the one most likely to hold a secret. It also holds things no model
+saw -- a host traceback stays in the event and out of the agent's error -- so, like execution
+diagnostics, it needs its own justification. An event never calls into an object to describe it:
+a preview is built from the by-value form that crossed, and a host object is named by its type.
 
 What the single rule got right and the three must keep: capture is a decision with consequences,
 not a free byproduct. Even recording exactly model-visible text changes its retention and its
@@ -60,6 +72,9 @@ expensive part of watching an agent is already paid:
 while an execution runs, and not otherwise -- so recording its answer costs nothing that is not
 already spent.
 
+Hosted calls add one more kind, `rpc` (`0003-16`), and are cheap to observe for the same reason:
+each request is already decoded on the host side, where it is intercepted (`hosted-objects.md`).
+
 **Messages between agents are the exception, and co-hosting is why.** `agent-placement.md` puts
 every agent in one interpreter process, and `messages.md` says a message between two of them never
 leaves it -- it moves between event loops through `loop.call_soon_threadsafe`. Nothing about it
@@ -79,8 +94,21 @@ timeline is not like that. A model turn produced this code, which printed this, 
 message, which woke that agent -- the ordering *is* the information, and recovering it by
 timestamp-joining separate files is exactly the thing that goes wrong at the moment it is needed.
 
-So: **`<session_dir>/logs/events.jsonl`**, one append-only stream, ordering guaranteed by the
-single writer that owns the file. This diverges from the per-subject convention on purpose.
+So a session publishes **one stream**, in memory, and fixes its order where an event enters it:
+
+- **A sequence at publication.** Each event is numbered as it is published, and the numbers are
+  unique and gap-free however many threads publish at once. The sequence is the order of
+  publication, not a claim about the order of effects on the host: two hosted calls running at
+  once publish in whatever order their events reach the stream.
+- **Fan-out.** Every subscriber receives every event, in sequence order.
+- **A lagging subscriber loses a counted gap.** A subscriber that falls too far behind loses the
+  oldest events it has not taken and is told how many. Nothing it does makes a producer wait, so
+  no subscriber can hold up a round, an execution, or a shutdown. Because the sequence itself has
+  no gaps, every gap in what a subscriber saw is a counted one.
+
+The CLI's subscriber writes **`<session_dir>/logs/events.jsonl`**, one append-only file in sequence
+order, when the opt-in below is on. One file rather than one per subject diverges from the
+`network.jsonl` convention on purpose.
 
 ## The envelope is CloudEvents; the payloads are OutRig's
 
@@ -105,9 +133,11 @@ line:
 ```
 
 `id` and `source` are the two required attributes that carry meaning here: the spec requires
-`source` + `id` to be unique per event, and a session plus a sequence number satisfies that without
-coordination. `source` is a URI-reference rather than a free string, which is why it is written as
-a path. `subject` names the agent, which is what the protocol's agent id supplies.
+`source` + `id` to be unique per event, and a session plus the stream's sequence number satisfies
+that without coordination. `id` *is* that sequence, so a gap the CLI's subscriber was told about
+shows in the file as a jump in `id`. `source` is a URI-reference rather than a free string, which
+is why it is written as a path. `subject` names the agent, which is what the protocol's agent id
+supplies.
 
 `type` values take the `org.outrig.` prefix the codebase already uses for OCI and container labels
 (`org.outrig.mcp`, `org.outrig.session`), which is also what the spec recommends -- a reverse-DNS
@@ -118,6 +148,9 @@ lower-case letters [a-z] or digits [0-9]", so the flat `outrig.session_id` style
 uses for its extras is not a legal extension attribute. Nothing OutRig-specific goes at the top
 level. Everything goes inside `data`, and the top level stays exactly the standard context
 attributes. That is tidier than the alternative anyway.
+
+The envelope belongs to the file. A subscriber in memory receives events as values
+(`embedding.md`); the CLI's subscriber wraps each one in this envelope as it writes it.
 
 ## What is emitted
 
@@ -130,11 +163,13 @@ channel, the endpoint names at both ends, the sender, and the body.
 
 **The model, from data the loop currently discards.** `llm.rs:1988` already calls
 `.extended_details()`, which is rig's opt-in for usage tracking, and the success arm reads
-`.messages`, `.output`, and `.content` while dropping `response.usage` and
-`response.completion_calls` on the floor. So `model.round.completed` costs a field read: input,
-output, total, cached, and reasoning tokens for the round, plus the per-turn breakdown. The
-context high-water mark is the largest `input_tokens` across those calls -- rig's own
-documentation points at the last entry for the final request's context length.
+`.messages`, `.output`, and `.content` while discarding `response.usage` and
+`response.completion_calls`. So `model.round.completed` costs a field read: input, output, total,
+cached, and reasoning tokens for the round, plus the per-turn breakdown. The context high-water
+mark is the largest `input_tokens` across those calls -- rig's own documentation points at the
+last entry for the final request's context length. A provider metric that is unavailable --
+cached or reasoning tokens from a provider that does not report them -- is recorded as null, never
+as zero, here and in every event that carries usage: zero is a count the provider did not give.
 
 `model.retry` and `model.failover` are the same story one level down: `retry.rs:644` and
 `failover.rs:351` format an attempt or a hop into `eprintln!` and drop it. A structured event also
@@ -159,17 +194,60 @@ It also settles a question left open in `agent-placement.md`: the unattributed-o
 what reaches fd 1 without belonging to any agent -- is **logged as an event**. It cannot be billed
 to an agent and it should not be silently dropped.
 
-## Nothing new becomes public
+**The session's own state** (`0003-19`): starting, idle, round running, executing, closing, and
+reported. *Closing* lasts from `close_admission()` to the report, through `lifecycle.md`'s
+closing, draining and terminating steps. The interpreter's death is an event, not a state of its
+own, after which the session passes through closing to reported. These are how an embedder knows
+what its session is doing without parsing text (`embedding.md`), and the outcomes a shutdown
+report lists are events too (`lifecycle.md`).
 
-`harness-components.md:80` leaves `session.rs` and `paths.rs` in `outrig-cli` and says to "revisit
-if the library loop needs a session record of its own." This is that need, and the revisit
-concludes no: `NetworkInterceptor::new(log_dir, ..)` already shows the shape. **The caller supplies
-a directory; the library owns the writer and the schema.** Host conventions stay where they are,
-and the library's public surface does not move.
+**The boundary, once there is one.** The integration-audit category has no producer until hosted
+objects are built, and then three tasks add one each:
 
-That is not a preference. `plan/todo/0002-47` and `0002-48` are narrowing and then CI-gating
-`crates/outrig/public-api.txt`, and this phase's entire budget is the one entry point `outrig-cli`
-needs. A subject that published event types would spend a budget that is already committed.
+- `0003-21`: each hosted request's receipt, dispatch and outcome, sharing its id -- binding, agent,
+  operation, member, host type, bounded previews, the outcome (`returned`, `raised`, `refused`,
+  `cancelled` or `unknown`, as `lifecycle.md` defines them), duration, and the call a callback ran
+  under;
+- `0003-22`: each request's decision -- a rule's action with the rule's position and layer, the
+  `default`, or the approver's answer -- with the effective policy's version; and each escalation
+  with its answer, its cancellation, or the late answer that changed nothing;
+- `0003-23`: each evaluator verdict, as a request's decision, and each evaluation's usage,
+  attributed apart from the agent's, so a judge's tokens never appear in a round's total.
+
+Three more tasks add events beside them that are execution diagnostics, not integration audit:
+
+- `0003-25`: each request a child is given -- a submission, or a request on one of its request
+  channels -- as one family, `agent.request.sent`, `received`, `replied`, `invalid`, `failed`,
+  `cancelled` and `settled`, with request and reply bodies as bounded previews;
+  `agent.call.started` and `agent.call.settled` only as the wrapper around a decorated call
+  (`0003-26`). The child's model usage is attributed to the child's round and added to the skill
+  invocation it ran under and to the main agent's round; a request's settled event names the
+  rounds it spanned;
+- `0003-28`: each skill invocation, which the hosted calls made inside it carry as context, not as
+  authority. Invocation events are not an audit of what a skill did; only boundary events record
+  every crossing (`skills.md`);
+- `0003-29`: each agent instance -- `agent.instance.started`, `ready`, `released` and
+  `collected`, the last when the runtime releases an instance that was collected unreleased.
+  Execution diagnostics like the rest, with any body they carry as a bounded preview.
+
+## Subscription becomes public; the file keeps its rules
+
+This section used to conclude that nothing here becomes public. The caller supplied a directory,
+the library owned the writer and the schema, and the phase's budget for public surface was the one
+entry point `outrig-cli` needed, so a subject that published event types would have spent a budget
+already committed. The first two still hold for the CLI's file. The third does not: the phase now
+designs a public session API (`embedding.md`), and an embedder driving a session from Rust needs
+its events as values, not as a file to read back.
+
+So **event subscription becomes public through the session API**, and is fixed with the rest of it
+at the 0.3.0 release. The event types stay crate-private until `0003-19` makes subscription public;
+`0003-13` built the file writer and the event types without publishing either, and no
+in-memory stream: its `emit` numbers each event and queues it to the file's sink. `0003-19` adds
+the stream in front of that sink and makes subscription public. For the file, the revisit
+`harness-components.md` asked for -- whether the library loop needs a session record of its own --
+still concludes no, because `NetworkInterceptor::new(log_dir, ..)` already shows the shape. **The
+caller supplies a directory; the library owns the writer and the schema.** Session directories and
+their host conventions stay in `outrig-cli`.
 
 The writer itself is not new work. `AuditSink` and `audit_writer` in `crates/outrig/src/network.rs`
 are generic in everything but the record type: a bounded queue that applies backpressure rather
@@ -178,11 +256,28 @@ exclusive lock on the file, rollback to the last whole line on a partial write, 
 rollback cannot be proven, and bounded loss accounting at teardown. This subject is its second
 caller and `resources.jsonl` would be the third, so extracting it is no longer speculative.
 
+Its backpressure now stops at the subscriber. The writer can make the CLI's subscription wait, and
+a subscription that waits too long falls behind and loses a counted gap; nothing the writer does
+can make the session wait. So `events.jsonl` can miss events, which a writer fed directly by the
+session would have ruled out with backpressure. Every miss is counted with the writer's other
+losses, and a jump in the file's ids shows where each gap is. A record that must be complete is
+the mandatory sink below, and not in this phase.
+
 Two neighbors to keep distinct. `Transcript` is a public sink for podman and buildah transcripts
-whose future `plan/todo/README.md:110` records as undecided; it is a text log, not an event
-stream, and this subject should not absorb it. And `call-inspection.md` is the other half of the
-same coin -- it says plainly that a passive tap "is observability, and it is not a boundary." This
-page is that tap, deliberately, and makes no enforcement claim.
+whose future `plan/todo/README.md` records as undecided; it is a text log, not an event stream,
+and this subject should not absorb it. And `boundary-policy.md` is the other half of a hosted
+call's record: it decides what crosses, before the call is dispatched. This page records what was
+decided and what happened, and makes no enforcement claim. An event is a record of what the session
+observed, not a grant, and a call denied before dispatch is denied whether or not anyone is
+subscribed.
+
+## Not in this phase
+
+- **A mandatory audit sink** (`plan/next/mandatory-audit-sink.md`): a subscriber whose failure to
+  take an event stops admission, so that no hosted call runs without a record.
+- **Per-audience projections** (`plan/next/event-audience-projections.md`): different views of one
+  event for the agent, an approver, the CLI's file, and an embedder's interface -- a host path an
+  approver needs to see, for one, and a generic subscriber should not.
 
 ## The renderer
 
@@ -229,18 +324,38 @@ something over their own session, and it is worth keeping short enough that they
 
 ## Opt-in
 
-A config block with a mode, mirroring `[network]`, defaulting off, with a CLI override for one
-session. `sessions.md:294` already frames transcript capture as opt-in, and the record holds the
+**Decided in `0003-13`: `[events] mode = "off" | "record"`,** defaulting off and merging like
+`[network].mode`, so a repo that declares it wins. There is no per-session CLI flag yet;
+`plan/next/run-new-flag-parity.md` holds `--events`. Opt-in because the record holds the
 conversation.
+
+The mode governs the file, not the stream. An embedder's subscribers receive events whatever the
+mode says, because what an embedder keeps is its own decision; the mode is the CLI's decision about
+what it writes to disk.
+
+**Boundary events follow the same opt-in (the maintainer's call).** They reach `events.jsonl` only
+when the mode is on. The consequence is worth stating, because the default policy is audit: with
+no rules configured, every hosted call runs and is evented (`boundary-policy.md`), and with the
+mode off the CLI writes none of those events anywhere. A user who wants a record of what an agent
+did through its bindings turns the mode on. Boundary events carry argument previews, the same kind
+of content the opt-in already guards, so they are not exempt from it.
 
 ## Rejected alternatives
 
 **Rejected: a socket to attach to.** The JDWP shape, and what the subject was first described as.
-Rejected because the session directory already is the interface, and everything wanted here is a
-record rather than a live interrogation. It also avoids a second listening surface: `outrig mcp
---listen` already carries the warning that "v1 has no built-in auth," and a port serving an agent's
-full history deserves better than that before it exists. The events do not change if a socket is
-added later, which is the property worth keeping.
+Rejected because everything wanted here is a record or a subscription rather than a live
+interrogation, and because it would add a listening surface: `outrig mcp --listen` already carries
+the warning that "v1 has no built-in auth," and a port serving an agent's full history deserves
+better than that before it exists. The in-memory subscription `embedding.md` makes public is not
+this: a subscriber is code the owner runs in its own process, so nothing new can connect. The
+events do not change if a socket is added later, which is the property worth keeping.
+
+**Rejected: a stream that waits for its slowest subscriber.** It would make every subscriber's
+record complete, the file included, as the earlier design did by letting the file's writer apply
+backpressure to the session. Rejected because a stalled disk or a slow embedder would then stall
+rounds, executions and shutdown, and a subscriber is never allowed to do that. A subscriber whose
+record must be complete belongs to the mandatory sink, which stops admission instead of slowing
+everything.
 
 **Rejected: a file per subject.** Consistent with `network.jsonl`, and it loses the ordering that
 is the reason to look.
@@ -254,8 +369,8 @@ are clearly worth keeping or licenses capture nobody argued for.
 **Rejected: recording an execution's full output.** Tempting, because "what did the command
 actually print" is a real question the model-view record cannot answer. Rejected because it
 creates capture that does not otherwise exist, in a file that outlives the session, which is the
-disclosure `call-inspection.md` is careful about -- and because the agent has better tools for
-it, which `history.md` records.
+disclosure the integration-audit warning above is about -- and because the agent has better tools
+for it, which `history.md` records.
 
 ## Open questions
 
@@ -269,11 +384,17 @@ it, which `history.md` records.
   design," and this is the first design that wants them.
 - Where the renderer lives. `scripts/` is described in the tree as repo-local tooling, and this is
   the first thing there meant for a user.
-- Whether an event carries a causal parent -- which model turn produced which execution -- or
-  whether ordering alone is enough. Ordering is enough to read; it is not enough to query.
+- Whether every event carries a causal parent -- which model turn produced which execution -- or
+  whether ordering alone is enough. Hosted requests carry one, because a callback names the call it
+  ran under (`0003-21`); for the rest, ordering is enough to read and not enough to query.
+- How far a subscriber may fall behind before it loses events, and whether an embedder may choose
+  that per subscriber.
 
 ## Unverified
 
+- The stream's promise that a stalled subscriber never delays a round is `0003-19`'s acceptance
+  and has not run. Its numbering has: `0003-13` assigns an event's id under one lock as it queues
+  the event, so the id is the event's place in the file.
 - The cost of emitting inter-agent messages was not measured. It is the one addition co-hosting
   forces, and a chatty pair of agents is the case to measure before assuming it is free.
 - The CloudEvents attribute names, their required/optional split, and the lower-case-alphanumeric

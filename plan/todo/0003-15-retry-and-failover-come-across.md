@@ -9,8 +9,15 @@ CLI could run sooner. This finishes the copy. Until it lands, `run-new` is less 
 `harness-components.md` lists `llm/retry.rs` and `llm/failover.rs` among the files copied rather
 than moved, because the 0.2.x line actively edits them and a copy is what keeps those merges
 clean. `llm/mistralrs.rs` and `llm/registry.rs` are explicitly **not** copied: the in-process
-backend is deprecated, its removal is `plan/next/remove-deprecated-local-llm.md`, and omitting it
-avoids `mistralrs-core`, `hf-hub`, and `candle-core` becoming library dependencies.
+backend has since been removed from the tree (`5fc715b`), and copying it would have made
+`mistralrs-core`, `hf-hub`, and `candle-core` library dependencies.
+
+Resolution and retry are not only a round's. `0003-23`'s evaluator makes one model call with no
+round around it, to judge one request, and a child from `0003-25` resolves its own model -- an
+alias included -- when it is spawned. Both reuse what this task copies, so the copy should not
+assume that every model call belongs to the session's agent or sits inside a round. The evaluator
+also resolves its model from the global config's declarations alone, so that a repository cannot
+choose it, which a resolver that reads only the merged config cannot do.
 
 Two defects already filed against the originals are worth carrying rather than reproducing.
 `plan/next/clamped-ceiling-is-silent.md` records that the effective `max-tokens` never escapes
@@ -74,4 +81,4 @@ knows which model actually answered.
 - `plan/phase/0003-python/harness-components.md` -- what is copied and what is deliberately not.
 - `plan/next/clamped-ceiling-is-silent.md` and
   `plan/next/chain-attribution-names-the-first-candidate.md` -- the two defects to fix rather than
-  reproduce, and `plan/next/remove-deprecated-local-llm.md` for the arm that is never copied.
+  reproduce. The in-process arm that is never copied was removed in `5fc715b`.

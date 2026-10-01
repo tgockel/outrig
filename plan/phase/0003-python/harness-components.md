@@ -64,18 +64,19 @@ the prototype branch, so no 0.2.x commit can conflict with a file that line does
 them, and copying is what keeps those merges clean. `0003-04` copied the part of `llm.rs` one
 round needs; `0003-15` brings retry and failover. From `rig_tool.rs` only the result truncation
 came across, and nothing from `session_tool.rs`. The model's one tool is `submit_python`, and
-MCP servers reach Python as the objects `mcp-wrappers.md` designs rather than as rig tools, so
-the MCP adapter has no caller on this side. An earlier draft had it coming along anyway.
+MCP servers would reach Python as the objects `mcp-wrappers.md` designs, after this phase
+(`plan/next/rust-object-as-python-object.md`), rather than as rig tools, so the MCP adapter has
+no caller on this side. An earlier draft had it coming along anyway.
 
-**Neither** -- `llm/mistralrs.rs` and `llm/registry.rs`. The in-process backend is deprecated
-and its removal is `plan/next/remove-deprecated-local-llm.md`. The new loop omits it, which
-costs nothing now and avoids `mistralrs-core`, `hf-hub`, and `candle-core` becoming library
-dependencies.
+**Neither** -- `llm/mistralrs.rs` and `llm/registry.rs`. The in-process backend was deprecated
+for 0.2.0 and has since been removed (`5fc715b`). The new loop never had it, which avoided
+`mistralrs-core`, `hf-hub`, and `candle-core` becoming library dependencies.
 
 **Designed, not yet ported** -- `builtin_tool.rs`, `self_tool.rs`, `subagent/`. These are
-MCP-shaped, and their Python equivalents now have designs rather than a gap: `work.md` for the
-subagent surface and `discovery.md` for self-documentation. Neither is built while one agent
-runs, and `self_tool.rs` would bring the 1,100-line `mcp_self/` corpus with it.
+MCP-shaped, and their Python equivalents now have designs rather than a gap: `work.md` and
+`typed-agents.md` for the subagent surface, queued as `0003-25` and `0003-26`, and
+`discovery.md` for self-documentation. None of the three files is ported; `self_tool.rs` would
+bring the 1,100-line `mcp_self/` corpus with it.
 
 **Stays in `outrig-cli`** -- `repl.rs`. Terminal interaction is the CLI's job, and `run-new`
 drives the same loop the existing command does.
@@ -91,16 +92,18 @@ Both become private dependencies: nothing rig-typed appears in the library's pub
 which is what keeps a rig release from forcing an `outrig` major. `clap` and `dialoguer` stay
 in `outrig-cli`; no terminal-interaction crate crosses over.
 
-**The new modules are private, with one entry point that is not.** Six of the modules being
+**The new modules are private, behind the session API.** Six of the modules being
 copied are `pub` in `outrig-cli` only under the `internal-test-api` feature, which means their
 current shape was never designed as an API. They stay private in `outrig`.
 
 Private means crate-private, though, so `outrig-cli` cannot call them either -- something has
-to be `pub` for `run-new` to reach the loop at all. That something is deliberately minimal:
-whatever starting a session and driving a round requires, in terms that name no rig type, and
-nothing beyond it. It exists because Rust requires it, not because it is an interface anyone
-should build on, and it will move. A consumer-facing API is later work and there is nothing yet
-to design one against.
+to be `pub` for `run-new` to reach the loop at all. For the first milestone that was
+deliberately minimal: `PythonAgent`, which existed because Rust requires it rather than as an
+interface anyone should build on. After the first milestone the maintainer decided the loop gets a
+designed public surface after all. `embedding.md` describes the session API that an embedder
+and `run-new` both use, `0003-19` builds it and removes `PythonAgent`, and the surface may change
+freely until the 0.3.0 release fixes it in `public-api.txt`. The modules behind it stay private,
+and no rig type crosses it.
 
 **The error type does not carry rig's.** `outrig-cli`'s `CliError` has
 `Prompt(rig::completion::PromptError)` and `LlmResolve(..)`. The library's equivalent converts
@@ -110,6 +113,17 @@ paid once per error variant rather than at every call site.
 **Two loops will drift.** That is accepted, not overlooked. A fix landing on the 0.2.x line
 does not reach `outrig`'s copy unless someone carries it across. `crate-split-tradeoffs.md`
 records what was weighed against that.
+
+## The host side gains a process per binding
+
+Hosted objects (`hosted-objects.md`) add processes on the host side of the picture. Each binding
+a session declares is the same embedded static CPython the container mounts, run on the host as
+a child of the owner -- one process per binding, in its own process group -- with the binding's
+packages on its path. Agent code reaches it only through the interpreter: RPyC frames travel the
+existing NDJSON protocol, and `python/host.rs` relays them between the interpreter and each
+binding process. Nothing in the container listens. The new mounts are the binding's package
+directory, read-only, and -- when any binding exists -- the workspace and every
+`[[workspace.mounts]]` entry at their host paths.
 
 ## The container side
 

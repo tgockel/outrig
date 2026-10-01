@@ -42,6 +42,11 @@ first.
   traceback, in captured output, and in a message body. Four assertions, because they reach the
   page by different paths.
 - A session directory missing `network.jsonl` renders without it rather than failing.
+- **An unknown event type renders generically** -- its type, its time, and its `data` cut to a
+  bound -- so the events later tasks add (hosted requests, policy decisions, children, skill
+  invocations) appear on the page without a change to the renderer.
+- **Per-agent sections key on `subject`**, so a child agent from `0003-25` renders as an agent of
+  its own, asserted with a fixture holding two subjects.
 - A truncated final line -- the record was being written when the session died -- does not abort
   the render.
 - The script runs with no prior install, on a machine with only `uv`.

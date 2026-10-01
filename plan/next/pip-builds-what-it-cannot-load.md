@@ -41,3 +41,12 @@ it.
 - In a session container, `pip install` of a package that has no pure-Python wheel ends quickly
   with a message naming the reason, and installs nothing.
 - `pip install` of a pure-Python package that ships only an sdist still installs and imports.
+
+## Binding installs already check for pure Python (2026-09-30)
+
+`0003-18` installs a binding's requirements with the payload's pip into a host cache, wheels only
+(`--only-binary=:all:`), and refuses any wheel that is not pure Python (`py3-none-any`), naming
+the reason. Its tag check is what the second option above needs: share it rather than write a
+second one, and have it accept every pure-Python tag set (`py2.py3-none-any` too). The
+wheels-only flag does not carry over, since the agent's pip must still build and install a
+pure-Python package that ships only an sdist.

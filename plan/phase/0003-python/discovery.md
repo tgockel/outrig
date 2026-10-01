@@ -51,9 +51,9 @@ round, so it is in the preamble.
 
 The same test admits a short list and rejects a long one: that names persist across rounds, that
 observations are bounded while the values behind them are not, that waiting watches channels, and
-that this interpreter cannot install packages -- the last because `discovery` exists partly so an
-agent does not learn it by failing. What it excludes is every individual capability, every tool
-schema, and every object an agent might eventually touch. Those are `help()`.
+that `pip` installs pure-Python packages and nothing compiled loads -- the last because `discovery`
+exists partly so an agent does not learn it by failing. What it excludes is every individual
+capability, every tool schema, and every object an agent might eventually touch. Those are `help()`.
 
 A concise orientation plus `help()` beats an exhaustive preamble, and it degrades better: a model
 that does not know something can find out, and one that does is not charged for the reminder.
@@ -63,6 +63,14 @@ that does not know something can find out, and one that does is not charged for 
 pure-Python packages and nothing compiled loads -- and one sentence naming `help(runtime)`, where
 the rest is: the manifest, `runtime.names()`, and each object's own docstring. Docstrings work
 only if the model thinks to look, and that one sentence is what tells it to.
+
+Two later subjects pass the same test, and it decides how much of each the preamble carries.
+Supplied bindings (`hosted-objects.md`) are names an agent cannot learn by looking -- the
+inventory hides boot names, and a binding is presented at boot -- and any round may need one, so
+the preamble lists each binding's name and description, from a local manifest, and nothing
+else. Skills (`skills.md`) follow the Agent Skills standard: each skill's name and description in
+the preamble, the body only when a skill is used. Neither adds a signature, a method list, or a
+docstring to the preamble; those stay `help()`.
 
 **Decided in `0003-10`: `help()` is replaced by a bounded one.** Checked in the static build,
 pydoc renders signatures and docstrings, marks a coroutine function `async` -- which answers
@@ -122,10 +130,17 @@ receiving a truncated description of all of them and guessing. This is the same 
 `history.md` applies to the conversation and `agent-placement.md` applies to output, and it is the
 reason processing data larger than the context window is possible at all.
 
+## Hosted proxies describe themselves
+
+Whether `help()` is enough, or whether proxies need a description path of their own, was the
+open question here while the transport was Pyro, whose proxies carry no signatures.
+`hosted-objects.md` settles it: `help()` on a hosted proxy round-trips as an intercepted and
+evented request, and the binding's package is importable in the container, so signatures and
+`isinstance` work against the same version the host runs. Automatic observation -- the inventory
+and the preamble -- never touches a proxy.
+
 ## Open questions
 
-- Whether `help()` is enough or whether proxies need their own description path. A Pyro proxy's
-  signature is not locally knowable, so `help()` on one either lies or round-trips.
 - Whether the active-work inventory belongs here or in `work.md`. "What am I waiting on" is a
   discovery question and a lifecycle question at the same time.
 - Whether the inventory should ever render values, given a bounded and explicit request. The safe
