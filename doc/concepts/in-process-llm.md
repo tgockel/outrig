@@ -320,6 +320,12 @@ the GGUF's chat template uses one -- is not streamed. A turn that produces nothi
 reasoning, usually because it hit `max-tokens` before finishing the thought, is reported on
 stderr along with the reasoning it produced.
 
+A reply that stops partway through a multi-byte character, such as an emoji cut off at
+`max-tokens`, never gets its last chunk from `mistralrs` 0.8.1. That chunk would carry the reason
+generation stopped, along with any text `mistralrs` was still holding back -- up to the whole
+reply, when it opened like a tool call. outrig warns on stderr that the reply may be incomplete,
+and the turn ends as usual. The missing text cannot be recovered.
+
 ## Model lifecycle
 
 Loading a GGUF is expensive (seconds, sometimes tens of seconds, sometimes gigabytes of

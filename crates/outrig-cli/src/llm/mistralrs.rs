@@ -23,7 +23,9 @@ use rig::completion::message::{AssistantContent, Message, ToolCall, ToolFunction
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, CompletionResponse, GetTokenUsage, Usage,
 };
-use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse};
+use rig::streaming::{
+    RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse, StreamingResult,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -326,34 +328,43 @@ impl CompletionModel for MistralrsModel {
 
         dispatch_request(self.engine.clone(), request_for_engine).await?;
 
-        Ok(response_stream(rx))
+        Ok(StreamingCompletionResponse::stream(response_stream(rx)))
     }
 }
 
 /// The stream rig reads for one request, fed by the engine's response channel.
 ///
 /// Split out of [`MistralrsModel::stream`] so that everything past the engine
-/// can be driven from a scripted channel, without loading any weights.
-fn response_stream(
-    mut rx: mpsc::Receiver<Response>,
-) -> StreamingCompletionResponse<MistralrsStreamResponse> {
-    let stream = async_stream::try_stream! {
-        let mut saw_response = false;
+/// can be driven from a scripted channel, without loading any weights. Callers
+/// wrap it in a [`StreamingCompletionResponse`]; it is returned unwrapped
+/// because that wrapper drops every final response after the first, and a test
+/// needs to see whether a second one was sent.
+fn response_stream(mut rx: mpsc::Receiver<Response>) -> StreamingResult<MistralrsStreamResponse> {
+    Box::pin(async_stream::try_stream! {
         let mut state = MistralrsStreamState::default();
         while let Some(response) = rx.recv().await {
-            saw_response = true;
             for item in state.translate(response)? {
                 yield item;
             }
         }
-        if !saw_response {
-            Err(CompletionError::ProviderError(
-                "mistralrs engine closed the response channel without replying".into(),
-            ))?;
+        // mistralrs-core 0.8.1 drops a reply's last chunk, the one with the
+        // finish reason and usage, when its unsent bytes end partway through a
+        // multi-byte character, as a max-tokens stop inside an emoji does. Text
+        // it was still holding back goes with it: the start of what might be a
+        // reasoning tag, or everything since the reply began to look like a
+        // tool call, which can be all of it. That is a reply cut short, not a
+        // failed one, even when nothing arrived: end it as a finished reply
+        // ends, with no usage, and warn that text may be missing.
+        if !state.saw_final_response {
+            eprintln!(
+                "[outrig] warning: the local model's reply ended without a finish reason, \
+                 so some or all of it may be missing. The likely cause is mistralrs \
+                 dropping the last chunk of a reply that stops partway through a \
+                 multi-byte character, such as an emoji cut off at max-tokens."
+            );
+            yield RawStreamingChoice::FinalResponse(MistralrsStreamResponse { usage: None });
         }
-    };
-
-    StreamingCompletionResponse::stream(Box::pin(stream))
+    })
 }
 
 async fn dispatch_request(
@@ -858,7 +869,9 @@ fn translate_usage(usage: &mistralrs_core::Usage) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use mistralrs_core::{Choice, ChunkChoice, Delta, ResponseMessage, ToolCallType};
+    use rig::streaming::StreamedAssistantContent;
 
     fn chat_done(content: Option<&str>, calls: Option<Vec<ToolCallResponse>>) -> Response {
         Response::Done(mistralrs_core::ChatCompletionResponse {
@@ -1211,6 +1224,19 @@ mod tests {
         );
     }
 
+    /// A response channel holding `script`, closed behind it, as the engine
+    /// leaves one once it is done with a request.
+    fn scripted_channel(script: Vec<Response>) -> mpsc::Receiver<Response> {
+        let (tx, rx) = mpsc::channel(script.len().max(1));
+        for response in script {
+            assert!(
+                tx.try_send(response).is_ok(),
+                "the channel is sized to hold the whole script",
+            );
+        }
+        rx
+    }
+
     /// An engine that answers every request with the same script, read back
     /// through the [`response_stream`] a real engine's channel feeds.
     ///
@@ -1244,15 +1270,8 @@ mod tests {
             StreamingCompletionResponse<Self::StreamingResponse>,
             CompletionError,
         > {
-            let script = (self.0)();
-            let (tx, rx) = mpsc::channel(script.len().max(1));
-            for response in script {
-                assert!(
-                    tx.try_send(response).is_ok(),
-                    "the channel is sized to hold the whole script",
-                );
-            }
-            Ok(response_stream(rx))
+            let rx = scripted_channel((self.0)());
+            Ok(StreamingCompletionResponse::stream(response_stream(rx)))
         }
     }
 
@@ -1318,5 +1337,93 @@ mod tests {
             )),
             "with its reasoning: {content:?}",
         );
+    }
+
+    /// mistralrs-core 0.8.1 drops the chunk with the finish reason and usage
+    /// when a reply stops partway through a multi-byte character. The stream
+    /// still ends on a final response, with no usage, so rig records one as it
+    /// would for a reply that finished.
+    #[tokio::test]
+    async fn a_stream_closed_before_its_final_chunk_ends_on_a_final_response() {
+        let rx = scripted_channel(vec![stream_chunk(Some("Here is a crab: "), None, None, None)]);
+        let mut stream = StreamingCompletionResponse::stream(response_stream(rx));
+
+        let items: Vec<_> = stream.by_ref().collect().await;
+
+        assert!(
+            matches!(
+                items.as_slice(),
+                [
+                    Ok(StreamedAssistantContent::Text(text)),
+                    Ok(StreamedAssistantContent::Final(MistralrsStreamResponse { usage: None })),
+                ] if text.text == "Here is a crab: "
+            ),
+            "got: {items:?}",
+        );
+        assert!(
+            matches!(
+                stream.response,
+                Some(MistralrsStreamResponse { usage: None })
+            ),
+            "rig records the final response: {:?}",
+            stream.response,
+        );
+    }
+
+    /// A reply whose last chunk carried its finish reason ends on that chunk's
+    /// final response alone, so the warning is not printed either. Read ahead
+    /// of rig's wrapper, which would hide a second final response.
+    #[tokio::test]
+    async fn a_finished_stream_ends_on_its_own_final_response_alone() {
+        let rx = scripted_channel(vec![stream_chunk(
+            Some("done"),
+            None,
+            Some("stop"),
+            Some(usage()),
+        )]);
+
+        let items: Vec<_> = response_stream(rx).collect().await;
+
+        assert!(
+            matches!(
+                items.as_slice(),
+                [
+                    Ok(RawStreamingChoice::MessageId(_)),
+                    Ok(RawStreamingChoice::Message(_)),
+                    Ok(RawStreamingChoice::FinalResponse(MistralrsStreamResponse {
+                        usage: Some(_)
+                    })),
+                ]
+            ),
+            "got: {items:?}",
+        );
+    }
+
+    /// A channel that closes before any response is the same cut, with all of
+    /// the reply held back. It used to fail the stream, which ended the whole
+    /// `outrig run` session; the turn now ends with nothing to show, and is
+    /// reported as silent like any other turn that produced no content.
+    #[tokio::test]
+    async fn a_local_turn_whose_channel_closes_empty_is_silent_not_fatal() {
+        let agent = rig::agent::AgentBuilder::new(ScriptedEngine(Vec::new)).build();
+        let mut history = Vec::new();
+        let mut stdout = Vec::new();
+
+        let end = crate::llm::run_turn_streaming_to(
+            &agent,
+            "draw a crab",
+            &mut history,
+            crate::llm::OutrigPromptHook::new(50),
+            &mut stdout,
+        )
+        .await
+        .expect("a reply that never arrived ends the turn, not the session");
+
+        assert!(
+            stdout.is_empty(),
+            "nothing arrived, so nothing is streamed: {:?}",
+            String::from_utf8_lossy(&stdout),
+        );
+        assert!(end.is_silent(), "no text and no stop reason: {end:?}");
     }
 }

@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A local reply cut off inside a multi-byte character warns that it may be incomplete.** With
+  `local-llm`, a turn whose `max-tokens` ceiling landed partway through a character such as an
+  emoji ended as if it had finished. mistralrs-core 0.8.1 drops that turn's last chunk, and with
+  it the finish reason, the cut character, and any text it was still holding back, which is the
+  whole reply when it opened like a tool call. When the cut came before anything was sent, the
+  empty stream was reported as an error that ended `outrig run`. outrig now warns on stderr that
+  the reply may be incomplete, keeps what did arrive, and ends only the turn. The missing text
+  cannot be recovered.
 - **Subagents sharing a name keep separate transcripts.** A name is unique only among one agent's
   subagents, so two subagents could each launch an `audit`, and a subagent could give a child its
   own name, but every subagent wrote `logs/subagent-<name>.log`. Same-named subagents appended to
