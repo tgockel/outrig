@@ -148,6 +148,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outrig design prompt` gives now say to download a prebuilt binary for the image's
   architecture. A Dockerfile generated earlier keeps its old lines; replace its `# go toolchain`
   section with the one `image add` writes now.
+- **`outrig mcp self` refuses `--env`, `--network`, and `--volume`.** It started with any of them
+  and ignored them, so a client configuration carrying one looked correct, and an `--env` every
+  other `outrig mcp` path refuses as malformed was taken too. Each now exits with an error naming
+  the option to remove, as `--image`, `--session-dir`, `--attach`, and `--listen` already did.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 

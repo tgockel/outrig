@@ -252,6 +252,44 @@ where
         .unwrap_or_else(|err| panic!("tools/call {name} returned invalid JSON {body:?}: {err}"))
 }
 
+/// `mcp self` starts no container and creates no session, so it refuses
+/// each `McpArgs` option rather than ignore it. Every one has a row here.
+#[test]
+fn mcp_self_refuses_the_session_options() {
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_outrig");
+    for (cmdline, flag) in [
+        ("mcp self --image x", "--image"),
+        ("mcp self --session-dir /tmp", "--session-dir"),
+        ("mcp self --attach foo", "--attach"),
+        // `--listen` is not global, so it is only accepted ahead of `self`.
+        ("mcp --listen 127.0.0.1:7331 self", "--listen"),
+        ("mcp self --env K=V", "--env"),
+        ("mcp self --env not-a-valid-env", "--env"),
+        // A global option parses ahead of `self` as well as after it.
+        ("mcp --env K=V self", "--env"),
+        ("mcp self --network audit", "--network"),
+        ("mcp self --volume /tmp:/tmp", "--volume"),
+    ] {
+        let output = std::process::Command::new(bin)
+            .args(cmdline.split_whitespace())
+            .current_dir(cwd.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("run outrig");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "`outrig {cmdline}` should be refused; stderr was: {stderr}",
+        );
+        assert!(
+            stderr.contains(&format!("remove {flag}")),
+            "`outrig {cmdline}` should name {flag}; stderr was: {stderr}",
+        );
+    }
+}
+
 /// Regression for the `tools/list` rejection reported against protocol revision
 /// `2026-07-28`, which made the SEP-2549 `ttlMs` / `cacheScope` fields mandatory
 /// on list results. The server negotiated that revision but omitted both, so a
