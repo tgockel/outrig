@@ -20,6 +20,8 @@ the environment the agent gets to play in, leaving the agents free to work quick
   deliverables, exit criteria, linked subsystems, tasks, out of scope). When a phase closes
   its README moves into `plan/done/phase/<PPPP>-<name>/`, beside the `tasks/` folder already
   there. Multiple phases may be open at once; a task belongs to one via its `PPPP-` prefix.
+  A phase directory may also hold `potential/`: alternatives and improvements not adopted out
+  of the box, each with the evaluation that would decide it.
 - `plan/next/` -- buffer for follow-up work discovered mid-execution (no leading
   `PPPP-NN-`). Drop entries here so the current task stays focused; the queue is folded
   into `plan/todo/` periodically.

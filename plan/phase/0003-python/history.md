@@ -43,6 +43,28 @@ agent put it there. Pruning is safe exactly to the degree state has been externa
 variable inventory is how a pruned agent re-orients, and binding what matters to a name is the
 habit the whole design rewards.
 
+**"Nothing is lost" is a statement about storage.** The store keeps every turn, so no turn has to
+be summarized to survive. Decision-making is a different question, and the design makes an
+assumption about it: the first N and the last M turns, plus what the model promotes, are enough
+to decide well. That is an unverified hypothesis, not a property of large models: a large context
+window does not stop a fixed first-and-recent selector from leaving out an instruction given in a
+middle round while token space remains, because the selector cuts by position and not by room.
+The model's ability to promote what it deems critical is what makes the assumption workable: a
+constraint it recognizes as one stays in the view wherever the window moves. A source-linked
+active-intent record -- the current goal, explicit constraints, and decisions still open, each
+pointing at the turn it came from -- is `potential/active-intent-record.md`, whose evaluation is
+what tests the hypothesis, against disciplined promotion, possibly in 0.3.1; a versioned
+selection strategy at the existing seam is `potential/history-selection-seam.md`.
+
+Two things follow for the design. First, user input is data the agent's code reads, not text that
+enters the model's history by itself: a message is announced by count, the agent's code receives
+it, and only what that execution observed enters the turn (`messages.md`). So the agent can
+record a shorter form of a long message, and what the model sees later is separated from what
+the user typed; `potential/input-rewritten-into-history.md` holds tooling for that. Second, the
+history and view structures and their methods are substitutable: an addition such as the intent
+record adds a field or a method and changes no existing one, so it breaks no API. `0003-19`'s
+public surface owns that requirement (`embedding.md`).
+
 ## The store
 
 The full history, mirrored into the interpreter as ordinary Python data as the host authors
@@ -239,8 +261,10 @@ construction.
 **Rejected: summarizing what gets dropped.** The standard answer, and the most forgiving of an
 agent that never thinks about its context. It costs a model call at exactly the moment the design
 was trying to save time, and it introduces a failure that is hard to see -- a confident summary
-that dropped the one constraint the user cared about. The store makes it unnecessary: nothing is
-lost, so nothing has to be compressed.
+that dropped the one constraint the user cared about. The store makes it unnecessary as storage:
+nothing is lost, so nothing has to be compressed to survive. Whether the view is enough to decide
+on is the assumption "Why this is newly safe" states, and the intent record filed there is the
+alternative to evaluate if disciplined promotion is not enough.
 
 **Rejected: cutting by message, with synthesized repair.** The finest control, and it makes every
 provider's validity rules OutRig's problem. A turn gives most of the benefit with none of that.

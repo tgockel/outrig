@@ -85,10 +85,66 @@ Killing a **subprocess** is a signal to something with its own opinion about dyi
 **accepted remote operation** may be impossible, and its effect may already have happened. A
 design that says only "cancel" has not said anything.
 
+### A hosted call blocks its kernel
+
+A call on a hosted object (`hosted-objects.md`) is an ordinary synchronous Python call, and it
+holds the calling kernel's thread until the host answers. While it does, that kernel's event loop
+does not turn: messages are not delivered to it, a `runtime.wait` in one of its tasks does not
+wake, and its background tasks stall. Other kernels keep running, because the waiting thread does
+not hold the GIL. A long call that should not stall the loop is written
+`await asyncio.to_thread(lambda: repo.remotes.origin.push())`, which runs the whole expression on
+a worker thread. The attribute lookups are hosted calls too, so a method the kernel's thread looks
+up, `to_thread(repo.remotes.origin.push)`, costs the loop three round trips and offloads only the
+call. A bare `await` of the worker still does not watch the channels, so the pattern for staying
+reachable during a long call is a retained task plus `runtime.wait`:
+
+```python
+push = asyncio.create_task(asyncio.to_thread(lambda: repo.remotes.origin.push()), name="push")
+done, pending = await runtime.wait({push})
+```
+
+A kernel keeps a pool of up to four connections per binding, with one call in flight per
+connection, so one call waiting on the host does not, by default, delay the binding's other
+calls: calls from several of its threads run at once, up to four, and a fifth waits for a free
+connection; only a binding declared `serialize = true` runs its calls one after another
+(`hosted-objects.md`, `0003-17`).
+
+An interrupt reaches a kernel blocked in a hosted call and raises in the caller (`0003-17`). What
+it does to the call depends on where the call is. A call waiting for approval is cancelled and
+never runs later (`boundary-policy.md`). A call already running on the host is the fourth
+cancellation above, made concrete: RPyC has no cancel message, so the host call continues until it
+returns, and its reply is recorded as `returned` or `raised` with the note that the caller was
+interrupted.
+
 ## A round
 
 One prompt or message, the agent working, and yielding control back. It yields when the model
 stops emitting or when a limit fires.
+
+What opens a host-initiated round -- one no prompt started -- is one rule for every kernel, the
+primary's and a child's alike. A round the host opens on queue state is a nudge, and the host keeps
+the summary the nudge opened on as its baseline: on each plain channel its delivered and unread
+counts, so that an arrival and a receive each change it even when they leave the unread count where
+it was, and on a request channel the ids of the requests unread and of those received and not yet
+answered. At the end of every round it computes the same summary from live queue state and compares
+it with the baseline, the state at the last nudge. Any difference -- an arrival, a receive, a reply,
+a cancellation -- opens the next round, and the new round's opening line is rendered from the live
+summary; an unchanged summary opens nothing; and a summary with nothing in it, nothing unread and
+nothing unanswered, opens nothing. An announcement made during a round, the prefix on a result,
+tells the model what has arrived and moves the baseline nowhere; the comparison at the round's end
+is still with the summary the round opened on. Today's `Announcer`
+(`crates/outrig/src/agent/channel.rs`) is the unread-count case of this rule: it keeps its baseline,
+`Told::kept`, at the last round that ended well -- so an announcement a failed or dropped round made
+is made again -- and opens on what is unread, by channel and count, when deliveries have passed it.
+Two things change in the generalization: `keep` today copies what the round announced, a mid-round
+announcement included, where the baseline is the summary the round opened on; and the comparison is
+of live state rather than of deliveries, so a receive that leaves something unread is a change too.
+So a round the model ends with nothing changed is followed by nothing; a new arrival changes the
+summary and opens a round; a request received in one round and still unanswered when it ends is a
+change once, and earns one round; a kernel that answered or read anything in a round gets the next
+round, whatever arrived meanwhile, unless nothing is left open; and a round opened this way counts
+no attempt against any request. `agent-classes.md` carries the request side in full, with the traces
+the rule and its baseline were decided on, and `messages.md` the announcement's text.
 
 A round has no fixed duration, and this is the point most easily misread. An execution may await
 something slow -- a build, a deployment, CI, a human review -- and the round simply lasts that
@@ -236,6 +292,11 @@ That extends to runtime wakes generally, not just user input. A bump the host de
 reasons -- an operator checking in, a limit coming into view, a condition it is tracking on the
 agent's behalf -- is the same category and takes the same path. The agent does not have to
 enumerate them, and adding one later does not change a signature.
+
+The same rule covers a child's request traffic (`agent-classes.md`). A request arriving on one of
+the child's request channels is input: it ends a `runtime.wait` in the child, and it starts a round
+for a child that was idle. A reply settling a handle the parent holds is a completion: it resumes
+code awaiting that handle and never calls the model.
 
 **Decided in `0003-09`: `MessageAvailable` derives from `BaseException`**, as
 `asyncio.CancelledError` has since Python 3.8, and is reached as `runtime.MessageAvailable`. As an
