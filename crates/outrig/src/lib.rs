@@ -17,14 +17,15 @@
 //
 // One gate covers both crates: `outrig` is a hard dependency of `outrig-cli`,
 // so cargo stops here before the binary is touched. Deleting this is part of
-// the acceptance criteria in `plan/next/macos-host-support.md`.
+// the acceptance criteria in #295.
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "outrig does not build for this platform. Its container plumbing calls \
      setns(2) and CLONE_NEW* unconditionally, through the `network` and \
      `nsfork` modules. On Windows use WSL2, which is an ordinary Linux build; \
      on macOS run inside podman machine's VM. Host-native support for either \
-     is tracked in plan/next/{macos,windows}-host-support.md."
+     is tracked in https://github.com/tgockel/outrig/issues/295 and \
+     https://github.com/tgockel/outrig/issues/296."
 );
 
 use std::path::{Path, PathBuf};

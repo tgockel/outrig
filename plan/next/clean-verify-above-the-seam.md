@@ -2,9 +2,8 @@
 
 ## Context
 
-0002-53 fixed `outrig clean` claiming to have removed containers it had not
-(`plan/next/clean-batch-removal-fidelity.md`). The fix works and is measured, but it was
-installed in the wrong place.
+0002-53 fixed `outrig clean` claiming to have removed containers it had not. The fix works
+and is measured, but it was installed in the wrong place.
 
 `execute_with` (`crates/outrig-cli/src/cli/clean.rs`) is deliberately parameterized over its
 engine reads -- it takes `running`, `labeled`, and `build` as arguments so the sweep is testable
@@ -54,5 +53,4 @@ covered by the tests that cover the rest of the sweep.
 
 ## Dependencies
 
-- After `plan/next/clean-batch-removal-fidelity.md`, which landed in 0002-53 and is what this
-  refines.
+- After 0002-53's fix to what `outrig clean` reports as removed, which this refines.

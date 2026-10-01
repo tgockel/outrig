@@ -2345,8 +2345,7 @@ fn handle_prompt_error(
     if let Some(label) = retry::exhausted_transient_label(&err) {
         // `PromptError::CompletionError` carries no `chat_history`, so a turn
         // that died on a *later* model call loses the tool calls it already
-        // ran. Filed as
-        // `plan/next/partial-turn-history-on-failed-model-call.md`.
+        // ran: #197.
         return endpoint_failed(
             format!("LLM endpoint failed and did not recover ({label})"),
             None,

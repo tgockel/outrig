@@ -1,5 +1,15 @@
 # A non-object `input_schema` still costs the session every tool
 
+> **Premise corrected.** The `Err` branch this entry targets can't be reached with a real MCP
+> client. `McpClient::list_tools` (`crates/outrig/src/mcp.rs`) decodes through rmcp's typed `Tool`,
+> whose `input_schema` is `Arc<JsonObject>`. So a non-object schema fails rmcp's decode of the
+> server's whole listing first, as `McpToolsListFailed`, and that aborts both `outrig run` and
+> `outrig mcp`. Only the test `FakeClient` reaches the branch below. Skip-and-log here would
+> change nothing a user sees. The open question is whether one malformed tool should cost its
+> server's whole listing, and answering yes to tolerance needs a lenient decode of `tools/list`.
+> The doc on `McpTool::input_schema` (`crates/outrig/src/mcp_content.rs`) still says
+> `ProxyServer::build` is what rejects such a schema.
+
 ## Context
 
 `0002-44` stopped a tool-name clash from failing `ProxyServer::build`: the losing name is
@@ -41,8 +51,7 @@ A tool outrig cannot represent costs that tool, not the listing.
 - **Check the `outrig run` path for the same shape.** `McpToolAdapter::from_client_tools`
   carries `input_schema` as an opaque `Value` and never validates it, so the two halves
   disagree about what a malformed schema costs. Whatever is decided here should be the answer
-  for both; this overlaps `plan/next/run-path-has-no-tool-name-guard.md` and the two may want
-  to land together.
+  for both; this overlaps #277 and the two may want to land together.
 
 ## Acceptance
 

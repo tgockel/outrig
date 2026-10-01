@@ -1551,7 +1551,7 @@ fn attempt_token() -> String {
 /// stamps and selects its own label instead. This stays because it is published
 /// surface, not because anything here needs it; whether it should survive the
 /// next surface review is recorded in
-/// `plan/next/a-container-handle-should-hold-the-id-podman-gave-it.md`.
+/// `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`.
 ///
 /// Synchronous, detached, and needs no tokio runtime, so it is safe from a
 /// `Drop`. It goes through `crate::supervise`, so the `podman rm` it starts

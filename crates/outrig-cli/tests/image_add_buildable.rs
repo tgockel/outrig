@@ -89,8 +89,7 @@ async fn assert_toolchain_probe(toolchain: Toolchain, probe: &str, expected: &[&
     .tag;
 
     // Not under a timeout: the first `--userns=keep-id` start of an image this
-    // size can spend minutes remapping its layers
-    // (plan/next/keepid-first-run-layer-remap-cost.md).
+    // size can spend minutes remapping its layers (#284).
     let host_ws = tempfile::tempdir().expect("tempdir");
     let mut container = Container::start(
         &tag,

@@ -255,10 +255,11 @@ user asked for.
 Metal is only usable on macOS targets, and outrig does not build for one today: its
 container plumbing calls `setns(2)` and `CLONE_NEW*` unconditionally, so
 `crates/outrig/src/lib.rs` rejects a non-Linux target outright. That makes `metal`
-unreachable in practice until `plan/next/macos-host-support.md` lands. It stays declared so
-the feature matrix and the macOS-only dependency block in `crates/outrig-cli/Cargo.toml` do
-not rot: non-macOS builds can compile with it for that coverage, but instantiating a Metal
-device fails with a platform error.
+unreachable in practice until macOS host support
+([#295](https://github.com/tgockel/outrig/issues/295)) lands. It stays
+declared so the feature matrix and the macOS-only dependency block in
+`crates/outrig-cli/Cargo.toml` do not rot: non-macOS builds can compile with it for that
+coverage, but instantiating a Metal device fails with a platform error.
 
 For one-off runs, `outrig run --device cuda`, `--device cuda:1`, `--device metal`, or
 `--device cpu` overrides the model's configured `device` without editing the config file.

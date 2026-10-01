@@ -104,7 +104,7 @@ choosing it means the API cleanup does *not* happen in the same release.
   `[workspace.dependencies]`. Both evaporate with the feature; the *rest* of that
   entry (a `cargo hack --each-feature` job) is independent and still wanted.
 - `plan/next/streaming-path-has-no-http-retry.md` -- see above.
-- `plan/next/macos-host-support.md` -- mentions `metal` as motivation; re-read.
+- #295 (macOS host support) -- mentions `metal` as motivation; re-read.
 
 ## Deliverables (sketch)
 

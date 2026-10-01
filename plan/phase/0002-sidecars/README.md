@@ -64,10 +64,9 @@ rationale.
 
 ## Out of scope
 
-- TLS-terminating inspection (`plan/next/network-interceptor-mitm.md`). The interceptor gains
-  multi-container reach and correct policy semantics, not visibility into payloads.
-- macOS and Windows hosts. Both stay declared and unreachable; see
-  `plan/next/macos-host-support.md` and `plan/next/windows-host-support.md`.
+- TLS-terminating inspection (#294). The interceptor gains multi-container reach and
+  correct policy semantics, not visibility into payloads.
+- macOS and Windows hosts. Both stay declared and unreachable; see #295 and #296.
 - Removing the deprecated in-process local-LLM backend. 0.2.0 decides what the deprecated
   surface does; the removal itself is `plan/next/remove-deprecated-local-llm.md`.
 - The post-0.2.0 buffer that the release audit surfaced. It is catalogued under

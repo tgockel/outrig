@@ -104,8 +104,7 @@ get, a `plan/next/` entry.
 - The panic-hook sweep removing by requested name is **no longer buffered** -- `0002-55` fixed it,
   and what that task could not reach is refiled as
   `plan/next/panic-hook-sweep-is-never-driven-by-a-panic.md`,
-  `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`, and
-  `plan/next/a-forked-child-inherits-the-parents-cleanup-obligations.md`.
+  `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`, and #272.
 - The four-site `[security]` lowering (`plan/next/launch-spec-security-lowering.md`) is the same
   silent-drop class as `0002-41` and stays buffered: `0002-41` fixed a block that was not lowered
   at all, which was the bug; the four sites are ergonomics. It is *not* the same conversion --
@@ -113,10 +112,10 @@ get, a `plan/next/` entry.
 - `Transcript` is a concrete public sink and therefore an extension-point commitment that `0002-47`
   does not cover.
 - Dynamic sidecar add has no removal or handle-lifecycle contract.
-- Device colon grammar, mount lexical normalization, and the silent Anthropic ceiling remain
-  buffered. Startup-banner testing no longer does: `0002-49` pulled it in, since three of its
-  documentation corrections are what the banner would have regressed. What it could not reach --
-  the mid-turn failover move announcement -- is refiled as
+- The silent Anthropic ceiling remains buffered; device colon grammar and mount lexical
+  normalization are now #263 and #262. Startup-banner testing is no longer buffered: `0002-49`
+  pulled it in, since three of its documentation corrections are what the banner would have
+  regressed. What it could not reach -- the mid-turn failover move announcement -- is refiled as
   `plan/next/failover-move-announcement-untested.md`.
 - The workspace rustdoc output-name collision now has one, filed by `0002-52` while adding the
   `cargo rustdoc` gate whose `-p` and `--lib` work around it:

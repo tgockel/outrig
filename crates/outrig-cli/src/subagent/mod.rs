@@ -627,8 +627,7 @@ impl ModelLabel {
     /// That is the model the subagent starts on, and for a chain it is a
     /// preference rather than a certainty: a mid-turn move changes which model
     /// is answering without changing this label. Attribution that has to be
-    /// exact about what served a given reply cannot read it -- see
-    /// `plan/next/chain-attribution-names-the-first-candidate.md`.
+    /// exact about what served a given reply cannot read it -- see #265.
     fn of(resolved: &ResolvedAgent) -> Self {
         Self {
             // `model_display`, not `model_name`: a launch under an alias shows

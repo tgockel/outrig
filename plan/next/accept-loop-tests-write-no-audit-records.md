@@ -32,8 +32,8 @@ otherwise idle machine. `SNIFF_TIMEOUT` is 750 ms, so the 30 s is the poll givin
 than a sniff window.
 
 The shared fact is that **zero** records reach `NETWORK_LOG` -- one test wants 1, the other
-wants 4, and both get 0. So this is not the accounting question in
-`accept-loop-reaps-only-on-accept.md`; nothing is being written at all.
+wants 4, and both get 0. So this is not the accounting question in #267; nothing is
+being written at all.
 
 ## Provenance
 
@@ -80,7 +80,7 @@ the tests depend on ambient conditions they do not state; if CI is red too, it i
 
 ## See also
 
-- `plan/next/accept-loop-reaps-only-on-accept.md` -- same loop, different claim (*when*
-  handles are reaped, not whether records are written).
+- #267 -- same loop, different claim (*when* handles are reaped, not whether records are
+  written).
 - `plan/next/lib-unit-test-flake.md` -- the other `--lib` failure, which is a genuine flake in
   `process_tests` and unrelated.

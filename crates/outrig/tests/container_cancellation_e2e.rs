@@ -246,8 +246,8 @@ async fn engine_holds(name: &str) -> bool {
 /// container was running frees the name in 25-500 ms, while one that landed
 /// after a *start* had completed pays podman's full ten-second stop grace,
 /// because the container runs `sleep infinity` as PID 1 and PID 1 discards a
-/// SIGTERM it has no handler for. `plan/next/primary-image-needs-no-sleep.md`
-/// owns that second figure. The ceiling is sized for it.
+/// SIGTERM it has no handler for. #255 owns that second figure. The
+/// ceiling is sized for it.
 async fn await_engine_free(name: &str) -> Duration {
     let started = Instant::now();
     loop {
