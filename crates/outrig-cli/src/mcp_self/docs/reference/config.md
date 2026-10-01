@@ -454,9 +454,10 @@ only local models has none, and needs none.
 
 When every candidate has failed the report names each one's reason, and what ends depends
 on why. If at least one failed recoverably -- a rate limit, an unusable response -- the
-**turn** ends and the prompt can be sent again. If every one was terminal, such as a `401`
-at each vendor, the **session** ends, exactly as that failure ends it for a single model:
-no resend can satisfy credentials that are refused everywhere.
+**turn** ends, keeping any tool calls it had already run, and can be continued, or sent
+again if it failed on its first call. If every one was terminal, such as a `401` at each
+vendor, the **session** ends, exactly as that failure ends it for a single model: no resend
+can satisfy credentials that are refused everywhere.
 
 A single-target alias is pure renaming, so it keeps its target's own errors -- an unset key
 still names the variable, and an in-process model in a build without `local-llm` still says

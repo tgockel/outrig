@@ -150,9 +150,11 @@ When every candidate has failed, what happens next depends on *why*. The message
 candidate with its own reason either way:
 
 * **At least one failed recoverably** -- a rate limit, an unreachable host, a response that could
-  not be used -- and the **turn** ends. Nothing was appended to the history, so sending the prompt
-  again retries it. One vendor rate-limiting while another's key is revoked lands here too: the
-  rate limit is the reason that can lift on its own, so it is worth waiting out.
+  not be used -- and the **turn** ends. If that was the turn's first model call nothing was
+  appended to the history, and sending the prompt again retries it; a later call keeps the tool
+  calls the turn already ran, and `continue` picks up from them (see
+  [`outrig run`](../usage/run.md)). One vendor rate-limiting while another's key is revoked lands
+  here too: the rate limit is the reason that can lift on its own, so it is worth waiting out.
 * **Every one was terminal** -- a revoked key answering `401` at all three vendors, say -- and the
   **session** ends, exactly as that failure ends it for a single model. No resend can satisfy a
   prompt whose credentials are refused everywhere, and advising one would loop forever.
@@ -384,9 +386,10 @@ model -> tool -> model loop, and retrying the *turn* would re-run container tool
 already happened. Tools run between model calls, never inside one, so replaying either an
 HTTP request or a model call replays exactly that and nothing observable.
 
-If the budget or the attempts do run out, the turn ends and the REPL prompts again with the
-conversation untouched -- see [`outrig run`](../usage/run.md). The session, and its
-containers, stay up.
+If the budget or the attempts do run out, the turn ends and the REPL prompts again. The
+conversation keeps the tool calls the turn had already run, with their results, and is
+otherwise untouched -- see [`outrig run`](../usage/run.md). The session, and its containers,
+stay up.
 
 ## Other Rig provider styles
 

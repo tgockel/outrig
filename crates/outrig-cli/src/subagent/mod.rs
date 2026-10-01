@@ -1720,7 +1720,17 @@ mod tests {
         provider: &ScriptedProvider,
         tool_call_max: usize,
     ) -> (SubagentRegistry, tempfile::TempDir) {
+        launch_probe_with(provider, tool_call_max, Vec::new()).await
+    }
+
+    /// [`launch_probe`], with `tools` as the session's MCP tools.
+    async fn launch_probe_with(
+        provider: &ScriptedProvider,
+        tool_call_max: usize,
+        tools: Vec<SessionTool>,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
         let (mut registry, log_dir) = test_registry();
+        registry.ctx.mcp_tools = tools;
         registry.ctx.resolved = test_resolved_at(
             &provider.server.base_url,
             Some(0),
@@ -2231,6 +2241,48 @@ mod tests {
     #[tokio::test]
     async fn a_round_whose_endpoint_failed_folds_its_undelivered_steer() {
         a_failed_round_folds_its_undelivered_steer(StatusCode::SERVICE_UNAVAILABLE).await;
+    }
+
+    /// A round whose endpoint fails *after* a tool call ran keeps that call.
+    /// The round still reaches the parent as failed, but its history holds the
+    /// call answered by its result, so the round the parent starts next goes on
+    /// from it rather than running it again (#197).
+    #[tokio::test]
+    async fn a_round_whose_endpoint_failed_after_a_tool_call_keeps_it() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        let call = provider.next_call().await;
+        let message = tool_call_message(&[("counted", "{}")]);
+        call.respond(StatusCode::OK, completion(message, "tool_calls"));
+        provider
+            .next_call()
+            .await
+            .fail(StatusCode::SERVICE_UNAVAILABLE);
+
+        match registry.get_result("probe").await {
+            Ok(Outcome::Error(message)) => {
+                assert!(message.starts_with("round failed"), "got: {message}");
+            }
+            other => panic!("the failed round must reach the parent, got: {other:?}"),
+        }
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions("do the work"),
+            1,
+            "the failed round's prompt stays with its work"
+        );
+        let messages = call.body["messages"].as_array().expect("messages");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["tool_calls"][0]["function"]["name"] == "counted"),
+            "the follow-up carries the call the failed round ran: {messages:#?}"
+        );
+        call.reply("ok");
     }
 
     /// A and B queue while the subagent is idle. A steer sent during A's last

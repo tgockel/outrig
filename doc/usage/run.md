@@ -317,20 +317,31 @@ the call, honoring the server's own `Retry-After` when it sends one, and prints 
 ```
 
 If the endpoint is still failing when the budget runs out, the turn ends and you are back at
-`>`, with the containers still up and the conversation unchanged:
+`>`, with the containers still up. What the conversation keeps depends on how far the turn got.
+A turn whose first model call failed has done nothing, and the conversation is unchanged:
 
 ```
 [outrig] LLM endpoint failed and did not recover (HTTP 429 Too Many Requests); ending turn
 [outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
 ```
 
-Note the difference from the tool-call max above: nothing was appended, so there is no partial
-turn to `continue`. Resend the prompt itself once the window clears. The budget is
+Resend the prompt itself once the window clears. A later model call comes after tool calls the
+turn has already run, and those stay in the conversation with their results, as they do when the
+tool-call max fires:
+
+```
+[outrig] LLM endpoint failed and did not recover (HTTP 429 Too Many Requests); ending turn
+[outrig] partial history retained -- send another prompt (e.g. "continue")
+        to keep going, or "/reset" to drop it.
+```
+
+Once the window clears, send `continue` rather than the prompt again: the model sees the tool
+calls that already ran, where a resent prompt could have it run them a second time. The budget is
 `retry-budget-secs`; see [config reference](../reference/config.md) to change it, and
 [LLM providers](../concepts/llm-providers.md) for which failures count as transient.
 
-A provider that answers with nothing usable is handled the same way. The call is retried
-twice before outrig gives up:
+A provider that answers with nothing usable is handled the same way, down to what the
+conversation keeps. The call is retried twice before outrig gives up:
 
 ```
 [outrig] model returned an unusable response (Response contained no message or tool call
@@ -424,11 +435,14 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
 
 - **Ctrl-C** during a turn cancels the in-flight LLM/tool call. The REPL prints
   `[outrig] interrupted` to stderr and returns to a `> ` prompt with conversation history intact,
-  so you can redirect the agent. A turn interrupted before it finished is not added, nor is
-  anything the agent did toward it: the next turn sees the conversation as it stood before that
-  prompt, so say what you still need rather than referring back to it. A local model's reply that
-  had already streamed in full is kept, even if Ctrl-C lands while its output is still being
-  written. It stops the agent *waiting*, not work already handed to the container: a
+  so you can redirect the agent. A turn interrupted before it finished keeps the tool calls whose
+  results had already gone back to the model, with those results and the prompt that led to
+  them, so the next turn knows those calls ran. The rest of the turn is not kept: a tool call
+  still running when Ctrl-C lands, any the model asked for alongside it, and the whole of a turn
+  interrupted before its first results went back, which leaves the conversation as it stood
+  before that prompt. Say what you still need rather than referring back to them. A local model's
+  reply that had already streamed in full is kept, even if Ctrl-C lands while its output is still
+  being written. It stops the agent *waiting*, not work already handed to the container: a
   `shell__exec` that started a build runs to completion, and any
   [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn.
 

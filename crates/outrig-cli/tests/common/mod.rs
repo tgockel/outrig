@@ -220,6 +220,8 @@ pub struct CannedResponse {
     /// `Content-Length`, and `Connection` are always sent and are not listed
     /// here.
     pub headers: Vec<(String, String)>,
+    /// Answer nothing at all; see [`Self::held`].
+    pub held: bool,
 }
 
 impl CannedResponse {
@@ -234,6 +236,18 @@ impl CannedResponse {
             status,
             body,
             headers: Vec::new(),
+            held: false,
+        }
+    }
+
+    /// A request the mock records and never answers, holding the connection
+    /// open until the client gives up on it: a model call still in flight,
+    /// which is where a test drops a turn to do what Ctrl-C does.
+    #[allow(dead_code)]
+    pub fn held() -> Self {
+        Self {
+            held: true,
+            ..Self::status(0, serde_json::Value::Null)
         }
     }
 
@@ -287,6 +301,16 @@ async fn serve_mock_http(
             return;
         };
         served += 1;
+
+        if canned.held {
+            // Off the accept loop, so later requests are still served. Reading
+            // to EOF is what notices the client has dropped the request.
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let _ = sock.read_to_end(&mut Vec::new()).await;
+            });
+            continue;
+        }
 
         let body = serde_json::to_string(&canned.body).expect("canned body serializes");
         let extra: String = canned

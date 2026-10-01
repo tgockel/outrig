@@ -26,6 +26,10 @@
 //! * an alias chain moves to its next candidate *inside* a `completion()`
 //!   call, so a turn that has already run a tool keeps its history and does
 //!   not re-execute it -- which needs two endpoints, and so needs two mocks;
+//! * a turn that stops past its first model call without finishing -- a call
+//!   that failed for good, or a future dropped the way Ctrl-C drops it --
+//!   keeps the tool calls it ran, answered in the order Anthropic requires,
+//!   for the next request to carry;
 //! * reasoning Anthropic did not issue -- a fallback's, left in a chain's
 //!   shared history -- is not sent back to it as a `thinking` block it would
 //!   refuse.
@@ -39,16 +43,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rig::OneOrMany;
 use rig::completion::Message;
-use rig::completion::message::{AssistantContent, Reasoning};
+use rig::completion::message::{AssistantContent, Reasoning, ToolResultContent, UserContent};
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::{Value, json};
 
 use outrig::config::Config;
-use outrig_cli::llm::{build_agent, resolve_agent};
+use outrig_cli::llm::{RigAgent, TurnStop, build_agent, resolve_agent};
 use outrig_cli::session_tool;
 
-use common::{CannedResponse, drain_recorded, set_test_env, start_mock_http, unset_test_env};
+use common::{
+    CannedResponse, RecordedRequest, drain_recorded, set_test_env, start_mock_http, unset_test_env,
+};
 
 // ---- the in-process tool --------------------------------------------------
 
@@ -889,6 +895,356 @@ async fn a_rejected_api_key_stays_fatal() {
         1,
         "a 401 is terminal at both retry layers",
     );
+}
+
+/// The model asking for one echo, under the id the assertions below look for.
+fn echo_tool_use() -> CannedResponse {
+    message(
+        json!([{
+            "type": "tool_use",
+            "id": "toolu_mock_1",
+            "name": "outrig_test_echo",
+            "input": { "value": "ping" }
+        }]),
+        "tool_use",
+    )
+}
+
+fn rate_limited() -> CannedResponse {
+    CannedResponse::status(
+        429,
+        json!({
+            "type": "error",
+            "error": { "type": "rate_limit_error", "message": "slow down" },
+        }),
+    )
+}
+
+/// Assert that `history` is `prior` followed by the turn that asked for one
+/// echo and ran it: the prompt, the assistant's `tool_use`, then the user turn
+/// carrying its `tool_result` -- the order Anthropic requires -- and nothing
+/// after it.
+fn assert_kept_the_echo(history: &[Message], prior: &[Message], prompt: &str) {
+    assert!(
+        history.starts_with(prior),
+        "the conversation before the turn is untouched: {history:#?}",
+    );
+    let [asked, called, answered] = &history[prior.len()..] else {
+        panic!("the turn keeps its prompt, the tool call, and its result: {history:#?}");
+    };
+    assert_eq!(asked, &Message::user(prompt));
+    let Message::Assistant { content, .. } = called else {
+        panic!("the tool call is the assistant's: {called:#?}");
+    };
+    assert!(
+        content.iter().any(|part| matches!(
+            part,
+            AssistantContent::ToolCall(call)
+                if call.id == "toolu_mock_1" && call.function.name == "outrig_test_echo"
+        )),
+        "the assistant turn carries the tool_use that ran: {called:#?}",
+    );
+    let Message::User { content } = answered else {
+        panic!("the result comes back on a user turn: {answered:#?}");
+    };
+    assert!(
+        content.iter().any(|part| matches!(
+            part,
+            UserContent::ToolResult(result)
+                if result.id == "toolu_mock_1"
+                    && result.content.iter().any(|item| matches!(
+                        item,
+                        ToolResultContent::Text(text) if text.text.contains("pong:ping")
+                    ))
+        )),
+        "the result answers that call with the tool's output: {answered:#?}",
+    );
+}
+
+/// Assert that a request carries the echo's `tool_use`, answered by its
+/// `tool_result` in the very next message, and ends with `prompt` -- which is
+/// how the next turn learns the tool already ran.
+fn assert_request_carries_the_echo(request: &RecordedRequest, prompt: &str) {
+    let messages = request.body["messages"].as_array().expect("messages array");
+    let called = messages
+        .iter()
+        .position(|message| {
+            message["role"] == "assistant"
+                && message["content"].as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block["type"] == "tool_use" && block["id"] == "toolu_mock_1")
+                })
+        })
+        .unwrap_or_else(|| panic!("the request lacks the tool_use that ran: {messages:#?}"));
+    let answered = messages
+        .get(called + 1)
+        .unwrap_or_else(|| panic!("nothing answers the tool_use: {messages:#?}"));
+    assert_eq!(answered["role"], "user");
+    assert_eq!(answered["content"][0]["type"], "tool_result");
+    assert_eq!(
+        answered["content"][0]["tool_use_id"], "toolu_mock_1",
+        "the result must name the call it answers",
+    );
+    assert!(
+        answered.to_string().contains("pong:ping"),
+        "the tool's output reaches the model: {answered:#?}",
+    );
+    let last = messages.last().expect("a prompt");
+    assert!(
+        last["role"] == "user" && last.to_string().contains(prompt),
+        "the new prompt follows the kept work: {messages:#?}",
+    );
+}
+
+/// Drive a turn until the mock has recorded `calls` requests -- the last held
+/// open -- then drop it inside that model call. That is what `repl.rs` does on
+/// Ctrl-C: it races the turn against the interrupt, and the losing future is
+/// dropped mid-await.
+async fn drop_turn_in_call(
+    agent: &RigAgent,
+    prompt: &str,
+    history: &mut Vec<Message>,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+    calls: usize,
+) {
+    let turn = std::pin::pin!(agent.run_turn(prompt, history));
+    let parked = async {
+        for _ in 0..calls {
+            requests.recv().await.expect("the mock is serving");
+        }
+    };
+    tokio::select! {
+        end = turn => panic!("a held call keeps the turn waiting, got: {end:?}"),
+        () = parked => {}
+    }
+}
+
+/// The case #197 is about: a turn runs a tool, and its *next* model call
+/// fails for good. Retries are off, so the `429` is final at once.
+///
+/// This used to leave the history as it stood before the prompt and advise
+/// sending the prompt again, which would run the tool again -- harmless for
+/// this echo, a repeat for a container tool call that wrote something. The
+/// tool call and its result are kept instead, and the next turn's request
+/// carries them, so a `continue` picks up from the work.
+#[tokio::test]
+async fn a_failed_call_after_a_tool_call_keeps_it() {
+    let (addr, mut requests) = start_mock_http(vec![
+        echo_tool_use(),
+        rate_limited(),
+        text_reply("Picked up from the echo."),
+    ])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_FAILED_AFTER_TOOL";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let tool = EchoTool::default();
+    let agent = build_mock_agent(&cfg, &[var], vec![tool.clone()]).await;
+
+    let prior = vec![
+        Message::user("what is this repo?"),
+        Message::assistant("outrig"),
+    ];
+    let mut history = prior.clone();
+    let end = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("a failed call ends the turn, it does not fail the session");
+
+    assert!(
+        matches!(end.stopped, Some(TurnStop::EndpointFailed(_))),
+        "got: {:?}",
+        end.stopped,
+    );
+    assert_eq!(end.reply, "", "the model spoke only in the tool call");
+    assert_eq!(tool.call_count(), 1);
+    assert_kept_the_echo(&history, &prior, "echo ping for me");
+    assert_eq!(
+        drain_recorded(&mut requests).len(),
+        2,
+        "the tool_use, then the 429, final with retries off",
+    );
+
+    let reply = agent
+        .run_turn("continue", &mut history)
+        .await
+        .expect("the next turn runs on the same agent")
+        .reply;
+    assert_eq!(reply, "Picked up from the echo.");
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "continuing does not run the tool again"
+    );
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 1, "{recorded:#?}");
+    assert_request_carries_the_echo(&recorded[0], "continue");
+}
+
+/// A response that stays unusable ends the turn the same way, and keeps the
+/// same work.
+#[tokio::test]
+async fn an_unusable_response_after_a_tool_call_keeps_it() {
+    let (addr, _requests) =
+        start_mock_http(vec![echo_tool_use(), message(json!([]), "max_tokens")]).await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_UNUSABLE_AFTER_TOOL";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let tool = EchoTool::default();
+    let agent = build_mock_agent(&cfg, &[var], vec![tool.clone()]).await;
+
+    let mut history = Vec::new();
+    let end = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("an unusable response ends the turn, it does not fail the session");
+
+    assert!(
+        matches!(end.stopped, Some(TurnStop::EndpointFailed(_))),
+        "got: {:?}",
+        end.stopped,
+    );
+    assert_eq!(tool.call_count(), 1);
+    assert_kept_the_echo(&history, &[], "echo ping for me");
+}
+
+/// So does an alias chain whose every candidate failed, while one of them
+/// failed for a reason a later prompt can get past.
+#[tokio::test]
+async fn an_exhausted_chain_after_a_tool_call_keeps_it() {
+    let down = || CannedResponse::status(503, json!({ "type": "error" }));
+    let (head, _head_requests) = start_mock_http(vec![echo_tool_use(), down()]).await;
+    let (next, _next_requests) = start_mock_http(vec![down()]).await;
+
+    let vars = [
+        "OUTRIG_TEST_ANTHROPIC_CHAIN_AFTER_TOOL_HEAD",
+        "OUTRIG_TEST_ANTHROPIC_CHAIN_AFTER_TOOL_NEXT",
+    ];
+    let cfg = mock_chain_config(head, next, vars);
+    let tool = EchoTool::default();
+    let agent = build_mock_agent(&cfg, &vars, vec![tool.clone()]).await;
+
+    let mut history = Vec::new();
+    let end = agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("a chain that failed recoverably ends the turn, not the session");
+
+    assert_eq!(
+        end.stopped,
+        Some(TurnStop::EndpointFailed(
+            "every model candidate failed".to_string()
+        )),
+    );
+    assert_eq!(tool.call_count(), 1);
+    assert_kept_the_echo(&history, &[], "echo ping for me");
+}
+
+/// A turn that fails on its *first* model call has run nothing, so the history
+/// is exactly what it was, and sending the prompt again is the right advice.
+/// Here that comes straight after a turn that did run a tool, whose work must
+/// not come back a second time.
+#[tokio::test]
+async fn a_failure_on_the_first_call_leaves_the_history_as_it_was() {
+    let (addr, _requests) = start_mock_http(vec![
+        echo_tool_use(),
+        text_reply("The echo said pong:ping."),
+        rate_limited(),
+    ])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_FIRST_CALL_FAILS";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let tool = EchoTool::default();
+    let agent = build_mock_agent(&cfg, &[var], vec![tool.clone()]).await;
+
+    let mut history = Vec::new();
+    agent
+        .run_turn("echo ping for me", &mut history)
+        .await
+        .expect("the first turn completes");
+    let before = history.clone();
+
+    let end = agent
+        .run_turn("and once more", &mut history)
+        .await
+        .expect("a failed call ends the turn, it does not fail the session");
+
+    assert!(
+        matches!(end.stopped, Some(TurnStop::EndpointFailed(_))),
+        "got: {:?}",
+        end.stopped,
+    );
+    assert_eq!(
+        history, before,
+        "nothing ran, so nothing is added -- not even the prompt",
+    );
+    assert_eq!(tool.call_count(), 1);
+}
+
+/// Ctrl-C drops the turn's future mid-await, and no error comes back to splice
+/// from. Dropped inside its second model call, after its tool ran, the turn
+/// keeps the tool call and its result as a failed call does, and the next turn
+/// carries them.
+#[tokio::test]
+async fn a_turn_dropped_mid_call_keeps_the_tool_calls_before_it() {
+    let (addr, mut requests) = start_mock_http(vec![
+        echo_tool_use(),
+        CannedResponse::held(),
+        text_reply("Picked up from the echo."),
+    ])
+    .await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_DROPPED_AFTER_TOOL";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let tool = EchoTool::default();
+    let agent = build_mock_agent(&cfg, &[var], vec![tool.clone()]).await;
+
+    let prior = vec![
+        Message::user("what is this repo?"),
+        Message::assistant("outrig"),
+    ];
+    let mut history = prior.clone();
+    drop_turn_in_call(&agent, "echo ping for me", &mut history, &mut requests, 2).await;
+
+    assert_eq!(tool.call_count(), 1);
+    assert_kept_the_echo(&history, &prior, "echo ping for me");
+
+    let reply = agent
+        .run_turn("continue", &mut history)
+        .await
+        .expect("the next turn runs on the same agent")
+        .reply;
+    assert_eq!(reply, "Picked up from the echo.");
+    assert_eq!(
+        tool.call_count(),
+        1,
+        "continuing does not run the tool again"
+    );
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 1, "{recorded:#?}");
+    assert_request_carries_the_echo(&recorded[0], "continue");
+}
+
+/// Dropped inside its first model call, a turn has run nothing, and the
+/// history is left as it was.
+#[tokio::test]
+async fn a_turn_dropped_in_its_first_call_adds_nothing() {
+    let (addr, mut requests) = start_mock_http(vec![CannedResponse::held()]).await;
+
+    let var = "OUTRIG_TEST_ANTHROPIC_DROPPED_FIRST_CALL";
+    let cfg = mock_config(addr, var, MODEL, Some(1024), Some(0));
+    let agent = build_mock_agent(&cfg, &[var], vec![EchoTool::default()]).await;
+
+    let prior = vec![
+        Message::user("what is this repo?"),
+        Message::assistant("outrig"),
+    ];
+    let mut history = prior.clone();
+    drop_turn_in_call(&agent, "echo ping for me", &mut history, &mut requests, 1).await;
+
+    assert_eq!(history, prior);
 }
 
 /// Anthropic requires `max_tokens` on every request, and rig only knows a

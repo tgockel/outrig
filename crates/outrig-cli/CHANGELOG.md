@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A turn that fails after running a tool call keeps the call and its result.** When a model
+  call failed for good -- a rate limit or outage that outlasted `retry-budget-secs`, every
+  candidate in an alias chain failing, a response outrig could not use -- the turn ended with the
+  conversation as it stood before the prompt, and outrig advised sending the prompt again. Past
+  the turn's first model call, that conversation was missing tool calls that had already run, so
+  the resend could run them a second time: a file written twice, a command run again. Ctrl-C
+  mid-turn dropped them the same way. The tool calls whose results had gone back to the model now
+  stay in the conversation with those results, and outrig advises sending another prompt (e.g.
+  "continue") instead. A failure on a turn's first model call still leaves the conversation
+  unchanged. A subagent round that fails this way keeps its tool calls for the round its parent
+  starts next.
 - **A local reply cut off inside a multi-byte character warns that it may be incomplete.** With
   `local-llm`, a turn whose `max-tokens` ceiling landed partway through a character such as an
   emoji ended as if it had finished. mistralrs-core 0.8.1 drops that turn's last chunk, and with

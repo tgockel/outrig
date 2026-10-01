@@ -447,9 +447,11 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
     let on_prompt = move |line: String| {
         let history = history_for_prompt.clone();
         async move {
-            // A turn the hook cut short (tool-call max) splices its partial
-            // history into `h` and returns normally. A Ctrl-C instead drops
-            // this future mid-await, and the guard puts `h` back regardless.
+            // A turn cut short -- by the tool-call max, or by an endpoint that
+            // stayed down -- splices its partial history into `h` and returns
+            // normally. A Ctrl-C instead drops this future mid-await: the turn
+            // splices what it had completed into `h` as it is dropped, and the
+            // guard puts `h` back regardless.
             let result = {
                 let mut h = TakenHistory::take(&history);
                 agent.run_turn(&line, &mut h).await
