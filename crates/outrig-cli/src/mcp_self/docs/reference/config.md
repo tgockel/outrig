@@ -688,9 +688,9 @@ container-path = "/resources/cache"
 access         = "read-write"
 ```
 
-- `host-path` (path, optional, default: `"."`): primary workspace host path. A
-  relative value resolves against the directory of the file that declared it --
-  see [path resolution](#path-resolution).
+- `host-path` (path, optional, default: `"."`): primary workspace host path, an
+  existing directory. A relative value resolves against the directory of the
+  file that declared it -- see [path resolution](#path-resolution).
 - `container-path` (path, optional, default: `"/workspace"`): where the primary
   workspace is mounted in the container.
 - `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
@@ -1119,10 +1119,10 @@ whichever repo is current, so give that one an absolute path. See
 [Validation rules](#validation-rules).
 
 Because provenance is recorded per entry, a diagnostic about a config-declared path names the
-file that declared it, as a trailing `(declared in "<path>")`. Every image and mount rule
-carries it -- including the mount rules that judge the value rather than look for a directory,
-since the question it answers is which file to go edit. The reported path stays the raw config
-value rather than the resolved one:
+file that declared it, as a trailing `(declared in "<path>")`. Every image,
+`[workspace].host-path`, and mount rule carries it -- including the mount rules that judge the
+value rather than look for a directory, since the question it answers is which file to go edit.
+The reported path stays the raw config value rather than the resolved one:
 
 ```
 workspace mount host-path "shared" does not exist (declared in "/home/you/.outrig/config.toml")
@@ -1345,8 +1345,9 @@ image-config in the merged config but does not require agent/model/provider wiri
   entry would be several paths wearing one entry's clothes; declare one path per entry.
 - Unmask paths must not be duplicated within one `unmask` list.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
-- Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
-  directory. Relative host paths resolve against the declaring file's directory.
+- `workspace.host-path` and every `workspace.mounts[*].host-path`, if validated with a repo root,
+  must exist and be a directory. Relative host paths resolve against the declaring file's
+  directory; an undeclared `workspace.host-path` is `.`, the repo root.
 - Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`.

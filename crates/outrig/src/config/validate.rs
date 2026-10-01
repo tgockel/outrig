@@ -9,7 +9,7 @@
 //!
 //! `api-key` syntax is enforced at parse time by `super::api_key`; this module
 //! only checks cross-references, MCP server-name shape, and disk-existence of
-//! image `dockerfile` / `context` paths.
+//! config-declared paths.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -174,6 +174,29 @@ pub enum ConfigValidationError {
 
     #[error("model-cache-root {path:?} must be an absolute path")]
     ModelCacheRootNotAbsolute { path: PathBuf },
+
+    #[error(
+        "workspace host-path {path:?} does not exist{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceHostMissing {
+        path: PathBuf,
+        /// The config file that declared `host-path`, or `None` for the
+        /// built-in `.` or a hand-built value.
+        declared_in: Option<PathBuf>,
+    },
+
+    #[error(
+        "workspace host-path {path:?} is not a directory{}",
+        declared_in_clause(declared_in)
+    )]
+    #[non_exhaustive]
+    WorkspaceHostNotDirectory {
+        path: PathBuf,
+        /// The config file that declared `host-path`, or `None` when unrecorded.
+        declared_in: Option<PathBuf>,
+    },
 
     // The five below restate `MountRuleViolation` in workspace terms, so their
     // `declared_in` means exactly what the variant it is mapped from means.
@@ -556,6 +579,7 @@ pub(super) fn validate_with_options(
     repo_root: Option<&Path>,
     options: ValidationOptions<'_>,
 ) -> Result<(), ConfigValidationError> {
+    validate_workspace_host_path(cfg, repo_root)?;
     validate_workspace_mounts(cfg, repo_root)?;
 
     if let Some(name) = &cfg.default_image
@@ -1327,6 +1351,29 @@ fn validate_capability_list(
     }
 
     Ok(seen)
+}
+
+/// Hold the primary `host-path` to the rule [`check_mount_list`] applies to
+/// every extra mount: when a repo root is known, it must exist and be a
+/// directory. Podman refuses a bind source that is missing, but only at
+/// `podman run`, and without naming the key or the file that declared it.
+fn validate_workspace_host_path(
+    cfg: &Config,
+    repo_root: Option<&Path>,
+) -> Result<(), ConfigValidationError> {
+    let Some(root) = repo_root else {
+        return Ok(());
+    };
+    let resolved = cfg.workspace.resolved_host_path(root);
+    let path = cfg.workspace.host_path().to_path_buf();
+    let declared_in = cfg.workspace.declared_in();
+    if !resolved.exists() {
+        return Err(ConfigValidationError::WorkspaceHostMissing { path, declared_in });
+    }
+    if !resolved.is_dir() {
+        return Err(ConfigValidationError::WorkspaceHostNotDirectory { path, declared_in });
+    }
+    Ok(())
 }
 
 pub(super) fn validate_workspace_mounts(

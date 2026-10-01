@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Config::validate` checks the primary `[workspace].host-path` on disk.** Given a repo root,
+  it held every `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]` `host-path` to an existing
+  directory but read nothing of `[workspace].host-path`. A typo there validated, and the session
+  failed at `podman run`, with podman's `statfs` error naming the resolved path but neither the
+  key nor the file. That `host-path` is now held to the same rule, resolved the same way, so
+  `Config::load`, `load_for_run`, and `load_for_build` refuse it -- the last as it refuses a bad
+  mount, though a build never mounts the workspace. Two new `ConfigValidationError` variants
+  report it, `WorkspaceHostMissing` and `WorkspaceHostNotDirectory`, each carrying the `path` as
+  written and, as `declared_in`, the file that declared it. `declared_in` is `None` for the
+  built-in `.` and for a value set through `Workspace::new` or `Workspace::set_host_path`.
+  `Config::validate(None)` still checks nothing on disk, so a caller that validates before
+  creating its workspace directory is unaffected.
+
 - **A finished session leaves no volumes behind.** Podman made an anonymous volume for each
   `VOLUME` a container's image declares, and an entrypoint-stdio sidecar's were never removed.
   When its server exited, the `podman start --attach` client was what acted on `--rm`, and

@@ -383,8 +383,9 @@ impl Config {
     }
 
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
-    /// `repo_root: Some(_)` enables `dockerfile`/`context` on-disk existence checks;
-    /// `None` keeps the check pure-structural for unit tests.
+    /// `repo_root: Some(_)` enables the on-disk existence checks for
+    /// config-declared paths; `None` keeps the check pure-structural for unit
+    /// tests.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
         Ok(())
@@ -1221,6 +1222,14 @@ impl Workspace {
             source_base_dir(self.source.as_ref(), repo_root),
             self.host_path(),
         )
+    }
+
+    /// The file to name in a diagnostic about `host-path`, or `None` when no
+    /// file declared it: the built-in `.`, or a value from [`Workspace::new`]
+    /// or [`set_host_path`](Self::set_host_path). Deliberately not defaulted
+    /// to the repo config, for the reason [`ImageConfig::declared_in`] gives.
+    pub(crate) fn declared_in(&self) -> Option<PathBuf> {
+        self.source.as_ref().map(ConfigSource::config_path)
     }
 }
 

@@ -260,6 +260,12 @@ pub outrig::config::ConfigValidationError::UnmaskPathListSeparator::path: alloc:
 pub outrig::config::ConfigValidationError::UnmaskPathRelative
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::image: alloc::string::String
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostMissing
+pub outrig::config::ConfigValidationError::WorkspaceHostMissing::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceHostMissing::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory
+pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::path: std::path::PathBuf

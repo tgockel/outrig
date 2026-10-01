@@ -575,10 +575,14 @@ context    = "missing-ctx"
 
     #[test]
     fn disk_checks_skipped_when_repo_root_is_none() {
-        // Same shape as dockerfile_missing_on_disk_errors -- but with
-        // `repo_root = None`, the on-disk existence check is skipped.
+        // Same shape as dockerfile_missing_on_disk_errors and
+        // workspace_missing_host_errors -- but with `repo_root = None`, the
+        // on-disk existence checks are skipped.
         let cfg = parse(
             r#"
+[workspace]
+host-path = "does/not/exist"
+
 [images.coding]
 dockerfile = "does/not/exist/Dockerfile"
 context    = "does/not/exist"
@@ -586,6 +590,43 @@ context    = "does/not/exist"
         );
         cfg.validate(None)
             .expect("structural-only validate ignores disk paths");
+    }
+
+    #[test]
+    fn workspace_missing_host_errors() {
+        let tmp = tempdir().unwrap();
+        let cfg = parse(
+            r#"
+[workspace]
+host-path = "missing-src"
+"#,
+        );
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        match err {
+            ConfigValidationError::WorkspaceHostMissing { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("missing-src"));
+            }
+            other => panic!("expected WorkspaceHostMissing, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_file_host_errors() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("src.txt"), "not a directory").unwrap();
+        let cfg = parse(
+            r#"
+[workspace]
+host-path = "src.txt"
+"#,
+        );
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        match err {
+            ConfigValidationError::WorkspaceHostNotDirectory { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("src.txt"));
+            }
+            other => panic!("expected WorkspaceHostNotDirectory, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -2289,6 +2330,7 @@ mod config_load {
             global.path(),
             "[workspace]\nhost-path = \"global-workspace\"\n",
         );
+        fs::create_dir(global.path().join("global-workspace")).unwrap();
 
         let mut cfg = Config::load(repo.path(), Some(&global_path)).expect("config loads");
         assert_eq!(
@@ -2318,6 +2360,7 @@ mod config_load {
             &global_dir,
             "[workspace]\nhost-path = \"global-workspace\"\n",
         );
+        fs::create_dir(global_dir.join("global-workspace")).unwrap();
 
         // Name the global config relatively, from its own parent directory.
         let restore = std::env::current_dir().unwrap();
@@ -3779,6 +3822,49 @@ container-path = "/shared"
         }
     }
 
+    /// The primary `host-path` is held to the extra mounts' rule, so a typo in
+    /// it stops the load naming the key, the value, and the file. Unchecked, it
+    /// reached `podman run`, whose `statfs` error names none of them (#249).
+    #[test]
+    fn missing_workspace_host_path_names_the_repo_config() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "[workspace]\nhost-path = \"does-not-exist\"\n");
+        let repo_cfg = repo.path().join(".agents/outrig/config.toml");
+
+        let err = expect_load_validation_err(Config::load(repo.path(), None).unwrap_err());
+        assert_eq!(
+            err.to_string(),
+            format!(
+                r#"workspace host-path "does-not-exist" does not exist (declared in {repo_cfg:?})"#
+            ),
+        );
+        assert!(matches!(
+            err,
+            ConfigValidationError::WorkspaceHostMissing { .. }
+        ));
+    }
+
+    /// The primary's half of the mount case above: an inherited `host-path` is
+    /// looked for beside the global config, and the error names that file.
+    #[test]
+    fn global_workspace_host_path_is_not_satisfied_by_a_repo_path() {
+        let (repo, _global, global_cfg) = repo_and_global("[workspace]\nhost-path = \"shared\"\n");
+        // Only the repo has `shared/`; the global config's own directory doesn't.
+        fs::create_dir_all(repo.path().join("shared")).unwrap();
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::WorkspaceHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("shared"));
+                assert_eq!(declared_in, Some(global_cfg));
+            }
+            other => panic!("expected WorkspaceHostMissing, got: {other:?}"),
+        }
+    }
+
     /// The concatenated list is the case one base directory provably cannot
     /// cover, so attribution has to be per entry. One load reports one failure
     /// -- `check_mount_list` returns on the first -- so this breaks each side in
@@ -4188,6 +4274,35 @@ container-path = "/abs"
                 assert_eq!(declared_in, None, "naming the global file would be a lie");
             }
             other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
+        }
+    }
+
+    /// The primary `host-path` half of the same rule, through
+    /// `WorkspaceHostMissing`.
+    #[test]
+    fn mutated_workspace_host_path_error_does_not_name_the_old_file() {
+        let (repo, global, global_cfg) = repo_and_global("[workspace]\nhost-path = \"shared\"\n");
+        fs::create_dir_all(global.path().join("shared")).unwrap();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        cfg.workspace.set_host_path("absent");
+
+        let err = expect_load_validation_err(
+            cfg.validate(Some(repo.path()))
+                .expect_err("the replacement does not exist under the repo root"),
+        );
+        assert!(
+            !err.to_string().contains("declared in"),
+            "a hand-set value has no declaring file to name: {err}",
+        );
+        match err {
+            ConfigValidationError::WorkspaceHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("absent"));
+                assert_eq!(declared_in, None, "naming the global file would be a lie");
+            }
+            other => panic!("expected WorkspaceHostMissing, got: {other:?}"),
         }
     }
 

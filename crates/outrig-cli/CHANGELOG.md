@@ -160,6 +160,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `outrig run` refused the config. Given a `<name>`, the setup now writes it as `default-image`
   without asking for one; given none, it asks, and the answer names both. A repo that already
   has a config keeps its `default-image`.
+- **A `[workspace] host-path` that doesn't exist is refused when the config loads.** A typo in
+  it validated, and `outrig run` failed only at `podman run`, with podman's `statfs` error, which
+  names the resolved path but neither the key nor the file. `outrig run`, `outrig mcp`, and
+  `outrig build` now refuse it at load, as they already refused an extra mount's missing
+  `host-path`, with an error naming the value as written and the config file that declared it.
+  A `host-path` that names a file rather than a directory is refused the same way. The default
+  `.` is checked too, as the repo root, so `--config <root>/.agents/outrig/config.toml` with a
+  `<root>` that doesn't exist now stops at load rather than at `podman run`.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
