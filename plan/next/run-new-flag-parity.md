@@ -22,9 +22,13 @@ through `LaunchSpec::from_config`, which lowers the config and nothing else, so 
 - `-v` writes `logs/container.log` under `run` because `session_setup` attaches a transcript to
   its containers. `Outrig` has no transcript to attach.
 
-The REPL has no slash commands of its own either. `/reset` in particular needs deciding before it
-exists: clearing the conversation while the interpreter keeps every name leaves the model with
-state it has no record of making.
+The REPL had no slash commands of its own. Phase 0003's planning (2026-09-30) gives it the first
+ones: `/approve <id>` and `/deny <id>` answer a boundary escalation (`0003-22`), and `/name text`
+sends a skill directive to the main agent (`0003-28`). Built-in commands win over a skill of the
+same name, so a built-in added later changes what `/<name>` does in a project that already has a
+skill by that name. `run`'s `/tools`, `/reset` and `/sidecar add` are still absent, and `/reset`
+in particular needs deciding before it exists: clearing the conversation while the interpreter
+keeps every name leaves the model with state it has no record of making.
 
 ## Acceptance
 

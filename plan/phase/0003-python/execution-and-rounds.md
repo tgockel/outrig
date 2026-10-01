@@ -85,6 +85,25 @@ Killing a **subprocess** is a signal to something with its own opinion about dyi
 **accepted remote operation** may be impossible, and its effect may already have happened. A
 design that says only "cancel" has not said anything.
 
+### A hosted call blocks its kernel
+
+A call on a hosted object (`hosted-objects.md`) is an ordinary synchronous Python call, and it
+holds the calling kernel's thread until the host answers. While it does, that kernel's event loop
+does not turn: messages are not delivered to it, a `runtime.wait` in one of its tasks does not
+wake, and its background tasks stall. Other kernels keep running, because the waiting thread does
+not hold the GIL. A long call that should not stall the loop is written
+`await asyncio.to_thread(repo.remotes.origin.push)`, which runs it on a worker thread. A kernel
+keeps a pool of up to four connections per binding, with one call in flight per connection, so
+calls from several of its threads run at once, up to four, and a fifth waits for a free
+connection; only a binding declared `serialize = true` runs its calls one after another
+(`hosted-objects.md`, `0003-17`).
+
+An interrupt reaches a kernel blocked in a hosted call and raises in the caller (`0003-17`). What
+it does to the call depends on where the call is. A call waiting for approval is cancelled and
+never runs later (`boundary-policy.md`). A call already running on the host is the fourth
+cancellation above, made concrete: RPyC has no cancel message, so the host call continues until it
+returns, its reply is discarded, and its outcome is reported `unknown`.
+
 ## A round
 
 One prompt or message, the agent working, and yielding control back. It yields when the model
@@ -236,6 +255,11 @@ That extends to runtime wakes generally, not just user input. A bump the host de
 reasons -- an operator checking in, a limit coming into view, a condition it is tracking on the
 agent's behalf -- is the same category and takes the same path. The agent does not have to
 enumerate them, and adding one later does not change a signature.
+
+The same rule covers a child's request traffic (`agent-classes.md`). A request arriving on one of
+the child's request channels is input: it ends a `runtime.wait` in the child, and it starts a round
+for a child that was idle. A reply settling a handle the parent holds is a completion: it resumes
+code awaiting that handle and never calls the model.
 
 **Decided in `0003-09`: `MessageAvailable` derives from `BaseException`**, as
 `asyncio.CancelledError` has since Python 3.8, and is reached as `runtime.MessageAvailable`. As an

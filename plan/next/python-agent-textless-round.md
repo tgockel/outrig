@@ -1,5 +1,10 @@
 # A `PythonAgent` round that produces only reasoning replies with nothing
 
+> **Absorbed by `0003-19` (2026-09-30).** `0003-19` replaces `PythonAgent` with the embedding
+> API's `Session`, whose round returns an outcome richer than reply text -- the second answer
+> under Shape below -- and takes the salvage and its test with it. This file stays until
+> `/groom-plan` retires it.
+
 ## Context
 
 `outrig-cli`'s loop salvages a turn whose final message carries no text. rig's `output` is the

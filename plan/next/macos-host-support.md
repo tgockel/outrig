@@ -79,3 +79,12 @@ absent by construction rather than broken at runtime.
 
 - None, but it overlaps `plan/next/ci-configuration-coverage.md`'s macOS job; land them
   together or the job goes in red.
+
+## Hosted objects are Linux-only (2026-09-30)
+
+Phase 0003 adds a Linux-only piece that has nothing to do with namespaces. A binding's process
+runs on the host and runs the payload's CPython (`plan/phase/0003-python/hosted-objects.md`), and
+the payload is `python-build-standalone`'s static `<arch>-unknown-linux-musl` build, which
+`build.rs` picks by architecture alone. A macOS host cannot execute it, so hosted objects are
+Linux-only. A macOS build either fetches a second payload that runs on the host, or reports
+bindings as an unavailable capability in the same shape as the rest.

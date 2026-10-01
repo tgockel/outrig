@@ -15,7 +15,8 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
   crates is narrowed, sealed, and frozen for 0.2.0.
 - [0003 -- python](../phase/0003-python/README.md) -- an agent acts by writing Python into a
   persistent interpreter in its container rather than by calling MCP tools, and the agent loop
-  moves into `outrig`. The code lands on `version/0.3.x`.
+  moves into `outrig` behind a public session API. Host objects, a policy over what crosses to
+  them, typed child agents and Python skills follow. The code lands on `version/0.3.x`.
 
 ## Recently completed
 
@@ -90,7 +91,7 @@ tasks is an invariant this file holds.
 
 ### Phase 0003 -- python
 
-`0003-01` through `0003-16` cover the phase's ten user-visible deliverables. The ordering is
+`0003-01` through `0003-30` cover the phase's user-visible deliverables. The ordering is
 chosen so a person can use the thing early: `0003-01` through `0003-05` are the shortest path to
 an interactive `outrig run-new`, and everything after it is additive. A first draft of this queue
 was built from the phase's exit criteria instead and silently omitted discovery, history, and
@@ -103,7 +104,51 @@ phase.
 | --------- | ------------------------------------------------------------------ |
 | `0003-14` | A script renders a session directory to one page                   |
 | `0003-15` | Retry and failover come across from the 0.2.x loop                 |
-| `0003-16` | The docs describe the system that now exists                       |
+
+**Spikes: the risky parts of hosted objects, proven before they are built on**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-16` | RPyC crosses the interpreter pipe; every request is intercepted    |
+| `0003-17` | A host call blocks only its caller                                 |
+| `0003-18` | A binding's process dies with its owner                            |
+
+**The owner's API**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-19` | An embedder owns the session, and `run-new` is one                 |
+
+**Host objects and the boundary**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-20` | A binding lives as long as its session                             |
+| `0003-21` | A hosted call crosses the boundary and is recorded                 |
+| `0003-22` | Policy decides what crosses, and the user can be asked             |
+| `0003-23` | An evaluator judges what no rule settled                           |
+
+**Children**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-24` | `outrig` imports in every kernel, and decodes results strictly     |
+| `0003-25` | A parent awaits its child's typed result                           |
+| `0003-26` | A decorated function is typed agent work                           |
+| `0003-29` | An agent class answers requests                                    |
+
+**Skills**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-27` | Skills import as modules from pluggable sources                    |
+| `0003-28` | `/name` reaches the main agent as a call it makes                  |
+
+**Last**
+
+| Task      | What it settles                                                    |
+| --------- | ------------------------------------------------------------------ |
+| `0003-30` | The docs describe the system that now exists                       |
 
 Cross-cutting notes the individual tasks carry rather than this file:
 
@@ -116,9 +161,21 @@ Cross-cutting notes the individual tasks carry rather than this file:
 - `0003-06` is not optional polish. `runtime-protection.md` records that without it the first
   `while True:` ends the session, which is why it lands immediately after the CLI that makes it
   reachable.
-- The phase's deferred subjects -- credential isolation, MCP as Python objects, subagents and the
-  work API -- have design pages and no tasks. They are out of scope by the phase README's own
+- `0003-16` through `0003-18` are spikes. Each proves one part of hosted objects with real
+  processes, and a spike that fails its acceptance stops and reports to the maintainer rather than
+  changing the transport, the threading model, or the host process model on its own.
+- Close behavior lands with each resource: the task that adds a resource adds its row to
+  `lifecycle.md`'s close table, so no single shutdown task has to reopen the others.
+- Credential isolation became hosted objects (`0003-16` through `0003-23`), and subagents became
+  `0003-24` through `0003-26` and `0003-29`. MCP as Python objects, interpreter restart,
+  confining what a hosted library does on the host, and the other deferred subjects have design
+  pages or `plan/next/` entries and no tasks. They are out of scope by the phase README's own
   list, not forgotten.
+- `plan/phase/0003-python/potential/` holds the alternatives the phase did not adopt out of the
+  box, each with the evaluation that would decide it, and `/groom-plan` may turn one into a task.
+  The same pass may defer `0003-17`'s service-shaped measurements -- RPC count, process memory and
+  tail latency against a service that blocks for minutes -- to a task of their own, when the spike
+  is better kept to its own question.
 
 ## Not queued, deliberately
 

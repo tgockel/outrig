@@ -5,9 +5,12 @@ own; this phase does not. **One interpreter process per session, one thread and 
 agent.** `harness-components.md` describes what the interpreter is; this page is why there is one of
 them rather than one per agent, and what that choice costs.
 
-Nothing here is exercised by the first milestone, which runs a single agent. It is settled now
-anyway, because an interpreter written around module globals cannot host a second agent
-without being rewritten, and the interpreter is being ported regardless.
+The first milestone ran a single agent. It was settled then anyway, because an interpreter
+written around module globals cannot host a second agent without being rewritten, and the
+interpreter was being ported regardless. Children arrive with `0003-25`, `0003-26` and `0003-29`:
+`runtime.spawn`, `@outrig.agent` and the agent classes under `outrig.Agent` (`work.md`,
+`typed-agents.md`, `agent-classes.md`) create each child as a kernel in this interpreter, which is
+the placement this page decides.
 
 ## The shape
 
@@ -212,10 +215,9 @@ and therefore every imported module's state, plus `os.environ`, `sys.path`, `war
 signal handlers, and the recursion limit. Most consequentially they share the working directory: a
 subagent calling `os.chdir("/workspace/sub")` moves its parent.
 
-It is not disclosure. The operator's grant is per-session, and the credential boundary is a
-socket any process in the container can open -- `security.md` works this through, and
-`pyro-remote-objects.md` notes the consequence for proxies, which is that one agent's prebound
-name is presentation over a session-wide grant rather than a grant of its own.
+It is not disclosure. The operator's grant is per-session (`security.md`), and every kernel gets a
+stub for every binding (`hosted-objects.md`), so one agent's bound name is presentation over a
+session-wide grant rather than a grant of its own.
 
 What is left is interference, and it is the same kind of thing
 `doc/concepts/subagents.md` already says about the workspace -- two subagents told to edit the
@@ -242,6 +244,20 @@ GIL. Confirmed present on the payload as the private `_interpreters` and `_inter
 `concurrent.interpreters`, the public API, is 3.14 and is absent. Rejected for this phase as a
 large lift on a private interface that would still not fix descriptors, the working directory, the
 environment, or signals -- the four things that actually bite.
+
+## Hosted objects follow the kernel
+
+Each kernel gets its own RPyC connections to each binding: a pool of up to four, none shared with
+another kernel (`hosted-objects.md`). RPyC runs an incoming request on whichever thread is reading
+the connection, so two kernels sharing one could run a callback meant for one kernel on the
+other's thread, billing its output and its state to the wrong agent. Each connection has one call
+in flight at a time and is served by a thread of its own in the binding process, so a callback
+still runs on the thread whose call started it.
+
+A kernel blocked in a hosted call blocks only itself (`execution-and-rounds.md`). Interrupting
+that wait does not use the signal path above: the interpreter wakes the waiting connection
+directly, so a blocked hosted call can be interrupted on any kernel, not only the primary
+(`0003-17`). A child wedged in its own Python loop is still contained and unrecoverable, as above.
 
 ## Open questions
 

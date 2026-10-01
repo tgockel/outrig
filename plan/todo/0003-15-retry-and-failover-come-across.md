@@ -9,8 +9,15 @@ CLI could run sooner. This finishes the copy. Until it lands, `run-new` is less 
 `harness-components.md` lists `llm/retry.rs` and `llm/failover.rs` among the files copied rather
 than moved, because the 0.2.x line actively edits them and a copy is what keeps those merges
 clean. `llm/mistralrs.rs` and `llm/registry.rs` are explicitly **not** copied: the in-process
-backend is deprecated, its removal is `plan/next/remove-deprecated-local-llm.md`, and omitting it
-avoids `mistralrs-core`, `hf-hub`, and `candle-core` becoming library dependencies.
+backend has since been removed from the tree (`5fc715b`), and copying it would have made
+`mistralrs-core`, `hf-hub`, and `candle-core` library dependencies.
+
+Resolution and retry are not only a round's. `0003-23`'s evaluator makes one model call with no
+round around it, to judge one request, and a child from `0003-25` resolves its own model -- an
+alias included -- when it is spawned. Both reuse what this task copies, so the copy should not
+assume that every model call belongs to the session's agent or sits inside a round. The evaluator
+also resolves its model from the global config's declarations alone, so that a repository cannot
+choose it, which a resolver that reads only the merged config cannot do.
 
 Two defects already filed against the originals are worth carrying rather than reproducing.
 `plan/next/clamped-ceiling-is-silent.md` records that the effective `max-tokens` never escapes
@@ -21,7 +28,7 @@ candidate one, so a failover mid-round changes which model answered without chan
 ## Goal
 
 `run-new` survives a transient provider failure and a failed candidate as well as `run` does, and
-knows which model actually answered.
+its record says which model answered and which attempts were made on the way.
 
 ## Deliverables
 
@@ -34,6 +41,15 @@ knows which model actually answered.
 - **Attribution that names the model that answered.** `failover.rs`'s private `Abandoned` carries
   the hop; today the chain's state is recovered by prefix-matching the rendered error string,
   which a structured channel replaces.
+- **Attempt identity on every model event.** `model.retry`, `model.failover`,
+  `model.round.completed` with its per-call list, and every other event that carries usage name a
+  **logical call id**, one per model call the loop decided to make, and a **provider attempt id**,
+  one per request actually sent, so a call that was retried or failed over has one logical id and
+  several attempts. A failed attempt is recorded as an event of its own, with the settings of the
+  request it sent -- the candidate, the model, the effective ceiling -- and a usage that is null
+  when the provider reported none, never zero. Aggregates are derived from unique attempts, and a
+  parent's inclusive total is never summed with a child's; `0003-25` inherits the rule when
+  children arrive.
 - The tests come across with the code. A copy without its ~4,900 lines of tests is a copy whose
   behavior nobody can check.
 
@@ -43,6 +59,13 @@ knows which model actually answered.
   rather than only printed.
 - A failover chain whose first candidate is unreachable resolves to the second, and **the
   attribution names the second**, not the first.
+- **Every attempt is recorded once, failed ones included.** A call that is retried once and then
+  fails over shows one logical call id across three provider attempt ids: the first two carry
+  their request settings and null usage, the third the usage the provider reported.
+- **Totals derive from unique attempts.** A test totals a session's usage from its unique
+  attempts and from the per-attempt events and gets the same number, and shows that adding a
+  round's inclusive total to the per-call entries beneath it counts each attempt twice. The same
+  test shape holds a parent's total apart from a child's once `0003-25` adds children.
 - An exhausted chain ends the round with the reason, and the conversation is retained per the
   existing wording, not discarded.
 - **The end-to-end checks `0003-12` and `0003-13` could not run**, because this is the task that
@@ -72,6 +95,8 @@ knows which model actually answered.
 ## See also
 
 - `plan/phase/0003-python/harness-components.md` -- what is copied and what is deliberately not.
+- `plan/phase/0003-python/observability.md` -- the model events, and the two ids every one of them
+  carries.
 - `plan/next/clamped-ceiling-is-silent.md` and
   `plan/next/chain-attribution-names-the-first-candidate.md` -- the two defects to fix rather than
-  reproduce, and `plan/next/remove-deprecated-local-llm.md` for the arm that is never copied.
+  reproduce. The in-process arm that is never copied was removed in `5fc715b`.

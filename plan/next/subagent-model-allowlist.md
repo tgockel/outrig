@@ -39,6 +39,15 @@ refusing the rest. Points that follow from how 0002-24 landed:
   block should fail config validation, beside `subagent-depth-max` / `subagent-width-max`'s range
   checks in `crates/outrig/src/config/validate.rs`.
 
+## Python children choose a model too (2026-09-30)
+
+Phase 0003 gives agent code the same choice without the tool. `runtime.spawn(..., model=...)`
+(`0003-25`), `@outrig.agent(model=...)` (`0003-26`) and an agent class's `model=` (`0003-29`) take
+a configured model name, and one execution can start many children on it in a loop. The allowlist
+should constrain every one of those surfaces with the one key, and a refused name should raise a
+Python exception distinct from an unknown one, for the same reason the tool's refusal is a third
+case.
+
 ## See also
 
 - `plan/done/phase/0002-sidecars/tasks/0002-24-subagent-model-selection.md` -- fork 1 states the
