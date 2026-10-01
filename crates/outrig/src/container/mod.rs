@@ -1639,9 +1639,10 @@ fn build_podman_create_cmd(
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
 /// extra bind mounts, keep-id, workspace workdir, capability policy, device
-/// passthrough, and the hardening tail. `--security-opt=no-new-privileges` is
-/// part of that tail only when the launch spec keeps it, and each `unmask`
-/// entry follows it as a second `--security-opt`.
+/// passthrough, the hardening tail, and `--image-volume=ignore`.
+/// `--security-opt=no-new-privileges` is part of that tail only when the
+/// launch spec keeps it, and each `unmask` entry follows it as a second
+/// `--security-opt`.
 fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool) -> Cmd {
     for (key, value) in &launch.labels {
         cmd = cmd.arg("--label").arg(format!("{key}={value}"));
@@ -1707,7 +1708,16 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     if launch.primary_view.is_some() {
         cmd = cmd.arg("--entrypoint").arg(PRIMARY_VIEW_HELPER_MOUNT);
     }
-    cmd.arg("--pull=never")
+    // No volume for the image's `VOLUME`s: the path keeps what the image's
+    // layers put there, and a write to it lands in the container's own layer,
+    // which `--rm` removes with it. An anonymous volume is not removed with
+    // it when `podman start --attach` is what acts on `--rm`, as it is for an
+    // entrypoint-stdio server (measured against podman 5.7), and each one
+    // left behind held one of podman's `num_locks` until no launch could get
+    // one (#214). The cost is that a declared path the layers never create is
+    // absent rather than an empty mount. `tmpfs` would mount it without
+    // leaking, but holds what is written there in memory.
+    cmd.arg("--image-volume=ignore").arg("--pull=never")
 }
 
 fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -> Cmd {
@@ -2449,6 +2459,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2506,6 +2517,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2551,6 +2563,7 @@ mod tests {
                 "/host/docs:/resources/docs:ro,Z",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2611,6 +2624,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--dns",
                 "127.0.0.1",
@@ -2650,6 +2664,7 @@ mod tests {
                 "outrig-test-fetch",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2685,6 +2700,7 @@ mod tests {
                 "outrig-test-fs",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--env",
                 "MARKER=1",
@@ -2760,6 +2776,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--entrypoint",
                 "/outrig-enter",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--env",
                 "HOME=/home/tgockel",
@@ -2804,6 +2821,7 @@ mod tests {
                 "outrig-test-noview",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2848,6 +2866,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2894,6 +2913,7 @@ mod tests {
                 "--cap-drop=MKNOD",
                 "--cap-add=NET_BIND_SERVICE",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2932,6 +2952,7 @@ mod tests {
                 "--device=/dev/fuse",
                 "--device=/dev/kvm",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2972,6 +2993,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
                 "--security-opt=unmask=ALL",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3022,6 +3044,7 @@ mod tests {
                 "--device=/dev/net/tun",
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3060,6 +3083,7 @@ mod tests {
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3104,6 +3128,7 @@ mod tests {
                 "--cap-drop=ALL",
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3143,6 +3168,7 @@ mod tests {
                 "--userns=keep-id",
                 "--device=/dev/fuse",
                 "--security-opt=unmask=/proc/*",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",

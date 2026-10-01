@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A finished session leaves no volumes behind.** Podman made an anonymous volume for each
+  `VOLUME` a container's image declares, and an entrypoint-stdio sidecar's were never removed.
+  When its server exited, the `podman start --attach` client was what acted on `--rm`, and
+  podman, through 5.7 at least, removes the container on that path without its volumes. Each
+  volume left behind held one of podman's `num_locks`, 2048 by default, until launches on the
+  host failed with `allocating lock for new volume: ... exceeded num_locks`. A sidecar built on
+  `docker.io/searxng/searxng`, which declares two, leaked two per session. A primary leaked its
+  volumes only when outrig force-removed it. Every container now runs with
+  `--image-volume=ignore`, so podman makes no volume at all: the path holds what the image's
+  layers put there, and writes to it land in the container's own layer, which `--rm` already
+  removes. A declared path the layers never create is now absent, where podman mounted an empty
+  volume over it, so an image whose program expects the directory has to create it. Upgrading
+  does not remove volumes already leaked. They are anonymous and name no container, so
+  `podman volume prune`, which removes every volume no container uses, is what clears them.
+
 - **An image rebuilds when an uncommitted file in its build context changes.** When the context
   was in a git repo, the cache key hashed only the files git tracks, yet buildah is handed the
   whole directory. A file not yet committed -- a helper script beside a freshly scaffolded

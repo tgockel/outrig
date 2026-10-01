@@ -107,6 +107,17 @@ RUN npm install -g @modelcontextprotocol/server-filesystem
 If multiple MCP servers need different language toolchains (one needs Node, one needs Python),
 install both in the same image. The agent's whole MCP set runs in one container per session.
 
+### Create the directory a `VOLUME` names
+
+outrig runs every container with `--image-volume=ignore`, so a `VOLUME` in the image creates no
+volume. The path holds whatever the image's layers put there, and what the container writes
+there lands in its own layer and is removed with it, like any other write. Left to its default,
+podman would mount an anonymous volume there, and does not always remove it with the container.
+
+`VOLUME` does not create the directory, so a path the layers never create is not there at all,
+where podman's default would have mounted an empty one. If the image's program expects the
+directory and does not make it, the image has to: `RUN mkdir -p <path>` ahead of the `VOLUME`.
+
 ## The `[images.<name>]` config block
 
 A typical config has at least one `[images.<name>]` block plus a top-level
@@ -521,7 +532,9 @@ container was created privileged.
 into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<path>` flags
 only when it declares `devices`, and `--security-opt=unmask=<path>` flags only when it declares
 `unmask`. Session containers additionally carry the `org.outrig.session` label (and sidecars
-`org.outrig.sidecar`).
+`org.outrig.sidecar`). Every container gets `--image-volume=ignore`, so its image's `VOLUME`s
+create no volumes; see
+[Create the directory a `VOLUME` names](#create-the-directory-a-volume-names).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode

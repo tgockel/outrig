@@ -165,6 +165,31 @@ fn sidecar_containers_labeled(sidecar: &str) -> Vec<String> {
         .collect()
 }
 
+/// Names of the volumes mounted into `container`, read off the engine rather
+/// than the argv outrig sent: an image's `VOLUME` gets one from podman without
+/// any flag asking for it.
+fn volume_mounts_of(container: &str) -> Vec<String> {
+    let output = std::process::Command::new("podman")
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}",
+            container,
+        ])
+        .output()
+        .expect("podman container inspect");
+    assert!(
+        output.status.success(),
+        "podman container inspect {container} failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn network_filter_builder_is_on_curated_surface() {
     let policy = NetworkPolicy::builder()
@@ -450,6 +475,51 @@ async fn launch_with_entrypoint_sidecar_serves_tools() {
         Vec::<String>::new(),
         "shutdown should remove the sidecar container"
     );
+}
+
+/// An image's `VOLUME` gets no volume. Podman would make an anonymous one per
+/// declaration, and an entrypoint-stdio container's outlived it: the
+/// `podman start --attach` client that acts on `--rm` removes the container
+/// without its volumes, and each one left behind held a podman lock until no
+/// launch could get one. The sidecar is #214's repro, the stock filesystem
+/// image plus `VOLUME /data`.
+#[tokio::test]
+async fn entrypoint_sidecar_gets_no_volume_for_its_image_volume() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-volume-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_image_from_dockerfile(
+        &sidecar_tag,
+        &format!("FROM {MCP_FS_IMAGE}\nVOLUME /data\n"),
+    );
+    // Stock: nothing here asks anything of the primary but that it run.
+    ensure_image(UBUNTU_IMAGE);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        UBUNTU_IMAGE,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_sidecar(
+        SidecarSpec::from_image("volumed", sidecar_tag.as_str())
+            .with_entrypoint_server("fs", ["/tmp"]),
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let sidecars = sidecar_containers_labeled("volumed");
+    assert_eq!(sidecars.len(), 1, "one sidecar container: {sidecars:?}");
+    assert_eq!(
+        volume_mounts_of(&sidecars[0]),
+        Vec::<String>::new(),
+        "the image's `VOLUME /data` got a volume, which outlives the sidecar"
+    );
+
+    outrig.shutdown().await.expect("shutdown");
 }
 
 /// `view = "primary"` from the library: an off-the-shelf Alpine MCP image
