@@ -2817,6 +2817,7 @@ async fn with_events_off_no_log_is_written() {
     events.close().await.expect("nothing lost");
     let records = events::recorded(dir.path());
     assert_eq!(records[0]["source"], "/outrig/session/20260921T103000-a1b2");
+    events::released(dir.path()).await;
 
     // An agent started again on the session would repeat those events'
     // `source` and ids, so its start is refused instead.

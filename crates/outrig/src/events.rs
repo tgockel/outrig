@@ -578,6 +578,27 @@ mod testing {
             .expect("open the log")
     }
 
+    /// Wait until nothing holds the lock on `log_dir`'s closed log, for a test
+    /// that opens it again.
+    ///
+    /// Closing the log does not release its lock at once when another test
+    /// is starting a process. `flock` belongs to the open file description,
+    /// and a process being spawned holds a copy of the descriptor table it
+    /// was cloned with until it execs, so the lock outlives the writer by
+    /// that long: a fraction of a millisecond, often enough for a reopen to
+    /// be refused as "already owned" rather than for what it holds.
+    pub(crate) async fn released(log_dir: &Path) {
+        let path = log_dir.join(super::EVENTS_LOG);
+        tokio::task::spawn_blocking(move || {
+            let log = std::fs::File::open(&path).expect("open the log");
+            nix::fcntl::Flock::lock(log, nix::fcntl::FlockArg::LockExclusive)
+                .map_err(|(_, errno)| errno)
+                .expect("lock the log");
+        })
+        .await
+        .expect("wait for the log's lock");
+    }
+
     /// Every record in `log_dir`'s `events.jsonl`, in order, each checked to
     /// parse.
     pub(crate) fn recorded(log_dir: &Path) -> Vec<Value> {

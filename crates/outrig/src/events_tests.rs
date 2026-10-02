@@ -492,6 +492,7 @@ async fn a_log_that_holds_a_recording_is_refused_and_kept() {
     let first = opened(dir.path()).await;
     first.emit(Event::AgentStopped {});
     first.close().await.expect("nothing lost");
+    released(dir.path()).await;
     let path = dir.path().join(EVENTS_LOG);
     let before = std::fs::read(&path).expect("the first recording");
 
