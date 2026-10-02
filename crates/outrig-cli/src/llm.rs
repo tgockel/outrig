@@ -14,6 +14,7 @@ use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
 #[cfg(feature = "local-llm")]
 use rig::streaming::{StreamedAssistantContent, StreamingChat};
+use rig::tool::ToolCallExtensions;
 use thiserror::Error;
 #[cfg(feature = "local-llm")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -2123,6 +2124,93 @@ impl Drop for KeepOnDrop<'_> {
     }
 }
 
+/// Puts back what a turn's tool calls changed outside the conversation, for
+/// every call whose result the turn's history ends up without.
+///
+/// `outrig__get_result` is why this exists. It moves the parent's read
+/// position past the result it returns as the call runs, but the result
+/// reaches the history only when the turn keeps it, and rig keeps a batch's
+/// results together or not at all. A turn dropped while a later call in the
+/// same batch was still running (Ctrl-C), or one that ended in an error, left
+/// the result out of the history and the read position past it, so the next
+/// read of a subagent that had gone idle blocked for good (#251).
+///
+/// Reaches the tool calls through rig's per-run [`ToolCallExtensions`], which
+/// keeps this module unaware of the subagent registry, as [`InjectionSource`]
+/// does. Settled in step with the history: what the hook's `checkpoint`
+/// carries stands wherever the checkpoint is kept, everything stands wherever
+/// rig's whole transcript is, and the rest is undone, newest first, when the
+/// turn's last handle drops. A drop because it is the one way out every path
+/// shares -- a turn dropped on Ctrl-C runs no other code.
+#[derive(Clone, Default)]
+pub(crate) struct TurnUndo(Arc<std::sync::Mutex<UndoLog>>);
+
+#[derive(Default)]
+struct UndoLog {
+    /// The undos, in the order the tool calls that recorded them ran.
+    entries: Vec<Box<dyn FnOnce() + Send>>,
+    /// How many of `entries` the hook's checkpoint carries: those recorded
+    /// before the turn's latest model call.
+    carried: usize,
+}
+
+impl TurnUndo {
+    /// The turn a tool call is part of, from the extensions rig hands the
+    /// call. `None` outside a turn, where nothing is put back.
+    pub(crate) fn of(extensions: &ToolCallExtensions) -> Option<&TurnUndo> {
+        extensions.get::<TurnUndo>()
+    }
+
+    /// Record how to undo what the running tool call changed, should the turn's
+    /// history not keep the call's result.
+    pub(crate) fn record(&self, undo: impl FnOnce() + Send + 'static) {
+        self.log().entries.push(Box::new(undo));
+    }
+
+    /// A model call is going out, and its checkpoint carries every tool call
+    /// recorded so far.
+    fn carry(&self) {
+        let mut log = self.log();
+        log.carried = log.entries.len();
+    }
+
+    /// The history kept the checkpoint: what it carries stands.
+    fn keep_carried(&self) {
+        let mut log = self.log();
+        let carried = std::mem::take(&mut log.carried);
+        log.entries.drain(..carried);
+    }
+
+    /// The history kept rig's whole transcript: everything stands.
+    fn keep_all(&self) {
+        let mut log = self.log();
+        log.entries.clear();
+        log.carried = 0;
+    }
+
+    /// The extensions that carry this log to the turn's tool calls.
+    fn extensions(&self) -> ToolCallExtensions {
+        let mut extensions = ToolCallExtensions::new();
+        extensions.insert(self.clone());
+        extensions
+    }
+
+    fn log(&self) -> std::sync::MutexGuard<'_, UndoLog> {
+        self.0.lock().expect("turn-undo mutex poisoned")
+    }
+}
+
+impl Drop for UndoLog {
+    fn drop(&mut self) {
+        // Newest first, so each undo finds things as its own call left them:
+        // two reads of one subagent put back oldest first would leave the
+        // position where the later read found it, not the earlier.
+        while let Some(undo) = self.entries.pop() {
+            undo();
+        }
+    }
+}
+
 async fn run_turn_inner<M: CompletionModel + 'static>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
@@ -2137,6 +2225,7 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
         .prompt(prompt.to_string())
         .history(history.clone())
         .max_turns(max_turns)
+        .tool_extensions(observer.undo.extensions())
         .add_hook(hook)
         .extended_details();
     let kept = KeepOnDrop::arm(history, &observer);
@@ -2149,6 +2238,7 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
                 .messages
                 .expect("rig populates messages on extended_details");
             history.extend(messages);
+            observer.undo.keep_all();
             // `output` is the final turn's *text* parts concatenated, so a turn
             // that produced only reasoning lands here as "". Rig hands the
             // structured turn back in `content`; consulting it is what keeps a
@@ -2242,6 +2332,7 @@ where
     let mut stream = agent
         .stream_chat(prompt.to_string(), history.clone())
         .max_turns(max_turns)
+        .tool_extensions(observer.undo.extensions())
         .add_hook(hook)
         .await;
     let kept = KeepOnDrop::arm(history, &observer);
@@ -2280,6 +2371,7 @@ where
     let history = kept.disarm();
     if let Some(messages) = final_history {
         extend_history_with_new_suffix(history, messages);
+        observer.undo.keep_all();
     }
 
     if !streamed_reply.is_empty() && !streamed_reply.ends_with('\n') {
@@ -2465,6 +2557,12 @@ fn handle_prompt_error(
     eprintln!("[outrig] {reason}; ending turn");
     eprintln!("{PARTIAL_HISTORY_RETAINED}");
     extend_history_with_new_suffix(history, chat_history);
+    // Everything stands, not only what the checkpoint carries: the hook stops
+    // the loop only at a model call, and rig runs out of turns only before
+    // one, so every batch that ran is in rig's transcript. Rig's own
+    // `MaxTurnsError` comes before the hook sees that call, so its last batch
+    // is in the transcript but in no checkpoint.
+    hook.undo.keep_all();
     Ok(TurnEnd {
         reply: format!("(turn ended: {reason})"),
         stopped: Some(TurnStop::Interrupted(reason)),
@@ -2617,6 +2715,8 @@ pub struct OutrigPromptHook {
     /// Skipped on the first call, which no tool has run before: a turn that
     /// fails there leaves the history as it was.
     checkpoint: Arc<std::sync::Mutex<Option<Vec<Message>>>>,
+    /// The turn's [`TurnUndo`], settled alongside `checkpoint`.
+    undo: TurnUndo,
 }
 
 impl OutrigPromptHook {
@@ -2631,6 +2731,7 @@ impl OutrigPromptHook {
             breaker_stop: Arc::default(),
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
             checkpoint: Arc::default(),
+            undo: TurnUndo::default(),
         }
     }
 
@@ -2650,7 +2751,8 @@ impl OutrigPromptHook {
     }
 
     /// Splice what the turn completed before its latest model call into
-    /// `history`, and say whether there was anything to keep.
+    /// `history`, and say whether there was anything to keep. What those
+    /// calls changed outside the conversation stands with them.
     ///
     /// Taken rather than read, so the work is kept once whichever way out of
     /// the turn reaches it first.
@@ -2664,6 +2766,7 @@ impl OutrigPromptHook {
             return false;
         };
         extend_history_with_new_suffix(history, transcript);
+        self.undo.keep_carried();
         true
     }
 
@@ -2709,10 +2812,12 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                 turn,
             } => {
                 // Rig's transcript as of this call, kept in case the call
-                // fails or the turn is dropped during it. See `checkpoint`.
+                // fails or the turn is dropped during it, along with the tool
+                // calls it carries. See `checkpoint` and `undo`.
                 if turn > 1 {
                     *self.checkpoint.lock().expect("checkpoint mutex poisoned") =
                         Some(history.iter().chain([prompt]).cloned().collect());
+                    self.undo.carry();
                 }
                 if let Some(reason) = self.breaker_stop.get() {
                     return self.stop(reason.clone());
@@ -3130,6 +3235,52 @@ mod tests {
             observer.stop_reason().as_deref(),
             Some("tool-call iteration max (50) reached")
         );
+    }
+
+    /// What a turn's tool calls changed is undone for exactly the calls the
+    /// history did not keep, newest first, and only once the turn's last
+    /// handle is gone: rig holds two of its own, in the hook it was given and
+    /// in the extensions its tool calls read.
+    #[test]
+    fn a_turn_undoes_what_its_history_did_not_keep_newest_first() {
+        let undone = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = |undo: &TurnUndo, call: u32| {
+            let undone = undone.clone();
+            undo.record(move || undone.lock().expect("undone poisoned").push(call));
+        };
+        let take = || std::mem::take(&mut *undone.lock().expect("undone poisoned"));
+
+        // The checkpoint carries the first call, and the history keeps the
+        // checkpoint. The two calls after it ran in a batch it never got.
+        let undo = TurnUndo::default();
+        record(&undo, 1);
+        undo.carry();
+        record(&undo, 2);
+        record(&undo, 3);
+        undo.keep_carried();
+        let rigs = undo.clone();
+        drop(undo);
+        assert!(take().is_empty(), "nothing is undone while a handle is left");
+        drop(rigs);
+        assert_eq!(take(), [3, 2]);
+
+        // The history keeps rig's whole transcript.
+        let undo = TurnUndo::default();
+        record(&undo, 1);
+        undo.carry();
+        record(&undo, 2);
+        undo.keep_all();
+        drop(undo);
+        assert!(take().is_empty());
+
+        // The history keeps nothing -- the turn errored -- so a call the
+        // checkpoint carried is undone too.
+        let undo = TurnUndo::default();
+        record(&undo, 1);
+        undo.carry();
+        record(&undo, 2);
+        drop(undo);
+        assert_eq!(take(), [2, 1]);
     }
 
     #[test]

@@ -108,12 +108,32 @@ struct Entry {
     abort: tokio::task::AbortHandle,
     /// The parent's read position. Deliberately here rather than on
     /// [`SubagentShared`]: it describes the *reader*, not the subagent.
+    ///
+    /// Moved by a read as the read is made, and moved back if the turn that
+    /// made it ends without the result in its history -- see [`Claim`].
     watermark: u64,
     /// This subagent's own registry, present only when it was given launch
     /// tools (i.e. its depth was under the max). An `Arc` clone of the one the
     /// ledger holds, kept here so [`SubagentRegistry::release`] can cancel this
     /// subagent's descendants without a search.
     child: Option<Arc<SubagentRegistry>>,
+}
+
+/// One advance of an [`Entry`]'s watermark by [`SubagentRegistry::read`]: which
+/// subagent's, and from where to where. Handed to [`SubagentRegistry::put_back`]
+/// when the turn the read was made in ends without its result -- see
+/// [`crate::llm::TurnUndo`].
+pub(crate) struct Claim {
+    shared: Arc<SubagentShared>,
+    from: u64,
+    to: u64,
+}
+
+/// What [`SubagentRegistry::read`] hands back: the outcome, and the advance
+/// reading it made.
+pub(crate) struct Read {
+    pub(crate) outcome: Outcome,
+    pub(crate) claim: Claim,
 }
 
 /// One task this registry spawned, owned independently of the name it was
@@ -325,7 +345,7 @@ impl SubagentRegistry {
     /// Block until at least `min_count` of `names` are readable, then report
     /// which. Carries no payloads and moves no watermark: results can be
     /// large, and the parent decides how much of one enters its context by
-    /// calling [`Self::get_result`] per subagent.
+    /// reading each subagent with [`Self::read`].
     pub async fn wait_results(
         &self,
         names: &[String],
@@ -380,7 +400,11 @@ impl SubagentRegistry {
 
     /// Block until this subagent is readable, return its outcome, and advance
     /// the watermark past it. The only consumer of a version.
-    pub async fn get_result(&self, name: &str) -> Result<Outcome, String> {
+    ///
+    /// The advance comes back with the outcome as a [`Claim`], for the reader's
+    /// turn to hand to [`Self::put_back`] if its history ends up without the
+    /// result.
+    pub(crate) async fn read(&self, name: &str) -> Result<Read, String> {
         let (shared, mut rx) = {
             let entries = self.lock();
             let entry = entries
@@ -400,25 +424,46 @@ impl SubagentRegistry {
                 let entry = entries.get_mut(name).ok_or_else(|| {
                     format!("subagent {name:?} was released while waiting for its result")
                 })?;
-                match snapshot.read(entry.watermark) {
-                    Some(outcome) => {
-                        // Only a genuinely newer version advances the read
-                        // position; the idle-without-publishing case is
-                        // level-triggered and must stay readable.
-                        if snapshot.version > entry.watermark {
-                            entry.watermark = snapshot.version;
-                        }
-                        Some(outcome)
-                    }
-                    None => None,
-                }
+                snapshot.read(entry.watermark).map(|outcome| {
+                    // A readable version is never behind the watermark. The
+                    // idle-without-publishing case reads at the watermark
+                    // itself, so this leaves it where it is and the case stays
+                    // readable, as level-triggered reads must.
+                    let claim = Claim {
+                        shared: entry.shared.clone(),
+                        from: entry.watermark,
+                        to: snapshot.version,
+                    };
+                    entry.watermark = snapshot.version;
+                    Read { outcome, claim }
+                })
             };
-            if let Some(outcome) = claimed {
-                return Ok(outcome);
+            if let Some(read) = claimed {
+                return Ok(read);
             }
             if rx.changed().await.is_err() {
                 return Err(format!("subagent {name:?} stopped without a result"));
             }
+        }
+    }
+
+    /// Undo `claim`: move the read position back to where the read found it,
+    /// so the result it returned is collectable again.
+    ///
+    /// Only for the subagent the read was made against, which is why it is
+    /// found by identity rather than by name: a name released and launched
+    /// again is a different subagent, whose position the read never moved. And
+    /// only while the position is still where the read left it: one a later
+    /// read has moved on was moved past something at least as new -- the inbox
+    /// keeps only the latest -- so leaving it loses nothing.
+    pub(crate) fn put_back(&self, claim: Claim) {
+        let mut entries = self.lock();
+        if let Some(entry) = entries
+            .values_mut()
+            .find(|entry| Arc::ptr_eq(&entry.shared, &claim.shared))
+            && entry.watermark == claim.to
+        {
+            entry.watermark = claim.from;
         }
     }
 
@@ -1205,9 +1250,18 @@ mod tests {
     use super::fixtures::*;
     use super::*;
     use axum::http::StatusCode;
+    use rig::completion::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
     use tokio::sync::{Notify, mpsc};
+
+    impl SubagentRegistry {
+        /// A read made directly rather than by a model's tool call, and so
+        /// outside any turn: its advance stands.
+        async fn get_result(&self, name: &str) -> Result<Outcome, String> {
+            self.read(name).await.map(|read| read.outcome)
+        }
+    }
 
     /// A registry whose subagents talk to a closed port, so every round fails
     /// fast and deterministically. That is enough to exercise the bookkeeping
@@ -1613,6 +1667,21 @@ mod tests {
                 .expect("the round made no further model call")
                 .expect("the scripted provider stopped")
         }
+
+        /// An agent whose model calls come here.
+        ///
+        /// Retries are off, so each call is made once and the next one the test
+        /// sees is the turn's next step. The request timeout is a minute, not
+        /// the fixture's usual second, so a call the test is holding cannot time
+        /// out into a failed turn.
+        fn resolved(&self) -> ResolvedAgent {
+            test_resolved_at(
+                &self.server.base_url,
+                Some(0),
+                Some(60),
+                outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+            )
+        }
     }
 
     /// One model call, held open until the test answers it.
@@ -1687,7 +1756,21 @@ mod tests {
                 .iter()
                 .map(|arguments| (name.as_str(), arguments.as_str()))
                 .collect();
-            let message = tool_call_message(&calls);
+            self.call_tools(&calls);
+        }
+
+        /// Answer with an `outrig__get_result` call for `name`, so another
+        /// model call follows it.
+        fn get_result(self, name: &str) {
+            let get_result = crate::builtin_tool::name_of("get_result");
+            let arguments = serde_json::json!({ "name": name }).to_string();
+            self.call_tools(&[(&get_result, &arguments)]);
+        }
+
+        /// Answer with one call per `(name, arguments)`, all in the one
+        /// message, which rig runs as one batch.
+        fn call_tools(self, calls: &[(&str, &str)]) {
+            let message = tool_call_message(calls);
             self.respond(StatusCode::OK, completion(message, "tool_calls"));
         }
 
@@ -1709,13 +1792,9 @@ mod tests {
     /// What the parent sends once the subagent has gone idle.
     const FOLLOW_UP: &str = "now summarize what you found";
 
-    /// A registry whose subagents talk to `provider`, with `probe` launched on
-    /// it and its first round under way.
-    ///
-    /// Retries are off, so each call is made once and the next one the test
-    /// sees is the round's next step. The request timeout is a minute, not
-    /// the fixture's usual second, so a call the test is holding cannot time
-    /// out into a failed round.
+    /// A registry whose subagents talk to `provider` -- see
+    /// [`ScriptedProvider::resolved`] -- with `probe` launched on it and its
+    /// first round under way.
     async fn launch_probe(
         provider: &ScriptedProvider,
         tool_call_max: usize,
@@ -1731,12 +1810,7 @@ mod tests {
     ) -> (SubagentRegistry, tempfile::TempDir) {
         let (mut registry, log_dir) = test_registry();
         registry.ctx.mcp_tools = tools;
-        registry.ctx.resolved = test_resolved_at(
-            &provider.server.base_url,
-            Some(0),
-            Some(60),
-            outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
-        );
+        registry.ctx.resolved = provider.resolved();
         registry.ctx.resolved.tool_call_max = tool_call_max;
         registry
             .launch("probe", None, None, "do the work".to_string())
@@ -1919,6 +1993,267 @@ mod tests {
             .get_result("audit")
             .await
             .expect("still collectable after waiting on it");
+    }
+
+    /// What `probe` has published when its parent reads it below.
+    const FINDINGS: &str = "probe findings: 3 call sites";
+
+    /// A registry holding `probe`, which has published [`FINDINGS`] and not
+    /// been read, and a parent agent over it whose model is `provider` -- see
+    /// [`ScriptedProvider::resolved`] -- with `tools` beside the subagent
+    /// tools. `probe` has no task behind it: only the parent's read is under
+    /// test.
+    async fn parent_of_probe(
+        provider: &ScriptedProvider,
+        tools: Vec<SessionTool>,
+    ) -> (
+        Arc<SubagentRegistry>,
+        crate::llm::RigAgent,
+        tempfile::TempDir,
+    ) {
+        let (registry, log_dir) = test_registry();
+        let registry = Arc::new(registry);
+        hand_built_entry(&registry, "probe").publish(Outcome::Result(FINDINGS.to_string()));
+        let resolved = provider.resolved();
+        let mut parent_tools =
+            crate::builtin_tool::parent_tools(registry.clone(), resolved.tool_result_max_bytes);
+        parent_tools.extend(tools);
+        let agent = crate::llm::build_agent(
+            &resolved,
+            parent_tools,
+            &registry.ctx.cache_root,
+            #[cfg(feature = "local-llm")]
+            &registry.ctx.registry,
+        )
+        .await
+        .expect("build the parent agent");
+        (registry, agent, log_dir)
+    }
+
+    /// Run one parent turn to its end, its model calls answered by `script`.
+    async fn parent_turn(
+        agent: &crate::llm::RigAgent,
+        script: impl std::future::Future<Output = ()>,
+    ) -> (crate::error::Result<crate::llm::TurnEnd>, Vec<Message>) {
+        let mut history = Vec::new();
+        let (end, ()) = tokio::join!(agent.run_turn("collect the probe", &mut history), script);
+        (end, history)
+    }
+
+    /// Run one parent turn until `script` is done, then drop it there, which is
+    /// what the REPL does with a turn on Ctrl-C.
+    async fn parent_turn_dropped(
+        agent: &crate::llm::RigAgent,
+        script: impl std::future::Future<Output = ()>,
+    ) -> Vec<Message> {
+        let mut history = Vec::new();
+        {
+            let turn = std::pin::pin!(agent.run_turn("collect the probe", &mut history));
+            tokio::select! {
+                end = turn => panic!("the turn was to be dropped part-way, got: {end:?}"),
+                () = script => {}
+            }
+        }
+        history
+    }
+
+    /// Whether `name` has something to collect -- what `outrig__wait_results`
+    /// waits for -- asked without waiting, and without collecting it.
+    fn collectable(registry: &SubagentRegistry, name: &str) -> bool {
+        let names = [name.to_string()];
+        registry.readable_among(&names) == Ok(names.to_vec())
+    }
+
+    /// The parent's history holds the read with [`FINDINGS`] as its result.
+    fn assert_kept_the_read(history: &[Message]) {
+        let rendered = serde_json::to_string(history).expect("history serializes");
+        assert!(
+            rendered.contains(FINDINGS),
+            "the read and its result are in the history: {history:#?}"
+        );
+    }
+
+    /// The read #251 is about, as #197 left it: the parent's model batches
+    /// `outrig__get_result` with a call that is still running when Ctrl-C drops
+    /// the turn. Rig keeps a batch's results together, so the read's result
+    /// never reached the history, and the read must not have consumed it
+    /// either: the next one would block for good on a subagent that has
+    /// nothing newer coming.
+    #[tokio::test]
+    async fn a_read_in_a_batch_ctrl_c_interrupts_stays_collectable() {
+        let mut provider = ScriptedProvider::start().await;
+        let mut blocking = BlockingTools::new();
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, blocking.take_tools()).await;
+
+        let history = parent_turn_dropped(&agent, async {
+            let get_result = crate::builtin_tool::name_of("get_result");
+            provider
+                .next_call()
+                .await
+                .call_tools(&[(&get_result, r#"{"name":"probe"}"#), ("blocking", "{}")]);
+            // Rig runs the batch in order, so the read is done by now.
+            blocking.wait_for_calls(1).await;
+        })
+        .await;
+
+        assert_eq!(
+            history,
+            [],
+            "nothing from the cut batch reaches the history"
+        );
+        assert!(
+            collectable(&registry, "probe"),
+            "a read the history never got is put back"
+        );
+        assert_eq!(
+            futures_util::FutureExt::now_or_never(registry.get_result("probe")),
+            Some(Ok(Outcome::Result(FINDINGS.to_string()))),
+            "the next read returns the result rather than block"
+        );
+    }
+
+    /// A turn that ends in an error keeps none of itself, so a read it made is
+    /// put back even though the model call after it was made: for a subagent,
+    /// whose next round goes on from the history this round leaves, the read
+    /// would otherwise be lost the same way.
+    #[tokio::test]
+    async fn a_read_in_a_turn_that_errors_stays_collectable() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            provider.next_call().await.get_result("probe");
+            // A 400 is terminal, so the turn errors out of `run_turn`.
+            provider.next_call().await.fail(StatusCode::BAD_REQUEST);
+        })
+        .await;
+
+        assert!(end.is_err(), "got: {end:?}");
+        assert_eq!(history, [], "an errored turn keeps nothing");
+        assert!(collectable(&registry, "probe"));
+    }
+
+    /// The other side of putting a read back: a read whose result the history
+    /// keeps stays consumed, or the next read would hand the model a result
+    /// already in front of it. A turn dropped in the model call after the
+    /// read keeps the read, as #197 has it.
+    #[tokio::test]
+    async fn a_read_kept_by_a_dropped_turn_stays_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let history = parent_turn_dropped(&agent, async {
+            provider.next_call().await.get_result("probe");
+            // The model call after the read is out when the turn is dropped.
+            provider.next_call().await;
+        })
+        .await;
+
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// So does a turn whose model call after the read fails for good: it keeps
+    /// the read with its result, and the read stays consumed.
+    #[tokio::test]
+    async fn a_read_kept_by_a_failed_turn_stays_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            provider.next_call().await.get_result("probe");
+            // A 503 is transient, and with retries off it ends the turn at once.
+            provider
+                .next_call()
+                .await
+                .fail(StatusCode::SERVICE_UNAVAILABLE);
+        })
+        .await;
+
+        let stopped = end
+            .expect("a failed call ends the turn, not the session")
+            .stopped;
+        assert!(
+            matches!(stopped, Some(crate::llm::TurnStop::EndpointFailed(_))),
+            "got: {stopped:?}"
+        );
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// So does a turn the tool-call max ends. It ends at the model call after
+    /// the batch that ran over, which keeps the read's batch along with the
+    /// rest of rig's transcript.
+    #[tokio::test]
+    async fn a_read_kept_by_a_turn_the_tool_call_max_ended_stays_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (_live, counted) = counted_tools();
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, counted).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            let get_result = crate::builtin_tool::name_of("get_result");
+            let max = provider.resolved().tool_call_max;
+            // The read and `max` more, so the last is one over the max.
+            let mut batch = vec![(get_result.as_str(), r#"{"name":"probe"}"#)];
+            batch.extend(std::iter::repeat_n(("counted", "{}"), max));
+            provider.next_call().await.call_tools(&batch);
+        })
+        .await;
+
+        let stopped = end
+            .expect("the tool-call max ends the turn, not the session")
+            .stopped;
+        assert!(
+            matches!(stopped, Some(crate::llm::TurnStop::Interrupted(_))),
+            "got: {stopped:?}"
+        );
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// And a turn that finishes keeps everything: the read is consumed, as a
+    /// direct read is in [`a_second_read_blocks_until_there_is_something_new`].
+    #[tokio::test]
+    async fn a_read_in_a_turn_that_lands_is_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            provider.next_call().await.get_result("probe");
+            provider.next_call().await.reply("collected");
+        })
+        .await;
+
+        assert_eq!(end.expect("the turn finishes").reply, "collected");
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// A read is put back against the subagent it was made against. A name
+    /// released and launched again within one turn names a different subagent,
+    /// and the old read must leave the new one's position where it is -- here,
+    /// past a result it has already delivered, which putting the old read back
+    /// by name would deliver a second time.
+    #[tokio::test]
+    async fn putting_a_read_back_leaves_a_relaunched_name_alone() {
+        let (registry, _log_dir) = test_registry();
+        hand_built_entry(&registry, "probe").publish(Outcome::Result("before".to_string()));
+        let claim = registry.read("probe").await.expect("readable").claim;
+
+        registry
+            .release(&["probe".to_string()])
+            .expect("probe is live");
+        hand_built_entry(&registry, "probe").publish(Outcome::Result("after".to_string()));
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("after".to_string()))
+        );
+
+        registry.put_back(claim);
+        assert!(
+            !collectable(&registry, "probe"),
+            "the relaunched subagent's result was delivered, and stays delivered"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2253,9 +2588,7 @@ mod tests {
         let mut provider = ScriptedProvider::start().await;
         let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
 
-        let call = provider.next_call().await;
-        let message = tool_call_message(&[("counted", "{}")]);
-        call.respond(StatusCode::OK, completion(message, "tool_calls"));
+        provider.next_call().await.call_tools(&[("counted", "{}")]);
         provider
             .next_call()
             .await

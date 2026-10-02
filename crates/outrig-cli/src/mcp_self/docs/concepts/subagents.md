@@ -181,6 +181,12 @@ Each subagent's inbox carries a version, and the parent keeps a read position ag
 it, and moves the read position past it. Reading twice with nothing new in between blocks rather
 than returning the same answer again.
 
+A read counts once its result is in the parent's conversation. A turn can end without it: Ctrl-C
+keeps only the tool calls whose results had already gone back to the model, so a read made
+alongside a call still running is dropped with that call, and a subagent round that ends in an
+error keeps none of its calls. The read position moves back for such a read, and the next
+`outrig__get_result` returns that result again rather than block for a newer one.
+
 `outrig__wait_results` blocks on the same condition across several subagents and reports **names
 only**. Results can be large, so a call that returned three of them at once is exactly the
 oversized tool result worth avoiding; the parent pulls each one with `outrig__get_result` and can
@@ -255,8 +261,9 @@ again appends to the same file, under a header of its own.
 
 Ctrl-C behaves as it always has: it abandons whatever the parent was waiting on and returns you to
 the prompt. Subagents keep running and are still collectable on the next turn -- the same way an
-abandoned `shell__exec` keeps running to completion inside the container. A second Ctrl-C ends the
-session, and everything shuts down with it.
+abandoned `shell__exec` keeps running to completion inside the container. So is a result the
+interrupted turn had read but not yet handed to the model. A second Ctrl-C ends the session, and
+everything shuts down with it.
 
 ## The shared workspace
 

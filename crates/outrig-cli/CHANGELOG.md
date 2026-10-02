@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent result a turn read but did not keep can be read again.** `outrig__get_result` moves
+  the parent's read position past the result it returns as it runs, but the result reaches the
+  conversation only when the turn keeps it. Ctrl-C while another tool call made alongside the read
+  was still running dropped the result with that call -- and a subagent round that ended in an
+  error dropped every call it made -- but the read position stayed moved, so the next
+  `outrig__get_result` for a subagent with nothing newer to report blocked until interrupted, and
+  `outrig__wait_results` never listed it. A read the turn does not keep now moves the read position
+  back, and the next read returns that result; one the conversation keeps stays consumed.
 - **A turn that fails after running a tool call keeps the call and its result.** When a model
   call failed for good -- a rate limit or outage that outlasted `retry-budget-secs`, every
   candidate in an alias chain failing, a response outrig could not use -- the turn ended with the

@@ -444,7 +444,8 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
   reply that had already streamed in full is kept, even if Ctrl-C lands while its output is still
   being written. It stops the agent *waiting*, not work already handed to the container: a
   `shell__exec` that started a build runs to completion, and any
-  [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn.
+  [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn, as
+  does a result the turn read from one of them but did not keep.
 
   Nothing is killed. The MCP servers, and the `podman exec` transports outrig talks to them
   over, belong to the session and not to the turn, so they stay up for the next prompt; what
