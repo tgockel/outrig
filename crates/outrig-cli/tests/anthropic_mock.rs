@@ -32,12 +32,13 @@
 //!   for the next request to carry;
 //! * reasoning Anthropic did not issue -- a fallback's, left in a chain's
 //!   shared history -- is not sent back to it as a `thinking` block it would
-//!   refuse.
+//!   refuse, while a turn that was only its own thinking goes back as the
+//!   signed block it came as, untouched by what the OpenAI-style arm does to
+//!   the same turn.
 
 mod common;
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -49,12 +50,10 @@ use rig::wasm_compat::WasmBoxedFuture;
 use serde_json::{Value, json};
 
 use outrig::config::Config;
-use outrig_cli::llm::{RigAgent, TurnStop, build_agent, resolve_agent};
+use outrig_cli::llm::{RigAgent, TurnStop};
 use outrig_cli::session_tool;
 
-use common::{
-    CannedResponse, RecordedRequest, drain_recorded, set_test_env, start_mock_http, unset_test_env,
-};
+use common::{CannedResponse, RecordedRequest, drain_recorded, start_mock_http};
 
 // ---- the in-process tool --------------------------------------------------
 
@@ -272,39 +271,11 @@ async fn recorded_max_tokens(
     recorded[0].body["max_tokens"].clone()
 }
 
-/// Build an agent from `cfg` through the real resolve -> build path. Split out
-/// of [`run_one_turn`] so a test can drive more than one turn through the same
-/// agent, which is what "the session survived" means.
-///
-/// `vars` is a slice rather than one name because a failover chain has a key
-/// per candidate, and candidate selection drops any row whose key is unset --
-/// so a chain that set only the head's var would resolve to a chain of one.
-async fn build_mock_agent(
-    cfg: &Config,
-    vars: &[&str],
-    tools: Vec<EchoTool>,
-) -> outrig_cli::llm::RigAgent {
-    for var in vars {
-        set_test_env(var, KEY);
-    }
-    // No `[models.<name>].model-path` in any config here, so the repo root
-    // this resolves relative paths against never comes up.
-    let resolved = resolve_agent(cfg, std::path::Path::new("/"), Some("coding")).expect("resolves");
-    for var in vars {
-        unset_test_env(var);
-    }
-
-    #[cfg(feature = "local-llm")]
-    let registry = std::sync::Arc::new(outrig_cli::llm::LlmRegistry::new());
-    build_agent(
-        &resolved,
-        session_tool::erase(tools),
-        Path::new("."),
-        #[cfg(feature = "local-llm")]
-        &registry,
-    )
-    .await
-    .expect("agent builds")
+/// [`common::build_mock_agent`] with this file's key and its in-process tools.
+/// Split out of [`run_one_turn`] so a test can drive more than one turn through
+/// the same agent, which is what "the session survived" means.
+async fn build_mock_agent(cfg: &Config, vars: &[&str], tools: Vec<EchoTool>) -> RigAgent {
+    common::build_mock_agent(cfg, KEY, vars, session_tool::erase(tools)).await
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -1400,16 +1371,23 @@ fn rig_max_tokens_defaults_differ_between_constructors() {
 /// Pins all three of the properties that make it reportable: the turn is
 /// recognizably silent, the reasoning is recovered rather than dropped, and the
 /// report says which of the two silences this was.
+///
+/// Then pins what the next prompt sends: the turn, as the signed `thinking`
+/// block it came as. That is the arm the OpenAI-style fix for the same turn
+/// must leave alone -- rig's OpenAI conversion drops an assistant message with
+/// no text, so outrig gives one an empty text part on its way out there, and
+/// Anthropic refuses an empty text block.
 #[tokio::test]
 async fn a_reasoning_only_turn_is_recovered_and_reported() {
-    let (addr, mut requests) = start_mock_http(vec![message(
-        json!([{
-            "type": "thinking",
-            "thinking": "weighing the two-image split against one",
-            "signature": "sig-1",
-        }]),
-        "max_tokens",
-    )])
+    let thinking = json!({
+        "type": "thinking",
+        "thinking": "weighing the two-image split against one",
+        "signature": "sig-1",
+    });
+    let (addr, mut requests) = start_mock_http(vec![
+        message(json!([thinking.clone()]), "max_tokens"),
+        text_reply("ok"),
+    ])
     .await;
 
     let var = "OUTRIG_TEST_ANTHROPIC_REASONING_ONLY";
@@ -1461,6 +1439,24 @@ async fn a_reasoning_only_turn_is_recovered_and_reported() {
         drain_recorded(&mut requests).len(),
         1,
         "a reasoning-only turn is a completed turn, not a retryable one",
+    );
+
+    agent
+        .run_turn("continue", &mut history)
+        .await
+        .expect("the next prompt is answered");
+    let recorded = drain_recorded(&mut requests);
+    assert_eq!(recorded.len(), 1, "one request for the next turn");
+    let messages = recorded[0].messages();
+    assert_eq!(
+        recorded[0].roles(),
+        ["user", "assistant", "user"],
+        "{messages:#?}",
+    );
+    assert_eq!(
+        messages[1],
+        json!({ "role": "assistant", "content": [thinking] }),
+        "the thinking goes back exactly as Anthropic issued it",
     );
 }
 

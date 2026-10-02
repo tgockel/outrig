@@ -465,16 +465,23 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
             result.map(|end| {
                 if end.is_silent() {
                     eprintln!("{}", end.silent_report());
-                    // Deliberately not the "history retained" advice the
-                    // truncation paths give. The turn *is* in outrig's history,
-                    // but on an OpenAI-compatible provider an assistant message
-                    // carrying only reasoning is dropped on the way back out,
-                    // so promising the model will see it would be false for the
-                    // arm this failure shows up on most.
+                    // A turn with reasoning is in the history for "continue" to
+                    // pick up from, but the reasoning itself may not reach the
+                    // model: providers commonly leave an earlier turn's
+                    // reasoning out of what it reads, and what each is sent is
+                    // decided at its wire boundary (`OpenAiModel`,
+                    // `AnthropicModel`). A turn with nothing at all may not be
+                    // in the history to refer back to: rig keeps an empty reply
+                    // out of it.
+                    let caveat = if end.recovered.is_some() {
+                        "the model may not see the reasoning above"
+                    } else {
+                        "but say what you need again rather than referring back, as the \
+                         model may not see this turn"
+                    };
                     eprintln!(
                         "[outrig] send another prompt (e.g. \"continue\") to keep going, \
-                         or \"/reset\" to start over -- but say what you need again \
-                         rather than referring back, as the model may not see this turn."
+                         or \"/reset\" to start over -- {caveat}."
                     );
                     // Whitespace is exact-non-empty, so returning it would
                     // put a stray blank line on stdout directly under the

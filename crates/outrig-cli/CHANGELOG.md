@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A turn that produced only reasoning reaches the next request on an OpenAI-style provider.**
+  With `style = "openai"`, a turn whose reply was nothing but reasoning, such as one cut off at
+  the output-token ceiling, stayed in the conversation but was left out of every later request,
+  a subagent's later rounds included. The prompts on either side of it reached the model as two
+  user messages in a row: the model answered without knowing it had taken that turn, and an
+  endpoint that requires alternating roles refused the next prompt with a `400` that ended
+  `outrig run`. The turn is now sent as an assistant reply with no text and its reasoning in
+  `reasoning_content`, as reasoning beside text already was. The advice printed after such a turn
+  no longer asks you to restate what you need rather than refer back to it; it says instead that
+  the model may not see the reasoning printed above it.
 - **A message sent to a busy subagent no longer fails its round.** `outrig__subagent_send` to a
   subagent partway through a round put the message between the subagent's latest tool call and
   that call's result, which OpenAI and Anthropic refuse. Every model call but a round's first

@@ -206,6 +206,23 @@ impl RecordedRequest {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
+
+    /// The conversation the request carried. OpenAI's chat completions and
+    /// Anthropic's messages both send it as a top-level `messages` array.
+    #[allow(dead_code)]
+    pub fn messages(&self) -> &[serde_json::Value] {
+        self.body["messages"].as_array().expect("a messages array")
+    }
+
+    /// The role of each of [`Self::messages`], in order: what an endpoint that
+    /// requires alternating roles checks.
+    #[allow(dead_code)]
+    pub fn roles(&self) -> Vec<&str> {
+        self.messages()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect()
+    }
 }
 
 /// One canned response. Status is separate from body so a script can put a
@@ -418,6 +435,46 @@ pub fn set_test_env(var: &str, value: &str) {
 #[allow(dead_code)]
 pub fn unset_test_env(var: &str) {
     unsafe { std::env::remove_var(var) }
+}
+
+/// Build `cfg`'s `[agents.coding]` through the real `resolve_agent` ->
+/// `build_agent` path, for a test whose providers point at
+/// [`start_mock_http`] mocks.
+///
+/// `vars` are the test's own env-var names for its fake keys, each set to `key`
+/// -- unique per test, which is what makes the `set_test_env` calls safe. A
+/// slice rather than one name because a failover chain has a key per
+/// candidate, and candidate selection drops any row whose key is unset -- so a
+/// chain that set only the head's var would resolve to a chain of one.
+#[allow(dead_code)]
+pub async fn build_mock_agent(
+    cfg: &outrig::config::Config,
+    key: &str,
+    vars: &[&str],
+    tools: Vec<outrig_cli::session_tool::SessionTool>,
+) -> outrig_cli::llm::RigAgent {
+    for var in vars {
+        set_test_env(var, key);
+    }
+    // A mock config names no `[models.<name>].model-path`, so the repo root
+    // this resolves relative paths against never comes up.
+    let resolved = outrig_cli::llm::resolve_agent(cfg, std::path::Path::new("/"), Some("coding"))
+        .expect("resolves");
+    for var in vars {
+        unset_test_env(var);
+    }
+
+    #[cfg(feature = "local-llm")]
+    let registry = Arc::new(outrig_cli::llm::LlmRegistry::new());
+    outrig_cli::llm::build_agent(
+        &resolved,
+        tools,
+        std::path::Path::new("."),
+        #[cfg(feature = "local-llm")]
+        &registry,
+    )
+    .await
+    .expect("agent builds")
 }
 
 /// Materialize `<root>/<sid>/session.json` from [`sample_session`], letting

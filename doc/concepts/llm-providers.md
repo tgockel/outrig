@@ -277,6 +277,12 @@ identifier = "anthropic/claude-sonnet-4-6"
 The agent loop is unchanged -- it's still tool calls in OpenAI's format, just routed somewhere
 else.
 
+Reasoning an endpoint returns beside its reply -- in `reasoning_content`, or OpenRouter's
+`reasoning` -- goes back to it on that turn's assistant message in later requests. A turn that
+produced nothing but reasoning, usually one cut off at the output-token ceiling, goes back as an
+assistant message with empty text, so the conversation keeps alternating between user and
+assistant.
+
 ## Native Anthropic (`style = "anthropic"`)
 
 `style = "anthropic"` talks to Anthropic's own Messages API rather than to an

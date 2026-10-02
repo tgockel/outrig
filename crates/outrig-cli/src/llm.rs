@@ -969,11 +969,7 @@ fn validate_mistralrs_device(
 /// loop) match on the variant.
 pub enum RigAgent {
     OpenAi {
-        agent: rig::agent::Agent<
-            retry::RetryingModel<
-                rig::providers::openai::CompletionModel<retry::RetryingHttpClient>,
-            >,
-        >,
+        agent: rig::agent::Agent<retry::RetryingModel<OpenAiModel>>,
         tool_call_max: usize,
     },
     Anthropic {
@@ -1178,12 +1174,10 @@ async fn build_single(
             request_timeout_secs,
             retry_budget_secs,
         } => {
-            use rig::client::CompletionClient;
-
             let policy = retry_policy(*retry_budget_secs);
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
-            let model = client.completion_model(&candidate.model_identifier);
+            let model = openai_model(&client, candidate);
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
@@ -1257,11 +1251,9 @@ async fn build_candidate(
             request_timeout_secs,
             ..
         } => {
-            use rig::client::CompletionClient;
-
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
-            let model = client.completion_model(&candidate.model_identifier);
+            let model = openai_model(&client, candidate);
             Ok(Box::new(failover::ModelCandidate::new(
                 retry::RetryingModel::new(model, policy.clone()),
                 &candidate.model_name,
@@ -1428,6 +1420,21 @@ fn openai_client(
         .http_client(http)
         .build()
         .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
+}
+
+/// One candidate's OpenAI-style model, wrapped so that every assistant turn in
+/// the history reaches the wire -- see [`OpenAiModel`].
+///
+/// Shared by the single path and the chain for the reason [`openai_client`]
+/// is: a candidate built without the wrapper would quietly send a different
+/// conversation than a lone model sends.
+fn openai_model(
+    client: &rig::providers::openai::CompletionsClient<retry::RetryingHttpClient>,
+    candidate: &ResolvedCandidate,
+) -> OpenAiModel {
+    use rig::client::CompletionClient;
+
+    OpenAiModel(client.completion_model(&candidate.model_identifier))
 }
 
 /// Rig's Anthropic client for one candidate.
@@ -1601,6 +1608,92 @@ fn only_anthropic_reasoning(
     // Never empty in practice: only assistant messages are dropped, and a
     // request always ends in its prompt.
     rig::OneOrMany::many(kept).map_err(|e| rig::completion::CompletionError::RequestError(e.into()))
+}
+
+type RigOpenAiModel = rig::providers::openai::CompletionModel<retry::RetryingHttpClient>;
+
+/// rig's OpenAI chat-completions model, sent every assistant turn it is given.
+///
+/// rig converts an assistant message with no text and no tool call into nothing
+/// at all, reasoning notwithstanding -- by design, pinned by its own
+/// `assistant_reasoning_alone_is_dropped`, in 0.42 as in 0.40. Its agent loop
+/// keeps such a turn, though, and so does outrig, which reports the reasoning:
+/// a reasoning model stopped at its output ceiling produces exactly that turn.
+/// Left to rig, the next request would carry the prompts on either side of it
+/// as two user messages in a row. The model would never learn it had answered,
+/// and an endpoint that requires alternating roles would refuse the request.
+///
+/// So each such message gets an empty text part here, at the one boundary every
+/// OpenAI-style request crosses, whether it comes from a lone model or a chain
+/// candidate. rig then sends it as an assistant message with empty content and
+/// its reasoning in `reasoning_content`, as it already sends reasoning beside
+/// text: the empty reply the turn actually was. outrig's own history keeps the
+/// turn as rig returned it, since a chain sends that history to its other
+/// candidates too, and Anthropic refuses an empty text block.
+#[derive(Clone)]
+pub struct OpenAiModel(RigOpenAiModel);
+
+impl CompletionModel for OpenAiModel {
+    type Response = <RigOpenAiModel as CompletionModel>::Response;
+    type StreamingResponse = <RigOpenAiModel as CompletionModel>::StreamingResponse;
+    type Client = <RigOpenAiModel as CompletionModel>::Client;
+
+    /// Never reached by outrig, which builds the model in [`openai_model`],
+    /// but rig's trait requires it.
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self(RigOpenAiModel::make(client, model))
+    }
+
+    async fn completion(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::completion::CompletionResponse<Self::Response>,
+        rig::completion::CompletionError,
+    > {
+        keep_textless_turns(&mut request.chat_history);
+        self.0.completion(request).await
+    }
+
+    async fn stream(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig::completion::CompletionError,
+    > {
+        keep_textless_turns(&mut request.chat_history);
+        self.0.stream(request).await
+    }
+
+    /// Delegated for the reason [`retry::RetryingModel`] delegates it: the
+    /// trait's `false` would cost OpenAI guaranteed structured output on every
+    /// turn that has tools.
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.0.composes_native_output_with_tools()
+    }
+}
+
+/// Give every assistant message rig's OpenAI conversion would drop an empty
+/// text part. See [`OpenAiModel`].
+///
+/// The test is rig's own -- no text and no tool call -- rather than "only
+/// reasoning", so that nothing it drops is missed.
+fn keep_textless_turns(history: &mut rig::OneOrMany<Message>) {
+    use rig::completion::message::AssistantContent;
+
+    for message in history.iter_mut() {
+        if let Message::Assistant { content, .. } = message
+            && !content.iter().any(|part| {
+                matches!(
+                    part,
+                    AssistantContent::Text(_) | AssistantContent::ToolCall(_)
+                )
+            })
+        {
+            content.push(AssistantContent::text(""));
+        }
+    }
 }
 
 /// One candidate's in-process model, from the registry that keys them by
