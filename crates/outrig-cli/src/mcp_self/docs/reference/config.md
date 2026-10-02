@@ -144,10 +144,15 @@ does not hold up the container's other lookups. If either mode is requested and 
 session fails before MCP servers launch.
 
 Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
-`/etc/resolv.conf`. When that file is missing, names no nameserver, or names only loopback
-addresses such as systemd-resolved's stub, the listener prefers the upstream servers
-systemd-resolved lists in `/run/systemd/resolve/resolv.conf`. If neither file names a resolver,
-setup fails rather than choosing one on the host's behalf.
+`/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback
+entry answers just as it does for the host. On a host using systemd-resolved, that entry is its
+stub, `127.0.0.53`, and resolved routes each container lookup as it routes the host's own: a
+name in a VPN's routing domain goes to the VPN's server. A bare single-label name such as `nas`
+can reach resolved as it is, since the resolver interception installs names none of the host's
+search domains, and resolved does not look such a name up over DNS by default -- name such a
+host in full. When `/etc/resolv.conf` is missing or names no nameserver, the listener uses the
+upstream servers systemd-resolved lists in `/run/systemd/resolve/resolv.conf` instead. If
+neither file names a resolver, setup fails rather than choosing one on the host's behalf.
 
 Filter policy lives in the global config only:
 

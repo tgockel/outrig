@@ -3,8 +3,10 @@
 //! access. [`a_resolved_name_grants_a_hostname_allow`] and
 //! [`a_lookup_sent_to_another_resolver_is_answered`] additionally need working
 //! outbound DNS, since resolving through the interceptor is the whole point of
-//! them. The IPv6 tests need the container to have an IPv6 default route,
-//! which rootless podman's pasta gives it by default.
+//! them. [`a_lookup_on_a_systemd_resolved_host_goes_through_its_stub`] needs a
+//! host whose first resolver is systemd-resolved's stub, from systemd 253 on,
+//! and skips itself on any other. The IPv6 tests need the container to have an
+//! IPv6 default route, which rootless podman's pasta gives it by default.
 //!
 //! Run with:
 //!
@@ -17,7 +19,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -1103,6 +1105,100 @@ async fn a_lookup_sent_to_another_resolver_is_answered() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// systemd-resolved's stub listener address.
+const RESOLVED_STUB: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 53);
+
+/// The first `nameserver` in the host's `/etc/resolv.conf`, read the way the
+/// interceptor reads it: the resolver it forwards to first.
+fn host_first_nameserver() -> Option<IpAddr> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let line = line.split('#').next().unwrap_or("").trim();
+            line.strip_prefix("nameserver")?.trim().parse().ok()
+        })
+}
+
+/// Whether the host's systemd-resolved answers `_localdnsstub` itself, which
+/// it does from systemd 253 on.
+fn host_resolved_answers_localdnsstub() -> bool {
+    Command::new("resolvectl")
+        .args(["query", "_localdnsstub"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// On a systemd-resolved host the interceptor forwards to resolved's stub, so
+/// resolved decides where each container lookup goes -- a VPN's domains to
+/// the VPN's server -- rather than every name going to the servers its
+/// upstream file lists, which leave out a VPN that is not a default route.
+/// That routing cannot be staged without privileges, so this asks for the one
+/// name only resolved answers: `_localdnsstub`, which it synthesizes as the
+/// stub's own address. That address coming back is the proof the stub
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lookup_on_a_systemd_resolved_host_goes_through_its_stub() {
+    // Before the lock, so a host that skips does not wait out the suite.
+    if host_first_nameserver() != Some(IpAddr::V4(RESOLVED_STUB)) {
+        eprintln!("skipping: /etc/resolv.conf does not name systemd-resolved's stub first");
+        return;
+    }
+    if !host_resolved_answers_localdnsstub() {
+        eprintln!("skipping: the host's systemd-resolved does not answer _localdnsstub itself");
+        return;
+    }
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+
+    // `-type=a`, or busybox asks for AAAA as well, which resolved answers
+    // with no records. The trailing dot, because busybox puts any search
+    // domain it finds on a dotless name and then never asks for the name
+    // itself.
+    let output = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["nslookup", "-type=a", "_localdnsstub."]),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The answer's line. The one naming the server asked carries a port.
+    let answered = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("Address:"))
+        .any(|address| address.trim().parse::<Ipv4Addr>().ok() == Some(RESOLVED_STUB));
+    assert!(
+        output.status.success() && answered,
+        "_localdnsstub should resolve to {RESOLVED_STUB} through the interceptor: {:?}\n\
+         stdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     interceptor
         .shutdown()

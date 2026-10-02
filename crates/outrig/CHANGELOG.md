@@ -108,10 +108,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/etc/resolv.conf` was missing, unreadable, or named no nameserver, the `audit`/`filter`
   DNS listener forwarded every lookup to Cloudflare at `1.1.1.1:53`, without saying so anywhere.
   It did this even when systemd-resolved's `/run/systemd/resolve/resolv.conf` named a usable
-  upstream, which had already been read and was then thrown away. That upstream is now preferred
-  whenever `/etc/resolv.conf` names nothing or only loopback addresses. If neither file names a
-  resolver, attaching fails with a `Configuration` error that says what each file held, so a
-  host that had been resolving through Cloudflare now fails `audit`/`filter` setup instead.
+  upstream, which had already been read and was then thrown away. That upstream is now used
+  whenever `/etc/resolv.conf` names nothing. If neither file names a resolver, attaching fails
+  with a `Configuration` error that says what each file held, so a host that had been resolving
+  through Cloudflare now fails `audit`/`filter` setup instead.
+
+- **Intercepted DNS follows systemd-resolved's split-DNS routing.** When the host's
+  `/etc/resolv.conf` named only loopback addresses -- on a systemd-resolved host, its stub at
+  `127.0.0.53` -- the `audit`/`filter` DNS listener passed over them and forwarded every lookup
+  straight to the servers in `/run/systemd/resolve/resolv.conf`. That file is a flat list that
+  leaves out every link that is not a default route, such as a VPN serving only its own domains,
+  so a container's lookup of a name only the VPN serves went to the LAN's resolver, which could
+  not answer it and learned the name all the same. The listener now forwards to whatever
+  `/etc/resolv.conf` names, a loopback stub included, so resolved routes each container lookup
+  as it routes the host's own, including through a VPN that connects mid-session, which the
+  list read at attach never saw. One consequence: a bare single-label name such as `nas` that
+  the LAN's resolver used to answer can now reach resolved as it is, since the resolver
+  interception installs names none of the host's search domains, and resolved does not look such
+  a name up over DNS by default. Such a name has to be given in full.
 
 - **One slow DNS lookup no longer stalls the container's others.** The interceptor's DNS
   listener forwarded one query at a time and did not read the next until the current one was
