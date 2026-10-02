@@ -1551,6 +1551,7 @@ dependencies = [
  "async-stream",
  "axum",
  "blake3",
+ "bytes",
  "futures-util",
  "heck",
  "ignore",

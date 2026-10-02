@@ -10,6 +10,10 @@
 //! model call is sent a view of it: the first rounds, the most recent, and
 //! what the agent promoted.
 //!
+//! Each call retries a provider's transient failures ([`retry`]), and one that
+//! still fails moves to the next model an alias names ([`failover`]), sent a
+//! view assembled for that model's own window.
+//!
 //! A copy of `outrig-cli`'s loop rather than a move of it, so the 0.2.x line
 //! keeps editing its own without conflict; `plan/phase/0003-python/` records
 //! why. rig stays a private dependency: nothing rig-typed crosses
@@ -19,9 +23,11 @@
 mod budget;
 mod build;
 mod channel;
+mod failover;
 mod history;
 mod orientation;
 mod resolve;
+mod retry;
 mod round;
 mod tool;
 
@@ -63,16 +69,11 @@ pub struct PythonAgent {
     agent: RigAgent,
     /// The whole conversation, which rounds commit to as they go.
     history: History,
-    /// What each model call may carry of it.
+    /// What each model call may carry of it: the head's allowance, whose
+    /// `model` is the row every call is tried against first. A call moved to
+    /// another model is held to that model's, which the chain holds.
     budget: Arc<Budget>,
     tool_call_max: usize,
-    /// The output-token ceiling the model is held to: the configured one,
-    /// filled in or lowered to what the model publishes. Recorded as
-    /// `model.instructions` when the agent is built.
-    #[cfg(test)]
-    max_tokens: Option<u32>,
-    /// The concrete `[models.<name>]` row the agent runs against.
-    model: String,
     python_version: String,
     container_name: String,
     /// Shared with the tool, which calls what [`PythonAgent::on_submit`] puts
@@ -140,10 +141,13 @@ impl PythonAgent {
         Ok(())
     }
 
-    /// The `[models.<name>]` row the agent runs against. An alias has already
-    /// been resolved to one of its models, so this never names an alias.
+    /// The `[models.<name>]` row every model call is tried against first. An
+    /// alias has already been resolved to its models, so this never names an
+    /// alias: it is the first of them this build can reach. A call that fails
+    /// there moves to the next, and the event log records which model answered
+    /// each call.
     pub fn model(&self) -> &str {
-        &self.model
+        &self.budget.model
     }
 
     /// The Python version the interpreter reported when it started, such as
@@ -248,16 +252,15 @@ impl PythonAgent {
         events.emit(Event::RoundStarted {
             round: self.history.round(),
         });
-        let RoundEnd { reply, stopped } = self
-            .agent
-            .round(
-                opening,
-                &self.history,
-                &self.budget,
-                self.tool_call_max,
-                &self.interrupts,
-            )
-            .await?;
+        let RoundEnd { reply, stopped } = round::round(
+            &self.agent,
+            opening,
+            &self.history,
+            &self.budget,
+            self.tool_call_max,
+            &self.interrupts,
+        )
+        .await?;
         // Only now: a round that failed or was dropped may have left the
         // model unaware of what it announced, and the next one says it again.
         self.announcer.keep();
@@ -328,24 +331,24 @@ impl PythonAgent {
                 &definition.parameters.to_string(),
             ],
         );
-        let built = build::build_agent(
+        // Each candidate's budget is settled in building: the reply's reserve
+        // is the ceiling that reaches the wire, which building may fill in or
+        // lower.
+        let agent = build::build_agent(
             resolved,
             &preamble,
             vec![Box::new(tool) as Box<dyn ToolDyn>],
+            &history,
+            overhead,
         )?;
-        // After building: the reply's reserve is the ceiling that reaches the
-        // wire, which building may have filled in or lowered.
-        let budget = Budget::new(&resolved.candidate, built.max_tokens, overhead)?;
-        tracing::debug!(
-            model = %budget.model,
-            window = budget.window,
-            assumed = budget.window_assumed,
-            reserve = budget.reserve,
-            overhead = budget.overhead,
-            "each model call is held to this budget"
-        );
+        let budget = agent
+            .model
+            .budgets()
+            .next()
+            .expect("a chain is never empty")
+            .clone();
+        let model = &budget.model;
         let events = history.events();
-        let model = &resolved.candidate.model_name;
         events.emit(Event::AgentStarted {
             model,
             python: &python_version,
@@ -357,16 +360,13 @@ impl PythonAgent {
             model,
             preamble: &preamble,
             tools: std::slice::from_ref(&definition),
-            max_tokens: built.max_tokens,
+            max_tokens: budget.max_tokens,
         });
         Ok(Self {
-            agent: built.agent,
+            agent,
             history,
             budget: Arc::new(budget),
             tool_call_max: resolved.tool_call_max,
-            #[cfg(test)]
-            max_tokens: built.max_tokens,
-            model: resolved.candidate.model_name.clone(),
             python_version,
             container_name: container_name.to_string(),
             on_submit,

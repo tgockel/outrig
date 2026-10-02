@@ -89,11 +89,13 @@ category says what it may hold.
 
 - `model.instructions` -- once, as the agent starts: what every call is sent besides the
   conversation.
-  - `model`: the `[models.<name>]` row.
+  - `model`: the `[models.<name>]` row every call is tried against first. For an alias, that is
+    the first of its models this build can reach.
   - `preamble`: the system prompt.
   - `tools`: each tool's `name`, `description`, and `parameters` schema.
-  - `max_tokens`: the reply ceiling in force, after the model's published ceiling filled it in or
-    lowered it; `null` when none is sent.
+  - `max_tokens`: that model's reply ceiling, after its published ceiling filled it in or
+    lowered it; `null` when none is sent. A call that moves to another of an alias's models
+    carries that model's ceiling instead, which its `model.call` records.
 - `turn.committed` -- a turn, as it joins the conversation. A turn is one model call and the tool
   results it asked for, so it joins once those results are in: after the executions it ran, and
   before the next call.
@@ -106,8 +108,8 @@ category says what it may hold.
 - `model.call` -- a model call, as it is made: its manifest.
   - `call`: the agent's calls counted from 0.
   - `round`: its round.
-  - `budget`: what it was held to, in tokens: `model`, `window`, `window_assumed`, `reserve`, and
-    `overhead`.
+  - `budget`: what it was held to, in tokens: `model`, `window`, `window_assumed`, `reserve`,
+    `overhead`, and `max_tokens`, the reply ceiling the call carried, or `null`.
   - `estimate`: the whole request's estimated tokens.
   - `carried`: the turns it sent, oldest first, each as `{turn, why}`; `why` is `latest`,
     `round`, `promoted`, `first`, or `recent`.
@@ -116,11 +118,22 @@ category says what it may hold.
     otherwise `null`.
   - `adjacent`: where one role follows itself in what was sent, each as `{turn, role}`; `turn` is
     `null` where the repeat is the round's opening.
+  - `left_out`: the parts of carried turns the call's provider cannot take, which it was not
+    sent, each as `{turn, message, part}`, counted from 0 within the turn's `messages` and the
+    message's `content`. Today that is reasoning without a signature, left out of a call to an
+    Anthropic model, such as an OpenAI-compatible model's `reasoning_content`.
 - `exec.submitted` -- Python the model submitted, as it goes to run: `execid` and `source`.
 
 What a call sent rebuilds from the file alone: the `messages` of each turn in its `carried`, in
-order, then its `opening`, with `model.instructions` for the system prompt and the tool. A
-promotion is a request rather than proof of what was sent; the call's `carried` is the answer.
+order, less each part its `left_out` names and any message all of whose parts it names, then its
+`opening`, with `model.instructions` for the system prompt and the tool. A promotion is a request
+rather than proof of what was sent; the call's `carried` is the answer. The turns themselves keep
+everything each model wrote.
+
+A call that moves to another of an alias's models is assembled again for that model's window, and
+recorded as a `model.call` of its own, right after the `model.failover` that moved it. Its
+`budget` names the model it went to. A retry resends the same call, and records no new
+`model.call`.
 
 ## Execution diagnostics
 
@@ -168,16 +181,22 @@ promotion is a request rather than proof of what was sent; the call's `carried` 
   - `usage`: the round's tokens, as the provider reported them: `input_tokens`, `output_tokens`,
     `total_tokens`, `cached_input_tokens`, `cache_creation_input_tokens`, `reasoning_tokens`.
     Zeros mean the provider reported none.
-  - `calls`: each call's `{index, usage}`, counted from 0.
+  - `calls`: each call's `{index, model, usage}`, counted from 0. `model` is the
+    `[models.<name>]` row that answered it, which for an alias is not always the first.
   - `input_tokens_max`: the largest `input_tokens` any call reported. Providers differ on
     whether cached input counts there: Anthropic's does not, OpenAI's does.
 - `model.round.failed` -- a round ended by an error: `round`, `error`, and `calls` so far.
 - `model.round.dropped` -- a round ended by a Ctrl-C while no Python ran: `round` and `calls`
   so far.
-- `model.retry` -- reserved for a retried model call: `attempt`, `delay` in seconds, and
-  `error`. `run-new` does not retry yet, so nothing records it.
-- `model.failover` -- reserved for a move to another model: `from`, `to`, and `error`. Not
-  recorded yet, for the same reason.
+- `model.retry` -- a model call that failed and will be made again, after a wait.
+  - `model`: the `[models.<name>]` row being retried.
+  - `attempt`: the attempt that failed, counted from 1.
+  - `delay`: seconds until the next.
+  - `error`: why, without the provider's response body: an HTTP status, a connection error, or
+    an unusable response.
+- `model.failover` -- a model call that moved to the next of an alias's models, once the one
+  before had failed past its retries, or could not take the call: `from` and `to`, each a
+  `[models.<name>]` row, and `error`, why `from` was given up.
 - `message.sent` -- a message put on a channel: `message`, an id OutRig gives it; `channel`;
   `from` and `to`, each `user` or `agent/primary`; and `body`.
 - `message.refused` -- a message the other end did not take: `message`, `channel`, `from`, `to`,

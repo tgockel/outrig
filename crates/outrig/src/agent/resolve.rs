@@ -1,14 +1,13 @@
 //! Resolve agent -> model -> provider.
 //!
 //! Copied from `outrig-cli`'s `llm.rs`, which keeps its own; the two do not
-//! share code during this phase. What one round needs came across, and what it
-//! does not was left behind:
+//! share code during this phase. What the agent loop needs came across, and
+//! what it does not was left behind:
 //!
-//! - An alias resolves to the first of its models this build can reach, as the
-//!   CLI's did before failover. Resolving the whole chain is failover's, and
-//!   arrives with it.
-//! - The subagent limits, the image hint, and the retry budget have no reader
-//!   here, and neither do the names the CLI's banner prints.
+//! - An alias resolves to every one of its models this build can reach, in
+//!   order: the chain a failed call moves along ([`super::failover`]).
+//! - The subagent limits and the image hint have no reader here, and neither do
+//!   the names the CLI's banner prints.
 //! - There are no fallback arms for a provider style nobody taught the
 //!   resolver. `LlmProvider` is `#[non_exhaustive]` for other crates, not this
 //!   one, so here a new style fails to compile until both matches handle it.
@@ -88,15 +87,47 @@ pub(crate) enum ResolvedProvider {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
+        retry_budget_secs: Option<u64>,
     },
     Anthropic {
         base_url: String,
         api_key: String,
         request_timeout_secs: Option<u64>,
+        retry_budget_secs: Option<u64>,
     },
 }
 
-/// The concrete `[models.<name>]` row a session runs against, fully resolved.
+impl ResolvedProvider {
+    /// This provider's per-request timeout, or `None` for the default.
+    pub(crate) fn request_timeout_secs(&self) -> Option<u64> {
+        match self {
+            Self::OpenAi {
+                request_timeout_secs,
+                ..
+            }
+            | Self::Anthropic {
+                request_timeout_secs,
+                ..
+            } => *request_timeout_secs,
+        }
+    }
+
+    /// This provider's retry budget, the top-level value already folded in.
+    /// `None` is an answer -- "the compiled default" -- not an absence.
+    pub(crate) fn retry_budget_secs(&self) -> Option<u64> {
+        match self {
+            Self::OpenAi {
+                retry_budget_secs, ..
+            }
+            | Self::Anthropic {
+                retry_budget_secs, ..
+            } => *retry_budget_secs,
+        }
+    }
+}
+
+/// One concrete `[models.<name>]` row a session may run against, fully
+/// resolved.
 #[derive(Debug)]
 pub(crate) struct ResolvedCandidate {
     /// The *concrete* row: never an alias's name.
@@ -120,13 +151,25 @@ pub(crate) struct ResolvedCandidate {
 /// serialized.
 #[derive(Debug)]
 pub(crate) struct ResolvedAgent {
-    pub(crate) candidate: ResolvedCandidate,
+    /// The rows the agent may run against, in preference order, and never
+    /// empty. One for a model named directly or an alias of one model; an
+    /// alias of several keeps each this build can reach.
+    pub(crate) candidates: Vec<ResolvedCandidate>,
     /// The agent's configured preamble, which the system prompt carries after
     /// the orientation.
     pub(crate) preamble: Option<String>,
     pub(crate) temperature: Option<f32>,
     pub(crate) tool_call_max: usize,
     pub(crate) tool_result_max_bytes: usize,
+}
+
+impl ResolvedAgent {
+    /// The first candidate: the row every call is tried against first.
+    pub(crate) fn head(&self) -> &ResolvedCandidate {
+        self.candidates
+            .first()
+            .expect("a resolved agent always has at least one candidate")
+    }
 }
 
 /// Why this build could not reach `model_name`, a concrete (provider-shape)
@@ -164,34 +207,48 @@ fn selectability(cfg: &Config, model_name: &str) -> Result<(), String> {
     }
 }
 
-/// The first of `alias`'s `models` this build could reach, or an error listing
-/// every one and why it was skipped.
+/// Every one of `alias`'s `models` this build could reach, in order, or an
+/// error listing every one and why it was skipped.
 ///
 /// Selection is blind to whether an endpoint is *up*: it answers "am I
-/// configured for this", not "is this working".
-fn first_selectable<'a>(
+/// configured for this", not "is this working" -- which a failover chain
+/// settles among the models kept here. Dropping the unreachable ones now keeps
+/// a chain from spending a move on a model whose api-key was never set.
+fn selectable<'a>(
     cfg: &Config,
     alias: &str,
     models: &[&'a str],
-) -> Result<&'a str, AgentError> {
+) -> Result<Vec<&'a str>, AgentError> {
+    let mut kept = Vec::new();
     let mut tried = Vec::new();
     for model in models {
         match selectability(cfg, model) {
-            Ok(()) => return Ok(model),
+            Ok(()) => kept.push(*model),
             Err(reason) => tried.push((*model, reason)),
         }
     }
-    let width = tried.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
-    let tried = tried
-        .iter()
-        .map(|(name, reason)| format!("  {name:width$} -- {reason}"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    if !kept.is_empty() {
+        return Ok(kept);
+    }
     Err(LlmResolveError::NoUsableAliasCandidate {
         alias: alias.to_string(),
-        tried,
+        tried: render_candidate_reasons(&tried),
     }
     .into())
+}
+
+/// One line per model: its name, padded so the reasons align, and why it is
+/// not the one serving.
+///
+/// Shared by the two halves of the same message: resolution reports it when no
+/// model of an alias can be reached, and a failover chain when every one it
+/// tried has failed.
+pub(crate) fn render_candidate_reasons(rows: &[(&str, String)]) -> String {
+    let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(name, reason)| format!("  {name:width$} -- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Walk `cfg.agents -> models -> providers` to resolve every knob the agent
@@ -255,49 +312,46 @@ pub(crate) fn resolve_agent(
     // A model names either a provider that serves it or other models it stands
     // for. Read from the raw field rather than through `Model::source()`,
     // which panics on a row that is both shapes or neither.
-    let concrete = if root.alias.is_some() {
+    let concrete: Vec<&str> = if root.alias.is_some() {
         let models = cfg
             .model_candidates(model_name)
             .map_err(OutrigError::from)?;
         match models.as_slice() {
             // One model is renaming, not choosing. Resolve it exactly as if the
             // user had typed it, so every error keeps its own text and remedy.
-            [only] => only,
-            _ => {
-                let chosen = first_selectable(cfg, model_name, &models)?;
-                tracing::warn!(
-                    "{model_name} names {} models, and this loop has no failover yet: it runs \
-                     against {chosen} alone",
-                    models.len(),
-                );
-                chosen
-            }
+            [only] => vec![*only],
+            _ => selectable(cfg, model_name, &models)?,
         }
     } else {
-        model_name
+        vec![model_name]
     };
 
-    let candidate = resolve_candidate(cfg, agent, concrete)?;
-    // The configured values alone: a ceiling at or above the window is a
-    // contradiction in the file, whatever a provider would have lowered it to.
-    if let (Some(max_tokens), Some(window)) = (candidate.max_tokens, candidate.context_window)
-        && max_tokens >= window
-    {
-        let setter = match (agent_name, agent.max_tokens) {
-            (Some(name), Some(_)) => format!("[agents.{name}].max-tokens"),
-            _ => format!("[models.{concrete}].max-tokens"),
-        };
-        return Err(LlmResolveError::ReplyFillsWindow {
-            setter,
-            max_tokens,
-            model: concrete.to_string(),
-            window,
+    let mut candidates = Vec::with_capacity(concrete.len());
+    for name in concrete {
+        let candidate = resolve_candidate(cfg, agent, name)?;
+        // The configured values alone: a ceiling at or above the window is a
+        // contradiction in the file, whatever a provider would have lowered it
+        // to. Checked for each model, since each has its own window.
+        if let (Some(max_tokens), Some(window)) = (candidate.max_tokens, candidate.context_window)
+            && max_tokens >= window
+        {
+            let setter = match (agent_name, agent.max_tokens) {
+                (Some(name), Some(_)) => format!("[agents.{name}].max-tokens"),
+                _ => format!("[models.{name}].max-tokens"),
+            };
+            return Err(LlmResolveError::ReplyFillsWindow {
+                setter,
+                max_tokens,
+                model: name.to_string(),
+                window,
+            }
+            .into());
         }
-        .into());
+        candidates.push(candidate);
     }
 
     Ok(ResolvedAgent {
-        candidate,
+        candidates,
         preamble: agent.preamble.clone(),
         temperature: agent.temperature,
         tool_call_max: agent
@@ -348,21 +402,25 @@ fn resolve_candidate(
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
             ..
         } => ResolvedProvider::OpenAi {
             base_url: base_url.clone(),
             api_key: api_key.resolve()?,
             request_timeout_secs: *request_timeout_secs,
+            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
         },
         LlmProvider::Anthropic {
             base_url,
             api_key,
             request_timeout_secs,
+            retry_budget_secs,
             ..
         } => ResolvedProvider::Anthropic {
             base_url: base_url.clone(),
             api_key: api_key.resolve()?,
             request_timeout_secs: *request_timeout_secs,
+            retry_budget_secs: retry_budget_secs.or(cfg.retry_budget_secs),
         },
     };
 

@@ -76,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ends, keeping it, with a reason naming the turn, and the next round leaves it out. A provider's
   refusal of a call whose shortened history put one role after itself says so.
 
+  Each model call retries a provider's transient failures -- a retryable status, Anthropic's
+  `529` included, honoring `Retry-After`, a dropped connection, a response rig cannot use --
+  within `retry-budget-secs`, as `outrig run` does, and says so through `tracing`. A request that
+  cannot succeed as sent, such as a redirect loop, is not retried. An alias naming several models
+  resolves to each this build can reach, in order, and a call that still fails moves to the next,
+  starting again at the first on every call. The call that moves is sent a view assembled for
+  that model's own window, and carries that model's own reply ceiling. A call to an Anthropic
+  model leaves out reasoning another provider wrote, which has no signature for Anthropic to take
+  it back with. When every model has failed, the round fails with each one's reason, keeping what
+  it ran, as any failed round does.
+
   The system prompt opens with a short orientation: the one tool is the only way to act, how the
   user's messages arrive and how to answer them, how `runtime.wait` differs from `asyncio.wait`,
   what each model call is sent of the conversation and where the rest is, the working directory
@@ -105,8 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was, one that needs more can raise its own.
 
   **Provisional**: this is the entry point `outrig-cli` drives, not an interface to build on. Its
-  shape will change without a deprecation while the agent loop is built out. It has no retry or
-  failover yet, and an alias naming several models runs against the first.
+  shape will change without a deprecation while the agent loop is built out.
 
 - **`Model::context_window`, `[models.<name>].context-window` in config**: the model's whole
   context window in tokens, a request and its reply together, as its provider publishes it. It
@@ -121,7 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Each line is a CloudEvents 1.0 event whose `data` is OutRig's: each model call's manifest and
   the turns it carried, in rig's message JSON, so the file alone rebuilds what every call sent;
   each submission and how it ended; each message on the `user` channel, with its body; what each
-  round used in tokens, as the provider reported it; and what the host did -- interrupts,
+  round used in tokens, as the provider reported it, and which model answered each call; each
+  retry, and each move to another of an alias's models; and what the host did -- interrupts,
   cancels, failed liveness checks, executions it stopped waiting for, `MemoryError`s, and output
   no execution wrote. `doc/reference/events.md` is the schema, with the rule each event is
   recorded under. `PythonAgent::shutdown` finishes the file, waiting at most two seconds, and

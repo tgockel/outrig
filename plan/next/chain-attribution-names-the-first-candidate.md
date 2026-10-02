@@ -50,3 +50,14 @@ mean "what this session is configured for".
   introduced the delegating accessors and its decision 8 the mitigations that cover the interactive
   case only.
 - **Soft: `plan/next/subagent-model-allowlist.md`**, which wants the same value for audit.
+
+## The library's loop names the model that answered, and the CLI's does not
+
+`0003-15` copied failover into `crates/outrig/src/agent/` for `PythonAgent`, and fixed this there
+rather than copying it. The chain's completion carries the candidate that answered as its
+response type (`failover::Answered`), which rig hands the round's hook, so each call in the event
+log's `calls[]` names its own model. A move is also recorded as `model.failover` as it happens.
+`PythonAgent::model()` still names the head, and says so: it is what every call is tried against
+first.
+
+The CLI's `ModelLabel` and its transcript header are unchanged, and still name candidate one.

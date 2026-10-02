@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `runtime.context.promote` sends a turn again until `runtime.context.demote`. Each call is held
   to the model's context window, `[models.<name>].context-window` or an assumed 128,000 tokens,
   leaving out what does not fit; a turn too large to send on its own ends its round, naming it,
-  and later rounds go on without it. Python that spins without yielding is interrupted
+  and later rounds go on without it. A failing provider is retried and an alias fails over as in
+  `run`, a call that moves being sent what fits the next model's window; when every model has
+  failed, the round ends with each one's reason, and the session goes on. Python that spins without yielding is interrupted
   after about half a minute on its own. Python that allocates past its memory ceiling, half of
   what the container can see, gets a `MemoryError` the model reads rather than ending the session;
   programs it starts inherit the ceiling, and can raise their own. The agent's Python imports
@@ -42,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignores it.
 - **`[events] mode = "record"`**, which has `run-new` record what its agent did in
   `<session_dir>/logs/events.jsonl`: each model call and the conversation it was sent, each
-  submission and how it ended, each message on the channel, and the tokens each round used. The
+  submission and how it ended, each message on the channel, the tokens each round used and the
+  model that answered each call, and each retry and failover. The
   file is readable by its owner only, and finished before the container stops; a warning at exit
   counts any events it could not take. Off by default, with no flag yet, and `run` ignores it.
   `doc/reference/events.md` lists every event, and `uv run --script scripts/render-session.py

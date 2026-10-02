@@ -394,13 +394,12 @@ pub(crate) enum Event<'a> {
         round: u32,
         calls: Vec<CallUsage>,
     },
-    #[cfg_attr(not(test), expect(dead_code, reason = "0003-15 emits it"))]
     ModelRetry {
+        model: &'a str,
         attempt: u32,
         delay: f64,
         error: &'a str,
     },
-    #[cfg_attr(not(test), expect(dead_code, reason = "0003-15 emits it"))]
     ModelFailover {
         from: &'a str,
         to: &'a str,
@@ -487,6 +486,16 @@ pub(crate) struct ModelCall<'a> {
     pub(crate) evicted: Vec<Chosen>,
     pub(crate) opening: Option<&'a Message>,
     pub(crate) adjacent: Vec<Repeat>,
+    pub(crate) left_out: Vec<LeftOut>,
+}
+
+/// A part of a carried turn a call was not sent, by its place: the turn, the
+/// message within it, and the part within that.
+#[derive(Debug, Serialize)]
+pub(crate) struct LeftOut {
+    pub(crate) turn: usize,
+    pub(crate) message: usize,
+    pub(crate) part: usize,
 }
 
 /// What a call was held to, in tokens.
@@ -497,6 +506,7 @@ pub(crate) struct CallBudget<'a> {
     pub(crate) window_assumed: bool,
     pub(crate) reserve: u32,
     pub(crate) overhead: u64,
+    pub(crate) max_tokens: Option<u32>,
 }
 
 /// A turn a call carried or left out, and the reason it was chosen.
@@ -532,6 +542,21 @@ pub(crate) struct Usage {
     pub(crate) reasoning_tokens: u64,
 }
 
+/// A round's tokens are its calls' added up.
+impl std::iter::Sum for Usage {
+    fn sum<I: Iterator<Item = Usage>>(calls: I) -> Usage {
+        calls.fold(Usage::default(), |sum, call| Usage {
+            input_tokens: sum.input_tokens + call.input_tokens,
+            output_tokens: sum.output_tokens + call.output_tokens,
+            total_tokens: sum.total_tokens + call.total_tokens,
+            cached_input_tokens: sum.cached_input_tokens + call.cached_input_tokens,
+            cache_creation_input_tokens: sum.cache_creation_input_tokens
+                + call.cache_creation_input_tokens,
+            reasoning_tokens: sum.reasoning_tokens + call.reasoning_tokens,
+        })
+    }
+}
+
 impl From<rig::completion::Usage> for Usage {
     fn from(usage: rig::completion::Usage) -> Self {
         Self {
@@ -545,10 +570,12 @@ impl From<rig::completion::Usage> for Usage {
     }
 }
 
-/// One model call's tokens, by its place in the round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// One model call's tokens, by its place in the round, and the model that
+/// answered it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CallUsage {
     pub(crate) index: usize,
+    pub(crate) model: String,
     pub(crate) usage: Usage,
 }
 

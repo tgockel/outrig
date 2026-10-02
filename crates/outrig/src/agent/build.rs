@@ -1,11 +1,13 @@
-//! Build a Rig agent for a resolved agent: its client, its model, and the
-//! output-token ceiling the model will actually be held to.
+//! Build a Rig agent for a resolved agent: a failover chain over its
+//! candidates, each with its client, its retry stack, and what a call to it may
+//! carry -- including the output-token ceiling it will actually be held to.
 //!
-//! Copied from `outrig-cli`'s `llm.rs` without its retry layer, which arrives
-//! later: each provider gets a plain `reqwest::Client` rather than the retrying
-//! one.
+//! Copied from `outrig-cli`'s `llm.rs`. The CLI builds a lone model without a
+//! chain, so its sessions stay byte-for-byte what they were before failover;
+//! here every agent's model is a chain, of one when no alias names more.
 
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rig::agent::{Agent, AgentBuilder};
@@ -15,20 +17,18 @@ use rig::providers::{anthropic, openai};
 use rig::tool::ToolDyn;
 
 use super::AgentError;
+use super::budget::Budget;
+use super::failover::{Candidate, FailoverModel, ModelCandidate};
+use super::history::History;
 use super::resolve::{LlmResolveError, ResolvedAgent, ResolvedCandidate, ResolvedProvider};
+use super::retry::{self, Retries, RetryPolicy, RetryingHttpClient, RetryingModel};
+use crate::events::Events;
 
 /// Default per-request HTTP timeout for remote providers when
 /// `request-timeout-secs` is unset. Generous enough not to truncate long
 /// reasoning completions, and above typical proxy timeouts so a client-side
 /// timeout never races a still-in-flight server request.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
-
-/// How long a request may take to connect at all. The request timeout above
-/// bounds a whole non-streaming completion, which answers only when the model
-/// has finished; this bounds reaching the endpoint, which nothing is waiting
-/// on, so a host that silently drops packets fails in seconds rather than in
-/// ten minutes.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Output-token ceiling for a Claude identifier this build of rig has no
 /// published ceiling for -- typically a model newer than the pinned rig, or a
@@ -41,58 +41,105 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// line, which is the trade this number is chosen for.
 pub(crate) const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 32_768;
 
-/// A Rig agent over whichever provider the candidate named. The two
-/// `CompletionModel` impls are concretely different types, so the agent is an
-/// enum rather than one type.
-pub(crate) enum RigAgent {
-    OpenAi(Agent<openai::CompletionModel<reqwest::Client>>),
-    Anthropic(Agent<anthropic::completion::CompletionModel<reqwest::Client>>),
-}
-
-/// What building produced: the agent, and the output-token ceiling it will be
-/// held to -- which is not always the one configured, since the Anthropic arm
-/// fills it in or lowers it.
-pub(crate) struct Built {
-    pub(crate) agent: RigAgent,
-    pub(crate) max_tokens: Option<u32>,
-}
+/// A Rig agent over a failover chain of the resolved candidates.
+pub(crate) type RigAgent = Agent<FailoverModel>;
 
 /// Build the agent for `resolved`, with `preamble` as its system prompt and
-/// `tools` as its whole tool list. Does no I/O.
+/// `tools` as its whole tool list, recording to `history`'s events and taking
+/// a moved call's view from `history`. Every call carries `overhead` besides
+/// the conversation. Does no I/O.
+///
+/// Each candidate's [`Budget`] is settled and checked here, since its reserve
+/// is the ceiling building settles: one whose window leaves a round too little
+/// room fails the build, whichever candidate it is. The chain holds them
+/// ([`FailoverModel::budgets`]).
 pub(crate) fn build_agent(
     resolved: &ResolvedAgent,
     preamble: &str,
     tools: Vec<Box<dyn ToolDyn>>,
-) -> Result<Built, AgentError> {
-    let candidate = &resolved.candidate;
-    let built = match &candidate.provider {
+    history: &History,
+    overhead: u64,
+) -> Result<RigAgent, AgentError> {
+    // One policy for the whole chain, so its `chain_deadline` is the same
+    // handle in every candidate's HTTP client and model wrapper. Arming it once
+    // per `completion()` call is what bounds the chain's worst case at one
+    // budget rather than one per candidate.
+    //
+    // The budget itself comes from the head's provider. A chain spanning
+    // providers that disagree on `retry-budget-secs` has no single right
+    // answer, and the head of a preference order is the defensible one -- it
+    // is the endpoint the user said to use.
+    let policy = retry_policy(resolved.head().provider.retry_budget_secs());
+    let events = history.events();
+    let candidates = resolved
+        .candidates
+        .iter()
+        .map(|candidate| build_candidate(candidate, &policy, events, overhead))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let [head, rest @ ..] = &resolved.candidates[..]
+        && !rest.is_empty()
+    {
+        // A move means one round can be half one model's work, so the models
+        // it may move to are named before the first one, as `run`'s banner
+        // names them.
+        let rest: Vec<&str> = rest.iter().map(|c| c.model_name.as_str()).collect();
+        tracing::info!(
+            "calls go to {}, and one that fails moves to {}, in that order",
+            head.model_name,
+            rest.join(", ")
+        );
+    }
+
+    let chain = FailoverModel::new(
+        candidates,
+        policy,
+        events.clone(),
+        Arc::new(history.clone()),
+    );
+    // No `max_tokens` here: the chain sets each attempt's to its candidate's.
+    let mut builder = AgentBuilder::new(chain).preamble(preamble);
+    if let Some(temperature) = resolved.temperature {
+        builder = builder.temperature(f64::from(temperature));
+    }
+    Ok(builder.tools(tools).build())
+}
+
+/// Build one link of the chain: its client, its retry stack, its model, and
+/// its budget, behind the object-safe shim a chain holds.
+///
+/// Every candidate takes the *chain's* policy rather than its own provider's,
+/// so they share one deadline. The rest -- the client, the ceiling precedence,
+/// the Anthropic cap, the window -- is per candidate.
+fn build_candidate(
+    candidate: &ResolvedCandidate,
+    policy: &RetryPolicy,
+    events: &Events,
+    overhead: u64,
+) -> Result<Box<dyn Candidate>, AgentError> {
+    let retries = Retries::new(events.clone(), &candidate.model_name);
+    let http = remote_http_client(candidate.provider.request_timeout_secs(), policy, &retries)?;
+    match &candidate.provider {
         ResolvedProvider::OpenAi {
-            base_url,
-            api_key,
-            request_timeout_secs,
+            base_url, api_key, ..
         } => {
             let client = openai::CompletionsClient::builder()
                 .api_key(api_key.to_string())
                 .base_url(base_url)
-                .http_client(remote_http_client(*request_timeout_secs)?)
+                .http_client(http)
                 .build()
                 .map_err(client_build)?;
             let model = client.completion_model(&candidate.model_identifier);
-            Built {
-                agent: RigAgent::OpenAi(finish_agent(
-                    model,
-                    resolved,
-                    preamble,
-                    candidate.max_tokens,
-                    tools,
-                )),
-                max_tokens: candidate.max_tokens,
-            }
+            link(
+                candidate,
+                policy,
+                retries,
+                overhead,
+                model,
+                candidate.max_tokens,
+            )
         }
         ResolvedProvider::Anthropic {
-            base_url,
-            api_key,
-            request_timeout_secs,
+            base_url, api_key, ..
         } => {
             // Rig's client owns the protocol: `x-api-key`, the
             // `anthropic-version` header, `POST {base-url}/v1/messages`, and the
@@ -101,44 +148,99 @@ pub(crate) fn build_agent(
             let client = anthropic::Client::builder()
                 .api_key(api_key.to_string())
                 .base_url(base_url)
-                .http_client(remote_http_client(*request_timeout_secs)?)
+                .http_client(http)
                 .build()
                 .map_err(client_build)?;
             let (model, max_tokens) = anthropic_model(&client, candidate);
-            Built {
-                agent: RigAgent::Anthropic(finish_agent(
-                    model,
-                    resolved,
-                    preamble,
-                    Some(max_tokens),
-                    tools,
-                )),
-                max_tokens: Some(max_tokens),
-            }
+            link(
+                candidate,
+                policy,
+                retries,
+                overhead,
+                model,
+                Some(max_tokens),
+            )
         }
-    };
+    }
+}
+
+/// `model`, retried under `policy` and recorded by `retries`, as `candidate`'s
+/// link of the chain: its calls carry `max_tokens`, and `overhead` besides the
+/// conversation. What every provider's link shares.
+fn link<M>(
+    candidate: &ResolvedCandidate,
+    policy: &RetryPolicy,
+    retries: Retries,
+    overhead: u64,
+    model: M,
+    max_tokens: Option<u32>,
+) -> Result<Box<dyn Candidate>, AgentError>
+where
+    M: CompletionModel + Send + Sync + 'static,
+{
+    let budget = Budget::new(candidate, max_tokens, overhead)?;
     tracing::debug!(
         model = %candidate.model_name,
         identifier = %candidate.model_identifier,
         provider = %candidate.provider_name,
-        max_tokens = built.max_tokens,
-        "built the agent"
+        max_tokens = budget.max_tokens,
+        window = budget.window,
+        assumed = budget.window_assumed,
+        reserve = budget.reserve,
+        overhead = budget.overhead,
+        "built a candidate; each call to it is held to this budget"
     );
-    Ok(built)
+    Ok(Box::new(ModelCandidate::new(
+        RetryingModel::new(model, policy.clone(), retries),
+        &candidate.model_identifier,
+        budget,
+    )))
 }
 
 fn client_build(e: impl Display) -> AgentError {
     LlmResolveError::RigClientBuild(e.to_string()).into()
 }
 
+/// The retry policy every candidate gets, from the head's `retry-budget-secs`
+/// or [`DEFAULT_RETRY_BUDGET_SECS`]. Both retry layers take the same one, so
+/// `retry-budget-secs = 0` switches off both.
+///
+/// `retry-budget-secs` is not the whole policy: the default carries a second,
+/// much shorter bound for a call that never reaches the endpoint, which config
+/// cannot reach. It never widens this one -- the loop applies whichever is
+/// smaller -- so `0` still means no retries anywhere. See
+/// [`RetryPolicy::connect_budget`].
+///
+/// [`DEFAULT_RETRY_BUDGET_SECS`]: crate::config::DEFAULT_RETRY_BUDGET_SECS
+fn retry_policy(retry_budget_secs: Option<u64>) -> RetryPolicy {
+    RetryPolicy {
+        budget: Duration::from_secs(
+            retry_budget_secs.unwrap_or(crate::config::DEFAULT_RETRY_BUDGET_SECS),
+        ),
+        ..RetryPolicy::default()
+    }
+}
+
 /// The HTTP client every remote provider gets: one per-request timeout, from
 /// the provider's `request-timeout-secs` or [`DEFAULT_REQUEST_TIMEOUT_SECS`],
-/// and the connect bound.
-fn remote_http_client(request_timeout_secs: Option<u64>) -> Result<reqwest::Client, AgentError> {
+/// and the connect bound, wrapped in the transient-retry loop `policy` bounds
+/// and `retries` records.
+fn remote_http_client(
+    request_timeout_secs: Option<u64>,
+    policy: &RetryPolicy,
+    retries: &Retries,
+) -> Result<RetryingHttpClient, AgentError> {
     let timeout = Duration::from_secs(request_timeout_secs.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS));
+    // Two ceilings, on two different things. `timeout` bounds the whole
+    // request, and is high because a non-streaming completion answers only
+    // when the model has finished. `connect_timeout` bounds getting connected
+    // at all, which no completion is waiting on -- without it, a host that
+    // silently drops packets would hold an attempt open for the full request
+    // timeout, and the retry loop's much shorter budget for an endpoint that
+    // never answered could not stop it (see [`retry::CONNECT_TIMEOUT`]).
     let builder = reqwest::Client::builder()
         .timeout(timeout)
-        .connect_timeout(CONNECT_TIMEOUT);
+        .connect_timeout(retry::CONNECT_TIMEOUT);
 
     // Unit tests point providers at loopback fixtures. reqwest picks up
     // `HTTP_PROXY` / `ALL_PROXY` automatically and has no loopback exemption of
@@ -148,7 +250,12 @@ fn remote_http_client(request_timeout_secs: Option<u64>) -> Result<reqwest::Clie
     #[cfg(test)]
     let builder = builder.no_proxy();
 
-    builder.build().map_err(client_build)
+    let inner = builder.build().map_err(client_build)?;
+    Ok(RetryingHttpClient::new(
+        inner,
+        policy.clone(),
+        retries.clone(),
+    ))
 }
 
 /// One candidate's Anthropic model, and the output-token ceiling that reaches
@@ -157,11 +264,16 @@ fn remote_http_client(request_timeout_secs: Option<u64>) -> Result<reqwest::Clie
 /// Precedence, highest first: the agent's or model's `max-tokens`, then rig's
 /// published ceiling for an identifier it recognizes, then
 /// [`ANTHROPIC_FALLBACK_MAX_TOKENS`]. There is always one, because Anthropic
-/// rejects a request that carries none.
+/// rejects a request that carries none. Under a chain it runs per candidate,
+/// which is what makes the ceiling travel with the identifier instead of
+/// staying the head's.
 pub(crate) fn anthropic_model(
-    client: &anthropic::Client<reqwest::Client>,
+    client: &anthropic::Client<RetryingHttpClient>,
     candidate: &ResolvedCandidate,
-) -> (anthropic::completion::CompletionModel<reqwest::Client>, u32) {
+) -> (
+    anthropic::completion::CompletionModel<RetryingHttpClient>,
+    u32,
+) {
     // `completion_model`, never `CompletionModel::with_model`: the two
     // disagree about a model identifier rig does not recognize. This one
     // leaves the default unset, which is the signal the fallback below keys
@@ -190,23 +302,4 @@ pub(crate) fn anthropic_model(
         }
     };
     (model, u32::try_from(max_tokens).unwrap_or(u32::MAX))
-}
-
-/// `max_tokens` is passed rather than read off `resolved` because the ceiling
-/// that travels is not always the one that was configured.
-fn finish_agent<M: CompletionModel + 'static>(
-    model: M,
-    resolved: &ResolvedAgent,
-    preamble: &str,
-    max_tokens: Option<u32>,
-    tools: Vec<Box<dyn ToolDyn>>,
-) -> Agent<M> {
-    let mut builder = AgentBuilder::new(model).preamble(preamble);
-    if let Some(temperature) = resolved.temperature {
-        builder = builder.temperature(f64::from(temperature));
-    }
-    if let Some(max_tokens) = max_tokens {
-        builder = builder.max_tokens(u64::from(max_tokens));
-    }
-    builder.tools(tools).build()
 }

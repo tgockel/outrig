@@ -415,7 +415,8 @@ When every candidate has failed the report names each one's reason, and what end
 on why. If at least one failed recoverably -- a rate limit, an unusable response -- the
 **turn** ends and the prompt can be sent again. If every one was terminal, such as a `401`
 at each vendor, the **session** ends, exactly as that failure ends it for a single model:
-no resend can satisfy credentials that are refused everywhere.
+no resend can satisfy credentials that are refused everywhere. `outrig run-new` ends the
+round either way, and its session goes on.
 
 A single-target alias is pure renaming, so it keeps its target's own errors -- an unset key
 still names the variable rather than becoming one line of a list.
@@ -468,7 +469,8 @@ Unset, `run-new` assumes a 128,000-token window, sets aside at most a quarter of
 reply, and warns once at startup; it never infers a window from `identifier`. A model with a
 larger window is sent less than it could take until its row says so, and one with a smaller
 window can still refuse a request as too long. A `max-tokens` at or above `context-window` is
-refused when the session starts. `outrig run` ignores the key.
+refused when the session starts. Under an alias each model is held to its own window: a call
+that moves to the next model is sent what fits that model's. `outrig run` ignores the key.
 
 #### anthropic models
 

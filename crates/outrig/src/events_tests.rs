@@ -117,7 +117,13 @@ fn each_event_has_exactly_its_data_fields() {
         cache_creation_input_tokens: 0,
         reasoning_tokens: 0,
     };
-    let calls = || vec![CallUsage { index: 0, usage }];
+    let calls = || {
+        vec![CallUsage {
+            index: 0,
+            model: "sonnet".into(),
+            usage,
+        }]
+    };
     let id = execid(3);
     let cases: Vec<(Event<'_>, &str, &[&str])> = vec![
         (
@@ -150,6 +156,7 @@ fn each_event_has_exactly_its_data_fields() {
                     window_assumed: true,
                     reserve: 32_000,
                     overhead: 900,
+                    max_tokens: Some(4096),
                 },
                 estimate: 1_000,
                 carried: vec![Chosen {
@@ -162,10 +169,16 @@ fn each_event_has_exactly_its_data_fields() {
                     turn: None,
                     role: "user",
                 }],
+                left_out: vec![LeftOut {
+                    turn: 0,
+                    message: 1,
+                    part: 0,
+                }],
             }),
             "model.call",
             &[
                 "call", "round", "budget", "estimate", "carried", "evicted", "opening", "adjacent",
+                "left_out",
             ],
         ),
         (
@@ -340,12 +353,13 @@ fn each_event_has_exactly_its_data_fields() {
         ),
         (
             Event::ModelRetry {
+                model: "sonnet",
                 attempt: 2,
                 delay: 1.5,
                 error: "429",
             },
             "model.retry",
-            &["attempt", "delay", "error"],
+            &["model", "attempt", "delay", "error"],
         ),
         (
             Event::ModelFailover {
@@ -425,6 +439,12 @@ fn each_event_has_exactly_its_data_fields() {
             "total_tokens",
         ]
     );
+    let data = serde_json::to_value(completed).expect("encodes");
+    assert_eq!(
+        keys(&data["calls"][0]),
+        BTreeSet::from(["index", "model", "usage"]),
+        "each call names the model that answered it"
+    );
     let call = &cases
         .iter()
         .find(|(_, kind, _)| *kind == "model.call")
@@ -432,11 +452,22 @@ fn each_event_has_exactly_its_data_fields() {
         .0;
     assert_eq!(
         nested(call, "budget"),
-        ["model", "overhead", "reserve", "window", "window_assumed"]
+        [
+            "max_tokens",
+            "model",
+            "overhead",
+            "reserve",
+            "window",
+            "window_assumed"
+        ]
     );
     let data = serde_json::to_value(call).expect("encodes");
     assert_eq!(data["carried"], json!([{"turn": 0, "why": "first"}]));
     assert_eq!(data["adjacent"], json!([{"turn": null, "role": "user"}]));
+    assert_eq!(
+        data["left_out"],
+        json!([{"turn": 0, "message": 1, "part": 0}])
+    );
     // rig's own form of the message. Compared as JSON: read back, rig fills in
     // an empty `additional_params` the original did not have.
     assert_eq!(

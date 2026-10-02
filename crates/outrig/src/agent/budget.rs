@@ -22,8 +22,9 @@
 use std::io;
 
 use rig::completion::Message;
+use rig::completion::message::{AssistantContent, ReasoningContent};
 
-use super::resolve::{LlmResolveError, ResolvedCandidate};
+use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider};
 
 /// The window a model is held to when its row names none. Below the window of
 /// every current hosted model this loop is meant for, so a call is rarely
@@ -48,7 +49,8 @@ const BYTES_PER_TOKEN: u64 = 3;
 /// prompt for tool use.
 const TOOL_USE_OVERHEAD: u64 = 512;
 
-/// One candidate's allowance: what a model call to it may carry.
+/// One candidate's allowance: what a model call to it may carry, the
+/// output-token ceiling the call carries, and the protocol it is carried in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Budget {
     /// The candidate's `[models.<name>]` row.
@@ -62,6 +64,49 @@ pub(crate) struct Budget {
     /// What every call carries besides the conversation: the system prompt and
     /// the tool definitions, estimated.
     pub(crate) overhead: u64,
+    /// The output-token ceiling a call to this candidate carries on the wire:
+    /// the configured one, filled in or lowered to what the model publishes, or
+    /// `None` when none is sent.
+    pub(crate) max_tokens: Option<u32>,
+    /// The protocol the candidate's provider speaks, which settles what it can
+    /// be sent of replies other providers wrote.
+    pub(crate) wire: Wire,
+}
+
+/// Which provider's protocol a candidate speaks, for what a call to it can
+/// carry of a conversation other providers wrote.
+///
+/// Reasoning is the part that does not travel. Anthropic's API takes a
+/// thinking block back only with the signature it was signed with, and refuses
+/// a request carrying one without. An OpenAI-compatible provider's reasoning
+/// (`reasoning_content`) has no signature, so a call to Anthropic leaves it
+/// out; Anthropic's own, signed or redacted, goes back whole. rig's OpenAI
+/// adapter sends any reasoning as `reasoning_content` beside its reply, so an
+/// OpenAI-compatible candidate takes everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wire {
+    OpenAi,
+    Anthropic,
+}
+
+impl Wire {
+    /// Whether a call in this protocol can carry `part` of a model's reply.
+    pub(crate) fn takes(self, part: &AssistantContent) -> bool {
+        match (self, part) {
+            (Wire::Anthropic, AssistantContent::Reasoning(reasoning)) => {
+                reasoning.content.iter().all(|block| {
+                    matches!(
+                        block,
+                        ReasoningContent::Text {
+                            signature: Some(_),
+                            ..
+                        } | ReasoningContent::Redacted { .. }
+                    )
+                })
+            }
+            _ => true,
+        }
+    }
 }
 
 impl Budget {
@@ -96,6 +141,11 @@ impl Budget {
             window_assumed,
             reserve,
             overhead,
+            max_tokens,
+            wire: match candidate.provider {
+                ResolvedProvider::OpenAi { .. } => Wire::OpenAi,
+                ResolvedProvider::Anthropic { .. } => Wire::Anthropic,
+            },
         };
         if budget.room() < MIN_ROOM {
             return Err(LlmResolveError::WindowTooSmall(budget));
@@ -129,6 +179,8 @@ impl Budget {
             window_assumed: false,
             reserve: 0,
             overhead: 0,
+            max_tokens: None,
+            wire: Wire::OpenAi,
         }
     }
 }
@@ -141,6 +193,7 @@ pub(crate) fn too_small(budget: &Budget) -> String {
         window_assumed,
         reserve,
         overhead,
+        ..
     } = budget;
     let assumed = if *window_assumed { " (assumed)" } else { "" };
     format!(
@@ -165,6 +218,7 @@ pub(crate) fn candidate(model: &str, context_window: Option<u32>) -> ResolvedCan
             base_url: "http://127.0.0.1:1".into(),
             api_key: "k".into(),
             request_timeout_secs: None,
+            retry_budget_secs: None,
         },
         max_tokens: None,
         context_window,

@@ -97,11 +97,10 @@ was built from the phase's exit criteria instead and silently omitted discovery,
 observability -- the exit criteria describe the first milestone, the deliverables describe the
 phase.
 
-**What a human can see afterwards, and finishing the loop**
+**What a human can see afterwards**
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-15` | Retry and failover come across from the 0.2.x loop                 |
 | `0003-16` | The docs describe the system that now exists                       |
 
 Cross-cutting notes the individual tasks carry rather than this file:
@@ -109,8 +108,8 @@ Cross-cutting notes the individual tasks carry rather than this file:
 - `0003-05` ships a CLI that passes a typed line to the model as an ordinary prompt. The `user`
   channel that replaces that arrangement is `0003-08`; the staging is deliberate, and gating the
   first runnable CLI on the channel would have bought no verification the prompt does not give.
-- `0003-04` copies the minimum of the agent loop that one round needs and `0003-15` finishes it.
-  Between them `run-new` is less resilient than `run`, which is a stated cost rather than an
+- `0003-04` copied the minimum of the agent loop that one round needs and `0003-15` finished it.
+  Until then `run-new` was less resilient than `run`, which was a stated cost rather than an
   oversight.
 - `0003-06` is not optional polish. `runtime-protection.md` records that without it the first
   `while True:` ends the session, which is why it lands immediately after the CLI that makes it

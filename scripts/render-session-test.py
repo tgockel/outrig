@@ -192,12 +192,14 @@ def model_call(call: int, round_: int, estimate: int = 1700, **over: object) -> 
             "window_assumed": True,
             "reserve": 4096,
             "overhead": 1662,
+            "max_tokens": 4096,
         },
         "estimate": estimate,
         "carried": [],
         "evicted": [],
         "opening": None,
         "adjacent": [],
+        "left_out": [],
     } | over
 
 
@@ -589,6 +591,14 @@ class RenderSession(unittest.TestCase):
 
     def test_no_session_record_renders(self) -> None:
         self.assertIn("There is no session.json.", self.page(ordinary(), session=False))
+
+    def test_a_call_names_what_its_provider_was_not_sent(self) -> None:
+        left_out = {"left_out": [{"turn": 0, "message": 1, "part": 0}]}
+        events = [
+            (kind, data | left_out) if kind == "model.call" else (kind, data)
+            for kind, data in ordinary()
+        ]
+        self.assertIn("left out of turn 0: part 0 of message 1", self.page(events))
 
     def test_an_unknown_type_is_shown_as_it_is(self) -> None:
         html = self.page(ordinary() + [("something.new", {"what": "it says"})])

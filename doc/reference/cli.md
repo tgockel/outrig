@@ -261,8 +261,8 @@ outrig run-new [--agent <name>]
   `run`. Its `preamble` follows OutRig's own orientation in the system prompt.
 - `--image <name>` (default: from agent or `default-image`, else the built-in default): the
   `[images.<name>]` block to launch. Unlike `run`, a local image ref no block names is refused.
-- `--model <name>` (default: agent's `model`, else `default-model`): as for `run`. An alias
-  runs against the first of its models this build can reach, with no failover.
+- `--model <name>` (default: agent's `model`, else `default-model`): as for `run`, aliases and
+  their failover included.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): as for `run`. While another
   `run-new` holds the directory, this one is refused before it pulls or starts anything.
 
@@ -336,6 +336,17 @@ it accepts two replies in a row. Both adapters are exercised against a mock, not
 endpoint. A provider or gateway that requires turns to alternate -- a Bedrock-backed Claude
 behind an OpenAI-compatible gateway is known to -- can refuse such a call, and when a refused
 call carried one, the error says where.
+
+**A failing provider is retried, then left for the next model.** A call that fails in a way that
+may clear -- a rate limit, a 5xx, a dropped connection, a response OutRig cannot use -- is made
+again within `retry-budget-secs`, as in `run`, and stderr says so. When the model is an alias of
+several, a call that still fails moves to the next, as in `run`, and each call starts again at
+the first. The call that moves is sent a conversation chosen for the window of the model it moves
+to, which may leave out more than the first model's did. When every model has failed, the round
+ends with each one's reason and keeps any Python it ran. Unlike `run`, no failure ends the
+session, even one a resend cannot fix, such as a key every provider refuses; `/quit` does. With
+`[events] mode = "record"`, the event log records each retry and each move, and names the model
+that answered each call.
 
 stdout carries only what the agent sends on the channel -- including a send from code still
 running after its round ended, which is printed when it arrives, at the prompt or not. The agent

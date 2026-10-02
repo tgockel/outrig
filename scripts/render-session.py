@@ -514,6 +514,10 @@ class Builder:
             f"evicted: {turn_list(d.get('evicted')) or 'nothing'}",
             f"overhead: {tokens(budget.get('overhead'))} tokens",
         ] + [
+            f"left out of turn {text(part.get('turn'))}: part {text(part.get('part'))} of message "
+            f"{text(part.get('message'))}, which this model's provider cannot take"
+            for part in objs(d.get("left_out"))
+        ] + [
             f"{text(a.get('role'))} follows itself at "
             + (f"turn {text(a['turn'])}" if a.get("turn") is not None else "the opening")
             for a in objs(d.get("adjacent"))

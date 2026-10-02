@@ -175,6 +175,13 @@ from the first four, and those stay done.
 The cost is that one reply can be half one model's work. That is why a move prints, and why the
 banner lists the fallbacks a session may reach before it starts.
 
+`outrig run-new` fails over the same way, with three differences. A call that moves is sent a
+conversation chosen for the window of the model it moves to, since each model's `context-window`
+is its own, so a smaller model is sent less. A call to an Anthropic model leaves out reasoning
+another provider wrote: Anthropic takes back only reasoning it signed, and refuses a request with
+any other. And when every candidate has failed, the **round** ends whatever the reasons, keeping
+any Python it ran, and the session goes on.
+
 ## `[agents.<name>]`
 
 An agent ties a model to a system preamble and (optionally) a default image. Agents are

@@ -62,15 +62,14 @@ the prototype branch, so no 0.2.x commit can conflict with a file that line does
 
 **Copied** -- `llm.rs`, `llm/retry.rs`, and `llm/failover.rs`. The 0.2.x line actively edits
 them, and copying is what keeps those merges clean. `0003-04` copied the part of `llm.rs` one
-round needs; `0003-15` brings retry and failover. From `rig_tool.rs` only the result truncation
+round needs; `0003-15` brought retry and failover. From `rig_tool.rs` only the result truncation
 came across, and nothing from `session_tool.rs`. The model's one tool is `submit_python`, and
 MCP servers reach Python as the objects `mcp-wrappers.md` designs rather than as rig tools, so
 the MCP adapter has no caller on this side. An earlier draft had it coming along anyway.
 
-**Neither** -- `llm/mistralrs.rs` and `llm/registry.rs`. The in-process backend is deprecated
-and its removal is `plan/next/remove-deprecated-local-llm.md`. The new loop omits it, which
-costs nothing now and avoids `mistralrs-core`, `hf-hub`, and `candle-core` becoming library
-dependencies.
+**Neither** -- `llm/mistralrs.rs` and `llm/registry.rs`. The in-process backend was deprecated
+in 0.2.0 and has since been removed from this line. The new loop never had it, so `mistralrs-core`,
+`hf-hub`, and `candle-core` never became library dependencies.
 
 **Designed, not yet ported** -- `builtin_tool.rs`, `self_tool.rs`, `subagent/`. These are
 MCP-shaped, and their Python equivalents now have designs rather than a gap: `work.md` for the

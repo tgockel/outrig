@@ -2,9 +2,10 @@
 //!
 //! Copied from `outrig-cli`'s `llm.rs` down to what a round needs: the
 //! tool-call cap and the partial history a stopped round keeps. The subagent
-//! machinery -- labels, steering, the repeat breaker -- is not here, and
-//! neither is anything that recovers from a failing endpoint, which arrives
-//! with retry.
+//! machinery -- labels, steering, the repeat breaker -- is not here. Recovering
+//! from a failing endpoint happens below the round, inside each model call
+//! ([`super::retry`], [`super::failover`]), and the round reads which model
+//! answered each call off the response the chain hands rig.
 //!
 //! The conversation is the store's ([`History`]), not the round's. rig is
 //! handed nothing from before the round, so everything it holds, and hands
@@ -19,18 +20,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rig::OneOrMany;
-use rig::agent::{Agent, AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
+use rig::agent::{AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
 use rig::completion::message::{
     AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent,
 };
-use rig::completion::{CompletionModel, Message, Prompt, PromptError};
+use rig::completion::{Message, Prompt, PromptError};
 
 use super::AgentError;
 use super::budget::Budget;
 use super::build::RigAgent;
+use super::failover::FailoverModel;
 use super::history::{self, Adjacent, History};
 use super::tool::{self, Interrupts};
-use crate::events::{CallUsage, Event};
+use crate::events::{self, CallUsage, Event};
 
 /// How a round ended.
 pub(crate) struct RoundEnd {
@@ -41,53 +43,42 @@ pub(crate) struct RoundEnd {
     pub(crate) stopped: Option<String>,
 }
 
-impl RigAgent {
-    /// Run one round that `opening` opens, committing its turns to `history`
-    /// as they complete. `history` has begun the round on the same message
-    /// ([`History::open_round`]): rig's first message is the store's opening.
-    ///
-    /// A round cut short -- the tool-call cap, or rig's own turn budget -- keeps
-    /// what it managed, so the next prompt can carry on from it. Any other
-    /// failure is an error. It leaves the store as it was when the round had
-    /// run no Python; otherwise the store keeps the tool calls that completed,
-    /// since what they did stands and nothing is rolled back. A round whose
-    /// future is dropped before it returns -- Ctrl-C at the REPL while no
-    /// Python runs -- keeps them the same way, as it is dropped.
-    ///
-    /// Each model call is sent what `history` assembles for it within
-    /// `budget`. A call whose latest turn would not fit on its own is not
-    /// made: the round ends there, keeping its turns, and says which turn it
-    /// was.
-    ///
-    /// An interrupt relayed through `interrupts` while a call waits on Python
-    /// stops that execution, and the round goes on: the model reads how it
-    /// ended. The turn's later calls are not run.
-    pub(crate) async fn round(
-        &self,
-        opening: Message,
-        history: &History,
-        budget: &Arc<Budget>,
-        tool_call_max: usize,
-        interrupts: &Interrupts,
-    ) -> Result<RoundEnd, AgentError> {
-        let hook = RoundHook::new(
-            tool_call_max,
-            interrupts.clone(),
-            history.clone(),
-            Arc::clone(budget),
-        );
-        match self {
-            RigAgent::OpenAi(agent) => run_round(agent, opening, hook).await,
-            RigAgent::Anthropic(agent) => run_round(agent, opening, hook).await,
-        }
-    }
-}
-
-async fn run_round<M: CompletionModel + 'static>(
-    agent: &Agent<M>,
+/// Run one round of `agent` that `opening` opens, committing its turns to
+/// `history` as they complete. `history` has begun the round on the same
+/// message ([`History::open_round`]): rig's first message is the store's
+/// opening.
+///
+/// A round cut short -- the tool-call cap, or rig's own turn budget -- keeps
+/// what it managed, so the next prompt can carry on from it. Any other failure
+/// is an error. It leaves the store as it was when the round had run no
+/// Python; otherwise the store keeps the tool calls that completed, since what
+/// they did stands and nothing is rolled back. A round whose future is dropped
+/// before it returns -- Ctrl-C at the REPL while no Python runs -- keeps them
+/// the same way, as it is dropped.
+///
+/// Each model call is sent what `history` assembles for it within `budget`,
+/// the head's allowance. A call whose latest turn would not fit on its own is
+/// not made: the round ends there, keeping its turns, and says which turn it
+/// was. A call the chain moves to another model is assembled again for that
+/// model's allowance.
+///
+/// An interrupt relayed through `interrupts` while a call waits on Python
+/// stops that execution, and the round goes on: the model reads how it ended.
+/// The turn's later calls are not run.
+pub(crate) async fn round(
+    agent: &RigAgent,
     opening: Message,
-    hook: RoundHook,
+    history: &History,
+    budget: &Arc<Budget>,
+    tool_call_max: usize,
+    interrupts: &Interrupts,
 ) -> Result<RoundEnd, AgentError> {
+    let hook = RoundHook::new(
+        tool_call_max,
+        interrupts.clone(),
+        history.clone(),
+        Arc::clone(budget),
+    );
     // rig's own budget is a backstop set above the hook's, so the hook -- with
     // its message the model can read -- is the limiter that fires first. As of
     // rig 0.40 it counts every model call, the first included.
@@ -112,18 +103,13 @@ async fn run_round<M: CompletionModel + 'static>(
     unfinished.armed = false;
     let hook = &unfinished.hook;
 
-    let (ended, calls, usage) = match result {
+    let (ended, usage) = match result {
         Ok(response) => {
             hook.flush(
                 &response
                     .messages
                     .expect("rig populates messages on extended_details"),
             );
-            let calls = response
-                .completion_calls
-                .iter()
-                .map(|call| (call.call_index, call.usage))
-                .collect();
             // A hook stop normally surfaces as an error, but reading the reason
             // back unconditionally means a stop can never be lost to a path
             // that ends the run cleanly instead.
@@ -131,13 +117,13 @@ async fn run_round<M: CompletionModel + 'static>(
                 reply: response.output,
                 stopped: hook.stop_reason(),
             };
-            (Ok(end), calls, Some(response.usage))
+            (Ok(end), Some(response.usage))
         }
-        // Only a run that succeeded has rig's account of its calls; any other
-        // has the hook's, of each call's turn as rig accepted it.
-        Err(err) => (stopped_short(err, hook), hook.calls_so_far(), None),
+        // Only a run that succeeded has rig's total; any other is summed from
+        // its calls.
+        Err(err) => (stopped_short(err, hook), None),
     };
-    hook.record_end(&ended, calls, usage);
+    hook.record_end(&ended, hook.calls_so_far(), usage);
     ended
 }
 
@@ -159,7 +145,7 @@ impl Drop for KeptIfDropped {
             if events.is_on() {
                 events.emit(Event::ModelRoundDropped {
                     round: self.hook.round,
-                    calls: call_usages(self.hook.calls_so_far()),
+                    calls: self.hook.calls_so_far(),
                 });
             }
         }
@@ -268,10 +254,9 @@ struct Journal {
     latest: Latest,
     /// Where the latest model call's view first put one role after itself.
     adjacent: Option<Adjacent>,
-    /// What each of the round's model calls used, as rig reported it when
-    /// the call's turn was accepted: the only account of a round that does not
-    /// end in rig's response.
-    calls: Vec<(usize, rig::completion::Usage)>,
+    /// Each of the round's model calls rig accepted: its place, the model that
+    /// answered it, and what it used, as the provider reported it.
+    calls: Vec<CallUsage>,
 }
 
 /// The round's latest model call, while it is not yet a turn in the store.
@@ -322,8 +307,8 @@ impl RoundHook {
         }
     }
 
-    /// What the round's model calls have used so far, by each call's place.
-    fn calls_so_far(&self) -> Vec<(usize, rig::completion::Usage)> {
+    /// The round's model calls so far, by each call's place.
+    fn calls_so_far(&self) -> Vec<CallUsage> {
         self.journal().calls.clone()
     }
 
@@ -332,32 +317,28 @@ impl RoundHook {
     fn record_end(
         &self,
         ended: &Result<RoundEnd, AgentError>,
-        calls: Vec<(usize, rig::completion::Usage)>,
+        calls: Vec<CallUsage>,
         usage: Option<rig::completion::Usage>,
     ) {
         let events = self.history.events();
         if !events.is_on() {
             return;
         }
-        let usage = usage.unwrap_or_else(|| {
-            calls
-                .iter()
-                .fold(rig::completion::Usage::new(), |sum, (_, usage)| {
-                    sum + *usage
-                })
-        });
+        let usage = usage.map_or_else(
+            || calls.iter().map(|call| call.usage).sum(),
+            events::Usage::from,
+        );
         let input_tokens_max = calls
             .iter()
-            .map(|(_, usage)| usage.input_tokens)
+            .map(|call| call.usage.input_tokens)
             .max()
             .unwrap_or(0);
-        let calls = call_usages(calls);
         let error;
         events.emit(match ended {
             Ok(RoundEnd { stopped, .. }) => Event::ModelRoundCompleted {
                 round: self.round,
                 stopped: stopped.as_deref(),
-                usage: usage.into(),
+                usage,
                 calls,
                 input_tokens_max,
             },
@@ -473,18 +454,18 @@ impl RoundHook {
     }
 }
 
-impl<M: CompletionModel> AgentHook<M> for RoundHook {
+impl AgentHook<FailoverModel> for RoundHook {
     fn observes(&self, kind: StepEventKind) -> bool {
         matches!(
             kind,
             StepEventKind::CompletionCall
-                | StepEventKind::ModelTurnFinished
+                | StepEventKind::CompletionResponse
                 | StepEventKind::ToolCall
                 | StepEventKind::ToolResult
         )
     }
 
-    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+    async fn on_event(&self, ctx: &HookContext, event: StepEvent<'_, FailoverModel>) -> Flow {
         if let StepEvent::ToolResult { result, .. } = &event {
             self.journal().latest.results.push(result.to_string());
         }
@@ -523,16 +504,20 @@ impl<M: CompletionModel> AgentHook<M> for RoundHook {
                     Err(too_large) => self.stop(too_large.to_string()),
                 }
             }
-            StepEvent::ModelTurnFinished {
-                turn,
-                content,
-                usage,
-            } => {
+            // A call rig accepted. rig fires this and `ModelTurnFinished`
+            // back to back, under the same rules, and only this one carries
+            // the chain's word for which of its models answered, in place of
+            // the provider's raw response.
+            StepEvent::CompletionResponse { response, .. } => {
                 let mut journal = self.journal();
-                journal.latest.reply = Some(content.clone());
-                // rig counts its turns from one, and its completion calls from
-                // zero; the event log counts both from zero.
-                journal.calls.push((turn.saturating_sub(1), usage));
+                journal.latest.reply = Some(response.choice.clone());
+                // rig counts its turns from one; the event log counts calls
+                // from zero.
+                journal.calls.push(CallUsage {
+                    index: ctx.turn().saturating_sub(1),
+                    model: response.raw_response.model.clone(),
+                    usage: response.usage.into(),
+                });
                 Flow::cont()
             }
             StepEvent::ToolCall {
@@ -570,15 +555,4 @@ impl<M: CompletionModel> AgentHook<M> for RoundHook {
             _ => Flow::cont(),
         }
     }
-}
-
-/// Each call's place and what it used, as the event log records them.
-fn call_usages(calls: Vec<(usize, rig::completion::Usage)>) -> Vec<CallUsage> {
-    calls
-        .into_iter()
-        .map(|(index, usage)| CallUsage {
-            index,
-            usage: usage.into(),
-        })
-        .collect()
 }

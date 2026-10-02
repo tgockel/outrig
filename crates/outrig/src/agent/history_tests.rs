@@ -476,6 +476,8 @@ fn the_latest_turn_is_never_evicted_and_too_large_names_it() {
         window_assumed: true,
         reserve: 250,
         overhead: 300,
+        max_tokens: None,
+        wire: crate::agent::budget::Wire::OpenAi,
     };
     let err = store.assemble(&budget).expect_err("450 of room");
     assert_eq!(
@@ -787,4 +789,85 @@ async fn the_host_record_and_the_transport_of_a_long_session_are_measured() {
     assert!(record < payload * 12 / 10, "host record {record}");
     assert!(transport < payload * 12 / 10, "transport {transport}");
     assert!(longest < RESULT + 1024, "one line is one turn: {longest}");
+}
+
+/// A call is sent only the reasoning its provider can take back. To
+/// Anthropic, an unsigned block -- another provider's -- is left out, and with
+/// it a reply of nothing else; Anthropic's own signed block goes as it came.
+/// The manifest names each part left out, so the record alone rebuilds the
+/// call, and the turns keep everything.
+#[test]
+fn a_call_is_sent_only_the_reasoning_its_provider_takes() {
+    use rig::completion::message::Reasoning;
+
+    use super::{LeftOut, as_sent};
+    use crate::agent::budget::Wire;
+
+    let unsigned = AssistantContent::Reasoning(Reasoning::new("thinking it over"));
+    let signed = AssistantContent::Reasoning(Reasoning::new_with_signature(
+        "weighing it",
+        Some("sig".into()),
+    ));
+    let reply = |parts: Vec<AssistantContent>| Message::Assistant {
+        id: None,
+        content: OneOrMany::many(parts).expect("a part"),
+    };
+    let mut store = Store::default();
+    store.begin_round(Message::user("go"));
+    store.commit(vec![
+        reply(vec![
+            unsigned.clone(),
+            AssistantContent::tool_call("call_1", tool::NAME, json!({"source": "1"})),
+        ]),
+        Message::tool_result("call_1", "1"),
+    ]);
+    store.commit(vec![reply(vec![unsigned.clone()])]);
+    store.commit(vec![reply(vec![signed.clone()])]);
+    let whole: Vec<Message> = store
+        .turns
+        .iter()
+        .flat_map(|turn| turn.messages.clone())
+        .collect();
+
+    for (wire, left_out) in [
+        (
+            Wire::Anthropic,
+            vec![
+                LeftOut {
+                    turn: 0,
+                    message: 1,
+                    part: 0,
+                },
+                LeftOut {
+                    turn: 1,
+                    message: 0,
+                    part: 0,
+                },
+            ],
+        ),
+        (Wire::OpenAi, Vec::new()),
+    ] {
+        let budget = Budget {
+            wire,
+            ..Budget::with_room("m", ROOMY)
+        };
+        let (sent, manifest) = store.assemble(&budget).expect("room for everything");
+        assert_eq!(manifest.left_out, left_out, "{wire:?}");
+        let unsigned_sent = sent.iter().any(|message| {
+            matches!(message, Message::Assistant { content, .. } if content.iter().any(|part| *part == unsigned))
+        });
+        assert_eq!(unsigned_sent, wire == Wire::OpenAi, "{wire:?}: {sent:#?}");
+        let rebuilt: Vec<Message> = manifest
+            .carried
+            .iter()
+            .flat_map(|&(id, _)| as_sent(id, &store.turns[id].messages, &manifest.left_out))
+            .collect();
+        assert_eq!(rebuilt, sent, "{wire:?}: the record rebuilds the call");
+    }
+    let kept: Vec<Message> = store
+        .turns
+        .iter()
+        .flat_map(|turn| turn.messages.clone())
+        .collect();
+    assert_eq!(kept, whole, "the turns keep what each model wrote");
 }

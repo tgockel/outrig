@@ -19,6 +19,9 @@ use tokio::sync::mpsc;
 /// published ceiling of 64 000.
 pub(super) const MODEL: &str = "claude-sonnet-4-6";
 
+/// The signature on the thinking an Anthropic canned response carries.
+pub(super) const SIGNATURE: &str = "signed-by-the-mock";
+
 /// One request as the mock saw it, before any client library is asked to
 /// interpret it.
 #[derive(Debug)]
@@ -32,34 +35,66 @@ pub(super) struct RecordedRequest {
 pub(super) struct CannedResponse {
     status: u16,
     body: Value,
+    /// Sent besides the content type, length, and `Connection: close`.
+    headers: Vec<(&'static str, String)>,
 }
 
 impl CannedResponse {
+    fn new(status: u16, body: Value) -> Self {
+        Self {
+            status,
+            body,
+            headers: Vec::new(),
+        }
+    }
+
     /// The same response, reporting `usage` -- in the provider's own shape --
     /// rather than the fixed counts every canned response starts with.
     pub(super) fn usage(mut self, usage: Value) -> Self {
         self.body["usage"] = usage;
         self
     }
+
+    /// The same reply, with the model's reasoning `text` before the rest: as
+    /// OpenAI-compatible providers send it, a `reasoning_content` beside the
+    /// message, or as Anthropic does, a thinking block signed [`SIGNATURE`].
+    pub(super) fn with_reasoning(mut self, text: &str) -> Self {
+        if self.body.get("choices").is_some() {
+            self.body["choices"][0]["message"]["reasoning_content"] = json!(text);
+        } else if let Some(content) = self.body["content"].as_array_mut() {
+            content.insert(
+                0,
+                json!({ "type": "thinking", "thinking": text, "signature": SIGNATURE }),
+            );
+        }
+        self
+    }
+
+    /// The same response, carrying the header `name: value` -- a
+    /// `Retry-After`, say.
+    pub(super) fn header(mut self, name: &'static str, value: impl ToString) -> Self {
+        self.headers.push((name, value.to_string()));
+        self
+    }
 }
 
 /// A provider failing: `status` with Anthropic's error envelope.
 pub(super) fn failure(status: u16) -> CannedResponse {
-    CannedResponse {
+    CannedResponse::new(
         status,
-        body: json!({
+        json!({
             "type": "error",
             "error": { "type": "api_error", "message": "the mock failed on purpose" },
         }),
-    }
+    )
 }
 
 /// An Anthropic message envelope in the shape rig's `ApiResponse`
 /// deserializes.
 pub(super) fn message(content: Value, stop_reason: &str) -> CannedResponse {
-    CannedResponse {
-        status: 200,
-        body: json!({
+    CannedResponse::new(
+        200,
+        json!({
             "type": "message",
             "id": "msg_mock",
             "model": MODEL,
@@ -69,7 +104,13 @@ pub(super) fn message(content: Value, stop_reason: &str) -> CannedResponse {
             "content": content,
             "usage": { "input_tokens": 12, "output_tokens": 7 },
         }),
-    }
+    )
+}
+
+/// A `200 OK` rig cannot make a completion of: no content at all. Its
+/// `stop_reason` is not `end_turn`, which rig would read as an empty reply.
+pub(super) fn unusable() -> CannedResponse {
+    message(json!([]), "max_tokens")
 }
 
 /// One text block, round over.
@@ -154,15 +195,15 @@ impl Style {
     pub(super) fn failure(self, status: u16) -> CannedResponse {
         match self {
             Style::Anthropic => failure(status),
-            Style::OpenAi => CannedResponse {
+            Style::OpenAi => CannedResponse::new(
                 status,
-                body: json!({
+                json!({
                     "error": {
                         "type": "invalid_request_error",
                         "message": "the mock failed on purpose",
                     },
                 }),
-            },
+            ),
         }
     }
 }
@@ -170,9 +211,9 @@ impl Style {
 /// A chat completion choosing `message`, in the shape rig's OpenAI
 /// `CompletionResponse` deserializes.
 fn chat(message: Value, finish_reason: &str) -> CannedResponse {
-    CannedResponse {
-        status: 200,
-        body: json!({
+    CannedResponse::new(
+        200,
+        json!({
             "id": "chatcmpl-mock",
             "object": "chat.completion",
             "created": 0,
@@ -186,7 +227,7 @@ fn chat(message: Value, finish_reason: &str) -> CannedResponse {
             }],
             "usage": { "prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19 },
         }),
-    }
+    )
 }
 
 /// What [`check_wire`] found in one request's `messages`.
@@ -332,9 +373,14 @@ async fn serve(
         served += 1;
 
         let body = serde_json::to_string(&canned.body).expect("canned body serializes");
+        let headers: String = canned
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let response = format!(
             "HTTP/1.1 {} MOCK\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+             Content-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
             canned.status,
             body.len(),
             body,

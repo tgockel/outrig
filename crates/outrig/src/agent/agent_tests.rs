@@ -15,14 +15,15 @@ use serde_json::json;
 use super::budget::{ASSUMED_CONTEXT_WINDOW, Budget, DEFAULT_REPLY_RESERVE};
 use super::build::{ANTHROPIC_FALLBACK_MAX_TOKENS, anthropic_model};
 use super::channel::Announcer;
-use super::history::{Manifest, Why, Window};
+use super::history::{LeftOut, Manifest, Why, Window, as_sent};
 use super::mock_http::{
     self, CannedResponse, MODEL, RecordedRequest, Style, check_wire, failure, submit, text_reply,
 };
 use super::resolve::{LlmResolveError, ResolvedCandidate, ResolvedProvider, resolve_agent};
+use super::retry::RetryingHttpClient;
 use super::tool::{self, SubmitPython, render, truncate_for_llm};
 use super::{AgentError, PythonAgent};
-use crate::config::Config;
+use crate::config::{Config, LlmProvider};
 use crate::events::{self, Events};
 use crate::python::host::{Background, ExecId, Late, Outcome, Report, Unknown};
 use crate::python::recovery::{GaveUp, Verdict, Waited};
@@ -61,6 +62,10 @@ fn config(addr: std::net::SocketAddr, var: &str, identifier: &str, agent_keys: &
 /// A config with a provider of `style` at `addr`, a `sonnet` model on it whose
 /// row carries `model_keys`, and a `coding` agent whose block carries
 /// `agent_keys`.
+///
+/// Retries are off, so each scripted response is what the call that asked for
+/// it gets: a scripted failure fails its call rather than being retried into
+/// the reply after it. The retry tests turn them on.
 fn config_in(
     style: Style,
     addr: std::net::SocketAddr,
@@ -78,6 +83,7 @@ style                = "{style}"
 base-url             = "http://{addr}"
 api-key              = "${{{var}}}"
 request-timeout-secs = 10
+retry-budget-secs    = 0
 
 [models.sonnet]
 provider   = "claude"
@@ -146,12 +152,17 @@ async fn agent_with(
 ) {
     let (addr, requests) = mock_http::start(script).await;
     let cfg = config_in(style, addr, var, identifier, model_keys, agent_keys);
+    (agent_of(&cfg, var, events).await, requests)
+}
+
+/// `cfg`'s `coding` agent over a host-run interpreter recording to `events`,
+/// with the api-key variable `var` set.
+async fn agent_of(cfg: &Config, var: &str, events: Events) -> PythonAgent {
     let interpreter = start_on_host_with(events).await;
-    let agent = with_key(var, || {
-        PythonAgent::with_interpreter(interpreter, &cfg, Some("coding"), None)
+    with_key(var, || {
+        PythonAgent::with_interpreter(interpreter, cfg, Some("coding"), None)
     })
-    .unwrap_or_else(|e| panic!("{e}"));
-    (agent, requests)
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Send `message` on the agent's user channel, as a person typing it does.
@@ -2313,6 +2324,7 @@ fn anthropic_candidate(identifier: &str, max_tokens: Option<u32>) -> ResolvedCan
             base_url: "http://127.0.0.1:1".to_string(),
             api_key: KEY.to_string(),
             request_timeout_secs: None,
+            retry_budget_secs: None,
         },
         max_tokens,
         context_window: None,
@@ -2327,6 +2339,7 @@ fn the_ceiling_handed_back_is_the_one_in_force() {
     let client = rig::providers::anthropic::Client::builder()
         .api_key(KEY)
         .base_url("http://127.0.0.1:1")
+        .http_client(RetryingHttpClient::default())
         .build()
         .expect("client builds");
     let ceiling = |identifier: &str, configured| {
@@ -2342,7 +2355,7 @@ fn the_ceiling_handed_back_is_the_one_in_force() {
     assert_eq!(ceiling(MODEL, Some(999_999)), 64_000);
 }
 
-/// The ceiling the agent reports is the one that reached the wire, including
+/// The ceiling building settles is the one that reached the wire, including
 /// when it is not the configured one. This is what makes it worth reading
 /// outside construction.
 #[tokio::test]
@@ -2363,7 +2376,8 @@ async fn the_reported_ceiling_is_the_one_on_the_wire() {
     ] {
         let (mut agent, mut requests) =
             agent_over(var, identifier, keys, vec![text_reply("ok")]).await;
-        assert_eq!(agent.max_tokens, Some(expected), "{identifier}");
+        let head = agent.agent.model.budgets().next().expect("a head");
+        assert_eq!(head.max_tokens, Some(expected), "{identifier}");
         round(&mut agent, "hi").await;
         let recorded = mock_http::drain(&mut requests);
         assert_eq!(
@@ -2421,7 +2435,7 @@ fn an_agentless_session_takes_the_default_model_and_the_default_limits() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_AGENTLESS";
     let cfg = two_provider_config(vars, "");
     let resolved = with_both_keys(vars, || resolve_agent(&cfg, None, None)).expect("resolves");
-    assert_eq!(resolved.candidate.model_name, "head");
+    assert_eq!(resolved.head().model_name, "head");
     assert_eq!(resolved.preamble, None);
     assert_eq!(
         resolved.tool_result_max_bytes,
@@ -2435,9 +2449,9 @@ fn a_model_override_wins_over_the_agent_and_the_default() {
     let cfg = two_provider_config(vars, "model = \"head\"");
     let resolved = with_both_keys(vars, || resolve_agent(&cfg, Some("coding"), Some("tail")))
         .expect("resolves");
-    assert_eq!(resolved.candidate.model_identifier, "gpt-tail");
+    assert_eq!(resolved.head().model_identifier, "gpt-tail");
     assert!(matches!(
-        resolved.candidate.provider,
+        resolved.head().provider,
         ResolvedProvider::OpenAi { .. }
     ));
 }
@@ -2479,19 +2493,29 @@ async fn check_agrees_with_start() {
     assert!(checked.contains(&format!("{vars}_FIRST")), "{checked}");
 }
 
-/// An alias runs against the first of its models this build can reach: one
-/// whose key is unset is passed over rather than tried, and when none can be
-/// reached the error names each and why.
+/// The models an agent's resolution kept, in order.
+fn names(resolved: &super::resolve::ResolvedAgent) -> Vec<&str> {
+    resolved
+        .candidates
+        .iter()
+        .map(|candidate| candidate.model_name.as_str())
+        .collect()
+}
+
+/// An alias resolves to every one of its models this build can reach, in
+/// order -- the chain a failed call moves along. One whose key is unset is
+/// left out rather than tried, and when none can be reached the error names
+/// each and why.
 #[test]
-fn an_alias_runs_against_its_first_reachable_model() {
+fn an_alias_resolves_to_each_reachable_model_in_order() {
     let vars = "OUTRIG_TEST_AGENT_RESOLVE_ALIAS";
     let cfg = two_provider_config(vars, "");
     let both = with_both_keys(vars, || resolve_agent(&cfg, None, Some("chain"))).expect("resolves");
-    assert_eq!(both.candidate.model_name, "head");
+    assert_eq!(names(&both), ["head", "tail"]);
 
     let second = format!("{vars}_SECOND");
     let tail_only = with_key(&second, || resolve_agent(&cfg, None, Some("chain")));
-    assert_eq!(tail_only.expect("resolves").candidate.model_name, "tail");
+    assert_eq!(names(&tail_only.expect("resolves")), ["tail"]);
 
     let err = resolve_agent(&cfg, None, Some("chain")).expect_err("no key is set");
     let rendered = err.to_string();
@@ -2647,8 +2671,9 @@ async fn a_recorded_session_is_the_agents_timeline() {
 }
 
 /// What a round used is what the provider reported: each call's tokens from
-/// rig's `completion_calls`, the round's from its `usage`, which the loop used
-/// to drop. A round's high-water input is the largest a call reported.
+/// the response rig hands the hook, the round's from rig's `usage`, which the
+/// loop used to drop. A round's high-water input is the largest a call
+/// reported.
 #[tokio::test]
 async fn token_usage_is_what_the_provider_reported() {
     let dir = tempfile::tempdir().expect("a log dir");
@@ -2693,12 +2718,81 @@ async fn token_usage_is_what_the_provider_reported() {
             "stopped": null,
             "usage": usage(400, 30, 480, 50),
             "calls": [
-                {"index": 0, "usage": usage(100, 10, 160, 50)},
-                {"index": 1, "usage": usage(300, 20, 320, 0)},
+                {"index": 0, "model": "sonnet", "usage": usage(100, 10, 160, 50)},
+                {"index": 1, "model": "sonnet", "usage": usage(300, 20, 320, 0)},
             ],
             "input_tokens_max": 300,
         })
     );
+}
+
+/// What the `model.call` manifest `call` says its call sent, from `turns`, the
+/// committed turns' messages as the log recorded them: each carried turn, then
+/// the opening the call held.
+fn rebuilt(
+    turns: &[Vec<rig::completion::Message>],
+    call: &serde_json::Value,
+) -> Vec<rig::completion::Message> {
+    let place = |value: &serde_json::Value, key: &str| {
+        usize::try_from(value[key].as_u64().expect("a place")).expect("a place fits")
+    };
+    let left_out: Vec<LeftOut> = call["left_out"]
+        .as_array()
+        .expect("left_out")
+        .iter()
+        .map(|part| LeftOut {
+            turn: place(part, "turn"),
+            message: place(part, "message"),
+            part: place(part, "part"),
+        })
+        .collect();
+    let mut messages: Vec<rig::completion::Message> = call["carried"]
+        .as_array()
+        .expect("carried")
+        .iter()
+        .flat_map(|chosen| {
+            let turn = place(chosen, "turn");
+            as_sent(turn, &turns[turn], &left_out)
+        })
+        .collect();
+    if !call["opening"].is_null() {
+        messages.push(serde_json::from_value(call["opening"].clone()).expect("a message"));
+    }
+    messages
+}
+
+/// Every `model.call` in `records` rebuilds, from the log alone, what its
+/// model received: `received` gives each model's row, its provider's style,
+/// and the requests its mock recorded, in order, and each call is matched with
+/// the next request to the model its budget names.
+fn each_call_rebuilds(
+    records: &[serde_json::Value],
+    received: &[(&str, Style, &[RecordedRequest])],
+) {
+    let turns: Vec<Vec<rig::completion::Message>> = events::of_kind(records, "turn.committed")
+        .iter()
+        .map(|turn| serde_json::from_value(turn["messages"].clone()).expect("rig's messages"))
+        .collect();
+    let mut next = vec![0; received.len()];
+    for call in events::of_kind(records, "model.call") {
+        let model = call["budget"]["model"].as_str().expect("a model");
+        let at = received
+            .iter()
+            .position(|(name, ..)| *name == model)
+            .unwrap_or_else(|| panic!("no requests to {model}"));
+        let (_, style, requests) = received[at];
+        let request = &requests[next[at]];
+        next[at] += 1;
+        assert_eq!(
+            on_the_wire(style, rebuilt(&turns, call)),
+            conversation(style, request),
+            "call {} to {model}: {call:#}",
+            call["call"]
+        );
+    }
+    for ((model, _, requests), used) in received.iter().zip(next) {
+        assert_eq!(used, requests.len(), "a manifest for each call to {model}");
+    }
 }
 
 /// The log alone rebuilds what each call sent the provider: every committed
@@ -2733,23 +2827,9 @@ async fn each_call_is_rebuilt_from_the_event_log_alone() {
                     );
                 }
                 "model.call" => {
-                    let mut rebuilt: Vec<rig::completion::Message> = data["carried"]
-                        .as_array()
-                        .expect("carried")
-                        .iter()
-                        .flat_map(|chosen| {
-                            let turn = chosen["turn"].as_u64().expect("a turn") as usize;
-                            turns[turn].clone()
-                        })
-                        .collect();
-                    if !data["opening"].is_null() {
-                        rebuilt.push(
-                            serde_json::from_value(data["opening"].clone()).expect("a message"),
-                        );
-                    }
                     assert_eq!(data["call"], calls, "{style:?}");
                     assert_eq!(
-                        on_the_wire(style, rebuilt),
+                        on_the_wire(style, rebuilt(&turns, data)),
                         conversation(style, &recorded[calls]),
                         "{style:?} call {calls}: {data:#}"
                     );
@@ -2884,6 +2964,665 @@ async fn failed_dropped_and_truncated_are_recorded() {
         1,
         "the call that started the slow code"
     );
+}
+
+// ---------------------------------------------------------------------------- retry and failover
+
+/// [`agent_with`]'s agent against Anthropic, recording to `events`, with
+/// retries on -- thirty seconds of them -- where [`config_in`] turns them off.
+async fn retrying_agent(
+    var: &str,
+    events: Events,
+    script: Vec<CannedResponse>,
+) -> (
+    PythonAgent,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedRequest>,
+) {
+    let (addr, requests) = mock_http::start(script).await;
+    let mut cfg = config(addr, var, MODEL, "max-tokens = 4096");
+    retrying(&mut cfg, "claude");
+    (agent_of(&cfg, var, events).await, requests)
+}
+
+/// Turn retries on for `cfg`'s provider `provider`: thirty seconds of them.
+fn retrying(cfg: &mut Config, provider: &str) {
+    match cfg.providers.get_mut(provider) {
+        Some(
+            LlmProvider::Anthropic {
+                retry_budget_secs, ..
+            }
+            | LlmProvider::OpenAi {
+                retry_budget_secs, ..
+            },
+        ) => *retry_budget_secs = Some(30),
+        None => panic!("no provider {provider}"),
+    }
+}
+
+/// Two models, `head` and `tail`, and the alias `chain` over both, which the
+/// session runs. Each is given as its provider's style, that provider's
+/// address, and the keys its `[models.<name>]` row carries, and each provider
+/// is its own, keyed by `{vars}_FIRST` and `{vars}_SECOND`. The head's
+/// provider sets the chain's retry budget, which is none: a failed call moves
+/// at once.
+fn chain_config(
+    vars: &str,
+    (head_style, head_url, head_keys): (Style, &str, &str),
+    (tail_style, tail_url, tail_keys): (Style, &str, &str),
+) -> Config {
+    load(&format!(
+        r#"
+default-model = "chain"
+
+[providers.first]
+style             = "{head_style}"
+base-url          = "{head_url}"
+api-key           = "${{{vars}_FIRST}}"
+retry-budget-secs = 0
+
+[providers.second]
+style    = "{tail_style}"
+base-url = "{tail_url}"
+api-key  = "${{{vars}_SECOND}}"
+
+[models.head]
+provider   = "first"
+identifier = "{MODEL}"
+{head_keys}
+
+[models.tail]
+provider   = "second"
+identifier = "{MODEL}"
+{tail_keys}
+
+[models.chain]
+alias = ["head", "tail"]
+"#,
+        head_style = head_style.name(),
+        tail_style = tail_style.name(),
+    ))
+}
+
+/// An agent over `cfg`'s chain and a host-run interpreter, recording to
+/// `events`.
+async fn chained_agent(vars: &str, events: Events, cfg: &Config) -> PythonAgent {
+    let interpreter = start_on_host_with(events).await;
+    with_both_keys(vars, || {
+        PythonAgent::with_interpreter(interpreter, cfg, None, None)
+    })
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// A rate-limited call waits as long as the provider asks, is made again, and
+/// the round completes. The retry is recorded, not only announced: the model,
+/// the attempt that failed, the wait, and why -- without the provider's body.
+#[tokio::test]
+async fn a_rate_limited_call_is_retried_and_the_retry_recorded() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, mut requests) = retrying_agent(
+        "OUTRIG_TEST_AGENT_RETRY_RATE_LIMITED",
+        events::opened(dir.path()).await,
+        vec![failure(429).header("Retry-After", 1), text_reply("ok")],
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    assert_eq!(round(&mut agent, "hi").await, "ok");
+    let waited = started.elapsed();
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert!(
+        waited >= std::time::Duration::from_millis(950),
+        "Retry-After: 1 is honored, not {waited:?}"
+    );
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(recorded.len(), 2, "{recorded:#?}");
+    assert_eq!(
+        recorded[0].body, recorded[1].body,
+        "a retry replays the call"
+    );
+    let records = events::recorded(dir.path());
+    assert_eq!(
+        events::of_kind(&records, "model.retry"),
+        [&json!({
+            "model": "sonnet",
+            "attempt": 1,
+            "delay": 1.0,
+            "error": "HTTP 429 Too Many Requests",
+        })]
+    );
+    assert_eq!(
+        events::of_kind(&records, "model.call").len(),
+        1,
+        "a retry resends the view it was assembled, rather than assembling another"
+    );
+}
+
+/// A `200` rig cannot use is retried below the round: the call is made again
+/// with what it carried, so the Python an earlier call ran does not run again.
+/// It is recorded as a retry like any other.
+#[tokio::test]
+async fn an_unusable_response_is_retried_without_running_python_again() {
+    let dir = tempfile::tempdir().expect("a log dir");
+    let (mut agent, mut requests) = retrying_agent(
+        "OUTRIG_TEST_AGENT_RETRY_UNUSABLE",
+        events::opened(dir.path()).await,
+        vec![
+            submit("toolu_1", "print('ran')"),
+            mock_http::unusable(),
+            text_reply("done"),
+        ],
+    )
+    .await;
+    let ran = sources(&mut agent);
+
+    assert_eq!(round(&mut agent, "run it").await, "done");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(*ran.lock().expect("sources"), ["print('ran')"]);
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(
+        recorded.len(),
+        3,
+        "the tool call, the unusable reply, the retry"
+    );
+    assert_eq!(
+        recorded[1].body, recorded[2].body,
+        "the retried call carries what the unusable one did"
+    );
+    assert_eq!(tool_result(&recorded[2], "toolu_1"), "ran\n");
+    let records = events::recorded(dir.path());
+    let retries = events::of_kind(&records, "model.retry");
+    assert_eq!(retries.len(), 1, "{retries:#?}");
+    assert!(
+        retries[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("unusable response")),
+        "{}",
+        retries[0]
+    );
+}
+
+/// A chain whose first model cannot be reached answers from the second, and
+/// the record says so: the move, and the model that answered the call.
+#[tokio::test]
+async fn an_unreachable_head_moves_to_the_next_model_which_is_named_as_answering() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_UNREACHABLE";
+    let (tail, mut requests) = mock_http::start(vec![text_reply("from the tail")]).await;
+    // The discard port: nothing listens there, so every connection is refused.
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, "http://127.0.0.1:9", ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+    assert_eq!(
+        agent.model(),
+        "head",
+        "what every call is tried against first"
+    );
+
+    assert_eq!(round(&mut agent, "hi").await, "from the tail");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(mock_http::drain(&mut requests).len(), 1);
+    let records = events::recorded(dir.path());
+    let moves = events::of_kind(&records, "model.failover");
+    assert_eq!(moves.len(), 1, "{moves:#?}");
+    assert_eq!(
+        (&moves[0]["from"], &moves[0]["to"]),
+        (&json!("head"), &json!("tail"))
+    );
+    assert!(
+        moves[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("127.0.0.1:9")),
+        "{}",
+        moves[0]
+    );
+    let ended = events::of_kind(&records, "model.round.completed");
+    assert_eq!(
+        ended[0]["calls"][0]["model"], "tail",
+        "the call is attributed to the model that answered it, not the head"
+    );
+}
+
+/// A move replays one model call against the next model, not the round around
+/// it: the Python the head's earlier call ran does not run again, and the
+/// moved call carries its result. Each call is named for its own model.
+#[tokio::test]
+async fn python_run_before_a_move_is_not_run_again() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_MID_ROUND";
+    let (head, mut head_requests) =
+        mock_http::start(vec![submit("toolu_1", "print('ran')"), failure(503)]).await;
+    let (tail, mut tail_requests) =
+        mock_http::start(vec![text_reply("finished on the tail")]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+    let ran = sources(&mut agent);
+
+    assert_eq!(round(&mut agent, "run it").await, "finished on the tail");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(*ran.lock().expect("sources"), ["print('ran')"]);
+    assert_eq!(mock_http::drain(&mut head_requests).len(), 2);
+    let moved = mock_http::drain(&mut tail_requests);
+    assert_eq!(moved.len(), 1);
+    assert_eq!(tool_result(&moved[0], "toolu_1"), "ran\n");
+    let records = events::recorded(dir.path());
+    let calls = &events::of_kind(&records, "model.round.completed")[0]["calls"];
+    let models: Vec<_> = calls
+        .as_array()
+        .expect("calls")
+        .iter()
+        .map(|call| (call["index"].clone(), call["model"].clone()))
+        .collect();
+    assert_eq!(
+        models,
+        [(json!(0), json!("head")), (json!(1), json!("tail"))]
+    );
+}
+
+/// When every model fails, the round ends with each one's reason and keeps
+/// the Python it ran, in the wording any failed round uses: continue rather
+/// than repeat. The session goes on, and the next round carries what ran.
+#[tokio::test]
+async fn an_exhausted_chain_ends_the_round_and_keeps_what_it_ran() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_EXHAUSTED";
+    let (head, mut head_requests) = mock_http::start(vec![
+        submit("toolu_1", "x = 41\nprint('ran')"),
+        failure(503),
+        text_reply("carried on"),
+    ])
+    .await;
+    let (tail, _tail_requests) = mock_http::start(vec![failure(401)]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let mut agent = chained_agent(vars, Events::off(), &cfg).await;
+    let ran = sources(&mut agent);
+
+    post(&agent, "set x").await;
+    let err = within(agent.round())
+        .await
+        .expect_err("every model failed")
+        .to_string();
+    assert!(
+        err.contains("every model candidate failed; tried:"),
+        "a 503 can clear, so the chain does not say terminally: {err}"
+    );
+    for reason in ["head", "503", "tail", "401"] {
+        assert!(err.contains(reason), "{reason}: {err}");
+    }
+    assert!(
+        err.contains("already run Python") && err.contains("rather than repeating one"),
+        "{err}"
+    );
+
+    assert_eq!(round(&mut agent, "continue").await, "carried on");
+    assert_eq!(*ran.lock().expect("sources"), ["x = 41\nprint('ran')"]);
+    let recorded = mock_http::drain(&mut head_requests);
+    assert_eq!(recorded.len(), 3, "{recorded:#?}");
+    assert_eq!(
+        tool_result(&recorded[2], "toolu_1"),
+        "ran\n",
+        "the next round carries what the failed one ran"
+    );
+}
+
+/// The check `0003-12` left for this task: a call that moves to a model with
+/// a smaller window is sent a view assembled for that window, not the head's.
+/// The head's view carried round 1's large turn; the tail's leaves it out, and
+/// the move's manifest says so, names the tail's allowance, and rebuilds what
+/// the tail received. Each model's own output ceiling reaches the wire with
+/// it, as building settled and the log recorded it.
+#[tokio::test]
+async fn a_move_to_a_smaller_window_is_sent_a_view_assembled_for_it() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REBUDGET";
+    let (head, mut head_requests) = mock_http::start(vec![
+        submit("toolu_big", "print('a' * 15000)"),
+        text_reply("first"),
+        failure(503),
+    ])
+    .await;
+    let (tail, mut tail_requests) = mock_http::start(vec![text_reply("second")]).await;
+    let cfg = chain_config(
+        vars,
+        (
+            Style::Anthropic,
+            &format!("http://{head}"),
+            "max-tokens = 4096",
+        ),
+        (
+            Style::Anthropic,
+            &format!("http://{tail}"),
+            "max-tokens = 1024\ncontext-window = 6000",
+        ),
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+    let ceilings: Vec<_> = agent
+        .agent
+        .model
+        .budgets()
+        .map(|budget| (budget.model.as_str(), budget.max_tokens))
+        .collect();
+    assert_eq!(ceilings, [("head", Some(4096)), ("tail", Some(1024))]);
+
+    assert_eq!(round(&mut agent, "make a large result").await, "first");
+    assert_eq!(round(&mut agent, "and then?").await, "second");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let at_head = mock_http::drain(&mut head_requests);
+    let at_tail = mock_http::drain(&mut tail_requests);
+    assert_eq!((at_head.len(), at_tail.len()), (3, 1));
+    // The same call, as each model was sent it.
+    let (headed, moved) = (&at_head[2], &at_tail[0]);
+    tool_result(headed, "toolu_big");
+    assert!(
+        !moved.body.to_string().contains("toolu_big"),
+        "the tail's window leaves the large turn out: {:#}",
+        moved.body
+    );
+    assert!(
+        check_wire(Style::Anthropic, &moved.body)
+            .unpaired
+            .is_empty()
+    );
+    assert_eq!(headed.body["max_tokens"], 4096);
+    assert_eq!(moved.body["max_tokens"], 1024);
+
+    let records = events::recorded(dir.path());
+    let kinds = events::kinds(&records);
+    assert_eq!(
+        events::of_kind(&records, "model.instructions")[0]["max_tokens"],
+        4096,
+        "the head's ceiling, as the head's call carried it"
+    );
+    let failover = at(&kinds, "model.failover", 0);
+    let head_call = *events::of_kind(&records[..failover], "model.call")
+        .last()
+        .expect("the head's manifest of the call");
+    let moved_call = &records[at(&kinds, "model.call", failover)]["data"];
+    assert_eq!(head_call["budget"]["model"], "head");
+    assert_eq!(
+        moved_call["budget"],
+        json!({
+            "model": "tail",
+            "window": 6000,
+            "window_assumed": false,
+            "reserve": 1024,
+            "overhead": moved_call["budget"]["overhead"],
+            "max_tokens": 1024,
+        })
+    );
+    // Turn 0 is round 1's opening, the call, and its large result.
+    assert_eq!(head_call["evicted"], json!([]), "{head_call:#}");
+    assert_eq!(
+        moved_call["evicted"],
+        json!([{"turn": 0, "why": "first"}]),
+        "{moved_call:#}"
+    );
+
+    let turns: Vec<Vec<rig::completion::Message>> = events::of_kind(&records, "turn.committed")
+        .iter()
+        .map(|turn| serde_json::from_value(turn["messages"].clone()).expect("rig's messages"))
+        .collect();
+    for (call, request) in [(head_call, headed), (moved_call, moved)] {
+        assert_eq!(
+            on_the_wire(Style::Anthropic, rebuilt(&turns, call)),
+            conversation(Style::Anthropic, request)
+        );
+    }
+}
+
+/// The blocks of `kind` in the messages `request` carried, as the Anthropic
+/// API received them.
+fn blocks<'a>(request: &'a RecordedRequest, kind: &str) -> Vec<&'a serde_json::Value> {
+    messages(request)
+        .iter()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter(|block| block["type"] == kind)
+        .collect()
+}
+
+/// Anthropic's own signed thinking goes back to Anthropic as it came: what
+/// keeps a call to another provider valid must not strip it from the one that
+/// wrote it.
+#[tokio::test]
+async fn signed_thinking_goes_back_to_anthropic_whole() {
+    let (mut agent, mut requests) = agent_over(
+        "OUTRIG_TEST_AGENT_SIGNED_THINKING",
+        MODEL,
+        "max-tokens = 4096",
+        vec![
+            submit("toolu_1", "print('ran')").with_reasoning("weighing it"),
+            text_reply("done"),
+        ],
+    )
+    .await;
+
+    assert_eq!(round(&mut agent, "run it").await, "done");
+
+    let recorded = mock_http::drain(&mut requests);
+    assert_eq!(
+        blocks(&recorded[1], "thinking"),
+        [&json!({
+            "type": "thinking",
+            "thinking": "weighing it",
+            "signature": mock_http::SIGNATURE,
+        })]
+    );
+}
+
+/// A call that moves from an OpenAI-compatible model to Anthropic's is sent
+/// the earlier reasoning the first one wrote as Anthropic takes it: not at
+/// all, since there is no signature to send it with, and a thinking block
+/// without one is a request Anthropic refuses. The conversation keeps it.
+#[tokio::test]
+async fn reasoning_another_provider_wrote_is_not_sent_to_anthropic() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_FOREIGN_REASONING";
+    let (head, mut head_requests) = mock_http::start(vec![
+        Style::OpenAi
+            .submit("call_1", "print('ran')")
+            .with_reasoning("thinking it over"),
+        Style::OpenAi.failure(503),
+    ])
+    .await;
+    let (tail, mut tail_requests) =
+        mock_http::start(vec![text_reply("finished on Anthropic")]).await;
+    let cfg = chain_config(
+        vars,
+        (Style::OpenAi, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+
+    assert_eq!(round(&mut agent, "run it").await, "finished on Anthropic");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let moved = mock_http::drain(&mut tail_requests);
+    assert_eq!(moved.len(), 1);
+    assert!(
+        blocks(&moved[0], "thinking").is_empty(),
+        "{:#}",
+        moved[0].body
+    );
+    assert!(
+        check_wire(Style::Anthropic, &moved[0].body)
+            .unpaired
+            .is_empty()
+    );
+    assert_eq!(tool_result(&moved[0], "call_1"), "ran\n");
+    let records = events::recorded(dir.path());
+    assert!(
+        events::of_kind(&records, "turn.committed")[0]["messages"]
+            .to_string()
+            .contains("thinking it over"),
+        "the conversation keeps what the model wrote"
+    );
+    let headed = mock_http::drain(&mut head_requests);
+    each_call_rebuilds(
+        &records,
+        &[
+            ("head", Style::OpenAi, &headed),
+            ("tail", Style::Anthropic, &moved),
+        ],
+    );
+}
+
+/// The same when the Anthropic model is the head: a later call starts there
+/// again, and leaves out what the OpenAI-compatible model it moved to on the
+/// call before reasoned. Every call's record rebuilds what its model received.
+#[tokio::test]
+async fn the_anthropic_head_is_sent_none_of_the_reasoning_its_fallback_wrote() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_FOREIGN_REASONING_HEAD";
+    let (head, mut head_requests) =
+        mock_http::start(vec![failure(503), text_reply("finished on the head")]).await;
+    let (tail, mut tail_requests) = mock_http::start(vec![
+        Style::OpenAi
+            .submit("call_1", "print('ran')")
+            .with_reasoning("thinking it over"),
+    ])
+    .await;
+    let cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::OpenAi, &format!("http://{tail}"), ""),
+    );
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+
+    assert_eq!(round(&mut agent, "run it").await, "finished on the head");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let headed = mock_http::drain(&mut head_requests);
+    let moved = mock_http::drain(&mut tail_requests);
+    assert_eq!((headed.len(), moved.len()), (2, 1));
+    assert!(
+        blocks(&headed[1], "thinking").is_empty(),
+        "{:#}",
+        headed[1].body
+    );
+    assert_eq!(
+        tool_result(&headed[1], "call_1"),
+        "ran
+"
+    );
+    let records = events::recorded(dir.path());
+    let calls = events::of_kind(&records, "model.call");
+    assert_eq!(
+        calls.last().expect("the head's second call")["left_out"],
+        json!([{"turn": 0, "message": 1, "part": 0}]),
+        "the opening, then the reply whose reasoning is left out"
+    );
+    each_call_rebuilds(
+        &records,
+        &[
+            ("head", Style::Anthropic, &headed),
+            ("tail", Style::OpenAi, &moved),
+        ],
+    );
+}
+
+/// A request that cannot succeed as sent -- a redirect loop reqwest gives up
+/// on -- is not retried: the call moves to the next model at once, with its
+/// retry budget unspent.
+#[tokio::test]
+async fn a_redirect_loop_moves_on_without_retrying() {
+    let vars = "OUTRIG_TEST_AGENT_FAILOVER_REDIRECT_LOOP";
+    let (head, mut head_requests) =
+        mock_http::start(vec![failure(307).header("Location", "/v1/messages")]).await;
+    let (tail, _tail_requests) = mock_http::start(vec![text_reply("from the tail")]).await;
+    let mut cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    retrying(&mut cfg, "first");
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+
+    assert_eq!(round(&mut agent, "hi").await, "from the tail");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let followed = mock_http::drain(&mut head_requests).len();
+    assert!(
+        (2..=11).contains(&followed),
+        "one request and the redirects reqwest follows, once: {followed}"
+    );
+    let records = events::recorded(dir.path());
+    assert_eq!(
+        events::of_kind(&records, "model.retry"),
+        Vec::<&serde_json::Value>::new()
+    );
+    assert_eq!(events::of_kind(&records, "model.failover").len(), 1);
+}
+
+/// Anthropic's overloaded status is temporary: the same model is asked again
+/// after the wait, and the call does not move.
+#[tokio::test]
+async fn an_overloaded_model_is_retried_rather_than_left() {
+    let vars = "OUTRIG_TEST_AGENT_RETRY_OVERLOADED";
+    let (head, mut head_requests) = mock_http::start(vec![
+        failure(529).header("Retry-After", 0),
+        text_reply("from the head"),
+    ])
+    .await;
+    let (tail, mut tail_requests) = mock_http::start(vec![text_reply("from the tail")]).await;
+    let mut cfg = chain_config(
+        vars,
+        (Style::Anthropic, &format!("http://{head}"), ""),
+        (Style::Anthropic, &format!("http://{tail}"), ""),
+    );
+    retrying(&mut cfg, "first");
+    let dir = tempfile::tempdir().expect("a log dir");
+    let mut agent = chained_agent(vars, events::opened(dir.path()).await, &cfg).await;
+
+    assert_eq!(round(&mut agent, "hi").await, "from the head");
+    within(agent.shutdown())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_eq!(mock_http::drain(&mut head_requests).len(), 2);
+    assert!(mock_http::drain(&mut tail_requests).is_empty());
+    let records = events::recorded(dir.path());
+    let retries = events::of_kind(&records, "model.retry");
+    assert_eq!(retries.len(), 1, "{retries:#?}");
+    assert!(
+        retries[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("529")),
+        "{}",
+        retries[0]
+    );
+    assert!(events::of_kind(&records, "model.failover").is_empty());
 }
 
 // ---------------------------------------------------------------------------- through podman

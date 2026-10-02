@@ -61,3 +61,11 @@ not judge, which narrows what the warning is for and may shrink it to nothing.
 - `crates/outrig-cli/tests/anthropic_mock.rs` --
   `a_configured_ceiling_is_capped_at_the_published_one` pins the clamp itself; a warning wants
   stderr capture, which that harness does not do today.
+
+## The library's half of the export is settled
+
+`0003-04` exported the effective ceiling from the library's copy of `build_agent`, and `0003-15`
+made it per candidate: each failover candidate's `Budget` carries the ceiling that reaches the
+wire for it, the chain rewrites each request from it, and every `model.call` manifest records the
+`max_tokens` its call carried. The warning when the clamp fires is still open in both loops, and
+the CLI's `SetResultTool` still reads the unclamped value.

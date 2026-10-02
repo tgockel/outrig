@@ -27,11 +27,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use rig::OneOrMany;
 use rig::completion::Message;
 use rig::completion::message::{AssistantContent, ToolCall, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 
-use super::budget::{self, Budget};
+use super::budget::{self, Budget, Wire};
 #[cfg(test)]
 use super::tool::ObserverSlot;
 use crate::events::{self, Event};
@@ -156,6 +157,89 @@ pub(crate) struct Manifest {
     /// Where one role follows itself in the conversation sent, whether or not
     /// the wire repeats it.
     pub(crate) adjacent: Vec<Adjacent>,
+    /// The parts of the carried turns the call's provider cannot take, which
+    /// it was not sent: see [`Wire`]. Oldest first.
+    pub(crate) left_out: Vec<LeftOut>,
+}
+
+/// One part of a carried turn a call was not sent: in turn `turn`, the
+/// `part`-th part of its `message`-th message, each counted from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeftOut {
+    pub(crate) turn: usize,
+    pub(crate) message: usize,
+    pub(crate) part: usize,
+}
+
+/// Turn `turn`'s `messages` as a call in `wire` is sent them: each part of a
+/// reply the protocol cannot take left out, and pushed onto `left_out`, and a
+/// reply left with nothing left out with it. The turn itself is not changed.
+fn fit(wire: Wire, turn: usize, messages: &[Message], left_out: &mut Vec<LeftOut>) -> Vec<Message> {
+    let mut sent = Vec::with_capacity(messages.len());
+    for (message, original) in messages.iter().enumerate() {
+        let Message::Assistant { id, content } = original else {
+            sent.push(original.clone());
+            continue;
+        };
+        if content.iter().all(|part| wire.takes(part)) {
+            sent.push(original.clone());
+            continue;
+        }
+        let mut kept = Vec::new();
+        for (part, content) in content.iter().enumerate() {
+            if wire.takes(content) {
+                kept.push(content.clone());
+            } else {
+                left_out.push(LeftOut {
+                    turn,
+                    message,
+                    part,
+                });
+            }
+        }
+        // A reply of nothing but what was left out made no tool call, so
+        // leaving it out leaves no result unanswered.
+        if let Ok(content) = OneOrMany::many(kept) {
+            sent.push(Message::Assistant {
+                id: id.clone(),
+                content,
+            });
+        }
+    }
+    sent
+}
+
+/// Turn `turn`'s `messages` as the call `left_out` describes was sent them:
+/// each part it names left out, and a message all of whose parts it names
+/// left out with them. What [`fit`] decided, rebuilt from the record alone.
+#[cfg(test)]
+pub(crate) fn as_sent(turn: usize, messages: &[Message], left_out: &[LeftOut]) -> Vec<Message> {
+    let named = |message: usize, part: usize| {
+        left_out.contains(&LeftOut {
+            turn,
+            message,
+            part,
+        })
+    };
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(message, original)| match original {
+            Message::Assistant { id, content } => OneOrMany::many(
+                content
+                    .iter()
+                    .enumerate()
+                    .filter(|&(part, _)| !named(message, part))
+                    .map(|(_, content)| content.clone()),
+            )
+            .ok()
+            .map(|content| Message::Assistant {
+                id: id.clone(),
+                content,
+            }),
+            other => Some(other.clone()),
+        })
+        .collect()
 }
 
 impl Manifest {
@@ -179,6 +263,7 @@ impl Manifest {
                 window_assumed: self.budget.window_assumed,
                 reserve: self.budget.reserve,
                 overhead: self.budget.overhead,
+                max_tokens: self.budget.max_tokens,
             },
             estimate: self.estimate,
             carried: chosen(&self.carried),
@@ -194,6 +279,21 @@ impl Manifest {
                         Role::Assistant => "assistant",
                     },
                 })
+                .collect(),
+            left_out: self
+                .left_out
+                .iter()
+                .map(
+                    |&LeftOut {
+                         turn,
+                         message,
+                         part,
+                     }| events::LeftOut {
+                        turn,
+                        message,
+                        part,
+                    },
+                )
                 .collect(),
         }
     }
@@ -231,6 +331,7 @@ impl fmt::Display for TooLarge {
             window_assumed,
             reserve,
             overhead,
+            ..
         } = &self.budget;
         match self.turn {
             Some(turn) => write!(
@@ -270,6 +371,10 @@ impl fmt::Display for TooLarge {
         }
     }
 }
+
+/// An error so a failover chain can give it as the reason a candidate it
+/// moved to could not be sent the call.
+impl std::error::Error for TooLarge {}
 
 /// The agent's conversation. Cheap to clone; every clone is the one store.
 #[derive(Clone)]
@@ -410,7 +515,7 @@ impl History {
         let mut messages: Vec<Message> = manifest
             .carried
             .iter()
-            .flat_map(|(id, _)| store.turns[*id].messages.iter().cloned())
+            .flat_map(|(id, _)| as_sent(*id, &store.turns[*id].messages, &manifest.left_out))
             .collect();
         messages.extend(manifest.opening.iter().cloned());
         messages
@@ -602,22 +707,24 @@ impl Store {
 
         let mut sent: Vec<Message> = Vec::new();
         let mut adjacent = Vec::new();
+        let mut left_out = Vec::new();
         let opening = match prompt {
             Prompt::Opening { .. } => self.opening.as_ref().map(|o| o.message.clone()),
             Prompt::Turn(_) => None,
         };
-        let turns = carried
-            .iter()
-            .map(|(id, _)| (Some(*id), &self.turns[*id].messages[..]));
-        for (turn, messages) in
-            turns.chain(opening.as_ref().map(|o| (None, std::slice::from_ref(o))))
-        {
+        // Each turn as the call's provider takes it. The estimate above counts
+        // turns whole, so what is left out only makes it more conservative.
+        let turns = carried.iter().map(|&(id, _)| {
+            let messages = fit(budget.wire, id, &self.turns[id].messages, &mut left_out);
+            (Some(id), messages)
+        });
+        for (turn, messages) in turns.chain(opening.iter().map(|o| (None, vec![o.clone()]))) {
             if let (Some(before), Some(first)) = (sent.last(), messages.first())
                 && let Some(role) = Role::of(first).filter(|role| Role::of(before) == Some(*role))
             {
                 adjacent.push(Adjacent { turn, role });
             }
-            sent.extend(messages.iter().cloned());
+            sent.extend(messages);
         }
 
         let manifest = Manifest {
@@ -629,6 +736,7 @@ impl Store {
             evicted,
             opening,
             adjacent,
+            left_out,
         };
         self.calls += 1;
         Ok((sent, manifest))

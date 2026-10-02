@@ -39,3 +39,10 @@ paying for a binary-level failover fixture.
 ## Dependencies
 
 - **Landed:** `plan/done/phase/0002-sidecars/tasks/0002-36-model-alias-failover.md`, decision 8.
+
+## The library's move is pinned
+
+`0003-15`'s copy in `crates/outrig/src/agent/failover.rs` announces a move through `tracing` and
+records it as a `model.failover` event. `each_move_is_recorded` and the round tests in
+`agent/agent_tests.rs` assert the event, which a refactor that dropped the move's report would
+fail. The CLI's `eprintln!` is still unasserted.
