@@ -12,7 +12,8 @@ mode = "record"          # off (default) | record
 
 See [Config](config.md#events) for where the key can live, and
 [Sessions](../usage/sessions.md#the-event-log) for how the file fits beside the session's other
-logs. `outrig run` reads the key and records nothing.
+logs. `outrig run` reads the key and records nothing. To read a recording as a page rather than as
+JSON, see [Reading it in a browser](../usage/sessions.md#reading-it-in-a-browser).
 
 The file is created readable and writable by its owner only (mode `0600`), and an empty file
 already there is narrowed to that. It holds message bodies the model may never have printed, which
@@ -61,6 +62,10 @@ For `run-new` that is not yet the id in `session.json`, whose `container_name` l
 The interpreter belongs to the session rather than to one agent, so events about it --
 `output.unattributed`, `interpreter.diagnostic`, and `interpreter.exited` -- carry no `subject`.
 
+Inside `data`, an execution's `execid` and a message's `message` id come from one counter, which
+also numbers OutRig's own questions to the interpreter, so neither runs in sequence and a gap in
+them means nothing. Turns and calls are each counted from 0 on their own.
+
 ## Three categories
 
 Recording is a decision with consequences: even text the model saw has a different audience and
@@ -90,7 +95,8 @@ category says what it may hold.
   - `max_tokens`: the reply ceiling in force, after the model's published ceiling filled it in or
     lowered it; `null` when none is sent.
 - `turn.committed` -- a turn, as it joins the conversation. A turn is one model call and the tool
-  results it asked for.
+  results it asked for, so it joins once those results are in: after the executions it ran, and
+  before the next call.
   - `turn`: its id, from 0, in commit order.
   - `round`: its round.
   - `incomplete`: `true` for a turn the round ended while its calls ran, whose missing results
@@ -108,7 +114,8 @@ category says what it may hold.
   - `evicted`: the turns chosen but left out for size, the same way.
   - `opening`: the round's opening message, on a round's first call, before any turn holds it;
     otherwise `null`.
-  - `adjacent`: where one role follows itself in what was sent, each as `{turn, role}`.
+  - `adjacent`: where one role follows itself in what was sent, each as `{turn, role}`; `turn` is
+    `null` where the repeat is the round's opening.
 - `exec.submitted` -- Python the model submitted, as it goes to run: `execid` and `source`.
 
 What a call sent rebuilds from the file alone: the `messages` of each turn in its `carried`, in
@@ -130,7 +137,8 @@ promotion is a request rather than proof of what was sent; the call's `carried` 
   - `error`: the traceback, or `null`.
   - `background`: output earlier executions wrote since, each as `{id, output, dropped}`.
 - `exec.refused` -- a submission not run because another held the interpreter: `execid` and
-  `holder`.
+  `holder`. It has no `exec.submitted` and no `exec.completed`; its source is only in the turn
+  that asked for it.
 - `memory.exhausted` -- an execution raised `MemoryError`, beside its `exec.completed`: `execid`.
   The traceback is that event's `error`.
 - `exec.cancel.sent` -- `execid`. A cancel sent, which a first Ctrl-C does.

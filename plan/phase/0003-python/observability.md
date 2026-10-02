@@ -202,8 +202,11 @@ block:
 ```
 
 ```
-uv run --script scripts/render-session.py <session-dir> --out report.html
+uv run --script scripts/render-session.py <session-dir> [--out PATH]
 ```
+
+The page goes to `<session-dir>/report.html` by default, owner-only like `events.jsonl`, because it
+holds the same things. `0003-14` records why it is not the current directory.
 
 `uv run --script` rather than `uvx`: `uvx` runs a command from a published package, while PEP 723
 inline metadata is what `uv run` reads from a local script.
@@ -267,8 +270,8 @@ it, which `history.md` records.
   `session-record-error-variant`, `unreadable-session-records-are-unremovable`, and
   `dangling-session-symlink-is-invisible`. Two of them say they were deferred pending "its own
   design," and this is the first design that wants them.
-- Where the renderer lives. `scripts/` is described in the tree as repo-local tooling, and this is
-  the first thing there meant for a user.
+- Where the renderer lives. Settled by `0003-14`: `scripts/render-session.py`, with the tree's
+  description of `scripts/` widened to say it holds one thing meant for a user.
 - Whether an event carries a causal parent -- which model turn produced which execution -- or
   whether ordering alone is enough. Ordering is enough to read; it is not enough to query.
 
@@ -283,5 +286,5 @@ it, which `history.md` records.
   to extract it. The extraction is where that claim gets tested.
 - The renderer's mechanics were confirmed rather than assumed: `uv run --script` resolved a PEP 723
   block declaring `jinja2>=3.1`, installed it with its one transitive dependency, and rendered a
-  template whose autoescaping turned `<script>` into `&lt;script&gt;`. What was not tested is any
-  of it against a real session directory, because none exists yet.
+  template whose autoescaping turned `<script>` into `&lt;script&gt;`. `0003-14` then ran it
+  against a real `run-new` session directory, and records what that covered.

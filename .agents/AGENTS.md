@@ -30,7 +30,9 @@ the environment the agent gets to play in, leaving the agents free to work quick
   behind each crate's `e2e` feature (`--features outrig/e2e,outrig-cli/e2e`); CI compiles
   them without running them.
 - `scripts/` -- repo-local tooling (doc-style audit, public-API snapshot gate, mdbook
-  assets).
+  assets), plus `render-session.py`, the one script meant for users: it renders a session
+  directory's event log to an HTML page, run with `uv run --script`. Its tests,
+  `render-session-test.py`, run in CI's `render-session` job.
 - `book.toml` -- mdbook config; output goes to `target/book/`.
 
 ## Conventions for `doc/`

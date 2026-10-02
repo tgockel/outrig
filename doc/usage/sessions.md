@@ -31,6 +31,7 @@ random hex digits -- sortable, unambiguous across concurrent runs):
 ~/.local/share/outrig/sessions/
 └── 20260501T134412-3f2a/
     ├── session.json              # id, timestamps, containers, image, exit status
+    ├── report.html               # the event log as a page, once you have rendered it
     └── logs/
         ├── container.log         # buildah/podman transcripts when --verbose is set
         ├── network.jsonl         # network audit/filter records when enabled
@@ -238,6 +239,31 @@ the time `run-new` exits, on the same terms as `network.jsonl`: not synced to th
 cannot keep up, the agent waits for it rather than losing events; a part of OutRig that cannot
 wait, such as the one reading the interpreter's replies, queues its events instead, and any the
 file never got are counted in a warning at exit.
+
+### Reading it in a browser
+
+`scripts/render-session.py` turns a session directory into one HTML page. It reads
+`session.json`, `logs/events.jsonl`, and `logs/network.jsonl` when there is one, and shows the
+session; whether its record is whole; the tokens each round used; a timeline of the rounds, with
+each round's model calls, turns, executions, and messages linked by their ids; every execution's
+source, output, and traceback; the messages; and the connections. Nothing on the page runs and
+nothing on it loads from anywhere.
+
+```sh
+$ uv run --script scripts/render-session.py /tmp/my-debug-run
+/tmp/my-debug-run/report.html
+```
+
+[uv](https://docs.astral.sh/uv/) is all it needs: the script declares its Python version and its
+one dependency, Jinja, inline, and `uv` provides both. The page is written into the session
+directory as `report.html`, readable by its owner only, because it holds what `events.jsonl`
+holds; `outrig discard` removes it with the rest. `--out <path>` writes it elsewhere, on the same
+terms. A log still being written, or one whose session died mid-line, renders anyway: a line that
+does not parse is skipped and listed on the page.
+
+The script is in OutRig's repository, not in the installed binary. If you installed with `cargo
+install`, take the copy from the `outrig-cli-vX.Y.Z` tag matching your `outrig --version`: the
+event log can change between versions, and each copy reads its own version's.
 
 ## `outrig discard`
 

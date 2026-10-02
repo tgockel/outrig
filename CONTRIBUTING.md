@@ -52,6 +52,20 @@ The check does not forbid changing the API. After an intentional surface change,
 with `python3 scripts/check-public-api.py --write` and let the regenerated snapshot travel in
 the same commit: that diff is the review material.
 
+## The session renderer
+
+`scripts/render-session.py` turns a session's event log into a page a browser opens, and the log
+holds model-written and user-typed text. Its tests run it through `uv`, the way a person does, and
+assert that nothing in the record reaches the page as markup:
+
+```sh
+uv run --script scripts/render-session-test.py
+```
+
+They need only [uv](https://docs.astral.sh/uv/). Run them after changing the renderer, and after
+adding or renaming an event in `crates/outrig/src/events.rs`: one test fails until the renderer's
+fixture covers every event the log can hold.
+
 ## Packaging
 
 What gets published is not what `cargo test` builds. `crates/outrig/build.rs` compiles the

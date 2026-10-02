@@ -302,6 +302,34 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 scripts/audit-doc-style.py
 
+  # `scripts/render-session.py` turns a session's event log into a page a browser opens, and
+  # everything on that page -- source, tracebacks, output, message bodies -- was written by a
+  # model or a user. Its tests run it the way a person does, `uv run --script`, over sessions
+  # whose every field tries to become markup.
+  #
+  # `uv` is all this job installs, and `only-managed` keeps uv off the runner's own Python: the
+  # interpreter and Jinja both come from uv, which is the claim the script's docs make about
+  # what running it needs. No cache: none of setup-uv's default keys matches a file here, and
+  # what it would hold is a Python and two small packages. Pinned to a release, since setup-uv
+  # publishes no moving `v10` tag.
+  render-session:
+    name: render-session
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: false
+      - run: uv run --script scripts/render-session-test.py
+      # And on the oldest Python its `requires-python` accepts, which is not where uv goes by
+      # default: 3.12 and 3.13 refuse JSON nested too deep with a `RecursionError` that 3.14
+      # does not raise, so a handler for it is tested only here.
+      - run: uv run --script scripts/render-session-test.py
+        env:
+          UV_PYTHON: "3.12"
+
   mdbook:
     name: mdbook
     runs-on: ubuntu-latest
