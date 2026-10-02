@@ -428,6 +428,14 @@ subagent launched, under a `subagent-<parent>/` directory there.
 [outrig] tool call: outrig__get_result({"name": "audit-mcp"})
 ```
 
+A subagent round that ends early says why on a line labeled the same way, without the advice
+shown above for your own turns: `continue` or `/reset` would act on the primary's conversation,
+and what the subagent does next is up to the agent that launched it.
+
+```
+[outrig]   [audit-mcp] tool-call iteration max (50) reached; ending turn
+```
+
 Nothing a subagent produces reaches stdout, so `outrig run > out.txt` still captures only the
 primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
 

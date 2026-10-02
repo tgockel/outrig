@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent round that ends early says so under the subagent's name, without advice meant for
+  your own turn.** When a subagent's round hit its tool-call max or the repeat breaker, or a model
+  call in it failed for good, stderr got the lines printed when the primary's turn ends early,
+  with no label: `[outrig] <reason>; ending turn`, then advice to send the prompt again or
+  `/quit`, to send `continue`, or to `/reset`. That advice acts on the primary's conversation:
+  `/reset` cleared the primary's history, and resending reran the primary's turn. The reason now
+  carries the subagent's label, as its tool calls do, and the advice is left out, since what a
+  subagent does next is its parent's call.
 - **A follow-up sent to a busy subagent after it reported gets an answer.** `outrig__subagent_send`
   to a subagent whose round had already called `outrig__set_result` reached its model on the next
   tool result, but the round still counted the earlier report as its answer. When the subagent

@@ -253,7 +253,11 @@ subagent, or ending the session, tears down everything it launched with it.
 Nothing reaches stdout except the primary agent's reply, so `outrig run > out.txt` still captures
 only the model's text. Subagent activity shows up two other ways:
 
-- On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name.
+- On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name. A
+  round that ends early -- at its tool-call max, at the repeat breaker, or on a model call that
+  failed for good -- says why on a line labeled the same way. It leaves out the advice printed
+  when the primary's turn ends early: `continue`, `/reset`, and the rest act on the primary's
+  conversation, and what a subagent does next is its parent's call.
 - In a transcript holding that subagent's prompts, replies, and published outcomes. A subagent the
   primary launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
   logs. One launched by a subagent writes into a directory named for its parent, beside the

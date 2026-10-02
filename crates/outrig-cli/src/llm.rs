@@ -2490,7 +2490,8 @@ where
     })
 }
 
-/// What the user is told when a turn ends early with its completed work kept.
+/// What the user is told when the primary's turn ends early with its completed
+/// work kept.
 ///
 /// One line for every such end -- a hook stop, the tool-call max, an endpoint
 /// that failed past the turn's first model call -- because each leaves the same
@@ -2498,6 +2499,11 @@ where
 /// prompt to carry on from.
 const PARTIAL_HISTORY_RETAINED: &str = "[outrig] partial history retained -- send another prompt \
      (e.g. \"continue\") to keep going, or \"/reset\" to drop it.";
+
+/// What the user is told when the primary's turn ends having kept nothing: its
+/// first model call failed, so the prompt itself is what wants resending.
+const HISTORY_UNCHANGED: &str =
+    "[outrig] history unchanged -- send the prompt again to retry, or \"/quit\" to stop.";
 
 /// End the *turn* -- not the session -- because the endpoint failed.
 ///
@@ -2512,27 +2518,24 @@ const PARTIAL_HISTORY_RETAINED: &str = "[outrig] partial history retained -- sen
 /// the checkpoint holds tool calls that already ran, so the advice is the
 /// "continue" the truncation paths give: sending the prompt again would run
 /// them a second time. A turn that failed on its first call has nothing to
-/// keep, and only there is the prompt itself what wants resending. No budget is
-/// named, because with `retry-budget-secs = 0` there was none; the retry
-/// progress lines above name it whenever there was one.
+/// keep, and only there is the prompt itself what wants resending. A
+/// subagent's round keeps its checkpoint the same way, for the parent's next
+/// send to carry on from, but is given neither: see
+/// [`OutrigPromptHook::turn_end_notice`]. No budget is named, because with
+/// `retry-budget-secs = 0` there was none; the retry progress lines above name
+/// it whenever there was one.
 fn endpoint_failed(
     reason: String,
     tried: Option<&str>,
     history: &mut Vec<Message>,
     hook: &OutrigPromptHook,
 ) -> Result<TurnEnd> {
-    eprintln!("[outrig] {reason}; ending turn");
-    if let Some(tried) = tried {
-        eprintln!("[outrig] tried:\n{tried}");
-    }
-    if hook.keep_checkpoint(history) {
-        eprintln!("{PARTIAL_HISTORY_RETAINED}");
+    let advice = if hook.keep_checkpoint(history) {
+        PARTIAL_HISTORY_RETAINED
     } else {
-        eprintln!(
-            "[outrig] history unchanged -- send the prompt again to retry, \
-             or \"/quit\" to stop."
-        );
-    }
+        HISTORY_UNCHANGED
+    };
+    eprintln!("{}", hook.turn_end_notice(&reason, tried, advice));
     Ok(TurnEnd {
         // Nothing belongs on stdout: the model never spoke, or spoke only in
         // tool calls, which the history now holds. `repl.rs`'s
@@ -2651,8 +2654,10 @@ fn handle_prompt_error(
         ),
         other => return Err(other.into()),
     };
-    eprintln!("[outrig] {reason}; ending turn");
-    eprintln!("{PARTIAL_HISTORY_RETAINED}");
+    eprintln!(
+        "{}",
+        hook.turn_end_notice(&reason, None, PARTIAL_HISTORY_RETAINED)
+    );
     extend_history_with_new_suffix(history, chat_history);
     // Everything stands, not only what the checkpoint carries: the hook stops
     // the loop only at a model call, and rig runs out of turns only before
@@ -2768,7 +2773,9 @@ pub struct OutrigPromptHook {
     cap_reached: Arc<AtomicBool>,
     max: usize,
     /// Prefixes trace lines so concurrent subagents are tellable apart. The
-    /// primary agent leaves it unset and its traces keep their original shape.
+    /// primary agent leaves it unset and its traces keep their original shape,
+    /// down to the advice its turn ends with: see
+    /// [`OutrigPromptHook::turn_end_notice`].
     label: Option<Arc<str>>,
     /// Present for subagents only: the parent's steers, which the last result
     /// of each tool batch carries to the model. See [`InjectionSource`].
@@ -2905,6 +2912,28 @@ impl OutrigPromptHook {
             Some(label) => format!("  [{label}] "),
             None => String::new(),
         }
+    }
+
+    /// What stderr is told when the turn ends early: why, and for the primary,
+    /// what to do next.
+    ///
+    /// The reason carries this hook's label, as its tool-call traces do, and so
+    /// does a failed chain's `tried:` report under it. `advice` is about the
+    /// primary's conversation -- send the prompt again, `continue`, `/reset`,
+    /// `/quit` -- so a subagent's round leaves it out. What a subagent does
+    /// next is its parent's call, and following the advice acted on the
+    /// primary instead: `/reset` cleared the primary's history (#309).
+    ///
+    /// Returned rather than printed, so the wording is assertable without
+    /// capturing stderr.
+    fn turn_end_notice(&self, reason: &str, tried: Option<&str>, advice: &str) -> String {
+        let prefix = self.trace_prefix();
+        let mut lines = vec![format!("[outrig] {prefix}{reason}; ending turn")];
+        lines.extend(tried.map(|tried| format!("[outrig] {prefix}tried:\n{tried}")));
+        if self.label.is_none() {
+            lines.push(advice.to_string());
+        }
+        lines.join("\n")
     }
 
     /// The parent's steers for the tool result rig is reporting: whatever is
@@ -3344,6 +3373,61 @@ mod tests {
             "a spent tool-call budget is a continuable stop, got: {stopped:?}",
         );
         assert!(stopped.reason().contains("(52)"), "got: {stopped:?}");
+    }
+
+    /// #309: a subagent's round that ended early printed the primary's lines,
+    /// unlabeled, with advice about the primary's conversation -- `/reset`
+    /// cleared the primary's history. The round's end now carries its label,
+    /// as its tool calls do, and no advice, whichever the turn would have
+    /// given.
+    #[test]
+    fn a_subagent_round_ends_under_its_label_without_advice() {
+        let injections: InjectionSource = Arc::new(|_: &TurnUndo| Vec::new());
+        let hook = OutrigPromptHook::for_subagent(10, "probe", injections);
+
+        for advice in [PARTIAL_HISTORY_RETAINED, HISTORY_UNCHANGED] {
+            assert_eq!(
+                hook.turn_end_notice("tool-call iteration max (10) reached", None, advice),
+                "[outrig]   [probe] tool-call iteration max (10) reached; ending turn"
+            );
+        }
+        assert_eq!(
+            hook.turn_end_notice(
+                "every model candidate failed",
+                Some("  fast -- HTTP 503"),
+                HISTORY_UNCHANGED
+            ),
+            "[outrig]   [probe] every model candidate failed; ending turn\n\
+             [outrig]   [probe] tried:\n  fast -- HTTP 503"
+        );
+    }
+
+    /// The primary's turn ends with the lines the REPL has always printed,
+    /// advice included.
+    #[test]
+    fn the_primary_turn_ends_with_its_advice() {
+        let hook = OutrigPromptHook::new(10);
+
+        assert_eq!(
+            hook.turn_end_notice(
+                "tool-call iteration max (10) reached",
+                None,
+                PARTIAL_HISTORY_RETAINED
+            ),
+            "[outrig] tool-call iteration max (10) reached; ending turn\n\
+             [outrig] partial history retained -- send another prompt (e.g. \"continue\") \
+             to keep going, or \"/reset\" to drop it."
+        );
+        assert_eq!(
+            hook.turn_end_notice(
+                "every model candidate failed",
+                Some("  fast -- HTTP 503"),
+                HISTORY_UNCHANGED
+            ),
+            "[outrig] every model candidate failed; ending turn\n\
+             [outrig] tried:\n  fast -- HTTP 503\n\
+             [outrig] history unchanged -- send the prompt again to retry, or \"/quit\" to stop."
+        );
     }
 
     /// Both turn paths read the stop cause straight off the hook, so a hook
