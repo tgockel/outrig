@@ -477,6 +477,59 @@ pub async fn build_mock_agent(
     .expect("agent builds")
 }
 
+/// The name [`FixedTool`] registers under.
+#[allow(dead_code)]
+pub const FIXED_TOOL: &str = "outrig_test_fixed";
+
+/// A tool that returns `output` whatever it is called with, so a test can put
+/// exact text in a tool result and look for it in the request that follows.
+#[allow(dead_code)]
+pub struct FixedTool {
+    pub output: &'static str,
+}
+
+impl rig::tool::ToolDyn for FixedTool {
+    fn name(&self) -> String {
+        FIXED_TOOL.to_string()
+    }
+
+    fn description(&self) -> String {
+        "Return a fixed text.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    fn call<'a>(
+        &'a self,
+        _args: String,
+    ) -> rig::wasm_compat::WasmBoxedFuture<'a, std::result::Result<String, rig::tool::ToolError>>
+    {
+        Box::pin(async move { Ok(self.output.to_string()) })
+    }
+}
+
+/// Tool results rig 0.40 would not send as written: each is JSON in a shape
+/// its `ToolResultContent::from_tool_output` reads as structured (#253).
+///
+/// * A WireMock stub mapping, as a file read returns it. It has a top-level
+///   `response` key, so it would reach the model as that value alone,
+///   re-serialized, and without the `request` it matches.
+/// * A `response` beside image `parts`, which would reach it as the quoted
+///   `response` and an image.
+/// * An object shaped as an image, which would reach it as that image.
+#[allow(dead_code)]
+pub const RESULTS_RIG_RESHAPES: [&str; 3] = [
+    r#"{
+  "request": { "method": "GET", "url": "/api/health" },
+  "response": { "status": 200, "body": "ok" }
+}
+"#,
+    r#"{"response": "Rendered the chart.", "parts": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}"#,
+    r#"{"type": "image", "data": "https://example.com/x.png", "mimeType": "image/png"}"#,
+];
+
 /// Materialize `<root>/<sid>/session.json` from [`sample_session`], letting
 /// `mutate` reshape the JSON first. Tests on-disk shapes the current code
 /// wouldn't write itself -- legacy key names, dropped fields, corruption --

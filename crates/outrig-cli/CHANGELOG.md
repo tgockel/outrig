@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tool result that is JSON reaches the model as the tool returned it.** rig, which runs the
+  agent loop, read every tool result for structure. One that was a JSON object with a top-level
+  `response` key reached the model as that value alone, with nothing to say the rest was missing:
+  a WireMock stub mapping read through the `fs` server came through without the `request` it
+  matches, and an Ollama reply without the `done_reason` that says it was cut off. One carrying an
+  image -- in a `parts` list, or shaped as one -- was sent as that image. An OpenAI-style provider
+  cannot be sent an image there, nor the native Anthropic one an image given by URL, so the
+  request failed to build and `outrig run` ended, or a subagent's round failed. Every tool result
+  now reaches the model as the text the tool returned.
 - **A subagent round that ends early says so under the subagent's name, without advice meant for
   your own turn.** When a subagent's round hit its tool-call max or the repeat breaker, or a model
   call in it failed for good, stderr got the lines printed when the primary's turn ends early,

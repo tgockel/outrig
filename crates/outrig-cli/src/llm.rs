@@ -3089,6 +3089,55 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
     }
 }
 
+/// Hands every tool result to the model as the tool returned it, through
+/// [`as_written`].
+///
+/// The agent's own hook rather than part of [`OutrigPromptHook`]: it holds no
+/// state, so [`finish_agent`] attaches it once and every run of every agent
+/// has it, a subagent's included. It can go whole with the move to rig 0.41 or
+/// later, which no longer re-parses tool results.
+struct ResultsAsWritten;
+
+impl<M: CompletionModel> AgentHook<M> for ResultsAsWritten {
+    // Off the streaming path's per-token deltas, like `OutrigPromptHook`.
+    fn observes(&self, kind: StepEventKind) -> bool {
+        kind == StepEventKind::ToolResult
+    }
+
+    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        match event {
+            StepEvent::ToolResult { result, .. } => as_written(result),
+            _ => Flow::cont(),
+        }
+    }
+}
+
+/// What to tell rig about a tool result so the model reads it as the tool
+/// returned it: nothing, if rig sends it that way, and otherwise a rewrite to
+/// the same text (#253).
+///
+/// Rig 0.40 reads each result its hooks leave alone for structure
+/// (`ToolResultContent::from_tool_output`). A JSON object with a top-level
+/// `response` key goes out as that value alone, re-serialized, plus the
+/// images listed in `parts`, and one shaped as an image goes out as that
+/// image. The rest of the object is dropped without a marker, and an image
+/// fails the turn on a provider that cannot take one there, as the OpenAI arm
+/// never can. A tool's text is never meant that way, and rig sends a rewrite
+/// as written.
+///
+/// Rig's own parser decides, so whatever it would reshape is caught, not just
+/// the shapes known here. The rest is left alone because a rewrite costs the
+/// result rig's log line, which then says only that a hook rewrote it.
+fn as_written(result: &str) -> Flow {
+    use rig::message::ToolResultContent;
+
+    let content = ToolResultContent::from_tool_output(result);
+    match (content.len(), content.first_ref()) {
+        (1, ToolResultContent::Text(text)) if text.text == result => Flow::cont(),
+        _ => Flow::rewrite_result(result),
+    }
+}
+
 /// `max_tokens` is passed rather than read off `resolved` because the ceiling
 /// that travels is not always the one that was configured: the Anthropic arm
 /// caps it at what the identifier publishes. Every other field is the resolved
@@ -3113,7 +3162,10 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
     if let Some(max_tokens) = max_tokens {
         builder = builder.max_tokens(max_tokens as u64);
     }
-    builder.tools(session_tool::boxed(&tools)).build()
+    builder
+        .tools(session_tool::boxed(&tools))
+        .add_hook(ResultsAsWritten)
+        .build()
 }
 
 #[cfg(test)]
@@ -3292,6 +3344,38 @@ mod tests {
                 !AgentHook::<rig::providers::openai::CompletionModel>::observes(&primary, kind),
                 "the primary agent keeps its existing behavior: {kind:?}"
             );
+        }
+    }
+
+    /// A result rig sends as written is left to it: plain text, and JSON in no
+    /// shape rig reads for structure. Rewriting those too would cost every
+    /// result rig's log line, for nothing.
+    #[test]
+    fn a_result_rig_sends_as_written_is_left_alone() {
+        for result in [
+            "pong:ping",
+            "",
+            r#"{"status": 200, "body": "ok"}"#,
+            r#"[{"response": "not at the top level"}]"#,
+            r#"{"type": "image", "data": "iVBORw0KGgo="}"#,
+            r#"ToolCallError: {"response": "not JSON as a whole"}"#,
+        ] {
+            assert_eq!(as_written(result), Flow::cont(), "{result}");
+        }
+    }
+
+    /// A result rig would reshape goes back to it as a rewrite to the same
+    /// text, which it sends as written (#253).
+    #[test]
+    fn a_result_rig_would_reshape_is_rewritten_to_itself() {
+        for result in [
+            r#"{"request": {"url": "/api/health"}, "response": {"status": 200}}"#,
+            r#"{"response": "Blue.", "done": true, "done_reason": "length"}"#,
+            r#"{"response": "Rendered.", "parts": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}"#,
+            r#"{"parts": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}"#,
+            r#"{"type": "image", "data": "https://example.com/x.png", "mimeType": "image/png"}"#,
+        ] {
+            assert_eq!(as_written(result), Flow::rewrite_result(result), "{result}");
         }
     }
 

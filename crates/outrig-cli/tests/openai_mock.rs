@@ -12,7 +12,9 @@
 //!   so roles still alternate -- from a lone model and from a chain candidate,
 //!   which are built apart -- while outrig's own history keeps the turn as rig
 //!   returned it;
-//! * reasoning beside text goes back exactly as it always has.
+//! * reasoning beside text goes back exactly as it always has;
+//! * a tool result goes out as the tool returned it, byte for byte, even when
+//!   it is JSON that rig would read as structured.
 
 mod common;
 
@@ -25,8 +27,9 @@ use serde_json::{Value, json};
 
 use outrig::config::Config;
 use outrig_cli::llm::RigAgent;
+use outrig_cli::session_tool;
 
-use common::{CannedResponse, drain_recorded, start_mock_http};
+use common::{CannedResponse, FIXED_TOOL, FixedTool, drain_recorded, start_mock_http};
 
 // ---- canned chat completions ----------------------------------------------
 
@@ -55,14 +58,14 @@ fn text_reply(text: &str) -> CannedResponse {
 
 // ---- harness --------------------------------------------------------------
 
-/// The agent under test, running `model` against the mock with retries off: no
-/// test here is about them, and a failure should end the turn at once.
+/// A config running `model` against the mock with retries off: no test here is
+/// about them, and a failure should end the turn at once.
 ///
 /// `model` is `"gpt"`, a lone model, or `"chain"`, an alias over two rows on the
 /// same mock. `build_agent` builds that into a `FailoverModel`, candidate by
 /// candidate, apart from the path a lone model takes; a move along it would
 /// show as a second request.
-async fn mock_agent(addr: SocketAddr, var: &str, model: &str) -> RigAgent {
+fn mock_config(addr: SocketAddr, var: &str, model: &str) -> Config {
     let cfg = format!(
         r#"
 default-model = "{model}"
@@ -91,7 +94,12 @@ preamble = "{PREAMBLE}"
     );
     let cfg = Config::load_from_str(&cfg).expect("config parses");
     cfg.validate(None).expect("config validates");
-    common::build_mock_agent(&cfg, KEY, &[var], Vec::new()).await
+    cfg
+}
+
+/// The agent under test: [`mock_config`]'s, with no tools.
+async fn mock_agent(addr: SocketAddr, var: &str, model: &str) -> RigAgent {
+    common::build_mock_agent(&mock_config(addr, var, model), KEY, &[var], Vec::new()).await
 }
 
 /// The turn a reasoning model stopped at its output ceiling leaves in history:
@@ -245,4 +253,57 @@ async fn a_chain_candidate_is_sent_a_reasoning_only_turn() {
         "{messages:#?}",
     );
     assert_eq!(messages[2]["reasoning_content"], REASONING);
+}
+
+/// A tool result goes out as the tool returned it, even when it is JSON that
+/// rig would read as structured.
+///
+/// rig 0.40 re-parses each tool result a hook leaves alone. One with a
+/// top-level `response` key went out as that value alone, re-serialized, so a
+/// stub mapping read from a file lost the `request` it matches. One carrying
+/// an image, in `parts` or as the whole object, became an image, which this
+/// arm's conversion refuses (#253).
+#[tokio::test]
+async fn a_json_tool_result_reaches_the_model_as_written() {
+    let var = "OUTRIG_TEST_OPENAI_RESULT_AS_WRITTEN";
+    for output in common::RESULTS_RIG_RESHAPES {
+        let (addr, mut requests) = start_mock_http(vec![
+            completion(
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": FIXED_TOOL, "arguments": "{}" },
+                    }],
+                }),
+                "tool_calls",
+            ),
+            text_reply("Read it."),
+        ])
+        .await;
+        let cfg = mock_config(addr, var, "gpt");
+        let tools = session_tool::erase([FixedTool { output }]);
+        let agent = common::build_mock_agent(&cfg, KEY, &[var], tools).await;
+
+        let mut history = Vec::new();
+        agent
+            .run_turn("Run the tool.", &mut history)
+            .await
+            .unwrap_or_else(|err| panic!("the turn failed on {output}: {err}"));
+
+        let recorded = drain_recorded(&mut requests);
+        assert_eq!(recorded.len(), 2, "the tool call, then its result");
+        let messages = recorded[1].messages();
+        assert_eq!(
+            recorded[1].roles(),
+            ["system", "user", "assistant", "tool"],
+            "{messages:#?}",
+        );
+        assert_eq!(
+            messages[3]["content"], output,
+            "the model reads what the tool returned, byte for byte",
+        );
+    }
 }

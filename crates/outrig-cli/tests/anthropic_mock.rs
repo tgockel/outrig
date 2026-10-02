@@ -12,6 +12,8 @@
 //!
 //! * the wire shape is Anthropic's, not an OpenAI-compatible one (path,
 //!   `x-api-key`, `anthropic-version`, `input_schema`, content blocks);
+//! * a tool result goes back as the tool returned it, byte for byte, even
+//!   when it is JSON that rig would read as structured;
 //! * which of the three `max_tokens` tiers -- config, rig's published ceiling,
 //!   OutRig's fallback -- reaches the wire for a model identifier rig
 //!   recognizes and one it does not, including the difference between
@@ -53,7 +55,9 @@ use outrig::config::Config;
 use outrig_cli::llm::{RigAgent, TurnStop};
 use outrig_cli::session_tool;
 
-use common::{CannedResponse, RecordedRequest, drain_recorded, start_mock_http};
+use common::{
+    CannedResponse, FIXED_TOOL, FixedTool, RecordedRequest, drain_recorded, start_mock_http,
+};
 
 // ---- the in-process tool --------------------------------------------------
 
@@ -399,6 +403,51 @@ async fn native_tool_use_round_trip() {
         result_block.to_string().contains("pong:ping"),
         "the tool's output should reach the model: {result_block:#?}",
     );
+}
+
+/// A tool result goes back as the tool returned it, even when it is JSON that
+/// rig would read as structured.
+///
+/// The Anthropic sibling of `openai_mock.rs`'s test of the same name. rig 0.40
+/// re-parses each tool result a hook leaves alone, before either arm converts
+/// it: a top-level `response` key went out as that value alone, and an image,
+/// in `parts` or as the whole object, as an image block -- or, for a URL, as a
+/// request this arm's conversion refuses (#253).
+#[tokio::test]
+async fn a_json_tool_result_reaches_the_model_as_written() {
+    let var = "OUTRIG_TEST_ANTHROPIC_RESULT_AS_WRITTEN";
+    for output in common::RESULTS_RIG_RESHAPES {
+        let (addr, mut requests) = start_mock_http(vec![
+            tool_use(FIXED_TOOL, json!({})),
+            text_reply("Read it."),
+        ])
+        .await;
+        let cfg = mock_config(addr, var, MODEL, Some(4096), Some(0));
+        let tools = session_tool::erase([FixedTool { output }]);
+        let agent = common::build_mock_agent(&cfg, KEY, &[var], tools).await;
+
+        let mut history = Vec::new();
+        agent
+            .run_turn("Run the tool.", &mut history)
+            .await
+            .unwrap_or_else(|err| panic!("the turn failed on {output}: {err}"));
+
+        let recorded = drain_recorded(&mut requests);
+        assert_eq!(recorded.len(), 2, "the tool call, then its result");
+        let messages = recorded[1].messages();
+        assert_eq!(
+            recorded[1].roles(),
+            ["user", "assistant", "user"],
+            "{messages:#?}",
+        );
+        let result_block = &messages[2]["content"][0];
+        assert_eq!(result_block["type"], "tool_result");
+        assert_eq!(
+            result_block["content"],
+            json!([{ "type": "text", "text": output }]),
+            "the model reads what the tool returned, byte for byte",
+        );
+    }
 }
 
 /// The per-turn tool-call cap governs this provider too. The cap lives in
@@ -868,17 +917,23 @@ async fn a_rejected_api_key_stays_fatal() {
     );
 }
 
-/// The model asking for one echo, under the id the assertions below look for.
-fn echo_tool_use() -> CannedResponse {
+/// The model asking for one call to `name`, under the id the assertions below
+/// look for.
+fn tool_use(name: &str, input: Value) -> CannedResponse {
     message(
         json!([{
             "type": "tool_use",
             "id": "toolu_mock_1",
-            "name": "outrig_test_echo",
-            "input": { "value": "ping" }
+            "name": name,
+            "input": input
         }]),
         "tool_use",
     )
+}
+
+/// The model asking for one echo.
+fn echo_tool_use() -> CannedResponse {
+    tool_use("outrig_test_echo", json!({ "value": "ping" }))
 }
 
 fn rate_limited() -> CannedResponse {
