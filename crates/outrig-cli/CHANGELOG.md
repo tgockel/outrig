@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A message sent to a busy subagent no longer fails its round.** `outrig__subagent_send` to a
+  subagent partway through a round put the message between the subagent's latest tool call and
+  that call's result, which OpenAI and Anthropic refuse. Every model call but a round's first
+  follows a tool call, so nearly every such message failed the round: the parent read
+  `round failed`, and the subagent's history lost the round's work. The message now reaches the
+  subagent appended to its next tool results, and stays there in its history.
 - **A subagent result a turn read but did not keep can be read again.** `outrig__get_result` moves
   the parent's read position past the result it returns as it runs, but the result reaches the
   conversation only when the turn keeps it. Ctrl-C while another tool call made alongside the read

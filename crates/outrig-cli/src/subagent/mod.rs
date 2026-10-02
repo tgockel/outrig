@@ -317,8 +317,8 @@ impl SubagentRegistry {
     }
 
     /// Deliver a prompt whether the subagent is idle or running: into the round
-    /// in flight while one of its model calls could still carry it, and as a
-    /// round of its own otherwise, behind any already waiting.
+    /// in flight while it could still carry it to its model, and as a round of
+    /// its own otherwise, behind any already waiting.
     /// [`SubagentShared::accept`] decides which.
     ///
     /// The run state has no say. It reads `Running` for a while after the
@@ -888,9 +888,9 @@ fn compose_preamble(parent: Option<&str>) -> String {
 /// is the same call the REPL makes for a typed line.
 ///
 /// Rounds run in the order their prompts were accepted, and a steer injected
-/// too late for any of its round's model calls takes its place in that order
-/// as a round of its own -- see [`injection`]. The loop ends only when the task
-/// is aborted, which release and shutdown both do.
+/// too late for any of its round's tool results to carry takes its place in
+/// that order as a round of its own -- see [`injection`]. The loop ends only
+/// when the task is aborted, which release and shutdown both do.
 async fn run_rounds(
     name: String,
     agent: crate::llm::RigAgent,
@@ -907,16 +907,20 @@ async fn run_rounds(
         shared.begin_round();
         log.record_prompt(&prompt).await;
 
-        // Rebuilt per model call because the patch rig applies is non-sticky.
-        // That means O(queued steers) allocations per completion call, which
-        // is fine: a parent redirecting a subagent sends a handful at most.
+        // Each steer goes out once, on a tool result rig then keeps -- see
+        // `injection`. The turn takes the delivery back if its history ends up
+        // without that result, as it does a parent's read (#251).
         let injections = {
             let shared = shared.clone();
-            Arc::new(move || {
-                shared
-                    .deliver_injections()
+            Arc::new(move |undo: &crate::llm::TurnUndo| {
+                let (steers, span) = shared.deliver_injections();
+                if !span.is_empty() {
+                    let shared = shared.clone();
+                    undo.record(move || shared.undeliver_injections(span));
+                }
+                steers
                     .iter()
-                    .map(|text| injection::steer_message(text))
+                    .map(|text| injection::steer_text(text))
                     .collect()
             }) as crate::llm::InjectionSource
         };
@@ -926,7 +930,7 @@ async fn run_rounds(
             .await;
 
         // Why the round failed, if it did. Worked out before the round stops
-        // taking steers, since it decides where the ones no call carried go.
+        // taking steers, since it decides where the ones no result carried go.
         let (reply, failure) = match outcome {
             Ok(end) => {
                 let failure = match &end.stopped {
@@ -968,13 +972,12 @@ async fn run_rounds(
         // Closed before anything below awaits, so a prompt sent from here on
         // queues as a round of its own instead of joining one that is over.
         // A failed round starts nothing on its own: the parent is told, and
-        // decides what comes next. So the steers no call carried are folded
+        // decides what comes next. So the steers no result carried are folded
         // in to reach the model with that, rather than run against the
         // endpoint that just failed.
         //
-        // Rig never persisted the steers a call did carry -- the patch it
-        // applied was per-turn and non-sticky -- so they are folded in too, or
-        // the next round would not remember being steered.
+        // The steers a result carried are in the history already, on that
+        // result: the turn took back any whose result it lost.
         let steers = shared.close_injections(failure.is_none());
         history.extend(steers.iter().map(|text| injection::steer_message(text)));
 
@@ -1626,10 +1629,11 @@ mod tests {
     /// A loopback provider that hands each model call to the test and holds it
     /// until the test answers.
     ///
-    /// A call arrives after the round's hook has already read the injection
-    /// queue for it, and the round can go no further until it is answered. That
-    /// is what lets a test put a `send` at an exact point in a round, instead of
-    /// racing one there.
+    /// A call arrives with every steer it carries already in it, and the round
+    /// can go no further until it is answered. That is what lets a test put a
+    /// `send` at an exact point in a round, instead of racing one there: a
+    /// steer sent while a call is held rides on the results of the batch that
+    /// the call's answer asks for.
     struct ScriptedProvider {
         server: MockServer,
         calls: mpsc::UnboundedReceiver<ModelCall>,
@@ -1691,12 +1695,16 @@ mod tests {
     }
 
     impl ModelCall {
+        /// The request's messages, its prompt last.
+        fn messages(&self) -> &[serde_json::Value] {
+            self.body["messages"].as_array().expect("messages")
+        }
+
         /// The text of the request's last message. On a round's first call,
         /// that is the prompt the round was started with.
         fn last_text(&self) -> &str {
-            self.body["messages"]
-                .as_array()
-                .and_then(|messages| messages.last())
+            self.messages()
+                .last()
                 .and_then(|message| message["content"].as_str())
                 .unwrap_or_default()
         }
@@ -1713,7 +1721,7 @@ mod tests {
         /// so a lookup would find an earlier call's answer for a call that has
         /// none.
         fn assert_tool_calls_answered(&self) {
-            let messages = self.body["messages"].as_array().expect("messages");
+            let messages = self.messages();
             for (index, message) in messages.iter().enumerate() {
                 let Some(calls) = message["tool_calls"].as_array() else {
                     continue;
@@ -2425,7 +2433,7 @@ mod tests {
             registry.send("open", "steer".to_string()),
             Ok("injected into the round in flight")
         );
-        assert_eq!(open.deliver_injections(), ["steer"]);
+        assert_eq!(open.deliver_injections().0, ["steer"]);
         assert!(
             futures_util::FutureExt::now_or_never(open.next_round()).is_none(),
             "an injected prompt must not start a round as well"
@@ -2491,75 +2499,118 @@ mod tests {
     /// read as a regression in the other: a steer queued while another model
     /// call is still to come goes out with that call, and does not run again as
     /// a round of its own.
+    ///
+    /// That call follows tool calls, so it is prompted with their results, and
+    /// a steer put in the history sent ahead of them separated the calls from
+    /// their results, which OpenAI and Anthropic refuse (#230). It rides on the
+    /// batch's last result instead, after everything it interrupted.
     #[tokio::test]
     async fn a_steer_between_model_calls_goes_out_with_the_next_one() {
+        let (_live, tools) = counted_tools();
         let mut provider = ScriptedProvider::start().await;
-        let (registry, _log_dir) = launch_probe(&provider, 4).await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
 
         let call = provider.next_call().await;
         steer(&registry);
-        // A tool call, so another model call follows to carry the steer.
-        call.set_result("done");
+        // Tool calls, so another model call follows to carry the steer.
+        call.call_tools(&[("counted", "{}"), ("counted", "{}")]);
 
         let call = provider.next_call().await;
-        // Only that it went out: where rig puts it in the request is #230, and
-        // fixing that must not have to rewrite this test.
+        call.assert_tool_calls_answered();
+        let messages = call.messages();
+        let [.., first, last] = messages else {
+            panic!("the request ends in the batch's results: {messages:#?}");
+        };
+        assert!(
+            first["role"] == "tool" && last["role"] == "tool",
+            "the steer adds no message of its own: {messages:#?}"
+        );
+        assert!(
+            last.to_string().contains(STEER),
+            "the steer rides on the batch's last result: {messages:#?}"
+        );
         assert_eq!(
             call.mentions(STEER),
             1,
-            "the next model call carries the steer"
+            "the next model call carries it once"
         );
         call.reply("ok");
 
         let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
         assert_eq!(call.mentions(STEER), 1, "the steer is in history once");
         call.reply("summary");
     }
 
     /// The tool-call cap ends a round at its next model call without making
-    /// it, so a steer queued during the last call that was made never reached
-    /// the model either.
+    /// it, so a steer queued during the last call that was made never reaches
+    /// the model either -- not even on a result the round left behind. Here the
+    /// batch's second call is over the cap of one, and a steer written into
+    /// the first result would sit in the history, read by nothing and never
+    /// run.
     #[tokio::test]
     async fn a_steer_cut_off_by_the_tool_call_cap_runs_as_the_next_round() {
+        let (_live, tools) = counted_tools();
         let mut provider = ScriptedProvider::start().await;
-        let (registry, _log_dir) = launch_probe(&provider, 1).await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 1, tools).await;
 
-        provider.next_call().await.set_result("partial");
         let call = provider.next_call().await;
         steer(&registry);
-        // A second tool call is over the cap of one: it is skipped, and the
-        // round stops where its next model call would have been.
-        call.set_result("more");
+        call.call_tools(&[("counted", "{}"), ("counted", "{}")]);
 
         let call = provider.next_call().await;
         assert_eq!(call.last_text(), STEER, "the steer starts the next round");
+        assert_eq!(
+            call.mentions(STEER),
+            1,
+            "and is in no result the round before left behind"
+        );
+        call.assert_tool_calls_answered();
         call.reply("ok");
     }
 
-    /// A failed round starts nothing on its own, so a steer it never sent does
-    /// not run as a round of its own against the endpoint that just failed. It
-    /// is folded in, and reaches the model with whatever the parent, told of
-    /// the failure, sends next.
-    async fn a_failed_round_folds_its_undelivered_steer(status: StatusCode) {
-        let mut provider = ScriptedProvider::start().await;
-        let (registry, _log_dir) = launch_probe(&provider, 4).await;
-
-        let call = provider.next_call().await;
-        steer(&registry);
-        call.fail(status);
-
+    /// Wait for `probe`'s round to fail, and check that its parent is told so.
+    async fn assert_round_failed(registry: &SubagentRegistry) {
         match registry.get_result("probe").await {
             Ok(Outcome::Error(message)) => {
                 assert!(message.starts_with("round failed"), "got: {message}");
             }
             other => panic!("the failed round must reach the parent, got: {other:?}"),
         }
+    }
+
+    /// A failed round starts nothing on its own, so a steer it never sent does
+    /// not run as a round of its own against the endpoint that just failed. It
+    /// is folded in, and reaches the model with whatever the parent, told of
+    /// the failure, sends next. One that went out, with the results of a batch
+    /// before the failure, stays on its result where the round keeps that, and
+    /// is folded in where it does not. Either way the next round sees it once.
+    async fn a_failed_round_passes_its_steer_on_once(status: StatusCode, delivered: bool) {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        let mut call = provider.next_call().await;
+        steer(&registry);
+        if delivered {
+            call.call_tools(&[("counted", "{}")]);
+            call = provider.next_call().await;
+            assert_eq!(call.mentions(STEER), 1, "the call that fails carries it");
+        }
+        call.fail(status);
+        assert_round_failed(&registry).await;
 
         let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions(STEER),
+            1,
+            "the steer reaches the next round once"
+        );
         assert_eq!(
             call.mentions(injection::STEER_HEADER),
             1,
-            "the steer rides along, folded in"
+            "marked as the parent's"
         );
         call.reply("ok");
     }
@@ -2568,14 +2619,29 @@ mod tests {
     /// `run_turn_captured`.
     #[tokio::test]
     async fn a_round_that_errored_folds_its_undelivered_steer() {
-        a_failed_round_folds_its_undelivered_steer(StatusCode::BAD_REQUEST).await;
+        a_failed_round_passes_its_steer_on_once(StatusCode::BAD_REQUEST, false).await;
     }
 
     /// The `EndpointFailed` arm: a 503 is transient, and with retries off it
     /// ends the turn at once.
     #[tokio::test]
     async fn a_round_whose_endpoint_failed_folds_its_undelivered_steer() {
-        a_failed_round_folds_its_undelivered_steer(StatusCode::SERVICE_UNAVAILABLE).await;
+        a_failed_round_passes_its_steer_on_once(StatusCode::SERVICE_UNAVAILABLE, false).await;
+    }
+
+    /// An error keeps nothing of the turn, the result the steer rode on
+    /// included, so the turn takes the delivery back and the steer is folded
+    /// in.
+    #[tokio::test]
+    async fn a_round_that_errored_folds_its_delivered_steer() {
+        a_failed_round_passes_its_steer_on_once(StatusCode::BAD_REQUEST, true).await;
+    }
+
+    /// A failed endpoint leaves the turn's tool call in the history (#197), and
+    /// the steer stays on the call's result.
+    #[tokio::test]
+    async fn a_round_whose_endpoint_failed_keeps_its_delivered_steer() {
+        a_failed_round_passes_its_steer_on_once(StatusCode::SERVICE_UNAVAILABLE, true).await;
     }
 
     /// A round whose endpoint fails *after* a tool call ran keeps that call.
@@ -2593,13 +2659,7 @@ mod tests {
             .next_call()
             .await
             .fail(StatusCode::SERVICE_UNAVAILABLE);
-
-        match registry.get_result("probe").await {
-            Ok(Outcome::Error(message)) => {
-                assert!(message.starts_with("round failed"), "got: {message}");
-            }
-            other => panic!("the failed round must reach the parent, got: {other:?}"),
-        }
+        assert_round_failed(&registry).await;
 
         let call = follow_up(&registry, &mut provider).await;
         call.assert_tool_calls_answered();
@@ -2608,7 +2668,7 @@ mod tests {
             1,
             "the failed round's prompt stays with its work"
         );
-        let messages = call.body["messages"].as_array().expect("messages");
+        let messages = call.messages();
         assert!(
             messages
                 .iter()

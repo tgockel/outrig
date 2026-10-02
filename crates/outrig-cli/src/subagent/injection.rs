@@ -1,31 +1,40 @@
 //! Delivering a parent's prompt into a round already in flight.
 //!
 //! `outrig__subagent_send` to a *running* subagent cannot start a new round --
-//! one is already going. Instead the prompt is queued and folded into the
-//! history of the subagent's next model call, so it reads as something the
-//! parent just said and the subagent can course-correct without finishing
-//! first.
+//! one is already going. Instead the prompt is queued as a steer and appended
+//! to the subagent's next tool results, so its model reads it as something the
+//! parent said while those calls ran, and the subagent can course-correct
+//! without finishing first.
 //!
-//! Rig supports this directly: a hook on `StepEvent::CompletionCall` returns
-//! `Flow::PatchRequest` with a replacement history. Two properties of that
-//! patch drive the design here, both because it is **per-turn and
-//! non-sticky** -- rig's docs are explicit that "the persisted transcript and
-//! the run state are untouched":
+//! A tool result is the one place it can go. A model call that follows a tool
+//! call is prompted with that call's results, and rig always sends the prompt
+//! last: a hook can patch only the history sent ahead of it, and a steer put
+//! there separates the call from its results, which OpenAI and Anthropic
+//! refuse (#230). So the hook rewrites a result to end with the steer, under
+//! [`STEER_HEADER`], and rig keeps the result as rewritten -- see
+//! [`crate::llm::InjectionSource`]. Three properties follow:
 //!
-//! - Queued steers are *read*, not drained, on every model call. Dropping one
-//!   after a single turn would make it vanish from the next call in the same
-//!   round.
-//! - The round's driver folds the steers a model call carried into the
-//!   subagent's own `Vec<Message>` when the round ends, since rig never
-//!   persisted them and the following round would otherwise not remember
-//!   being steered.
+//! - A steer goes out once. The result it rides on stays in the round's
+//!   history, so every later model call, and every later round, sees it where
+//!   the model first did. Nothing re-applies it, and the round's driver has
+//!   nothing to fold in. A turn whose history ends up without that result --
+//!   one that ends in an error keeps none of itself -- takes the delivery
+//!   back, the way it takes back a parent's read (#251), and the steer counts
+//!   as never sent.
+//! - It rides on a batch's last result, after everything it interrupted, and
+//!   only when a model call is going to read the batch. The tool-call cap and
+//!   the repeat breaker end a round at its next model call without making it,
+//!   and a steer written into a result no model call reads would sit in the
+//!   history, acted on by nothing.
+//! - A round's first model call follows no tool result. A steer accepted
+//!   before it waits for the round's first batch, as one accepted during it
+//!   does.
 //!
-//! A round can take a steer only while a model call is still to come, and
-//! which call is the last is unknown until the agent loop returns. So the
-//! round stops taking steers at that moment, under the same lock
+//! Which model call is a round's last is unknown until the agent loop returns,
+//! so the round stops taking steers at that moment, under the same lock
 //! [`SubagentShared::accept`] decides under. From then on a prompt queues as a
-//! round of its own, behind any already waiting. A steer queued during the last
-//! call reached no model:
+//! round of its own, behind any already waiting. A steer no result carried
+//! reached no model:
 //!
 //! - Unless the round failed, the steer joins that queue as a round of its own.
 //!   Nothing was queued while the round took steers, so this puts it behind
@@ -33,7 +42,7 @@
 //!   order the parent sent them. The subagent does not go idle while a round
 //!   is waiting.
 //! - A failed round starts nothing on its own: its parent is told, and decides
-//!   what comes next. The steer is folded in with the rest, to reach the model
+//!   what comes next. The steer is folded into the history, to reach the model
 //!   with that.
 //!
 //! Either way, no steer outlives its round.
@@ -42,13 +51,20 @@
 
 use rig::completion::Message;
 
-/// The line a steer opens with; see [`steer_message`].
+/// The line a steer opens with; see [`steer_text`].
 pub(crate) const STEER_HEADER: &str = "[message from the agent that launched you]";
 
 /// Marks the text as coming from the parent rather than from the subagent's
-/// own task, so a steer is not mistaken for part of the original assignment.
+/// own task or the tool result it rides on, so a steer is not mistaken for
+/// either.
+pub fn steer_text(text: &str) -> String {
+    format!("{STEER_HEADER}\n{text}")
+}
+
+/// A steer as a message of its own, which a failed round folds into the
+/// history when no tool result there carries it.
 pub fn steer_message(text: &str) -> Message {
-    Message::user(format!("{STEER_HEADER}\n{text}"))
+    Message::user(steer_text(text))
 }
 
 #[cfg(test)]

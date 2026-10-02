@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(feature = "local-llm")]
 use futures_util::StreamExt;
-use rig::agent::{AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
+use rig::agent::{AgentHook, Flow, HookContext, StepEvent, StepEventKind};
 #[cfg(feature = "local-llm")]
 use rig::agent::{MultiTurnStreamItem, StreamingError};
 use rig::completion::{CompletionModel, Message, Prompt};
@@ -1797,8 +1797,8 @@ impl RigAgent {
     }
 
     /// Run one round for a subagent: nothing reaches stdout, traces carry
-    /// `label`, and each model call picks up whatever the parent has queued
-    /// through `injections`.
+    /// `label`, and the last result of each tool batch carries whatever the
+    /// parent has queued through `injections` to the model.
     ///
     /// Subagent outcomes come from `outrig__set_result`, not from this return
     /// value -- the text is for the transcript log, and
@@ -2133,7 +2133,9 @@ impl Drop for KeepOnDrop<'_> {
 /// results together or not at all. A turn dropped while a later call in the
 /// same batch was still running (Ctrl-C), or one that ended in an error, left
 /// the result out of the history and the read position past it, so the next
-/// read of a subagent that had gone idle blocked for good (#251).
+/// read of a subagent that had gone idle blocked for good (#251). A steer that
+/// went out on a tool result is taken back the same way: see
+/// [`InjectionSource`].
 ///
 /// Reaches the tool calls through rig's per-run [`ToolCallExtensions`], which
 /// keeps this module unaware of the subagent registry, as [`InjectionSource`]
@@ -2143,7 +2145,7 @@ impl Drop for KeepOnDrop<'_> {
 /// turn's last handle drops. A drop because it is the one way out every path
 /// shares -- a turn dropped on Ctrl-C runs no other code.
 #[derive(Clone, Default)]
-pub(crate) struct TurnUndo(Arc<std::sync::Mutex<UndoLog>>);
+pub struct TurnUndo(Arc<std::sync::Mutex<UndoLog>>);
 
 #[derive(Default)]
 struct UndoLog {
@@ -2582,18 +2584,17 @@ fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Mess
     }
 }
 
-/// Supplies messages to splice into a turn's history at its next model call.
+/// Supplies the steers a parent has queued for the round in flight, each
+/// already marked as the parent's, to append to the last result of a tool
+/// batch that a model call is going to read. `crate::subagent::injection` says
+/// why a result, and why that one.
 ///
 /// A closure rather than a concrete type so this module stays unaware of the
 /// subagent registry: `subagent` hands one in that reads its queued steers.
-/// Called on *every* model call in the turn, because rig's `RequestPatch` is
-/// per-turn and non-sticky -- a steer applied once would vanish from the next
-/// call.
-///
-/// Calling it counts what it returns as delivered, so it is called only for a
-/// model call that is going to be made. Steers handed to a call that never
-/// happened would be folded into history as though the model had seen them.
-pub type InjectionSource = Arc<dyn Fn() -> Vec<Message> + Send + Sync>;
+/// What it returns counts as delivered, and it records on the turn's
+/// [`TurnUndo`] how to take that back, for a turn whose history ends up
+/// without the result.
+pub type InjectionSource = Arc<dyn Fn(&TurnUndo) -> Vec<String> + Send + Sync>;
 
 /// Consecutive identical failures before the model is told that repeating the
 /// call is pointless.
@@ -2674,7 +2675,13 @@ pub struct OutrigPromptHook {
     /// Prefixes trace lines so concurrent subagents are tellable apart. The
     /// primary agent leaves it unset and its traces keep their original shape.
     label: Option<Arc<str>>,
+    /// Present for subagents only: the parent's steers, which the last result
+    /// of each tool batch carries to the model. See [`InjectionSource`].
     injections: Option<InjectionSource>,
+    /// How many results of the running tool batch are still to come, so the
+    /// last of them can carry the parent's steers. Set from the model turn
+    /// that asks for the batch, before any of it runs.
+    batch_left: Arc<AtomicUsize>,
     /// Present for subagents only, which is what keeps the breaker off the
     /// primary agent's loop. See [`RepeatTracker`].
     repeats: Option<Arc<std::sync::Mutex<RepeatTracker>>>,
@@ -2727,6 +2734,7 @@ impl OutrigPromptHook {
             max,
             label: None,
             injections: None,
+            batch_left: Arc::default(),
             repeats: None,
             breaker_stop: Arc::default(),
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
@@ -2741,6 +2749,21 @@ impl OutrigPromptHook {
             .lock()
             .expect("stop-reason mutex poisoned")
             .clone()
+    }
+
+    /// Why the turn's next model call is not going to be made, once that is
+    /// already decided: the breaker tripped, or the tool-call cap was reached.
+    ///
+    /// A bare reason, no "ending turn": `handle_prompt_error` prints it and a
+    /// subagent's parent is shown it, so a suffix here reads twice in the log
+    /// and lands in the parent's error as trailing noise.
+    fn pending_stop(&self) -> Option<String> {
+        if let Some(reason) = self.breaker_stop.get() {
+            return Some(reason.clone());
+        }
+        self.cap_reached
+            .load(Ordering::SeqCst)
+            .then(|| format!("tool-call iteration max ({}) reached", self.max))
     }
 
     /// Record the reason and hand it to rig, so the same string reaches the
@@ -2770,9 +2793,9 @@ impl OutrigPromptHook {
         true
     }
 
-    /// The subagent form: traces carry the subagent's name, each model call
-    /// picks up whatever the parent has queued, and a tool call that keeps
-    /// failing identically stops the round.
+    /// The subagent form: traces carry the subagent's name, the last result of
+    /// each tool batch carries whatever the parent has queued, and a tool call
+    /// that keeps failing identically stops the round.
     pub fn for_subagent(max: usize, label: &str, injections: InjectionSource) -> Self {
         Self {
             label: Some(Arc::from(label)),
@@ -2788,18 +2811,36 @@ impl OutrigPromptHook {
             None => String::new(),
         }
     }
+
+    /// The parent's steers for the tool result rig is reporting: whatever is
+    /// queued, if this is its batch's last result and no stop is pending for
+    /// the model call after it, and nothing otherwise. Rig's own turn budget is
+    /// set past the cap, so no other stop comes first.
+    fn steers_for_result(&self) -> Vec<String> {
+        let Some(source) = &self.injections else {
+            return Vec::new();
+        };
+        // A batch rig never sized wraps the count, and a wrapped count reads
+        // as no batch's last until the next turn sets it.
+        let last = self.batch_left.fetch_sub(1, Ordering::SeqCst) == 1;
+        if !last || self.pending_stop().is_some() {
+            return Vec::new();
+        }
+        source(&self.undo)
+    }
 }
 
 impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
-    // The hook only acts on `CompletionCall` and `ToolCall`; narrowing
-    // `observes` keeps it off the per-token `TextDelta`/`ToolCallDelta` stream
-    // in the streaming path, where `on_event` below would just no-op anyway.
+    // Narrowing `observes` keeps the hook off the per-token `TextDelta` and
+    // `ToolCallDelta` stream in the streaming path. Rig consults it for those
+    // alone and hands every hook each other event, so `on_event` checks for
+    // itself what applies.
     fn observes(&self, kind: StepEventKind) -> bool {
         match kind {
             StepEventKind::CompletionCall | StepEventKind::ToolCall => true,
-            // Only subagents run the repeat breaker, so the primary agent stays
-            // off the per-result path entirely.
+            // Only subagents run the repeat breaker or take steers.
             StepEventKind::ToolResult => self.repeats.is_some(),
+            StepEventKind::ModelTurnFinished => self.injections.is_some(),
             _ => false,
         }
     }
@@ -2819,28 +2860,19 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                         Some(history.iter().chain([prompt]).cloned().collect());
                     self.undo.carry();
                 }
-                if let Some(reason) = self.breaker_stop.get() {
-                    return self.stop(reason.clone());
+                if let Some(reason) = self.pending_stop() {
+                    return self.stop(reason);
                 }
-                if self.cap_reached.load(Ordering::SeqCst) {
-                    // Bare reason, no "ending turn": `handle_prompt_error`
-                    // prints it and a subagent's parent is shown it, so a
-                    // suffix here reads twice in the log and lands in the
-                    // parent's error as trailing noise.
-                    return self.stop(format!("tool-call iteration max ({}) reached", self.max));
-                }
-                // Steers are re-applied on every model call, not just the one
-                // after they arrive: the patch is per-turn and non-sticky.
-                // Asked only past the stop checks above: asking counts them as
-                // delivered (see `InjectionSource`).
-                if let Some(source) = &self.injections {
-                    let steers = source();
-                    if !steers.is_empty() {
-                        let mut patched = history.to_vec();
-                        patched.extend(steers);
-                        return Flow::patch_request(RequestPatch::new().history(patched));
-                    }
-                }
+                Flow::cont()
+            }
+            StepEvent::ModelTurnFinished { content, .. } if self.injections.is_some() => {
+                // Every call the model asked for gets a result, the skipped
+                // ones included, so this counts down to the batch's last.
+                let calls = content
+                    .iter()
+                    .filter(|part| matches!(part, rig::message::AssistantContent::ToolCall(_)))
+                    .count();
+                self.batch_left.store(calls, Ordering::SeqCst);
                 Flow::cont()
             }
             StepEvent::ToolCall {
@@ -2882,21 +2914,22 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                 outcome,
                 ..
             } => {
-                let Some(repeats) = &self.repeats else {
-                    return Flow::cont();
+                let verdict = match &self.repeats {
+                    Some(repeats) => repeats
+                        .lock()
+                        .expect("repeat-tracker mutex poisoned")
+                        .observe(tool_name, args, outcome.is_error()),
+                    // Only subagents run the breaker.
+                    None => RepeatVerdict::Allow,
                 };
-                let verdict = repeats
-                    .lock()
-                    .expect("repeat-tracker mutex poisoned")
-                    .observe(tool_name, args, outcome.is_error());
-                match verdict {
-                    RepeatVerdict::Allow => Flow::cont(),
+                let note = match verdict {
+                    RepeatVerdict::Allow => None,
                     // Rewrite rather than skip: the tool already ran, and the
                     // model needs to keep seeing *why* it failed alongside the
                     // note that repeating it will not change that.
-                    RepeatVerdict::Nudge => Flow::rewrite_result(format!(
-                        "{result}\n\n[outrig] this is the same call to {tool_name} with the \
-                         same arguments as the previous one, and it failed the same way. \
+                    RepeatVerdict::Nudge => Some(format!(
+                        "[outrig] this is the same call to {tool_name} with the same \
+                         arguments as the previous one, and it failed the same way. \
                          Repeating it will not change the outcome -- change the arguments \
                          or do something else.",
                     )),
@@ -2908,17 +2941,24 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                             "{tool_name} failed {REPEAT_TERMINATE_AT} times in a row with \
                              identical arguments"
                         );
-                        let answer = format!(
-                            "{result}\n\n[outrig] {reason}, so the turn was ended here. \
-                             Repeating it will not change the outcome -- change the \
-                             arguments or do something else."
+                        let note = format!(
+                            "[outrig] {reason}, so the turn was ended here. Repeating it \
+                             will not change the outcome -- change the arguments or do \
+                             something else."
                         );
                         // Set once at most: every call after this one is
                         // skipped above, and a skip is not a failure.
                         let _ = self.breaker_stop.set(reason);
-                        Flow::rewrite_result(answer)
+                        Some(note)
                     }
+                };
+                // After the verdict, which can stop the round at its next model
+                // call and so leave this result for no model to read.
+                let notes: Vec<String> = note.into_iter().chain(self.steers_for_result()).collect();
+                if notes.is_empty() {
+                    return Flow::cont();
                 }
+                Flow::rewrite_result(format!("{result}\n\n{}", notes.join("\n\n")))
             }
             _ => Flow::cont(),
         }
@@ -3111,27 +3151,24 @@ mod tests {
         );
     }
 
-    /// The breaker is subagent-only, and `observes` is what enforces it: the
-    /// primary agent never even sees the events it keys off.
+    /// The breaker and steers are subagent-only, and a primary agent's hook
+    /// declares no interest in the events they key off.
     #[test]
-    fn only_subagent_hooks_watch_tool_results() {
-        let injections: InjectionSource = Arc::new(Vec::new);
+    fn only_subagent_hooks_watch_tool_batches() {
+        let injections: InjectionSource = Arc::new(|_: &TurnUndo| Vec::new());
         let subagent = OutrigPromptHook::for_subagent(10, "audit", injections);
         let primary = OutrigPromptHook::new(10);
 
-        assert!(
-            AgentHook::<rig::providers::openai::CompletionModel>::observes(
-                &subagent,
-                StepEventKind::ToolResult
-            )
-        );
-        assert!(
-            !AgentHook::<rig::providers::openai::CompletionModel>::observes(
-                &primary,
-                StepEventKind::ToolResult
-            ),
-            "the primary agent keeps its existing behavior"
-        );
+        for kind in [StepEventKind::ToolResult, StepEventKind::ModelTurnFinished] {
+            assert!(
+                AgentHook::<rig::providers::openai::CompletionModel>::observes(&subagent, kind),
+                "{kind:?}"
+            );
+            assert!(
+                !AgentHook::<rig::providers::openai::CompletionModel>::observes(&primary, kind),
+                "the primary agent keeps its existing behavior: {kind:?}"
+            );
+        }
     }
 
     /// A cut-short turn has to carry *why* out of the loop. Flattening both

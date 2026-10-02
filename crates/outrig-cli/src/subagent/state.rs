@@ -14,6 +14,7 @@
 //! [`crate::subagent::injection`].
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -156,14 +157,13 @@ pub struct SubagentShared {
 /// prompt runs in the order it was accepted.
 #[derive(Debug)]
 struct Prompts {
-    /// Whether a model call of the round in flight could still carry a steer.
+    /// Whether the round in flight could still carry a steer to its model.
     /// Set when a round begins, cleared the moment its agent loop returns.
     open: bool,
     /// Steers for the round in flight.
     steers: Vec<String>,
-    /// How many of `steers` the round's latest model call carried. Steers only
-    /// arrive while the round is open, so everything past this arrived after
-    /// that call was made.
+    /// How many of `steers` have gone out on a tool result the round's history
+    /// keeps. They go out in order, so the rest are still to go.
     delivered: usize,
     /// Prompts waiting for rounds of their own, in the order they were
     /// accepted.
@@ -173,7 +173,7 @@ struct Prompts {
 /// Where [`SubagentShared::accept`] put a prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accepted {
-    /// Into the round in flight, for its next model call to carry.
+    /// Into the round in flight, for a tool result to carry to its model.
     Injected,
     /// Behind every prompt accepted before it, as a round of its own.
     Queued,
@@ -318,8 +318,8 @@ impl SubagentShared {
         self.tx.borrow().version > started_at
     }
 
-    /// Take a prompt from the parent: into the round in flight while one of its
-    /// model calls could still carry it, and otherwise into the queue of rounds.
+    /// Take a prompt from the parent: into the round in flight while it could
+    /// still carry it to its model, and otherwise into the queue of rounds.
     ///
     /// A queued prompt is a round the subagent is committed to, so a subagent
     /// that went idle reads as `Running` again from this moment. Otherwise a
@@ -360,28 +360,43 @@ impl SubagentShared {
         }
     }
 
-    /// Every steer queued so far, in order, counted as delivered: the model
-    /// call about to be made carries them. See [`crate::llm::InjectionSource`]
-    /// for who may ask.
+    /// The steers queued since the last delivery, in order, counted as
+    /// delivered, and the span of the queue they take up: the tool result
+    /// about to go back to the model carries them. See
+    /// [`crate::llm::InjectionSource`] for who may ask.
     ///
-    /// Read, not drained, on each model call, because `RequestPatch` is
-    /// per-turn and non-sticky: a steer dropped after one call would vanish
-    /// from the next.
-    pub fn deliver_injections(&self) -> Vec<String> {
+    /// Each goes out once, since rig keeps the result as rewritten. A turn
+    /// whose history ends up without the result hands the span to
+    /// [`Self::undeliver_injections`].
+    pub fn deliver_injections(&self) -> (Vec<String>, Range<usize>) {
         let mut prompts = self.lock_prompts();
-        prompts.delivered = prompts.steers.len();
-        prompts.steers.clone()
+        let span = prompts.delivered..prompts.steers.len();
+        prompts.delivered = span.end;
+        (prompts.steers[span.clone()].to_vec(), span)
+    }
+
+    /// Count the steers in `span` as never sent: the history lost the tool
+    /// result that carried them.
+    ///
+    /// Only while nothing has gone out after them, which holds within a turn,
+    /// whose undos run newest first.
+    pub fn undeliver_injections(&self, span: Range<usize>) {
+        let mut prompts = self.lock_prompts();
+        if prompts.delivered == span.end {
+            prompts.delivered = span.start;
+        }
     }
 
     /// Stop taking steers, since the round's agent loop has returned and no
-    /// model call is left to carry one, and hand back the ones to fold into the
-    /// subagent's history.
+    /// tool result is left to carry one, and hand back the ones to fold into
+    /// the subagent's history.
     ///
-    /// Those are the steers a call carried. The rest reached no model:
+    /// Those that went out are in the history already, on the results that
+    /// carried them. The rest reached no model:
     /// - With `carry`, they join the queue of rounds as one prompt. That puts
     ///   them behind every prompt queued before them, since nothing was queued
     ///   while this round took steers, and ahead of any queued after.
-    /// - Without it, they are handed back with the rest.
+    /// - Without it, they are handed back.
     ///
     /// From here to the next [`Self::begin_round`], [`Self::accept`] queues
     /// every prompt as a round of its own.
@@ -389,15 +404,15 @@ impl SubagentShared {
     pub fn close_injections(&self, carry: bool) -> Vec<String> {
         let mut prompts = self.lock_prompts();
         prompts.open = false;
-        let mut steers = std::mem::take(&mut prompts.steers);
-        let undelivered = steers.split_off(prompts.delivered);
-        prompts.delivered = 0;
+        let delivered = std::mem::take(&mut prompts.delivered);
+        let undelivered = std::mem::take(&mut prompts.steers).split_off(delivered);
         if !carry {
-            steers.extend(undelivered);
-        } else if !undelivered.is_empty() {
+            return undelivered;
+        }
+        if !undelivered.is_empty() {
             prompts.rounds.push_back(undelivered.join("\n\n"));
         }
-        steers
+        Vec::new()
     }
 
     fn lock_prompts(&self) -> std::sync::MutexGuard<'_, Prompts> {
@@ -657,22 +672,27 @@ mod tests {
         futures_util::FutureExt::now_or_never(shared.next_round()).expect("a round is waiting")
     }
 
+    /// The tool result a steer rides on stays in the history, so the model
+    /// goes on seeing the steer without its going out again.
     #[test]
-    fn injections_survive_repeated_deliveries_until_closed() {
+    fn a_steer_is_delivered_once() {
         let shared = SubagentShared::new();
         shared.begin_round();
         assert_eq!(
             shared.accept("stop, wrong module".into()),
             Accepted::Injected
         );
-        assert_eq!(shared.deliver_injections().len(), 1);
-        assert_eq!(
-            shared.deliver_injections().len(),
-            1,
-            "delivering does not drain"
+        assert_eq!(shared.deliver_injections().0, ["stop, wrong module"]);
+        assert!(
+            shared.deliver_injections().0.is_empty(),
+            "a steer that went out does not go out again"
         );
-        assert_eq!(shared.close_injections(true), ["stop, wrong module"]);
-        assert!(shared.deliver_injections().is_empty());
+        shared.accept("and the tests too".into());
+        assert_eq!(shared.deliver_injections().0, ["and the tests too"]);
+        assert!(
+            shared.close_injections(true).is_empty(),
+            "the history holds both, on the results that carried them"
+        );
     }
 
     /// The window #181 was about: the run state still reads `Running` after
@@ -705,19 +725,22 @@ mod tests {
         assert_eq!(next_waiting(&shared), "a follow-up");
     }
 
-    /// A model call carries what was queued when it was made. Whatever arrived
-    /// during the last call reached no model, so it cannot be folded into
-    /// history as though it had: it runs as a round of its own.
+    /// A tool result carries what was queued when it came back. Whatever
+    /// arrived after the round's last one reached no model, so it cannot be
+    /// left in history as though it had: it runs as a round of its own.
     #[test]
-    fn a_steer_no_model_call_carried_runs_as_a_round() {
+    fn a_steer_no_tool_result_carried_runs_as_a_round() {
         let shared = SubagentShared::new();
         shared.begin_round();
         shared.accept("seen".into());
-        assert_eq!(shared.deliver_injections(), ["seen"]);
+        assert_eq!(shared.deliver_injections().0, ["seen"]);
         shared.accept("unseen".into());
         shared.accept("also unseen".into());
 
-        assert_eq!(shared.close_injections(true), ["seen"]);
+        assert!(
+            shared.close_injections(true).is_empty(),
+            "the one that went out is in the history already"
+        );
         assert_eq!(
             next_waiting(&shared),
             "unseen\n\nalso unseen",
@@ -726,19 +749,41 @@ mod tests {
     }
 
     /// A failed round starts nothing on its own, so the steers it never sent
-    /// come back to be folded in with the rest.
+    /// come back to be folded in. One that went out stays where it is, on the
+    /// tool result the round's history kept.
     #[test]
-    fn a_round_that_does_not_carry_hands_every_steer_back() {
+    fn a_failed_round_hands_back_the_steers_it_never_sent() {
         let shared = SubagentShared::new();
         shared.begin_round();
         shared.accept("seen".into());
         let _ = shared.deliver_injections();
         shared.accept("unseen".into());
 
-        assert_eq!(shared.close_injections(false), ["seen", "unseen"]);
+        assert_eq!(shared.close_injections(false), ["unseen"]);
         assert!(
             futures_util::FutureExt::now_or_never(shared.next_round()).is_none(),
             "nothing may be queued as a round"
+        );
+    }
+
+    /// A turn whose history ends up without the results its steers went out
+    /// on takes those deliveries back, newest first, so the steers count as
+    /// never sent and a failed round hands them back with the rest.
+    #[test]
+    fn a_delivery_the_history_lost_is_taken_back() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.accept("first".into());
+        let (_, first) = shared.deliver_injections();
+        shared.accept("second".into());
+        let (_, second) = shared.deliver_injections();
+        shared.accept("unsent".into());
+
+        shared.undeliver_injections(second);
+        shared.undeliver_injections(first);
+        assert_eq!(
+            shared.close_injections(false),
+            ["first", "second", "unsent"]
         );
     }
 
@@ -814,7 +859,7 @@ mod tests {
         let _ = shared.close_injections(false);
 
         shared.begin_round();
-        assert!(shared.deliver_injections().is_empty());
+        assert!(shared.deliver_injections().0.is_empty());
         assert!(shared.close_injections(true).is_empty());
     }
 

@@ -214,12 +214,12 @@ Finishing a round does not end a subagent. It goes idle with its history intact,
 `outrig__subagent_send` reopens it -- to follow up on a result, or to redirect one that is still
 working. That holds for a round its model endpoint failed, too: the parent reads `round failed`,
 but the tool calls the round had already run stay in its history, so a send picks up from them
-rather than running them again. A running subagent sees the message at its next step, so the
-parent never has to know whether it is busy. One already past its last step when the message
-arrives runs it as a round of its own instead. Rounds run in the order their messages were sent,
-and a subagent with one waiting is not idle: reading its result waits for that round rather than
-returning how the last one stopped. Idle subagents live until released or until the session
-ends.
+rather than running them again. A running subagent sees the message at its next step, appended
+to its next tool results, so the parent never has to know whether it is busy. One already past
+its last step when the message arrives runs it as a round of its own instead. Rounds run in the
+order their messages were sent, and a subagent with one waiting is not idle: reading its result
+waits for that round rather than returning how the last one stopped. Idle subagents live until
+released or until the session ends.
 
 `outrig__subagent_release` takes the whole list or none of it. If any name in the call is unknown
 -- or named twice -- nothing is released and every subagent in that call stays live, with its
