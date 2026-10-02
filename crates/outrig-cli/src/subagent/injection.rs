@@ -41,9 +41,9 @@
 //!   every prompt sent before it and ahead of every one sent after, in the
 //!   order the parent sent them. The subagent does not go idle while a round
 //!   is waiting.
-//! - A failed round starts nothing on its own: its parent is told, and decides
-//!   what comes next. The steer is folded into the history, to reach the model
-//!   with that.
+//! - A failed round starts nothing on its own: its parent reads the failure, or
+//!   the round's report if it sent nothing after that, and decides what comes
+//!   next. The steer is folded into the history, to reach the model with that.
 //!
 //! Either way, no steer outlives its round.
 //!

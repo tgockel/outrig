@@ -2162,7 +2162,9 @@ pub enum TurnStop {
     /// has nothing to splice, and only there is the prompt itself what wants
     /// resending. A subagent round publishes this as a *failed* round rather
     /// than a quiet stop: an unreachable endpoint is infrastructure for the
-    /// parent to act on, not a report the model declined to write.
+    /// parent to act on, not a report the model declined to write. A round
+    /// that reported, and that its parent sent nothing since, keeps the report
+    /// instead (#310).
     EndpointFailed(String),
 }
 
@@ -2629,8 +2631,8 @@ fn handle_prompt_error(
         } => match hook.stop_reason() {
             Some(ours) => (ours, chat_history),
             // Nothing in OutRig asked for this, so it is rig's own. Propagating
-            // keeps it an error: the round driver publishes it as a failed
-            // round, which names it as a fault rather than a tidy stop.
+            // keeps it an error: the round driver treats it as a failed round,
+            // which names it as a fault rather than a tidy stop.
             None => {
                 return Err(rig::completion::PromptError::PromptCancelled {
                     reason,

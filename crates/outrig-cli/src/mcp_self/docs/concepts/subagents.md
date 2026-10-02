@@ -110,7 +110,11 @@ explicitly also makes failure honest -- a subagent that runs out of tool calls n
 the parent is told it stopped rather than handed a status string dressed up as an answer.
 
 A subagent may call it more than once. The inbox keeps only the latest value, so a later call
-simply supersedes an earlier one, and calling it does not end the subagent's round.
+simply supersedes an earlier one, and calling it does not end the subagent's round. A failure
+later in the round does not supersede it: if a model call after the report fails for good, the
+parent still reads the report, and the failure is noted on stderr and in the subagent's transcript.
+If the parent sent a message after the report, though, the report is no answer to it, and the
+parent reads the failure instead.
 
 Both fields are required, which is deliberate. An earlier shape took `{result}` or `{error}` as
 two optional strings, and models called it as `{}` constantly -- a schema where every field is
@@ -212,14 +216,14 @@ outrig__get_result({"name": "audit-mcp"})
 
 Finishing a round does not end a subagent. It goes idle with its history intact, and
 `outrig__subagent_send` reopens it -- to follow up on a result, or to redirect one that is still
-working. That holds for a round its model endpoint failed, too: the parent reads `round failed`,
-but the tool calls the round had already run stay in its history, so a send picks up from them
-rather than running them again. A running subagent sees the message at its next step, appended
-to its next tool results, so the parent never has to know whether it is busy. One already past
-its last step when the message arrives runs it as a round of its own instead. Rounds run in the
-order their messages were sent, and a subagent with one waiting is not idle: reading its result
-waits for that round rather than returning how the last one stopped. Idle subagents live until
-released or until the session ends.
+working. That holds for a round its model endpoint failed, too: the parent reads `round failed`, or
+the round's report if it sent nothing after that, and the tool calls the round had already run stay
+in its history, so a send picks up from them rather than running them again. A running subagent sees
+the message at its next step, appended to its next tool results, so the parent never has to know
+whether it is busy. One already past its last step when the message arrives runs it as a round of
+its own instead. Rounds run in the order their messages were sent, and a subagent with one waiting
+is not idle: reading its result waits for that round rather than returning how the last one stopped.
+Idle subagents live until released or until the session ends.
 
 `outrig__subagent_release` takes the whole list or none of it. If any name in the call is unknown
 -- or named twice -- nothing is released and every subagent in that call stays live, with its

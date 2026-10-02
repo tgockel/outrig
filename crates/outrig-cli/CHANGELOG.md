@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A subagent's report outlasts a failure later in its round.** When a subagent reported with
+  `outrig__set_result` and a model call after that failed for good -- a rate limit or outage that
+  outlasted `retry-budget-secs`, every candidate in an alias chain failing, a response outrig
+  could not use, a request the endpoint refused -- `round failed: <reason>` was published over
+  the report. A parent that read once the round was over was told the round failed, and the report
+  was gone from the inbox and from the transcript's outcome; one that read sooner got the report,
+  then the failure. The report now stands, and the failure is noted beside it, on stderr and in
+  the subagent's transcript. A message the parent sent after the report is still answered with
+  the failure, since the report could not have answered it.
 - **A turn that produced only reasoning reaches the next request on an OpenAI-style provider.**
   With `style = "openai"`, a turn whose reply was nothing but reasoning, such as one cut off at
   the output-token ceiling, stayed in the conversation but was left out of every later request,

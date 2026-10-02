@@ -971,7 +971,8 @@ async fn run_rounds(
 
         // Closed before anything below awaits, so a prompt sent from here on
         // queues as a round of its own instead of joining one that is over.
-        // A failed round starts nothing on its own: the parent is told, and
+        // A failed round starts nothing on its own: the parent reads the
+        // failure, or the round's report if it sent nothing after that, and
         // decides what comes next. So the steers no result carried are folded
         // in to reach the model with that, rather than run against the
         // endpoint that just failed.
@@ -983,7 +984,20 @@ async fn run_rounds(
 
         log.record_reply(&reply).await;
         if let Some(reason) = &failure {
-            publish_round_failure(&shared, &name, reason);
+            if shared.published_this_round() && !shared.steered_since_publish() {
+                // A round that reported keeps its report. The inbox keeps only
+                // the latest, so publishing the failure would replace the
+                // report with news of a model call made after it (#310). It
+                // goes beside the report instead, ahead of the outcome block.
+                // Not when the parent steered the round after the report,
+                // though: the report cannot answer that, and a parent waiting
+                // for the answer would wait forever.
+                eprintln!("[outrig]   [{name}] round failed after reporting: {reason}");
+                log.record_outcome("round failed after reporting", reason)
+                    .await;
+            } else {
+                publish_round_failure(&shared, &name, reason);
+            }
         }
         shared.end_round();
 
@@ -2676,6 +2690,81 @@ mod tests {
             "the follow-up carries the call the failed round ran: {messages:#?}"
         );
         call.reply("ok");
+    }
+
+    /// #310: a round whose model call fails for good after the subagent
+    /// reported keeps the report. The failure was published over it, so a
+    /// parent that read once the round was over was told the round failed, and
+    /// the report was gone from the inbox and from the transcript's outcome
+    /// block. The failure is noted beside the report instead.
+    async fn a_round_that_fails_after_reporting_keeps_the_report(status: StatusCode) {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe(&provider, 4).await;
+
+        provider.next_call().await.set_result("the findings");
+        provider.next_call().await.fail(status);
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(&registry, "probe"))
+            .await
+            .expect("the round went idle");
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string())),
+            "a parent that reads once the round is over gets the report"
+        );
+
+        // The next round records its prompt before its first model call, so
+        // by now the failed round's transcript entry is written.
+        let call = follow_up(&registry, &mut provider).await;
+        let transcript = tokio::fs::read_to_string(log_dir.path().join("subagent-probe.log"))
+            .await
+            .expect("transcript exists");
+        assert!(
+            transcript.contains("\n--- round failed after reporting ---\n"),
+            "the failure is noted: {transcript}"
+        );
+        assert!(
+            transcript.contains("\n--- result ---\nthe findings\n"),
+            "and the report recorded as the round's outcome: {transcript}"
+        );
+        call.reply("ok");
+    }
+
+    /// The `Err` arm: a 400 is terminal, so the turn errors out of
+    /// `run_turn_captured`.
+    #[tokio::test]
+    async fn a_round_that_errors_after_reporting_keeps_the_report() {
+        a_round_that_fails_after_reporting_keeps_the_report(StatusCode::BAD_REQUEST).await;
+    }
+
+    /// The `EndpointFailed` arm: a 503 is transient, and with retries off it
+    /// ends the turn at once.
+    #[tokio::test]
+    async fn a_round_whose_endpoint_fails_after_reporting_keeps_the_report() {
+        a_round_that_fails_after_reporting_keeps_the_report(StatusCode::SERVICE_UNAVAILABLE).await;
+    }
+
+    /// A report is no answer to a message the parent sends after it. Here the
+    /// parent reads the report and follows up while the round's next model
+    /// call is out, and that call fails for good. Kept beside the report, as
+    /// it is when the parent sent nothing more, the failure would leave the
+    /// parent waiting on its follow-up for good: the round queued nothing, and
+    /// published nothing newer.
+    #[tokio::test]
+    async fn a_follow_up_after_the_report_is_told_the_round_failed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 4).await;
+
+        provider.next_call().await.set_result("the findings");
+        let call = provider.next_call().await;
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string()))
+        );
+        steer(&registry);
+        call.fail(StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::timeout(WAIT_TIMEOUT, assert_round_failed(&registry))
+            .await
+            .expect("the parent is told, rather than left waiting");
     }
 
     /// A and B queue while the subagent is idle. A steer sent during A's last

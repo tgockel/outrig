@@ -162,6 +162,8 @@ struct Prompts {
     open: bool,
     /// Steers for the round in flight.
     steers: Vec<String>,
+    /// The inbox version when the round in flight last took a steer.
+    steered_at: Option<u64>,
     /// How many of `steers` have gone out on a tool result the round's history
     /// keeps. They go out in order, so the rest are still to go.
     delivered: usize,
@@ -198,6 +200,7 @@ impl SubagentShared {
             prompts: Mutex::new(Prompts {
                 open: false,
                 steers: Vec::new(),
+                steered_at: None,
                 delivered: 0,
                 rounds: VecDeque::new(),
             }),
@@ -283,7 +286,10 @@ impl SubagentShared {
             .expect("round-version mutex poisoned") = version;
         self.truncated_attempts.store(0, Ordering::SeqCst);
         self.gave_up.store(false, Ordering::SeqCst);
-        self.lock_prompts().open = true;
+        let mut prompts = self.lock_prompts();
+        prompts.open = true;
+        prompts.steered_at = None;
+        drop(prompts);
         self.tx.send_modify(|snap| {
             snap.state = RunState::Running;
             snap.silent_cause = None;
@@ -318,6 +324,12 @@ impl SubagentShared {
         self.tx.borrow().version > started_at
     }
 
+    /// Whether the parent steered the round in flight after its latest
+    /// publish, which that publish therefore cannot answer.
+    pub fn steered_since_publish(&self) -> bool {
+        self.lock_prompts().steered_at == Some(self.tx.borrow().version)
+    }
+
     /// Take a prompt from the parent: into the round in flight while it could
     /// still carry it to its model, and otherwise into the queue of rounds.
     ///
@@ -329,6 +341,7 @@ impl SubagentShared {
         let mut prompts = self.lock_prompts();
         if prompts.open {
             prompts.steers.push(prompt);
+            prompts.steered_at = Some(self.tx.borrow().version);
             return Accepted::Injected;
         }
         prompts.rounds.push_back(prompt);
@@ -876,5 +889,25 @@ mod tests {
             !shared.published_this_round(),
             "an earlier round's publish is not this one's"
         );
+    }
+
+    /// A report is no answer to a steer that came after it, and a steer from
+    /// an earlier round says nothing about this one.
+    #[test]
+    fn a_steer_after_a_publish_waits_for_the_next_one() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.publish(Outcome::Result("report".into()));
+        assert!(!shared.steered_since_publish());
+        shared.accept("follow-up".into());
+        assert!(shared.steered_since_publish());
+        shared.publish(Outcome::Result("revised".into()));
+        assert!(!shared.steered_since_publish());
+
+        shared.accept("late".into());
+        let _ = shared.close_injections(true);
+        let _ = next_waiting(&shared);
+        shared.begin_round();
+        assert!(!shared.steered_since_publish(), "a new round starts clean");
     }
 }
