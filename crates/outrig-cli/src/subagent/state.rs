@@ -60,7 +60,8 @@ pub enum SilentCause {
 /// `Idle` carries whether the round that just ended published anything,
 /// because "went idle without publishing" is the error the parent needs to
 /// see, and it is *per round*: a subagent that published and then finished is
-/// idle but not failed.
+/// idle but not failed. A publish counts only when no steer came after it,
+/// since it cannot answer one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Running,
@@ -76,7 +77,8 @@ pub struct Snapshot {
     pub outcome: Option<Outcome>,
     /// Why this round looks like it will publish nothing, when that is known.
     /// Kept so a round that ends up publishing nothing can say *why* instead of
-    /// just that it stopped.
+    /// just that it stopped. A publish clears it, so a cause from before a
+    /// report cannot explain a stop after it.
     pub silent_cause: Option<SilentCause>,
 }
 
@@ -84,10 +86,11 @@ impl Snapshot {
     /// Whether a parent at `watermark` has something to collect.
     ///
     /// Two ways that happens: a newer version was published, or the subagent
-    /// stopped without publishing during its last round. The second is the
-    /// error case, and it stays true until the parent pokes the subagent back
-    /// into `Running` -- it is deliberately level-triggered, since nothing
-    /// about a stalled subagent changes just by being looked at.
+    /// stopped without publishing during its last round -- or without
+    /// publishing again after a steer. The second is the error case, and it
+    /// stays true until the parent pokes the subagent back into `Running` -- it
+    /// is deliberately level-triggered, since nothing about a stalled subagent
+    /// changes just by being looked at.
     pub fn readable(&self, watermark: u64) -> bool {
         self.version > watermark
             || (self.version == watermark && self.state == RunState::Idle { published: false })
@@ -223,6 +226,7 @@ impl SubagentShared {
         self.tx.send_modify(|snap| {
             snap.version += 1;
             snap.outcome = Some(outcome);
+            snap.silent_cause = None;
         });
     }
 
@@ -303,8 +307,11 @@ impl SubagentShared {
     /// on it this round's stop just before that round starts.
     pub fn end_round(&self) {
         // Asked outside `send_modify`, yet still this round's answer: only the
-        // round's own task publishes, and its agent loop has returned.
-        let published = self.published_this_round();
+        // round's own task publishes, its agent loop has returned, and it
+        // takes no more steers. A publish from before the round's latest
+        // steer does not count: a parent that read it and then steered would
+        // otherwise wait on the steer for good.
+        let published = self.published_this_round() && !self.steered_since_publish();
         // Checked and applied under the prompts lock, which `accept` queues
         // under, so a prompt cannot land between the two.
         let prompts = self.lock_prompts();
@@ -314,8 +321,7 @@ impl SubagentShared {
         }
     }
 
-    /// Whether the round in flight has published yet: what [`Self::end_round`]
-    /// records as `Idle { published }`, asked without going idle.
+    /// Whether the round in flight has published yet.
     pub fn published_this_round(&self) -> bool {
         let started_at = *self
             .round_start_version
@@ -909,5 +915,31 @@ mod tests {
         let _ = next_waiting(&shared);
         shared.begin_round();
         assert!(!shared.steered_since_publish(), "a new round starts clean");
+    }
+
+    /// A round that took a steer after its report, and ended without
+    /// publishing again, reads as stopped: once the parent has collected the
+    /// report, which still comes first. The stop's reason is from after the
+    /// report, not the truncation the report itself got past.
+    #[test]
+    fn a_round_steered_after_its_report_and_left_unreported_reads_as_stopped() {
+        let shared = SubagentShared::new();
+        shared.begin_round();
+        shared.note_truncated_attempt();
+        shared.publish(Outcome::Result("report".into()));
+        shared.accept("follow-up".into());
+        let _ = shared.deliver_injections();
+        let _ = shared.close_injections(true);
+        shared.end_round();
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.state, RunState::Idle { published: false });
+        assert_eq!(snapshot.read(0), Some(Outcome::Result("report".into())));
+        assert_eq!(
+            snapshot.read(1),
+            Some(Outcome::Error(
+                "subagent stopped without calling outrig__set_result".into()
+            ))
+        );
     }
 }

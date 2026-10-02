@@ -2767,6 +2767,40 @@ mod tests {
             .expect("the parent is told, rather than left waiting");
     }
 
+    /// The same follow-up in a round that goes on: the model reads it, on the
+    /// next tool result, and ends the round without reporting again. The
+    /// report from before is no answer to it, so the parent is told the
+    /// subagent stopped, as it is for a follow-up that started a round of its
+    /// own. It used to wait for good, the round having published.
+    #[tokio::test]
+    async fn a_follow_up_after_the_report_left_unreported_is_told_it_stopped() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        provider.next_call().await.set_result("the findings");
+        let call = provider.next_call().await;
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string()))
+        );
+        steer(&registry);
+        call.call_tools(&[("counted", "{}")]);
+        let call = provider.next_call().await;
+        assert_eq!(call.mentions(STEER), 1, "the model reads the follow-up");
+        call.reply("noted");
+
+        let outcome = tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe"))
+            .await
+            .expect("the parent is told, rather than left waiting");
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Error(
+                "subagent stopped without calling outrig__set_result".to_string()
+            ))
+        );
+    }
+
     /// A and B queue while the subagent is idle. A steer sent during A's last
     /// model call must not overtake B, which was sent before it, and neither
     /// may one sent during B's: every prompt runs in the order it was sent, so

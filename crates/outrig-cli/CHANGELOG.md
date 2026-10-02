@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A follow-up sent to a busy subagent after it reported gets an answer.** `outrig__subagent_send`
+  to a subagent whose round had already called `outrig__set_result` reached its model on the next
+  tool result, but the round still counted the earlier report as its answer. When the subagent
+  then ended the round without reporting again, `outrig__get_result` for a parent that had read
+  the report waited until interrupted, and `outrig__wait_results` never listed the subagent. The
+  parent now reads `subagent stopped without calling outrig__set_result`, as it does for a
+  follow-up that started a round of its own; a parent that had not read the report yet gets the
+  report first.
 - **A subagent's report outlasts a failure later in its round.** When a subagent reported with
   `outrig__set_result` and a model call after that failed for good -- a rate limit or outage that
   outlasted `retry-budget-secs`, every candidate in an alias chain failing, a response outrig
