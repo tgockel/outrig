@@ -188,11 +188,7 @@ impl CacheKey {
         }
         hasher.update(block.as_bytes());
 
-        if is_git_context(context).await? {
-            hash_git_context(context, &mut hasher).await?;
-        } else {
-            hash_tar_context(context, &mut hasher).await?;
-        }
+        hash_context(context, &mut hasher).await?;
 
         let hex = hasher.finalize().to_hex();
         Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
@@ -231,11 +227,7 @@ impl CacheKey {
         }
         hasher.update(block.as_bytes());
 
-        if is_git_context(context).await? {
-            hash_git_context(context, &mut hasher).await?;
-        } else {
-            hash_tar_context(context, &mut hasher).await?;
-        }
+        hash_context(context, &mut hasher).await?;
 
         let hex = hasher.finalize().to_hex();
         Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
@@ -1113,6 +1105,16 @@ fn buildah_build_cmd(
     cmd.arg(context)
 }
 
+/// Key the build context `ctx`: by [`hash_git_context`] in a git worktree, or
+/// as a tarball of the whole directory outside one.
+async fn hash_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    if is_git_context(ctx).await? {
+        hash_git_context(ctx, hasher).await
+    } else {
+        hash_tar_context(ctx, hasher).await
+    }
+}
+
 async fn is_git_context(ctx: &Path) -> Result<bool> {
     let output = process::try_capture(
         Cmd::new("git")
@@ -1145,6 +1147,12 @@ async fn is_worktree_root(dir: &Path) -> Result<bool> {
 /// reach, less what `.gitignore` excludes: build output (`target/`,
 /// `node_modules/`) stays out so it cannot bust the cache. The mode carries
 /// both the file type and the permission bits `COPY` preserves.
+///
+/// Where the rules exclude every file -- the context sits under an ignored
+/// directory, as `.agents/` kept out of version control would, or every file
+/// in it is ignored -- they say nothing about which are build inputs, and the
+/// whole tree counts. A file tracked although a rule matches it, force-added
+/// or committed before the rule, is excluded all the same.
 async fn hash_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
     hash_git_tree(ctx, Path::new(""), hasher).await
 }
@@ -1155,28 +1163,12 @@ async fn hash_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
 /// resolves every `COPY` source.
 async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
     let tree = ctx.join(dir);
-    // Without `--full-name`, paths come out relative to `tree`, as buildah
-    // sees them.
-    let listing = process::run_capture(Cmd::new("git").arg("-C").arg(&tree).args([
-        "ls-files",
-        "-z",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-        ".",
-    ]))
-    .await?;
-
-    // `--cached` and `--others` come out as two runs, each sorted; pin one
-    // order. An unmerged path is listed once per stage.
-    let mut paths: Vec<Vec<u8>> = listing
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect();
-    paths.sort_unstable();
-    paths.dedup();
+    // What the rules admit, tracked or not, and what is tracked although a
+    // rule matches it.
+    let (paths, excluded) = tokio::try_join!(
+        ls_files(&tree, &["--cached", "--others", "--exclude-standard"]),
+        ls_files(&tree, &["--cached", "--ignored", "--exclude-standard"]),
+    )?;
 
     // One blocking pass rather than an async round-trip per stat and read:
     // a context can be a whole checkout.
@@ -1194,6 +1186,15 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
     .await
     .expect("context hashing task panicked")?;
 
+    // Nothing left, or only what a rule excludes: the whole tree counts.
+    if entries
+        .iter()
+        .all(|(rel, ..)| excluded.binary_search(rel).is_ok())
+    {
+        hasher.update(hash_whole_tree(ctx, dir).await?.as_bytes());
+        return Ok(());
+    }
+
     for (rel, mode, entry) in entries {
         let digest = match entry {
             ContextEntry::Leaf(digest) => digest,
@@ -1210,10 +1211,7 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
                     Box::pin(hash_git_tree(ctx, &sub_dir, &mut sub)).await?;
                     sub.finalize()
                 } else {
-                    let root = ctx.to_path_buf();
-                    tokio::task::spawn_blocking(move || TreeHasher::new(&root).dir(&sub_dir))
-                        .await
-                        .expect("context hashing task panicked")?
+                    hash_whole_tree(ctx, &sub_dir).await?
                 }
             }
         };
@@ -1227,6 +1225,41 @@ async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> R
     Ok(())
 }
 
+/// What `git ls-files -z <flags> .` lists in `tree`, sorted and deduplicated.
+/// Without `--full-name`, paths come out relative to `tree`, as buildah sees
+/// them.
+async fn ls_files(tree: &Path, flags: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let listing = process::run_capture(
+        Cmd::new("git")
+            .arg("-C")
+            .arg(tree)
+            .args(["ls-files", "-z"])
+            .args(flags)
+            .arg("."),
+    )
+    .await?;
+
+    // `--cached` and `--others` come out as two runs, each sorted; pin one
+    // order. An unmerged path is listed once per stage.
+    let mut paths: Vec<Vec<u8>> = listing
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`].
+async fn hash_whole_tree(ctx: &Path, dir: &Path) -> Result<blake3::Hash> {
+    let (root, dir) = (ctx.to_path_buf(), dir.to_path_buf());
+    tokio::task::spawn_blocking(move || TreeHasher::new(&root).dir(&dir))
+        .await
+        .expect("context hashing task panicked")
+}
+
 /// What one listed path contributes to [`hash_git_context`].
 enum ContextEntry {
     /// Anything but a directory, hashed in the blocking pass.
@@ -1236,8 +1269,8 @@ enum ContextEntry {
 }
 
 /// Hashes paths under the build context directly, off git's listing: what a
-/// symlink resolves to, and a directory git lists whole with no repository of
-/// its own.
+/// symlink resolves to, a directory git lists whole with no repository of its
+/// own, and a tree git's ignore rules exclude whole.
 ///
 /// `COPY <link>` copies a link's referent, which git may never list (ignored,
 /// or under `.git`) and which may hold more links, so every link is followed

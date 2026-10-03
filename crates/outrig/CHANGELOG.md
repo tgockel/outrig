@@ -43,6 +43,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image rebuilds when a file changes in a build context git ignores.** When an ignore rule
+  excluded the context directory or one above it, as for `.agents/` kept out of version control,
+  git listed none of its files. The cache key covered only the `Dockerfile`, build args, and
+  labels, so editing a script the `Dockerfile` copies left it unchanged: `outrig build` and
+  `outrig run` reported a cache hit on an image built from the old content, and two checkouts of
+  such a context shared a tag. A file force-added there narrowed the key to the tracked files
+  instead. Wherever ignore rules match every file in a context, as they do there or as `private/*`
+  does for a context of `private`, every file now counts, tracked or not, by path, permission
+  bits, and content. Editor and build leftovers count there too, so a change to one rebuilds.
+
 - **`Config::validate` checks the primary `[workspace].host-path` on disk.** Given a repo root,
   it held every `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]` `host-path` to an existing
   directory but read nothing of `[workspace].host-path`. A typo there validated, and the session
@@ -83,9 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buildah resolves it. A tracked file deleted without `git rm`, a symlink to a directory, or a
   submodule in the context used to fail the key computation outright. The first is now hashed as
   absent, and a submodule or nested repository is hashed by the same rule in its own
-  repository. A file `.gitignore` excludes still does not count when copied by its own path.
-  Every build image whose context is in a git repo gets a new key, so each rebuilds once after
-  upgrading.
+  repository. A file `.gitignore` excludes still does not count when copied by its own path,
+  unless the context itself is ignored or every file in it is. Every build image whose context
+  is in a git repo gets a new key, so each rebuilds once after upgrading.
 
 - **`audit`/`filter` interception now covers IPv6.** The nftables redirect matched TCP of either
   family, but the interceptor listened on IPv4 only. So every IPv6 connection from the container

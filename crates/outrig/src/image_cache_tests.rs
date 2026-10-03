@@ -43,16 +43,31 @@ fn git_init(p: &Path) {
     git(p, &["commit", "-q", "-m", "init", "--allow-empty"]);
 }
 
-/// Pin that `rel` is untracked but not ignored, so a test of that case cannot
-/// quietly become a second copy of the gitignore one. `check-ignore` exits 1
-/// for "not ignored" and 128 on error, so only 1 passes.
-fn assert_not_ignored(repo: &Path, rel: &str) {
-    let status = Command::new("git")
+/// `git check-ignore -q <rel>`'s exit code in `repo`: 0 when `rel` is ignored,
+/// 1 when it is not, and 128 on an error.
+fn check_ignore(repo: &Path, rel: &str) -> Option<i32> {
+    Command::new("git")
         .current_dir(repo)
         .args(["check-ignore", "-q", rel])
         .status()
-        .expect("spawn git");
-    assert_eq!(status.code(), Some(1), "{rel} must not be gitignored");
+        .expect("spawn git")
+        .code()
+}
+
+/// Pin that `rel` is untracked but not ignored, so a test of that case cannot
+/// quietly become a second copy of the gitignore one. Only 1 passes: an error
+/// is no answer.
+fn assert_not_ignored(repo: &Path, rel: &str) {
+    assert_eq!(
+        check_ignore(repo, rel),
+        Some(1),
+        "{rel} must not be gitignored"
+    );
+}
+
+/// Pin that `rel` is gitignored, so a test of an ignored file exercises one.
+fn assert_ignored(repo: &Path, rel: &str) {
+    assert_eq!(check_ignore(repo, rel), Some(0), "{rel} must be gitignored");
 }
 
 async fn key(dockerfile: &Path, args: &BTreeMap<String, String>, ctx: &Path) -> String {
@@ -164,6 +179,118 @@ async fn gitignored_file_does_not_affect_key_when_in_git() {
     git(ctx_b.path(), &["add", "-f", "ignored.log"]);
     let kb2 = key(&ctx_b.path().join("Dockerfile"), &args, ctx_b.path()).await;
     assert_ne!(kb, kb2, "tracking a new file must change the key");
+}
+
+/// Where ignore rules exclude every file in a context -- the directory is
+/// ignored, itself or through one above it, or every file in it is -- they
+/// say nothing about which are build inputs, yet buildah is handed all of
+/// them, so all of them count. A file tracked although a rule matches it, as a
+/// force-added one is, is excluded all the same.
+#[tokio::test]
+async fn context_whose_every_file_is_ignored_keys_every_file() {
+    // Where the rule lives, the rule, the context, and whether its
+    // `Dockerfile` is force-added.
+    for (rules, rule, ctx_rel, tracked) in [
+        (".gitignore", "private/\n", "private/ctx", false),
+        (".gitignore", "private/\n", "private/ctx", true),
+        (".gitignore", "/ctx/\n", "ctx", false),
+        (".git/info/exclude", "private/\n", "private/ctx", false),
+        (".gitignore", "private/*\n", "private", false),
+        (".gitignore", "private/*\n", "private", true),
+        ("images/coding/.gitignore", "*\n", "images/coding", true),
+    ] {
+        let dockerfile_rel = format!("{ctx_rel}/Dockerfile");
+        let helper_rel = format!("{ctx_rel}/helper.sh");
+        let repo = make_ctx(&[
+            (rules, rule),
+            (&dockerfile_rel, "FROM scratch\nCOPY helper.sh /helper.sh\n"),
+            (&helper_rel, "echo v1\n"),
+        ]);
+        git_init(repo.path());
+        if tracked {
+            git(repo.path(), &["add", "-f", &dockerfile_rel]);
+            git(repo.path(), &["commit", "-q", "-m", "force-add"]);
+        }
+        assert_ignored(repo.path(), &helper_rel);
+
+        let ctx = repo.path().join(ctx_rel);
+        let dockerfile = ctx.join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, &ctx).await;
+        std::fs::write(ctx.join("helper.sh"), "echo v2\n").unwrap();
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, &ctx).await,
+            "{rule:?} in {rules}, Dockerfile tracked {tracked}: an edit in {ctx_rel} must change the key"
+        );
+    }
+}
+
+/// Image tags are host-wide, so two checkouts of an ignored context share one
+/// only while their files match.
+#[tokio::test]
+async fn ignored_contexts_share_a_key_only_while_their_files_match() {
+    let checkout = || {
+        let repo = make_ctx(&[
+            (".gitignore", "private/\n"),
+            (
+                "private/ctx/Dockerfile",
+                "FROM scratch\nCOPY helper.sh /helper.sh\n",
+            ),
+            ("private/ctx/helper.sh", "echo v1\n"),
+        ]);
+        git_init(repo.path());
+        repo
+    };
+    let (a, b) = (checkout(), checkout());
+    let (ctx_a, ctx_b) = (a.path().join("private/ctx"), b.path().join("private/ctx"));
+
+    let args = BTreeMap::new();
+    let ka = key(&ctx_a.join("Dockerfile"), &args, &ctx_a).await;
+    assert_eq!(
+        ka,
+        key(&ctx_b.join("Dockerfile"), &args, &ctx_b).await,
+        "identical ignored contexts must share a key"
+    );
+
+    std::fs::write(ctx_b.join("helper.sh"), "echo v2\n").unwrap();
+    assert_ne!(
+        ka,
+        key(&ctx_b.join("Dockerfile"), &args, &ctx_b).await,
+        "ignored contexts that differ in a file must not share a key"
+    );
+}
+
+/// Ignore rules that admit any file in a context still filter it: ones that
+/// ignore everything they do not name, and ones beside a file tracked although
+/// a rule matches it.
+#[tokio::test]
+async fn rules_admitting_any_file_still_filter_the_context() {
+    // The context's own `.gitignore`, and whether `keep.log` is force-added.
+    for (rules, tracked) in [("*\n!.gitignore\n!Dockerfile\n", false), ("*.log\n", true)] {
+        let repo = make_ctx(&[
+            ("images/coding/.gitignore", rules),
+            ("images/coding/Dockerfile", "FROM alpine\n"),
+            ("images/coding/keep.log", "kept\n"),
+        ]);
+        git_init(repo.path());
+        if tracked {
+            git(repo.path(), &["add", "-f", "images/coding/keep.log"]);
+            git(repo.path(), &["commit", "-q", "-m", "force-add"]);
+        }
+        let ctx = repo.path().join("images/coding");
+        let dockerfile = ctx.join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, &ctx).await;
+
+        std::fs::write(ctx.join("out.log"), "build output\n").unwrap();
+        assert_ignored(repo.path(), "images/coding/out.log");
+        assert_eq!(
+            before,
+            key(&dockerfile, &args, &ctx).await,
+            "{rules:?}, keep.log tracked {tracked}: a file the rules exclude must not count"
+        );
+    }
 }
 
 /// buildah is handed the whole context directory, so a file nobody has
