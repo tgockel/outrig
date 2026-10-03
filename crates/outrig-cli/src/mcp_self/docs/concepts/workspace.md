@@ -129,6 +129,13 @@ access         = "read-write"
 `host-path = "src"` mounts only the source dir. The primary workspace is always read-write and
 becomes the container workdir.
 
+outrig never picks your home directory on its own. With `host-path` undeclared, the workspace is
+the repo root -- the directory holding `.agents/outrig/`, or the current directory when no repo
+config is found -- and a session refuses to start when that is your home directory or a directory
+above it, such as `/` or `/home`. Running from `~`, an MCP client that starts outrig in `/`, or a
+stray `~/.agents/outrig/config.toml` would otherwise put `~/.ssh` in the container. To mount your
+home directory on purpose, declare it, for example `host-path = "~"`.
+
 Extra `workspace.mounts` entries are for supporting directories: sibling repos, generated docs,
 SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root
 when the repo config declares it, and beside the file that declares it otherwise -- the global

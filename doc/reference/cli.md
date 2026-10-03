@@ -254,6 +254,11 @@ resolves no model either, so it needs nothing beyond a working podman. `build` s
 a repo config and does not fall through; pass `--image outrig-default` to pre-warm the
 built-in.
 
+Whichever way the repo root is found, a workspace no config declares is never your home
+directory or a directory above it: `run` and `mcp` refuse to start, naming the directory and
+what chose it. Declare `[workspace] host-path` to mount it on purpose; see
+[Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
+
 See [Usage -> outrig run](../usage/run.md) for REPL details.
 
 ### `outrig mcp`

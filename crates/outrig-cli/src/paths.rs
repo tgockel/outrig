@@ -203,6 +203,47 @@ fn repo_root_or_cwd(cwd: &Path) -> PathBuf {
     find_repo_root_from(cwd).unwrap_or_else(|_| cwd.to_path_buf())
 }
 
+/// Refuse a workspace no config declared when it is the invoking user's home
+/// directory or a directory above it. Such a workspace is outrig's own pick --
+/// the repo root, which a run from `~`, an MCP client started in `/`, or a
+/// stray `~/.agents/outrig/config.toml` can make that directory -- and it
+/// would put `~/.ssh` and `~/.gnupg` in the sandbox. A declared
+/// `[workspace] host-path` is the user's pick, and the caller does not ask.
+pub(crate) fn refuse_home_workspace(workspace: &Path, repo_root: &Path) -> Result<()> {
+    match BaseDirs::new() {
+        Some(dirs) => refuse_home_workspace_with(workspace, dirs.home_dir(), repo_root),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_home_workspace`] against an explicit `home`. Both paths are
+/// compared canonicalized, so a symlink or a `..` cannot spell its way past;
+/// one that will not canonicalize is compared as written.
+fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -> Result<()> {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (workspace, home) = (canonical(workspace), canonical(home));
+    if !home.starts_with(&workspace) {
+        return Ok(());
+    }
+    let what = if workspace == home {
+        "your home directory".to_string()
+    } else {
+        format!("above your home directory ({})", home.display())
+    };
+    let repo_cfg = repo_config_path(repo_root);
+    let why = if repo_cfg.is_file() {
+        format!("{} makes it the repo root", repo_cfg.display())
+    } else {
+        "no repo config was found, so it is the current directory".to_string()
+    };
+    Err(OutrigError::Configuration(format!(
+        "refusing to mount {} as the workspace: it is {what}, and {why}\n\
+         help: run outrig from a project directory, or declare [workspace] host-path \
+         to mount it on purpose",
+        workspace.display()
+    )))
+}
+
 /// Build context for one of outrig's built-in images, under the user cache
 /// directory. A subdirectory per image: the content hash covers the whole
 /// context, so two built-ins sharing a directory would bust each other's tag.
@@ -470,6 +511,77 @@ mod tests {
         }
         let resolved = resolve_repo_config(Some(Path::new("ci/outrig.toml")), repo.path()).unwrap();
         assert_eq!(resolved.file, Some(repo.path().join("ci/outrig.toml")));
+    }
+
+    /// The home directory and every directory above it are refused as a
+    /// default workspace, however they are spelled; anything below or beside
+    /// it is not.
+    #[test]
+    fn home_and_its_ancestors_are_refused_as_a_default_workspace() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home/u");
+        let proj = home.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let elsewhere = tmp.path().join("srv");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let link = tmp.path().join("link-to-home");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+
+        for refused in [
+            home.clone(),
+            home.join("."),
+            proj.join(".."),
+            link,
+            tmp.path().join("home"),
+            PathBuf::from("/"),
+        ] {
+            let err = refuse_home_workspace_with(&refused, &home, &refused).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to mount"),
+                "{} must be refused: {err}",
+                refused.display(),
+            );
+        }
+        for allowed in [&proj, &elsewhere] {
+            refuse_home_workspace_with(allowed, &home, allowed)
+                .unwrap_or_else(|e| panic!("{} must be allowed: {e}", allowed.display()));
+        }
+    }
+
+    /// The refusal says which default put the workspace there: a repo config
+    /// at the root, or no repo config at all.
+    #[test]
+    fn home_refusal_names_the_default_that_chose_it() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home/u");
+        fs::create_dir_all(&home).unwrap();
+
+        let err = refuse_home_workspace_with(&home, &home, &home).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "configuration: refusing to mount {} as the workspace: it is your home \
+                 directory, and no repo config was found, so it is the current directory\n\
+                 help: run outrig from a project directory, or declare [workspace] host-path \
+                 to mount it on purpose",
+                home.display()
+            ),
+        );
+
+        let config = write_repo_config(&home);
+        let parent = tmp.path().join("home");
+        let err = refuse_home_workspace_with(&home, &home, &home).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("{} makes it the repo root", config.display())),
+            "{err}",
+        );
+        let err = refuse_home_workspace_with(&parent, &home, &parent).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("it is above your home directory ({})", home.display())),
+            "{err}",
+        );
     }
 
     #[test]

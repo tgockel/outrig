@@ -94,7 +94,9 @@ only to explicit `--image` values and to raw image refs saved in session records
 config. With no agent it resolves no model and no provider either, so a working podman is all
 it needs -- the built-in default supplies the image and two MCP servers. Pass
 `--image <local-ref>` to proxy a different image instead; its proxied MCP servers come from
-that image's `org.outrig.mcp` labels.
+that image's `org.outrig.mcp` labels. As with `outrig run`, the current directory can't be your
+home directory or one above it unless a config declares `[workspace] host-path` -- so an MCP
+client that starts outrig in `/` or `~` needs `--config` naming a repo.
 
 With `--attach`, image-config selection is different:
 

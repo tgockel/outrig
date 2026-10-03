@@ -609,6 +609,16 @@ fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
 /// reaches the network or the developer's real cache.
 #[allow(dead_code)]
 pub async fn run_outrig(cwd: &Path, args: &[&str]) -> (bool, String) {
+    run_outrig_with_env(cwd, args, &[]).await
+}
+
+/// [`run_outrig`] with extra environment variables, set last so they win.
+#[allow(dead_code)]
+pub async fn run_outrig_with_env(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> (bool, String) {
     let stubs = tempfile::tempdir().expect("tempdir stubs");
     let cache = tempfile::tempdir().expect("tempdir cache");
 
@@ -620,6 +630,7 @@ pub async fn run_outrig(cwd: &Path, args: &[&str]) -> (bool, String) {
             .env("OUTRIG_TEST_KEY", "test-key")
             .env("PATH", stub_runtime_path(stubs.path()))
             .env("XDG_CACHE_HOME", cache.path())
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .output(),
     )

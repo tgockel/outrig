@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A workspace outrig picks by default is never your home directory.** With no config declaring
+  `[workspace] host-path`, the workspace is the repo root, and nothing checked what that was.
+  `outrig run` or `outrig mcp` from `~` with no repo config, an MCP client that started outrig in
+  `/`, or a stray `~/.agents/outrig/config.toml` above the working directory mounted the home
+  directory, or one above it, read-write at `/workspace`, with `~/.ssh` and `~/.gnupg` inside.
+  Such a session now refuses to start, naming the directory and whether a repo config or the
+  current directory chose it. Declaring `host-path`, such as `"~"`, still mounts it on purpose, as
+  `--volume` does.
 - **`--config` reads the file it names.** `outrig run`, `outrig mcp`, and `outrig build` took the
   directory three levels above the path as the repo and read that repo's
   `.agents/outrig/config.toml`, never the named file. The two agree only for a path that already

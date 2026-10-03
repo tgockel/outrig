@@ -36,7 +36,9 @@ use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
-use crate::paths::{RepoConfig, default_session_root, repo_config_path};
+use crate::paths::{
+    RepoConfig, default_session_root, refuse_home_workspace, repo_config_path,
+};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
     Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
@@ -315,6 +317,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         Some(target) => Some(resolve_attach_target(target, args.image_flag, &store)?),
         None => None,
     };
+    // A workspace no config declared is outrig's pick, and outrig never picks
+    // the home directory or one above it. An attached session mounts nothing.
+    if attach.is_none() && cfg.workspace.declared_host_path().is_none() {
+        refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
+    }
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode());
     if attach.is_some() && matches!(network_mode, NetworkMode::Audit | NetworkMode::Filter) {
         return Err(OutrigError::Configuration(

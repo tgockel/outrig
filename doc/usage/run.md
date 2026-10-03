@@ -118,7 +118,9 @@ root (mounted at `/workspace`) and reads the agent, model, and provider from the
 (`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). You need not pass
 `--image`: with nothing else naming one, the session falls through to
 [the built-in default image-config](#the-built-in-default-image). If you do pass `--image`, an
-unknown ref is used as a local Podman image and is never pulled.
+unknown ref is used as a local Podman image and is never pulled. The current directory can't be
+your home directory or one above it, unless a config declares `[workspace] host-path`; see
+[Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 What the global config must still supply is a **model**. The session does not need an agent --
 without one it runs with no preamble -- but `--model` alone is not enough on its own: the name
