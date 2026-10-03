@@ -2,7 +2,9 @@
 //! `tests/` as test binaries; subdirectories with `mod.rs` are
 //! conventional shared modules (no phantom `common` test binary).
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -564,4 +566,69 @@ pub fn as_legacy_image_key(value: &mut serde_json::Value) {
 #[allow(dead_code)]
 pub fn drop_image_tag(value: &mut serde_json::Value) {
     value.as_object_mut().expect("object").remove("image_tag");
+}
+
+#[allow(dead_code)]
+const RUN_OUTRIG_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A global config that resolves a model, so a run gets past model wiring and
+/// into the image cascade. The provider is never contacted.
+#[allow(dead_code)]
+pub const GLOBAL_WITH_MODEL: &str = r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "http://127.0.0.1:1/v1"
+api-key  = "${OUTRIG_TEST_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "test-model"
+"#;
+
+/// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
+/// probes and pulls fail instantly instead of hitting the network.
+#[allow(dead_code)]
+fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
+    for name in ["podman", "buildah"] {
+        let stub = dir.join(name);
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("write runtime stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod runtime stub");
+    }
+    let mut path = std::ffi::OsString::from(dir);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+/// Run `outrig` in `cwd` and return whether it succeeded, plus its stderr.
+/// `podman` and `buildah` are stubs that fail at once (see
+/// `builtin_default.rs`), and `XDG_CACHE_HOME` is a tempdir, so nothing
+/// reaches the network or the developer's real cache.
+#[allow(dead_code)]
+pub async fn run_outrig(cwd: &Path, args: &[&str]) -> (bool, String) {
+    let stubs = tempfile::tempdir().expect("tempdir stubs");
+    let cache = tempfile::tempdir().expect("tempdir cache");
+
+    let output = tokio::time::timeout(
+        RUN_OUTRIG_TIMEOUT,
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .args(args)
+            .current_dir(cwd)
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .env("PATH", stub_runtime_path(stubs.path()))
+            .env("XDG_CACHE_HOME", cache.path())
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("outrig timed out")
+    .expect("spawn outrig");
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }

@@ -34,7 +34,8 @@ outrig run [--agent <name>]
   pick an image-config by name; if an explicit `--image` value does not match
   config, treat it as a local Podman image ref and run it without pulling.
 - `--config <path>` (default: walks up from cwd; if not found, run config-less -- see
-  [Config-less runs](#config-less-runs)): load config from a non-standard location.
+  [Config-less runs](#config-less-runs)): read the repo config from this file instead. See
+  [Reference -> CLI](../reference/cli.md#global-flags) for which repo the session runs against.
 - `--device <cpu|cuda|cuda:N|metal>` (default: mistralrs model `device`, else `cpu`):
   override the in-process mistralrs model device for this run. **Deprecated** with the
   in-process backend; see [In-process LLMs](../concepts/in-process-llm.md).

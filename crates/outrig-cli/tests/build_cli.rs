@@ -17,6 +17,7 @@ use std::time::Instant;
 use outrig::config::Config;
 use outrig::image;
 use outrig_cli::cli::build::{self, BuildArgs};
+use outrig_cli::paths::RepoConfig;
 use serde_json::Value;
 
 const ALPINE_DOCKERFILE: &str = "FROM docker.io/library/alpine:latest\n";
@@ -90,7 +91,6 @@ async fn build_default_image_then_cache_hits() {
     let tmp = tempfile::tempdir().unwrap();
     write_repo(tmp.path(), &[("coding", ALPINE_DOCKERFILE)], Some("coding"));
 
-    let repo_cfg = tmp.path().join(".agents/outrig/config.toml");
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
@@ -99,9 +99,13 @@ async fn build_default_image_then_cache_hits() {
         no_cache: false,
     };
 
-    let exit = build::execute(&repo_cfg, &global_cfg, &args)
-        .await
-        .expect("first build must succeed");
+    let exit = build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &args,
+    )
+    .await
+    .expect("first build must succeed");
     assert_eq!(exit, 0);
 
     let tag = tag_for(tmp.path(), "coding").await;
@@ -111,9 +115,13 @@ async fn build_default_image_then_cache_hits() {
     );
 
     let started = Instant::now();
-    let exit2 = build::execute(&repo_cfg, &global_cfg, &args)
-        .await
-        .expect("second call must succeed");
+    let exit2 = build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &args,
+    )
+    .await
+    .expect("second call must succeed");
     assert_eq!(exit2, 0);
     assert!(
         started.elapsed().as_millis() < 500,
@@ -143,9 +151,13 @@ async fn build_stamps_repo_mcp_labels() {
         no_cache: false,
     };
 
-    let exit = build::execute(&repo_cfg, &global_cfg, &args)
-        .await
-        .expect("build must succeed");
+    let exit = build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &args,
+    )
+    .await
+    .expect("build must succeed");
     assert_eq!(exit, 0);
 
     let tag = tag_for(tmp.path(), "coding").await;
@@ -175,7 +187,6 @@ async fn build_all_iterates_every_container() {
         None,
     );
 
-    let repo_cfg = tmp.path().join(".agents/outrig/config.toml");
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
@@ -184,9 +195,13 @@ async fn build_all_iterates_every_container() {
         no_cache: false,
     };
 
-    let exit = build::execute(&repo_cfg, &global_cfg, &args)
-        .await
-        .expect("--all must succeed");
+    let exit = build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &args,
+    )
+    .await
+    .expect("--all must succeed");
     assert_eq!(exit, 0);
 
     for name in ["coding", "planning"] {
@@ -210,7 +225,6 @@ async fn build_all_short_circuits_on_first_failure() {
     let valid = "FROM docker.io/library/alpine:latest\nRUN echo short_circuit\n";
     write_repo(tmp.path(), &[("aaa", broken), ("zzz", valid)], None);
 
-    let repo_cfg = tmp.path().join(".agents/outrig/config.toml");
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
@@ -218,7 +232,12 @@ async fn build_all_short_circuits_on_first_failure() {
         all: true,
         no_cache: false,
     };
-    let result = build::execute(&repo_cfg, &global_cfg, &args).await;
+    let result = build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &args,
+    )
+    .await;
     assert!(
         result.is_err(),
         "--all must propagate the first failure; got {result:?}"
@@ -242,7 +261,6 @@ async fn no_cache_rebuilds_after_cache_hit() {
         "FROM docker.io/library/alpine:latest\nRUN echo no_cache_rebuilds_after_cache_hit\n";
     write_repo(tmp.path(), &[("coding", dockerfile)], Some("coding"));
 
-    let repo_cfg = tmp.path().join(".agents/outrig/config.toml");
     let global_cfg = tmp.path().join("nonexistent-global.toml");
 
     let args = BuildArgs {
@@ -250,9 +268,13 @@ async fn no_cache_rebuilds_after_cache_hit() {
         all: false,
         no_cache: false,
     };
-    build::execute(&repo_cfg, &global_cfg, &args)
-        .await
-        .expect("warm-up build must succeed");
+    build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &args,
+    )
+    .await
+    .expect("warm-up build must succeed");
     let tag = tag_for(tmp.path(), "coding").await;
     let id_before = buildah_image_id(&tag).await;
     assert!(!id_before.is_empty(), "image must exist after warm-up");
@@ -262,9 +284,13 @@ async fn no_cache_rebuilds_after_cache_hit() {
         all: false,
         no_cache: true,
     };
-    build::execute(&repo_cfg, &global_cfg, &no_cache_args)
-        .await
-        .expect("--no-cache rebuild must succeed");
+    build::execute(
+        &RepoConfig::at_root(tmp.path().to_path_buf()),
+        &global_cfg,
+        &no_cache_args,
+    )
+    .await
+    .expect("--no-cache rebuild must succeed");
     let id_after = buildah_image_id(&tag).await;
     assert!(
         !id_after.is_empty(),

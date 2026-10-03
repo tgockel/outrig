@@ -43,8 +43,9 @@ outrig mcp self
   choose Podman's default networking, network audit logging, or global network filtering for
   this fresh session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
-- `--config <path>` (default: walks up from cwd; if not found, run config-less): path to repo
-  `config.toml`.
+- `--config <path>` (default: walks up from cwd; if not found, run config-less): read the repo
+  config from this file instead. See [Reference -> CLI](../reference/cli.md#global-flags) for
+  which repo the session runs against.
 - `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
 - `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
@@ -196,7 +197,8 @@ session's copy or with another attacher.
 
 Put `outrig` on `PATH`, or use an absolute path to the binary in each client config.
 MCP clients may start servers with a different working directory than your shell, so
-passing an absolute `--config` path is the least surprising setup.
+passing the absolute path of the repo's `.agents/outrig/config.toml` as `--config` is the least
+surprising setup.
 
 Claude Code can add a stdio server from the command line:
 
@@ -282,8 +284,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 ## What Happens, in Order
 
 1. **Locate config.** Walks up from the current directory until
-   `.agents/outrig/config.toml` is found, or fails. The MCP host's `cwd` therefore
-   needs to be the repo, or pass `--config <path>` explicitly.
+   `.agents/outrig/config.toml` is found, else runs config-less there. The MCP host's
+   `cwd` therefore needs to be the repo, or pass `--config <repo>/.agents/outrig/config.toml`
+   explicitly.
 2. **Resolve image.** Uses explicit `--image` first. Config entries win; an
    unknown explicit value is treated as a local Podman image ref. Without
    explicit `--image`, top-level `default-image` still names a config block.

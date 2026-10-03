@@ -36,7 +36,7 @@ use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
-use crate::paths::{default_session_root, repo_root_from_config_path};
+use crate::paths::{RepoConfig, default_session_root, repo_config_path};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
     Config, ImageConfig, McpServerSpec, MistralrsDeviceSpec, MountConfig, NetworkMode,
@@ -95,7 +95,7 @@ fn format_elapsed(duration: Duration) -> String {
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
 /// is the caller's stack frame.
 pub struct SessionSetupArgs<'a> {
-    pub repo_cfg_path: &'a Path,
+    pub repo: &'a RepoConfig,
     pub global_cfg_path: &'a Path,
     pub session_root_flag: Option<&'a Path>,
     pub image_flag: Option<&'a str>,
@@ -257,8 +257,8 @@ pub struct SessionSetup {
     pub session: Session,
     pub log_dir: PathBuf,
     pub store: SessionStore,
-    /// Directory the repo config was resolved against; mid-session sidecar
-    /// starts resolve mount paths against it.
+    /// The repo the session runs against; mid-session sidecar starts resolve
+    /// mount paths without a declaring file against it.
     pub repo_root: PathBuf,
     pub attached: bool,
     /// The session fell through to outrig's built-in default image-config.
@@ -284,20 +284,18 @@ struct AttachResolution {
 /// Run the shared bootstrap. Returns once the container is up, the runtime
 /// user is bootstrapped, and the session directory + log dir exist.
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
-    let repo_root = repo_root_from_config_path(args.repo_cfg_path);
+    let repo_root = args.repo.root.clone();
     let span = ProgressSpan::start("loading config");
     let mut cfg = if args.llm_session {
-        Config::load_for_run(
-            &repo_root,
-            Some(args.global_cfg_path),
-            args.agent_flag,
-            args.model_override,
-        )?
+        args.repo
+            .load_for_run(args.global_cfg_path, args.agent_flag, args.model_override)?
     } else {
-        Config::load(&repo_root, Some(args.global_cfg_path))?
+        args.repo.load(args.global_cfg_path)?
     };
     span.done("config loaded");
-    if !args.repo_cfg_path.exists() {
+    // No config of its own at the root means the root is the working
+    // directory by default, whether or not `--config` supplied the settings.
+    if !repo_config_path(&repo_root).exists() {
         eprintln!(
             "[outrig] no repo config found; using current directory as workspace ({})",
             repo_root.display()

@@ -1101,8 +1101,13 @@ concatenated `workspace.mounts` list can hold entries with different base direct
 | Declared in                  | Relative paths resolve against         |
 |------------------------------|----------------------------------------|
 | `.agents/outrig/config.toml` | the repo root                          |
+| `--config <path>`            | `<path>`'s parent directory            |
 | `~/.outrig/config.toml`      | that file's directory (`~/.outrig/`)   |
 | `--global-config <path>`     | `<path>`'s parent directory            |
+
+A `--config` path that ends in `.agents/outrig/config.toml` is that repo's own config and takes the
+first row; any other takes the second. See
+[Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html#global-flags).
 
 Absolute paths are used as-is and ignore the rule entirely. This applies to
 `[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, and to `host-path` in

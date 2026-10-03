@@ -372,7 +372,7 @@ pub fn resolve_session_root_for_cli(
         return Ok(p.to_path_buf());
     }
     let repo_cfg_path = match resolve_repo_config(repo_cfg_override, cwd) {
-        Ok(p) => Some(p),
+        Ok(repo) => Some(repo.config_path()),
         Err(OutrigError::NoRepoConfig) => None,
         Err(e) => return Err(e),
     };

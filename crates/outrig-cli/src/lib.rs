@@ -25,7 +25,7 @@ macro_rules! internal_modules {
 
 // Exactly the modules some integration test names.
 internal_modules! {
-    cli, config_init, error, hf, image_setup, init, llm, repl, rig_tool, session,
+    cli, config_init, error, hf, image_setup, init, llm, paths, repl, rig_tool, session,
     session_tool,
 }
 
@@ -33,7 +33,6 @@ internal_modules! {
 pub(crate) mod builtin_image;
 pub(crate) mod builtin_tool;
 pub(crate) mod mcp_self;
-pub(crate) mod paths;
 pub(crate) mod self_tool;
 pub(crate) mod subagent;
 

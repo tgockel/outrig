@@ -4522,3 +4522,165 @@ container-path = "/abs"
         );
     }
 }
+
+/// `Config::load_file*`: the repo-side config read from a file named outright,
+/// as `outrig --config <path>` names one outside `.agents/outrig/`.
+mod repo_file_load {
+    use super::*;
+
+    /// A repo whose own config declares `planted`, an image whose Dockerfile
+    /// does not exist, so the load fails if it reads that file at all; and,
+    /// in a separate tree, `ci/outrig.toml` holding `body`. Returns
+    /// `(repo_tmp, file_tmp, file_path)`.
+    fn repo_and_file(body: &str) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(
+            repo.path(),
+            "[images.planted]\ndockerfile = \"planted/Dockerfile\"\ncontext = \"planted\"\n",
+        );
+        let outside = tempdir().unwrap();
+        let ci = outside.path().join("ci");
+        fs::create_dir_all(&ci).unwrap();
+        let file = ci.join("outrig.toml");
+        fs::write(&file, body).unwrap();
+        (repo, outside, file)
+    }
+
+    /// #323: the named file is the one read, and the relative paths it
+    /// declares resolve beside it, as a `--global-config` file's do.
+    #[test]
+    fn reads_the_named_file_and_resolves_its_paths_beside_it() {
+        let (repo, outside, file) =
+            repo_and_file("[images.named]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n");
+        let ci = outside.path().join("ci");
+        fs::write(ci.join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let cfg = Config::load_file(&file, repo.path(), None).expect("the named file loads");
+
+        assert_eq!(cfg.images.keys().collect::<Vec<_>>(), ["named"]);
+        let image = &cfg.images["named"];
+        let src = image
+            .config_source()
+            .expect("a loaded entry carries its source");
+        assert_eq!(src, &ConfigSource::RepoFile { path: file.clone() });
+        assert_eq!(src.base_dir(), ci);
+        assert_eq!(src.config_path(), file);
+        assert_eq!(
+            image.resolved_build_paths(repo.path()),
+            (ci.join("Dockerfile"), ci.join(".")),
+        );
+    }
+
+    /// The file's own `host-path`s resolve beside it; the default workspace,
+    /// which no file declared, is still the repo root.
+    #[test]
+    fn workspace_paths_resolve_beside_the_file_and_default_to_the_root() {
+        let (repo, outside, file) = repo_and_file(
+            "[workspace]\nhost-path = \"ws\"\n\n\
+             [[workspace.mounts]]\nhost-path = \"shared\"\ncontainer-path = \"/shared\"\n",
+        );
+        let ci = outside.path().join("ci");
+        fs::create_dir_all(ci.join("ws")).unwrap();
+        fs::create_dir_all(ci.join("shared")).unwrap();
+
+        let cfg = Config::load_file(&file, repo.path(), None).expect("config loads");
+        assert_eq!(cfg.workspace.resolved_host_path(repo.path()), ci.join("ws"));
+        assert_eq!(
+            cfg.workspace.mounts[0].resolved_host_path(repo.path()),
+            ci.join("shared"),
+        );
+
+        fs::write(&file, "").unwrap();
+        let cfg = Config::load_file(&file, repo.path(), None).expect("empty config loads");
+        assert_eq!(cfg.workspace.resolved_host_path(repo.path()), repo.path());
+    }
+
+    /// A failure in the file names the file, not a repo config it never read.
+    #[test]
+    fn a_missing_dockerfile_names_the_file() {
+        let (repo, _outside, file) =
+            repo_and_file("[images.named]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n");
+
+        let err =
+            expect_load_validation_err(Config::load_file(&file, repo.path(), None).unwrap_err());
+        match err {
+            ConfigValidationError::DockerfileMissing {
+                image, declared_in, ..
+            } => {
+                assert_eq!(image, "named");
+                assert_eq!(declared_in, Some(file));
+            }
+            other => panic!("expected DockerfileMissing, got: {other:?}"),
+        }
+    }
+
+    /// Unlike `Config::load`'s missing repo config, a missing named file is
+    /// an error, even with a repo config under the root to fall back on.
+    #[test]
+    fn a_missing_file_is_an_error_naming_it() {
+        let (repo, outside, _file) = repo_and_file("");
+        let missing = outside.path().join("ci/outrig-typo.toml");
+
+        let err = Config::load_file(&missing, repo.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "read", path, .. } if *path == missing),
+            "expected a read error naming the file, got: {err:?}",
+        );
+    }
+
+    /// The file is the repo side of the merge, so the repo-only rules hold.
+    #[test]
+    fn the_file_is_held_to_the_repo_rules() {
+        let (repo, _outside, file) =
+            repo_and_file("[network]\nmode = \"filter\"\nallow = [\"github.com:443\"]\n");
+
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[network].allow belongs in global config"),
+            "got: {err:?}",
+        );
+    }
+
+    /// Each variant reads the named file and validates as its root-taking
+    /// twin does: a model-less agent fails the full load, passes `run` given
+    /// `--model`, and is not looked at by `build`.
+    #[test]
+    fn each_variant_reads_the_file_with_its_own_validation() {
+        let (repo, _outside, file) = repo_and_file(
+            r#"
+default-agent = "coding"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+preamble = "hi"
+"#,
+        );
+
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::AgentMissingModel { ref agent } if agent == "coding"
+            ),
+            "the full load holds the agent to a model",
+        );
+        let cfg = Config::load_file_for_run(&file, repo.path(), None, None, Some("fast"))
+            .expect("run --model supplies the selected agent's model");
+        assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
+        let cfg = Config::load_file_for_build(&file, repo.path(), None)
+            .expect("build skips agent cross-references");
+        assert!(
+            cfg.images.is_empty(),
+            "the planted repo config stays unread"
+        );
+    }
+}

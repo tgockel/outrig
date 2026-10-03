@@ -20,10 +20,21 @@ These are accepted by every subcommand.
 | `-v`, `--verbose`        | Print buildah/podman transcripts; repeat for trace logs.    |
 | `--help`                 | Print subcommand help.                                      |
 
-`--config` resolves in this order: this flag (used verbatim -- no walk-up, no existence check),
-then a walk up from cwd looking for `.agents/outrig/config.toml`. The walk stops at the
-filesystem root; a `.agents/` directory without an `outrig/config.toml` inside does not
-terminate the walk -- outrig keeps looking in parents.
+`--config` resolves in this order: this flag, then a walk up from cwd looking for
+`.agents/outrig/config.toml`. The walk stops at the filesystem root; a `.agents/` directory
+without an `outrig/config.toml` inside does not terminate the walk -- outrig keeps looking in
+parents.
+
+The flag names a file, and that file has to exist: a path that is not one is an error, not a
+config-less run. Which repo the command then runs against depends on where the file is:
+
+- `<repo>/.agents/outrig/config.toml` is that repo's own config, and the flag means what running
+  from `<repo>` means. This is the way to point an MCP client, which may start outrig in any
+  directory, at a repo.
+- Any other file is read in place of the repo's config, for the repo found from cwd as if there
+  were no flag: the walk above, else cwd itself. Relative paths in the file resolve beside it,
+  as a `--global-config` file's do (see [path resolution](config.md#path-resolution)). Where the
+  file sits never decides which directory is mounted as the workspace.
 
 `--global-config` resolves in this order: this flag, then `<XDG_CONFIG_HOME>/outrig/config.toml`
 when `XDG_CONFIG_HOME` is set, then `~/.outrig/config.toml` (the outrig-specific fallback --

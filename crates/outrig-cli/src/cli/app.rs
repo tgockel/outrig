@@ -13,7 +13,9 @@ use crate::cli::mcp::{self, McpArgs};
 use crate::cli::mcp_self as mcp_self_cli;
 use crate::cli::run::{self, RunArgs};
 use crate::error::Result;
-use crate::paths::{global_config_path, resolve_repo_config, resolve_repo_config_optional};
+use crate::paths::{
+    RepoConfig, global_config_path, resolve_repo_config, resolve_repo_config_optional,
+};
 use crate::{config_init, image_setup, init};
 
 #[derive(Debug, Parser)]
@@ -336,12 +338,12 @@ fn session_cmd_ctx(cli: &Cli) -> Result<(PathBuf, PathBuf, tokio::runtime::Runti
 fn repo_cmd_ctx(
     cli: &Cli,
     require_config: bool,
-) -> Result<(PathBuf, PathBuf, tokio::runtime::Runtime)> {
+) -> Result<(RepoConfig, PathBuf, tokio::runtime::Runtime)> {
     let cwd = crate::paths::current_dir()?;
     let repo_config = if require_config {
         resolve_repo_config(cli.config.as_deref(), &cwd)?
     } else {
-        resolve_repo_config_optional(cli.config.as_deref(), &cwd)
+        resolve_repo_config_optional(cli.config.as_deref(), &cwd)?
     };
     let global_config = global_config_path(cli.global_config.as_deref());
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -26,7 +26,8 @@ outrig build [--image <name>]
 - `--all` (default: off): build every image-config defined in the config file. The built-in
   default is deliberately not among them -- `--all` means the image-configs *you* declared,
   and pulling and building outrig's fallback in every repo would be a surprise.
-- `--config <path>` (default: walks up from cwd): use a non-default config path.
+- `--config <path>` (default: walks up from cwd): read the repo config from this file instead.
+  See [Reference -> CLI](../reference/cli.md#global-flags) for how its paths resolve.
 - `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
   to `buildah`.
 

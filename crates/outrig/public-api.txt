@@ -33,6 +33,8 @@ pub outrig::config::ConfigSource::Project
 pub outrig::config::ConfigSource::Project::dir: std::path::PathBuf
 pub outrig::config::ConfigSource::Repo
 pub outrig::config::ConfigSource::Repo::root: std::path::PathBuf
+pub outrig::config::ConfigSource::RepoFile
+pub outrig::config::ConfigSource::RepoFile::path: std::path::PathBuf
 impl outrig::config::ConfigSource
 pub fn outrig::config::ConfigSource::base_dir(&self) -> &std::path::Path
 pub fn outrig::config::ConfigSource::config_path(&self) -> std::path::PathBuf
@@ -468,6 +470,9 @@ pub outrig::config::Config::tool_result_max: core::option::Option<u32>
 pub outrig::config::Config::workspace: outrig::config::Workspace
 impl outrig::config::Config
 pub fn outrig::config::Config::load(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file_for_build(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file_for_run(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>

@@ -29,7 +29,7 @@ use crate::cli::session_setup::{
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
-use crate::paths::model_cache_root;
+use crate::paths::{RepoConfig, model_cache_root};
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
@@ -100,7 +100,7 @@ pub struct RunArgs {
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
 pub async fn execute(
-    repo_cfg_path: &Path,
+    repo: &RepoConfig,
     global_cfg_path: &Path,
     session_root_flag: Option<&Path>,
     args: &RunArgs,
@@ -110,7 +110,7 @@ pub async fn execute(
         CliEnvEntries::parse(&args.env).map_err(|e| OutrigError::Configuration(e.to_string()))?;
 
     let setup = session_setup::setup(SessionSetupArgs {
-        repo_cfg_path,
+        repo,
         global_cfg_path,
         session_root_flag,
         image_flag: args.image.as_deref(),

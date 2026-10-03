@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--config` reads the file it names.** `outrig run`, `outrig mcp`, and `outrig build` took the
+  directory three levels above the path as the repo and read that repo's
+  `.agents/outrig/config.toml`, never the named file. The two agree only for a path that already
+  ends that way. Any other was ignored without a word: the command ran on whatever config sat
+  three levels up, or none, and for `run` and `mcp` that directory -- for an absolute path, an
+  ancestor such as your home directory -- was mounted read-write as the workspace. The named file
+  is now the one read. One at `<repo>/.agents/outrig/config.toml` still means that repo; any other
+  is read for the repo found from the current directory, as without the flag, and its relative
+  paths resolve beside it, as a `--global-config` file's do. A `--config` that is not an existing
+  file is now an error wherever the flag is read, where `run` and `mcp` started config-less and
+  `ls`, `logs`, `discard`, and `clean` went on without it.
 - **A tool result that is JSON reaches the model as the tool returned it.** rig, which runs the
   agent loop, read every tool result for structure. One that was a JSON object with a top-level
   `response` key reached the model as that value alone, with nothing to say the rest was missing:

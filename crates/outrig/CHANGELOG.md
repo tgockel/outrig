@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Config::load_file`, `load_file_for_run`, and `load_file_for_build` read the repo config from
+  a file the caller names.** They mirror `load`, `load_for_run`, and `load_for_build`, which read
+  it from `<repo_root>/.agents/outrig/config.toml`, and still take that root: the default
+  `[workspace].host-path` and `model-path` resolve against it. Relative paths the file declares
+  resolve beside it, as the global config's do, and its entries record it as a new
+  `ConfigSource::RepoFile { path }`, so a diagnostic names the file that was read. A missing file
+  is an error, not an empty config. `outrig --config` uses them for a file outside
+  `.agents/outrig/`.
+
 - **`config::check_build_image_name(name)`** checks a name against the rule `Config::validate`
   holds a build image's `[images.<name>]` key to, so a tool that writes such a block can check
   the name before it does. It returns a `BuildImageNameError`, a non-exhaustive enum saying what
