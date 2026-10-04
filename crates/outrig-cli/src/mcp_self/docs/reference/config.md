@@ -131,7 +131,8 @@ Accepted modes:
 - `audit`: allow all outbound session-container traffic, but write Zeek `conn.log`-style
   records to `<session_dir>/logs/network.jsonl`.
 - `filter`: install the same interceptor as audit mode, write the same audit log, and enforce
-  global allow/deny policy before opening upstream TCP connections.
+  global allow/deny policy before opening upstream TCP connections. Traffic the interceptor
+  cannot carry -- UDP to any port but 53, ICMP, anything else -- follows `default` directly.
 
 Audit and filter mode require host `nft` and `nsenter` plus permission to enter the rootless podman
 container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
@@ -174,6 +175,15 @@ Filter evaluation checks `deny` entries first, then `allow` entries, then `defau
 connections are closed immediately and still write an audit record with
 `outrig.action = "deny"`, `outrig.rule`, and zero byte counts. `mode = "filter"` requires at
 least one `allow` or `deny` entry, even when `default = "allow"`.
+
+`allow` and `deny` entries match TCP connections, which the interceptor carries and can name a
+host for. Anything else the container sends -- UDP to any port but 53, which is how QUIC and so
+HTTP/3 travel, ICMP, any other transport -- matches no entry and takes `default` directly. Under
+`default = "deny"` the kernel drops it, by a rule in the same nftables table: the sending tool
+fails at once with "Operation not permitted" rather than reaching the network. Such a datagram
+never reaches the interceptor, so it writes no `network.jsonl` record. Under `default = "allow"`,
+and in audit mode, it leaves by podman's default route, unrecorded. DNS over UDP/53 and traffic
+between processes in the container over loopback are carried either way.
 
 ### What a hostname rule matches
 

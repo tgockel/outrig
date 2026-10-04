@@ -62,6 +62,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`filter` mode with `default = "deny"` now stops what the interceptor cannot carry.** The
+  nftables table interception installs held one nat chain, which can only rewrite: TCP was
+  redirected to the proxy and UDP/53 to the DNS listener, and every other datagram the container
+  sent -- UDP to any port but 53, which is how QUIC and so HTTP/3 travel, ICMP, anything else --
+  left by podman's default route. It met no policy and wrote no `network.jsonl` record, so under
+  a deny default one flag, `curl --http3-only`, reached any host unrecorded. Such a datagram
+  matches no `allow` or `deny` entry, and `default` is what unmatched traffic gets: a second
+  chain in the same table now gives it exactly that. Under `default = "deny"` the chain drops
+  it, so the sending tool fails at once with `EPERM` rather than reaching the network; under an
+  allow default -- audit mode included -- the chain accepts, and nothing changes. The chain
+  accepts loopback, which is where the redirects send what they carry, and the established
+  direction, which is the interceptor's own replies, and the one teardown still removes both
+  chains. A dropped datagram still writes no record, since it never reaches the interceptor;
+  recording them is #419.
+
 - **A `${VAR}` build-arg or MCP `env` value stays out of outrig's output and off podman's and
   buildah's command lines.** Each was resolved to its host value before the `buildah build
   --build-arg`, `podman create --env`, or `podman exec --env` argv was built, and every

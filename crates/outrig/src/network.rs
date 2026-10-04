@@ -557,7 +557,15 @@ impl NetworkInterceptor {
         // Before the first mutation, so a namespace that cannot be identified
         // is a refusal to start rather than an undo that cannot be trusted.
         let mut rollback = Rollback::new(pid)?;
-        if let Err(e) = install_interception(&run, &mut rollback, &target, tcp_port, dns_port).await
+        if let Err(e) = install_interception(
+            &run,
+            &mut rollback,
+            &target,
+            tcp_port,
+            dns_port,
+            self.policy.default,
+        )
+        .await
         {
             let residue = rollback.undo_now(&run).await;
             if residue.is_empty() {
@@ -1120,9 +1128,10 @@ async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
 
 /// The container-mutating half of [`NetworkInterceptor::attach`]: snapshot the
 /// resolver and point it at the DNS listener, then install the redirect
-/// table. Split from the socket and task plumbing, and parameterized over how
-/// a command runs, so the ordering and the rollback are exercisable without a
-/// container.
+/// table, whose `egress` chain gives traffic the redirects do not carry the
+/// policy's `default`. Split from the socket and task plumbing, and
+/// parameterized over how a command runs, so the ordering and the rollback
+/// are exercisable without a container.
 ///
 /// All-or-nothing rests on `rollback` belonging to the caller: a failure
 /// returns with the undos armed, and a caller who drops this future
@@ -1133,6 +1142,7 @@ async fn install_interception<F, Fut>(
     target: &Target,
     tcp_port: u16,
     dns_port: u16,
+    policy_default: NetworkAction,
 ) -> Result<()>
 where
     F: Fn(Cmd) -> Fut,
@@ -1149,7 +1159,7 @@ where
     }
 
     let mut rules = tempfile::NamedTempFile::new()?;
-    rules.write_all(nft_rules(&target.table, tcp_port, dns_port).as_bytes())?;
+    rules.write_all(nft_rules(&target.table, tcp_port, dns_port, policy_default).as_bytes())?;
     rules.as_file_mut().sync_all()?;
     // Safe to arm before the apply because the name belongs to this attach
     // alone -- see `nft_table_name`. `create table` is belt to that brace: it
@@ -3234,7 +3244,43 @@ fn nft_table_name(session_id: &str) -> String {
 ///
 /// The redirects match IPv4 and IPv6 alike, which is why the sockets they
 /// point at take both; see [`bind_any`].
-fn nft_rules(table: &str, tcp_port: u16, dns_port: u16) -> String {
+///
+/// A nat chain can only rewrite, and the two redirects carry TCP and UDP/53.
+/// Everything else the container emits -- UDP to any other port, which is
+/// how QUIC and so HTTP/3 travel, ICMP, SCTP -- would leave by podman's
+/// default route, reaching neither the proxy that applies policy nor the
+/// audit log. The `egress` chain gives that traffic the policy's `default`:
+/// it matches no `allow` or `deny` entry, which the proxy evaluates, and
+/// `default` is what unmatched traffic gets. The chain's policy is `drop`
+/// under a deny default and `accept` under an allow one -- audit mode, or
+/// `default = "allow"` with a deny list -- where it changes nothing, and the
+/// script keeps one shape for both.
+///
+/// What the chain accepts is what stays in the namespace. It hooks `output`
+/// at `filter` priority, after the nat chain at `dstnat` has rewritten a
+/// redirected packet's destination to loopback, so matching the loopback
+/// destination covers every packet the redirects carry as well as the
+/// container's own loopback traffic, mirroring the two `return`s above. Not
+/// `oif lo`: the output interface a rule sees is the one routing chose before
+/// the hook ran, and the re-route the redirect forces does not refresh it, so
+/// every packet of a redirected flow still names the external interface. The
+/// interceptor's replies -- the proxy's and the DNS listener's, sent to the
+/// container's own address -- are the reply direction of a tracked flow, which
+/// `ct state established` is. `ct status dnat` would name exactly the
+/// redirected flows instead; `established,related` is the conventional idiom
+/// and also covers a reply to anything forwarded into the container, should
+/// there ever be such a thing. A dropped datagram never confirms its conntrack
+/// entry, so nothing becomes `established` from the outside without the
+/// container first being sent a packet. The sender of a dropped datagram gets
+/// `EPERM` from `sendto` rather than a timeout. The container's own ICMPv6
+/// neighbor discovery is dropped too, which costs nothing here: a redirected
+/// flow needs no neighbor, DAD completes on its timer, and upstream
+/// connections are made from the host's namespace.
+fn nft_rules(table: &str, tcp_port: u16, dns_port: u16, policy_default: NetworkAction) -> String {
+    let verdict = match policy_default {
+        NetworkAction::Allow => "accept",
+        NetworkAction::Deny => "drop",
+    };
     format!(
         "\
 create table inet {table}
@@ -3243,6 +3289,10 @@ add rule inet {table} output ip daddr 127.0.0.0/8 return
 add rule inet {table} output ip6 daddr ::1 return
 add rule inet {table} output meta l4proto tcp redirect to :{tcp_port}
 add rule inet {table} output udp dport 53 redirect to :{dns_port}
+add chain inet {table} egress {{ type filter hook output priority filter; policy {verdict}; }}
+add rule inet {table} egress ip daddr 127.0.0.0/8 accept
+add rule inet {table} egress ip6 daddr ::1 accept
+add rule inet {table} egress ct state established,related accept
 "
     )
 }
@@ -3956,6 +4006,16 @@ mod tests {
         snapshot
     }
 
+    /// `install_interception` with the ports and policy default that none of
+    /// the ordering and rollback tests here depend on.
+    async fn install<F, Fut>(run: &F, rollback: &mut Rollback, target: &Target) -> Result<()>
+    where
+        F: Fn(Cmd) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>>>,
+    {
+        install_interception(run, rollback, target, 4001, 4002, NetworkAction::Allow).await
+    }
+
     /// A target whose pid is this test process: `Rollback` asks whether the
     /// container is still alive before undoing anything, and this one is.
     fn target() -> Target {
@@ -4093,7 +4153,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
         let failures = rollback.undo_now(&run).await;
@@ -4860,7 +4920,7 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
         assert_eq!(rollback.armed().len(), 2);
@@ -4898,7 +4958,7 @@ mod tests {
         let installing = FakeRunner::default();
         let run = |cmd: Cmd| installing.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
 
@@ -4930,7 +4990,7 @@ mod tests {
         let installing = FakeRunner::default();
         let run = |cmd: Cmd| installing.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
 
@@ -4963,7 +5023,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let cause = install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        let cause = install(&run, &mut rollback, &target())
             .await
             .expect_err("the apply was injected to fail");
 
@@ -5383,7 +5443,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let installed = install_interception(&run, &mut rollback, &target(), 4001, 4002).await;
+        let installed = install(&run, &mut rollback, &target()).await;
         assert!(installed.is_err(), "the nft apply was injected to fail");
         rollback.undo_now(&run).await;
 
@@ -5409,13 +5469,7 @@ mod tests {
         let target = target();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         {
-            let mut installing = Box::pin(install_interception(
-                &run,
-                &mut rollback,
-                &target,
-                4001,
-                4002,
-            ));
+            let mut installing = Box::pin(install(&run, &mut rollback, &target));
             assert!(
                 futures_util::poll!(&mut installing).is_pending(),
                 "the injected install never completes"
@@ -5440,13 +5494,7 @@ mod tests {
         let target = target();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         {
-            let mut installing = Box::pin(install_interception(
-                &run,
-                &mut rollback,
-                &target,
-                4001,
-                4002,
-            ));
+            let mut installing = Box::pin(install(&run, &mut rollback, &target));
             assert!(
                 futures_util::poll!(&mut installing).is_pending(),
                 "the injected nft apply never completes"
@@ -5474,7 +5522,7 @@ mod tests {
             ..target()
         };
 
-        install_interception(&run, &mut rollback, &target, 4001, 4002)
+        install(&run, &mut rollback, &target)
             .await
             .expect("install interception");
 
@@ -5493,7 +5541,7 @@ mod tests {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
 
@@ -5547,7 +5595,7 @@ mod tests {
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         let target = target();
         {
-            let installing = install_interception(&run, &mut rollback, &target, 4001, 4002);
+            let installing = install(&run, &mut rollback, &target);
             let cancelled = tokio::time::timeout(Duration::from_millis(50), installing).await;
             assert!(cancelled.is_err(), "the apply was injected to hang");
         }
@@ -5592,7 +5640,7 @@ mod tests {
             let mut rollback =
                 Rollback::new(std::process::id()).expect("this process has a namespace");
 
-            let failed = install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            let failed = install(&run, &mut rollback, &target())
                 .await
                 .expect_err("a table nothing can name exactly fails the attach");
             assert!(
@@ -6705,9 +6753,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
-        let rules = nft_rules("outrig_test", 44123, 44124);
+    /// The script's shape: `create table` first, then nothing but flat
+    /// `add chain` / `add rule` commands.
+    fn assert_flat_nft_script(rules: &str) {
         let lines: Vec<&str> = rules.lines().collect();
         assert_eq!(
             lines.first().copied(),
@@ -6725,12 +6773,48 @@ mod tests {
              Asserting only that the text contains each rule cannot tell the \
              two apart, which is why it did not: {rules}"
         );
+    }
+
+    #[test]
+    fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
+        let rules = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
+        assert_flat_nft_script(&rules);
         assert!(rules.contains("add rule inet outrig_test output ip daddr 127.0.0.0/8 return"));
         assert!(rules.contains("add rule inet outrig_test output ip6 daddr ::1 return"));
         assert!(
             rules.contains("add rule inet outrig_test output meta l4proto tcp redirect to :44123")
         );
         assert!(rules.contains("add rule inet outrig_test output udp dport 53 redirect to :44124"));
+    }
+
+    /// The `egress` chain's policy is the policy's `default`, and that is the
+    /// only thing the default changes about the script. See `nft_rules` for
+    /// why its three accepts are exactly what the redirects carry.
+    #[test]
+    fn nft_rules_give_what_the_redirects_do_not_carry_the_policy_default() {
+        let chain = |verdict: &str| {
+            format!(
+                "add chain inet outrig_test egress \
+                 {{ type filter hook output priority filter; policy {verdict}; }}\n"
+            )
+        };
+        let allow = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
+        let deny = nft_rules("outrig_test", 44123, 44124, NetworkAction::Deny);
+        assert_flat_nft_script(&deny);
+        assert!(allow.contains(&chain("accept")), "{allow}");
+        assert!(deny.contains(&chain("drop")), "{deny}");
+        assert_eq!(
+            allow.replacen(&chain("accept"), &chain("drop"), 1),
+            deny,
+            "the verdict is the whole difference"
+        );
+        for rule in [
+            "add rule inet outrig_test egress ip daddr 127.0.0.0/8 accept",
+            "add rule inet outrig_test egress ip6 daddr ::1 accept",
+            "add rule inet outrig_test egress ct state established,related accept",
+        ] {
+            assert!(deny.contains(rule), "{deny}");
+        }
     }
 
     #[test]

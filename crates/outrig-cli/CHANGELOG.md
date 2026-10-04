@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--network filter` with `default = "deny"` let any UDP tool through.** The interceptor's
+  redirects carry TCP and DNS; a datagram of any other kind -- QUIC and so HTTP/3, ICMP, anything
+  else -- left by podman's default route, unfiltered and unrecorded. It is now dropped in the
+  kernel under a deny default, and the sending tool fails at once with "Operation not permitted".
+  Fixed in `outrig`; see that crate's changelog for what the chain accepts. A dropped datagram
+  still writes no `network.jsonl` record; recording them is #419.
 - **A `${VAR}` build-arg or MCP `env` value stays out of outrig's output and `ps`.** A config's
   `build-args` or `env` entry, or an `--env [SERVER:]KEY=${VAR}`, was resolved before podman or
   buildah was called and printed as its value wherever the command was. A failed `outrig build`

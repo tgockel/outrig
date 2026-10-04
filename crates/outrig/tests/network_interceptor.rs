@@ -19,7 +19,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -1204,6 +1204,95 @@ async fn a_lookup_on_a_systemd_resolved_host_goes_through_its_stub() {
         .shutdown()
         .await
         .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// What the redirects do not carry -- here a UDP datagram to a port that is
+/// not 53 -- is dropped under a deny default rather than leaving by podman's
+/// default route. The sink on the host is the proof: it hears nothing while
+/// the interceptor is attached, and hears the same datagram once the
+/// interceptor is gone, so the path works and the drop was the chain's doing.
+/// The datagram is to the host, which is the one destination a test can be
+/// sure to hear at; what the kernel drops it drops before any route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_datagram_the_redirects_do_not_carry_is_dropped_under_a_deny_default() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+    // A host socket for the container to send to. Read under a timeout, so
+    // silence is the negative result rather than a hang.
+    let sink = UdpSocket::bind(("0.0.0.0", 0)).expect("bind UDP sink");
+    let sink_port = sink.local_addr().expect("UDP sink addr").port();
+    let mut buf = [0u8; 64];
+    let host_ip = container_host_ipv4(&container);
+    let send_probe = || {
+        let mut cmd = Command::new("podman");
+        cmd.arg("exec").arg(container.name()).args([
+            "sh",
+            "-c",
+            &format!("echo probe | nc -u -w1 {host_ip} {sink_port}"),
+        ]);
+        try_capture(&mut cmd)
+    };
+
+    let policy = NetworkPolicy::builder()
+        .default_action(NetworkAction::Deny)
+        .allow_host_port("example.com", 443)
+        .build()
+        .expect("policy");
+    let interceptor = NetworkInterceptor::start_with_policy(
+        &container,
+        &log_dir,
+        container.session_suffix(),
+        policy,
+    )
+    .await
+    .expect("start network interceptor");
+
+    let dropped = send_probe();
+    // `nc -w1` idles a second after sending, so anything that left is here.
+    sink.set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("sink read timeout");
+    let leaked = sink
+        .recv_from(&mut buf)
+        .map(|(len, _)| String::from_utf8_lossy(&buf[..len]).into_owned());
+    assert!(
+        leaked.is_err(),
+        "a UDP datagram left a deny-default container: {leaked:?}; nc exited {:?}, stderr: {}",
+        dropped.status,
+        String::from_utf8_lossy(&dropped.stderr)
+    );
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+
+    let delivered = send_probe();
+    sink.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("sink read timeout");
+    let (len, _) = sink.recv_from(&mut buf).unwrap_or_else(|e| {
+        panic!(
+            "the same datagram should reach the host once the interceptor is gone: {e}; \
+             nc exited {:?}, stderr: {}",
+            delivered.status,
+            String::from_utf8_lossy(&delivered.stderr)
+        )
+    });
+    assert_eq!(String::from_utf8_lossy(&buf[..len]).trim(), "probe");
+
     container
         .stop(Duration::from_secs(2))
         .await

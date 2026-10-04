@@ -188,11 +188,12 @@ outbound container traffic:
 mode = "audit"
 ```
 
-Audit mode writes one Zeek `conn.log`-style JSON object per connection to
+Audit mode writes one Zeek `conn.log`-style JSON object per TCP connection to
 `<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only: every connection is still
 allowed, but records include the best known host, destination IP and port, transport, service,
 byte counts, and duration. HTTPS remains opaque except for TLS SNI. URL, method, status, and
-body inspection are deferred.
+body inspection are deferred. The interceptor carries TCP and DNS over UDP/53; any other
+datagram leaves by podman's default route and is not recorded.
 
 Filter mode uses the same interceptor and audit log, then applies global host/port policy
 before opening upstream TCP connections:
@@ -210,6 +211,12 @@ choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Deny entrie
 allow entries, and unmatched connections use `default`. A denied connection is closed
 immediately and still writes a `network.jsonl` record with `outrig.action = "deny"` and zero
 byte counts, so the audit log is the place to diagnose network policy failures.
+
+Entries match TCP connections. Anything else the container sends -- UDP to any port but 53,
+which is how QUIC and so HTTP/3 travel, ICMP, any other transport -- matches no entry and takes
+`default` directly, so a deny default stops it. Such a datagram never reaches the interceptor
+and writes no `network.jsonl` record; see [Reference -> Config](../reference/config.md) for
+what is carried and what the sending tool sees.
 
 A hostname entry in `allow` grants only against a destination outrig resolved to that name
 itself, through the container's own lookup at the interceptor's DNS listener. A name the

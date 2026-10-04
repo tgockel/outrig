@@ -1658,6 +1658,10 @@ fn parse_network_port(raw: &str) -> std::result::Result<u16, String> {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct NetworkPolicy {
+    /// The verdict for a connection no entry matches, and for traffic the
+    /// interceptor cannot evaluate at all: anything but TCP and DNS over
+    /// UDP/53 is dropped in the kernel under `Deny` and passes unrecorded
+    /// under `Allow`.
     #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
     pub default: NetworkAction,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

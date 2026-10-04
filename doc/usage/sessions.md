@@ -164,7 +164,7 @@ warning: unused import: `std::collections::HashMap`
 returns when EOF is reached and no further writes are expected.
 
 When network audit or filter mode is enabled, `logs/network.jsonl` contains one Zeek
-`conn.log`-style JSON object per outbound connection. It is not selected with the server-name
+`conn.log`-style JSON object per outbound TCP connection. It is not selected with the server-name
 argument because it is not an MCP stderr log; read it directly from the session directory:
 
 ```sh
