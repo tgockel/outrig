@@ -19,8 +19,11 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec, resolve_against};
+use crate::config::{
+    ImageConfig, ImageSourceRef, McpServerSpec, ResolvedEnvValue, resolve_against,
+};
 use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_to_labels};
+use crate::engine_env;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::{CleanupGuard, Reissue};
@@ -236,20 +239,21 @@ impl CacheKey {
 
 /// Resolve `build-args` for an image-config. Literal values pass through;
 /// `${VAR}` references are read from the host environment and framed with the
-/// image name plus the build-arg key on failure.
+/// image name plus the build-arg key on failure. Each keeps its source, so the
+/// build passes a reference by name and shows it as `KEY=${VAR}`.
 pub(crate) fn resolve_build_args(
     image: &str,
     cfg: &ImageConfig,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<BTreeMap<String, ResolvedEnvValue>> {
     let mut resolved = BTreeMap::new();
     for (key, value) in &cfg.build_args {
-        let value = value
-            .resolve()
-            .map_err(|source| OutrigError::BuildArgResolveFailed {
+        let value = ResolvedEnvValue::resolve(value.clone()).map_err(|source| {
+            OutrigError::BuildArgResolveFailed {
                 image: image.to_string(),
                 key: key.clone(),
                 source,
-            })?;
+            }
+        })?;
         resolved.insert(key.clone(), value);
     }
     Ok(resolved)
@@ -291,11 +295,16 @@ async fn compute_tag_with_build_args(
     repo: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<ImageTag> {
     let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     let labels = repo_build_cache_labels(cfg)?;
-    let key = CacheKey::compute_with_labels(&dockerfile, build_args, &context, &labels).await?;
+    // The key covers the values buildah receives, however each is passed.
+    let values = build_args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.value().to_owned()))
+        .collect();
+    let key = CacheKey::compute_with_labels(&dockerfile, &values, &context, &labels).await?;
     Ok(ImageTag::new(format!("{repo}:{key}")))
 }
 
@@ -436,7 +445,7 @@ async fn build_image_with_build_args(
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
     into_temp_tag(tag, None, async |temp_tag| {
         process::run_streamed_checked(
@@ -456,7 +465,7 @@ async fn build_image_logged_with_build_args(
     tag: &ImageTag,
     no_cache: bool,
     transcript: Option<&Transcript>,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
     into_temp_tag(tag, transcript, async |temp_tag| {
         process::run_capture_logged_terminating(
@@ -1019,12 +1028,10 @@ async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transc
             guard.release();
             return;
         }
-        Ok(output) => OutrigError::Process {
-            program: cmd.program,
-            argv: cmd.args,
-            exit_code: output.status.code(),
-            stderr_tail: process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
-        },
+        Ok(output) => cmd.process_error(
+            output.status.code(),
+            process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
+        ),
         Err(e) => e,
     };
     tracing::warn!(
@@ -1055,7 +1062,7 @@ fn build_image_cmd(
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Cmd {
     let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     buildah_build_cmd(
@@ -1069,7 +1076,8 @@ fn build_image_cmd(
 }
 
 /// Assemble a `buildah build --tag <tag> --file <dockerfile> [--no-cache]
-/// [--build-arg ...] [--label ...] <context>` command. `dockerfile` and
+/// [--build-arg ...] [--label ...] <context>` command. A build-arg resolved
+/// from a `${VAR}` reference is passed by name; see [`engine_env`]. `dockerfile` and
 /// `context` are already resolved, through [`resolve_against`]. Used directly
 /// by standalone image builds; repo-local builds first build a temporary image,
 /// then stamp merged OutRig labels in a final metadata-only commit.
@@ -1084,7 +1092,7 @@ fn buildah_build_cmd(
     context: &Path,
     tag: &ImageTag,
     no_cache: bool,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
     labels: &BTreeMap<String, String>,
 ) -> Cmd {
     let mut cmd = Cmd::new("buildah")
@@ -1097,7 +1105,7 @@ fn buildah_build_cmd(
         cmd = cmd.arg("--no-cache");
     }
     for (k, v) in build_args {
-        cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
+        cmd = engine_env::push_keyed(cmd, "--build-arg", k, v.value(), Some(v.source()));
     }
     for (k, v) in labels {
         cmd = cmd.arg("--label").arg(format!("{k}={v}"));
@@ -1474,7 +1482,7 @@ async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
         ])
         .arg(ctx)
         .arg(".");
-    let argv_for_error = cmd.args.clone();
+    let failed = cmd.clone();
     let mut child = process::spawn_stdio(cmd).await?;
 
     drop(child.stdin.take());
@@ -1505,12 +1513,7 @@ async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
     let status = child.wait().await?;
     let _ = stderr_task.await;
     if !status.success() {
-        return Err(OutrigError::Process {
-            program: "tar",
-            argv: argv_for_error,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        });
+        return Err(failed.process_error(status.code(), String::new()));
     }
     Ok(())
 }
@@ -1523,14 +1526,24 @@ mod tests {
     use super::*;
     use crate::config::EnvValue;
 
+    /// The issue #324 shape: a token in a build-arg must not be on buildah's
+    /// command line, where `ps` reads it, nor in anything a failure prints.
     #[test]
-    fn build_image_cmd_uses_resolved_build_args() {
-        let mut cfg = ImageConfig::from_dockerfile("Dockerfile", ".");
-        cfg.build_args = BTreeMap::from([(
-            "GH_TOKEN".to_string(),
-            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
-        )]);
-        let resolved = BTreeMap::from([("GH_TOKEN".to_string(), "secret-token".to_string())]);
+    fn build_image_cmd_passes_a_referenced_build_arg_by_name() {
+        let cfg = ImageConfig::from_dockerfile("Dockerfile", ".");
+        let resolved = BTreeMap::from([
+            (
+                "GH_TOKEN".to_string(),
+                ResolvedEnvValue::assume(
+                    EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+                    "secret-token",
+                ),
+            ),
+            (
+                "NODE_VERSION".to_string(),
+                ResolvedEnvValue::assume(EnvValue::Literal("20".to_string()), "20"),
+            ),
+        ]);
 
         let cmd = build_image_cmd(
             &cfg,
@@ -1540,12 +1553,29 @@ mod tests {
             &resolved,
         );
 
-        assert!(cmd.args.contains(&OsString::from("--build-arg")));
-        assert!(cmd.args.contains(&OsString::from("GH_TOKEN=secret-token")));
+        let argv = cmd.exec_args();
+        for expected in ["--build-arg", "GH_TOKEN", "NODE_VERSION=20"] {
+            assert!(
+                argv.contains(&OsString::from(expected)),
+                "{expected}: {argv:?}"
+            );
+        }
         assert!(
-            !cmd.args
-                .contains(&OsString::from("GH_TOKEN=${GITHUB_TOKEN}"))
+            argv.iter()
+                .all(|arg| !arg.to_string_lossy().contains("secret-token")),
+            "the value is not on the command line: {argv:?}"
         );
+        assert_eq!(
+            cmd.hidden_env(),
+            [("GH_TOKEN".to_string(), "secret-token".to_string())]
+        );
+        let rendered = cmd.render();
+        assert!(
+            rendered.contains("'GH_TOKEN=${GITHUB_TOKEN}'"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("NODE_VERSION=20"), "{rendered}");
+        assert!(!rendered.contains("secret-token"), "{rendered}");
     }
 
     #[test]

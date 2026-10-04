@@ -31,7 +31,7 @@
 //! processes outrig itself is waiting on, and what dropping their future
 //! guarantees.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -415,8 +415,16 @@ fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
     let mut script = String::new();
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
     for cmd in cmds {
+        // One shell cannot scope an environment or a stand-in to one of the
+        // commands it runs, and no cleanup command carries either.
+        debug_assert!(
+            !cmd.carries_hidden(),
+            "a cleanup chain runs only plain argv"
+        );
         let mut words = Vec::new();
-        for word in std::iter::once(std::ffi::OsString::from(cmd.program)).chain(cmd.args) {
+        for word in std::iter::once(std::ffi::OsString::from(cmd.program))
+            .chain(cmd.exec_args().iter().cloned())
+        {
             argv.push(word);
             words.push(format!("\"${{{}}}\"", argv.len()));
         }
@@ -434,8 +442,7 @@ fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
 
 /// Start one attempt at `cmd`, with stdio nulled.
 fn spawn_cleanup(cmd: &Cmd) -> std::io::Result<Child> {
-    Command::new(cmd.program)
-        .args(&cmd.args)
+    cmd.std_command()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

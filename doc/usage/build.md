@@ -44,9 +44,13 @@ outrig build [--image <name>]
      ```
      buildah build --tag <image-config-name>:outrig-tmp-... \
                    --file <dockerfile> \
-                   [user build-args] \
+                   [--build-arg KEY=value | --build-arg KEY ...] \
                    <context>
      ```
+     A literal build-arg is passed as `KEY=value`. A `${VAR}` one is passed as a bare `KEY`,
+     with the value in buildah's environment rather than on its command line, and outrig's
+     errors and logs show it as `KEY=${VAR}` -- see
+     [the value syntax](../reference/config.md#mcp-env-value-syntax).
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.

@@ -301,3 +301,61 @@ async fn no_cache_rebuilds_after_cache_hit() {
         "--no-cache should produce a fresh image id"
     );
 }
+
+/// A self-referencing `TMPDIR` build-arg reaches the Dockerfile as resolved.
+///
+/// `TMPDIR` is one buildah reads itself, and it makes its own copy absolute
+/// before looking up a bare `--build-arg TMPDIR`, so the value passed by name
+/// would arrive as the directory buildah ran in. It is passed explicitly
+/// instead. Run through the binary, so the relative `TMPDIR` is the child's
+/// and never this test process's.
+#[tokio::test]
+async fn a_self_referencing_tmpdir_build_arg_arrives_unchanged() {
+    install_tracing();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    write_repo(
+        tmp.path(),
+        &[(
+            "coding",
+            &format!(
+                "{ALPINE_DOCKERFILE}# cache-bust: {marker}\nARG TMPDIR\n\
+                 RUN test \"$TMPDIR\" = rel\n"
+            ),
+        )],
+        Some("coding"),
+    );
+    let config = tmp.path().join(".agents/outrig/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[images.coding.build-args]\nTMPDIR = \"${TMPDIR}\"\n");
+    std::fs::write(&config, text).unwrap();
+    std::fs::create_dir_all(tmp.path().join("rel")).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let out = try_capture(
+        Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .args(["--global-config"])
+            .arg(tmp.path().join("nonexistent-global.toml"))
+            .args(["build", "--image", "coding"])
+            .current_dir(tmp.path())
+            .env("TMPDIR", "rel")
+            .env("XDG_CACHE_HOME", cache.path()),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if let Some(tag) = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("[outrig] image tag:"))
+    {
+        let _ = Command::new("buildah").args(["rmi", tag.trim()]).output();
+    }
+    assert!(
+        out.status.success(),
+        "the RUN sees TMPDIR as resolved; stderr:\n{stderr}"
+    );
+}

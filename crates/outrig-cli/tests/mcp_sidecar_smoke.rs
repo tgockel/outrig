@@ -114,6 +114,11 @@ struct McpChild {
     stderr_task: tokio::task::JoinHandle<()>,
 }
 
+/// A host variable every spawned `outrig mcp` has, for a config to reference
+/// as `${OUTRIG_E2E_SIDECAR_TOKEN}`. The value is what must never be printed.
+const TOKEN_VAR: &str = "OUTRIG_E2E_SIDECAR_TOKEN";
+const TOKEN_VALUE: &str = "sidecar-token-value-324";
+
 fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild {
     let bin = env!("CARGO_BIN_EXE_outrig");
     let mut child = Command::new(bin)
@@ -123,6 +128,7 @@ fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild 
         .args(extra_args)
         .current_dir(repo)
         .env("OUTRIG_LOG", "info")
+        .env(TOKEN_VAR, TOKEN_VALUE)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -142,6 +148,28 @@ fn spawn_mcp(repo: &Path, session_root: &Path, extra_args: &[&str]) -> McpChild 
         stderr_buf,
         stderr_task,
     }
+}
+
+/// Every process on the host whose command line contains `needle`, as
+/// `(pid, cmdline)`. `/proc/<pid>/cmdline` is what `ps` reads, and what any
+/// local user can.
+fn cmdlines_containing(needle: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("read /proc").flatten() {
+        let pid = entry.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process can exit between the listing and the read.
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if cmdline.contains(needle) {
+            found.push((pid, cmdline));
+        }
+    }
+    found
 }
 
 async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> String {
@@ -649,7 +677,7 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
             r#"
   [images.smoke.mcp]
   fs    = ["mcp-server-filesystem", "/workspace"]
-  fetch = {{ image = "entry", args = ["/tmp"], env = {{ MARKER = "smoke-value" }} }}
+  fetch = {{ image = "entry", args = ["/tmp"], env = {{ MARKER = "smoke-value", TOKEN = "${{{TOKEN_VAR}}}" }} }}
 {}"#,
             entry_image_block()
         ),
@@ -657,7 +685,15 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
     std::fs::write(repo_dir.path().join("HELLO.txt"), "hi\n").expect("write HELLO.txt");
     let sessions = tempfile::tempdir().expect("tempdir sessions");
 
-    let mut run = spawn_mcp(repo_dir.path(), sessions.path(), &[]);
+    // `-v` mirrors every podman command line to stderr and `container.log`.
+    // The `--env` reference is passed as text: no shell expands it, so the
+    // value is not on outrig's own command line either.
+    let exec_env = format!("fs:FS_TOKEN=${{{TOKEN_VAR}}}");
+    let mut run = spawn_mcp(
+        repo_dir.path(),
+        sessions.path(),
+        &["-v", "--env", &exec_env],
+    );
     let child_stdin = run.stdin.take().expect("stdin piped");
     let child_stdout = run.stdout.take().expect("stdout piped");
 
@@ -710,7 +746,7 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
         );
         assert!(labeled.contains(&sidecar), "sidecar missing: {labeled:?}");
         let store = SessionStore::new(sessions.path().to_path_buf());
-        let (_, session) = store
+        let (session_dir, session) = store
             .get_by_id(&SessionId(sid.clone()))
             .expect("session record");
         assert_eq!(
@@ -730,11 +766,25 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
             env.contains("MARKER=smoke-value"),
             "container env should carry the config entry env: {env}"
         );
+        // A `${VAR}` entry reaches the container by name, from podman's own
+        // environment.
+        assert!(
+            env.contains(&format!("TOKEN={TOKEN_VALUE}")),
+            "container env should carry the referenced value: {env}"
+        );
+
+        // While the session is live, its `podman exec -i` client is running,
+        // and no command line on the host holds the value.
+        let holders = cmdlines_containing(TOKEN_VALUE);
+        assert!(
+            holders.is_empty(),
+            "the value is on a command line: {holders:?}"
+        );
 
         let _ = service.cancel().await;
-        sid
+        (sid, session_dir)
     };
-    let sid = timeout(TEST_TIMEOUT, work)
+    let (sid, session_dir) = timeout(TEST_TIMEOUT, work)
         .await
         .unwrap_or_else(|_| panic!("MCP work did not finish within {TEST_TIMEOUT:?}"));
 
@@ -747,6 +797,22 @@ async fn entrypoint_stdio_server_serves_tools_and_reaps() {
     eprintln!("--- subprocess stderr ---\n{stderr}");
 
     assert!(status.success(), "clean EOF exit expected: {stderr}");
+    // Both podman commands that carry a reference show it as the reference,
+    // on the terminal and in the session's log.
+    let log = std::fs::read_to_string(session_dir.join("logs/container.log"))
+        .expect("-v writes container.log");
+    for (what, text) in [("stderr", &stderr), ("container.log", &log)] {
+        for shown in [
+            format!("--env 'TOKEN=${{{TOKEN_VAR}}}'"),
+            format!("--env 'FS_TOKEN=${{{TOKEN_VAR}}}'"),
+        ] {
+            assert!(text.contains(&shown), "{what} should show {shown}:\n{text}");
+        }
+        assert!(
+            !text.contains(TOKEN_VALUE),
+            "{what} shows the value:\n{text}"
+        );
+    }
     // Lifetime equals server lifetime: EOF closed the server, `--rm` reaped
     // the container, and teardown tolerated it already being gone.
     let leftovers = podman_names(&format!("label=org.outrig.session={sid}")).await;

@@ -5353,11 +5353,11 @@ mod tests {
         let restore = restore_resolv_conf(std::process::id(), "outrig_test", present_snapshot());
         assert!(
             restore
-                .args
+                .exec_args()
                 .iter()
                 .any(|arg| arg.as_os_str().as_bytes() == ORIGINAL_RESOLV.as_bytes()),
             "the snapshot travels as its own argument, whole: {:#?}",
-            restore.args
+            restore.exec_args()
         );
     }
 

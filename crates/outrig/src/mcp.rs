@@ -20,7 +20,7 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService, serve_client};
 use serde_json::Value;
 
-use crate::config::{EnvValue, McpServerSpec};
+use crate::config::{EnvValue, McpServerSpec, ResolvedEnvValue};
 use crate::container::{Container, ExecOptions, embedded::McpDeclarationSource};
 use crate::error::{IoPathExt, McpFailureKind, McpSessionError, OutrigError, Result};
 use crate::mcp_content::{McpTool, McpToolResult, result_from_rmcp, tool_from_rmcp};
@@ -99,10 +99,11 @@ impl McpClient {
         extra_env: &BTreeMap<String, EnvValue>,
     ) -> Result<Self> {
         let (command, env_spec) = server_cfg.normalize();
-        let env = resolve_mcp_env(name, env_spec, extra_env)?;
+        let env = resolve_mcp_env_values(name, env_spec, extra_env)?;
         // Sidecar servers run wherever their image puts them; no exec-side
         // working directory has come up for one yet.
-        let exec_cmd = container.build_exec_argv(&command, &ExecOptions::new().with_env(env));
+        let exec_cmd =
+            container.build_exec_argv(&command, &ExecOptions::new().with_resolved_env(env));
         Self::connect_stdio_cmd(
             exec_cmd,
             name,
@@ -138,7 +139,11 @@ impl McpClient {
         // Derived from the one Cmd so failure diagnostics can't drift from
         // what actually ran.
         let argv: Vec<String> = std::iter::once(cmd.program.to_string())
-            .chain(cmd.args.iter().map(|a| a.to_string_lossy().into_owned()))
+            .chain(
+                cmd.shown_args()
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned()),
+            )
             .collect();
         Self::connect_stdio_cmd(
             cmd,
@@ -310,27 +315,45 @@ impl McpClient {
 /// Layer the CLI `--env` overlay onto the config-file env (overlay wins on
 /// key conflict) and resolve each value -- literals verbatim, `${VAR}` refs
 /// from the host environment. `name` labels resolution failures with the
-/// owning server. Shared by both stdio transports: exec-stdio resolves at
-/// connect time (`podman exec --env`), entrypoint-stdio at container-create
-/// time (`podman create --env`).
+/// owning server.
+///
+/// The values come back as plain strings, which podman is handed and every
+/// diagnostic shows as written. For an environment headed to podman, use
+/// [`resolve_mcp_env_values`], which keeps each reference out of both.
 pub fn resolve_mcp_env(
     name: &str,
     config_env: BTreeMap<String, EnvValue>,
     extra_env: &BTreeMap<String, EnvValue>,
 ) -> Result<BTreeMap<String, String>> {
+    Ok(resolve_mcp_env_values(name, config_env, extra_env)?
+        .into_iter()
+        .map(|(key, value)| (key, value.into_value()))
+        .collect())
+}
+
+/// [`resolve_mcp_env`], keeping what each value was resolved from. Shared by
+/// both stdio transports: exec-stdio resolves at connect time (`podman exec
+/// --env`), entrypoint-stdio at container-create time (`podman create
+/// --env`), and each hands the result to `with_resolved_env`, so a `${VAR}`
+/// value reaches podman by name and is shown as the reference.
+pub fn resolve_mcp_env_values(
+    name: &str,
+    config_env: BTreeMap<String, EnvValue>,
+    extra_env: &BTreeMap<String, EnvValue>,
+) -> Result<BTreeMap<String, ResolvedEnvValue>> {
     let mut env_spec = config_env;
     for (key, value) in extra_env {
         env_spec.insert(key.clone(), value.clone());
     }
     let mut env = BTreeMap::new();
     for (key, value) in env_spec {
-        let resolved = value
-            .resolve()
-            .map_err(|source| OutrigError::McpEnvResolveFailed {
+        let resolved = ResolvedEnvValue::resolve(value).map_err(|source| {
+            OutrigError::McpEnvResolveFailed {
                 name: name.to_string(),
                 key: key.clone(),
                 source,
-            })?;
+            }
+        })?;
         env.insert(key, resolved);
     }
     Ok(env)
@@ -592,10 +615,51 @@ mod tests {
             ),
         ]);
 
-        let env = resolve_mcp_env("svc", config_env, &extra_env).expect("resolves");
+        let env = resolve_mcp_env("svc", config_env.clone(), &extra_env).expect("resolves");
         assert_eq!(env["KEEP"], "literal");
         assert_eq!(env["BOTH"], "overlay");
         assert_eq!(env["REF"], "from-host");
+
+        let values = resolve_mcp_env_values("svc", config_env, &extra_env).expect("resolves");
+        assert_eq!(
+            values["REF"].source(),
+            &EnvValue::EnvRef("OUTRIG_TEST_MCP_ENV".to_string())
+        );
+        assert_eq!(
+            values["BOTH"].source(),
+            &EnvValue::Literal("overlay".to_string())
+        );
+        let debug = format!("{values:?}");
+        assert!(!debug.contains("from-host"), "{debug}");
+    }
+
+    /// The `-v` transcript line is written before the spawn, so it is what a
+    /// server that never comes up leaves behind -- in `container.log`, and on
+    /// the terminal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_connect_transcript_shows_a_reference_not_its_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("container.log");
+        let transcript = Transcript::create(&log, false)
+            .await
+            .expect("create transcript");
+        let cmd = Cmd::new("/bin/sh")
+            // Some stderr, so the failure does not wait out the settle
+            // ceiling for a tail that is never coming.
+            .args(["-c", "echo gone >&2", "sh", "--env"])
+            .arg_shown_as("TOKEN", "TOKEN=${FETCH_TOKEN}")
+            .env_hidden("TOKEN", "s3cret");
+
+        let connected =
+            McpClient::connect_stdio_cmd(cmd, "svc", None, dir.path(), Some(transcript), &[]).await;
+        assert!(
+            connected.is_err(),
+            "a server that exits at once fails the handshake"
+        );
+
+        let text = std::fs::read_to_string(&log).expect("read transcript");
+        assert!(text.contains("--env 'TOKEN=${FETCH_TOKEN}'"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 
     #[test]

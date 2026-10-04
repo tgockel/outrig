@@ -72,6 +72,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
@@ -117,10 +118,22 @@ pub(crate) enum Termination {
 }
 const STREAM_READ_CHUNK: usize = 8 * 1024;
 
-#[derive(Debug, Clone)]
+/// A command to run, and what a diagnostic may say about it.
+///
+/// Those two differ for a value resolved from a `${VAR}` reference. The
+/// executed argv is `args`; a diagnostic sees [`Cmd::shown_args`], which
+/// substitutes a stand-in wherever one was given, and `env` is set on the
+/// child without ever being displayed. Every display path -- [`Cmd::render`],
+/// the transcript, tracing, and the errors built here -- goes through the
+/// shown form, and `Debug` is written by hand to follow it.
+#[derive(Clone)]
 pub(crate) struct Cmd {
     pub(crate) program: &'static str,
-    pub(crate) args: Vec<OsString>,
+    args: Vec<OsString>,
+    /// Display stand-ins for some of `args`, by index.
+    shown: Vec<(usize, OsString)>,
+    /// Added to the environment the child inherits.
+    env: Vec<(OsString, OsString)>,
 }
 
 impl Cmd {
@@ -128,6 +141,8 @@ impl Cmd {
         Self {
             program,
             args: Vec::new(),
+            shown: Vec::new(),
+            env: Vec::new(),
         }
     }
 
@@ -146,24 +161,80 @@ impl Cmd {
         self
     }
 
+    /// Append `arg`, which every diagnostic shows as `shown` instead.
+    pub(crate) fn arg_shown_as(mut self, arg: impl AsRef<OsStr>, shown: impl AsRef<OsStr>) -> Self {
+        self.shown
+            .push((self.args.len(), shown.as_ref().to_os_string()));
+        self.arg(arg)
+    }
+
+    /// Set `key` to `value` in the child's environment. Neither appears in
+    /// any diagnostic.
+    pub(crate) fn env_hidden(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.env
+            .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self
+    }
+
+    /// The argv as executed. For deciding what runs, never for display.
+    pub(crate) fn exec_args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// The argv as a diagnostic shows it: the executed argv with each
+    /// stand-in in place.
+    pub(crate) fn shown_args(&self) -> Vec<OsString> {
+        let mut argv = self.args.clone();
+        for (i, shown) in &self.shown {
+            argv[*i].clone_from(shown);
+        }
+        argv
+    }
+
+    /// Whether running or showing this command needs more than `program`
+    /// and [`Cmd::exec_args`].
+    pub(crate) fn carries_hidden(&self) -> bool {
+        !self.shown.is_empty() || !self.env.is_empty()
+    }
+
+    /// Build a fresh `std::process::Command` from this argv and environment.
+    /// No stdio configuration is applied.
+    pub(crate) fn std_command(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(self.program);
+        c.args(&self.args);
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
+        c
+    }
+
     /// Build a fresh `tokio::process::Command` from this argv. No stdio
     /// configuration is applied -- the caller layers `.stdin()` / `.stdout()`
     /// / `.stderr()` to taste before spawning.
     pub(crate) fn to_tokio_command(&self) -> Command {
-        let mut c = Command::new(self.program);
-        c.args(&self.args);
-        c
+        Command::from(self.std_command())
     }
 
     /// Render the argv as a shell-like command line for diagnostics. This is
     /// display-only; callers must still spawn via `Command` so no quoting
     /// participates in execution.
     pub(crate) fn render(&self) -> String {
-        std::iter::once(OsStr::new(self.program))
-            .chain(self.args.iter().map(OsString::as_os_str))
-            .map(render_arg)
+        std::iter::once(OsString::from(self.program))
+            .chain(self.shown_args())
+            .map(|arg| render_arg(&arg))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hidden_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
     }
 
     /// Spawn this command with `stdio`, returning the child already owned.
@@ -212,12 +283,22 @@ impl Cmd {
         })
     }
 
-    /// Report that this command was stopped by its caller's signal. Consumes
-    /// the argv, so it is the last thing a helper does on that path.
-    fn canceled_error(self) -> OutrigError {
+    /// Report that this command was stopped by its caller's signal.
+    pub(crate) fn canceled_error(&self) -> OutrigError {
         OutrigError::Canceled {
             program: self.program,
-            argv: self.args,
+            argv: self.shown_args(),
+        }
+    }
+
+    /// Report that this command ran and exited badly. Like every error built
+    /// here, it carries the shown argv rather than the one that ran.
+    pub(crate) fn process_error(&self, exit_code: Option<i32>, stderr_tail: String) -> OutrigError {
+        OutrigError::Process {
+            program: self.program,
+            argv: self.shown_args(),
+            exit_code,
+            stderr_tail,
         }
     }
 
@@ -230,6 +311,18 @@ impl Cmd {
             command: self.render(),
             source,
         }
+    }
+}
+
+/// The shown argv and only the keys of the environment, as every other
+/// diagnostic does.
+impl fmt::Debug for Cmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cmd")
+            .field("program", &self.program)
+            .field("argv", &self.shown_args())
+            .field("env", &self.env.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .finish()
     }
 }
 
@@ -783,12 +876,7 @@ pub(crate) async fn run_capture(cmd: Cmd) -> Result<Output> {
             stderr: stderr_tail.into_bytes(),
         })
     } else {
-        Err(OutrigError::Process {
-            program: cmd.program,
-            argv: cmd.args,
-            exit_code: status.code(),
-            stderr_tail: stderr_tail.into_tail_string(),
-        })
+        Err(cmd.process_error(status.code(), stderr_tail.into_tail_string()))
     }
 }
 
@@ -825,12 +913,10 @@ pub(crate) async fn run_capture_logged_terminating(
     if output.status.success() {
         Ok(output)
     } else {
-        Err(OutrigError::Process {
-            program: cmd.program,
-            argv: cmd.args,
-            exit_code: output.status.code(),
-            stderr_tail: tail_string(&output.stderr, STDERR_TAIL_LIMIT),
-        })
+        Err(cmd.process_error(
+            output.status.code(),
+            tail_string(&output.stderr, STDERR_TAIL_LIMIT),
+        ))
     }
 }
 
@@ -892,18 +978,11 @@ pub(crate) async fn run_streamed_checked(
     prefix: &'static str,
     termination: Termination,
 ) -> Result<()> {
-    let program = cmd.program;
-    let argv = cmd.args.clone();
-    let status = run_streamed(cmd, prefix, termination).await?;
+    let status = run_streamed(cmd.clone(), prefix, termination).await?;
     if status.success() {
         Ok(())
     } else {
-        Err(OutrigError::Process {
-            program,
-            argv,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        })
+        Err(cmd.process_error(status.code(), String::new()))
     }
 }
 

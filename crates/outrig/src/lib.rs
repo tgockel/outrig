@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 pub mod config;
 pub mod container;
+mod engine_env;
 pub mod error;
 pub mod image;
 mod mcp;
@@ -56,7 +57,7 @@ pub use config::{
 // convenience, not a rule: `Container` itself is named by
 // `McpClient::connect_via_podman_exec` and stays put.
 pub use container::ExecOptions;
-pub use mcp::{McpClient, resolve_mcp_env};
+pub use mcp::{McpClient, resolve_mcp_env, resolve_mcp_env_values};
 pub use mcp_content::{
     McpAnnotations, McpContent, McpEmbeddedResource, McpIcon, McpMediaContent, McpResourceContents,
     McpResourceLink, McpRole, McpTextContent, McpTool, McpToolAnnotations, McpToolResult,

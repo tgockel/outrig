@@ -1436,3 +1436,45 @@ async fn a_temp_tag_removal_that_keeps_failing_is_abandoned() {
         .expect("a refused cleanup must not fail a build that worked");
     expect_rmis(journal, &token, 4, Duration::from_millis(1200)).await;
 }
+
+/// Issue #324: a build-arg resolved from a `${VAR}` reference reaches buildah
+/// by name, and a failed build reports it as the reference.
+///
+/// The journal holds the argv the fake was actually given, which is what
+/// `/proc/<pid>/cmdline` shows every local user while a real build runs. The
+/// error is what `outrig build` prints with no flag at all, so in CI it is the
+/// job log.
+#[tokio::test]
+async fn a_failed_build_reports_a_referenced_build_arg_by_name() {
+    let journal = fake_runtime();
+    let context = tempfile::tempdir().expect("tempdir");
+    std::fs::write(context.path().join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+
+    let var = "OUTRIG_TEST_CANCELLATION_BUILD_ARG_REF";
+    let secret = "ghp_FAKE_SECRET_DO_NOT_USE_324";
+    // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+    // races; no other test reads or writes this name.
+    unsafe { std::env::set_var(var, secret) };
+
+    let token = unique_name("referenced-arg");
+    refuse_for(journal, "build", &token, 1);
+
+    let mut cfg = outrig::config::ImageConfig::from_dockerfile("Dockerfile", ".");
+    cfg.build_args = std::collections::BTreeMap::from([(
+        "GH_TOKEN".to_string(),
+        outrig::config::EnvValue::EnvRef(var.to_string()),
+    )]);
+    let final_tag = ImageTag::new(format!("example.invalid/{token}:latest"));
+    let err = outrig::image::build_image_for("referenced", &cfg, context.path(), &final_tag, false)
+        .await
+        .expect_err("the fake refuses the build");
+
+    assert!(failed_at(&err, "build"), "got {err}");
+    let shown = err.to_string();
+    assert!(shown.contains(&format!("GH_TOKEN=${{{var}}}")), "{shown}");
+    assert!(!shown.contains(secret), "{shown}");
+
+    let (_, argv) = invocation(journal, "build", &[token.as_str()]).await;
+    assert!(argv.contains(" --build-arg GH_TOKEN "), "{argv}");
+    assert!(!argv.contains(secret), "{argv}");
+}

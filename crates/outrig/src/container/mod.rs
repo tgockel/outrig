@@ -27,6 +27,7 @@ pub mod sidecar;
 mod userdb;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Mutex, OnceLock};
@@ -38,7 +39,10 @@ use nix::unistd::{Gid, Group, Uid, User};
 use serde_json::Value;
 use tokio::process::Child;
 
-use crate::config::{CapabilityProfile, MountAccess, capability_name_without_prefix};
+use crate::config::{
+    CapabilityProfile, EnvValue, MountAccess, ResolvedEnvValue, capability_name_without_prefix,
+};
+use crate::engine_env;
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd, Transcript};
@@ -282,11 +286,56 @@ impl ContainerLaunchSpec {
     }
 }
 
+/// The resolved entries an options type's `env` was set from, which is how a
+/// `${VAR}` value in it is told from a literal when the command is built.
+///
+/// An entry counts only while `env` still holds the value it resolved to: the
+/// map is public, and a value a caller put there since is theirs, passed and
+/// shown as written.
+#[derive(Clone, Default)]
+struct EnvSources(BTreeMap<String, ResolvedEnvValue>);
+
+impl EnvSources {
+    /// The plain values for `env`, and the record of where each came from.
+    fn split(resolved: BTreeMap<String, ResolvedEnvValue>) -> (BTreeMap<String, String>, Self) {
+        let env = resolved
+            .iter()
+            .map(|(key, value)| (key.clone(), value.value().to_owned()))
+            .collect();
+        (env, Self(resolved))
+    }
+
+    fn source_of(&self, key: &str, value: &str) -> Option<&EnvValue> {
+        self.0
+            .get(key)
+            .filter(|resolved| resolved.value() == value)
+            .map(ResolvedEnvValue::source)
+    }
+
+    /// One `--env` per entry of `env`, in the form [`engine_env::push_keyed`]
+    /// picks for it.
+    fn push(&self, cmd: Cmd, env: &BTreeMap<String, String>) -> Cmd {
+        env.iter().fold(cmd, |cmd, (key, value)| {
+            engine_env::push_keyed(cmd, "--env", key, value, self.source_of(key, value))
+        })
+    }
+
+    /// `env` for a `Debug` impl: a reference's entry as the reference.
+    fn shown<'a>(&self, env: &'a BTreeMap<String, String>) -> BTreeMap<&'a str, String> {
+        env.iter()
+            .map(|(key, value)| {
+                let shown = engine_env::shown_value(value, self.source_of(key, value));
+                (key.as_str(), shown)
+            })
+            .collect()
+    }
+}
+
 /// Complete inputs for a `podman create` + `podman init`, the pair
 /// [`Container::create_initialized`] runs. One struct rather than a parameter
 /// list because this call has already grown a parameter once, and every knob
 /// podman's create step accepts but its run step does not lands here.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ContainerCreateOptions {
     /// Image to create the container from.
@@ -299,13 +348,31 @@ pub struct ContainerCreateOptions {
     pub transcript: Option<Transcript>,
     /// Becomes `--env` flags on the create. There is no later exec to carry
     /// them, so an entrypoint-stdio server's environment has to be baked in
-    /// here.
+    /// here. An entry set by [`ContainerCreateOptions::with_resolved_env`]
+    /// from a `${VAR}` reference is passed by name and shown as the
+    /// reference; any other is passed and shown as written.
     pub env: BTreeMap<String, String>,
     /// Bakes the interceptor's loopback resolver in via `--dns`. The
     /// exec-based resolv.conf install is impossible before start.
     pub intercept_dns: bool,
     /// Trailing argv the image's `ENTRYPOINT` receives.
     pub args: Vec<String>,
+    env_sources: EnvSources,
+}
+
+/// `env` as every diagnostic shows it: a `${VAR}` entry as the reference.
+impl fmt::Debug for ContainerCreateOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContainerCreateOptions")
+            .field("image", &self.image)
+            .field("launch", &self.launch)
+            .field("name", &self.name)
+            .field("transcript", &self.transcript)
+            .field("env", &self.env_sources.shown(&self.env))
+            .field("intercept_dns", &self.intercept_dns)
+            .field("args", &self.args)
+            .finish()
+    }
 }
 
 impl ContainerCreateOptions {
@@ -320,6 +387,7 @@ impl ContainerCreateOptions {
             env: BTreeMap::new(),
             intercept_dns: false,
             args: Vec::new(),
+            env_sources: EnvSources::default(),
         }
     }
 
@@ -331,9 +399,18 @@ impl ContainerCreateOptions {
         self
     }
 
-    /// Set the environment baked into the create.
+    /// Set the environment baked into the create, each value passed to
+    /// podman and shown as written.
     pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
         self.env = env;
+        self.env_sources = EnvSources::default();
+        self
+    }
+
+    /// Set the environment baked into the create from resolved config values,
+    /// as [`ExecOptions::with_resolved_env`] does for an exec.
+    pub fn with_resolved_env(mut self, env: BTreeMap<String, ResolvedEnvValue>) -> Self {
+        (self.env, self.env_sources) = EnvSources::split(env);
         self
     }
 
@@ -355,11 +432,14 @@ impl ContainerCreateOptions {
 /// same reason: the environment was the only knob until the working directory
 /// joined it, and each further one would otherwise be another parameter on
 /// four published methods.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ExecOptions {
     /// Added to the environment podman already sets up (`HOME` plus the
     /// mapped user and group). `BTreeMap` order makes the argv deterministic.
+    /// An entry set by [`ExecOptions::with_resolved_env`] from a `${VAR}`
+    /// reference is passed by name and shown as the reference; any other is
+    /// passed and shown as written.
     pub env: BTreeMap<String, String>,
     /// Becomes `--workdir <path>`. `None` emits no flag, leaving the
     /// container's configured working directory -- which is the image's
@@ -370,6 +450,17 @@ pub struct ExecOptions {
     /// knob existed; set it explicitly if a relative or destructive command
     /// must not land there.
     pub workdir: Option<PathBuf>,
+    env_sources: EnvSources,
+}
+
+/// `env` as every diagnostic shows it: a `${VAR}` entry as the reference.
+impl fmt::Debug for ExecOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecOptions")
+            .field("env", &self.env_sources.shown(&self.env))
+            .field("workdir", &self.workdir)
+            .finish()
+    }
 }
 
 impl ExecOptions {
@@ -381,9 +472,23 @@ impl ExecOptions {
         Self::default()
     }
 
-    /// Set the environment added to the exec.
+    /// Set the environment added to the exec, each value passed to podman
+    /// and shown as written.
     pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
         self.env = env;
+        self.env_sources = EnvSources::default();
+        self
+    }
+
+    /// Set the environment added to the exec from resolved config values. A
+    /// value resolved from a `${VAR}` reference reaches podman as a bare
+    /// `--env KEY`, with the value in podman's own environment rather than on
+    /// its command line, and every diagnostic shows it as `KEY=${VAR}`. A key
+    /// podman itself reads, or one that is not a plain variable name, keeps
+    /// its value on the command line, still shown as the reference. `env`
+    /// holds the values either way.
+    pub fn with_resolved_env(mut self, env: BTreeMap<String, ResolvedEnvValue>) -> Self {
+        (self.env, self.env_sources) = EnvSources::split(env);
         self
     }
 
@@ -993,9 +1098,7 @@ impl Container {
             .arg(format!("--user={}:{}", self.uid, self.gid))
             .arg("--env")
             .arg(format!("HOME={}", userdb::home_dir(user_name)));
-        for (k, v) in &options.env {
-            c = c.arg("--env").arg(format!("{k}={v}"));
-        }
+        c = options.env_sources.push(c, &options.env);
         if let Some(workdir) = &options.workdir {
             c = c.arg("--workdir").arg(workdir);
         }
@@ -1155,10 +1258,7 @@ impl Container {
             // caller keeps a handle to try again through, and `Drop` still has
             // its detached removal.
             EngineOutcome::TimedOut => {
-                return Err(OutrigError::Canceled {
-                    program: stop.program,
-                    argv: stop.args,
-                });
+                return Err(stop.canceled_error());
             }
             EngineOutcome::Failed(e) => return Err(e),
         }
@@ -1203,10 +1303,7 @@ impl Container {
             // try again or to abandon it to teardown, and `Drop` still has the
             // detached removal if the handle is let go.
             EngineOutcome::TimedOut => {
-                return Err(OutrigError::Canceled {
-                    program: removal.program,
-                    argv: removal.args,
-                });
+                return Err(removal.canceled_error());
             }
             // Neither disposed of nor discharged, so the caller keeps
             // something to try again through and `Drop` still has its detached
@@ -1421,12 +1518,10 @@ enum EngineOutcome {
 fn classify_engine_call(cmd: &Cmd, outcome: Result<Output>) -> EngineOutcome {
     match outcome {
         Ok(output) if output.status.success() => EngineOutcome::Done,
-        Ok(output) => EngineOutcome::Failed(OutrigError::Process {
-            program: cmd.program,
-            argv: cmd.args.clone(),
-            exit_code: output.status.code(),
-            stderr_tail: process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
-        }),
+        Ok(output) => EngineOutcome::Failed(cmd.process_error(
+            output.status.code(),
+            process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
+        )),
         Err(OutrigError::Canceled { .. }) => EngineOutcome::TimedOut,
         // It could not be run at all, which says nothing about whether the
         // container is gone.
@@ -1625,9 +1720,7 @@ fn build_podman_create_cmd(
     if let Some(pv) = &options.launch.primary_view {
         cmd = cmd.arg("--env").arg(format!("HOME={}", pv.payload_home));
     }
-    for (k, v) in &options.env {
-        cmd = cmd.arg("--env").arg(format!("{k}={v}"));
-    }
+    cmd = options.env_sources.push(cmd, &options.env);
 
     // After the caller's labels; see `build_podman_run_cmd`.
     cmd.arg("--label")
@@ -2162,7 +2255,7 @@ mod tests {
     fn argv(cmd: Cmd) -> Vec<String> {
         std::iter::once(cmd.program.to_string())
             .chain(
-                cmd.args
+                cmd.exec_args()
                     .iter()
                     .map(|arg| arg.to_string_lossy().into_owned()),
             )
@@ -3292,5 +3385,149 @@ mod tests {
                 "pwd",
             ]
         );
+    }
+
+    /// A `${VAR}` entry and a literal, resolved as the MCP and sidecar paths
+    /// hand them over.
+    fn resolved_env() -> BTreeMap<String, ResolvedEnvValue> {
+        BTreeMap::from([
+            (
+                "TOKEN".to_string(),
+                ResolvedEnvValue::assume(EnvValue::EnvRef("FETCH_TOKEN".to_string()), "s3cret"),
+            ),
+            (
+                "ZONE".to_string(),
+                ResolvedEnvValue::assume(EnvValue::Literal("utc".to_string()), "utc"),
+            ),
+        ])
+    }
+
+    /// The exec-stdio client lives as long as the session, so this is the
+    /// argv `ps` shows for all of it.
+    #[test]
+    fn a_resolved_reference_reaches_podman_exec_by_name() {
+        let cmd = bootstrapped_container().build_exec_argv(
+            &["pwd".to_string()],
+            &ExecOptions::new().with_resolved_env(resolved_env()),
+        );
+
+        assert_eq!(
+            argv(cmd.clone()),
+            vec![
+                "podman",
+                "exec",
+                "-i",
+                "--user=1000:1000",
+                "--env",
+                "HOME=/home/dev",
+                "--env",
+                "TOKEN",
+                "--env",
+                "ZONE=utc",
+                "outrig-test-exec",
+                "pwd",
+            ]
+        );
+        assert_eq!(
+            cmd.hidden_env(),
+            [("TOKEN".to_string(), "s3cret".to_string())]
+        );
+        let rendered = cmd.render();
+        assert!(
+            rendered.contains("--env 'TOKEN=${FETCH_TOKEN}' --env ZONE=utc"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+    }
+
+    #[test]
+    fn a_resolved_reference_reaches_podman_create_by_name() {
+        let options = ContainerCreateOptions::new(
+            ImageTag::new("local:test"),
+            ContainerLaunchSpec::default(),
+            "outrig-test-fs",
+        )
+        .with_resolved_env(resolved_env());
+        assert_eq!(options.env["TOKEN"], "s3cret", "env holds the values");
+
+        let cmd = build_podman_create_cmd(&options, false, "org.outrig.attempt=testtoken");
+
+        let args = argv(cmd.clone());
+        assert!(args.windows(2).any(|w| w == ["--env", "TOKEN"]), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--env", "ZONE=utc"]),
+            "{args:?}"
+        );
+        assert!(args.iter().all(|arg| !arg.contains("s3cret")), "{args:?}");
+        assert_eq!(
+            cmd.hidden_env(),
+            [("TOKEN".to_string(), "s3cret".to_string())]
+        );
+        let rendered = cmd.render();
+        assert!(rendered.contains("'TOKEN=${FETCH_TOKEN}'"), "{rendered}");
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+    }
+
+    /// `env` is public. A value put there after resolution is the caller's,
+    /// and the reference it replaced no longer describes it.
+    #[test]
+    fn an_env_entry_changed_after_resolution_is_a_literal() {
+        let mut options = ExecOptions::new().with_resolved_env(resolved_env());
+        options
+            .env
+            .insert("TOKEN".to_string(), "replaced".to_string());
+
+        let cmd = bootstrapped_container().build_exec_argv(&["pwd".to_string()], &options);
+
+        assert!(argv(cmd.clone()).contains(&"TOKEN=replaced".to_string()));
+        assert!(cmd.hidden_env().is_empty());
+        assert!(cmd.render().contains("TOKEN=replaced"));
+    }
+
+    #[test]
+    fn with_env_forgets_resolved_references() {
+        let plain = BTreeMap::from([("TOKEN".to_string(), "s3cret".to_string())]);
+        let exec = bootstrapped_container().build_exec_argv(
+            &["pwd".to_string()],
+            &ExecOptions::new()
+                .with_resolved_env(resolved_env())
+                .with_env(plain.clone()),
+        );
+        let create = build_podman_create_cmd(
+            &ContainerCreateOptions::new(
+                ImageTag::new("local:test"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-fs",
+            )
+            .with_resolved_env(resolved_env())
+            .with_env(plain),
+            false,
+            "org.outrig.attempt=testtoken",
+        );
+
+        for cmd in [exec, create] {
+            assert!(cmd.hidden_env().is_empty());
+            assert!(argv(cmd).contains(&"TOKEN=s3cret".to_string()));
+        }
+    }
+
+    #[test]
+    fn options_debug_shows_a_reference_not_its_value() {
+        let exec = format!("{:?}", ExecOptions::new().with_resolved_env(resolved_env()));
+        let create = format!(
+            "{:?}",
+            ContainerCreateOptions::new(
+                ImageTag::new("local:test"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-fs",
+            )
+            .with_resolved_env(resolved_env())
+        );
+
+        for debug in [exec, create] {
+            assert!(debug.contains("\"TOKEN\": \"${FETCH_TOKEN}\""), "{debug}");
+            assert!(debug.contains("\"ZONE\": \"utc\""), "{debug}");
+            assert!(!debug.contains("s3cret"), "{debug}");
+        }
     }
 }

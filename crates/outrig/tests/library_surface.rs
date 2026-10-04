@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use outrig::config::{Config, McpServerSpec};
+use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
     MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
@@ -870,6 +870,25 @@ async fn exec_capture_runs_a_command_in_the_primary() {
         .expect("exec_capture");
     assert!(out.status.success(), "exit: {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+
+    // A value resolved from a `${VAR}` reference goes to podman as a bare
+    // `--env KEY`, which podman fills from its own environment.
+    let var = "OUTRIG_E2E_LIBRARY_SURFACE_REFERENCED";
+    // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+    // races; no other test reads or writes this name.
+    unsafe { std::env::set_var(var, "by-name") };
+    let referenced =
+        ResolvedEnvValue::resolve(EnvValue::EnvRef(var.to_string())).expect("the variable is set");
+    let out = outrig
+        .exec_capture(
+            &["sh".into(), "-lc".into(), "printf %s \"$GREETING\"".into()],
+            &ExecOptions::new()
+                .with_resolved_env(BTreeMap::from([("GREETING".to_string(), referenced)])),
+        )
+        .await
+        .expect("exec_capture");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "by-name");
 
     // A non-zero exit is data on the Output, not an error.
     let failed = outrig

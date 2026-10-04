@@ -1325,8 +1325,11 @@ async fn create_one_entrypoint_sidecar(
     let ctx = args.start_ctx();
     let mut launch = sidecar_launch_base(&ctx, sc);
     let (_, env_spec) = spec.normalize();
-    let env =
-        outrig::resolve_mcp_env(server_name, env_spec, &args.cli_env.for_server(server_name))?;
+    let env = outrig::resolve_mcp_env_values(
+        server_name,
+        env_spec,
+        &args.cli_env.for_server(server_name),
+    )?;
     let intercept_dns = args.network_mode != NetworkMode::Default;
 
     // A `view = "primary"` sidecar runs `outrig-enter` as its ENTRYPOINT (set in
@@ -1354,7 +1357,7 @@ async fn create_one_entrypoint_sidecar(
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
     let options = ContainerCreateOptions::new(tag.clone(), launch, container_name)
         .with_transcript(args.transcript.cloned())
-        .with_env(env)
+        .with_resolved_env(env)
         .with_intercept_dns(intercept_dns)
         .with_args(create_args);
     let container = Container::create_initialized(options).await?;

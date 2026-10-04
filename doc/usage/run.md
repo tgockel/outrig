@@ -92,6 +92,10 @@ $ RUST_LOG=debug outrig run
 DEBUG outrig::process: spawn command=podman run -d --rm --name outrig-... sleep infinity
 ```
 
+An env value that came from a `${VAR}` reference appears in that line as `'KEY=${VAR}'`, never
+as its value. Pasted as shown, the single quotes would hand podman that literal text; to rerun
+the command by hand, write it as `"KEY=${VAR}"` so your shell fills the value in.
+
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
 `<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`
 keep working. This lets you launch with a known path and read `session.json` immediately without

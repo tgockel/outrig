@@ -319,6 +319,11 @@ The cutoff is what keeps this away from a build that is running right now, so do
   buildah/podman traces in `container.log`; it is not a conversation transcript.
 - **API keys.** The bearer token used for the LLM call is never written to disk and never appears
   in tracing output.
+- **Referenced env values.** A `${VAR}` build-arg or MCP `env` value appears in `container.log`,
+  errors, and debug output only as `KEY=${VAR}`, and reaches podman and buildah through their
+  environment rather than their command line -- with the exceptions listed under
+  [the value syntax](../reference/config.md#mcp-env-value-syntax). What a build step or an MCP
+  server prints is recorded as printed.
 
 > **TODO: Incomplete** -- opt-in transcript capture (per-turn JSON of user/assistant/tool
 > messages) is deferred.

@@ -16,7 +16,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef};
-pub use env_value::{EnvValue, EnvValueError};
+pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use merge::merge;
 pub use validate::{
     BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,

@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `${VAR}` build-arg or MCP `env` value stays out of outrig's output and `ps`.** A config's
+  `build-args` or `env` entry, or an `--env [SERVER:]KEY=${VAR}`, was resolved before podman or
+  buildah was called and printed as its value wherever the command was. A failed `outrig build`
+  or entrypoint-sidecar create put it on stderr with no flag given -- in CI, into the job log.
+  `-v` wrote it to `container.log` and the terminal, `RUST_LOG=debug` traced it, and every
+  exec-stdio server's `podman exec` carried it on a command line any local user could read for
+  the whole session. Each is now shown as `KEY=${VAR}`, and podman and buildah get the value
+  through their environment instead. A key they read themselves, such as `HOME`, `TMPDIR`, or
+  `HTTPS_PROXY`, keeps its value on their command line, except a proxy variable referencing the
+  variable of its own name; the config reference's MCP `env` value syntax lists them. buildah
+  still records a build-arg's value in the image's history.
 - **A workspace outrig picks by default is never your home directory.** With no config declaring
   `[workspace] host-path`, the workspace is the repo root, and nothing checked what that was.
   `outrig run` or `outrig mcp` from `~` with no repo config, an MCP client that started outrig in

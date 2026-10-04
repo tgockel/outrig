@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image init` check their names with it, and `ConfigValidationError::BuildImageNameInvalid`
   explains a name the way it does.
 
+- **`config::ResolvedEnvValue` keeps a resolved `${VAR}` value beside the reference it came
+  from.** `ResolvedEnvValue::resolve` resolves an `EnvValue` as `EnvValue::resolve` does,
+  `value()` and `source()` read the two back, and `Debug` prints only the source.
+  `outrig::resolve_mcp_env_values` is `resolve_mcp_env` returning them, and
+  `ContainerCreateOptions::with_resolved_env` and `ExecOptions::with_resolved_env` take them.
+  `env` holds the values. An entry resolved from a reference reaches podman as a bare `--env KEY`,
+  its value in podman's own environment rather than on its command line, and is shown as
+  `KEY=${VAR}` wherever outrig shows the command. An entry a caller changes in `env` afterwards
+  is passed as the literal it now is, and `with_env` drops the references.
+
 ### Changed
 
 - **rmcp 3.4.1 or newer is required**, up from 3.1.0. rmcp is public here through
@@ -51,6 +61,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absolute home directory `~` keeps its old meaning.
 
 ### Fixed
+
+- **A `${VAR}` build-arg or MCP `env` value stays out of outrig's output and off podman's and
+  buildah's command lines.** Each was resolved to its host value before the `buildah build
+  --build-arg`, `podman create --env`, or `podman exec --env` argv was built, and every
+  diagnostic printed that argv as it ran: the `Process`, `Canceled`, and `Spawn` errors, the
+  transcript line written before each command, and the `outrig::process` debug trace. The value
+  also sat in `/proc/<pid>/cmdline`, readable by every local user, for as long as the client ran
+  -- for an exec-stdio server's `podman exec`, the whole session. Every build path, entrypoint
+  sidecar, and `McpClient::connect_via_podman_exec*` now passes such a value by name, as a bare
+  `--env KEY` or `--build-arg KEY` with the value in the client's environment, and shows it as
+  `KEY=${VAR}`. A key the client reads itself -- `HOME`, `PATH`, `TMPDIR`, the proxies, the
+  `XDG_*`, `LD_*`, and `CONTAINERS_*` families, any key starting `_`, and the rest the config
+  reference lists -- keeps its value on the command line, as does a key that is not a plain
+  variable name; either is still shown as the reference. Only a proxy variable referencing the
+  variable of its own name is passed by name regardless. **The `argv` of `OutrigError::Process`
+  and `OutrigError::Canceled` is now the argv as shown**, as `Spawn`'s `command` already was, so
+  for such an entry it is not what ran. `ExecOptions` and `ContainerCreateOptions` show a
+  referenced entry as the reference in `Debug` too. A caller that hands `resolve_mcp_env`'s
+  strings to `with_env` still passes and shows them as written; `resolve_mcp_env_values` and
+  `with_resolved_env` replace that pair.
 
 - **An image rebuilds when a file changes in a build context git ignores.** When an ignore rule
   excluded the context directory or one above it, as for `.agents/` kept out of version control,

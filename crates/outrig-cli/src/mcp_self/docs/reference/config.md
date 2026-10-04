@@ -741,8 +741,11 @@ name must be a valid container image repository component -- see the validation 
 - `context` (path, required\*): path to the build context, same rule.
 - `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
   Keys are ARG names. Values are either literal strings or `${VAR}` references resolved
-  from the host environment at `outrig build` time; see the MCP `env` value syntax
-  below.
+  from the host environment at `outrig build` time. A reference reaches buildah by name and
+  outrig shows it only as the reference, as the
+  [MCP `env` value syntax](#mcp-env-value-syntax) below describes for podman. buildah itself
+  records every build-arg a `RUN` step sees, value included, in the image's history
+  (`podman history --no-trunc`), so a build-arg does not keep a secret out of the image.
 
 ### Use-existing-image (new form)
 
@@ -909,8 +912,10 @@ image, or declare any other MCP command that should run inside the container.
 - `command` (array of strings, required unless using the short form or the entrypoint-stdio
   form): argv of the MCP server.
 - `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
-  invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env` (visible
-  to `podman inspect` on the host, like exec argv).
+  invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env`, which
+  stores them in the container's config, visible to `podman inspect` on the host. A `${VAR}`
+  value reaches podman by name rather than on its command line; see the
+  [value syntax](#mcp-env-value-syntax).
 - `sidecar` (string, optional): run this server in the named
   [`[sidecars.<sc>]`](#sidecarssc) container instead of the primary.
   With `command`, the server is exec-stdio in that container; *without* `command`, that
@@ -951,7 +956,8 @@ Notes:
 - The server name appears in `outrig logs <session> <server>` and as the prefix on every tool
   the server advertises (`<server>__<tool>`).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
-  resolved from the host environment at MCP startup -- see the subsection below.
+  resolved from the host environment at MCP startup and shown only as the reference -- see the
+  subsection below.
 - Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
   repo-config-only and rejected in labels). Repo config entries override image entries by
   server name; see
@@ -1054,6 +1060,45 @@ same syntax `api-key` accepts. Anything else is treated as a literal and passed 
 verbatim, including malformed-looking references (lower-case names, unmatched braces, or
 embedded substitution). If the named host env var is unset when the MCP server is about to
 start, MCP startup fails with an error naming the variable, the server, and the env key.
+
+A reference's value stays out of what outrig prints and off podman's command line, which any
+local user can read with `ps` for as long as the command runs -- for an exec-stdio server, the
+whole session. outrig's errors, the `--verbose` transcript (`container.log` and the terminal),
+and the `RUST_LOG=debug` log all show the entry as `GH_TOKEN=${GITHUB_TOKEN}`, the way the
+config wrote it. podman is given a bare `--env GH_TOKEN`, with the value in podman's own
+environment, which only your user can read, and copies it into the container from there.
+`build-args` reach buildah the same way, as a bare `--build-arg`.
+
+The exception is a key podman or buildah would read from that environment themselves, where
+setting it would change what they do. Such a key keeps its value on the command line, though
+outrig still shows it as the reference:
+
+- process and locale: `HOME`, `PATH`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TZ`,
+  `TZDIR`, `LANG`, `LANGUAGE`, `SUDO_USER`, `container`, and any key starting `LC_`, `LD_`,
+  `XDG_`, or `CLICOLOR`
+- proxies: any key ending `_PROXY`, in either case
+- the Go runtime and its TLS roots: `GODEBUG`, `GOGC`, `GOMAXPROCS`, `GOMEMLIMIT`,
+  `GOTRACEBACK`, `SSL_CERT_FILE`, `SSL_CERT_DIR`
+- systemd and D-Bus: `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`, and any key starting
+  `LISTEN_`, `WATCHDOG_`, or `DBUS_`
+- the containers stack: `REGISTRY_AUTH_FILE`, `REGISTRIES_CONFIG_PATH`, `GNUPGHOME`,
+  `SSH_AUTH_SOCK`, `SOURCE_DATE_EPOCH`, `BUILD_REGISTRY_SOURCES`, `CI_DESIRED_DATABASE`,
+  `SUPPRESS_BOLTDB_WARNING`, `DISABLE_HC_SYSTEMD`, `LOGLEVEL`, `OPT`, `MOBY_DISABLE_PIGZ`,
+  `BBOLT_VERIFY`, `BURNTSUSHI_TOML_110`, and any key starting `CONTAINER_`, `CONTAINERS_`,
+  `STORAGE_`, `BUILDAH_`, `PODMAN_`, `DOCKER_`, `CNI_`, or `OCICRYPT_`
+- internal markers: any key starting `_`, such as `_PODMAN_PAUSE` or `_CONTAINERS_*`
+
+The list covers what podman 4.9 and 5.7 and buildah 1.33 and 1.42 read, including the libraries
+they are built from.
+
+A proxy key that references the variable of its own name, such as
+`HTTPS_PROXY = "${HTTPS_PROXY}"`, is passed by name all the same: podman and buildah already
+have that value and read proxies as they find them. No other key on the list is, even
+self-referenced, because the engine may rewrite its own copy first -- buildah makes a relative
+`TMPDIR` absolute. A key that is not a plain variable name (`^[A-Za-z_][A-Za-z0-9_]*$`) keeps
+its value on the command line too. To keep a secret off it, give the secret a key outside these.
+
+outrig cannot redact what the server, or a build step, prints itself.
 
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md).
 

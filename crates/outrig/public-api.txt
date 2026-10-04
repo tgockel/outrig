@@ -580,6 +580,13 @@ impl outrig::config::OpenAiOptions
 pub fn outrig::config::OpenAiOptions::new() -> Self
 pub fn outrig::config::OpenAiOptions::with_request_timeout_secs(self, u64) -> Self
 pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
+pub struct outrig::config::ResolvedEnvValue
+impl outrig::config::ResolvedEnvValue
+pub fn outrig::config::ResolvedEnvValue::resolve(outrig::config::EnvValue) -> core::result::Result<Self, outrig::config::EnvValueError>
+pub fn outrig::config::ResolvedEnvValue::source(&self) -> &outrig::config::EnvValue
+pub fn outrig::config::ResolvedEnvValue::value(&self) -> &str
+impl core::fmt::Debug for outrig::config::ResolvedEnvValue
+pub fn outrig::config::ResolvedEnvValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::config::SidecarConfig
 pub outrig::config::SidecarConfig::args: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::SidecarConfig::image: alloc::string::String
@@ -776,7 +783,10 @@ pub fn outrig::container::ContainerCreateOptions::new(outrig::image::ImageTag, o
 pub fn outrig::container::ContainerCreateOptions::with_args(self, alloc::vec::Vec<alloc::string::String>) -> Self
 pub fn outrig::container::ContainerCreateOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
 pub fn outrig::container::ContainerCreateOptions::with_intercept_dns(self, bool) -> Self
+pub fn outrig::container::ContainerCreateOptions::with_resolved_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>) -> Self
 pub fn outrig::container::ContainerCreateOptions::with_transcript(self, core::option::Option<outrig::Transcript>) -> Self
+impl core::fmt::Debug for outrig::container::ContainerCreateOptions
+pub fn outrig::container::ContainerCreateOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::container::ContainerInspect
 pub outrig::container::ContainerInspect::image_tag: outrig::image::ImageTag
 pub outrig::container::ContainerInspect::running: bool
@@ -811,7 +821,10 @@ pub outrig::container::ExecOptions::workdir: core::option::Option<std::path::Pat
 impl outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::new() -> Self
 pub fn outrig::container::ExecOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ExecOptions::with_resolved_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>) -> Self
 pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+impl core::fmt::Debug for outrig::container::ExecOptions
+pub fn outrig::container::ExecOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::container::PrimaryView
 pub outrig::container::PrimaryView::helper_host: std::path::PathBuf
 pub outrig::container::PrimaryView::payload_home: alloc::string::String
@@ -1101,7 +1114,10 @@ pub outrig::ExecOptions::workdir: core::option::Option<std::path::PathBuf>
 impl outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::new() -> Self
 pub fn outrig::container::ExecOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ExecOptions::with_resolved_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>) -> Self
 pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+impl core::fmt::Debug for outrig::container::ExecOptions
+pub fn outrig::container::ExecOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::LaunchSpec
 pub outrig::LaunchSpec::embedded_mcp_policy: outrig::EmbeddedMcpPolicy
 pub outrig::LaunchSpec::log_dir: std::path::PathBuf
@@ -1301,4 +1317,5 @@ pub const outrig::PUBLIC_DOC_BASE_URL: &str
 pub const outrig::RESERVED_SERVER: &str
 pub fn outrig::load_project(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<(outrig::config::Config, std::path::PathBuf)>
 pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub fn outrig::resolve_mcp_env_values(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>>
 pub fn outrig::sanitize_tool_name(&str, &str) -> alloc::string::String
