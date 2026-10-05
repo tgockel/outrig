@@ -7,7 +7,9 @@
 //! host-side listener sockets in that namespace. The accepted sockets carry
 //! the original destination metadata; upstream connections are opened from
 //! the host namespace, so OutRig's own traffic is not routed back through the
-//! interceptor.
+//! interceptor. The one destination that names something else there is
+//! pasta's stand-in for the host, which is dialed where pasta would have sent
+//! it; see `HostAlias`.
 //!
 //! Policy evaluation keeps two kinds of evidence apart. The names an
 //! attachment's own DNS listener validated for an address (`ResolvedNames`)
@@ -66,6 +68,12 @@ const NETWORK_LOG: &str = "network.jsonl";
 pub(crate) const INTERCEPT_DNS_NAMESERVER: &str = "127.0.0.1";
 pub(crate) const INTERCEPT_DNS_OPTION: &str = "ndots:0";
 const SO_ORIGINAL_DST: libc::c_int = 80;
+/// The address rootless podman 5 hands pasta as `--map-guest-addr` and maps
+/// `host.containers.internal` to; see [`HostAlias`]. Podman's constant rather
+/// than whatever the container's `/etc/hosts` says: the container can write
+/// that file, and a stand-in read from it would let the container make any
+/// address it liked the host, under a label the policy allows.
+const PASTA_HOST_STAND_IN: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -544,6 +552,13 @@ impl NetworkInterceptor {
         let resolvers = host_resolvers()?;
         let pid = container.pid().await?;
         let sockets = bind_interceptor_sockets(pid)?;
+        // Before the redirect exists, so the probe leaves through pasta the way
+        // a client's connection does without interception.
+        let host_alias = if container.uses_pasta().await? {
+            pasta_host_alias(sockets.probe, PASTA_HOST_STAND_IN).await
+        } else {
+            None
+        };
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
 
@@ -604,6 +619,7 @@ impl NetworkInterceptor {
             self.audit.for_attachment(name, generation),
             bindings.clone(),
             self.policy.clone(),
+            host_alias,
             cancel.clone(),
             live,
         ));
@@ -801,6 +817,8 @@ fn teardown_result(causes: Vec<NetworkTeardownCause>) -> Result<()> {
 struct InterceptorSockets {
     tcp: TcpListener,
     dns: UdpSocket,
+    /// Unconnected, for [`pasta_host_alias`].
+    probe: std::net::TcpStream,
 }
 
 /// Everything the commands that install and remove interception are keyed to.
@@ -1953,6 +1971,7 @@ async fn tcp_accept_loop(
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
+    host_alias: Option<HostAlias>,
     cancel: CancellationToken,
     live: mpsc::Sender<()>,
 ) {
@@ -1967,6 +1986,7 @@ async fn tcp_accept_loop(
         &audit,
         &bindings,
         &policy,
+        host_alias,
         &cancel,
         &conn_cancel,
         &mut conns,
@@ -1994,6 +2014,7 @@ async fn accept_into(
     audit: &AuditSink,
     bindings: &Bindings,
     policy: &Arc<CompiledNetworkPolicy>,
+    host_alias: Option<HostAlias>,
     cancel: &CancellationToken,
     conn_cancel: &CancellationToken,
     conns: &mut JoinSet<()>,
@@ -2028,7 +2049,17 @@ async fn accept_into(
                         let (audit, bindings) = (audit.clone(), bindings.clone());
                         let (policy, cancel) = (policy.clone(), conn_cancel.clone());
                         conns.spawn(async move {
-                            handle_tcp(stream, peer, dst, audit, bindings, policy, cancel).await;
+                            handle_tcp(
+                                stream,
+                                peer,
+                                dst,
+                                host_alias,
+                                audit,
+                                bindings,
+                                policy,
+                                cancel,
+                            )
+                            .await;
                             drop(held);
                         });
                     }
@@ -2108,10 +2139,12 @@ struct ConnOutcome {
 /// Bridges one accepted connection to `dst` and records it. `dst` is the
 /// original destination the redirect displaced, read from the socket by the
 /// accept loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_tcp(
     mut client: TcpStream,
     orig: SocketAddr,
     dst: SocketAddr,
+    host_alias: Option<HostAlias>,
     audit: AuditSink,
     bindings: Bindings,
     policy: Arc<CompiledNetworkPolicy>,
@@ -2160,6 +2193,7 @@ async fn handle_tcp(
                 proxy(
                     &mut client,
                     dst,
+                    upstream_addr(dst, host_alias),
                     &sniffed.initial,
                     &resolved,
                     &policy,
@@ -2188,23 +2222,110 @@ async fn handle_tcp(
     .await;
 }
 
-/// Opens the upstream connection an allowed decision earned and bridges it.
+/// pasta's stand-in for the host, and the address pasta sends it to.
+///
+/// Inside a pasta container, [`PASTA_HOST_STAND_IN`] is redirected by pasta to
+/// a host address of pasta's choosing, so dialed as written from the host's
+/// namespace it reaches nothing. The interceptor dials `host` instead, which
+/// is where pasta would have sent it: a host service listening on every
+/// address answers, and one bound only to loopback stays as unreachable as it
+/// is without interception.
+///
+/// Measured once per attach, by [`pasta_host_alias`], from pasta itself.
+/// Nothing in the container says it: pasta takes the most specific of the
+/// host's addresses on its interface, so beside a `/24` a `/32` wins, while
+/// the container's routing, and with it the address a client connects from,
+/// picks the address whose subnet holds the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostAlias {
+    stand_in: Ipv4Addr,
+    host: Ipv4Addr,
+}
+
+/// How long [`pasta_host_alias`] waits for pasta to carry its probe.
+const ALIAS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Asks pasta where it sends `stand_in`, by having it carry one connection
+/// there. `probe` is an unconnected TCP socket in the container's namespace,
+/// used before the redirect is installed, so the connection leaves through
+/// pasta as a client's would. pasta opens its own from the host to wherever it
+/// maps the stand-in; a listener on every host address takes it, and the
+/// address it arrived at is the answer. The token the probe sends tells it
+/// apart from anything else that connects meanwhile. `None` when pasta
+/// carries nothing there within [`ALIAS_PROBE_TIMEOUT`].
+async fn pasta_host_alias(probe: std::net::TcpStream, stand_in: Ipv4Addr) -> Option<HostAlias> {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let mut token = [0u8; 16];
+    rand::rng().fill_bytes(&mut token);
+    probe.set_nonblocking(true).ok()?;
+    let probe = tokio::net::TcpSocket::from_std_stream(probe);
+
+    let send = async {
+        let mut sent = probe.connect(SocketAddr::from((stand_in, port))).await?;
+        sent.write_all(&token).await?;
+        // Held open until the other side has read it.
+        io::Result::Ok(sent)
+    };
+    let arrive = async {
+        loop {
+            let (mut arrived, _) = listener.accept().await?;
+            let mut heard = [0u8; 16];
+            if arrived.read_exact(&mut heard).await.is_ok() && heard == token {
+                return arrived.local_addr();
+            }
+        }
+    };
+    let (_, arrived) = tokio::time::timeout(ALIAS_PROBE_TIMEOUT, async {
+        tokio::try_join!(send, arrive)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    match arrived.ip() {
+        IpAddr::V4(host) => Some(HostAlias { stand_in, host }),
+        IpAddr::V6(_) => None,
+    }
+}
+
+/// Where the upstream connection for `dst` is dialed, from the host's
+/// namespace: `dst` itself, or the alias's `host` on the same port when `dst`
+/// is its stand-in. Only the dial moves; policy and the audit record keep
+/// `dst`. Podman maps no IPv6 stand-in.
+fn upstream_addr(dst: SocketAddr, host_alias: Option<HostAlias>) -> SocketAddr {
+    match (dst.ip(), host_alias) {
+        (IpAddr::V4(to), Some(alias)) if to == alias.stand_in => {
+            SocketAddr::from((alias.host, dst.port()))
+        }
+        _ => dst,
+    }
+}
+
+/// Opens the upstream connection an allowed decision earned, at `dial`, and
+/// bridges it. `dst` is still what the connection is judged by; `dial` is
+/// where [`upstream_addr`] put it.
 async fn proxy(
     client: &mut TcpStream,
     dst: SocketAddr,
+    dial: SocketAddr,
     initial: &[u8],
     resolved: &ResolvedNames,
     policy: &CompiledNetworkPolicy,
     outcome: &mut ConnOutcome,
 ) {
-    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
+    let via = if dial == dst {
+        String::new()
+    } else {
+        format!(" via {dial}")
+    };
+    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dial)).await {
         Ok(Ok(upstream)) => upstream,
         Ok(Err(e)) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst} failed: {e}");
+            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} failed: {e}");
             return;
         }
         Err(e) => {
-            tracing::warn!(target: "outrig::network", "connect upstream {dst} timed out: {e}");
+            tracing::warn!(target: "outrig::network", "connect upstream {dst}{via} timed out: {e}");
             return;
         }
     };
@@ -2959,25 +3080,29 @@ fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
     let net_ns_path = format!("/proc/{pid}/ns/net");
     let user_ns = StdFile::open(&user_ns_path).path_ctx("open", &user_ns_path)?;
     let net_ns = StdFile::open(&net_ns_path).path_ctx("open", &net_ns_path)?;
-    let (tcp, dns) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
+    let (tcp, dns, probe) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
     let tcp = std::net::TcpListener::from(tcp);
     tcp.set_nonblocking(true)?;
 
     Ok(InterceptorSockets {
         tcp: TcpListener::from_std(tcp)?,
         dns: dns_listener(dns)?,
+        probe: std::net::TcpStream::from(probe),
     })
 }
 
-fn bind_interceptor_socket_fds(user_ns: RawFd, net_ns: RawFd) -> io::Result<(OwnedFd, OwnedFd)> {
+fn bind_interceptor_socket_fds(
+    user_ns: RawFd,
+    net_ns: RawFd,
+) -> io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
     let (status, fds) =
         nsfork::fork_collect(|sock| child_bind_and_send_fds(sock, user_ns, net_ns))?;
     if status != nsfork::Status::OK {
         return Err(bind_failure(status));
     }
     let mut fds = fds.into_iter();
-    match (fds.next(), fds.next()) {
-        (Some(tcp), Some(dns)) => Ok((tcp, dns)),
+    match (fds.next(), fds.next(), fds.next()) {
+        (Some(tcp), Some(dns), Some(probe)) => Ok((tcp, dns, probe)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "network namespace helper did not return listener sockets",
@@ -2994,6 +3119,7 @@ enum BindStep {
     SetnsNet = 2,
     TcpListener = 3,
     DnsListener = 4,
+    AddressProbe = 5,
 }
 
 impl BindStep {
@@ -3003,6 +3129,7 @@ impl BindStep {
             BindStep::SetnsNet,
             BindStep::TcpListener,
             BindStep::DnsListener,
+            BindStep::AddressProbe,
         ]
         .into_iter()
         .find(|step| *step as u32 == code)
@@ -3014,6 +3141,7 @@ impl BindStep {
             BindStep::SetnsNet => "enter the container's network namespace",
             BindStep::TcpListener => "bind the TCP listener",
             BindStep::DnsListener => "bind the DNS listener on port 53",
+            BindStep::AddressProbe => "open the host alias probe",
         }
     }
 }
@@ -3052,11 +3180,20 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
         Ok(socket) => socket,
         Err(e) => return fail(BindStep::DnsListener, e),
     };
+    let probe = match nix::sys::socket::socket(
+        nix::sys::socket::AddressFamily::Inet,
+        SockType::Stream,
+        nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        None,
+    ) {
+        Ok(socket) => socket,
+        Err(e) => return fail(BindStep::AddressProbe, e.into()),
+    };
 
     let _ = nsfork::send_status(
         sock,
         nsfork::Status::OK,
-        &[tcp.as_raw_fd(), dns.as_raw_fd()],
+        &[tcp.as_raw_fd(), dns.as_raw_fd(), probe.as_raw_fd()],
     );
 }
 
@@ -5947,16 +6084,22 @@ mod tests {
 
     /// Brings up one connection through `handle_tcp` and returns once bytes
     /// have demonstrably crossed it in both directions, so a test that then
-    /// cancels is cancelling something that was working.
-    async fn live_connection(dir: &Path) -> LiveConnection {
+    /// cancels is cancelling something that was working. With a
+    /// `host_alias`, the client asks for its stand-in at the upstream's port
+    /// rather than for the upstream itself.
+    async fn live_connection(dir: &Path, host_alias: Option<HostAlias>) -> LiveConnection {
         let (mut client, intercepted, orig) = accepted_connection().await;
-        let (dst, upstream) = upstream_once().await;
+        let (upstream_at, upstream) = upstream_once().await;
+        let dst = host_alias.map_or(upstream_at, |alias| {
+            SocketAddr::from((alias.stand_in, upstream_at.port()))
+        });
         let cancel = CancellationToken::new();
         let mut tasks = JoinSet::new();
         tasks.spawn(handle_tcp(
             intercepted,
             orig,
             dst,
+            host_alias,
             audit_sink(dir).await,
             empty_bindings(),
             allow_all_policy(),
@@ -5966,7 +6109,10 @@ mod tests {
         // Written before the upstream is accepted: this is the client's
         // opening burst, which the sniff reads and the bridge forwards.
         client.write_all(b"before\n").await.expect("write before");
-        let mut upstream = upstream.await.expect("upstream accepted");
+        let mut upstream = tokio::time::timeout(Duration::from_secs(5), upstream)
+            .await
+            .expect("the bridge should reach the upstream")
+            .expect("upstream accepted");
         let mut sent = [0u8; 7];
         upstream
             .read_exact(&mut sent)
@@ -6002,7 +6148,7 @@ mod tests {
             mut upstream,
             mut tasks,
             cancel,
-        } = live_connection(dir.path()).await;
+        } = live_connection(dir.path(), None).await;
 
         cancel.cancel();
         let failures = stop_tasks(&mut tasks).await;
@@ -6028,7 +6174,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let LiveConnection {
             mut tasks, cancel, ..
-        } = live_connection(dir.path()).await;
+        } = live_connection(dir.path(), None).await;
 
         cancel.cancel();
         stop_tasks(&mut tasks).await;
@@ -6057,6 +6203,7 @@ mod tests {
             intercepted,
             orig,
             dst,
+            None,
             audit_sink(dir.path()).await,
             empty_bindings(),
             allow_all_policy(),
@@ -6078,6 +6225,76 @@ mod tests {
         assert_eq!(record["conn_state"], "S0");
     }
 
+    /// Only the stand-in moves, and only to the alias's host.
+    #[test]
+    fn only_the_host_stand_in_is_dialed_elsewhere() {
+        let alias = Some(HostAlias {
+            stand_in: PASTA_HOST_STAND_IN,
+            host: Ipv4Addr::new(192, 168, 1, 155),
+        });
+        let to_host = SocketAddr::from((PASTA_HOST_STAND_IN, 8080));
+        assert_eq!(
+            upstream_addr(to_host, alias),
+            SocketAddr::from(([192, 168, 1, 155], 8080))
+        );
+        // A network with no alias, and every other destination, are dialed as
+        // asked.
+        assert_eq!(upstream_addr(to_host, None), to_host);
+        let elsewhere = SocketAddr::from(([203, 0, 113, 7], 443));
+        assert_eq!(upstream_addr(elsewhere, alias), elsewhere);
+        // An IPv6 flow is never the stand-in, whatever its bits spell.
+        let mapped = SocketAddr::from((PASTA_HOST_STAND_IN.to_ipv6_mapped(), 8080));
+        assert_eq!(upstream_addr(mapped, alias), mapped);
+    }
+
+    /// A connection to the stand-in is bridged to the alias's host, on the
+    /// port it asked for, and recorded against the stand-in. Dialed literally
+    /// it would wait out `CONNECT_TIMEOUT` instead.
+    #[tokio::test]
+    async fn a_connection_to_the_host_stand_in_is_dialed_at_the_aliased_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let alias = HostAlias {
+            stand_in: PASTA_HOST_STAND_IN,
+            host: Ipv4Addr::LOCALHOST,
+        };
+        let LiveConnection {
+            upstream,
+            mut tasks,
+            cancel,
+            ..
+        } = live_connection(dir.path(), Some(alias)).await;
+        let port = upstream.local_addr().expect("upstream addr").port();
+
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["id.resp_h"], "169.254.1.2");
+        assert_eq!(record["id.resp_p"], port);
+    }
+
+    /// The alias is the address the probe's connection arrives at, not the
+    /// one the listener waiting for it is bound to. Without pasta, a probe
+    /// sent to `127.0.0.2` arrives there.
+    #[tokio::test]
+    async fn the_alias_is_the_address_the_probe_arrives_at() {
+        let probe = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Inet,
+            SockType::Stream,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("probe socket");
+        let stand_in = Ipv4Addr::new(127, 0, 0, 2);
+        assert_eq!(
+            pasta_host_alias(std::net::TcpStream::from(probe), stand_in).await,
+            Some(HostAlias {
+                stand_in,
+                host: stand_in,
+            })
+        );
+    }
+
     /// A connection parked with nothing to wake it -- neither peer speaks,
     /// neither closes -- is *terminated* by the cancel, not left running
     /// unwatched. The client's read returning EOF the moment the stop call
@@ -6091,7 +6308,7 @@ mod tests {
             upstream,
             mut tasks,
             cancel,
-        } = live_connection(dir.path()).await;
+        } = live_connection(dir.path(), None).await;
         // Held open and silent for the rest of the test: the bridge has
         // nothing to copy and no timer to expire.
         let _upstream = upstream;
@@ -6398,6 +6615,7 @@ mod tests {
             &audit,
             &empty_bindings(),
             &deny_all_policy(),
+            None,
             &cancel,
             &conn_cancel,
             &mut conns,
@@ -6446,6 +6664,7 @@ mod tests {
                 intercepted,
                 orig,
                 dst,
+                None,
                 audit.clone(),
                 empty_bindings(),
                 allow_all_policy(),
@@ -6479,6 +6698,7 @@ mod tests {
             audit_sink(dir.path()).await,
             empty_bindings(),
             allow_all_policy(),
+            None,
             cancel.clone(),
             mpsc::channel(1).0,
         ));
@@ -6523,6 +6743,7 @@ mod tests {
                 audit.clone(),
                 empty_bindings(),
                 allow_all_policy(),
+                None,
                 cancel.clone(),
                 mpsc::channel(1).0,
             ));
@@ -6684,6 +6905,7 @@ mod tests {
             audit_sink(dir.path()).await,
             empty_bindings(),
             allow_all_policy(),
+            None,
             cancel.clone(),
             mpsc::channel(1).0,
         ));

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`host.containers.internal` reaches the host under `--network audit` and `filter` on podman
+  5.** A tool reaching a service on the host by that name, or `host.docker.internal`, timed out
+  after 20 seconds once interception was on, and the connection was recorded as allowed with zero
+  bytes. Podman 5's pasta maps the alias to `169.254.1.2`, an address only the container
+  understands, and the interceptor now dials it where pasta would. Its record still names
+  `169.254.1.2`, so a filter entry for the host names that address; see the `[network]` reference.
+  Fixed in `outrig`; see that crate's changelog.
 - **A local model loaded by `model-path` answers prompts.** The model loaded, and then every
   request to it failed with `ModelNotFound("<file name>")`, including a subagent's and a local
   fallback's in an alias chain. The request named the GGUF file, and mistralrs had registered the

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`host.containers.internal` reaches the host under audit and filter on podman 5.** Rootless
+  podman 5 networks a container with pasta and maps the alias, and `host.docker.internal`, to
+  `169.254.1.2`, which pasta's `--map-guest-addr` sends to the address it assigned the container
+  -- by default the host's own. The interceptor dialed that address as written from the host's
+  namespace, where it means nothing, so the connection waited out the 20-second connect timeout
+  and was recorded as allowed with zero bytes. `NetworkInterceptor::attach` now reads the
+  container's network mode from podman and, for a `pasta` container, measures where pasta sends
+  `169.254.1.2` by having pasta carry one connection there before interception is installed. A
+  connection to `169.254.1.2` is dialed at that host address -- pasta's own choice, which on a
+  host with several addresses need not be the container's source address. Policy and the
+  `network.jsonl` record still see `169.254.1.2`. A host service bound
+  only to loopback stays unreachable through the alias, as it is without interception. Other
+  network modes are unchanged; under podman 4 the alias is the host's own address and always
+  worked.
+
 ## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.1) - 2026-10-04
 
 The first patch release since 0.2.0. Every change to the public surface is additive -- the three

@@ -838,16 +838,8 @@ impl Container {
     }
 
     async fn inspect_pid(&self) -> Result<u32> {
-        let output = process::run_capture_logged(
-            Cmd::new("podman")
-                .args(["inspect", "--format", "{{.State.Pid}}"])
-                .arg(&self.name),
-            "podman",
-            self.transcript.as_ref(),
-        )
-        .await?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let pid = text.trim().parse::<u32>().map_err(|e| {
+        let text = self.inspect_format("{{.State.Pid}}").await?;
+        let pid = text.parse::<u32>().map_err(|e| {
             OutrigError::Configuration(format!(
                 "podman inspect {} returned invalid pid: {e}",
                 self.name
@@ -861,6 +853,27 @@ impl Container {
             )));
         }
         Ok(pid)
+    }
+
+    /// Whether podman networks the container with pasta, rootless podman 5's
+    /// default (4's is `slirp4netns`; rootful is `bridge`). Read from podman's
+    /// own state, so nothing inside the container can change the answer, and it
+    /// reads the same before `podman start` as after.
+    pub(crate) async fn uses_pasta(&self) -> Result<bool> {
+        Ok(self.inspect_format("{{.HostConfig.NetworkMode}}").await? == "pasta")
+    }
+
+    /// `podman inspect --format <format>` of this container, trimmed.
+    async fn inspect_format(&self, format: &str) -> Result<String> {
+        let output = process::run_capture_logged(
+            Cmd::new("podman")
+                .args(["inspect", "--format", format])
+                .arg(&self.name),
+            "podman",
+            self.transcript.as_ref(),
+        )
+        .await?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
     /// Whether the interceptor's resolver was baked in at create time; see

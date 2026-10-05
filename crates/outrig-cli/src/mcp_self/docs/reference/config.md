@@ -213,11 +213,18 @@ A hostname `allow` entry with no binding simply does not match. Evaluation conti
 remaining entries and then `default`; the entry is never turned into a deny, so
 `default = "allow"` keeps meaning what it says.
 
-Two consequences worth planning for:
+Three consequences worth planning for:
 
 - A container that reaches an address without asking the interceptor's resolver -- a baked
   `/etc/hosts` entry, a hardcoded address, DNS carried over TCP or HTTPS -- earns no binding, so
   hostname `allow` entries do not cover it. Address and CIDR entries still do.
+- `host.containers.internal` and `host.docker.internal`, which reach the host, are such
+  `/etc/hosts` entries, so an entry naming them never matches; name their address instead. Under
+  podman 5's default rootless network, pasta, that is `169.254.1.2`, an address that means the
+  host only inside the container -- so `"169.254.1.2:8080"` allows one host port, and a deny
+  covering `169.254.0.0/16` covers the host too. Under podman 4 it is the host's own address.
+  Either way the connection reaches what it would with interception off, which excludes a host
+  service listening only on loopback, and its record names the address the container asked for.
 - A host glob with no letter in it (`*`, `10.0.*`, `192.168.*`) describes addresses rather than
   names: it is matched against the destination address and never against a resolved name, so a
   registrable hostname that happens to match it (`10.0.attacker.example` against `10.0.*`)

@@ -493,6 +493,105 @@ async fn curl_http_host_writes_allow_audit_record() {
     container.stop(Duration::from_secs(2)).await.expect("stop");
 }
 
+/// Every IPv4 address the host has, loopback included.
+fn host_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let mut found: Vec<Ipv4Addr> = nix::ifaddrs::getifaddrs()
+        .expect("list the host's addresses")
+        .filter_map(|ifaddr| Some(ifaddr.address?.as_sockaddr_in()?.ip()))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Under interception `host.containers.internal` reaches the very host
+/// address it reaches without. A listener on each of the host's IPv4
+/// addresses shares one port, and only the one the alias lands on with
+/// interception off may hear from it. Under pasta that is an address of
+/// pasta's own choosing, which on a host with several need not be the one the
+/// container connects from; the host's loopback is never it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_alias_reaches_the_address_it_reaches_without_interception() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let image_context = tempfile::tempdir().expect("image context");
+    write_curl_image_context(image_context.path());
+    let image = ensure_curl_image(image_context.path()).await;
+    let workspace = tempfile::tempdir().expect("workspace");
+    let session = tempfile::tempdir().expect("session");
+    let log_dir = session.path().join("logs");
+
+    let container = start_bootstrapped_container(&image, workspace.path()).await;
+    let host_ip = container_host_ipv4(&container);
+
+    // Never accepted from until curl is done, so a connection that reached a
+    // listener waits in its backlog for `accept` to find, and nothing answers.
+    let landing =
+        std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind landing listener");
+    landing
+        .set_nonblocking(true)
+        .expect("landing listener nonblocking");
+    let landing_port = landing.local_addr().expect("landing addr").port();
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &["--max-time", "2"],
+        &format!("http://{host_ip}:{landing_port}/"),
+    ));
+    let (arrived, _) = landing
+        .accept()
+        .expect("the alias should reach the host without interception");
+    let expected = arrived.local_addr().expect("arrival addr").ip();
+    let addresses = host_ipv4_addresses();
+    assert!(
+        addresses.iter().any(|addr| IpAddr::V4(*addr) == expected),
+        "the alias landed at {expected}, which is none of the host's addresses: {addresses:?}"
+    );
+
+    let interceptor = NetworkInterceptor::start(&container, &log_dir, container.session_suffix())
+        .await
+        .expect("start network interceptor");
+
+    let mut port = 0;
+    let listeners: Vec<_> = addresses
+        .iter()
+        .map(|addr| {
+            let listener = std::net::TcpListener::bind((*addr, port))
+                .unwrap_or_else(|e| panic!("bind {addr}:{port}: {e}"));
+            listener
+                .set_nonblocking(true)
+                .expect("listener nonblocking");
+            port = listener.local_addr().expect("listener addr").port();
+            (*addr, listener)
+        })
+        .collect();
+    let _ = try_capture(&mut curl_cmd(
+        &container,
+        &["--max-time", "2"],
+        &format!("http://{host_ip}:{port}/"),
+    ));
+    for (addr, listener) in &listeners {
+        let heard = listener.accept().is_ok();
+        let should = IpAddr::V4(*addr) == expected;
+        assert_eq!(
+            heard,
+            should,
+            "under interception the alias should reach {expected} and nothing else, but \
+             {addr}:{port} {} from it",
+            if heard { "heard" } else { "did not hear" }
+        );
+    }
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filter_mode_denies_matching_host_before_upstream_bytes() {
     let _guard = E2E_LOCK.lock().await;
