@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.1) - 2026-10-04
+
+The first patch release since 0.2.0. Every change to the public surface is additive -- the three
+items under **Added** -- and the one requirement that moves is rmcp, now 3.4.1 or newer. Two of
+the fixes change what a consumer sees without asking: every container now runs with
+`--image-volume=ignore`, so a path an image declares as a `VOLUME` holds what the image's layers
+put there rather than an empty volume, and a `~` that starts a config path now stands for the
+home directory. The rest are fixes, each described below.
 
 ### Added
 

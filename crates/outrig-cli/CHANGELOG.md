@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.1) - 2026-10-04
+
+The first patch release since 0.2.0: fixes, and one change to the MCP revision `outrig mcp`
+negotiates. Two of the fixes are worth knowing before upgrading. A session whose default
+workspace would be your home directory, or a directory above it, now refuses to start rather than
+mount it read-write; declare `[workspace] host-path` to mount it on purpose. And every build image
+whose context is in a git repository gets a new cache key, so each rebuilds once.
 
 ### Changed
 

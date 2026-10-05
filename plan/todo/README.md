@@ -10,12 +10,13 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Active phases
 
-- [0002 -- sidecars](../phase/0002-sidecars/README.md) -- tools move out of the agent's
-  primary image and into sidecar containers OutRig places, and the public surface of both
-  crates is narrowed, sealed, and frozen for 0.2.0.
+None. The next phase opens when `plan/next/` is groomed into a numbered queue.
 
 ## Recently completed
 
+- [0002 -- sidecars](../done/phase/0002-sidecars/README.md) -- closed 2026-10-04, at the
+  0.2.0 tags. Tools moved out of the agent's primary image and into sidecar containers OutRig
+  places, and the public surface of both crates was narrowed, sealed, and frozen.
 - [0001 -- bootstrap](../done/phase/0001-bootstrap/README.md) -- closed 2026-06-26.
 
 ## Per-step index
