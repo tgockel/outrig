@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`outrig discard` and `outrig clean` remove only what outrig wrote.** `--session-dir` took any
+  existing directory, and discard and clean later removed it recursively with the session, so
+  `--session-dir .` in a checkout, or a directory of notes, went with it. `--session-dir` now has
+  to be empty or not exist yet -- outrig creates it -- and one that holds anything, even a
+  `.gitkeep`, is refused. Removal deletes `session.json`, `logs/`, and `outrig-enter`, then the
+  directory only if that empties it; a directory that holds anything else stays, and the command
+  names what it kept. That covers sessions already written into such a directory, except that a
+  `logs/` the directory had before the session goes with the session's logs. And `discard
+  --session-dir` given a session's link under the session root removes the directory the link
+  names; it removed only the link, and reported the directory removed.
 - **`host.containers.internal` reaches the host under `--network audit` and `filter` on podman
   5.** A tool reaching a service on the host by that name, or `host.docker.internal`, timed out
   after 20 seconds once interception was on, and the connection was recorded as allowed with zero

@@ -107,7 +107,7 @@ fn resolve_logs_dir(
     cwd: &Path,
 ) -> Result<PathBuf> {
     if let Some(dir) = args.session_dir.as_deref() {
-        return Ok(dir.join("logs"));
+        return Ok(dir.join(session::LOGS_DIR));
     }
     let Some(query) = args.session.as_deref() else {
         return Err(OutrigError::Configuration(
@@ -123,7 +123,7 @@ fn resolve_logs_dir(
     )?;
     let store = SessionStore::new(root);
     let (dir, _) = super::resolve_session_arg(&store, query)?;
-    Ok(dir.join("logs"))
+    Ok(dir.join(session::LOGS_DIR))
 }
 
 async fn list_logs<W, E>(stdout: &mut W, stderr: &mut E, logs_dir: &Path) -> Result<()>

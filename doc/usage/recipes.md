@@ -132,7 +132,9 @@ $ tail -f /tmp/outrig-experiment/logs/shell.stderr
 ```
 
 `--session-dir` writes the session content under `/tmp/outrig-experiment/` and adds a symlink
-`<session-root>/<sid> -> /tmp/outrig-experiment/` so the run still appears in `outrig ls`. To
+`<session-root>/<sid> -> /tmp/outrig-experiment/` so the run still appears in `outrig ls`. The
+directory has to be empty or not exist yet, so a second run with the same path is refused while
+the first run's session is there: discard it first, or give each run its own path. To
 move the *root* (where new auto-generated sessions live) for the duration of one command, use
 `--session-root` instead:
 

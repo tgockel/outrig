@@ -18,7 +18,7 @@ pub mod session_setup;
 pub mod volume_arg;
 pub mod watcher;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{OutrigError, Result};
 use crate::session::{Session, SessionId, SessionStore, SkippedSession};
@@ -78,4 +78,24 @@ pub fn resolve_session_arg(store: &SessionStore, query: &str) -> Result<(PathBuf
             Err(OutrigError::Configuration(msg).into())
         }
     }
+}
+
+/// What `discard` and `clean` print for one removed session. `left` is what
+/// its directory still holds, as `SessionStore::remove_by_id` returns it:
+/// empty when the directory went with the record, otherwise the files outrig
+/// did not write, which stay -- and so does the directory.
+pub fn removal_report(dir: &Path, left: &[String]) -> String {
+    if left.is_empty() {
+        return format!("[outrig] removed {}\n", dir.display());
+    }
+    let (shown, rest) = left.split_at(left.len().min(5));
+    let mut names = shown.join(", ");
+    if !rest.is_empty() {
+        names += &format!(", and {} more", rest.len());
+    }
+    format!(
+        "[outrig] removed the session record from {dir}\n\
+         [outrig] kept {dir}, which also holds {names}\n",
+        dir = dir.display()
+    )
 }

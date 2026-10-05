@@ -232,15 +232,18 @@ outrig run [--agent <name>]
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this session.
-- `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): specific directory for this run;
+  must be empty or not exist yet.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, beyond the default workspace mount. Read-only unless `:rw`; host dir must exist.
 - `-v`, `--verbose` (default: off): print container lifecycle traces.
 
-When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly
-under `<path>`, and additionally creates a symlink `<session-root>/<sid> -> <path>` so
-`outrig ls`/`logs`/`discard`/`clean` still find it. When omitted, outrig auto-generates a
-session id and writes to `<session-root>/<sid>/` directly.
+When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`, and
+`outrig-enter` (only for a `view = "primary"` sidecar) directly under `<path>`, and
+additionally creates a symlink `<session-root>/<sid> -> <path>` so
+`outrig ls`/`logs`/`discard`/`clean` still find it. A `<path>` that does not exist is created,
+with any missing parents; one that already holds anything is refused. When omitted, outrig
+auto-generates a session id and writes to `<session-root>/<sid>/` directly.
 
 Reads the global and repo configs, resolves agent -> model -> provider, builds the image
 (cache-hit if possible), starts the container, attaches every MCP server, opens the REPL. Exits
@@ -296,7 +299,7 @@ outrig mcp self
 | `--listen <addr>`      | off                          | Serve Streamable HTTP at `/mcp`.      |
 | `--env <KEY=VALUE>`    | --                           | Override MCP env; repeatable. As run.  |
 | `--network <default|audit|filter>`| config, else `default` | Network monitoring mode.       |
-| `--session-dir <path>` | `<session-root>/<sid>` (auto)| Specific directory for this server.   |
+| `--session-dir <path>` | `<session-root>/<sid>` (auto)| New or empty dir for this server.     |
 | `--volume <spec>`      | --                           | Extra bind mount; not with --attach.  |
 | `-v`, `--verbose`      | off                          | Print container lifecycle traces.     |
 
@@ -423,7 +426,7 @@ on `<session>` is allowed if unambiguous.
 
 ### `outrig discard`
 
-Delete a session's on-disk record (logs and metadata).
+Delete a session's on-disk record (`session.json`, `logs/`, `outrig-enter`) and its directory.
 
 ```
 outrig discard [<session>] [--yes]
@@ -439,8 +442,10 @@ outrig discard [<session>] [--yes]
 
 `<session>` and `--session-dir` are mutually exclusive. If the session was created via
 `outrig run --session-dir <path>` (i.e. lives at a user-chosen path with a symlink in the root),
-discard removes the real directory **and** the symlink. Refuses if the session's container is
-still running. Discards the session directory only -- your repository is untouched.
+discard removes the real directory **and** the symlink; `--session-dir` given that symlink
+discards the directory it names. Discard removes the record's three names and nothing else: a
+directory that also holds anything else stays, and discard names what it kept. Refuses if the
+session's container is still running.
 
 ### `outrig clean`
 
@@ -464,7 +469,8 @@ outrig clean [--older-than <duration>]
 Durations are positive integers with `s`, `m`, `h`, or `d` units, for example `12h` or `7d`.
 The command previews matching sessions and asks once before deleting unless `--yes` is set.
 Running sessions are skipped. Sessions created with `--session-dir` remove both the symlink
-target and the symlink under the session root. Alongside the record walk, `clean` sweeps
+target and the symlink under the session root. As with `discard`, a directory that holds
+anything besides the record stays. Alongside the record walk, `clean` sweeps
 *stray containers*: containers carrying `org.outrig.session` whose session record is gone.
 Stopped strays older than the cutoff are removed; running ones are only reported.
 

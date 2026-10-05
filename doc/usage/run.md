@@ -56,7 +56,7 @@ outrig run [--agent <name>]
   choose Podman's default networking, network audit logging, or global network filtering for
   this run.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): this run's specific session
-  directory; symlinked from the root.
+  directory, which must be empty or not exist yet; symlinked from the root.
 - `--session-root <path>` (default: `session-root` config, else XDG): root directory
   containing all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
@@ -96,17 +96,21 @@ An env value that came from a `${VAR}` reference appears in that line as `'KEY=$
 as its value. Pasted as shown, the single quotes would hand podman that literal text; to rerun
 the command by hand, write it as `"KEY=${VAR}"` so your shell fills the value in.
 
-When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
-`<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`
-keep working. This lets you launch with a known path and read `session.json` immediately without
-looking up an auto-generated id:
+When `--session-dir` is given, outrig writes this run's `session.json`, `logs/`, and (for a
+`view = "primary"` sidecar) `outrig-enter` directly into `<path>` and creates a symlink at
+`<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard` keep working. This lets you
+launch with a known path and read `session.json` immediately without looking up an
+auto-generated id:
 
 ```sh
 $ outrig run --session-dir /tmp/my-debug-run < prompts.txt
 $ cat /tmp/my-debug-run/session.json   # known location, no id lookup needed
 ```
 
-`--session-dir` refuses if the path already contains a `session.json`.
+`<path>` has to be empty or not exist yet; outrig creates it, with any missing parents. A path
+that already holds anything -- even a `.gitkeep`, or an earlier run's `session.json` -- is
+refused, because `outrig discard` removes the directory along with the session. See
+[Sessions](sessions.md#outrig-discard).
 
 ## Config-less runs
 

@@ -246,10 +246,12 @@ where
 
     let mut removed = 0usize;
     for target in &targets {
-        store.remove_by_id(&target.session.id)?;
+        // What the session's directory still holds -- files outrig did not
+        // write, which stay. Not a failure, unlike `kept` below.
+        let left = store.remove_by_id(&target.session.id)?;
         removed += 1;
 
-        let dir_msg = format!("[outrig] removed {}\n", target.dir.display());
+        let dir_msg = super::removal_report(&target.dir, &left);
         stderr.write_all(dir_msg.as_bytes()).await?;
         if target.session.link_target.is_some() {
             let link_path = store.symlink_path(&target.session.id);

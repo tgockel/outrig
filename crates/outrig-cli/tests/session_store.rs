@@ -7,7 +7,10 @@ use outrig::error::OutrigError;
 use outrig_cli::session::{SessionId, SessionStore};
 
 mod common;
-use common::{as_legacy_image_key, drop_image_tag, sample_session, write_raw_session};
+use common::{
+    as_legacy_image_key, assert_only_user_files_left, drop_image_tag, sample_session,
+    write_outrig_entries, write_raw_session, write_user_files,
+};
 
 #[test]
 fn auto_path_creates_session_json() {
@@ -81,12 +84,95 @@ fn explicit_path_with_existing_session_json_errors() {
     match err {
         OutrigError::Configuration(msg) => {
             assert!(
-                msg.contains("already contains session.json"),
-                "expected 'already contains' message, got: {msg}"
+                msg.contains("holds an earlier session's record"),
+                "expected 'earlier session' message, got: {msg}"
             );
         }
         other => panic!("expected Configuration error, got: {other:?}"),
     }
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "a refused directory gets no link"
+    );
+}
+
+/// #326: an explicit directory has to start empty. One that already held the
+/// user's files used to be taken, and discard then removed it whole.
+#[test]
+fn explicit_path_that_is_not_empty_is_refused_before_anything_is_written() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    std::fs::write(explicit.path().join("KEEP_ME.txt"), b"my notes\n").expect("preseed");
+
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let mut session = sample_session(&sid);
+
+    let err = store
+        .create(&sid, Some(explicit.path()), &mut session)
+        .expect_err("create should refuse");
+    match err {
+        OutrigError::Configuration(msg) => {
+            assert!(
+                msg.contains("is not empty (it holds KEEP_ME.txt)"),
+                "expected the entry named, got: {msg}"
+            );
+        }
+        other => panic!("expected Configuration error, got: {other:?}"),
+    }
+    let names: Vec<_> = std::fs::read_dir(explicit.path())
+        .expect("read explicit")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    assert_eq!(names, ["KEEP_ME.txt"], "nothing is written beside the file");
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "a refused directory gets no link"
+    );
+}
+
+#[test]
+fn explicit_path_that_does_not_exist_is_created() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let explicit = parent.path().join("runs/run-1");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T141907-9b1c".into());
+    let mut session = sample_session(&sid);
+
+    let returned = store
+        .create(&sid, Some(&explicit), &mut session)
+        .expect("create");
+    let canon = std::fs::canonicalize(&explicit).expect("the directory should be created");
+    assert_eq!(returned, canon);
+    assert!(canon.join("session.json").exists());
+    let target = std::fs::read_link(root.path().join(sid.as_str())).expect("read_link");
+    assert_eq!(target, canon);
+}
+
+#[test]
+fn explicit_path_that_is_a_file_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let file = parent.path().join("notes.txt");
+    std::fs::write(&file, b"my notes\n").expect("write file");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let mut session = sample_session(&sid);
+
+    let err = store
+        .create(&sid, Some(&file), &mut session)
+        .expect_err("create should refuse");
+    match err {
+        OutrigError::Configuration(msg) => {
+            assert!(
+                msg.contains("exists and is not a directory"),
+                "expected 'not a directory' message, got: {msg}"
+            );
+        }
+        other => panic!("expected Configuration error, got: {other:?}"),
+    }
+    assert_eq!(std::fs::read(&file).expect("file kept"), b"my notes\n");
 }
 
 #[test]
@@ -217,11 +303,16 @@ fn remove_by_id_symlinked_removes_target_and_link() {
     let link = root.path().join(sid.as_str());
     assert!(link.exists());
     assert!(canon.join("session.json").exists());
+    write_outrig_entries(&canon);
 
-    store.remove_by_id(&sid).expect("remove");
+    let left = store.remove_by_id(&sid).expect("remove");
     assert!(
-        !canon.join("session.json").exists(),
-        "explicit dir contents should be removed"
+        left.is_empty(),
+        "nothing but the record was there: {left:?}"
+    );
+    assert!(
+        !canon.exists(),
+        "a directory holding only the record should be removed"
     );
     assert!(
         std::fs::symlink_metadata(&link).is_err(),
@@ -229,6 +320,151 @@ fn remove_by_id_symlinked_removes_target_and_link() {
     );
     // tempfile cleanup of `explicit` is fine even though the dir is now gone.
     drop(explicit);
+}
+
+/// #326: removal deletes `session.json`, `logs/`, and `outrig-enter` and
+/// nothing else, so a directory that also holds the user's files stays with
+/// them. Files are added after `create` because it now refuses a non-empty
+/// directory; the result is the shape a record written before 0.2.2 has.
+#[test]
+fn remove_by_id_symlinked_keeps_what_outrig_did_not_write() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let canon = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+    write_outrig_entries(&canon);
+    write_user_files(&canon);
+
+    let left = store.remove_by_id(&sid).expect("remove");
+    assert_eq!(left, ["KEEP_ME.txt", "photos"]);
+    assert_only_user_files_left(&canon);
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "the link goes even though the directory stays"
+    );
+}
+
+#[test]
+fn remove_by_id_auto_keeps_what_outrig_did_not_write() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let dir = store
+        .create(&sid, None, &mut sample_session(&sid))
+        .expect("create");
+    write_outrig_entries(&dir);
+    write_user_files(&dir);
+
+    let left = store.remove_by_id(&sid).expect("remove");
+    assert_eq!(left, ["KEEP_ME.txt", "photos"]);
+    assert_only_user_files_left(&dir);
+}
+
+#[test]
+fn remove_by_path_keeps_what_outrig_did_not_write() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let canon = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+    write_outrig_entries(&canon);
+    write_user_files(&canon);
+
+    let left = store.remove_by_path(&canon).expect("remove_by_path");
+    assert_eq!(left, ["KEEP_ME.txt", "photos"]);
+    assert_only_user_files_left(&canon);
+    assert!(
+        std::fs::symlink_metadata(root.path().join(sid.as_str())).is_err(),
+        "the sweep removes the link to it"
+    );
+}
+
+/// Before 0.2.2 a `--session-dir` could already hold a `logs` that was not a
+/// directory: the run then failed to create its log directory and finalized
+/// the record beside it. Removal takes the record and leaves that `logs`
+/// rather than failing on it -- which would also stop `clean` on every run.
+#[test]
+fn remove_by_id_keeps_a_logs_that_is_not_a_directory() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let canon = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+    std::fs::write(canon.join("logs"), b"my log\n").expect("write logs file");
+
+    let left = store.remove_by_id(&sid).expect("remove");
+    assert_eq!(left, ["logs"]);
+    assert!(!canon.join("session.json").exists(), "the record goes");
+    assert_eq!(
+        std::fs::read(canon.join("logs")).expect("kept"),
+        b"my log\n"
+    );
+}
+
+/// The same for an `outrig-enter` that is a directory, and a `logs` that is a
+/// symlink: outrig makes neither, so neither is outrig's to remove.
+#[test]
+fn remove_by_id_keeps_record_names_of_another_type() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let elsewhere = tempfile::tempdir().expect("tempdir elsewhere");
+    std::fs::write(elsewhere.path().join("mine.txt"), b"mine\n").expect("write");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T120000-aaaa".into());
+    let canon = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+    std::fs::create_dir_all(canon.join("outrig-enter/inside")).expect("mkdir");
+    std::os::unix::fs::symlink(elsewhere.path(), canon.join("logs")).expect("symlink");
+
+    let left = store.remove_by_id(&sid).expect("remove");
+    assert_eq!(left, ["logs", "outrig-enter"]);
+    assert!(!canon.join("session.json").exists(), "the record goes");
+    assert!(canon.join("outrig-enter/inside").is_dir());
+    assert!(
+        std::fs::symlink_metadata(canon.join("logs"))
+            .expect("link kept")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(elsewhere.path().join("mine.txt")).expect("target kept"),
+        b"mine\n"
+    );
+}
+
+/// #337: given the `<root>/<sid>` link rather than the directory, the record is
+/// still the one in the directory it names. Removing the argument itself only
+/// unlinked the link and left the record where nothing could find it.
+#[test]
+fn remove_by_path_through_the_link_removes_the_record_it_names() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let explicit = tempfile::tempdir().expect("tempdir explicit");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20261003T110000-dddd".into());
+    let canon = store
+        .create(&sid, Some(explicit.path()), &mut sample_session(&sid))
+        .expect("create");
+    write_outrig_entries(&canon);
+    let link = root.path().join(sid.as_str());
+
+    let left = store.remove_by_path(&link).expect("remove_by_path");
+    assert!(
+        left.is_empty(),
+        "nothing but the record was there: {left:?}"
+    );
+    assert!(!canon.exists(), "the record's directory should be removed");
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "and the link to it"
+    );
 }
 
 #[test]

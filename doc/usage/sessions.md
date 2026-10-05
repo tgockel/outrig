@@ -31,6 +31,7 @@ random hex digits -- sortable, unambiguous across concurrent runs):
 ~/.local/share/outrig/sessions/
 └── 20260501T134412-3f2a/
     ├── session.json              # id, timestamps, containers, image, exit status
+    ├── outrig-enter              # launcher for view = "primary" sidecars, if any start
     └── logs/
         ├── container.log         # buildah/podman transcripts when --verbose is set
         ├── network.jsonl         # network audit/filter records when enabled
@@ -72,6 +73,12 @@ $ outrig run --session-dir /tmp/my-debug-run < prompts.txt
 $ cat /tmp/my-debug-run/session.json
 $ tail -f /tmp/my-debug-run/logs/shell.stderr
 ```
+
+`<path>` has to be empty or not exist yet; outrig creates it, with any missing parents. A
+directory that already holds anything -- even a `.gitkeep` -- is refused, because from then on
+the directory is the session's. Running again with the same path is refused for the same
+reason, since the first run's `session.json` is still there: discard that session first, or
+give each run its own path.
 
 ## `outrig ls`
 
@@ -212,7 +219,8 @@ not there.
 
 ## `outrig discard`
 
-Delete a session's entire on-disk record (including logs):
+Delete a session's on-disk record -- `session.json`, `logs/`, and `outrig-enter` -- and the
+directory that held it:
 
 ```sh
 $ outrig discard 20260430T091203-44d2 --yes
@@ -228,16 +236,31 @@ $ outrig discard 20260501T141907-9b1c --yes
 [outrig] removed ~/.local/share/outrig/sessions/20260501T141907-9b1c (symlink)
 ```
 
-You can also point at a session directory directly:
+You can also point at a session directory directly, or at its symlink under the root, which
+discards the directory the symlink names:
 
 ```sh
 $ outrig discard --session-dir /tmp/my-debug-run --yes
 ```
 
-`--yes` skips the interactive confirmation. This is destructive (it `rm -rf`'s the session
-directory) but only of the session record itself -- your repository is untouched. A session
-that's still running can't be discarded; outrig refuses with an error pointing at the running
-container.
+`--yes` skips the interactive confirmation. Discard removes those three names and nothing else.
+`logs/` is the session's, so it goes whole, with anything you put in it. Anything else in the
+directory is yours -- and so is a `logs` that is not a directory, which outrig never makes -- so
+the directory stays and discard says what it kept. Versions before 0.2.2 let a session start in
+a directory you keep other files in, and this is what discarding one of those looks like:
+
+```sh
+$ outrig discard 20261003T120000-aaaa --yes
+[outrig] removed the session record from /home/me/notes
+[outrig] kept /home/me/notes, which also holds KEEP_ME.txt, photos
+[outrig] removed ~/.local/share/outrig/sessions/20261003T120000-aaaa (symlink)
+```
+
+If such a directory had a `logs/` of its own before the session, the session's logs went into
+it, and it goes with them.
+
+A session that's still running can't be discarded; outrig refuses with an error pointing at the
+running container.
 
 ## `outrig clean`
 
@@ -268,8 +291,9 @@ $ outrig clean --older-than 30d --yes
 
 `outrig clean` uses the same deletion semantics as `outrig discard`: auto-allocated sessions
 remove the session directory, while sessions created with `--session-dir` remove both the
-symlink target and the symlink under the session root. Running sessions are skipped so cleanup
-doesn't race a live `outrig run` or `outrig mcp` writer.
+symlink target and the symlink under the session root. A directory that holds anything besides
+the record stays, and clean says what it kept. Running sessions are skipped so cleanup doesn't
+race a live `outrig run` or `outrig mcp` writer.
 
 Alongside the record walk, `outrig clean` sweeps for *stray containers*: podman containers
 carrying the `org.outrig.session` label whose session record no longer exists (a lost record,

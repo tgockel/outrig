@@ -150,6 +150,41 @@ pub fn sample_session(id: &SessionId) -> Session {
     }
 }
 
+/// What a session writes into its directory beside `session.json`: a log
+/// under `logs/`, and the `outrig-enter` launcher a `view = "primary"` sidecar
+/// runs.
+#[allow(dead_code)]
+pub fn write_outrig_entries(dir: &Path) {
+    std::fs::create_dir_all(dir.join("logs")).expect("mkdir logs");
+    std::fs::write(dir.join("logs/fs.stderr"), b"server stderr\n").expect("write log");
+    std::fs::write(dir.join("outrig-enter"), b"\x7fELF").expect("write launcher");
+}
+
+/// Files of the user's own in a directory that also holds a session record --
+/// what a `--session-dir` given an existing directory before 0.2.2 left.
+#[allow(dead_code)]
+pub fn write_user_files(dir: &Path) {
+    std::fs::write(dir.join("KEEP_ME.txt"), b"my notes\n").expect("write note");
+    std::fs::create_dir_all(dir.join("photos")).expect("mkdir photos");
+    std::fs::write(dir.join("photos/holiday.jpg"), b"jpeg bytes\n").expect("write photo");
+}
+
+/// After removing a record from a directory [`write_user_files`] wrote into:
+/// the user's files are intact, and nothing outrig wrote is left.
+#[allow(dead_code)]
+pub fn assert_only_user_files_left(dir: &Path) {
+    let note = std::fs::read(dir.join("KEEP_ME.txt")).expect("note kept");
+    assert_eq!(note, b"my notes\n");
+    let photo = std::fs::read(dir.join("photos/holiday.jpg")).expect("photo kept");
+    assert_eq!(photo, b"jpeg bytes\n");
+    for name in ["session.json", "logs", "outrig-enter"] {
+        assert!(
+            std::fs::symlink_metadata(dir.join(name)).is_err(),
+            "{name} should be removed from {dir:?}"
+        );
+    }
+}
+
 /// Drain `reader` line-by-line, mirroring each line to the test runner's
 /// stderr (so a hang dumps everything-so-far) and into the shared `sink`
 /// buffer for later assertions. `label` distinguishes which stream a line

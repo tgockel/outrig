@@ -42,7 +42,8 @@ outrig mcp self
 - `--network <default|audit|filter>` (default: config `[network].mode`, else `default`):
   choose Podman's default networking, network audit logging, or global network filtering for
   this fresh session.
-- `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
+- `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path, which must
+  be empty or not exist yet.
 - `--config <path>` (default: walks up from cwd; if not found, run config-less): read the repo
   config from this file instead. See [Reference -> CLI](../reference/cli.md#global-flags) for
   which repo the session runs against.

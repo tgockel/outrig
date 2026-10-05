@@ -6,7 +6,12 @@
 //!   `<root>/<sid>/logs/`.
 //! - **Explicit** (`create(.., Some(dir), ..)`): writes to `<dir>/session.json`
 //!   directly and creates `<root>/<sid>` as a symlink to `<dir>` so
-//!   `outrig ls` finds it uniformly.
+//!   `outrig ls` finds it uniformly. `<dir>` has to be empty or absent: from
+//!   then on it is the session's.
+//!
+//! Either way the record is `session.json`, `logs/`, and -- for a session with
+//! a `view = "primary"` sidecar -- `outrig-enter`. Removal deletes those three
+//! names and nothing else, then the directory if that empties it.
 
 use std::fs;
 use std::io::Write as _;
@@ -20,6 +25,9 @@ use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError, Result};
 
 const SESSION_JSON: &str = "session.json";
+/// The session's log directory. Everything outrig logs for a session -- MCP
+/// stderr, `network.jsonl`, transcripts -- goes under it.
+pub(crate) const LOGS_DIR: &str = "logs";
 
 /// Stable, sortable session id. Format: `yyyymmddTHHMMSS-rrrr` (UTC, four
 /// hex digits of randomness). Lexicographic order matches chronological
@@ -153,24 +161,45 @@ impl SessionStore {
     /// with the resolved path so the caller doesn't need to compute it twice
     /// and the in-memory `Session` matches what got persisted. Returns the
     /// same path for convenience.
+    ///
+    /// An explicit directory is created if absent and refused unless empty, so
+    /// that nothing in it predates the session.
     pub fn create(
         &self,
         sid: &SessionId,
         explicit_dir: Option<&Path>,
         session: &mut Session,
     ) -> Result<PathBuf> {
+        // Before the root is created, so a root nested inside the explicit
+        // directory is not taken for something already there.
+        if let Some(dir) = explicit_dir {
+            if dir.exists() && !dir.is_dir() {
+                return Err(OutrigError::Configuration(format!(
+                    "--session-dir {} exists and is not a directory",
+                    dir.display()
+                )));
+            }
+            fs::create_dir_all(dir).path_ctx("create directory", dir)?;
+            if dir.join(SESSION_JSON).exists() {
+                return Err(OutrigError::Configuration(format!(
+                    "--session-dir {} holds an earlier session's record; discard that \
+                     session first, or name a new or empty directory",
+                    dir.display()
+                )));
+            }
+            if let Some(first) = dir_names(dir)?.first() {
+                return Err(OutrigError::Configuration(format!(
+                    "--session-dir {} is not empty (it holds {first}); name a new or \
+                     empty directory",
+                    dir.display()
+                )));
+            }
+        }
         fs::create_dir_all(&self.root).path_ctx("create directory", &self.root)?;
 
         let actual_dir = match explicit_dir {
             Some(dir) => {
                 let canon = fs::canonicalize(dir).path_ctx("resolve", dir)?;
-                let target_json = canon.join(SESSION_JSON);
-                if target_json.exists() {
-                    return Err(OutrigError::Configuration(format!(
-                        "--session-dir {} already contains session.json",
-                        canon.display()
-                    )));
-                }
                 session.session_dir = canon.clone();
                 write_session_json_atomic(&canon, session)?;
                 let link = self.root.join(&sid.0);
@@ -271,35 +300,44 @@ impl SessionStore {
         read_session_json(&dir.join(SESSION_JSON))
     }
 
-    /// Auto session: remove the dir.
-    /// Symlinked: remove the link target's contents *and* the symlink.
-    pub fn remove_by_id(&self, id: &SessionId) -> Result<()> {
+    /// Remove a session's record from its directory -- the link target for a
+    /// symlinked session -- and the directory too if that empties it. A
+    /// symlink goes either way. Returns what the directory still holds,
+    /// sorted; empty when it is gone.
+    pub fn remove_by_id(&self, id: &SessionId) -> Result<Vec<String>> {
         let entry = self.root.join(&id.0);
         let meta = fs::symlink_metadata(&entry).path_ctx("stat", &entry)?;
         if meta.file_type().is_symlink() {
             let target = fs::read_link(&entry).path_ctx("read symlink", &entry)?;
-            if target.exists() {
-                fs::remove_dir_all(&target).path_ctx("remove", &target)?;
-            }
+            let left = if target.exists() {
+                remove_record(&target)?
+            } else {
+                Vec::new()
+            };
             fs::remove_file(&entry).path_ctx("remove", &entry)?;
+            Ok(left)
         } else {
-            fs::remove_dir_all(&entry).path_ctx("remove", &entry)?;
+            remove_record(&entry)
         }
-        Ok(())
     }
 
-    /// `rm -rf <dir>`, then sweep `<root>` for any symlink whose target was
-    /// `<dir>` and remove it too. O(n) over root entries; fine for v0.
-    pub fn remove_by_path(&self, dir: &Path) -> Result<()> {
+    /// [`SessionStore::remove_by_id`] for a directory named outright, then
+    /// sweep `<root>` for any symlink whose target was `<dir>` and remove it
+    /// too. O(n) over root entries; fine for v0.
+    pub fn remove_by_path(&self, dir: &Path) -> Result<Vec<String>> {
         // Resolve once *before* removing so we can match dangling symlinks
-        // even after the target is gone.
+        // even after the target is gone. The removal works on this path too:
+        // given a symlink, it is the directory the link names that holds the
+        // record.
         let canon_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if dir.exists() {
-            fs::remove_dir_all(dir).path_ctx("remove", dir)?;
-        }
+        let left = if canon_dir.exists() {
+            remove_record(&canon_dir)?
+        } else {
+            Vec::new()
+        };
         let entries = match fs::read_dir(&self.root) {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(left),
             Err(e) => return Err(e).path_ctx("read directory", &self.root),
         };
         for entry in entries {
@@ -318,8 +356,64 @@ impl SessionStore {
                 fs::remove_file(&path).path_ctx("remove", &path)?;
             }
         }
-        Ok(())
+        Ok(left)
     }
+}
+
+/// Remove the record in `dir` -- `outrig-enter`, `logs/`, then `session.json`
+/// -- and `dir` itself if that empties it. Nothing else is touched: a
+/// directory given to `--session-dir` before 0.2.2 may hold the user's own
+/// files, and under these names too: `logs` goes only as a real directory and
+/// the other two only as anything else. `session.json` goes last, so a removal
+/// that fails partway leaves a record that can still be found and removed
+/// again.
+///
+/// Returns what `dir` still holds, sorted; empty when `dir` is gone.
+fn remove_record(dir: &Path) -> Result<Vec<String>> {
+    // `outrig-enter` is the launcher `outrig::container::enter::materialize`
+    // writes, under that name.
+    for name in ["outrig-enter", LOGS_DIR, SESSION_JSON] {
+        let path = dir.join(name);
+        // `logs/` goes only as a real directory, not a symlink to one; the
+        // others only as a non-directory, a symlink unlinked, not followed.
+        // A name of any other type stays, for the listing below to report.
+        let removed = match fs::symlink_metadata(&path) {
+            Ok(meta) if name == LOGS_DIR && meta.is_dir() => fs::remove_dir_all(&path),
+            Ok(meta) if name != LOGS_DIR && !meta.is_dir() => fs::remove_file(&path),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = removed
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e).path_ctx("remove", &path);
+        }
+    }
+    // `remove_dir` is the emptiness check: it fails rather than remove
+    // anything still there, including a file that arrived just now.
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(Vec::new()),
+        Err(e) => {
+            let left = dir_names(dir)?;
+            if left.is_empty() {
+                Err(e).path_ctx("remove", dir)
+            } else {
+                Ok(left)
+            }
+        }
+    }
+}
+
+/// The names in `dir`, sorted, so what a message names does not depend on
+/// directory order.
+fn dir_names(dir: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir).path_ctx("read directory", dir)? {
+        let entry = entry.path_ctx("read directory", dir)?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(names)
 }
 
 /// Resolve a path under the session root. `Ok(None)` when the entry is

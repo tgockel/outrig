@@ -508,16 +508,6 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
     launch.unmask = image_cfg.security.unmask.clone();
     launch.labels = BTreeMap::from([(LABEL_SESSION.to_string(), sid.0.clone())]);
 
-    if let Some(p) = args.explicit_session_dir
-        && !p.is_dir()
-    {
-        return Err(OutrigError::Configuration(format!(
-            "--session-dir {} is not an existing directory (create it first or omit the flag)",
-            p.display()
-        ))
-        .into());
-    }
-
     let container_name = attach
         .as_ref()
         .map(|attach| attach.container_name.clone())
@@ -537,7 +527,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         link_target: None,
     };
     let session_dir = store.create(&sid, args.explicit_session_dir, &mut session)?;
-    let log_dir = session_dir.join("logs");
+    let log_dir = session_dir.join(session::LOGS_DIR);
     if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
         let _ = store.finalize(&sid, SystemTime::now(), 1);
         return Err(e)

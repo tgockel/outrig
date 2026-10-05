@@ -66,8 +66,9 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME-OR-LOCAL-REF")]
     pub image: Option<String>,
 
-    /// Write the session into an explicit, already-existing directory. The
-    /// session root gets a symlink at `<root>/<sid>` pointing at this path.
+    /// Write the session into this directory, which must be empty or not exist
+    /// yet (it is created, with any missing parents). The session root gets a
+    /// symlink at `<root>/<sid>` pointing at this path.
     #[arg(long = "session-dir", value_name = "PATH")]
     pub session_dir: Option<PathBuf>,
 

@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{OutrigError, Result};
 use crate::session::{self, Session, SessionStore};
 use outrig::container::Container;
+use outrig::error::IoPathExt;
 
 #[derive(Debug, Parser)]
 #[command(group(
@@ -90,13 +91,13 @@ where
         return Ok(0);
     }
 
-    if args.session_dir.is_some() {
-        store.remove_by_path(&target.dir)?;
+    let left = if args.session_dir.is_some() {
+        store.remove_by_path(&target.dir)?
     } else {
-        store.remove_by_id(&target.session.id)?;
-    }
+        store.remove_by_id(&target.session.id)?
+    };
 
-    let dir_msg = format!("[outrig] removed {}\n", target.dir.display());
+    let dir_msg = super::removal_report(&target.dir, &left);
     stderr.write_all(dir_msg.as_bytes()).await?;
     if args.session_dir.is_none() && target.session.link_target.is_some() {
         let link_path = store.symlink_path(&target.session.id);
@@ -128,10 +129,10 @@ struct Target {
 fn resolve_target(args: &DiscardArgs, store: &SessionStore) -> Result<Target> {
     if let Some(dir) = args.session_dir.as_deref() {
         let session = store.get_by_path(dir)?;
-        return Ok(Target {
-            dir: dir.to_path_buf(),
-            session,
-        });
+        // Given a symlink, the record is in the directory it names, so that is
+        // the one the prompt and the report have to name.
+        let dir = std::fs::canonicalize(dir).path_ctx("resolve", dir)?;
+        return Ok(Target { dir, session });
     }
     let Some(query) = args.session.as_deref() else {
         return Err(OutrigError::Configuration(
