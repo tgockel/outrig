@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A local model loaded by `model-path` answers prompts.** The model loaded, and then every
+  request to it failed with `ModelNotFound("<file name>")`, including a subagent's and a local
+  fallback's in an alias chain. The request named the GGUF file, and mistralrs had registered the
+  model under its directory. A request now names no model, and the engine, which holds only that
+  one, routes it there. A `model-id` model was unaffected.
+
 ## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.1) - 2026-10-04
 
 The first patch release since 0.2.0: fixes, and one change to the MCP revision `outrig mcp`

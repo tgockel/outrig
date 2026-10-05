@@ -3,7 +3,9 @@
 //! behind an environment variable that points at a real GGUF model, since
 //! loading any model takes seconds and ~hundreds of MB to gigabytes of disk.
 //! Without those env vars the tests print a `skip:` notice and exit 0 so
-//! `cargo test --features local-llm` stays green in CI.
+//! `cargo test --features local-llm` stays green in CI. Run them with
+//! `--release`: an unoptimized build is too slow to answer within
+//! `PROMPT_TIMEOUT`. RELEASING.md has the full invocation.
 
 use std::path::Path;
 use std::time::Duration;

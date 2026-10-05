@@ -863,9 +863,8 @@ fn resolve_candidate(
                 device,
             };
             // For display: prefer the HF model-id, fall back to the GGUF
-            // basename, then the model name. mistralrs's own `load()`
-            // derives the same kind of identifier internally; this is for
-            // banner / error messaging only.
+            // basename, then the model name. Banner and error messaging
+            // only: a request to the engine names no model at all.
             let identifier = weights
                 .model_id
                 .clone()

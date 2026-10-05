@@ -24,6 +24,27 @@ are links CI can check rather than prose that rots silently.
 below need it clean for their own reasons: `cargo package` refuses to archive uncommitted
 changes, since what it would publish is not what anyone can check out.
 
+### Run the in-process model smoke tests
+
+CI compiles `crates/outrig-cli/tests/mistralrs_smoke.rs` but cannot run it, because it needs
+model weights. Run it here, against a small GGUF, once for each way a `style = "mistralrs"` model
+names its weights -- a local file and a Hugging Face download:
+
+```sh
+OUTRIG_MISTRALRS_TEST_MODEL=/path/to/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
+OUTRIG_MISTRALRS_TEST_MODEL_ID=Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF \
+OUTRIG_MISTRALRS_TEST_MODEL_FILE=qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
+  cargo test --release -p outrig-cli --features local-llm --test mistralrs_smoke -- --nocapture
+```
+
+`--release` is not optional: built unoptimized, that model did not answer within the test's
+three-minute timeout even on a 32-thread CPU. A test whose variable is unset prints `skip:` and
+passes, so a green run that printed one proved nothing about that form. Until #423 is fixed,
+`download_path_smoke` fails after its first prompt, where it looks for the GGUF in its own cache
+directory; a failure anywhere earlier is a regression. Left unrun, these let #223 ship: a model
+loaded from a local file could not answer a single prompt. The step goes when the deprecated
+`local-llm` feature does.
+
 ### Bump the version
 
 The version is set once in the root `Cargo.toml` under `[workspace.package]` and inherited by

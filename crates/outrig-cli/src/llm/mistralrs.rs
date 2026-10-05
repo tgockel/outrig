@@ -48,7 +48,6 @@ pub struct MistralrsClient {
 #[derive(Clone)]
 pub struct MistralrsModel {
     engine: Arc<MistralRs>,
-    model_identifier: String,
 }
 
 /// Round-trip-friendly wrapper for `mistralrs_core::ChatCompletionResponse`.
@@ -99,9 +98,7 @@ pub(crate) async fn load(
         source,
     };
 
-    let (quantized_model_id, quantized_filenames, hf_revision, identifier) = match (
-        model_id, model_path,
-    ) {
+    let (quantized_model_id, quantized_filenames, hf_revision) = match (model_id, model_path) {
         (Some(id), None) => {
             let files = model_file.filter(|s| !s.is_empty()).ok_or_else(|| {
                 load_err(anyhow::anyhow!(
@@ -116,12 +113,7 @@ pub(crate) async fn load(
                 revision = revision.unwrap_or("main"),
                 "downloading and loading GGUF model",
             );
-            (
-                id.to_string(),
-                files.to_vec(),
-                revision.map(str::to_string),
-                id.to_string(),
-            )
+            (id.to_string(), files.to_vec(), revision.map(str::to_string))
         }
         (None, Some(path)) => {
             let parent = path.parent().ok_or_else(|| {
@@ -145,7 +137,6 @@ pub(crate) async fn load(
                 parent.to_string_lossy().into_owned(),
                 vec![basename.to_string()],
                 None,
-                basename.to_string(),
             )
         }
         (Some(_), Some(_)) | (None, None) => {
@@ -205,10 +196,7 @@ pub(crate) async fn load(
         .into());
     }
 
-    Ok(MistralrsModel {
-        engine,
-        model_identifier: identifier,
-    })
+    Ok(MistralrsModel { engine })
 }
 
 fn candle_device(model_name: &str, spec: MistralrsDeviceSpec) -> Result<candle_core::Device> {
@@ -291,10 +279,11 @@ impl CompletionModel for MistralrsModel {
     type StreamingResponse = MistralrsStreamResponse;
     type Client = MistralrsClient;
 
-    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+    /// The engine holds one model and a request reaches it without naming it
+    /// (see [`build_normal_request`]), so the name has nothing to select.
+    fn make(client: &Self::Client, _model: impl Into<String>) -> Self {
         Self {
             engine: client.engine.clone(),
-            model_identifier: model.into(),
         }
     }
 
@@ -303,7 +292,7 @@ impl CompletionModel for MistralrsModel {
         request: CompletionRequest,
     ) -> std::result::Result<CompletionResponse<Self::Response>, CompletionError> {
         let (tx, mut rx) = mpsc::channel::<Response>(1);
-        let normal = build_normal_request(&self.model_identifier, request, tx, false)?;
+        let normal = build_normal_request(request, tx, false)?;
         let request_for_engine = Request::Normal(Box::new(normal));
 
         dispatch_request(self.engine.clone(), request_for_engine).await?;
@@ -323,7 +312,7 @@ impl CompletionModel for MistralrsModel {
     ) -> std::result::Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
     {
         let (tx, rx) = mpsc::channel::<Response>(1);
-        let normal = build_normal_request(&self.model_identifier, request, tx, true)?;
+        let normal = build_normal_request(request, tx, true)?;
         let request_for_engine = Request::Normal(Box::new(normal));
 
         dispatch_request(self.engine.clone(), request_for_engine).await?;
@@ -378,7 +367,6 @@ async fn dispatch_request(
 }
 
 fn build_normal_request(
-    model_identifier: &str,
     req: CompletionRequest,
     response_tx: mpsc::Sender<Response>,
     is_streaming: bool,
@@ -409,7 +397,11 @@ fn build_normal_request(
         logits_processors: None,
         return_raw_logits: false,
         web_search_options: None,
-        model_id: Some(model_identifier.to_string()),
+        // Named, a model must match the id mistralrs registered it under, which
+        // it derives itself: for a `model-path` GGUF that is the file's
+        // directory, not the file. The engine holds only the model `load`
+        // built, so naming none routes every request to it.
+        model_id: None,
         truncate_sequence: false,
     })
 }
@@ -1222,6 +1214,18 @@ mod tests {
             matches!(err, CompletionError::ProviderError(ref msg) if msg.contains("boom")),
             "got: {err:?}",
         );
+    }
+
+    /// Naming the model by its file failed every `model-path` request with
+    /// `ModelNotFound` (#223); see the comment on `model_id` for why.
+    #[test]
+    fn a_request_names_no_model_so_it_reaches_the_loaded_one() {
+        let request = ScriptedEngine(Vec::new).completion_request("hello").build();
+        let (tx, _rx) = mpsc::channel(1);
+
+        let normal = build_normal_request(request, tx, false).expect("request builds");
+
+        assert_eq!(normal.model_id, None);
     }
 
     /// A response channel holding `script`, closed behind it, as the engine

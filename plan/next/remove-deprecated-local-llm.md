@@ -116,6 +116,7 @@ choosing it means the API cleanup does *not* happen in the same release.
   other consumer in either crate).
 - Drop the `build.rs` deprecation warning and the two cuda/metal warnings.
 - Remove the CI `local-llm` matrix row (`.github/workflows/ci.yml`).
+- Remove the in-process smoke-test step from `RELEASING.md`.
 - Execute whichever config-surface decision is taken above, and regenerate
   `crates/outrig/public-api.txt` if the library surface moves.
 - `doc/concepts/in-process-llm.md` goes away as a chapter. **Keep the migration
