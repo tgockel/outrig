@@ -453,7 +453,8 @@ impl LaunchSpec {
     /// Build the container's image from a Dockerfile, then launch it.
     /// Caller-supplied `dockerfile` and `context` should be absolute (or
     /// relative to the current directory) -- they are forwarded as-is to
-    /// the buildah invocation.
+    /// the buildah invocation, except that a leading `~` is the home
+    /// directory, as it is in a config file.
     pub fn build(
         dockerfile: PathBuf,
         context: PathBuf,
@@ -813,9 +814,9 @@ impl Outrig {
                 build_args,
             } => {
                 // Reuse `ensure_image` by wrapping the raw inputs in a
-                // `ImageConfig`. The spec's paths are already absolute and the
-                // config records no `ConfigSource`, so the empty `repo_root`
-                // fallback makes the resolution a no-op.
+                // `ImageConfig`. The config records no `ConfigSource`, so the
+                // empty `repo_root` fallback leaves the spec's paths as given,
+                // apart from expanding a leading `~`.
                 let mut cfg = ImageConfig::from_dockerfile(dockerfile.clone(), context.clone());
                 cfg.build_args = build_args.clone();
                 image::ensure_image(&cfg, Path::new(""), false).await?.tag
@@ -1150,7 +1151,7 @@ impl Outrig {
         };
 
         let options = ContainerCreateOptions::new(image, launch, container_name)
-            .with_env(crate::mcp::resolve_mcp_env(
+            .with_resolved_env(crate::mcp::resolve_mcp_env_values(
                 server_name,
                 server.env().clone(),
                 &BTreeMap::new(),

@@ -11,8 +11,8 @@
 //!
 //! 1. [`open_user_db`] hands back open descriptors for `/etc/passwd` and
 //!    `/etc/group`. The kernel checks permission at `open`, not at `write`, so
-//!    the parent can then read and append through them with ordinary code even
-//!    though it is an unprivileged host process.
+//!    the parent can then read, append, and truncate through them with ordinary
+//!    code even though it is an unprivileged host process.
 //! 2. [`create_home`] creates and `chown`s the home directory, which cannot be
 //!    expressed as a descriptor handed back out.
 //!
@@ -47,12 +47,13 @@ pub(super) enum NsStep {
     Reply = 9,
     Mkdir = 10,
     Chown = 11,
+    OpenHome = 12,
 }
 
 impl NsStep {
     /// Every step, in discriminant order -- the one place the wire codes are
     /// listed, so [`NsStep::from_code`] cannot drift from the enum.
-    const ALL: [NsStep; 11] = [
+    const ALL: [NsStep; 12] = [
         NsStep::OpenUserNsFile,
         NsStep::OpenMountNsFile,
         NsStep::Fork,
@@ -64,6 +65,7 @@ impl NsStep {
         NsStep::Reply,
         NsStep::Mkdir,
         NsStep::Chown,
+        NsStep::OpenHome,
     ];
 
     fn from_code(code: u32) -> Option<Self> {
@@ -85,6 +87,7 @@ impl NsStep {
             NsStep::Reply => "hand back the opened files",
             NsStep::Mkdir => "mkdir the home directory",
             NsStep::Chown => "chown the home directory",
+            NsStep::OpenHome => "open the home directory",
         }
     }
 }
@@ -101,6 +104,15 @@ impl NsError {
         Self {
             step,
             errno: err.raw_os_error().unwrap_or(0),
+        }
+    }
+
+    /// `step`, with the errno of the syscall that just failed. Safe to call
+    /// from a forked child.
+    fn last(step: NsStep) -> Self {
+        Self {
+            step,
+            errno: errno(),
         }
     }
 
@@ -149,14 +161,19 @@ impl UserDb {
 
     /// Current contents, read from the start without disturbing where the
     /// next append lands (the descriptor carries `O_APPEND`, so writes always
-    /// go to the end regardless of this offset). Lossy-decoded: both files are
-    /// ASCII in every image that has them.
-    pub(super) fn read(&self, which: Db) -> io::Result<String> {
+    /// go to the end regardless of this offset).
+    pub(super) fn read_raw(&self, which: Db) -> io::Result<Vec<u8>> {
         let mut file = self.file(which);
         file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        Ok(bytes)
+    }
+
+    /// [`UserDb::read_raw`], lossy-decoded: both files are ASCII in every
+    /// image that has them, and the lookups only need the ids and names.
+    pub(super) fn read(&self, which: Db) -> io::Result<String> {
+        Ok(String::from_utf8_lossy(&self.read_raw(which)?).into_owned())
     }
 
     /// Append `blob` at end of file. Appending in place, rather than writing a
@@ -166,6 +183,21 @@ impl UserDb {
         let mut file = self.file(which);
         file.write_all(blob)?;
         file.flush()
+    }
+
+    /// Replace everything from byte `at` on with `tail`: truncate there, then
+    /// append. Still the same inode, so owner and mode survive as they do for
+    /// [`UserDb::append`], and nothing before `at` is written at all.
+    ///
+    /// Unlike an append it is not atomic: until the write lands, a reader sees
+    /// the file cut off at `at`, a concurrent append is lost, and a failed
+    /// write leaves it cut off for good. So the caller must own the container
+    /// and have it to itself. Bootstrap does this only in a container it just
+    /// started, before any exec, while the container's one process is its
+    /// `sleep`, and a failure there tears the container down.
+    pub(super) fn replace_tail(&self, which: Db, at: u64, tail: &[u8]) -> io::Result<()> {
+        self.file(which).set_len(at)?;
+        self.append(which, tail)
     }
 }
 
@@ -214,13 +246,33 @@ pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
     }
 }
 
-/// Pass 2: `mkdir -p` the home directory inside the container and give it to
+/// Pass 2: `mkdir -p` the home directory inside the container -- stricter
+/// about the home directory itself, see [`make_home`] -- and give it to
 /// `uid`:`gid`. Created inside the container's user namespace it would
 /// otherwise belong to the container's root.
 pub(super) fn create_home(pid: u32, home: &Path, uid: u32, gid: u32) -> Result<(), NsError> {
     let ns = NsFiles::open(pid)?;
-    // Every path the child needs, laid out before the fork, outermost first:
-    // "/home", then "/home/<user>". This is `mkdir -p`, unrolled.
+    let dirs = mkdir_p_paths(home)?;
+
+    let (status, _fds) = nsfork::fork_collect(|sock| {
+        if let Err(step) = enter(&ns) {
+            reply_failure(sock, step);
+            return;
+        }
+        let status = match make_home(&dirs, uid, gid) {
+            Ok(()) => nsfork::Status::OK,
+            Err(e) => nsfork::Status::failed(e.step as u32, e.errno),
+        };
+        let _ = nsfork::send_status(sock, status, &[]);
+    })
+    .map_err(|e| NsError::new(NsStep::Fork, &e))?;
+
+    check_reply(status)
+}
+
+/// Every path [`make_home`] needs, laid out before the fork, outermost first:
+/// "/home", then "/home/<user>". This is `mkdir -p`, unrolled.
+fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
     let mut dirs = Vec::new();
     for ancestor in home.ancestors() {
         if ancestor == Path::new("/") || ancestor.as_os_str().is_empty() {
@@ -229,29 +281,47 @@ pub(super) fn create_home(pid: u32, home: &Path, uid: u32, gid: u32) -> Result<(
         dirs.push(cstring(ancestor)?);
     }
     dirs.reverse();
-    let leaf = cstring(home)?;
+    Ok(dirs)
+}
 
-    let (status, _fds) = nsfork::fork_collect(|sock| {
-        if let Err(step) = enter(&ns) {
-            reply_failure(sock, step);
-            return;
+/// Create each of `dirs` in turn, then give the last of them -- the home
+/// directory -- to `uid`:`gid`. Runs in the forked child: syscalls only.
+///
+/// Anything already at an ancestor is fine: `/home` as a symlink to a
+/// directory is a normal layout, and a non-directory fails the next `mkdir`
+/// with `ENOTDIR`. The home directory itself is where this departs from
+/// `mkdir -p`: whatever is there must be a directory, not a file, a FIFO, or
+/// a symlink even to a directory. Anything else would be passed off as
+/// `$HOME` to every exec, and a symlink would carry the `chown` to wherever it
+/// points -- the bind-mounted workspace included. Opening with `O_DIRECTORY |
+/// O_NOFOLLOW` and changing ownership through that descriptor settles both in
+/// one step, with no window between the check and the `chown`.
+fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), NsError> {
+    for dir in dirs {
+        let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
+        if rc == -1 && errno() != libc::EEXIST {
+            return Err(NsError::last(NsStep::Mkdir));
         }
-        for dir in &dirs {
-            let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
-            if rc == -1 && errno() != libc::EEXIST {
-                reply_failure(sock, NsStep::Mkdir);
-                return;
-            }
-        }
-        if unsafe { libc::chown(leaf.as_ptr(), uid, gid) } == -1 {
-            reply_failure(sock, NsStep::Chown);
-            return;
-        }
-        let _ = nsfork::send_status(sock, nsfork::Status::OK, &[]);
-    })
-    .map_err(|e| NsError::new(NsStep::Fork, &e))?;
-
-    check_reply(status)
+    }
+    // Only a home of `/` itself lays out no paths at all.
+    let Some(home) = dirs.last() else {
+        return Err(NsError {
+            step: NsStep::Mkdir,
+            errno: libc::EINVAL,
+        });
+    };
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(home.as_ptr(), flags) };
+    if fd == -1 {
+        return Err(NsError::last(NsStep::OpenHome));
+    }
+    let result = if unsafe { libc::fchown(fd, uid, gid) } == -1 {
+        Err(NsError::last(NsStep::Chown))
+    } else {
+        Ok(())
+    };
+    nsfork::close_fd(fd);
+    result
 }
 
 /// The namespace files, opened in the parent so that a failure to open them
@@ -335,13 +405,13 @@ mod tests {
 
     #[test]
     fn step_codes_round_trip() {
-        for code in 1..=11 {
-            let step = NsStep::from_code(code).expect("known step");
+        for (code, step) in (1u32..).zip(NsStep::ALL) {
             assert_eq!(step as u32, code);
+            assert_eq!(NsStep::from_code(code), Some(step));
             assert!(!step.label().is_empty());
         }
         assert!(NsStep::from_code(0).is_none());
-        assert!(NsStep::from_code(99).is_none());
+        assert!(NsStep::from_code(NsStep::ALL.len() as u32 + 1).is_none());
     }
 
     /// Entering our *own* namespaces exercises the whole round trip without a
@@ -363,5 +433,145 @@ mod tests {
         // pid 0 never has /proc entries, so this stops at the parent's open.
         let err = open_user_db(0).expect_err("no such process");
         assert_eq!(err.step, NsStep::OpenUserNsFile);
+    }
+
+    /// What the child does once inside the namespaces, run in-process against
+    /// `home` -- a stand-in for `/home/<user>` under a tempdir -- and giving
+    /// it to ourselves, which needs no privilege.
+    fn make_home_at(home: &Path) -> Result<(), NsError> {
+        let (uid, gid) = own_ids();
+        make_home(&mkdir_p_paths(home).expect("paths"), uid, gid)
+    }
+
+    fn own_ids() -> (u32, u32) {
+        (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn an_absent_home_is_created_and_chowned() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home/dev");
+        make_home_at(&home).expect("absent home");
+        let meta = std::fs::symlink_metadata(&home).expect("stat home");
+        assert!(meta.is_dir());
+        assert_eq!((meta.uid(), meta.gid()), own_ids());
+
+        // Finding it already there on a second run is fine.
+        make_home_at(&home).expect("existing home");
+    }
+
+    /// `/home` itself a symlink to a directory is a normal distro layout.
+    #[test]
+    fn a_symlinked_parent_is_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("real")).expect("mkdir");
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("home"))
+            .expect("symlink");
+        make_home_at(&tmp.path().join("home/dev")).expect("home under a symlink");
+        assert!(tmp.path().join("real/dev").is_dir());
+    }
+
+    #[test]
+    fn a_home_that_is_not_a_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        /// Plants one shape at the given path, and anything it points to
+        /// beside it.
+        type Plant = fn(&Path);
+        let shapes: [(&str, Plant); 5] = [
+            ("regular file", |at| std::fs::write(at, "").expect("write")),
+            ("fifo", |at| {
+                nix::unistd::mkfifo(at, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+            }),
+            ("symlink to a file", |at| {
+                std::fs::write(at.with_file_name("target"), "").expect("write");
+                symlink(at.with_file_name("target"), at).expect("symlink");
+            }),
+            ("symlink to a directory", |at| {
+                std::fs::create_dir(at.with_file_name("target")).expect("mkdir");
+                symlink(at.with_file_name("target"), at).expect("symlink");
+            }),
+            ("dangling symlink", |at| {
+                symlink(at.with_file_name("nowhere"), at).expect("symlink");
+            }),
+        ];
+
+        for (shape, plant) in shapes {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(tmp.path().join("home")).expect("mkdir");
+            let home = tmp.path().join("home/dev");
+            plant(&home);
+            let planted = std::fs::symlink_metadata(&home).expect("stat").file_type();
+
+            let err = make_home_at(&home).expect_err(shape);
+            assert_eq!(err.step, NsStep::OpenHome, "{shape}: {err}");
+            let errno = err.io().raw_os_error();
+            assert_eq!(errno, Some(libc::ENOTDIR), "{shape}: {err}");
+            let after = std::fs::symlink_metadata(&home).expect("stat").file_type();
+            assert_eq!(
+                after, planted,
+                "{shape}: the home path should be left as it was"
+            );
+        }
+    }
+
+    /// A [`UserDb`] over two tempfiles, opened the way the child opens the
+    /// real ones: read-write and append-only.
+    fn user_db_at(dir: &Path, passwd: &[u8]) -> UserDb {
+        let open = |name: &str, contents: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).expect("write");
+            std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)
+                .expect("open")
+        };
+        UserDb {
+            passwd: open("passwd", passwd),
+            group: open("group", b"root:x:0:\n"),
+        }
+    }
+
+    #[test]
+    fn replace_tail_rewrites_only_from_the_offset_on_the_same_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let head = b"root:x:0:0:root:/root:/bin/sh\n";
+        let db = user_db_at(
+            tmp.path(),
+            &[&head[..], b"dev:*:1000:1000::/workspace:/bin/sh\n"].concat(),
+        );
+        let inode = std::fs::metadata(tmp.path().join("passwd"))
+            .expect("stat")
+            .ino();
+
+        let tail = b"dev:*:1000:1000::/home/dev:/bin/sh\n";
+        db.replace_tail(Db::Passwd, head.len() as u64, tail)
+            .expect("replace_tail");
+
+        assert_eq!(
+            db.read_raw(Db::Passwd).expect("read"),
+            [&head[..], tail].concat()
+        );
+        let after = std::fs::metadata(tmp.path().join("passwd")).expect("stat");
+        assert_eq!(after.ino(), inode, "the file must not be replaced");
+        // The other database is untouched.
+        assert_eq!(db.read(Db::Group).expect("read"), "root:x:0:\n");
+    }
+
+    #[test]
+    fn a_parent_that_is_not_a_directory_fails_the_mkdir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("home"), "").expect("write");
+        let err = make_home_at(&tmp.path().join("home/dev")).expect_err("file at /home");
+        assert_eq!(err.step, NsStep::Mkdir, "{err}");
+        assert_eq!(err.io().raw_os_error(), Some(libc::ENOTDIR), "{err}");
     }
 }

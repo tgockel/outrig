@@ -14,6 +14,14 @@ pub outrig::config::ApiKeyError::NotPresent
 pub outrig::config::ApiKeyError::NotPresent::var: alloc::string::String
 pub outrig::config::ApiKeyError::NotUnicode
 pub outrig::config::ApiKeyError::NotUnicode::var: alloc::string::String
+#[non_exhaustive] pub enum outrig::config::BuildImageNameError
+pub outrig::config::BuildImageNameError::Empty
+pub outrig::config::BuildImageNameError::InvalidCharacter
+pub outrig::config::BuildImageNameError::InvalidCharacter::character: char
+pub outrig::config::BuildImageNameError::InvalidSeparator
+pub outrig::config::BuildImageNameError::InvalidSeparator::separator: alloc::string::String
+pub outrig::config::BuildImageNameError::SeparatorAtEdge
+pub outrig::config::BuildImageNameError::SeparatorAtEdge::separator: char
 #[non_exhaustive] pub enum outrig::config::CapabilityProfile
 pub outrig::config::CapabilityProfile::Default
 pub outrig::config::CapabilityProfile::DropAll
@@ -25,6 +33,8 @@ pub outrig::config::ConfigSource::Project
 pub outrig::config::ConfigSource::Project::dir: std::path::PathBuf
 pub outrig::config::ConfigSource::Repo
 pub outrig::config::ConfigSource::Repo::root: std::path::PathBuf
+pub outrig::config::ConfigSource::RepoFile
+pub outrig::config::ConfigSource::RepoFile::path: std::path::PathBuf
 impl outrig::config::ConfigSource
 pub fn outrig::config::ConfigSource::base_dir(&self) -> &std::path::Path
 pub fn outrig::config::ConfigSource::config_path(&self) -> std::path::PathBuf
@@ -227,6 +237,12 @@ pub outrig::config::ConfigValidationError::UnmaskPathListSeparator::path: alloc:
 pub outrig::config::ConfigValidationError::UnmaskPathRelative
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::image: alloc::string::String
 pub outrig::config::ConfigValidationError::UnmaskPathRelative::path: alloc::string::String
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostMissing
+pub outrig::config::ConfigValidationError::WorkspaceHostMissing::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceHostMissing::path: std::path::PathBuf
+#[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory
+pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory::declared_in: core::option::Option<std::path::PathBuf>
+pub outrig::config::ConfigValidationError::WorkspaceHostNotDirectory::path: std::path::PathBuf
 #[non_exhaustive] pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::declared_in: core::option::Option<std::path::PathBuf>
 pub outrig::config::ConfigValidationError::WorkspaceMountContainerDuplicate::path: std::path::PathBuf
@@ -420,6 +436,9 @@ pub outrig::config::Config::tool_result_max: core::option::Option<u32>
 pub outrig::config::Config::workspace: outrig::config::Workspace
 impl outrig::config::Config
 pub fn outrig::config::Config::load(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file_for_build(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
+pub fn outrig::config::Config::load_file_for_run(&std::path::Path, &std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_build(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_for_run(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> outrig::error::Result<Self>
 pub fn outrig::config::Config::load_from_str(&str) -> outrig::error::Result<Self>
@@ -521,6 +540,13 @@ impl outrig::config::OpenAiOptions
 pub fn outrig::config::OpenAiOptions::new() -> Self
 pub fn outrig::config::OpenAiOptions::with_request_timeout_secs(self, u64) -> Self
 pub fn outrig::config::OpenAiOptions::with_retry_budget_secs(self, u64) -> Self
+pub struct outrig::config::ResolvedEnvValue
+impl outrig::config::ResolvedEnvValue
+pub fn outrig::config::ResolvedEnvValue::resolve(outrig::config::EnvValue) -> core::result::Result<Self, outrig::config::EnvValueError>
+pub fn outrig::config::ResolvedEnvValue::source(&self) -> &outrig::config::EnvValue
+pub fn outrig::config::ResolvedEnvValue::value(&self) -> &str
+impl core::fmt::Debug for outrig::config::ResolvedEnvValue
+pub fn outrig::config::ResolvedEnvValue::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::config::SidecarConfig
 pub outrig::config::SidecarConfig::args: alloc::vec::Vec<alloc::string::String>
 pub outrig::config::SidecarConfig::image: alloc::string::String
@@ -556,6 +582,7 @@ pub const outrig::config::SUBAGENT_WIDTH_MAX_CEILING: u32
 pub const outrig::config::TOOL_CALL_MAX_LIMIT: u32
 pub const outrig::config::TOOL_RESULT_MAX_CEILING_BYTES: u32
 pub const outrig::config::TOOL_RESULT_MAX_FLOOR_BYTES: u32
+pub fn outrig::config::check_build_image_name(&str) -> core::result::Result<(), outrig::config::BuildImageNameError>
 pub fn outrig::config::merge(outrig::config::Config, outrig::config::Config) -> outrig::config::Config
 pub mod outrig::container
 pub mod outrig::container::embedded
@@ -716,7 +743,10 @@ pub fn outrig::container::ContainerCreateOptions::new(outrig::image::ImageTag, o
 pub fn outrig::container::ContainerCreateOptions::with_args(self, alloc::vec::Vec<alloc::string::String>) -> Self
 pub fn outrig::container::ContainerCreateOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
 pub fn outrig::container::ContainerCreateOptions::with_intercept_dns(self, bool) -> Self
+pub fn outrig::container::ContainerCreateOptions::with_resolved_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>) -> Self
 pub fn outrig::container::ContainerCreateOptions::with_transcript(self, core::option::Option<outrig::Transcript>) -> Self
+impl core::fmt::Debug for outrig::container::ContainerCreateOptions
+pub fn outrig::container::ContainerCreateOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::container::ContainerInspect
 pub outrig::container::ContainerInspect::image_tag: outrig::image::ImageTag
 pub outrig::container::ContainerInspect::running: bool
@@ -751,7 +781,10 @@ pub outrig::container::ExecOptions::workdir: core::option::Option<std::path::Pat
 impl outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::new() -> Self
 pub fn outrig::container::ExecOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ExecOptions::with_resolved_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>) -> Self
 pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+impl core::fmt::Debug for outrig::container::ExecOptions
+pub fn outrig::container::ExecOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::container::PrimaryView
 pub outrig::container::PrimaryView::helper_host: std::path::PathBuf
 pub outrig::container::PrimaryView::payload_home: alloc::string::String
@@ -910,7 +943,7 @@ pub fn outrig::mcp_proxy::ProxyServer<C>::list_tools_inner(&self) -> rmcp::model
 pub fn outrig::mcp_proxy::ProxyServer<C>::per_server_counts(&self) -> alloc::vec::Vec<(&str, usize)>
 impl<C: outrig::mcp_proxy::BackingClient> rmcp::handler::server::ServerHandler for outrig::mcp_proxy::ProxyServer<C>
 pub async fn outrig::mcp_proxy::ProxyServer<C>::call_tool(&self, rmcp::model::CallToolRequestParams, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::mrtr::CallToolResponse, rmcp::model::ErrorData>
-pub fn outrig::mcp_proxy::ProxyServer<C>::get_info(&self) -> rmcp::model::ServerInfo
+pub fn outrig::mcp_proxy::ProxyServer<C>::get_info(&self) -> rmcp::model::ServerConfig
 pub async fn outrig::mcp_proxy::ProxyServer<C>::list_prompts(&self, core::option::Option<rmcp::model::PaginatedRequestParams>, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData>
 pub async fn outrig::mcp_proxy::ProxyServer<C>::list_resource_templates(&self, core::option::Option<rmcp::model::PaginatedRequestParams>, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::ListResourceTemplatesResult, rmcp::model::ErrorData>
 pub async fn outrig::mcp_proxy::ProxyServer<C>::list_resources(&self, core::option::Option<rmcp::model::PaginatedRequestParams>, rmcp::service::RequestContext<rmcp::service::server::RoleServer>) -> core::result::Result<rmcp::model::ListResourcesResult, rmcp::model::ErrorData>
@@ -1041,7 +1074,10 @@ pub outrig::ExecOptions::workdir: core::option::Option<std::path::PathBuf>
 impl outrig::container::ExecOptions
 pub fn outrig::container::ExecOptions::new() -> Self
 pub fn outrig::container::ExecOptions::with_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>) -> Self
+pub fn outrig::container::ExecOptions::with_resolved_env(self, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>) -> Self
 pub fn outrig::container::ExecOptions::with_workdir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+impl core::fmt::Debug for outrig::container::ExecOptions
+pub fn outrig::container::ExecOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct outrig::LaunchSpec
 pub outrig::LaunchSpec::embedded_mcp_policy: outrig::EmbeddedMcpPolicy
 pub outrig::LaunchSpec::log_dir: std::path::PathBuf
@@ -1258,4 +1294,5 @@ pub const outrig::PUBLIC_DOC_BASE_URL: &str
 pub const outrig::RESERVED_SERVER: &str
 pub fn outrig::load_project(&std::path::Path, core::option::Option<&std::path::Path>) -> outrig::error::Result<(outrig::config::Config, std::path::PathBuf)>
 pub fn outrig::resolve_mcp_env(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::string::String>>
+pub fn outrig::resolve_mcp_env_values(&str, alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>, &alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::EnvValue>) -> outrig::error::Result<alloc::collections::btree::map::BTreeMap<alloc::string::String, outrig::config::ResolvedEnvValue>>
 pub fn outrig::sanitize_tool_name(&str, &str) -> alloc::string::String

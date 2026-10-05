@@ -9,6 +9,7 @@
 use std::env::VarError;
 
 use std::borrow::Cow;
+use std::fmt;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::de::Deserializer;
@@ -70,6 +71,65 @@ impl EnvValue {
             Self::Literal(s) => s.clone(),
             Self::EnvRef(var) => format!("${{{var}}}"),
         }
+    }
+}
+
+/// An [`EnvValue`] resolved against the host environment, kept beside the
+/// value it was resolved from.
+///
+/// The source is what lets a resolved `${VAR}` reach podman or buildah without
+/// being shown: a command built from one passes the key by name, with the
+/// value in the client's environment rather than on its command line, and
+/// every diagnostic spells the entry `KEY=${VAR}` as the config did. A plain
+/// `String` carries no such record, so it is passed and shown as written.
+///
+/// The fields are private so the pair cannot drift: a value edited after
+/// resolution would still claim the reference that never produced it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedEnvValue {
+    value: String,
+    source: EnvValue,
+}
+
+impl ResolvedEnvValue {
+    /// Resolve `source` as [`EnvValue::resolve`] does, keeping it.
+    pub fn resolve(source: EnvValue) -> Result<Self, EnvValueError> {
+        let value = source.resolve()?;
+        Ok(Self { value, source })
+    }
+
+    /// The resolved value: the literal, or the referenced variable's value.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The config value this was resolved from.
+    pub fn source(&self) -> &EnvValue {
+        &self.source
+    }
+
+    pub(crate) fn into_value(self) -> String {
+        self.value
+    }
+
+    /// A pair as if `source` had resolved to `value`, without reading the
+    /// process environment.
+    #[cfg(test)]
+    pub(crate) fn assume(source: EnvValue, value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            source,
+        }
+    }
+}
+
+/// Only the source: a resolved reference's value is what this type exists to
+/// keep out of output.
+impl fmt::Debug for ResolvedEnvValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedEnvValue")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
     }
 }
 

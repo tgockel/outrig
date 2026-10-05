@@ -84,7 +84,10 @@ Configuring your first image
 
 The default agent name is `coder` (a role-based constant). The default
 image-config name is `<repo-folder>-standard` (kebab-cased), so the image-config carries
-the repo's identity while the agent carries its role.
+the repo's identity while the agent carries its role. A folder name with a letter outside
+ASCII suggests `standard` instead. The image-config name becomes the repository of the image
+built from it, so a name typed here that can't be one is asked for again; see
+[`outrig image add`](image.md#outrig-image-add) for the rule.
 
 The model section reads your global `~/.outrig/config.toml` and lists the available models.
 Answering "yes" walks the same model-definition prompts as `outrig config init`, except the

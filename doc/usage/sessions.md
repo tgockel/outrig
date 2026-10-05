@@ -37,7 +37,10 @@ random hex digits -- sortable, unambiguous across concurrent runs):
         ├── network.jsonl         # network audit/filter records when enabled
         ├── events.jsonl          # what a run-new agent did, when [events] records it
         ├── fs.stderr             # MCP "fs" server's captured stderr
-        └── shell.stderr          # MCP "shell" server's captured stderr
+        ├── shell.stderr          # MCP "shell" server's captured stderr
+        ├── subagent-audit.log    # transcript of the subagent "audit"
+        └── subagent-audit/       # transcripts of the subagents "audit" launched
+            └── subagent-scan.log
 ```
 
 `session.json` names every container the session owns: `container_name` for the primary,
@@ -143,6 +146,9 @@ $ outrig logs 20260501T134412-3f2a
   shell    (3.4 KiB)
 ```
 
+A file in a subdirectory, like the transcript of a subagent another subagent launched, is listed
+by its path under `logs/`.
+
 Follow a still-running session's log:
 
 ```sh
@@ -160,7 +166,7 @@ warning: unused import: `std::collections::HashMap`
 returns when EOF is reached and no further writes are expected.
 
 When network audit or filter mode is enabled, `logs/network.jsonl` contains one Zeek
-`conn.log`-style JSON object per outbound connection. It is not selected with the server-name
+`conn.log`-style JSON object per outbound TCP connection. It is not selected with the server-name
 argument because it is not an MCP stderr log; read it directly from the session directory:
 
 ```sh
@@ -376,6 +382,11 @@ The cutoff is what keeps this away from a build that is running right now, so do
   asked.
 - **API keys.** The bearer token used for the LLM call is never written to disk and never appears
   in tracing output.
+- **Referenced env values.** A `${VAR}` build-arg or MCP `env` value appears in `container.log`,
+  errors, and debug output only as `KEY=${VAR}`, and reaches podman and buildah through their
+  environment rather than their command line -- with the exceptions listed under
+  [the value syntax](../reference/config.md#mcp-env-value-syntax). What a build step or an MCP
+  server prints is recorded as printed.
 
 ## Concurrent sessions
 

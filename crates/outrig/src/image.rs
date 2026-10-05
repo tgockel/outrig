@@ -8,16 +8,22 @@
 //! still helps speed up the build itself when we miss; the project-level tag
 //! cache exists so a *hit* skips buildah entirely.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
-use crate::config::{ImageConfig, ImageSourceRef, McpServerSpec};
+use crate::config::{
+    ImageConfig, ImageSourceRef, McpServerSpec, ResolvedEnvValue, resolve_against,
+};
 use crate::container::embedded::{self, mcp_config_to_labels, merged_mcp_config_to_labels};
+use crate::engine_env;
 use crate::error::{IoPathExt, OutrigError, Result};
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::{CleanupGuard, Reissue};
@@ -185,11 +191,7 @@ impl CacheKey {
         }
         hasher.update(block.as_bytes());
 
-        if is_git_context(context).await? {
-            hash_git_context(context, &mut hasher).await?;
-        } else {
-            hash_tar_context(context, &mut hasher).await?;
-        }
+        hash_context(context, &mut hasher).await?;
 
         let hex = hasher.finalize().to_hex();
         Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
@@ -228,11 +230,7 @@ impl CacheKey {
         }
         hasher.update(block.as_bytes());
 
-        if is_git_context(context).await? {
-            hash_git_context(context, &mut hasher).await?;
-        } else {
-            hash_tar_context(context, &mut hasher).await?;
-        }
+        hash_context(context, &mut hasher).await?;
 
         let hex = hasher.finalize().to_hex();
         Ok(hex.as_str()[..KEY_HEX_LEN].to_string())
@@ -241,20 +239,21 @@ impl CacheKey {
 
 /// Resolve `build-args` for an image-config. Literal values pass through;
 /// `${VAR}` references are read from the host environment and framed with the
-/// image name plus the build-arg key on failure.
+/// image name plus the build-arg key on failure. Each keeps its source, so the
+/// build passes a reference by name and shows it as `KEY=${VAR}`.
 pub(crate) fn resolve_build_args(
     image: &str,
     cfg: &ImageConfig,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<BTreeMap<String, ResolvedEnvValue>> {
     let mut resolved = BTreeMap::new();
     for (key, value) in &cfg.build_args {
-        let value = value
-            .resolve()
-            .map_err(|source| OutrigError::BuildArgResolveFailed {
+        let value = ResolvedEnvValue::resolve(value.clone()).map_err(|source| {
+            OutrigError::BuildArgResolveFailed {
                 image: image.to_string(),
                 key: key.clone(),
                 source,
-            })?;
+            }
+        })?;
         resolved.insert(key.clone(), value);
     }
     Ok(resolved)
@@ -296,18 +295,23 @@ async fn compute_tag_with_build_args(
     repo: &str,
     cfg: &ImageConfig,
     repo_root: &Path,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<ImageTag> {
     let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     let labels = repo_build_cache_labels(cfg)?;
-    let key = CacheKey::compute_with_labels(&dockerfile, build_args, &context, &labels).await?;
+    // The key covers the values buildah receives, however each is passed.
+    let values = build_args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.value().to_owned()))
+        .collect();
+    let key = CacheKey::compute_with_labels(&dockerfile, &values, &context, &labels).await?;
     Ok(ImageTag::new(format!("{repo}:{key}")))
 }
 
 /// Returns `true` iff `tag` already exists in buildah's local image store.
-/// `buildah images --quiet <tag>` prints the image id on a hit and nothing
-/// on a miss; either way exits 0, so we ignore the status and inspect
-/// stdout.
+/// `buildah images --quiet <tag>` prints the image id on a hit, and exits 125
+/// with `image not known` on a miss; any failure reads as a miss, and so does
+/// a success that printed no id.
 pub async fn probe_cached(tag: &ImageTag) -> Result<bool> {
     let probe = process::try_capture(
         Cmd::new("buildah")
@@ -421,9 +425,10 @@ pub async fn build_image_for(
 /// The envelope every build path shares, held in one place because its
 /// ordering is the load-bearing part: the guard is armed before the tag can
 /// exist, so the store never holds it unowned, and released strictly *after*
-/// the awaited cleanup, because a cancellation landing inside that cleanup is
-/// the case the guard is for. Three call sites got that right independently;
-/// one is easier to keep right.
+/// the awaited cleanup -- and only if that worked, per [`discharge`] --
+/// because a cancellation landing inside that cleanup is the case the guard is
+/// for. Three call sites got that right independently; one is easier to keep
+/// right.
 async fn into_temp_tag<F>(tag: &ImageTag, transcript: Option<&Transcript>, build: F) -> Result<()>
 where
     F: AsyncFnOnce(&ImageTag) -> Result<()>,
@@ -431,8 +436,7 @@ where
     let temp_tag = temporary_build_tag(tag);
     let temp_owned = temp_tag_guard(&temp_tag);
     let result = build(&temp_tag).await;
-    cleanup_temp_image(&temp_tag, transcript).await;
-    temp_owned.release();
+    discharge(temp_owned, "image not known", transcript).await;
     result
 }
 
@@ -441,7 +445,7 @@ async fn build_image_with_build_args(
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
     into_temp_tag(tag, None, async |temp_tag| {
         process::run_streamed_checked(
@@ -461,7 +465,7 @@ async fn build_image_logged_with_build_args(
     tag: &ImageTag,
     no_cache: bool,
     transcript: Option<&Transcript>,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Result<()> {
     into_temp_tag(tag, transcript, async |temp_tag| {
         process::run_capture_logged_terminating(
@@ -590,9 +594,10 @@ pub async fn ensure_tagged_image_for(
 
 /// Build a standalone image project with buildah, tagging the result `tag` and
 /// stamping `labels` (the project's config, serialized to OCI labels) into the
-/// image metadata. `dockerfile` and `context` are resolved relative to
-/// `project_dir`. Stderr from buildah is streamed to `tracing::info!` with the
-/// `[buildah]` prefix.
+/// image metadata. `dockerfile` and `context` resolve against `project_dir` by
+/// the rule every config path follows, so a leading `~` is the home directory.
+/// Stderr from buildah is streamed to `tracing::info!` with the `[buildah]`
+/// prefix.
 ///
 /// Unlike [`ensure_image`], there is no content-addressed cache probe: a
 /// standalone build tags a stable caller-named ref (e.g. `rust-dev`), not a
@@ -612,8 +617,8 @@ pub async fn build_standalone(
     no_cache: bool,
     labels: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let dockerfile = project_dir.join(dockerfile);
-    let context = project_dir.join(context);
+    let dockerfile = resolve_against(project_dir, dockerfile);
+    let context = resolve_against(project_dir, context);
     // The cleanup `into_temp_tag` runs below is an *untag* on the success
     // path: `tag_image` has by then given the image a second name, so
     // removing the temporary one leaves the image under the caller's. On the
@@ -832,11 +837,12 @@ struct SkopeoInspect {
 
 /// Arm the removal of a build's temporary tag.
 ///
-/// `cleanup_temp_image` below each build is what runs on every path that
-/// reaches it; this covers the one that does not, since the cleanup is a
-/// statement after an `.await` and a dropped future never gets there. The tag
-/// is named before `buildah build` runs, so arming it first leaves no instant
-/// at which the store could hold it unowned.
+/// The [`discharge`] after each build is what runs on every path that reaches
+/// it; this covers the paths on which that does not remove the tag. A dropped
+/// future never gets there, since the cleanup is a statement after an
+/// `.await`, and buildah can refuse a removal it does reach. The tag is named
+/// before `buildah build` runs, so arming it first leaves no instant at which
+/// the store could hold it unowned.
 fn temp_tag_guard(temp_tag: &ImageTag) -> CleanupGuard {
     // The tag carries this build's pid and nonce, so it names nothing another
     // build could create -- a retry is safe.
@@ -988,12 +994,14 @@ async fn commit_image_with_labels(
     .await;
 
     // `commit --rm` takes the working container on the success path, and
-    // `cleanup_builder` on the failure path -- so by here it is gone either
-    // way and the guard has nothing left to owe.
-    if result.is_err() {
-        cleanup_builder(&builder, transcript).await;
+    // `discharge` on the failure path. A reissue that leaves races the
+    // caller's `rmi` of the image this container was made from, which buildah
+    // refuses as in use if it loses -- so that guard stays armed too, and its
+    // backed-off retries land once the container is gone.
+    match result {
+        Ok(()) => builder_owned.release(),
+        Err(_) => discharge(builder_owned, "container not known", transcript).await,
     }
-    builder_owned.release();
     result
 }
 
@@ -1006,22 +1014,47 @@ async fn run_buildah_capture(cmd: Cmd, transcript: Option<&Transcript>) -> Resul
     Ok(())
 }
 
-async fn cleanup_builder(builder: &str, transcript: Option<&Transcript>) {
-    let cmd = Cmd::new("buildah").arg("rm").arg(builder);
-    if transcript.is_some() {
-        let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
-    } else {
-        let _ = process::try_capture(cmd).await;
-    }
+/// Run `guard`'s removal now, awaited, and release the guard only if that
+/// left nothing behind; `absent` is the removal's stderr for a target that was
+/// never there.
+///
+/// Otherwise the guard drops armed, and its drop reissues the removal. The
+/// failure is warned about rather than returned: the caller is holding the
+/// build's own result, which a cleanup failure must not replace.
+async fn discharge(guard: CleanupGuard, absent: &str, transcript: Option<&Transcript>) {
+    let cmd = guard.removal().clone();
+    let failure = match process::try_capture_logged(cmd.clone(), "buildah", transcript).await {
+        Ok(output) if left_nothing(&output, absent) => {
+            guard.release();
+            return;
+        }
+        Ok(output) => cmd.process_error(
+            output.status.code(),
+            process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
+        ),
+        Err(e) => e,
+    };
+    tracing::warn!(
+        target: "outrig::image",
+        "a build cleanup left its target behind; reissuing it in the background: {failure}"
+    );
 }
 
-async fn cleanup_temp_image(tag: &ImageTag, transcript: Option<&Transcript>) {
-    let cmd = Cmd::new("buildah").arg("rmi").arg(tag.as_str());
-    if transcript.is_some() {
-        let _ = process::try_capture_logged(cmd, "buildah", transcript).await;
-    } else {
-        let _ = process::try_capture(cmd).await;
-    }
+/// Whether a removal's output shows its target gone: removed now, or never
+/// there.
+///
+/// buildah exits 125 for a target that does not exist, the same code as for
+/// every other failure, so the storage layer's "not known" sentinel in stderr
+/// is the only thing that tells the two apart (measured against buildah
+/// 1.33.7). A presence probe would not avoid the string match: `buildah images
+/// --quiet` answers a miss the same way.
+///
+/// Absence has to count. A build that fails before it creates its tag reaches
+/// the `rmi` of that tag every time, and reading the answer as a failure would
+/// spend a round of detached retries on nothing. Should a later buildah reword
+/// the sentinel, that round is what it costs -- never a leak.
+fn left_nothing(output: &std::process::Output, absent: &str) -> bool {
+    output.status.success() || String::from_utf8_lossy(&output.stderr).contains(absent)
 }
 
 fn build_image_cmd(
@@ -1029,7 +1062,7 @@ fn build_image_cmd(
     repo_root: &Path,
     tag: &ImageTag,
     no_cache: bool,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
 ) -> Cmd {
     let (dockerfile, context) = cfg.resolved_build_paths(repo_root);
     buildah_build_cmd(
@@ -1043,8 +1076,9 @@ fn build_image_cmd(
 }
 
 /// Assemble a `buildah build --tag <tag> --file <dockerfile> [--no-cache]
-/// [--build-arg ...] [--label ...] <context>` command. `dockerfile` and
-/// `context` are absolute (already joined with their base dir). Used directly
+/// [--build-arg ...] [--label ...] <context>` command. A build-arg resolved
+/// from a `${VAR}` reference is passed by name; see [`engine_env`]. `dockerfile` and
+/// `context` are already resolved, through [`resolve_against`]. Used directly
 /// by standalone image builds; repo-local builds first build a temporary image,
 /// then stamp merged OutRig labels in a final metadata-only commit.
 ///
@@ -1058,7 +1092,7 @@ fn buildah_build_cmd(
     context: &Path,
     tag: &ImageTag,
     no_cache: bool,
-    build_args: &BTreeMap<String, String>,
+    build_args: &BTreeMap<String, ResolvedEnvValue>,
     labels: &BTreeMap<String, String>,
 ) -> Cmd {
     let mut cmd = Cmd::new("buildah")
@@ -1071,12 +1105,22 @@ fn buildah_build_cmd(
         cmd = cmd.arg("--no-cache");
     }
     for (k, v) in build_args {
-        cmd = cmd.arg("--build-arg").arg(format!("{k}={v}"));
+        cmd = engine_env::push_keyed(cmd, "--build-arg", k, v.value(), Some(v.source()));
     }
     for (k, v) in labels {
         cmd = cmd.arg("--label").arg(format!("{k}={v}"));
     }
     cmd.arg(context)
+}
+
+/// Key the build context `ctx`: by [`hash_git_context`] in a git worktree, or
+/// as a tarball of the whole directory outside one.
+async fn hash_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    if is_git_context(ctx).await? {
+        hash_git_context(ctx, hasher).await
+    } else {
+        hash_tar_context(ctx, hasher).await
+    }
 }
 
 async fn is_git_context(ctx: &Path) -> Result<bool> {
@@ -1090,67 +1134,334 @@ async fn is_git_context(ctx: &Path) -> Result<bool> {
     Ok(output.status.success())
 }
 
+/// Whether git takes `dir` as the top of a worktree of its own. `rev-parse
+/// --show-prefix` prints an empty prefix there; from a directory an enclosing
+/// repository reaches into, it prints that directory's path.
+async fn is_worktree_root(dir: &Path) -> Result<bool> {
+    let output = process::try_capture(
+        Cmd::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "--show-prefix"]),
+    )
+    .await?;
+    Ok(output.status.success() && output.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
+/// Hash every file in a git-hosted `ctx` that no ignore rule excludes, tracked
+/// or not, each by its context-relative path, `st_mode`, and content.
+///
+/// buildah is handed the whole directory, so that is the set a `COPY` can
+/// reach, less what `.gitignore` excludes: build output (`target/`,
+/// `node_modules/`) stays out so it cannot bust the cache. The mode carries
+/// both the file type and the permission bits `COPY` preserves.
+///
+/// Where the rules exclude every file -- the context sits under an ignored
+/// directory, as `.agents/` kept out of version control would, or every file
+/// in it is ignored -- they say nothing about which are build inputs, and the
+/// whole tree counts. A file tracked although a rule matches it, force-added
+/// or committed before the rule, is excluded all the same.
 async fn hash_git_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    // `--full-name` makes `ls-files` emit paths relative to the repo root.
-    // Without it, paths come out cwd-relative, but `hash-object --stdin-paths`
-    // (below) only resolves repo-root-relative paths -- the two would
-    // disagree whenever `ctx` is a subdirectory of the working tree.
-    let listing = process::run_capture(Cmd::new("git").arg("-C").arg(ctx).args([
-        "ls-files",
-        "-z",
-        "--full-name",
-        ".",
-    ]))
+    hash_git_tree(ctx, Path::new(""), hasher).await
+}
+
+/// [`hash_git_context`] for `ctx/dir`, a directory git lists from its own
+/// repository: the context itself, or a nested repository in it. Paths are
+/// keyed relative to `ctx/dir`, but symlinks resolve against `ctx`, as buildah
+/// resolves every `COPY` source.
+async fn hash_git_tree(ctx: &Path, dir: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let tree = ctx.join(dir);
+    // What the rules admit, tracked or not, and what is tracked although a
+    // rule matches it.
+    let (paths, excluded) = tokio::try_join!(
+        ls_files(&tree, &["--cached", "--others", "--exclude-standard"]),
+        ls_files(&tree, &["--cached", "--ignored", "--exclude-standard"]),
+    )?;
+
+    // One blocking pass rather than an async round-trip per stat and read:
+    // a context can be a whole checkout.
+    let (root, base) = (ctx.to_path_buf(), dir.to_path_buf());
+    let entries = tokio::task::spawn_blocking(move || {
+        let mut tree = TreeHasher::new(&root);
+        let mut entries = Vec::with_capacity(paths.len());
+        for rel in paths {
+            if let Some((mode, entry)) = tree.listed(&base.join(OsStr::from_bytes(&rel)))? {
+                entries.push((rel, mode, entry));
+            }
+        }
+        Ok::<_, OutrigError>(entries)
+    })
+    .await
+    .expect("context hashing task panicked")?;
+
+    // Nothing left, or only what a rule excludes: the whole tree counts.
+    if entries
+        .iter()
+        .all(|(rel, ..)| excluded.binary_search(rel).is_ok())
+    {
+        hasher.update(hash_whole_tree(ctx, dir).await?.as_bytes());
+        return Ok(());
+    }
+
+    for (rel, mode, entry) in entries {
+        let digest = match entry {
+            ContextEntry::Leaf(digest) => digest,
+            ContextEntry::Dir => {
+                let sub_dir = dir.join(OsStr::from_bytes(&rel));
+                // A nested repository or initialized submodule is hashed by
+                // the same rule, in its own repository. Anything else -- an
+                // uninitialized submodule, or one whose `.git` git rejects --
+                // is hashed as a plain tree: git answers there from the
+                // enclosing repository and lists the directory as `./`, so
+                // recursing would never end.
+                if is_worktree_root(&ctx.join(&sub_dir)).await? {
+                    let mut sub = blake3::Hasher::new();
+                    Box::pin(hash_git_tree(ctx, &sub_dir, &mut sub)).await?;
+                    sub.finalize()
+                } else {
+                    hash_whole_tree(ctx, &sub_dir).await?
+                }
+            }
+        };
+        // Everything after the NUL-terminated path is fixed-width, so two
+        // different listings cannot feed the same stream.
+        hasher.update(&rel);
+        hasher.update(b"\0");
+        hasher.update(&mode.to_le_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    Ok(())
+}
+
+/// What `git ls-files -z <flags> .` lists in `tree`, sorted and deduplicated.
+/// Without `--full-name`, paths come out relative to `tree`, as buildah sees
+/// them.
+async fn ls_files(tree: &Path, flags: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let listing = process::run_capture(
+        Cmd::new("git")
+            .arg("-C")
+            .arg(tree)
+            .args(["ls-files", "-z"])
+            .args(flags)
+            .arg("."),
+    )
     .await?;
 
-    // Sort defensively (`git ls-files` already sorts, but pin the order so
-    // the hash stream is stable against any future change).
-    let mut sorted: Vec<Vec<u8>> = listing
+    // `--cached` and `--others` come out as two runs, each sorted; pin one
+    // order. An unmerged path is listed once per stage.
+    let mut paths: Vec<Vec<u8>> = listing
         .stdout
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
         .map(<[u8]>::to_vec)
         .collect();
-    sorted.sort_unstable();
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
 
-    let cmd = Cmd::new("git")
-        .arg("-C")
-        .arg(ctx)
-        .args(["hash-object", "--stdin-paths"]);
-    let argv_for_error = cmd.args.clone();
-    let mut child = process::spawn_stdio(cmd).await?;
+/// `ctx/dir` whole, ignored files and all, by [`TreeHasher::dir`].
+async fn hash_whole_tree(ctx: &Path, dir: &Path) -> Result<blake3::Hash> {
+    let (root, dir) = (ctx.to_path_buf(), dir.to_path_buf());
+    tokio::task::spawn_blocking(move || TreeHasher::new(&root).dir(&dir))
+        .await
+        .expect("context hashing task panicked")
+}
 
-    // Write paths to stdin and drain stdout concurrently. Writing all stdin
-    // before reading stdout would deadlock once the kernel pipe buffer fills
-    // (~64 KiB on Linux, ~1600 typical paths' worth of output).
-    let mut stdin = child.stdin.take().expect("stdin was piped");
-    let writer = tokio::spawn(async move {
-        for p in &sorted {
-            stdin.write_all(p).await?;
-            stdin.write_all(b"\n").await?;
+/// What one listed path contributes to [`hash_git_context`].
+enum ContextEntry {
+    /// Anything but a directory, hashed in the blocking pass.
+    Leaf(blake3::Hash),
+    /// A directory git lists as one entry: a submodule or nested repository.
+    Dir,
+}
+
+/// Hashes paths under the build context directly, off git's listing: what a
+/// symlink resolves to, a directory git lists whole with no repository of its
+/// own, and a tree git's ignore rules exclude whole.
+///
+/// `COPY <link>` copies a link's referent, which git may never list (ignored,
+/// or under `.git`) and which may hold more links, so every link is followed
+/// wherever it is met. A referent is hashed once; a link back into one still
+/// being hashed is a loop, and counts by its text alone.
+struct TreeHasher<'a> {
+    ctx: &'a Path,
+    /// Mode and digest of each referent hashed so far, by context-relative
+    /// path.
+    done: HashMap<PathBuf, (u32, blake3::Hash)>,
+    /// Referents being hashed now.
+    active: HashSet<PathBuf>,
+}
+
+impl<'a> TreeHasher<'a> {
+    fn new(ctx: &'a Path) -> Self {
+        Self {
+            ctx,
+            done: HashMap::new(),
+            active: HashSet::new(),
         }
-        drop(stdin);
-        Ok::<(), std::io::Error>(())
-    });
-
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut buf = Vec::new();
-    stdout.read_to_end(&mut buf).await?;
-
-    let status = child.wait().await?;
-    writer.await.expect("stdin writer panicked")?;
-
-    if !status.success() {
-        return Err(OutrigError::Process {
-            program: "git",
-            argv: argv_for_error,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        });
     }
 
-    hasher.update(&buf);
-    Ok(())
+    /// Stat and hash one path git listed. `None` for a path the worktree no
+    /// longer has: a tracked file deleted without `git rm`, which buildah does
+    /// not see either. A directory is left to the caller, which asks git
+    /// whether it is a repository of its own.
+    fn listed(&mut self, rel: &Path) -> Result<Option<(u32, ContextEntry)>> {
+        let path = self.ctx.join(rel);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).path_ctx("stat", path),
+        };
+        let entry = if meta.is_dir() {
+            ContextEntry::Dir
+        } else {
+            ContextEntry::Leaf(self.entry(rel, &meta)?)
+        };
+        Ok(Some((meta.mode(), entry)))
+    }
+
+    /// `ctx/rel` by what it is: a file by its content, a symlink by
+    /// [`Self::link`], a directory by [`Self::dir`], and a FIFO, socket, or
+    /// device by nothing -- its mode says which, and opening a FIFO would
+    /// block.
+    fn entry(&mut self, rel: &Path, meta: &std::fs::Metadata) -> Result<blake3::Hash> {
+        let file_type = meta.file_type();
+        if file_type.is_file() {
+            hash_file(&self.ctx.join(rel))
+        } else if file_type.is_symlink() {
+            self.link(rel)
+        } else if file_type.is_dir() {
+            self.dir(rel)
+        } else {
+            Ok(blake3::Hash::from_bytes([0; 32]))
+        }
+    }
+
+    /// Each entry of the directory `ctx/rel`, by name, mode, and digest.
+    fn dir(&mut self, rel: &Path) -> Result<blake3::Hash> {
+        let path = self.ctx.join(rel);
+        let mut names = std::fs::read_dir(&path)
+            .and_then(|entries| {
+                entries
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .path_ctx("read", &path)?;
+        names.sort_unstable();
+
+        let mut hasher = blake3::Hasher::new();
+        for name in names {
+            let rel = rel.join(&name);
+            let path = self.ctx.join(&rel);
+            let meta = std::fs::symlink_metadata(&path).path_ctx("stat", &path)?;
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(&meta.mode().to_le_bytes());
+            hasher.update(self.entry(&rel, &meta)?.as_bytes());
+        }
+        Ok(hasher.finalize())
+    }
+
+    /// The symlink `ctx/rel`: its text, as `COPY .` keeps it, then the mode
+    /// and digest of what `COPY <link>` copies in its place, if anything.
+    fn link(&mut self, rel: &Path) -> Result<blake3::Hash> {
+        let path = self.ctx.join(rel);
+        let target = std::fs::read_link(&path).path_ctx("read", &path)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(target.as_os_str().as_bytes());
+        hasher.update(b"\0");
+        if let Some(referent) = resolve_in_context(self.ctx, rel)
+            && let Some((mode, digest)) = self.referent(referent)?
+        {
+            hasher.update(&mode.to_le_bytes());
+            hasher.update(digest.as_bytes());
+        }
+        Ok(hasher.finalize())
+    }
+
+    /// Mode and digest of `ctx/rel`, which a link resolved to. `None` when
+    /// nothing is there, or when it is still being hashed -- a loop.
+    fn referent(&mut self, rel: PathBuf) -> Result<Option<(u32, blake3::Hash)>> {
+        if let Some(done) = self.done.get(&rel) {
+            return Ok(Some(*done));
+        }
+        let Ok(meta) = std::fs::symlink_metadata(self.ctx.join(&rel)) else {
+            return Ok(None);
+        };
+        if !self.active.insert(rel.clone()) {
+            return Ok(None);
+        }
+        let digest = self.entry(&rel, &meta);
+        self.active.remove(&rel);
+        let done = (meta.mode(), digest?);
+        self.done.insert(rel, done);
+        Ok(Some(done))
+    }
+}
+
+fn hash_file(path: &Path) -> Result<blake3::Hash> {
+    let file = std::fs::File::open(path).path_ctx("open", path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file).path_ctx("read", path)?;
+    Ok(hasher.finalize())
+}
+
+/// Resolve the symlink at `ctx/rel` to a path relative to `ctx`, as buildah
+/// resolves a `COPY` source: with `ctx` as `/`, so an absolute target or a
+/// `..` past the top stays inside. A target -- a relative one joined to the
+/// link's directory first -- is cleaned before any of it is resolved, so
+/// `alias/..` cancels even where `alias` is itself a link, and a component
+/// that is not there is kept as written. `None` past buildah's limit on links
+/// followed -- a loop.
+fn resolve_in_context(ctx: &Path, rel: &Path) -> Option<PathBuf> {
+    // buildah's maxLoopsFollowed.
+    const MAX_LINKS: usize = 64;
+    // Cleaned paths hold only names, so the walk below never meets `..`.
+    let names = |path: &Path| -> Vec<OsString> {
+        clean_lexically(path)
+            .components()
+            .rev()
+            .map(|c| c.as_os_str().to_owned())
+            .collect()
+    };
+
+    // Still to walk, next name last.
+    let mut pending = names(rel);
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    while let Some(name) = pending.pop() {
+        let next = resolved.join(&name);
+        let Ok(target) = std::fs::read_link(ctx.join(&next)) else {
+            resolved = next;
+            continue;
+        };
+        links += 1;
+        if links > MAX_LINKS {
+            return None;
+        }
+        // Joining an absolute target replaces `resolved` outright.
+        pending.extend(names(&resolved.join(target)));
+        resolved = PathBuf::new();
+    }
+    Some(resolved)
+}
+
+/// `path`'s names alone, each `..` cancelling the one before it and none
+/// climbing above the start. A leading `/` is dropped: the caller's root is
+/// the context.
+fn clean_lexically(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                cleaned.pop();
+            }
+            Component::Normal(name) => cleaned.push(name),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    cleaned
 }
 
 async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
@@ -1171,7 +1482,7 @@ async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
         ])
         .arg(ctx)
         .arg(".");
-    let argv_for_error = cmd.args.clone();
+    let failed = cmd.clone();
     let mut child = process::spawn_stdio(cmd).await?;
 
     drop(child.stdin.take());
@@ -1202,12 +1513,7 @@ async fn hash_tar_context(ctx: &Path, hasher: &mut blake3::Hasher) -> Result<()>
     let status = child.wait().await?;
     let _ = stderr_task.await;
     if !status.success() {
-        return Err(OutrigError::Process {
-            program: "tar",
-            argv: argv_for_error,
-            exit_code: status.code(),
-            stderr_tail: String::new(),
-        });
+        return Err(failed.process_error(status.code(), String::new()));
     }
     Ok(())
 }
@@ -1220,14 +1526,24 @@ mod tests {
     use super::*;
     use crate::config::EnvValue;
 
+    /// The issue #324 shape: a token in a build-arg must not be on buildah's
+    /// command line, where `ps` reads it, nor in anything a failure prints.
     #[test]
-    fn build_image_cmd_uses_resolved_build_args() {
-        let mut cfg = ImageConfig::from_dockerfile("Dockerfile", ".");
-        cfg.build_args = BTreeMap::from([(
-            "GH_TOKEN".to_string(),
-            EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
-        )]);
-        let resolved = BTreeMap::from([("GH_TOKEN".to_string(), "secret-token".to_string())]);
+    fn build_image_cmd_passes_a_referenced_build_arg_by_name() {
+        let cfg = ImageConfig::from_dockerfile("Dockerfile", ".");
+        let resolved = BTreeMap::from([
+            (
+                "GH_TOKEN".to_string(),
+                ResolvedEnvValue::assume(
+                    EnvValue::EnvRef("GITHUB_TOKEN".to_string()),
+                    "secret-token",
+                ),
+            ),
+            (
+                "NODE_VERSION".to_string(),
+                ResolvedEnvValue::assume(EnvValue::Literal("20".to_string()), "20"),
+            ),
+        ]);
 
         let cmd = build_image_cmd(
             &cfg,
@@ -1237,12 +1553,29 @@ mod tests {
             &resolved,
         );
 
-        assert!(cmd.args.contains(&OsString::from("--build-arg")));
-        assert!(cmd.args.contains(&OsString::from("GH_TOKEN=secret-token")));
+        let argv = cmd.exec_args();
+        for expected in ["--build-arg", "GH_TOKEN", "NODE_VERSION=20"] {
+            assert!(
+                argv.contains(&OsString::from(expected)),
+                "{expected}: {argv:?}"
+            );
+        }
         assert!(
-            !cmd.args
-                .contains(&OsString::from("GH_TOKEN=${GITHUB_TOKEN}"))
+            argv.iter()
+                .all(|arg| !arg.to_string_lossy().contains("secret-token")),
+            "the value is not on the command line: {argv:?}"
         );
+        assert_eq!(
+            cmd.hidden_env(),
+            [("GH_TOKEN".to_string(), "secret-token".to_string())]
+        );
+        let rendered = cmd.render();
+        assert!(
+            rendered.contains("'GH_TOKEN=${GITHUB_TOKEN}'"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("NODE_VERSION=20"), "{rendered}");
+        assert!(!rendered.contains("secret-token"), "{rendered}");
     }
 
     #[test]
@@ -1400,6 +1733,57 @@ mod tests {
         assert!(matches!(err, OutrigError::Configuration(_)));
         assert!(err.to_string().contains("invalid env JSON"), "got: {err}");
         assert!(err.to_string().contains("outrig-cache:test"), "got: {err}");
+    }
+
+    /// A removal discharges its guard only by working or by finding nothing
+    /// there. The absent answers are buildah 1.33.7's own text, exit 125 and
+    /// all -- the code every other failure exits with too.
+    #[test]
+    fn a_removal_is_discharged_only_by_success_or_a_known_absence() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = |code: i32, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        assert!(left_nothing(&output(0, ""), "image not known"));
+        assert!(left_nothing(
+            &output(
+                125,
+                "Error: 1 error occurred:\n\t* repo:outrig-tmp-1-ab-key: image not known\n\n"
+            ),
+            "image not known"
+        ));
+        assert!(left_nothing(
+            &output(
+                125,
+                "Error: removing container \"outrig-label-1-2\": container not known\n"
+            ),
+            "container not known"
+        ));
+
+        // Refusals that leave the target where it was.
+        assert!(!left_nothing(
+            &output(
+                125,
+                "Error: 1 error occurred:\n\t* image used by 5e1f: image is in use by a container\n"
+            ),
+            "image not known"
+        ));
+        assert!(!left_nothing(
+            &output(
+                125,
+                "Error: removing outrig-label-1-2: database is locked\n"
+            ),
+            "container not known"
+        ));
+        // Each removal is read against its own sentinel only.
+        assert!(!left_nothing(
+            &output(125, "Error: container not known\n"),
+            "image not known"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -31,7 +31,7 @@
 //! processes outrig itself is waiting on, and what dropping their future
 //! guarantees.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -415,8 +415,16 @@ fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
     let mut script = String::new();
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
     for cmd in cmds {
+        // One shell cannot scope an environment or a stand-in to one of the
+        // commands it runs, and no cleanup command carries either.
+        debug_assert!(
+            !cmd.carries_hidden(),
+            "a cleanup chain runs only plain argv"
+        );
         let mut words = Vec::new();
-        for word in std::iter::once(std::ffi::OsString::from(cmd.program)).chain(cmd.args) {
+        for word in std::iter::once(std::ffi::OsString::from(cmd.program))
+            .chain(cmd.exec_args().iter().cloned())
+        {
             argv.push(word);
             words.push(format!("\"${{{}}}\"", argv.len()));
         }
@@ -434,8 +442,7 @@ fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
 
 /// Start one attempt at `cmd`, with stdio nulled.
 fn spawn_cleanup(cmd: &Cmd) -> std::io::Result<Child> {
-    Command::new(cmd.program)
-        .args(&cmd.args)
+    cmd.std_command()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -795,8 +802,9 @@ impl Wait {
 /// ordinary paths still remove these themselves, awaited and in order; the
 /// guard covers the path that never gets there.
 ///
-/// Removing something twice has to be harmless, because on most paths it will
-/// be: `buildah rmi` of a tag that is already gone is a no-op.
+/// Removing something twice has to be harmless, because a removal whose
+/// outcome is not known gets issued again: `buildah rmi` of a tag that is
+/// already gone changes nothing.
 pub(crate) struct CleanupGuard(Option<(Cmd, Reissue)>);
 
 impl CleanupGuard {
@@ -809,10 +817,21 @@ impl CleanupGuard {
         Self(Some((remove, reissue)))
     }
 
+    /// The removal this guard owes, for a caller that awaits it first.
+    ///
+    /// Running this one rather than a copy built beside it is what keeps the
+    /// awaited removal and the reissue from drifting apart.
+    pub(crate) fn removal(&self) -> &Cmd {
+        // Only `release` and `Drop` empty it, and both take the guard.
+        let (remove, _) = self.0.as_ref().expect("an armed guard holds its removal");
+        remove
+    }
+
     /// The resource is gone by other means, or an owner that will remove it
     /// now exists. Release **after** the awaited cleanup, never before: a
     /// cancellation landing inside that cleanup is exactly the case the guard
-    /// is for.
+    /// is for. And only once that cleanup is known to have worked -- releasing
+    /// on the strength of a removal that failed disarms the one retry left.
     pub(crate) fn release(mut self) {
         self.0 = None;
     }

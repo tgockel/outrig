@@ -149,9 +149,11 @@ When every candidate has failed, what happens next depends on *why*. The message
 candidate with its own reason either way:
 
 * **At least one failed recoverably** -- a rate limit, an unreachable host, a response that could
-  not be used -- and the **turn** ends. Nothing was appended to the history, so sending the prompt
-  again retries it. One vendor rate-limiting while another's key is revoked lands here too: the
-  rate limit is the reason that can lift on its own, so it is worth waiting out.
+  not be used -- and the **turn** ends. If that was the turn's first model call nothing was
+  appended to the history, and sending the prompt again retries it; a later call keeps the tool
+  calls the turn already ran, and `continue` picks up from them (see
+  [`outrig run`](../usage/run.md)). One vendor rate-limiting while another's key is revoked lands
+  here too: the rate limit is the reason that can lift on its own, so it is worth waiting out.
 * **Every one was terminal** -- a revoked key answering `401` at all three vendors, say -- and the
   **session** ends, exactly as that failure ends it for a single model. No resend can satisfy a
   prompt whose credentials are refused everywhere, and advising one would loop forever.
@@ -175,12 +177,15 @@ from the first four, and those stay done.
 The cost is that one reply can be half one model's work. That is why a move prints, and why the
 banner lists the fallbacks a session may reach before it starts.
 
-`outrig run-new` fails over the same way, with three differences. A call that moves is sent a
+The history travels with the chain, with one exception: an Anthropic candidate is sent only the
+reasoning Anthropic issued itself. It refuses anyone else's -- a local model's, or an OpenAI-style
+endpoint's `reasoning_content` -- so the turns another candidate answered reach it as their text
+and tool calls alone.
+
+`outrig run-new` fails over the same way, with two differences. A call that moves is sent a
 conversation chosen for the window of the model it moves to, since each model's `context-window`
-is its own, so a smaller model is sent less. A call to an Anthropic model leaves out reasoning
-another provider wrote: Anthropic takes back only reasoning it signed, and refuses a request with
-any other. And when every candidate has failed, the **round** ends whatever the reasons, keeping
-any Python it ran, and the session goes on.
+is its own, so a smaller model is sent less. And when every candidate has failed, the **round**
+ends whatever the reasons, keeping any Python it ran, and the session goes on.
 
 ## `[agents.<name>]`
 
@@ -272,6 +277,12 @@ identifier = "anthropic/claude-sonnet-4-6"
 
 The agent loop is unchanged -- it's still tool calls in OpenAI's format, just routed somewhere
 else.
+
+Reasoning an endpoint returns beside its reply -- in `reasoning_content`, or OpenRouter's
+`reasoning` -- goes back to it on that turn's assistant message in later requests. A turn that
+produced nothing but reasoning, usually one cut off at the output-token ceiling, goes back as an
+assistant message with empty text, so the conversation keeps alternating between user and
+assistant.
 
 ### Local models
 
@@ -442,9 +453,10 @@ model -> tool -> model loop, and retrying the *turn* would re-run container tool
 already happened. Tools run between model calls, never inside one, so replaying either an
 HTTP request or a model call replays exactly that and nothing observable.
 
-If the budget or the attempts do run out, the turn ends and the REPL prompts again with the
-conversation untouched -- see [`outrig run`](../usage/run.md). The session, and its
-containers, stay up.
+If the budget or the attempts do run out, the turn ends and the REPL prompts again. The
+conversation keeps the tool calls the turn had already run, with their results, and is
+otherwise untouched -- see [`outrig run`](../usage/run.md). The session, and its containers,
+stay up.
 
 ## Other Rig provider styles
 

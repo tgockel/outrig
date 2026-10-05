@@ -9,7 +9,7 @@ use rmcp::model::{
     Implementation, JsonObject, ListPromptsRequestMethod, ListPromptsResult,
     ListResourceTemplatesRequestMethod, ListResourceTemplatesResult, ListResourcesRequestMethod,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use schemars::JsonSchema;
@@ -163,8 +163,8 @@ impl ServerHandler for SelfServer {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "outrig-self",
                 env!("CARGO_PKG_VERSION"),

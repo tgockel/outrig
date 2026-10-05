@@ -38,7 +38,6 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::future::select_all;
 use outrig::config::Config;
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::llm::{ResolvedAgent, TurnStop};
@@ -57,9 +56,11 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// session. Held by the registry so a launch needs only a name and a prompt.
 #[derive(Clone)]
 pub struct SubagentContext {
-    /// The session's resolved agent. A subagent reuses its limits and sampling;
-    /// the preamble is replaced by whatever the parent passes, and the model is
-    /// re-resolved when the launch names one.
+    /// The resolved agent of whoever launches through this registry: the
+    /// session's for the session's registry, a subagent's own for the one it
+    /// was handed. A subagent reuses its limits and sampling; the preamble is
+    /// replaced by whatever the parent passes, and the model is re-resolved
+    /// when the launch names one.
     pub resolved: ResolvedAgent,
     /// The merged session config, kept so a launch can re-resolve the agent
     /// against a different `[models.<name>]`. An `Arc` because the context is
@@ -68,8 +69,15 @@ pub struct SubagentContext {
     pub cfg: Arc<Config>,
     /// The session's MCP-backed tools. Cloning shares the live connections.
     pub mcp_tools: Vec<SessionTool>,
-    /// Where per-subagent transcripts go, alongside `<server>.stderr`.
+    /// Where per-subagent transcripts go, alongside `<server>.stderr`. The
+    /// session's at every level: a nested transcript's directory comes from
+    /// `ancestry`, not from a different `log_dir`.
     pub log_dir: PathBuf,
+    /// The names leading to the subagents this registry launches, outermost
+    /// first: empty for the session's registry, `["parent-a"]` for the one
+    /// `parent-a` launches through. Names are unique only within one registry,
+    /// so this is what keeps two `audit`s' transcripts apart.
+    pub ancestry: Vec<String>,
     /// The depth of the subagents *this* registry launches. The primary agent
     /// is the root at depth 1, so the session's registry launches at depth 2. A
     /// subagent at depth `D` may launch its own children (at `D + 1`) only while
@@ -77,23 +85,42 @@ pub struct SubagentContext {
     pub depth: u32,
 }
 
-/// One live subagent as the *parent* sees it: where to read its results, how
-/// to prompt it, how to stop it. Notably not where its task is owned -- see
-/// [`Spawned`].
+/// One live subagent as the *parent* sees it: where to read its results and
+/// send it prompts, and how to stop it. Notably not where its task is owned --
+/// see [`Spawned`].
 struct Entry {
     shared: Arc<SubagentShared>,
-    prompts: mpsc::UnboundedSender<String>,
     /// Cancellation only. The [`JoinHandle`] lives in the ledger so that
     /// freeing this name cannot detach the task.
     abort: tokio::task::AbortHandle,
     /// The parent's read position. Deliberately here rather than on
     /// [`SubagentShared`]: it describes the *reader*, not the subagent.
+    ///
+    /// Moved by a read as the read is made, and moved back if the turn that
+    /// made it ends without the result in its history -- see [`Claim`].
     watermark: u64,
     /// This subagent's own registry, present only when it was given launch
     /// tools (i.e. its depth was under the max). An `Arc` clone of the one the
     /// ledger holds, kept here so [`SubagentRegistry::release`] can cancel this
     /// subagent's descendants without a search.
     child: Option<Arc<SubagentRegistry>>,
+}
+
+/// One advance of an [`Entry`]'s watermark by [`SubagentRegistry::read`]: which
+/// subagent's, and from where to where. Handed to [`SubagentRegistry::put_back`]
+/// when the turn the read was made in ends without its result -- see
+/// [`crate::llm::TurnUndo`].
+pub(crate) struct Claim {
+    shared: Arc<SubagentShared>,
+    from: u64,
+    to: u64,
+}
+
+/// What [`SubagentRegistry::read`] hands back: the outcome, and the advance
+/// reading it made.
+pub(crate) struct Read {
+    pub(crate) outcome: Outcome,
+    pub(crate) claim: Claim,
 }
 
 /// One task this registry spawned, owned independently of the name it was
@@ -160,7 +187,7 @@ impl SubagentRegistry {
     /// launching agent's.
     ///
     /// Returns the [`ModelLabel`] the launch resolved to, `Some` on exactly the
-    /// condition the transcript header is written -- the caller named a model.
+    /// condition the transcript header names a model -- the caller named one.
     /// Handing the label back rather than letting the tool re-derive it from
     /// its own argument is what lets an alias show the hop it took, and is what
     /// makes `ModelLabel`'s claim to carry all three surfaces true.
@@ -206,17 +233,16 @@ impl SubagentRegistry {
         let (agent, child) =
             build_subagent_agent(&self.ctx, &resolved, &shared, name, preamble).await?;
 
-        let (prompts, rx) = mpsc::unbounded_channel();
-        prompts
-            .send(prompt)
-            .map_err(|_| "subagent channel closed before its first round".to_string())?;
+        // The first prompt goes in like any other: a round of its own, which
+        // the task takes as soon as it starts.
+        shared.accept(prompt);
 
         let task = tokio::spawn(run_rounds(
             name.to_string(),
             agent,
             shared.clone(),
-            rx,
             self.ctx.log_dir.clone(),
+            self.ctx.ancestry.clone(),
             label,
         ));
         let abort = task.abort_handle();
@@ -248,7 +274,6 @@ impl SubagentRegistry {
             name.to_string(),
             Entry {
                 shared,
-                prompts,
                 abort,
                 watermark: 0,
                 child,
@@ -257,35 +282,36 @@ impl SubagentRegistry {
         Ok(launched_as)
     }
 
-    /// Deliver a prompt whether the subagent is idle or running. Idle starts a
-    /// new round; running injects into the round in flight.
+    /// Deliver a prompt whether the subagent is idle or running: into the round
+    /// in flight while it could still carry it to its model, and as a round of
+    /// its own otherwise, behind any already waiting.
+    /// [`SubagentShared::accept`] decides which.
     ///
-    /// Run state is never a precondition here, because the tool surface gives
-    /// the parent no non-blocking way to observe it.
+    /// The run state has no say. It reads `Running` for a while after the
+    /// round's last model call, and it is no precondition for the parent
+    /// either, since the tool surface gives the parent no non-blocking way to
+    /// observe it.
     pub fn send(&self, name: &str, prompt: String) -> Result<&'static str, String> {
         let entries = self.lock();
         let entry = entries
             .get(name)
             .ok_or_else(|| unknown_name(name, &entries))?;
-        match entry.shared.snapshot().state {
-            state::RunState::Running => {
-                entry.shared.queue_injection(prompt);
-                Ok("injected into the round in flight")
-            }
-            state::RunState::Idle { .. } => {
-                entry
-                    .prompts
-                    .send(prompt)
-                    .map_err(|_| format!("subagent {name:?} is no longer running"))?;
-                Ok("started a new round")
-            }
+        // Release and shutdown take the name before they stop the task, so a
+        // task found finished here ended on its own. It would take the prompt
+        // and never run it.
+        if entry.abort.is_finished() {
+            return Err(format!("subagent {name:?} is no longer running"));
         }
+        Ok(match entry.shared.accept(prompt) {
+            state::Accepted::Injected => "injected into the round in flight",
+            state::Accepted::Queued => "started a new round",
+        })
     }
 
     /// Block until at least `min_count` of `names` are readable, then report
     /// which. Carries no payloads and moves no watermark: results can be
     /// large, and the parent decides how much of one enters its context by
-    /// calling [`Self::get_result`] per subagent.
+    /// reading each subagent with [`Self::read`].
     pub async fn wait_results(
         &self,
         names: &[String],
@@ -340,7 +366,11 @@ impl SubagentRegistry {
 
     /// Block until this subagent is readable, return its outcome, and advance
     /// the watermark past it. The only consumer of a version.
-    pub async fn get_result(&self, name: &str) -> Result<Outcome, String> {
+    ///
+    /// The advance comes back with the outcome as a [`Claim`], for the reader's
+    /// turn to hand to [`Self::put_back`] if its history ends up without the
+    /// result.
+    pub(crate) async fn read(&self, name: &str) -> Result<Read, String> {
         let (shared, mut rx) = {
             let entries = self.lock();
             let entry = entries
@@ -360,25 +390,46 @@ impl SubagentRegistry {
                 let entry = entries.get_mut(name).ok_or_else(|| {
                     format!("subagent {name:?} was released while waiting for its result")
                 })?;
-                match snapshot.read(entry.watermark) {
-                    Some(outcome) => {
-                        // Only a genuinely newer version advances the read
-                        // position; the idle-without-publishing case is
-                        // level-triggered and must stay readable.
-                        if snapshot.version > entry.watermark {
-                            entry.watermark = snapshot.version;
-                        }
-                        Some(outcome)
-                    }
-                    None => None,
-                }
+                snapshot.read(entry.watermark).map(|outcome| {
+                    // A readable version is never behind the watermark. The
+                    // idle-without-publishing case reads at the watermark
+                    // itself, so this leaves it where it is and the case stays
+                    // readable, as level-triggered reads must.
+                    let claim = Claim {
+                        shared: entry.shared.clone(),
+                        from: entry.watermark,
+                        to: snapshot.version,
+                    };
+                    entry.watermark = snapshot.version;
+                    Read { outcome, claim }
+                })
             };
-            if let Some(outcome) = claimed {
-                return Ok(outcome);
+            if let Some(read) = claimed {
+                return Ok(read);
             }
             if rx.changed().await.is_err() {
                 return Err(format!("subagent {name:?} stopped without a result"));
             }
+        }
+    }
+
+    /// Undo `claim`: move the read position back to where the read found it,
+    /// so the result it returned is collectable again.
+    ///
+    /// Only for the subagent the read was made against, which is why it is
+    /// found by identity rather than by name: a name released and launched
+    /// again is a different subagent, whose position the read never moved. And
+    /// only while the position is still where the read left it: one a later
+    /// read has moved on was moved past something at least as new -- the inbox
+    /// keeps only the latest -- so leaving it loses nothing.
+    pub(crate) fn put_back(&self, claim: Claim) {
+        let mut entries = self.lock();
+        if let Some(entry) = entries
+            .values_mut()
+            .find(|entry| Arc::ptr_eq(&entry.shared, &claim.shared))
+            && entry.watermark == claim.to
+        {
+            entry.watermark = claim.from;
         }
     }
 
@@ -576,8 +627,8 @@ pub(crate) fn usable_model_names(cfg: &Config) -> Vec<String> {
 /// transcript header. One value carries all three so they cannot drift.
 ///
 /// `None` wherever the launch inherited the parent's model, which is what keeps
-/// the default path byte-for-byte -- and byte-free in the transcript -- as it
-/// was before this argument existed.
+/// the default path's trace and tool result byte-for-byte as they were before
+/// this argument existed. Its transcript header names the subagent alone.
 ///
 /// Display-only. `name` holds the rendered `alias -> concrete` hop when one was
 /// taken, so it is not a key anything can be looked up by.
@@ -594,8 +645,7 @@ impl ModelLabel {
     /// That is the model the subagent starts on, and for a chain it is a
     /// preference rather than a certainty: a mid-turn move changes which model
     /// is answering without changing this label. Attribution that has to be
-    /// exact about what served a given reply cannot read it -- see
-    /// `plan/next/chain-attribution-names-the-first-candidate.md`.
+    /// exact about what served a given reply cannot read it -- see #265.
     fn of(resolved: &ResolvedAgent) -> Self {
         Self {
             // `model_display`, not `model_name`: a launch under an alias shows
@@ -739,6 +789,13 @@ async fn build_subagent_agent(
     let child = if ctx.depth < ctx.resolved.subagent_depth_max {
         let mut child_ctx = ctx.clone();
         child_ctx.depth = ctx.depth + 1;
+        child_ctx.ancestry.push(name.to_string());
+        // This subagent is the launching agent now, so its children inherit
+        // the model it runs under; left as the clone, a subagent launched onto
+        // a named model would hand its children its parent's instead. The
+        // agent-side fields are the same on both sides -- the launch carried
+        // them forward -- so only the model-derived ones change here.
+        child_ctx.resolved = resolved.clone();
         let child = Arc::new(SubagentRegistry::new(child_ctx));
         tools.extend(crate::builtin_tool::parent_tools(
             child.clone(),
@@ -783,31 +840,41 @@ fn compose_preamble(parent: Option<&str>) -> String {
 /// One subagent's lifetime: a round per prompt the parent sends, with history
 /// carried across them. This is the headless-REPL loop -- `run_turn_captured`
 /// is the same call the REPL makes for a typed line.
+///
+/// Rounds run in the order their prompts were accepted, and a steer injected
+/// too late for any of its round's tool results to carry takes its place in
+/// that order as a round of its own -- see [`injection`]. The loop ends only
+/// when the task is aborted, which release and shutdown both do.
 async fn run_rounds(
     name: String,
     agent: crate::llm::RigAgent,
     shared: Arc<SubagentShared>,
-    mut prompts: mpsc::UnboundedReceiver<String>,
     log_dir: PathBuf,
+    ancestry: Vec<String>,
     label: Option<ModelLabel>,
 ) {
     let mut history = Vec::new();
-    let mut log = transcript::Transcript::open(&log_dir, &name, label.as_ref()).await;
+    let mut log = transcript::Transcript::open(&log_dir, &ancestry, &name, label.as_ref()).await;
 
-    while let Some(prompt) = prompts.recv().await {
+    loop {
+        let prompt = shared.next_round().await;
         shared.begin_round();
         log.record_prompt(&prompt).await;
 
-        // Rebuilt per model call because the patch rig applies is non-sticky.
-        // That means O(queued steers) allocations per completion call, which
-        // is fine: a parent redirecting a subagent sends a handful at most.
+        // Each steer goes out once, on a tool result rig then keeps -- see
+        // `injection`. The turn takes the delivery back if its history ends up
+        // without that result, as it does a parent's read (#251).
         let injections = {
             let shared = shared.clone();
-            Arc::new(move || {
-                shared
-                    .injections()
+            Arc::new(move |undo: &crate::llm::TurnUndo| {
+                let (steers, span) = shared.deliver_injections();
+                if !span.is_empty() {
+                    let shared = shared.clone();
+                    undo.record(move || shared.undeliver_injections(span));
+                }
+                steers
                     .iter()
-                    .map(|text| injection::steer_message(text))
+                    .map(|text| injection::steer_text(text))
                     .collect()
             }) as crate::llm::InjectionSource
         };
@@ -816,20 +883,11 @@ async fn run_rounds(
             .run_turn_captured(&prompt, &mut history, &name, injections)
             .await;
 
-        // Rig never persisted the steers -- the patch it applied was per-turn
-        // and non-sticky -- so fold them in here or the next round will not
-        // remember being steered.
-        history.extend(
-            shared
-                .take_injections()
-                .iter()
-                .map(|text| injection::steer_message(text)),
-        );
-
-        match outcome {
+        // Why the round failed, if it did. Worked out before the round stops
+        // taking steers, since it decides where the ones no result carried go.
+        let (reply, failure) = match outcome {
             Ok(end) => {
-                log.record_reply(&end.reply).await;
-                match end.stopped {
+                let failure = match &end.stopped {
                     // A broken endpoint is a failed round, not a model that
                     // declined to report, and a parent needs to tell them apart
                     // to decide whether retrying is worth anything. Publishing
@@ -838,15 +896,16 @@ async fn run_rounds(
                     // polling a subagent whose endpoint is down would otherwise
                     // be handed the same answer forever instead of blocking for
                     // something new.
-                    Some(TurnStop::EndpointFailed(reason)) => {
-                        publish_round_failure(&shared, &name, &reason);
-                    }
+                    Some(TurnStop::EndpointFailed(reason)) => Some(reason.clone()),
                     // Recorded before `end_round` so that a round which
                     // published nothing can tell the parent *why* it stopped
                     // instead of only that it did. Does not displace a
                     // truncated report: running out of tool calls is what
                     // follows from a report that would not fit.
-                    Some(TurnStop::Interrupted(reason)) => shared.note_ended_early(reason),
+                    Some(TurnStop::Interrupted(reason)) => {
+                        shared.note_ended_early(reason.as_str());
+                        None
+                    }
                     // A round that finished on its own and produced no text at
                     // all. Without this the parent is told only that the
                     // subagent "stopped without calling outrig__set_result",
@@ -854,27 +913,62 @@ async fn run_rounds(
                     // fact it never got a turn out at all -- and the two want
                     // different responses from the parent.
                     None if end.is_silent() => {
-                        shared.note_ended_early(end.silent_reason().to_string());
+                        shared.note_ended_early(end.silent_reason());
+                        None
                     }
-                    None => {}
-                }
+                    None => None,
+                };
+                (end.reply, failure)
             }
-            Err(e) => publish_round_failure(&shared, &name, &e.to_string()),
+            Err(e) => (String::new(), Some(e.to_string())),
+        };
+
+        // Closed before anything below awaits, so a prompt sent from here on
+        // queues as a round of its own instead of joining one that is over.
+        // A failed round starts nothing on its own: the parent reads the
+        // failure, or the round's report if it sent nothing after that, and
+        // decides what comes next. So the steers no result carried are folded
+        // in to reach the model with that, rather than run against the
+        // endpoint that just failed.
+        //
+        // The steers a result carried are in the history already, on that
+        // result: the turn took back any whose result it lost.
+        let steers = shared.close_injections(failure.is_none());
+        history.extend(steers.iter().map(|text| injection::steer_message(text)));
+
+        log.record_reply(&reply).await;
+        if let Some(reason) = &failure {
+            if shared.published_this_round() && !shared.steered_since_publish() {
+                // A round that reported keeps its report. The inbox keeps only
+                // the latest, so publishing the failure would replace the
+                // report with news of a model call made after it (#310). It
+                // goes beside the report instead, ahead of the outcome block.
+                // Not when the parent steered the round after the report,
+                // though: the report cannot answer that, and a parent waiting
+                // for the answer would wait forever.
+                eprintln!("[outrig]   [{name}] round failed after reporting: {reason}");
+                log.record_outcome("round failed after reporting", reason)
+                    .await;
+            } else {
+                publish_round_failure(&shared, &name, reason);
+            }
         }
         shared.end_round();
 
         // The published outcome is the part worth keeping: the reply above is
         // whatever the model happened to close with, while this is what the
         // parent actually reads.
-        let snapshot = shared.snapshot();
-        if snapshot.state.ended_without_publishing() {
-            log.record_outcome("no result", "round ended without outrig__set_result")
-                .await;
+        let reported = if shared.published_this_round() {
+            shared.snapshot().outcome
         } else {
-            match snapshot.outcome {
-                Some(Outcome::Result(text)) => log.record_outcome("result", &text).await,
-                Some(Outcome::Error(text)) => log.record_outcome("error", &text).await,
-                None => {}
+            None
+        };
+        match reported {
+            Some(Outcome::Result(text)) => log.record_outcome("result", &text).await,
+            Some(Outcome::Error(text)) => log.record_outcome("error", &text).await,
+            None => {
+                log.record_outcome("no result", "round ended without outrig__set_result")
+                    .await;
             }
         }
     }
@@ -1071,7 +1165,7 @@ pub(crate) mod fixtures {
     /// model the fixture agent is configured on, against the discard port.
     pub(crate) fn test_resolved(subagent_depth_max: u32) -> ResolvedAgent {
         // Discard port: connects are refused immediately.
-        test_resolved_at("http://127.0.0.1:9", None, subagent_depth_max)
+        test_resolved_at("http://127.0.0.1:9", None, Some(1), subagent_depth_max)
     }
 
     /// [`test_resolved`] with retries switched off, for the real-clock tests
@@ -1083,18 +1177,20 @@ pub(crate) mod fixtures {
     /// thing the connect budget fixed. Measuring something other than retry is
     /// the case that earns the opt-out, and it says so at the call site.
     pub(crate) fn test_resolved_without_retries(subagent_depth_max: u32) -> ResolvedAgent {
-        test_resolved_at("http://127.0.0.1:9", Some(0), subagent_depth_max)
+        test_resolved_at("http://127.0.0.1:9", Some(0), Some(1), subagent_depth_max)
     }
 
     /// [`test_resolved`] against a caller-supplied endpoint, for the tests that
     /// need the round to reach a model rather than fail connecting.
     ///
-    /// `retry_budget_secs` is a parameter rather than something a caller pokes
-    /// afterwards, so "retries off" is a value this one constructor understands
-    /// and cannot be lost by a fixture changing provider variant.
+    /// `retry_budget_secs` and `request_timeout_secs` are parameters rather
+    /// than something a caller pokes afterwards, so "retries off" or "a longer
+    /// timeout" is a value this one constructor understands and cannot be lost
+    /// by a fixture changing provider variant.
     pub(crate) fn test_resolved_at(
         base_url: &str,
         retry_budget_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
         subagent_depth_max: u32,
     ) -> ResolvedAgent {
         ResolvedAgent {
@@ -1106,8 +1202,8 @@ pub(crate) mod fixtures {
                 provider: ResolvedProvider::OpenAi {
                     base_url: base_url.to_string(),
                     api_key: "test-key".to_string(),
-                    request_timeout_secs: Some(1),
-                    // `None` at every call site but one, which keeps
+                    request_timeout_secs,
+                    // `None` except where a test turns retries off, which keeps
                     // "immediately" true on its own: a refused connection never
                     // reaches the endpoint, so the short connect budget bounds
                     // it rather than the full one.
@@ -1138,6 +1234,7 @@ pub(crate) mod fixtures {
             cfg: Arc::new(cfg),
             mcp_tools: Vec::new(),
             log_dir: log_dir.path().to_path_buf(),
+            ancestry: Vec::new(),
             depth,
         });
         (registry, log_dir)
@@ -1148,9 +1245,19 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use axum::http::StatusCode;
+    use rig::completion::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, mpsc};
+
+    impl SubagentRegistry {
+        /// A read made directly rather than by a model's tool call, and so
+        /// outside any turn: its advance stands.
+        async fn get_result(&self, name: &str) -> Result<Outcome, String> {
+            self.read(name).await.map(|read| read.outcome)
+        }
+    }
 
     /// A registry whose subagents talk to a closed port, so every round fails
     /// fast and deterministically. That is enough to exercise the bookkeeping
@@ -1295,7 +1402,7 @@ mod tests {
 
         /// Block until `expected` rounds are suspended inside the tool.
         async fn wait_for_calls(&self, expected: usize) {
-            tokio::time::timeout(SETUP_TIMEOUT, async {
+            tokio::time::timeout(WAIT_TIMEOUT, async {
                 while self.entered.load(Ordering::SeqCst) < expected {
                     self.ready.notified().await;
                 }
@@ -1310,10 +1417,11 @@ mod tests {
         }
     }
 
-    /// How long a full-tree test waits for setup to settle before it gives up.
-    /// Generous on purpose: it is a stuck-test backstop, not a measurement --
-    /// the number under test is the shutdown join, timed separately.
-    const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How long a test waits on a subagent -- to settle, to enter a tool call,
+    /// to make its next model call -- before it gives up. Generous on purpose:
+    /// it is a stuck-test backstop, not a measurement. The full-tree tests time
+    /// their shutdown join separately.
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// One depth-2 subagent, the private registry it was given, and the
     /// depth-3 leaves launched through that registry.
@@ -1325,7 +1433,7 @@ mod tests {
 
     /// A full tree at the shipped defaults: the session registry's eight
     /// children, and eight grandchildren in each child's private registry.
-    /// Names are globally unique because transcripts share one directory.
+    /// Every branch names its grandchildren alike, as unrelated parents may.
     struct FullTree {
         branches: Vec<Branch>,
     }
@@ -1349,38 +1457,35 @@ mod tests {
 
         /// Block until every round has published and gone back to its prompt
         /// loop, so setup cannot leak into the shutdown measurement.
-        ///
-        /// `end_round` transitions through the same `watch` channel the parent
-        /// reads, so waiting on that channel needs no polling -- and `wait_for`
-        /// checks the current value before parking, which is what makes the
-        /// `publish`-then-`end_round` ordering a non-issue. A fresh subagent
-        /// starts `Running` (see `SubagentShared::new`), so no receiver can
-        /// match before its round has run.
         async fn wait_until_idle(&self, root: &SubagentRegistry) {
-            let mut receivers: Vec<_> = self
-                .members(root)
-                .map(|(registry, name)| {
-                    registry
-                        .lock()
-                        .get(name)
-                        .expect("every launched subagent stays live")
-                        .shared
-                        .subscribe()
-                })
-                .collect();
-
-            let settled =
-                futures_util::future::join_all(receivers.iter_mut().map(|rx| {
-                    rx.wait_for(|snap| matches!(snap.state, state::RunState::Idle { .. }))
-                }));
-            tokio::time::timeout(SETUP_TIMEOUT, settled)
+            let settled = futures_util::future::join_all(
+                self.members(root)
+                    .map(|(registry, name)| until_idle(registry, name)),
+            );
+            tokio::time::timeout(WAIT_TIMEOUT, settled)
                 .await
-                .expect("every subagent finishes its round")
-                .into_iter()
-                .for_each(|seen| {
-                    seen.expect("a subagent's state channel outlives its round");
-                });
+                .expect("every subagent finishes its round");
         }
+    }
+
+    /// Block until `name` has finished its round and gone idle.
+    ///
+    /// `end_round` transitions through the same `watch` channel the parent
+    /// reads, so waiting on that channel needs no polling -- and `wait_for`
+    /// checks the current value before parking, which is what makes the
+    /// `publish`-then-`end_round` ordering a non-issue. A fresh subagent starts
+    /// `Running` (see `SubagentShared::new`), so no receiver can match before
+    /// its round has run.
+    async fn until_idle(registry: &SubagentRegistry, name: &str) {
+        let mut rx = registry
+            .lock()
+            .get(name)
+            .expect("every launched subagent stays live")
+            .shared
+            .subscribe();
+        rx.wait_for(|snap| matches!(snap.state, state::RunState::Idle { .. }))
+            .await
+            .expect("a subagent's state channel outlives its round");
     }
 
     /// The registry a live subagent was handed to launch its own children
@@ -1426,7 +1531,7 @@ mod tests {
 
             let mut leaves = Vec::with_capacity(width);
             for leaf_index in 0..width {
-                let leaf = format!("leaf-{parent_index}-{leaf_index}");
+                let leaf = format!("leaf-{leaf_index}");
                 child
                     .launch(&leaf, None, None, "work".to_string())
                     .await
@@ -1443,63 +1548,306 @@ mod tests {
         FullTree { branches }
     }
 
+    /// A chat completion whose one choice is `message`, finishing for
+    /// `finish_reason`.
+    fn completion(message: serde_json::Value, finish_reason: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string()
+    }
+
+    /// An assistant message making one tool call per `(name, arguments)` in
+    /// `calls`, with the arguments as the JSON string the wire carries them in.
+    fn tool_call_message(calls: &[(&str, &str)]) -> serde_json::Value {
+        let calls: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, arguments))| {
+                serde_json::json!({
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments}
+                })
+            })
+            .collect();
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": calls})
+    }
+
     /// A completion that always asks for the `blocking` tool, so every round
     /// that reaches the model ends up suspended inside a session tool.
     ///
     /// The header is set by hand rather than through `axum::Json`, which would
     /// mean turning on axum's `json` feature for one test.
     async fn mock_tool_call() -> ([(&'static str, &'static str); 1], String) {
-        let body = serde_json::json!({
-            "id": "chatcmpl-shutdown",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "gpt-4o",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_shutdown",
-                        "type": "function",
-                        "function": {"name": "blocking", "arguments": "{}"}
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-        });
-        ([("content-type", "application/json")], body.to_string())
+        let body = completion(tool_call_message(&[("blocking", "{}")]), "tool_calls");
+        ([("content-type", "application/json")], body)
     }
 
-    struct ToolCallServer {
+    /// A loopback chat-completions endpoint answering with `route`, stopped on
+    /// drop.
+    struct MockServer {
         base_url: String,
         task: JoinHandle<()>,
     }
 
-    impl Drop for ToolCallServer {
+    impl Drop for MockServer {
         fn drop(&mut self) {
             self.task.abort();
         }
     }
 
-    async fn start_tool_call_server() -> ToolCallServer {
-        use axum::routing::post;
-
+    async fn serve_completions(route: axum::routing::MethodRouter) -> MockServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock provider");
         let address = listener.local_addr().expect("mock provider address");
-        let app = axum::Router::new().route("/v1/chat/completions", post(mock_tool_call));
+        let app = axum::Router::new().route("/v1/chat/completions", route);
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
                 .expect("mock provider serves");
         });
-        ToolCallServer {
+        MockServer {
             base_url: format!("http://{address}/v1"),
             task,
         }
+    }
+
+    /// A loopback provider that hands each model call to the test and holds it
+    /// until the test answers.
+    ///
+    /// A call arrives with every steer it carries already in it, and the round
+    /// can go no further until it is answered. That is what lets a test put a
+    /// `send` at an exact point in a round, instead of racing one there: a
+    /// steer sent while a call is held rides on the results of the batch that
+    /// the call's answer asks for.
+    struct ScriptedProvider {
+        server: MockServer,
+        calls: mpsc::UnboundedReceiver<ModelCall>,
+    }
+
+    impl ScriptedProvider {
+        async fn start() -> Self {
+            let (tx, calls) = mpsc::unbounded_channel();
+            let handler = move |body: String| {
+                let tx = tx.clone();
+                async move {
+                    let (reply, answer) = tokio::sync::oneshot::channel();
+                    let body = serde_json::from_str(&body).unwrap_or_default();
+                    // Never a panic here: the client would read a dropped
+                    // connection as a transient failure. A call the test did
+                    // not answer -- or never saw, which drops `reply` just the
+                    // same -- gets a 500 instead.
+                    let _ = tx.send(ModelCall { body, reply });
+                    let (status, body) = answer
+                        .await
+                        .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, String::new()));
+                    (status, [("content-type", "application/json")], body)
+                }
+            };
+            Self {
+                server: serve_completions(axum::routing::post(handler)).await,
+                calls,
+            }
+        }
+
+        /// The round's next model call, once the round is parked inside it.
+        async fn next_call(&mut self) -> ModelCall {
+            tokio::time::timeout(WAIT_TIMEOUT, self.calls.recv())
+                .await
+                .expect("the round made no further model call")
+                .expect("the scripted provider stopped")
+        }
+
+        /// An agent whose model calls come here.
+        ///
+        /// Retries are off, so each call is made once and the next one the test
+        /// sees is the turn's next step. The request timeout is a minute, not
+        /// the fixture's usual second, so a call the test is holding cannot time
+        /// out into a failed turn.
+        fn resolved(&self) -> ResolvedAgent {
+            test_resolved_at(
+                &self.server.base_url,
+                Some(0),
+                Some(60),
+                outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
+            )
+        }
+    }
+
+    /// One model call, held open until the test answers it.
+    struct ModelCall {
+        body: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<(StatusCode, String)>,
+    }
+
+    impl ModelCall {
+        /// The request's messages, its prompt last.
+        fn messages(&self) -> &[serde_json::Value] {
+            self.body["messages"].as_array().expect("messages")
+        }
+
+        /// The text of the request's last message. On a round's first call,
+        /// that is the prompt the round was started with.
+        fn last_text(&self) -> &str {
+            self.messages()
+                .last()
+                .and_then(|message| message["content"].as_str())
+                .unwrap_or_default()
+        }
+
+        /// How many times `text` appears in the request, history included.
+        fn mentions(&self, text: &str) -> usize {
+            self.body.to_string().matches(text).count()
+        }
+
+        /// Assert that each assistant message's tool calls are answered, in
+        /// order, by the `tool` messages directly after it -- OpenAI and
+        /// Anthropic reject any request whose history breaks that. Positional
+        /// rather than a lookup by id: the scripted responses reuse their ids,
+        /// so a lookup would find an earlier call's answer for a call that has
+        /// none.
+        fn assert_tool_calls_answered(&self) {
+            let messages = self.messages();
+            for (index, message) in messages.iter().enumerate() {
+                let Some(calls) = message["tool_calls"].as_array() else {
+                    continue;
+                };
+                let asked: Vec<_> = calls.iter().map(|call| &call["id"]).collect();
+                let answered: Vec<_> = messages[index + 1..]
+                    .iter()
+                    .take_while(|next| next["role"] == "tool")
+                    .map(|next| &next["tool_call_id"])
+                    .collect();
+                assert_eq!(
+                    answered, asked,
+                    "the tool calls in message {index} are not answered right after it"
+                );
+            }
+        }
+
+        /// Answer with a plain reply and no tool call, which makes this the
+        /// round's last model call.
+        fn reply(self, text: &str) {
+            let message = serde_json::json!({"role": "assistant", "content": text});
+            self.respond(StatusCode::OK, completion(message, "stop"));
+        }
+
+        /// Answer with an `outrig__set_result` call, so another model call
+        /// follows it.
+        fn set_result(self, body: &str) {
+            self.set_results(&[body]);
+        }
+
+        /// Answer with one `outrig__set_result` call per body, all in the one
+        /// message, the way a model batches calls in a single step.
+        fn set_results(self, bodies: &[&str]) {
+            let name = crate::builtin_tool::name_of("set_result");
+            let arguments: Vec<String> = bodies
+                .iter()
+                .map(|body| serde_json::json!({"status": "result", "body": body}).to_string())
+                .collect();
+            let calls: Vec<(&str, &str)> = arguments
+                .iter()
+                .map(|arguments| (name.as_str(), arguments.as_str()))
+                .collect();
+            self.call_tools(&calls);
+        }
+
+        /// Answer with an `outrig__get_result` call for `name`, so another
+        /// model call follows it.
+        fn get_result(self, name: &str) {
+            let get_result = crate::builtin_tool::name_of("get_result");
+            let arguments = serde_json::json!({ "name": name }).to_string();
+            self.call_tools(&[(&get_result, &arguments)]);
+        }
+
+        /// Answer with one call per `(name, arguments)`, all in the one
+        /// message, which rig runs as one batch.
+        fn call_tools(self, calls: &[(&str, &str)]) {
+            let message = tool_call_message(calls);
+            self.respond(StatusCode::OK, completion(message, "tool_calls"));
+        }
+
+        fn fail(self, status: StatusCode) {
+            let body = serde_json::json!({"error": {"message": "scripted failure"}});
+            self.respond(status, body.to_string());
+        }
+
+        fn respond(self, status: StatusCode, body: String) {
+            // The round may be gone already -- nothing needs this answer then.
+            let _ = self.reply.send((status, body));
+        }
+    }
+
+    /// What the parent sends mid-round below. Plain words, so it reads the same
+    /// inside a JSON request body as out of it.
+    const STEER: &str = "actually check the other module";
+
+    /// What the parent sends once the subagent has gone idle.
+    const FOLLOW_UP: &str = "now summarize what you found";
+
+    /// A registry whose subagents talk to `provider` -- see
+    /// [`ScriptedProvider::resolved`] -- with `probe` launched on it and its
+    /// first round under way.
+    async fn launch_probe(
+        provider: &ScriptedProvider,
+        tool_call_max: usize,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
+        launch_probe_with(provider, tool_call_max, Vec::new()).await
+    }
+
+    /// [`launch_probe`], with `tools` as the session's MCP tools.
+    async fn launch_probe_with(
+        provider: &ScriptedProvider,
+        tool_call_max: usize,
+        tools: Vec<SessionTool>,
+    ) -> (SubagentRegistry, tempfile::TempDir) {
+        let (mut registry, log_dir) = test_registry();
+        registry.ctx.mcp_tools = tools;
+        registry.ctx.resolved = provider.resolved();
+        registry.ctx.resolved.tool_call_max = tool_call_max;
+        registry
+            .launch("probe", None, None, "do the work".to_string())
+            .await
+            .expect("launch");
+        (registry, log_dir)
+    }
+
+    /// Send the steer while `probe`'s round is parked inside a model call,
+    /// which puts it in that round.
+    fn steer(registry: &SubagentRegistry) {
+        assert_eq!(
+            registry.send("probe", STEER.to_string()),
+            Ok("injected into the round in flight")
+        );
+    }
+
+    /// Once `probe` has gone idle, send the follow-up and hand back the first
+    /// model call of the round it starts. That call's prompt must be the
+    /// follow-up itself: had the steer run as a round of its own, that round
+    /// would have come first.
+    async fn follow_up(registry: &SubagentRegistry, provider: &mut ScriptedProvider) -> ModelCall {
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(registry, "probe"))
+            .await
+            .expect("the round went idle");
+        assert_eq!(
+            registry.send("probe", FOLLOW_UP.to_string()),
+            Ok("started a new round")
+        );
+        let call = provider.next_call().await;
+        assert_eq!(
+            call.last_text(),
+            FOLLOW_UP,
+            "the steer must not have run as a round of its own"
+        );
+        call
     }
 
     /// Tear `tree` down and report what the join cost against the grace.
@@ -1648,6 +1996,261 @@ mod tests {
             .expect("still collectable after waiting on it");
     }
 
+    /// What `probe` has published when its parent reads it below.
+    const FINDINGS: &str = "probe findings: 3 call sites";
+
+    /// A registry holding `probe`, which has published [`FINDINGS`] and not
+    /// been read, and a parent agent over it whose model is `provider` -- see
+    /// [`ScriptedProvider::resolved`] -- with `tools` beside the subagent
+    /// tools. `probe` has no task behind it: only the parent's read is under
+    /// test.
+    async fn parent_of_probe(
+        provider: &ScriptedProvider,
+        tools: Vec<SessionTool>,
+    ) -> (
+        Arc<SubagentRegistry>,
+        crate::llm::RigAgent,
+        tempfile::TempDir,
+    ) {
+        let (registry, log_dir) = test_registry();
+        let registry = Arc::new(registry);
+        hand_built_entry(&registry, "probe").publish(Outcome::Result(FINDINGS.to_string()));
+        let resolved = provider.resolved();
+        let mut parent_tools =
+            crate::builtin_tool::parent_tools(registry.clone(), resolved.tool_result_max_bytes);
+        parent_tools.extend(tools);
+        let agent = crate::llm::build_agent(&resolved, parent_tools)
+            .await
+            .expect("build the parent agent");
+        (registry, agent, log_dir)
+    }
+
+    /// Run one parent turn to its end, its model calls answered by `script`.
+    async fn parent_turn(
+        agent: &crate::llm::RigAgent,
+        script: impl std::future::Future<Output = ()>,
+    ) -> (crate::error::Result<crate::llm::TurnEnd>, Vec<Message>) {
+        let mut history = Vec::new();
+        let (end, ()) = tokio::join!(agent.run_turn("collect the probe", &mut history), script);
+        (end, history)
+    }
+
+    /// Run one parent turn until `script` is done, then drop it there, which is
+    /// what the REPL does with a turn on Ctrl-C.
+    async fn parent_turn_dropped(
+        agent: &crate::llm::RigAgent,
+        script: impl std::future::Future<Output = ()>,
+    ) -> Vec<Message> {
+        let mut history = Vec::new();
+        {
+            let turn = std::pin::pin!(agent.run_turn("collect the probe", &mut history));
+            tokio::select! {
+                end = turn => panic!("the turn was to be dropped part-way, got: {end:?}"),
+                () = script => {}
+            }
+        }
+        history
+    }
+
+    /// Whether `name` has something to collect -- what `outrig__wait_results`
+    /// waits for -- asked without waiting, and without collecting it.
+    fn collectable(registry: &SubagentRegistry, name: &str) -> bool {
+        let names = [name.to_string()];
+        registry.readable_among(&names) == Ok(names.to_vec())
+    }
+
+    /// The parent's history holds the read with [`FINDINGS`] as its result.
+    fn assert_kept_the_read(history: &[Message]) {
+        let rendered = serde_json::to_string(history).expect("history serializes");
+        assert!(
+            rendered.contains(FINDINGS),
+            "the read and its result are in the history: {history:#?}"
+        );
+    }
+
+    /// The read #251 is about, as #197 left it: the parent's model batches
+    /// `outrig__get_result` with a call that is still running when Ctrl-C drops
+    /// the turn. Rig keeps a batch's results together, so the read's result
+    /// never reached the history, and the read must not have consumed it
+    /// either: the next one would block for good on a subagent that has
+    /// nothing newer coming.
+    #[tokio::test]
+    async fn a_read_in_a_batch_ctrl_c_interrupts_stays_collectable() {
+        let mut provider = ScriptedProvider::start().await;
+        let mut blocking = BlockingTools::new();
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, blocking.take_tools()).await;
+
+        let history = parent_turn_dropped(&agent, async {
+            let get_result = crate::builtin_tool::name_of("get_result");
+            provider
+                .next_call()
+                .await
+                .call_tools(&[(&get_result, r#"{"name":"probe"}"#), ("blocking", "{}")]);
+            // Rig runs the batch in order, so the read is done by now.
+            blocking.wait_for_calls(1).await;
+        })
+        .await;
+
+        assert_eq!(
+            history,
+            [],
+            "nothing from the cut batch reaches the history"
+        );
+        assert!(
+            collectable(&registry, "probe"),
+            "a read the history never got is put back"
+        );
+        assert_eq!(
+            futures_util::FutureExt::now_or_never(registry.get_result("probe")),
+            Some(Ok(Outcome::Result(FINDINGS.to_string()))),
+            "the next read returns the result rather than block"
+        );
+    }
+
+    /// A turn that ends in an error keeps none of itself, so a read it made is
+    /// put back even though the model call after it was made: for a subagent,
+    /// whose next round goes on from the history this round leaves, the read
+    /// would otherwise be lost the same way.
+    #[tokio::test]
+    async fn a_read_in_a_turn_that_errors_stays_collectable() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            provider.next_call().await.get_result("probe");
+            // A 400 is terminal, so the turn errors out of `run_turn`.
+            provider.next_call().await.fail(StatusCode::BAD_REQUEST);
+        })
+        .await;
+
+        assert!(end.is_err(), "got: {end:?}");
+        assert_eq!(history, [], "an errored turn keeps nothing");
+        assert!(collectable(&registry, "probe"));
+    }
+
+    /// The other side of putting a read back: a read whose result the history
+    /// keeps stays consumed, or the next read would hand the model a result
+    /// already in front of it. A turn dropped in the model call after the
+    /// read keeps the read, as #197 has it.
+    #[tokio::test]
+    async fn a_read_kept_by_a_dropped_turn_stays_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let history = parent_turn_dropped(&agent, async {
+            provider.next_call().await.get_result("probe");
+            // The model call after the read is out when the turn is dropped.
+            provider.next_call().await;
+        })
+        .await;
+
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// So does a turn whose model call after the read fails for good: it keeps
+    /// the read with its result, and the read stays consumed.
+    #[tokio::test]
+    async fn a_read_kept_by_a_failed_turn_stays_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            provider.next_call().await.get_result("probe");
+            // A 503 is transient, and with retries off it ends the turn at once.
+            provider
+                .next_call()
+                .await
+                .fail(StatusCode::SERVICE_UNAVAILABLE);
+        })
+        .await;
+
+        let stopped = end
+            .expect("a failed call ends the turn, not the session")
+            .stopped;
+        assert!(
+            matches!(stopped, Some(crate::llm::TurnStop::EndpointFailed(_))),
+            "got: {stopped:?}"
+        );
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// So does a turn the tool-call max ends. It ends at the model call after
+    /// the batch that ran over, which keeps the read's batch along with the
+    /// rest of rig's transcript.
+    #[tokio::test]
+    async fn a_read_kept_by_a_turn_the_tool_call_max_ended_stays_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (_live, counted) = counted_tools();
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, counted).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            let get_result = crate::builtin_tool::name_of("get_result");
+            let max = provider.resolved().tool_call_max;
+            // The read and `max` more, so the last is one over the max.
+            let mut batch = vec![(get_result.as_str(), r#"{"name":"probe"}"#)];
+            batch.extend(std::iter::repeat_n(("counted", "{}"), max));
+            provider.next_call().await.call_tools(&batch);
+        })
+        .await;
+
+        let stopped = end
+            .expect("the tool-call max ends the turn, not the session")
+            .stopped;
+        assert!(
+            matches!(stopped, Some(crate::llm::TurnStop::Interrupted(_))),
+            "got: {stopped:?}"
+        );
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// And a turn that finishes keeps everything: the read is consumed, as a
+    /// direct read is in [`a_second_read_blocks_until_there_is_something_new`].
+    #[tokio::test]
+    async fn a_read_in_a_turn_that_lands_is_consumed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, agent, _log_dir) = parent_of_probe(&provider, Vec::new()).await;
+
+        let (end, history) = parent_turn(&agent, async {
+            provider.next_call().await.get_result("probe");
+            provider.next_call().await.reply("collected");
+        })
+        .await;
+
+        assert_eq!(end.expect("the turn finishes").reply, "collected");
+        assert_kept_the_read(&history);
+        assert!(!collectable(&registry, "probe"));
+    }
+
+    /// A read is put back against the subagent it was made against. A name
+    /// released and launched again within one turn names a different subagent,
+    /// and the old read must leave the new one's position where it is -- here,
+    /// past a result it has already delivered, which putting the old read back
+    /// by name would deliver a second time.
+    #[tokio::test]
+    async fn putting_a_read_back_leaves_a_relaunched_name_alone() {
+        let (registry, _log_dir) = test_registry();
+        hand_built_entry(&registry, "probe").publish(Outcome::Result("before".to_string()));
+        let claim = registry.read("probe").await.expect("readable").claim;
+
+        registry
+            .release(&["probe".to_string()])
+            .expect("probe is live");
+        hand_built_entry(&registry, "probe").publish(Outcome::Result("after".to_string()));
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("after".to_string()))
+        );
+
+        registry.put_back(claim);
+        assert!(
+            !collectable(&registry, "probe"),
+            "the relaunched subagent's result was delivered, and stays delivered"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn width_limit_counts_idle_handles_and_release_frees_a_slot() {
         let (mut registry, _log_dir) = test_registry();
@@ -1771,6 +2374,565 @@ mod tests {
             .send("nope", "hi".to_string())
             .expect_err("unknown");
         assert!(err.contains("audit"), "got: {err}");
+    }
+
+    /// Register `name` with no task behind it, so a test drives its state by
+    /// hand and reads its channel directly.
+    fn hand_built_entry(registry: &SubagentRegistry, name: &str) -> Arc<SubagentShared> {
+        let shared = Arc::new(SubagentShared::new());
+        registry.lock().insert(
+            name.to_string(),
+            Entry {
+                shared: shared.clone(),
+                // A task that never finishes, so `send` takes the subagent for
+                // live.
+                abort: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                watermark: 0,
+                child: None,
+            },
+        );
+        shared
+    }
+
+    /// The root of #181, with no network involved: `send` went by the run
+    /// state, which still reads `Running` after the round's last model call.
+    /// It now goes by whether the round can still take an injection.
+    #[tokio::test]
+    async fn send_follows_the_injection_gate_not_the_run_state() {
+        let (registry, _log_dir) = test_registry();
+
+        let closed = hand_built_entry(&registry, "closed");
+        closed.begin_round();
+        let _ = closed.close_injections(true);
+        assert_eq!(closed.snapshot().state, state::RunState::Running);
+        assert_eq!(
+            registry.send("closed", "late".to_string()),
+            Ok("started a new round")
+        );
+        assert_eq!(
+            futures_util::FutureExt::now_or_never(closed.next_round()).as_deref(),
+            Some("late")
+        );
+
+        let open = hand_built_entry(&registry, "open");
+        open.begin_round();
+        assert_eq!(
+            registry.send("open", "steer".to_string()),
+            Ok("injected into the round in flight")
+        );
+        assert_eq!(open.deliver_injections().0, ["steer"]);
+        assert!(
+            futures_util::FutureExt::now_or_never(open.next_round()).is_none(),
+            "an injected prompt must not start a round as well"
+        );
+    }
+
+    /// A subagent whose task ended on its own would take a prompt and never
+    /// run it, so `send` says so instead of reporting it delivered.
+    #[tokio::test]
+    async fn send_refuses_a_subagent_whose_task_is_gone() {
+        let (registry, _log_dir) = test_registry();
+        let shared = hand_built_entry(&registry, "gone");
+        let task = tokio::spawn(async {});
+        let abort = task.abort_handle();
+        task.await.expect("the stand-in task finishes");
+        registry.lock().get_mut("gone").expect("live").abort = abort;
+
+        let err = registry
+            .send("gone", "hello".to_string())
+            .expect_err("a finished task cannot run the prompt");
+        assert!(err.contains("no longer running"), "got: {err}");
+        assert!(
+            futures_util::FutureExt::now_or_never(shared.next_round()).is_none(),
+            "and the prompt must not be queued"
+        );
+    }
+
+    /// #181's wider window: a steer sent while the round's last model call is
+    /// already out. Nothing left in that round can carry it, so it runs as the
+    /// next round. The subagent goes straight into that round, so a parent
+    /// already waiting on it is not told in between that it stopped.
+    #[tokio::test]
+    async fn a_steer_that_misses_the_last_model_call_runs_as_the_next_round() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 4).await;
+
+        let script = async {
+            let call = provider.next_call().await;
+            steer(&registry);
+            // No tool call, so the round ends here, with the steer queued
+            // after its last model call was made.
+            call.reply("done");
+
+            let call = provider.next_call().await;
+            assert_eq!(call.last_text(), STEER, "the steer starts the next round");
+            assert_eq!(
+                call.mentions(injection::STEER_HEADER),
+                0,
+                "a steer that never went out must not be folded in as well"
+            );
+            call.set_result("steered");
+            provider.next_call().await.reply("reported");
+        };
+        let (outcome, ()) = tokio::join!(registry.get_result("probe"), script);
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Result("steered".to_string())),
+            "a parent waiting through both rounds is handed the steered one's report"
+        );
+    }
+
+    /// The ordinary path, beside the tail cases so a regression in one does not
+    /// read as a regression in the other: a steer queued while another model
+    /// call is still to come goes out with that call, and does not run again as
+    /// a round of its own.
+    ///
+    /// That call follows tool calls, so it is prompted with their results, and
+    /// a steer put in the history sent ahead of them separated the calls from
+    /// their results, which OpenAI and Anthropic refuse (#230). It rides on the
+    /// batch's last result instead, after everything it interrupted.
+    #[tokio::test]
+    async fn a_steer_between_model_calls_goes_out_with_the_next_one() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        let call = provider.next_call().await;
+        steer(&registry);
+        // Tool calls, so another model call follows to carry the steer.
+        call.call_tools(&[("counted", "{}"), ("counted", "{}")]);
+
+        let call = provider.next_call().await;
+        call.assert_tool_calls_answered();
+        let messages = call.messages();
+        let [.., first, last] = messages else {
+            panic!("the request ends in the batch's results: {messages:#?}");
+        };
+        assert!(
+            first["role"] == "tool" && last["role"] == "tool",
+            "the steer adds no message of its own: {messages:#?}"
+        );
+        assert!(
+            last.to_string().contains(STEER),
+            "the steer rides on the batch's last result: {messages:#?}"
+        );
+        assert_eq!(
+            call.mentions(STEER),
+            1,
+            "the next model call carries it once"
+        );
+        call.reply("ok");
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(call.mentions(STEER), 1, "the steer is in history once");
+        call.reply("summary");
+    }
+
+    /// The tool-call cap ends a round at its next model call without making
+    /// it, so a steer queued during the last call that was made never reaches
+    /// the model either -- not even on a result the round left behind. Here the
+    /// batch's second call is over the cap of one, and a steer written into
+    /// the first result would sit in the history, read by nothing and never
+    /// run.
+    #[tokio::test]
+    async fn a_steer_cut_off_by_the_tool_call_cap_runs_as_the_next_round() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 1, tools).await;
+
+        let call = provider.next_call().await;
+        steer(&registry);
+        call.call_tools(&[("counted", "{}"), ("counted", "{}")]);
+
+        let call = provider.next_call().await;
+        assert_eq!(call.last_text(), STEER, "the steer starts the next round");
+        assert_eq!(
+            call.mentions(STEER),
+            1,
+            "and is in no result the round before left behind"
+        );
+        call.assert_tool_calls_answered();
+        call.reply("ok");
+    }
+
+    /// Wait for `probe`'s round to fail, and check that its parent is told so.
+    async fn assert_round_failed(registry: &SubagentRegistry) {
+        match registry.get_result("probe").await {
+            Ok(Outcome::Error(message)) => {
+                assert!(message.starts_with("round failed"), "got: {message}");
+            }
+            other => panic!("the failed round must reach the parent, got: {other:?}"),
+        }
+    }
+
+    /// A failed round starts nothing on its own, so a steer it never sent does
+    /// not run as a round of its own against the endpoint that just failed. It
+    /// is folded in, and reaches the model with whatever the parent, told of
+    /// the failure, sends next. One that went out, with the results of a batch
+    /// before the failure, stays on its result where the round keeps that, and
+    /// is folded in where it does not. Either way the next round sees it once.
+    async fn a_failed_round_passes_its_steer_on_once(status: StatusCode, delivered: bool) {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        let mut call = provider.next_call().await;
+        steer(&registry);
+        if delivered {
+            call.call_tools(&[("counted", "{}")]);
+            call = provider.next_call().await;
+            assert_eq!(call.mentions(STEER), 1, "the call that fails carries it");
+        }
+        call.fail(status);
+        assert_round_failed(&registry).await;
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions(STEER),
+            1,
+            "the steer reaches the next round once"
+        );
+        assert_eq!(
+            call.mentions(injection::STEER_HEADER),
+            1,
+            "marked as the parent's"
+        );
+        call.reply("ok");
+    }
+
+    /// The `Err` arm: a 400 is terminal, so the turn errors out of
+    /// `run_turn_captured`.
+    #[tokio::test]
+    async fn a_round_that_errored_folds_its_undelivered_steer() {
+        a_failed_round_passes_its_steer_on_once(StatusCode::BAD_REQUEST, false).await;
+    }
+
+    /// The `EndpointFailed` arm: a 503 is transient, and with retries off it
+    /// ends the turn at once.
+    #[tokio::test]
+    async fn a_round_whose_endpoint_failed_folds_its_undelivered_steer() {
+        a_failed_round_passes_its_steer_on_once(StatusCode::SERVICE_UNAVAILABLE, false).await;
+    }
+
+    /// An error keeps nothing of the turn, the result the steer rode on
+    /// included, so the turn takes the delivery back and the steer is folded
+    /// in.
+    #[tokio::test]
+    async fn a_round_that_errored_folds_its_delivered_steer() {
+        a_failed_round_passes_its_steer_on_once(StatusCode::BAD_REQUEST, true).await;
+    }
+
+    /// A failed endpoint leaves the turn's tool call in the history (#197), and
+    /// the steer stays on the call's result.
+    #[tokio::test]
+    async fn a_round_whose_endpoint_failed_keeps_its_delivered_steer() {
+        a_failed_round_passes_its_steer_on_once(StatusCode::SERVICE_UNAVAILABLE, true).await;
+    }
+
+    /// A round whose endpoint fails *after* a tool call ran keeps that call.
+    /// The round still reaches the parent as failed, but its history holds the
+    /// call answered by its result, so the round the parent starts next goes on
+    /// from it rather than running it again (#197).
+    #[tokio::test]
+    async fn a_round_whose_endpoint_failed_after_a_tool_call_keeps_it() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        provider.next_call().await.call_tools(&[("counted", "{}")]);
+        provider
+            .next_call()
+            .await
+            .fail(StatusCode::SERVICE_UNAVAILABLE);
+        assert_round_failed(&registry).await;
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions("do the work"),
+            1,
+            "the failed round's prompt stays with its work"
+        );
+        let messages = call.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message["tool_calls"][0]["function"]["name"] == "counted"),
+            "the follow-up carries the call the failed round ran: {messages:#?}"
+        );
+        call.reply("ok");
+    }
+
+    /// #310: a round whose model call fails for good after the subagent
+    /// reported keeps the report. The failure was published over it, so a
+    /// parent that read once the round was over was told the round failed, and
+    /// the report was gone from the inbox and from the transcript's outcome
+    /// block. The failure is noted beside the report instead.
+    async fn a_round_that_fails_after_reporting_keeps_the_report(status: StatusCode) {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, log_dir) = launch_probe(&provider, 4).await;
+
+        provider.next_call().await.set_result("the findings");
+        provider.next_call().await.fail(status);
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(&registry, "probe"))
+            .await
+            .expect("the round went idle");
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string())),
+            "a parent that reads once the round is over gets the report"
+        );
+
+        // The next round records its prompt before its first model call, so
+        // by now the failed round's transcript entry is written.
+        let call = follow_up(&registry, &mut provider).await;
+        let transcript = tokio::fs::read_to_string(log_dir.path().join("subagent-probe.log"))
+            .await
+            .expect("transcript exists");
+        assert!(
+            transcript.contains("\n--- round failed after reporting ---\n"),
+            "the failure is noted: {transcript}"
+        );
+        assert!(
+            transcript.contains("\n--- result ---\nthe findings\n"),
+            "and the report recorded as the round's outcome: {transcript}"
+        );
+        call.reply("ok");
+    }
+
+    /// The `Err` arm: a 400 is terminal, so the turn errors out of
+    /// `run_turn_captured`.
+    #[tokio::test]
+    async fn a_round_that_errors_after_reporting_keeps_the_report() {
+        a_round_that_fails_after_reporting_keeps_the_report(StatusCode::BAD_REQUEST).await;
+    }
+
+    /// The `EndpointFailed` arm: a 503 is transient, and with retries off it
+    /// ends the turn at once.
+    #[tokio::test]
+    async fn a_round_whose_endpoint_fails_after_reporting_keeps_the_report() {
+        a_round_that_fails_after_reporting_keeps_the_report(StatusCode::SERVICE_UNAVAILABLE).await;
+    }
+
+    /// A report is no answer to a message the parent sends after it. Here the
+    /// parent reads the report and follows up while the round's next model
+    /// call is out, and that call fails for good. Kept beside the report, as
+    /// it is when the parent sent nothing more, the failure would leave the
+    /// parent waiting on its follow-up for good: the round queued nothing, and
+    /// published nothing newer.
+    #[tokio::test]
+    async fn a_follow_up_after_the_report_is_told_the_round_failed() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 4).await;
+
+        provider.next_call().await.set_result("the findings");
+        let call = provider.next_call().await;
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string()))
+        );
+        steer(&registry);
+        call.fail(StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::timeout(WAIT_TIMEOUT, assert_round_failed(&registry))
+            .await
+            .expect("the parent is told, rather than left waiting");
+    }
+
+    /// The same follow-up in a round that goes on: the model reads it, on the
+    /// next tool result, and ends the round without reporting again. The
+    /// report from before is no answer to it, so the parent is told the
+    /// subagent stopped, as it is for a follow-up that started a round of its
+    /// own. It used to wait for good, the round having published.
+    #[tokio::test]
+    async fn a_follow_up_after_the_report_left_unreported_is_told_it_stopped() {
+        let (_live, tools) = counted_tools();
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe_with(&provider, 4, tools).await;
+
+        provider.next_call().await.set_result("the findings");
+        let call = provider.next_call().await;
+        assert_eq!(
+            registry.get_result("probe").await,
+            Ok(Outcome::Result("the findings".to_string()))
+        );
+        steer(&registry);
+        call.call_tools(&[("counted", "{}")]);
+        let call = provider.next_call().await;
+        assert_eq!(call.mentions(STEER), 1, "the model reads the follow-up");
+        call.reply("noted");
+
+        let outcome = tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe"))
+            .await
+            .expect("the parent is told, rather than left waiting");
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Error(
+                "subagent stopped without calling outrig__set_result".to_string()
+            ))
+        );
+    }
+
+    /// A and B queue while the subagent is idle. A steer sent during A's last
+    /// model call must not overtake B, which was sent before it, and neither
+    /// may one sent during B's: every prompt runs in the order it was sent, so
+    /// B makes progress however many steers arrive late.
+    #[tokio::test]
+    async fn late_steers_do_not_overtake_prompts_already_waiting() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 4).await;
+        provider.next_call().await.reply("first round done");
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(&registry, "probe"))
+            .await
+            .expect("the first round went idle");
+
+        for prompt in ["prompt A", "prompt B"] {
+            assert_eq!(
+                registry.send("probe", prompt.to_string()),
+                Ok("started a new round")
+            );
+        }
+        let mut order = Vec::new();
+        for late in ["steer C", "steer D"] {
+            let call = provider.next_call().await;
+            order.push(call.last_text().to_string());
+            assert_eq!(
+                registry.send("probe", late.to_string()),
+                Ok("injected into the round in flight")
+            );
+            // No tool call: this was the round's last model call.
+            call.reply("done");
+        }
+        for _ in 0..2 {
+            let call = provider.next_call().await;
+            order.push(call.last_text().to_string());
+            call.reply("done");
+        }
+        assert_eq!(order, ["prompt A", "prompt B", "steer C", "steer D"]);
+    }
+
+    /// A send to a subagent whose last round published nothing ends that
+    /// round's stop at once. Otherwise a parent that sends and then waits could
+    /// be handed the stop of the round before, instead of the round it just
+    /// sent.
+    #[tokio::test]
+    async fn a_send_to_an_idle_subagent_is_not_answered_with_its_last_stop() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 4).await;
+        provider.next_call().await.reply("no report");
+        tokio::time::timeout(WAIT_TIMEOUT, until_idle(&registry, "probe"))
+            .await
+            .expect("the first round went idle");
+
+        assert_eq!(
+            registry.send("probe", FOLLOW_UP.to_string()),
+            Ok("started a new round")
+        );
+        let script = async {
+            provider.next_call().await.set_result("fresh");
+            provider.next_call().await.reply("reported");
+        };
+        let (outcome, ()) = tokio::join!(registry.get_result("probe"), script);
+        assert_eq!(outcome, Ok(Outcome::Result("fresh".to_string())));
+    }
+
+    /// Wait for `probe`'s round to end without a report, and check that the
+    /// repeat breaker is what the parent is told ended it.
+    async fn assert_stopped_by_the_breaker(registry: &SubagentRegistry) {
+        let outcome = tokio::time::timeout(WAIT_TIMEOUT, registry.get_result("probe"))
+            .await
+            .expect("the breaker ends the round without another model call");
+        let name = crate::builtin_tool::name_of("set_result");
+        assert_eq!(
+            outcome,
+            Ok(Outcome::Error(format!(
+                "subagent stopped before reporting: {name} failed 4 times in a row \
+                 with identical arguments"
+            )))
+        );
+    }
+
+    /// #231: the repeat breaker ended the round from inside the call that
+    /// tripped it, before rig had committed that call's result, so the
+    /// subagent's history ended in a tool call nothing answered. OpenAI and
+    /// Anthropic refuse every request carrying one, so the parent's redirect
+    /// failed, and every round after it, until the subagent was released.
+    #[tokio::test]
+    async fn a_subagent_the_repeat_breaker_stopped_can_still_be_redirected() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 8).await;
+        // A blank body fails the same way every time.
+        for _ in 0..4 {
+            provider.next_call().await.set_result("   ");
+        }
+        assert_stopped_by_the_breaker(&registry).await;
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions("so the turn was ended here"),
+            1,
+            "the call that tripped the breaker is answered with why the round ended"
+        );
+        call.reply("summary");
+    }
+
+    /// A model can batch several calls into one step. Those after the call
+    /// that trips the breaker do not run, just as none did when the breaker
+    /// ended the round on the spot -- here, a report that would otherwise have
+    /// been published. Each is still answered, saying it did not run.
+    async fn a_call_batched_after_the_breaker_does_not_run(tool_call_max: usize) {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, tool_call_max).await;
+        for _ in 0..3 {
+            provider.next_call().await.set_result("   ");
+        }
+        provider
+            .next_call()
+            .await
+            .set_results(&["   ", "the report"]);
+        assert_stopped_by_the_breaker(&registry).await;
+
+        let call = follow_up(&registry, &mut provider).await;
+        call.assert_tool_calls_answered();
+        assert_eq!(
+            call.mentions("tool call not executed"),
+            1,
+            "the batched call is answered, saying it did not run"
+        );
+        call.reply("summary");
+    }
+
+    #[tokio::test]
+    async fn a_call_batched_after_the_breaker_is_skipped() {
+        a_call_batched_after_the_breaker_does_not_run(8).await;
+    }
+
+    /// At a cap of four, the batched call is over the cap as well. The breaker
+    /// tripped first, so its reason is the one the parent is told.
+    #[tokio::test]
+    async fn the_breaker_outranks_a_cap_reached_in_the_same_batch() {
+        a_call_batched_after_the_breaker_does_not_run(4).await;
+    }
+
+    /// Like the cap, the breaker ends a round at its next model call without
+    /// making it, so a steer queued during the call that tripped it never
+    /// reached the model, and runs as the next round.
+    #[tokio::test]
+    async fn a_steer_cut_off_by_the_repeat_breaker_runs_as_the_next_round() {
+        let mut provider = ScriptedProvider::start().await;
+        let (registry, _log_dir) = launch_probe(&provider, 8).await;
+        for _ in 0..3 {
+            provider.next_call().await.set_result("   ");
+        }
+        let call = provider.next_call().await;
+        steer(&registry);
+        call.set_result("   ");
+
+        let call = provider.next_call().await;
+        assert_eq!(call.last_text(), STEER, "the steer starts the next round");
+        call.reply("ok");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1930,13 +3092,14 @@ mod tests {
     /// Run with `--nocapture` to see the join time it measures.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_in_flight_tool_tree_shuts_down_within_the_grace() {
-        let server = start_tool_call_server().await;
+        let server = serve_completions(axum::routing::post(mock_tool_call)).await;
         let mut probe = BlockingTools::new();
         let (mut registry, _log_dir) = test_registry();
         registry.ctx.mcp_tools = probe.take_tools();
         registry.ctx.resolved = test_resolved_at(
             &server.base_url,
             None,
+            Some(1),
             outrig::config::DEFAULT_SUBAGENT_DEPTH_MAX,
         );
 
@@ -2195,6 +3358,40 @@ mod tests {
         );
     }
 
+    /// "Omit to use yours" means the launching agent's model at every level: a
+    /// subagent launched onto `fast` launches its own children on `fast`, not on
+    /// the session's `smart`. The agent-side fields still cross both hops.
+    #[tokio::test(start_paused = true)]
+    async fn a_subagent_on_a_named_model_hands_that_model_to_its_children() {
+        let (mut registry, _log_dir) = test_registry();
+        registry.ctx.resolved.tool_call_max = 7;
+        registry
+            .launch("mid", Some("fast"), None, "work".to_string())
+            .await
+            .expect("launch");
+        let child = child_registry(&registry, "mid");
+
+        assert_eq!(
+            child.parent_model_name(),
+            "fast",
+            "the child's launch tool must name the subagent's own model as its own"
+        );
+        let inherited = resolve_launch_model(&child.ctx, None).expect("inherits");
+        assert_eq!(inherited.model_name(), "fast");
+        assert_eq!(inherited.model_identifier(), "gpt-4o-mini");
+        assert_eq!(inherited.max_tokens(), Some(16_000));
+        assert_eq!(
+            (inherited.tool_call_max, inherited.subagent_depth_max),
+            (7, 3),
+            "the session's CLI override and depth limit must survive two hops"
+        );
+
+        let named = resolve_launch_model(&child.ctx, Some("smart")).expect("resolves");
+        assert_eq!(named.model_name(), "smart");
+        assert_eq!(named.max_tokens(), Some(64_000));
+        assert_eq!(registry.ctx.resolved.model_name(), "smart");
+    }
+
     /// Refusal, enumeration, no half-registration, and a corrected retry -- the
     /// four things the acceptance bullet asks of a bad name.
     #[tokio::test(start_paused = true)]
@@ -2225,8 +3422,8 @@ mod tests {
     }
 
     /// Attribution, transcript half: the header names the model a launch asked
-    /// for, and an inherited launch adds no bytes at all. The trace and tool
-    /// result are the other half, pinned in `builtin_tool`.
+    /// for, and an inherited launch's names the subagent alone. The trace and
+    /// tool result are the other half, pinned in `builtin_tool`.
     #[tokio::test(start_paused = true)]
     async fn the_transcript_header_names_the_model() {
         let (registry, log_dir) = test_registry();
@@ -2257,8 +3454,8 @@ mod tests {
             .await
             .expect("transcript exists");
         assert!(
-            !text.contains("model:"),
-            "an inherited launch must add no header bytes: {text}"
+            text.starts_with("=== subagent plain ===\n"),
+            "an inherited launch's header must name no model: {text}"
         );
     }
 
@@ -2286,6 +3483,52 @@ mod tests {
             ),
             "got: {text}"
         );
+    }
+
+    /// Names are per launching agent, so two parents may each launch an
+    /// `audit`, and an `audit` may launch one of its own. Each keeps a
+    /// transcript of its own, under a header naming its whole path and holding
+    /// only its own prompt. All of them used to append to `subagent-audit.log`.
+    #[tokio::test(start_paused = true)]
+    async fn same_named_subagents_keep_separate_transcripts() {
+        let (registry, log_dir) = test_registry();
+        for parent in ["parent-a", "parent-b", "audit"] {
+            registry
+                .launch(parent, None, None, format!("prompt for {parent}"))
+                .await
+                .expect("launch");
+            // A prompt is recorded before its round runs, so once the round's
+            // result is readable the prompt is on disk.
+            registry.get_result(parent).await.expect("round fails");
+            let child = child_registry(&registry, parent);
+            child
+                .launch("audit", None, None, format!("prompt for {parent}/audit"))
+                .await
+                .expect("each parent may launch its own audit");
+            child.get_result("audit").await.expect("round fails");
+        }
+
+        for (path, file) in [
+            ("parent-a", "subagent-parent-a.log"),
+            ("parent-b", "subagent-parent-b.log"),
+            ("audit", "subagent-audit.log"),
+            ("parent-a/audit", "subagent-parent-a/subagent-audit.log"),
+            ("parent-b/audit", "subagent-parent-b/subagent-audit.log"),
+            ("audit/audit", "subagent-audit/subagent-audit.log"),
+        ] {
+            let text = tokio::fs::read_to_string(log_dir.path().join(file))
+                .await
+                .expect("transcript exists");
+            assert!(
+                text.starts_with(&format!("=== subagent {path} ===\n")),
+                "{file}: {text}"
+            );
+            assert_eq!(text.matches("=== prompt ===").count(), 1, "{file}: {text}");
+            assert!(
+                text.contains(&format!("=== prompt ===\nprompt for {path}\n")),
+                "{file} must hold its own prompt: {text}"
+            );
+        }
     }
 
     /// An alias is usable when *any* candidate is, which is what lets one name

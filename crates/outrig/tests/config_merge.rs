@@ -8,10 +8,10 @@ use std::path::Path;
 use tempfile::tempdir;
 
 use outrig::config::{
-    Config, ConfigSource, ConfigValidationError, EventsMode, ImageConfig, LlmProvider,
-    McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction, NetworkEntry,
-    NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView,
-    SidecarWorkspaceAccess, Workspace, merge,
+    BuildImageNameError, Config, ConfigSource, ConfigValidationError, EventsMode, ImageConfig,
+    LlmProvider, McpServerSpec, MountAccess, MountConfig, MountRuleViolation, NetworkAction,
+    NetworkEntry, NetworkMode, NetworkPolicy, SidecarOnFailure, SidecarStart, SidecarView,
+    SidecarWorkspaceAccess, Workspace, check_build_image_name, merge,
 };
 use outrig::error::OutrigError;
 
@@ -367,11 +367,74 @@ context    = "ctx"
 "#,
         );
         let err = expect_validation_err(&cfg, None);
+        // The message says what `check_build_image_name` does about the name.
+        assert!(
+            err.to_string()
+                .starts_with("image \"Bad Name\": a build image's name becomes its repository, which can't hold 'B'"),
+            "{err}"
+        );
         match err {
             ConfigValidationError::BuildImageNameInvalid { image } => {
                 assert_eq!(image, "Bad Name");
             }
             other => panic!("expected BuildImageNameInvalid, got: {other:?}"),
+        }
+    }
+
+    /// Each way a name fails says which. The separators are podman's:
+    /// `podman image exists` (podman 5.7) refuses `a..b`, `a._b`, `a-.b`, and
+    /// `a___b` as an "invalid reference format", and parses every accepted
+    /// name here. A name is a single component, so nothing path-shaped passes.
+    #[test]
+    fn check_build_image_name_says_what_is_wrong() {
+        use BuildImageNameError as E;
+
+        for name in ["a.b", "a_b", "a__b", "a--b", "1abc", "rust-dev"] {
+            assert_eq!(check_build_image_name(name), Ok(()), "{name:?}");
+        }
+        let separator = |run: &str| E::InvalidSeparator {
+            separator: run.to_string(),
+        };
+        for (name, want) in [
+            ("", E::Empty),
+            ("RustDev", E::InvalidCharacter { character: 'R' }),
+            ("a/b", E::InvalidCharacter { character: '/' }),
+            ("../a", E::InvalidCharacter { character: '/' }),
+            ("/abs", E::InvalidCharacter { character: '/' }),
+            (".", E::SeparatorAtEdge { separator: '.' }),
+            ("..", E::SeparatorAtEdge { separator: '.' }),
+            ("-a", E::SeparatorAtEdge { separator: '-' }),
+            ("a-", E::SeparatorAtEdge { separator: '-' }),
+            ("a..b", separator("..")),
+            ("a._b", separator("._")),
+            ("a-.b", separator("-.")),
+            ("a___b", separator("___")),
+        ] {
+            assert_eq!(check_build_image_name(name), Err(want), "{name:?}");
+        }
+    }
+
+    /// The check is written out so it can say what's wrong, and accepts
+    /// exactly the grammar its docs give: every name of up to five characters
+    /// from an alphabet that reaches each way to fail.
+    #[test]
+    fn check_build_image_name_accepts_exactly_its_grammar() {
+        let grammar = regex::Regex::new(r"^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$").unwrap();
+        let mut names = vec![String::new()];
+        let mut longest = names.clone();
+        for _ in 0..5 {
+            longest = longest
+                .iter()
+                .flat_map(|name| "a1._-A/".chars().map(move |c| format!("{name}{c}")))
+                .collect();
+            names.extend(longest.iter().cloned());
+        }
+        for name in &names {
+            assert_eq!(
+                check_build_image_name(name).is_ok(),
+                grammar.is_match(name),
+                "{name:?}"
+            );
         }
     }
 
@@ -512,10 +575,14 @@ context    = "missing-ctx"
 
     #[test]
     fn disk_checks_skipped_when_repo_root_is_none() {
-        // Same shape as dockerfile_missing_on_disk_errors -- but with
-        // `repo_root = None`, the on-disk existence check is skipped.
+        // Same shape as dockerfile_missing_on_disk_errors and
+        // workspace_missing_host_errors -- but with `repo_root = None`, the
+        // on-disk existence checks are skipped.
         let cfg = parse(
             r#"
+[workspace]
+host-path = "does/not/exist"
+
 [images.coding]
 dockerfile = "does/not/exist/Dockerfile"
 context    = "does/not/exist"
@@ -523,6 +590,43 @@ context    = "does/not/exist"
         );
         cfg.validate(None)
             .expect("structural-only validate ignores disk paths");
+    }
+
+    #[test]
+    fn workspace_missing_host_errors() {
+        let tmp = tempdir().unwrap();
+        let cfg = parse(
+            r#"
+[workspace]
+host-path = "missing-src"
+"#,
+        );
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        match err {
+            ConfigValidationError::WorkspaceHostMissing { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("missing-src"));
+            }
+            other => panic!("expected WorkspaceHostMissing, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_file_host_errors() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("src.txt"), "not a directory").unwrap();
+        let cfg = parse(
+            r#"
+[workspace]
+host-path = "src.txt"
+"#,
+        );
+        let err = expect_validation_err(&cfg, Some(tmp.path()));
+        match err {
+            ConfigValidationError::WorkspaceHostNotDirectory { path, .. } => {
+                assert_eq!(path, std::path::PathBuf::from("src.txt"));
+            }
+            other => panic!("expected WorkspaceHostNotDirectory, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -2186,6 +2290,7 @@ mod config_load {
             global.path(),
             "[workspace]\nhost-path = \"global-workspace\"\n",
         );
+        fs::create_dir(global.path().join("global-workspace")).unwrap();
 
         let mut cfg = Config::load(repo.path(), Some(&global_path)).expect("config loads");
         assert_eq!(
@@ -2215,6 +2320,7 @@ mod config_load {
             &global_dir,
             "[workspace]\nhost-path = \"global-workspace\"\n",
         );
+        fs::create_dir(global_dir.join("global-workspace")).unwrap();
 
         // Name the global config relatively, from its own parent directory.
         let restore = std::env::current_dir().unwrap();
@@ -3676,6 +3782,49 @@ container-path = "/shared"
         }
     }
 
+    /// The primary `host-path` is held to the extra mounts' rule, so a typo in
+    /// it stops the load naming the key, the value, and the file. Unchecked, it
+    /// reached `podman run`, whose `statfs` error names none of them (#249).
+    #[test]
+    fn missing_workspace_host_path_names_the_repo_config() {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(repo.path(), "[workspace]\nhost-path = \"does-not-exist\"\n");
+        let repo_cfg = repo.path().join(".agents/outrig/config.toml");
+
+        let err = expect_load_validation_err(Config::load(repo.path(), None).unwrap_err());
+        assert_eq!(
+            err.to_string(),
+            format!(
+                r#"workspace host-path "does-not-exist" does not exist (declared in {repo_cfg:?})"#
+            ),
+        );
+        assert!(matches!(
+            err,
+            ConfigValidationError::WorkspaceHostMissing { .. }
+        ));
+    }
+
+    /// The primary's half of the mount case above: an inherited `host-path` is
+    /// looked for beside the global config, and the error names that file.
+    #[test]
+    fn global_workspace_host_path_is_not_satisfied_by_a_repo_path() {
+        let (repo, _global, global_cfg) = repo_and_global("[workspace]\nhost-path = \"shared\"\n");
+        // Only the repo has `shared/`; the global config's own directory doesn't.
+        fs::create_dir_all(repo.path().join("shared")).unwrap();
+
+        let err =
+            expect_load_validation_err(Config::load(repo.path(), Some(&global_cfg)).unwrap_err());
+        match err {
+            ConfigValidationError::WorkspaceHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("shared"));
+                assert_eq!(declared_in, Some(global_cfg));
+            }
+            other => panic!("expected WorkspaceHostMissing, got: {other:?}"),
+        }
+    }
+
     /// The concatenated list is the case one base directory provably cannot
     /// cover, so attribution has to be per entry. One load reports one failure
     /// -- `check_mount_list` returns on the first -- so this breaks each side in
@@ -3901,6 +4050,150 @@ image = "docker.io/library/alpine:3"
         );
     }
 
+    /// Run the calling test's `body` in a child copy of this test binary whose
+    /// `HOME` is a fresh tempdir, and hand `body` that directory. A `~` test
+    /// can't take its home from the invoking user: a sandbox builder's `HOME`
+    /// need not exist, what is under a real one is no fixture of ours, and
+    /// before Rust 1.90 `std::env::home_dir` reads an empty `HOME` otherwise
+    /// than the resolver does. Nor can it set `HOME` in this process, where
+    /// `set_var` races the tests running beside it.
+    fn with_temp_home(body: impl FnOnce(&Path)) {
+        const CHILD_HOME: &str = "OUTRIG_TEST_CHILD_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            return body(Path::new(&home));
+        }
+        // libtest runs every test on a thread named for it.
+        let test = std::thread::current()
+            .name()
+            .expect("libtest names each test's thread")
+            .to_owned();
+        let home = tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact"])
+            .env("HOME", home.path())
+            .env(CHILD_HOME, home.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Ran, not just exited 0: a filter that matched nothing would too.
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {test} ... ok")),
+            "{test} failed in a child with HOME={}:\n{stdout}{}",
+            home.path().display(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A leading `~` is the invoking user's home directory, for every path the
+    /// one rule serves and whether or not the entry came from a file. The
+    /// sidecar mount is the config reference's own example, which resolved to
+    /// `<repo>/~/.cache/example` and so could never load (#187).
+    #[test]
+    fn a_leading_tilde_resolves_under_the_home_directory() {
+        with_temp_home(|home| {
+            let root = Path::new("/srv/repo");
+
+            let cfg = parse(
+                r#"
+[sidecars.tools]
+image = "docker.io/library/alpine:3"
+
+  [[sidecars.tools.mounts]]
+  host-path      = "~/.cache/example"
+  container-path = "/cache"
+"#,
+            );
+            assert_eq!(
+                cfg.sidecars["tools"].mounts[0].resolved_host_path(root),
+                home.join(".cache/example"),
+            );
+
+            let mount = MountConfig::new("~/data", "/data", MountAccess::ReadOnly);
+            assert_eq!(mount.resolved_host_path(root), home.join("data"));
+
+            let mut workspace = Workspace::default();
+            workspace.set_host_path("~");
+            assert_eq!(workspace.resolved_host_path(root), home);
+
+            let image = ImageConfig::from_dockerfile("~/img/Dockerfile", "~/img");
+            assert_eq!(
+                image.resolved_build_paths(root),
+                (home.join("img/Dockerfile"), home.join("img")),
+            );
+        });
+    }
+
+    /// `~` ignores the declaring file's directory the way an absolute path
+    /// does, so one value means one directory from either file, and the
+    /// existence check looks there.
+    #[test]
+    fn a_tilde_mount_means_home_from_either_file() {
+        with_temp_home(|home| {
+            fs::create_dir(home.join("shared")).unwrap();
+            let (repo, _global, global_cfg) = repo_and_global(
+                r#"
+[[workspace.mounts]]
+host-path      = "~/shared"
+container-path = "/global-shared"
+"#,
+            );
+            write_repo_cfg(
+                repo.path(),
+                r#"
+[[workspace.mounts]]
+host-path      = "~/shared"
+container-path = "/repo-shared"
+"#,
+            );
+
+            let cfg = Config::load(repo.path(), Some(&global_cfg))
+                .expect("a `~` mount is checked under the home directory");
+            let mounts = &cfg.workspace.mounts;
+            assert_eq!(mounts.len(), 2, "global mounts precede repo mounts");
+            for mount in mounts {
+                assert_eq!(mount.resolved_host_path(repo.path()), home.join("shared"));
+            }
+        });
+    }
+
+    /// The negative twin: a directory really named `~` beside the config no
+    /// longer satisfies a `~/...` mount, which is the reading #187's example
+    /// fell into, and the home here is empty. The message still names the path
+    /// as declared, now that the declared path means what it says.
+    #[test]
+    fn a_literal_tilde_directory_does_not_satisfy_a_tilde_mount() {
+        with_temp_home(|_| {
+            let repo = tempdir().unwrap();
+            fs::create_dir_all(repo.path().join("~/cache")).unwrap();
+            write_repo_cfg(
+                repo.path(),
+                r#"
+[[workspace.mounts]]
+host-path      = "~/cache"
+container-path = "/cache"
+"#,
+            );
+
+            let err = expect_load_validation_err(Config::load(repo.path(), None).unwrap_err());
+            match err {
+                ConfigValidationError::WorkspaceMountHostMissing {
+                    path, declared_in, ..
+                } => {
+                    assert_eq!(
+                        path,
+                        std::path::PathBuf::from("~/cache"),
+                        "the reported path stays the raw config value",
+                    );
+                    assert_eq!(
+                        declared_in,
+                        Some(repo.path().join(".agents/outrig/config.toml")),
+                    );
+                }
+                other => panic!("expected WorkspaceMountHostMissing, got: {other:?}"),
+            }
+        });
+    }
+
     /// Repo-declared entries keep resolving exactly as before, and a hand-built
     /// entry that never saw `Config::load` records no source and falls back to
     /// the passed root. That fallback is what keeps every existing library
@@ -4088,6 +4381,35 @@ container-path = "/abs"
         }
     }
 
+    /// The primary `host-path` half of the same rule, through
+    /// `WorkspaceHostMissing`.
+    #[test]
+    fn mutated_workspace_host_path_error_does_not_name_the_old_file() {
+        let (repo, global, global_cfg) = repo_and_global("[workspace]\nhost-path = \"shared\"\n");
+        fs::create_dir_all(global.path().join("shared")).unwrap();
+
+        let mut cfg = Config::load(repo.path(), Some(&global_cfg)).expect("config loads");
+        cfg.workspace.set_host_path("absent");
+
+        let err = expect_load_validation_err(
+            cfg.validate(Some(repo.path()))
+                .expect_err("the replacement does not exist under the repo root"),
+        );
+        assert!(
+            !err.to_string().contains("declared in"),
+            "a hand-set value has no declaring file to name: {err}",
+        );
+        match err {
+            ConfigValidationError::WorkspaceHostMissing {
+                path, declared_in, ..
+            } => {
+                assert_eq!(path, std::path::PathBuf::from("absent"));
+                assert_eq!(declared_in, None, "naming the global file would be a lie");
+            }
+            other => panic!("expected WorkspaceHostMissing, got: {other:?}"),
+        }
+    }
+
     /// The `ImageConfig` half of the same rule, through `DockerfileMissing`.
     #[test]
     fn mutated_image_error_does_not_name_the_old_file() {
@@ -4145,6 +4467,168 @@ container-path = "/abs"
             mutated.clone().config_source(),
             None,
             "a clone of a mutated entry stays sourceless",
+        );
+    }
+}
+
+/// `Config::load_file*`: the repo-side config read from a file named outright,
+/// as `outrig --config <path>` names one outside `.agents/outrig/`.
+mod repo_file_load {
+    use super::*;
+
+    /// A repo whose own config declares `planted`, an image whose Dockerfile
+    /// does not exist, so the load fails if it reads that file at all; and,
+    /// in a separate tree, `ci/outrig.toml` holding `body`. Returns
+    /// `(repo_tmp, file_tmp, file_path)`.
+    fn repo_and_file(body: &str) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempdir().unwrap();
+        write_repo_cfg(
+            repo.path(),
+            "[images.planted]\ndockerfile = \"planted/Dockerfile\"\ncontext = \"planted\"\n",
+        );
+        let outside = tempdir().unwrap();
+        let ci = outside.path().join("ci");
+        fs::create_dir_all(&ci).unwrap();
+        let file = ci.join("outrig.toml");
+        fs::write(&file, body).unwrap();
+        (repo, outside, file)
+    }
+
+    /// #323: the named file is the one read, and the relative paths it
+    /// declares resolve beside it, as a `--global-config` file's do.
+    #[test]
+    fn reads_the_named_file_and_resolves_its_paths_beside_it() {
+        let (repo, outside, file) =
+            repo_and_file("[images.named]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n");
+        let ci = outside.path().join("ci");
+        fs::write(ci.join("Dockerfile"), "FROM scratch\n").unwrap();
+
+        let cfg = Config::load_file(&file, repo.path(), None).expect("the named file loads");
+
+        assert_eq!(cfg.images.keys().collect::<Vec<_>>(), ["named"]);
+        let image = &cfg.images["named"];
+        let src = image
+            .config_source()
+            .expect("a loaded entry carries its source");
+        assert_eq!(src, &ConfigSource::RepoFile { path: file.clone() });
+        assert_eq!(src.base_dir(), ci);
+        assert_eq!(src.config_path(), file);
+        assert_eq!(
+            image.resolved_build_paths(repo.path()),
+            (ci.join("Dockerfile"), ci.join(".")),
+        );
+    }
+
+    /// The file's own `host-path`s resolve beside it; the default workspace,
+    /// which no file declared, is still the repo root.
+    #[test]
+    fn workspace_paths_resolve_beside_the_file_and_default_to_the_root() {
+        let (repo, outside, file) = repo_and_file(
+            "[workspace]\nhost-path = \"ws\"\n\n\
+             [[workspace.mounts]]\nhost-path = \"shared\"\ncontainer-path = \"/shared\"\n",
+        );
+        let ci = outside.path().join("ci");
+        fs::create_dir_all(ci.join("ws")).unwrap();
+        fs::create_dir_all(ci.join("shared")).unwrap();
+
+        let cfg = Config::load_file(&file, repo.path(), None).expect("config loads");
+        assert_eq!(cfg.workspace.resolved_host_path(repo.path()), ci.join("ws"));
+        assert_eq!(
+            cfg.workspace.mounts[0].resolved_host_path(repo.path()),
+            ci.join("shared"),
+        );
+
+        fs::write(&file, "").unwrap();
+        let cfg = Config::load_file(&file, repo.path(), None).expect("empty config loads");
+        assert_eq!(cfg.workspace.resolved_host_path(repo.path()), repo.path());
+    }
+
+    /// A failure in the file names the file, not a repo config it never read.
+    #[test]
+    fn a_missing_dockerfile_names_the_file() {
+        let (repo, _outside, file) =
+            repo_and_file("[images.named]\ndockerfile = \"Dockerfile\"\ncontext = \".\"\n");
+
+        let err =
+            expect_load_validation_err(Config::load_file(&file, repo.path(), None).unwrap_err());
+        match err {
+            ConfigValidationError::DockerfileMissing {
+                image, declared_in, ..
+            } => {
+                assert_eq!(image, "named");
+                assert_eq!(declared_in, Some(file));
+            }
+            other => panic!("expected DockerfileMissing, got: {other:?}"),
+        }
+    }
+
+    /// Unlike `Config::load`'s missing repo config, a missing named file is
+    /// an error, even with a repo config under the root to fall back on.
+    #[test]
+    fn a_missing_file_is_an_error_naming_it() {
+        let (repo, outside, _file) = repo_and_file("");
+        let missing = outside.path().join("ci/outrig-typo.toml");
+
+        let err = Config::load_file(&missing, repo.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, OutrigError::Path { op: "read", path, .. } if *path == missing),
+            "expected a read error naming the file, got: {err:?}",
+        );
+    }
+
+    /// The file is the repo side of the merge, so the repo-only rules hold.
+    #[test]
+    fn the_file_is_held_to_the_repo_rules() {
+        let (repo, _outside, file) =
+            repo_and_file("[network]\nmode = \"filter\"\nallow = [\"github.com:443\"]\n");
+
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[network].allow belongs in global config"),
+            "got: {err:?}",
+        );
+    }
+
+    /// Each variant reads the named file and validates as its root-taking
+    /// twin does: a model-less agent fails the full load, passes `run` given
+    /// `--model`, and is not looked at by `build`.
+    #[test]
+    fn each_variant_reads_the_file_with_its_own_validation() {
+        let (repo, _outside, file) = repo_and_file(
+            r#"
+default-agent = "coding"
+
+[providers.openai]
+style    = "openai"
+base-url = "https://api.openai.com/v1"
+api-key  = "${OPENAI_API_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "gpt-4o-mini"
+
+[agents.coding]
+preamble = "hi"
+"#,
+        );
+
+        let err = Config::load_file(&file, repo.path(), None).unwrap_err();
+        assert!(
+            matches!(
+                expect_load_validation_err(err),
+                ConfigValidationError::AgentMissingModel { ref agent } if agent == "coding"
+            ),
+            "the full load holds the agent to a model",
+        );
+        let cfg = Config::load_file_for_run(&file, repo.path(), None, None, Some("fast"))
+            .expect("run --model supplies the selected agent's model");
+        assert_eq!(cfg.default_agent.as_deref(), Some("coding"));
+        let cfg = Config::load_file_for_build(&file, repo.path(), None)
+            .expect("build skips agent cross-references");
+        assert!(
+            cfg.images.is_empty(),
+            "the planted repo config stays unread"
         );
     }
 }

@@ -2,9 +2,10 @@
 
 ## Problem
 
-`crates/outrig/src/config/validate.rs` has no `max_tokens` rule at all -- not a range check, not
-a nonzero check. A `[models.<name>].max-tokens` or `[agents.<name>].max-tokens` above what the
-model can serve is accepted, and what happens next depends on the provider:
+`crates/outrig/src/config/validate.rs` has no `max_tokens` rule at all. The missing nonzero check
+is a bug of its own, filed as #259. A `[models.<name>].max-tokens` or
+`[agents.<name>].max-tokens` above what the model can serve is accepted, and what happens next
+depends on the provider:
 
 - **Anthropic style, recognized identifier**: silently lowered to the published ceiling
   (see `plan/next/clamped-ceiling-is-silent.md`).
@@ -27,10 +28,8 @@ was `style = "openai"` with `identifier = "azure/anthropic/claude-haiku-4-5"`: n
 knows a ceiling for that string, and inventing a rule that pattern-matches `claude-` inside an
 arbitrary gateway identifier is guessing dressed as validation.
 
-So the honest options, in ascending order of cost:
+So the honest options, beyond the nonzero check #259 covers, in ascending order of cost:
 
-- **A nonzero / sanity range check only.** `max-tokens = 0` is accepted today and is never
-  meaningful. Cheap, obviously correct, and catches approximately none of the real cases.
 - **A ceiling table outrig owns**, consulted at validation and independent of provider style, with
   rig's remaining the authority at request time. Covers the gateway case. Costs a table that goes
   stale, which is exactly the objection `doc/reference/config.md` already records against tier 2
@@ -41,7 +40,7 @@ So the honest options, in ascending order of cost:
   language; the over-ceiling refusal could get the same treatment, turning a provider 400 into
   "reduce `[models.haiku].max-tokens`".
 
-The third is probably the best value and is not what the entry's title suggests, which is why this
+The second is probably the best value and is not what the entry's title suggests, which is why this
 is filed as a question rather than a task.
 
 ## See also
@@ -50,5 +49,5 @@ is filed as a question rather than a task.
   `subagent-depth-max`, `subagent-width-max`, `retry-budget-secs`, which are the pattern a range
   rule would join.
 - `crates/outrig-cli/src/error.rs` -- `RIG_MISSING_MAX_TOKENS` and the rewrite around it, the
-  precedent for the third option.
+  precedent for the second option.
 - `doc/reference/config.md` -- the three-tier section, including the cap.

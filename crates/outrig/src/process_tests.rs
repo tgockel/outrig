@@ -1221,3 +1221,146 @@ async fn a_failing_transcript_does_not_stop_the_drain() {
         .expect("the pump task panicked")
         .expect("the writer must have been able to finish");
 }
+
+/// The value every test below hides, and what each shows in its place.
+const HIDDEN: &str = "s3cret-324";
+const STAND_IN: &str = "KEY=${VAR}";
+
+/// `/bin/sh -c <script> sh <HIDDEN>`, the last argument shown as [`STAND_IN`].
+/// The script never reads it; it is there to be leaked or not.
+fn with_hidden_arg(script: &str) -> Cmd {
+    Cmd::new("/bin/sh")
+        .args(["-c", script, "sh"])
+        .arg_shown_as(HIDDEN, STAND_IN)
+}
+
+fn assert_shown_not_hidden(what: &str, text: &str) {
+    assert!(
+        text.contains(STAND_IN),
+        "{what} must show the stand-in: {text}"
+    );
+    assert!(
+        !text.contains(HIDDEN),
+        "{what} must not show the value: {text}"
+    );
+}
+
+#[test]
+fn a_stand_in_is_shown_while_the_argument_is_run() {
+    let cmd = Cmd::new("podman")
+        .arg("--env")
+        .arg_shown_as("TOKEN", "TOKEN=${VAR}")
+        .env_hidden("TOKEN", HIDDEN);
+
+    assert_eq!(cmd.render(), "podman --env 'TOKEN=${VAR}'");
+    assert_eq!(cmd.exec_args(), ["--env", "TOKEN"].map(OsString::from));
+    assert_eq!(
+        cmd.shown_args(),
+        ["--env", "TOKEN=${VAR}"].map(OsString::from)
+    );
+    let debug = format!("{cmd:?}");
+    assert!(
+        debug.contains("\"TOKEN\""),
+        "Debug names the env key: {debug}"
+    );
+    assert!(
+        !debug.contains(HIDDEN),
+        "Debug must not show the value: {debug}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_hidden_env_value_reaches_the_child_and_only_the_child() {
+    let _emitting = emitting().await;
+    let var = "OUTRIG_TEST_PROCESS_HIDDEN_ENV";
+    let out = super::run_capture(
+        Cmd::new("/bin/sh")
+            .args(["-c", &format!("printf %s \"${var}\"")])
+            .env_hidden(var, HIDDEN),
+    )
+    .await
+    .expect("the probe runs");
+    assert_eq!(out.stdout, HIDDEN.as_bytes());
+    assert!(
+        std::env::var_os(var).is_none(),
+        "the parent's environment is untouched"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn every_failed_run_shows_the_stand_in() {
+    let _emitting = emitting().await;
+    let captured = super::run_capture(with_hidden_arg("exit 3")).await;
+    let logged = super::run_capture_logged(with_hidden_arg("exit 3"), "test", None).await;
+    let streamed =
+        super::run_streamed_checked(with_hidden_arg("exit 3"), "test", Termination::Kill).await;
+
+    for (what, result) in [
+        ("run_capture", captured.map(drop)),
+        ("run_capture_logged", logged.map(drop)),
+        ("run_streamed_checked", streamed),
+    ] {
+        let err = result.expect_err(what);
+        let OutrigError::Process { argv, .. } = &err else {
+            panic!("{what}: expected Process, got {err:?}");
+        };
+        assert_eq!(argv.last(), Some(&OsString::from(STAND_IN)), "{what}");
+        assert_shown_not_hidden(what, &err.to_string());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_run_shows_the_stand_in() {
+    let _emitting = emitting().await;
+    let result = super::try_capture_logged_until(
+        with_hidden_arg("sleep 30"),
+        "test",
+        None,
+        Termination::Kill,
+        std::future::ready(()),
+    )
+    .await;
+    let err = result.expect_err("a ready stop cancels the run");
+    assert!(matches!(err, OutrigError::Canceled { .. }), "{err:?}");
+    assert_shown_not_hidden("Canceled", &err.to_string());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_run_that_never_started_shows_the_stand_in() {
+    let err =
+        super::try_capture(Cmd::new("/nonexistent/outrig-324").arg_shown_as(HIDDEN, STAND_IN))
+            .await
+            .expect_err("a missing program cannot start");
+    assert!(matches!(err, OutrigError::Spawn { .. }), "{err:?}");
+    assert_shown_not_hidden("Spawn", &err.to_string());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_transcript_shows_the_stand_in() {
+    let _emitting = emitting().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("container.log");
+    let transcript = Transcript::create(&path, false)
+        .await
+        .expect("create transcript");
+
+    super::run_capture_logged(with_hidden_arg("exit 0"), "test", Some(&transcript))
+        .await
+        .expect("logged command succeeds");
+
+    let log = std::fs::read_to_string(&path).expect("read transcript");
+    assert_shown_not_hidden("the transcript", &log);
+}
+
+/// Observes the logged helper's callsites, the pair
+/// `try_capture_logged_traces_spawn_and_exit_at_debug` already does, because
+/// every test reaching those holds [`emitting`]. `run_capture`'s own pair
+/// renders the same way, but its emitters were never gated.
+#[test]
+fn the_debug_trace_shows_the_stand_in() {
+    let (result, captured) = with_captured_tracing_at(tracing::Level::DEBUG, async {
+        super::try_capture_logged(with_hidden_arg("exit 0"), "test", None).await
+    });
+    result.expect("the command succeeds");
+    assert_shown_not_hidden("the debug trace", &captured);
+}

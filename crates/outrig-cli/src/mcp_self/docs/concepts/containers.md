@@ -74,6 +74,26 @@ works unchanged. What it does need is the two files to already exist and a writa
 base so minimal that it ships neither cannot be bootstrapped, and neither can one without the
 `sleep` the section above describes.
 
+What the image installs has to work for that user. The build runs as root, but outrig execs
+nothing as root: every exec gets your UID and `HOME=/home/<user>` (see
+[What outrig sets in an exec](#what-outrig-sets-in-an-exec)). Install tools under a shared prefix
+such as `/usr/local`, not into root's home, which is `0700`. A tool that keeps its state under
+`$HOME` by default -- rustup, nvm, pyenv, `pip install --user` -- needs that state pointed at the
+prefix as well, or at run time it looks under your home and finds nothing there; and whatever it
+writes as it works, as cargo does its registry cache, has to be writable by you. The `rust`
+toolchain [`outrig image add`](../usage/image.md#what-gets-written) generates does all of this.
+
+### Download for the image's architecture
+
+outrig names no platform when it builds or pulls an image, so the image takes the architecture
+of the machine its engine runs on -- x86-64 or AArch64 -- and a multi-arch base, as every curated
+one is, resolves to that architecture. A tool you download as a prebuilt binary has to follow it
+too: choose the archive at build time, from `uname -m`, rather than from a URL that names
+`amd64`. An archive for the other architecture unpacks all the same, so the build succeeds, and
+the failure waits for the first run of the binary: `exec format error`. The `go` toolchain
+[`outrig image add`](../usage/image.md#known-toolchains) generates chooses its archive this way,
+and fails the build on any other architecture.
+
 ### Install MCP servers
 
 The image needs to contain the binaries and dependencies for every MCP server you reference in
@@ -86,6 +106,17 @@ RUN npm install -g @modelcontextprotocol/server-filesystem
 
 If multiple MCP servers need different language toolchains (one needs Node, one needs Python),
 install both in the same image. The agent's whole MCP set runs in one container per session.
+
+### Create the directory a `VOLUME` names
+
+outrig runs every container with `--image-volume=ignore`, so a `VOLUME` in the image creates no
+volume. The path holds whatever the image's layers put there, and what the container writes
+there lands in its own layer and is removed with it, like any other write. Left to its default,
+podman would mount an anonymous volume there, and does not always remove it with the container.
+
+`VOLUME` does not create the directory, so a path the layers never create is not there at all,
+where podman's default would have mounted an empty one. If the image's program expects the
+directory and does not make it, the image has to: `RUN mkdir -p <path>` ahead of the `VOLUME`.
 
 ## The `[images.<name>]` config block
 
@@ -332,9 +363,12 @@ the first build.
 outrig tags built images as `<image-config-name>:<hash>`, where the name is the `[images.<name>]`
 block key and the hash is a content-addressed cache key combining the contents of the
 `Dockerfile`, the `build-args`, the OutRig labels derived from `[images.<name>.mcp]`, and the
-content of the build context (gitignore-aware when the context is in a git repo, otherwise a
-tarball hash). So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which podman
-shows as `localhost/outrig-standard`.
+build context. When the context is in a git repo, that means every file in it that `.gitignore`
+does not exclude, committed or not, by path, permission bits, and content. If `.gitignore`
+matches the context directory, or every file in it, committed or not, then every file counts: the
+rules say nothing about which of them the build uses. Outside a git repo, it is a tarball hash of
+the whole directory. So `[images.outrig-standard]` builds to `outrig-standard:<hash>`, which
+podman shows as `localhost/outrig-standard`.
 
 Repo-local build images carry an `org.outrig.mcp` label too. On a cache miss, outrig builds a
 temporary image, reads any inherited/Dockerfile MCP label, overlays `[images.<name>.mcp]`, and
@@ -348,7 +382,10 @@ alphanumeric separated by `.`, `_`, or `-` -- and `outrig` rejects invalid names
 
 A change to the `Dockerfile`, any file in the context, build args, or `[images.<name>.mcp]`
 causes a rebuild on the next `outrig run` or `outrig build`. Otherwise the cache hit is
-immediate. To force a rebuild without changing files, run `outrig build --no-cache`.
+immediate. To force a rebuild without changing files, run `outrig build --no-cache`. In a git
+repo, unless `.gitignore` excludes the context whole, a file it excludes does not count when the
+`Dockerfile` copies it by its own path, so run `outrig build --no-cache` after changing one. A
+symlink counts by what it points at, ignored or not, since copying the link copies that.
 
 Image-name configs use podman's local image store directly; there is no `<name>:<hash>`
 tag in that path. `--no-cache` on an image-name config re-runs `podman pull` even when the
@@ -373,9 +410,9 @@ start      = "auto"             # "auto" (default)  | "manual"
 on-failure = "abort"            # "abort" (default) | "warn"
 
 [[sidecars.tools.mounts]]
-host-path      = "~/.cache/example"
+host-path      = "~/.cache/example"  # ~ is your home directory
 container-path = "/cache"
-access         = "read-write"   # "read-only" (default) | "read-write"
+access         = "read-write"        # "read-only" (default) | "read-write"
 ```
 
 The `image` key resolves exactly like `--image`: an `[images.<name>]` config name first
@@ -480,8 +517,9 @@ also supplies the container's command: `sleep infinity`, appended after the imag
 which overrides the image's `CMD` (see [Don't set an `ENTRYPOINT`](#dont-set-an-entrypoint)).
 The bootstrap runs from the host: a forked child joins the container's user namespace, becomes
 its root, joins its mount namespace, and appends the missing `/etc/passwd` and `/etc/group`
-entries before creating `/home/<user>`. No `podman exec` is involved, and nothing is written
-when podman's `keep-id` mapping already planted the entries. A
+entries before creating `/home/<user>`. No `podman exec` is involved. When podman's `keep-id`
+mapping already planted the entries, nothing is appended, but the planted user entry's home --
+the container's working directory -- is rewritten to `/home/<user>`. A
 `view = "primary"` sidecar is the one exception to `keep-id`: it runs `--userns=container:<primary>`
 to join the primary's user namespace, plus `--cap-add=SYS_ADMIN`/`SYS_PTRACE`, the primary's
 `/proc/<pid>/ns` directory, and the `outrig-enter` launcher as its `--entrypoint` (see
@@ -496,7 +534,9 @@ container was created privileged.
 into a capability profile or explicit `cap-drop` / `cap-add` entries, `--device=<path>` flags
 only when it declares `devices`, and `--security-opt=unmask=<path>` flags only when it declares
 `unmask`. Session containers additionally carry the `org.outrig.session` label (and sidecars
-`org.outrig.sidecar`).
+`org.outrig.sidecar`). Every container gets `--image-volume=ignore`, so its image's `VOLUME`s
+create no volumes; see
+[Create the directory a `VOLUME` names](#create-the-directory-a-volume-names).
 
 outrig does not configure seccomp profiles, AppArmor policy, SELinux policy, read-only root
 filesystems, or network egress policy in this container launch path. Network audit/filter mode

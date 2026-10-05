@@ -87,11 +87,17 @@ pub fn install_shadow(name: &str) {
 /// file. Parsed here rather than shelled out to `getent`, which these images
 /// need not have.
 pub fn entry_for_id(text: &str, id: u32) -> Option<String> {
-    text.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        (fields.nth(1)? == id.to_string()).then(|| name.to_string())
-    })
+    field_for_id(text, id, 0)
+}
+
+/// Field `n` (0-based) of the first entry with numeric id `id`, as
+/// [`entry_for_id`] finds it.
+pub fn field_for_id(text: &str, id: u32, n: usize) -> Option<String> {
+    let id = id.to_string();
+    let entry = text
+        .lines()
+        .find(|line| line.split(':').nth(2) == Some(&id))?;
+    entry.split(':').nth(n).map(str::to_string)
 }
 
 /// Read a child's stdout to end and require a clean exit.

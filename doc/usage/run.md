@@ -33,7 +33,8 @@ outrig run [--agent <name>]
   pick an image-config by name; if an explicit `--image` value does not match
   config, treat it as a local Podman image ref and run it without pulling.
 - `--config <path>` (default: walks up from cwd; if not found, run config-less -- see
-  [Config-less runs](#config-less-runs)): load config from a non-standard location.
+  [Config-less runs](#config-less-runs)): read the repo config from this file instead. See
+  [Reference -> CLI](../reference/cli.md#global-flags) for which repo the session runs against.
 - `--env <KEY=VALUE>` (repeatable): add or override env vars for the MCP servers this session
   starts. `KEY=VALUE` applies to every server; `SERVER:KEY=VALUE` targets one server by name.
   Values take the same `${VAR}` host-env-reference syntax config files use, described in
@@ -57,7 +58,7 @@ outrig run [--agent <name>]
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
   container, on top of the default workspace mount. Access defaults to read-only; append `:rw`
   for read-write. The host directory must exist; relative host paths resolve against the
-  workspace root.
+  workspace root, and a leading `~` is your home directory.
 - `--verbose` (default: off): adds buildah/podman command transcripts to stderr and
   `container.log`.
 
@@ -87,6 +88,10 @@ $ RUST_LOG=debug outrig run
 DEBUG outrig::process: spawn command=podman run -d --rm --name outrig-... sleep infinity
 ```
 
+An env value that came from a `${VAR}` reference appears in that line as `'KEY=${VAR}'`, never
+as its value. Pasted as shown, the single quotes would hand podman that literal text; to rerun
+the command by hand, write it as `"KEY=${VAR}"` so your shell fills the value in.
+
 When `--session-dir` is given, outrig writes this run's `session.json` and `logs/` directly into
 `<path>` and creates a symlink at `<session-root>/<sid> -> <path>` so `outrig ls`/`logs`/`discard`
 keep working. This lets you launch with a known path and read `session.json` immediately without
@@ -113,7 +118,9 @@ root (mounted at `/workspace`) and reads the agent, model, and provider from the
 (`~/.outrig/config.toml`, or `$XDG_CONFIG_HOME/outrig/config.toml`). You need not pass
 `--image`: with nothing else naming one, the session falls through to
 [the built-in default image-config](#the-built-in-default-image). If you do pass `--image`, an
-unknown ref is used as a local Podman image and is never pulled.
+unknown ref is used as a local Podman image and is never pulled. The current directory can't be
+your home directory or one above it, unless a config declares `[workspace] host-path`; see
+[Concepts -> Workspace](../concepts/workspace.md#whats-mounted-what-isnt).
 
 What the global config must still supply is a **model**. The session does not need an agent --
 without one it runs with no preamble -- but `--model` alone is not enough on its own: the name
@@ -180,8 +187,8 @@ tools) and `shell` is unavailable. Full details in
    [Concepts -> Containers](../concepts/containers.md#dont-set-an-entrypoint)).
 5. **Bootstrap the user.** From the host, inside the container's namespaces: ensure a group with
    `$(id -g)` and a user with `$(id -u)` exist -- appending the entries to `/etc/group` and
-   `/etc/passwd` if not -- and that `/home/<user>` exists and is owned by them. The image needs
-   no `useradd`/`groupadd` for this. See
+   `/etc/passwd` if not -- and that `/home/<user>` exists, is owned by them, and is the home
+   their `/etc/passwd` entry names. The image needs no `useradd`/`groupadd` for this. See
    [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping) for the full
    logic.
 6. **Start network interception, if enabled.** `--network audit`, `--network filter`, or
@@ -310,20 +317,31 @@ the call, honoring the server's own `Retry-After` when it sends one, and prints 
 ```
 
 If the endpoint is still failing when the budget runs out, the turn ends and you are back at
-`>`, with the containers still up and the conversation unchanged:
+`>`, with the containers still up. What the conversation keeps depends on how far the turn got.
+A turn whose first model call failed has done nothing, and the conversation is unchanged:
 
 ```
 [outrig] LLM endpoint failed and did not recover (HTTP 429 Too Many Requests); ending turn
 [outrig] history unchanged -- send the prompt again to retry, or "/quit" to stop.
 ```
 
-Note the difference from the tool-call max above: nothing was appended, so there is no partial
-turn to `continue`. Resend the prompt itself once the window clears. The budget is
+Resend the prompt itself once the window clears. A later model call comes after tool calls the
+turn has already run, and those stay in the conversation with their results, as they do when the
+tool-call max fires:
+
+```
+[outrig] LLM endpoint failed and did not recover (HTTP 429 Too Many Requests); ending turn
+[outrig] partial history retained -- send another prompt (e.g. "continue")
+        to keep going, or "/reset" to drop it.
+```
+
+Once the window clears, send `continue` rather than the prompt again: the model sees the tool
+calls that already ran, where a resent prompt could have it run them a second time. The budget is
 `retry-budget-secs`; see [config reference](../reference/config.md) to change it, and
 [LLM providers](../concepts/llm-providers.md) for which failures count as transient.
 
-A provider that answers with nothing usable is handled the same way. The call is retried
-twice before outrig gives up:
+A provider that answers with nothing usable is handled the same way, down to what the
+conversation keeps. The call is retried twice before outrig gives up:
 
 ```
 [outrig] model returned an unusable response (Response contained no message or tool call
@@ -394,7 +412,8 @@ nothing: the container set, tool list, and conversation stay as they were.
 The agent can hand scoped work to subagents that share this session's container and tools, using
 the built-in `outrig__` tools. They are on by default; `subagents = false` on the
 `[agents.<name>]` block leaves them out. Their tool calls appear on stderr labeled by name, and
-each one's transcript is written to `<session_dir>/logs/subagent-<name>.log`.
+each one's transcript is written to `<session_dir>/logs/subagent-<name>.log` -- or, for one a
+subagent launched, under a `subagent-<parent>/` directory there.
 
 ```
 > audit the config and the mcp wiring in parallel
@@ -409,6 +428,14 @@ each one's transcript is written to `<session_dir>/logs/subagent-<name>.log`.
 [outrig] tool call: outrig__get_result({"name": "audit-mcp"})
 ```
 
+A subagent round that ends early says why on a line labeled the same way, without the advice
+shown above for your own turns: `continue` or `/reset` would act on the primary's conversation,
+and what the subagent does next is up to the agent that launched it.
+
+```
+[outrig]   [audit-mcp] tool-call iteration max (50) reached; ending turn
+```
+
 Nothing a subagent produces reaches stdout, so `outrig run > out.txt` still captures only the
 primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
 
@@ -416,9 +443,17 @@ primary agent's reply. See [Concepts -> Subagents](../concepts/subagents.md).
 
 - **Ctrl-C** during a turn cancels the in-flight LLM/tool call. The REPL prints
   `[outrig] interrupted` to stderr and returns to a `> ` prompt with conversation history intact,
-  so you can redirect the agent. It stops the agent *waiting*, not work already handed to the
-  container: a `shell__exec` that started a build runs to completion, and any
-  [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn.
+  so you can redirect the agent. A turn interrupted before it finished keeps the tool calls whose
+  results had already gone back to the model, with those results and the prompt that led to
+  them, so the next turn knows those calls ran. The rest of the turn is not kept: a tool call
+  still running when Ctrl-C lands, any the model asked for alongside it, and the whole of a turn
+  interrupted before its first results went back, which leaves the conversation as it stood
+  before that prompt. Say what you still need rather than referring back to them. A local model's
+  reply that had already streamed in full is kept, even if Ctrl-C lands while its output is still
+  being written. It stops the agent *waiting*, not work already handed to the container: a
+  `shell__exec` that started a build runs to completion, and any
+  [subagents](../concepts/subagents.md) keep working and stay collectable on the next turn, as
+  does a result the turn read from one of them but did not keep.
 
   Nothing is killed. The MCP servers, and the `podman exec` transports outrig talks to them
   over, belong to the session and not to the turn, so they stay up for the next prompt; what

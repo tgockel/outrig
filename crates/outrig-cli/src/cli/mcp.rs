@@ -39,6 +39,7 @@ use crate::cli::session_setup::{
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::cli::watcher;
 use crate::error::{OutrigError, Result};
+use crate::paths::RepoConfig;
 use outrig::McpClient;
 use outrig::config::{McpServerSpec, NetworkMode};
 use outrig::container::sidecar::{PlacedServer, Placement, SessionMcpPlan};
@@ -114,7 +115,7 @@ impl McpArgs {
 
 /// Run one `outrig mcp` invocation end-to-end. Returns the process exit code.
 pub async fn execute(
-    repo_cfg_path: &Path,
+    repo: &RepoConfig,
     global_cfg_path: &Path,
     session_root_flag: Option<&Path>,
     args: &McpArgs,
@@ -130,7 +131,7 @@ pub async fn execute(
     }
 
     let setup = session_setup::setup(SessionSetupArgs {
-        repo_cfg_path,
+        repo,
         global_cfg_path,
         session_root_flag,
         image_flag: args.image.as_deref(),
@@ -177,19 +178,9 @@ async fn serve(
         session: _,
         repo_root: _,
     } = setup;
+    // Nothing between here and `teardown` may return early: `teardown` is
+    // the only thing that finalizes the session record.
     let mut runtime = SessionRuntime::new(watcher, network, containers);
-
-    // Validate per-server env entries against the full merged plan (a
-    // skipped sidecar's servers are still declared names).
-    for name in cli_env.per_server_names() {
-        if !mcp_plan.servers.contains_key(name) {
-            return Err(OutrigError::Configuration(format!(
-                "--env {name}:...: image '{}' has no MCP server '{name}'",
-                image_cfg_name
-            ))
-            .into());
-        }
-    }
 
     let primary_died = runtime.watcher.as_ref().map(|w| w.primary_died());
     let outcome: Result<i32> = serve_inner(

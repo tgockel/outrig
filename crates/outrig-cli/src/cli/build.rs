@@ -16,7 +16,7 @@ use clap::{ArgGroup, Parser};
 
 use crate::builtin_image;
 use crate::error::{OutrigError, Result};
-use crate::paths::repo_root_from_config_path;
+use crate::paths::RepoConfig;
 use outrig::config::{Config, ImageConfig, ImageSourceRef};
 use outrig::image::{self, ImageTag};
 
@@ -37,13 +37,9 @@ pub struct BuildArgs {
 }
 
 /// Run one `outrig build` invocation end-to-end. Returns the process exit code.
-pub async fn execute(
-    repo_cfg_path: &Path,
-    global_cfg_path: &Path,
-    args: &BuildArgs,
-) -> Result<i32> {
-    let repo_root = repo_root_from_config_path(repo_cfg_path);
-    let mut cfg = Config::load_for_build(&repo_root, Some(global_cfg_path))?;
+pub async fn execute(repo: &RepoConfig, global_cfg_path: &Path, args: &BuildArgs) -> Result<i32> {
+    let repo_root = &repo.root;
+    let mut cfg = repo.load_for_build(global_cfg_path)?;
 
     // `--all` means "every image-config *you* declared". outrig's built-in
     // default is not that, and pulling and building it in every repo that runs
@@ -57,7 +53,7 @@ pub async fn execute(
             )
             .into());
         }
-        return build_all(&cfg, &repo_root, args.no_cache).await;
+        return build_all(&cfg, repo_root, args.no_cache).await;
     }
 
     let name = args
@@ -83,7 +79,7 @@ pub async fn execute(
             "image-config {name:?} does not match any [images.<name>]"
         ))
     })?;
-    build_single(&name, cc, &repo_root, args.no_cache).await
+    build_single(&name, cc, repo_root, args.no_cache).await
 }
 
 async fn build_single(

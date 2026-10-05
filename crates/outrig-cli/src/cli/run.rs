@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use crate::cli::session_setup::{
 use crate::cli::volume_arg::{CliVolume, parse_volume};
 use crate::error::{OutrigError, Result};
 use crate::llm;
+use crate::paths::RepoConfig;
 use crate::repl::{HelpEntry, Repl};
 use crate::rig_tool::McpToolAdapter;
 use crate::session::{SessionId, SessionStore};
@@ -94,7 +96,7 @@ pub struct RunArgs {
 
 /// Run one `outrig run` invocation end-to-end. Returns the process exit code.
 pub async fn execute(
-    repo_cfg_path: &Path,
+    repo: &RepoConfig,
     global_cfg_path: &Path,
     session_root_flag: Option<&Path>,
     args: &RunArgs,
@@ -104,7 +106,7 @@ pub async fn execute(
         CliEnvEntries::parse(&args.env).map_err(|e| OutrigError::Configuration(e.to_string()))?;
 
     let setup = session_setup::setup(SessionSetupArgs {
-        repo_cfg_path,
+        repo,
         global_cfg_path,
         session_root_flag,
         image_flag: args.image.as_deref(),
@@ -140,23 +142,13 @@ pub async fn execute(
         attached: _,
         session: _,
     } = setup;
+    // Nothing between here and `teardown` may return early: `teardown` is
+    // the only thing that finalizes the session record.
     let mut runtime = SessionRuntime::new(watcher, network, containers);
     // Shared from here on: the subagent registry keeps a handle so a launch can
     // re-resolve the agent against another `[models.<name>]`, against the same
     // merged config the session resolved from.
     let cfg = Arc::new(cfg);
-
-    // Validate per-server env entries against the full merged plan (a
-    // skipped sidecar's servers are still declared names).
-    for name in cli_env.per_server_names() {
-        if !mcp_plan.servers.contains_key(name) {
-            return Err(OutrigError::Configuration(format!(
-                "--env {name}:...: image '{}' has no MCP server '{name}'",
-                image_cfg_name
-            ))
-            .into());
-        }
-    }
 
     let outcome: Result<i32> = run_inner(RunInnerArgs {
         cfg: Arc::clone(&cfg),
@@ -277,6 +269,7 @@ async fn run_inner(args: RunInnerArgs<'_>) -> Result<i32> {
         cfg: cfg.clone(),
         mcp_tools: all_tools.clone(),
         log_dir: log_dir.to_path_buf(),
+        ancestry: Vec::new(),
         // The primary is the root at depth 1, so its subagents live at depth 2.
         depth: 2,
     }));
@@ -410,12 +403,15 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
     let on_prompt = move |line: String| {
         let history = history_for_prompt.clone();
         async move {
-            // Move the vec out so the RefCell isn't borrowed across the
-            // await; restore it on completion. Prompt cancellation may add
-            // partial history to `h`, so it must always be written back.
-            let mut h = std::mem::take(&mut *history.borrow_mut());
-            let result = agent.run_turn(&line, &mut h).await;
-            *history.borrow_mut() = h;
+            // A turn cut short -- by the tool-call max, or by an endpoint that
+            // stayed down -- splices its partial history into `h` and returns
+            // normally. A Ctrl-C instead drops this future mid-await: the turn
+            // splices what it had completed into `h` as it is dropped, and the
+            // guard puts `h` back regardless.
+            let result = {
+                let mut h = TakenHistory::take(&history);
+                agent.run_turn(&line, &mut h).await
+            };
             // A turn that finished on its own and still has nothing to show is
             // reported here rather than returned as an empty reply the REPL
             // would print as nothing. Every *deliberate* stop already printed
@@ -425,16 +421,23 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
             result.map(|end| {
                 if end.is_silent() {
                     eprintln!("{}", end.silent_report());
-                    // Deliberately not the "history retained" advice the
-                    // truncation paths give. The turn *is* in outrig's history,
-                    // but on an OpenAI-compatible provider an assistant message
-                    // carrying only reasoning is dropped on the way back out,
-                    // so promising the model will see it would be false for the
-                    // arm this failure shows up on most.
+                    // A turn with reasoning is in the history for "continue" to
+                    // pick up from, but the reasoning itself may not reach the
+                    // model: providers commonly leave an earlier turn's
+                    // reasoning out of what it reads, and what each is sent is
+                    // decided at its wire boundary (`OpenAiModel`,
+                    // `AnthropicModel`). A turn with nothing at all may not be
+                    // in the history to refer back to: rig keeps an empty reply
+                    // out of it.
+                    let caveat = if end.recovered.is_some() {
+                        "the model may not see the reasoning above"
+                    } else {
+                        "but say what you need again rather than referring back, as the \
+                         model may not see this turn"
+                    };
                     eprintln!(
                         "[outrig] send another prompt (e.g. \"continue\") to keep going, \
-                         or \"/reset\" to start over -- but say what you need again \
-                         rather than referring back, as the model may not see this turn."
+                         or \"/reset\" to start over -- {caveat}."
                     );
                     // Whitespace is exact-non-empty, so returning it would
                     // put a stray blank line on stdout directly under the
@@ -469,6 +472,47 @@ async fn run_repl(session: ReplSession<'_>) -> Result<i32> {
 
     Repl::run("", REPL_COMMANDS, on_prompt, on_command).await?;
     Ok(0)
+}
+
+/// The REPL's conversation history, moved out of its shared cell for one turn
+/// so no `RefCell` borrow is held across the turn's await, and moved back when
+/// this drops.
+///
+/// Dropping is the only way back because it is the only exit every path
+/// shares: on Ctrl-C the REPL drops the in-flight prompt future mid-await, so
+/// a write-back placed after the await never runs, and the cell is left
+/// holding the empty vec `take` swapped in -- every later prompt then goes to
+/// the model with no earlier context.
+struct TakenHistory<'a> {
+    cell: &'a RefCell<Vec<Message>>,
+    history: Vec<Message>,
+}
+
+impl<'a> TakenHistory<'a> {
+    fn take(cell: &'a RefCell<Vec<Message>>) -> Self {
+        let history = std::mem::take(&mut *cell.borrow_mut());
+        Self { cell, history }
+    }
+}
+
+impl Deref for TakenHistory<'_> {
+    type Target = Vec<Message>;
+
+    fn deref(&self) -> &Vec<Message> {
+        &self.history
+    }
+}
+
+impl DerefMut for TakenHistory<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<Message> {
+        &mut self.history
+    }
+}
+
+impl Drop for TakenHistory<'_> {
+    fn drop(&mut self) {
+        *self.cell.borrow_mut() = std::mem::take(&mut self.history);
+    }
 }
 
 /// Dispatch for the `/sidecar` slash command. Always returns stderr text --
@@ -1170,6 +1214,54 @@ mod tests {
   /quit                 exit the session
 "
         );
+    }
+
+    /// Ctrl-C drops the prompt callback mid-turn, and the history it took has
+    /// to come back anyway: the next prompt must reach the model with the
+    /// conversation that came before the interrupted one (#170).
+    #[tokio::test]
+    async fn an_interrupted_turn_keeps_the_prior_history() {
+        let prior = vec![Message::user("what is this repo?"), Message::assistant("outrig")];
+        let history = RefCell::new(prior.clone());
+        // The history each turn was handed, in prompt order.
+        let seen: RefCell<Vec<Vec<Message>>> = RefCell::new(Vec::new());
+        let notify = tokio::sync::Notify::new();
+
+        let (history, seen, notify) = (&history, &seen, &notify);
+        let on_prompt = move |line: String| async move {
+            let mut h = TakenHistory::take(history);
+            seen.borrow_mut().push(h.clone());
+            if line == "slow" {
+                // Stands in for a model call that is still pending when the
+                // user presses Ctrl-C.
+                notify.notify_one();
+                std::future::pending::<()>().await;
+            }
+            h.push(Message::user(line));
+            Result::Ok(String::new())
+        };
+
+        let run = Repl::run_with(
+            &b"slow\nnext\n"[..],
+            tokio::io::sink(),
+            tokio::io::sink(),
+            || notify.notified(),
+            "",
+            &[],
+            on_prompt,
+            |_, _| std::future::ready(None),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run_with must not hang")
+            .expect("run_with must succeed");
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2, "both prompts must reach the callback");
+        assert_eq!(seen[1], prior, "the prompt after Ctrl-C lost the history");
+        let mut finished = prior;
+        finished.push(Message::user("next"));
+        assert_eq!(*history.borrow(), finished);
     }
 
     mod sidecar_cmd {

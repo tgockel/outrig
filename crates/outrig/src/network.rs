@@ -20,19 +20,24 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File as StdFile;
 use std::future::Future;
-use std::io::{self, Write as _};
+use std::io::{self, IoSlice, IoSliceMut, Write as _};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nix::errno::Errno;
 use nix::libc;
+use nix::sys::socket::{
+    ControlMessage, ControlMessageOwned, MsgFlags, SockType, SockaddrStorage, recvmsg, sendmsg,
+    setsockopt, sockopt,
+};
 use rand::Rng;
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -64,6 +69,11 @@ const SO_ORIGINAL_DST: libc::c_int = 80;
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(750);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many lookups one attachment forwards at once. Each holds an ephemeral
+/// socket until its answer or its `DNS_TIMEOUT` per resolver, so this is also
+/// the attachment's bound on those. Past it the listener stops reading and
+/// the backlog waits in its receive buffer.
+const DNS_IN_FLIGHT: usize = 64;
 /// How much of a client's opening bytes is examined for an asserted name. A
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
@@ -524,6 +534,9 @@ impl NetworkInterceptor {
             )));
         }
 
+        // Before anything is changed, so a host with no resolver to forward to
+        // refuses the attach with nothing to undo.
+        let resolvers = host_resolvers()?;
         let pid = container.pid().await?;
         let sockets = bind_interceptor_sockets(pid)?;
         let tcp_port = sockets.tcp.local_addr()?.port();
@@ -539,7 +552,15 @@ impl NetworkInterceptor {
         // Before the first mutation, so a namespace that cannot be identified
         // is a refusal to start rather than an undo that cannot be trusted.
         let mut rollback = Rollback::new(pid)?;
-        if let Err(e) = install_interception(&run, &mut rollback, &target, tcp_port, dns_port).await
+        if let Err(e) = install_interception(
+            &run,
+            &mut rollback,
+            &target,
+            tcp_port,
+            dns_port,
+            self.policy.default,
+        )
+        .await
         {
             let residue = rollback.undo_now(&run).await;
             if residue.is_empty() {
@@ -581,12 +602,7 @@ impl NetworkInterceptor {
             cancel.clone(),
             live,
         ));
-        tasks.spawn(dns_loop(
-            sockets.dns,
-            host_resolvers(),
-            bindings,
-            cancel.clone(),
-        ));
+        tasks.spawn(dns_loop(sockets.dns, resolvers, bindings, cancel.clone()));
 
         self.attachments.insert(
             name.to_string(),
@@ -740,7 +756,9 @@ async fn teardown_attachment(name: &str, attachment: Attachment) -> Vec<NetworkT
 /// its connections in a set of its own and drains it before returning, so on
 /// every path but this one they are joined with it -- but aborting the loop
 /// drops that set, which requests their abort and does not wait. The caller
-/// waits them out separately; see `Attachment::idle`.
+/// waits them out separately; see `Attachment::idle`. The DNS loop's lookups
+/// need no such wait: it aborts them itself on the way out, and they owe
+/// nothing that would be lost if it were aborted first.
 async fn stop_tasks(tasks: &mut JoinSet<()>) -> Vec<OutrigError> {
     let mut failures = Vec::new();
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
@@ -1105,9 +1123,10 @@ async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
 
 /// The container-mutating half of [`NetworkInterceptor::attach`]: snapshot the
 /// resolver and point it at the DNS listener, then install the redirect
-/// table. Split from the socket and task plumbing, and parameterized over how
-/// a command runs, so the ordering and the rollback are exercisable without a
-/// container.
+/// table, whose `egress` chain gives traffic the redirects do not carry the
+/// policy's `default`. Split from the socket and task plumbing, and
+/// parameterized over how a command runs, so the ordering and the rollback
+/// are exercisable without a container.
 ///
 /// All-or-nothing rests on `rollback` belonging to the caller: a failure
 /// returns with the undos armed, and a caller who drops this future
@@ -1118,6 +1137,7 @@ async fn install_interception<F, Fut>(
     target: &Target,
     tcp_port: u16,
     dns_port: u16,
+    policy_default: NetworkAction,
 ) -> Result<()>
 where
     F: Fn(Cmd) -> Fut,
@@ -1134,7 +1154,7 @@ where
     }
 
     let mut rules = tempfile::NamedTempFile::new()?;
-    rules.write_all(nft_rules(&target.table, tcp_port, dns_port).as_bytes())?;
+    rules.write_all(nft_rules(&target.table, tcp_port, dns_port, policy_default).as_bytes())?;
     rules.as_file_mut().sync_all()?;
     // Safe to arm before the apply because the name belongs to this attach
     // alone -- see `nft_table_name`. `create table` is belt to that brace: it
@@ -1521,36 +1541,33 @@ async fn accept_into(
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, peer)) => match original_dst(&stream) {
-                        Ok(dst) => {
-                            // The connection carries a clone of `live` for
-                            // as long as it runs, so teardown can wait every
-                            // one of them out even on the path where this
-                            // loop is aborted and its carrier dropped.
-                            let held = live.clone();
-                            let (audit, bindings) = (audit.clone(), bindings.clone());
-                            let (policy, cancel) = (policy.clone(), conn_cancel.clone());
-                            conns.spawn(async move {
-                                handle_tcp(
-                                    stream,
-                                    peer,
-                                    dst,
-                                    audit,
-                                    bindings,
-                                    policy,
-                                    cancel,
-                                )
-                                .await;
-                                drop(held);
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "outrig::network",
-                                "SO_ORIGINAL_DST failed: {e}"
-                            );
-                        }
-                    },
+                    Ok((stream, peer)) => {
+                        // The listener takes both families, so an IPv4
+                        // client arrives v4-mapped. It is looked up and
+                        // recorded as the IPv4 connection it is.
+                        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+                        let dst = match original_dst(&stream, peer) {
+                            Ok(dst) => dst,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "outrig::network",
+                                    "SO_ORIGINAL_DST failed: {e}"
+                                );
+                                continue;
+                            }
+                        };
+                        // The connection carries a clone of `live` for as
+                        // long as it runs, so teardown can wait every one of
+                        // them out even on the path where this loop is
+                        // aborted and its carrier dropped.
+                        let held = live.clone();
+                        let (audit, bindings) = (audit.clone(), bindings.clone());
+                        let (policy, cancel) = (policy.clone(), conn_cancel.clone());
+                        conns.spawn(async move {
+                            handle_tcp(stream, peer, dst, audit, bindings, policy, cancel).await;
+                            drop(held);
+                        });
+                    }
                     Err(e) => {
                         tracing::warn!(target: "outrig::network", "tcp accept failed: {e}");
                         // The listener is gone, so this attachment is over.
@@ -1893,60 +1910,193 @@ async fn write_audit(audit: &AuditSink, event: AuditEvent) {
 /// Answers the container's lookups from the host's resolvers, recording what
 /// each name validly resolved to. `resolvers` is passed in rather than read
 /// here so a caller -- and a test -- decides who this forwards to.
+///
+/// Each lookup is forwarded in a task of its own. Every process in the
+/// container shares this listener, and a forward can wait out `DNS_TIMEOUT`
+/// per resolver, so one name a resolver is slow to answer must hold up only
+/// the client that asked for it. At most [`DNS_IN_FLIGHT`] run at once.
 async fn dns_loop(
     socket: UdpSocket,
     resolvers: Vec<SocketAddr>,
     bindings: Bindings,
     cancel: CancellationToken,
 ) {
+    let socket = Arc::new(socket);
+    let resolvers: Arc<[SocketAddr]> = resolvers.into();
+    let mut lookups = JoinSet::new();
     let mut buf = vec![0u8; 4096];
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            received = socket.recv_from(&mut buf) => {
-                let Ok((n, peer)) = received else {
+            // Takes each finished lookup back out of the set, which is what
+            // frees its slot.
+            Some(_) = lookups.join_next() => {}
+            // With the set full, the next query stays in the socket until a
+            // lookup finishes rather than being read with nowhere to go.
+            received = recv_query(&socket, &mut buf), if lookups.len() < DNS_IN_FLIGHT => {
+                let Ok((n, peer, asked)) = received else {
                     break;
                 };
                 let raw = buf[..n].to_vec();
-                let query = dns_query(&raw);
-                tracing::debug!(
-                    target: "outrig::network",
-                    "dns query from {peer}: {:?}",
-                    query.as_ref().map(|query| &query.question.name)
-                );
-                let socket_ref = &socket;
-                // A forward waits out `DNS_TIMEOUT` per resolver, which
-                // outlasts the grace a detach gives this task. Awaited bare,
-                // a detach landing mid-query would abort this task and report
-                // the abort -- a routine detach returning an error for
-                // nothing having gone wrong.
-                let Some(forwarded) = cancel
-                    .run_until_cancelled(forward_dns(&raw, query.as_ref(), &resolvers))
-                    .await
-                else {
-                    break;
-                };
-                match forwarded {
-                    Ok(response) => {
-                        if let Some(query) = &query
-                            && dns_response_is_bindable(&response)
-                        {
-                            record_dns_bindings(&bindings, &query.question.name, &response);
-                        }
-                        tracing::debug!(
-                            target: "outrig::network",
-                            "dns response to {peer}: {} bytes",
-                            response.len()
-                        );
-                        let _ = socket_ref.send_to(&response, peer).await;
-                    }
-                    Err(e) => {
-                        tracing::debug!(target: "outrig::network", "dns forward failed: {e}");
-                    }
-                }
+                let (socket, resolvers, bindings) =
+                    (socket.clone(), resolvers.clone(), bindings.clone());
+                lookups.spawn(async move {
+                    answer_dns(&socket, &raw, peer, asked, &resolvers, &bindings).await;
+                });
             }
         }
     }
+    // Aborted rather than waited out: a forward outlasts the grace a detach
+    // gives this task, and a lookup owes no record, so abandoning one loses
+    // nothing a detach has to account for.
+    lookups.shutdown().await;
+}
+
+/// Forwards one query and sends `peer` whatever validly answers it, from
+/// `asked`, the address the query was sent to.
+async fn answer_dns(
+    socket: &UdpSocket,
+    raw: &[u8],
+    peer: SocketAddr,
+    asked: Asked,
+    resolvers: &[SocketAddr],
+    bindings: &Bindings,
+) {
+    let query = dns_query(raw);
+    tracing::debug!(
+        target: "outrig::network",
+        "dns query from {peer}: {:?}",
+        query.as_ref().map(|query| &query.question.name)
+    );
+    match forward_dns(raw, query.as_ref(), resolvers).await {
+        Ok(response) => {
+            // Bound before the answer goes out, so a connection the client
+            // opens on the strength of it is decided with the name in hand.
+            if let Some(query) = &query
+                && dns_response_is_bindable(&response)
+            {
+                record_dns_bindings(bindings, &query.question.name, &response);
+            }
+            tracing::debug!(
+                target: "outrig::network",
+                "dns response to {peer}: {} bytes",
+                response.len()
+            );
+            let _ = send_answer(socket, &response, peer, asked).await;
+        }
+        Err(e) => {
+            tracing::debug!(target: "outrig::network", "dns forward failed: {e}");
+        }
+    }
+}
+
+/// The address a query was sent to, as the socket reported it, and so the
+/// address its answer goes out from; see [`recv_query`]. A dual-stack socket
+/// reports an IPv4 query's as a v4-mapped IPv6 address, and takes one back
+/// the same way.
+#[derive(Clone, Copy)]
+enum Asked {
+    V6(libc::in6_pktinfo),
+    V4(libc::in_pktinfo),
+}
+
+/// The DNS listener, from the socket the namespace helper bound: reporting
+/// where each query was sent, which [`recv_query`] needs, and ready for the
+/// runtime. Made before the redirect is installed, so no redirected query
+/// arrives without that.
+fn dns_listener(fd: OwnedFd) -> io::Result<UdpSocket> {
+    let socket = std::net::UdpSocket::from(fd);
+    // On a dual-stack socket the IPv6 option covers IPv4 datagrams too.
+    if socket.local_addr()?.is_ipv6() {
+        setsockopt(&socket, sockopt::Ipv6RecvPacketInfo, &true)?;
+    } else {
+        setsockopt(&socket, sockopt::Ipv4PacketInfo, &true)?;
+    }
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket)
+}
+
+/// Reads one query from a [`dns_listener`]: its length, who sent it, and the
+/// address it was sent to.
+///
+/// The last is where the answer has to come from. A query to any resolver
+/// but the container's loopback one arrives by way of the redirect, which
+/// rewrote it to loopback, and conntrack undoes that rewrite only on an
+/// answer sent back from the same loopback address. The listener is bound to
+/// the unspecified address, so an answer left to routing goes out from the
+/// container's own address instead. Nothing undoes it, and the client drops
+/// it as coming from a server it never asked.
+async fn recv_query(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Asked)> {
+    socket
+        .async_io(Interest::READABLE, || {
+            let mut iov = [IoSliceMut::new(buf)];
+            let mut control = nix::cmsg_space!(libc::in6_pktinfo);
+            let msg = recvmsg::<SockaddrStorage>(
+                socket.as_raw_fd(),
+                &mut iov,
+                Some(&mut control),
+                MsgFlags::empty(),
+            )?;
+            let peer = msg
+                .address
+                .as_ref()
+                .and_then(|addr| {
+                    addr.as_sockaddr_in6()
+                        .map(|v6| SocketAddr::V6((*v6).into()))
+                        .or_else(|| addr.as_sockaddr_in().map(|v4| SocketAddr::V4((*v4).into())))
+                })
+                .ok_or_else(|| io::Error::other("a query arrived with no sender address"))?;
+            // The address alone: the interface the query came in on is not
+            // one its answer has to leave by.
+            let asked = msg
+                .cmsgs()?
+                .find_map(|cmsg| match cmsg {
+                    ControlMessageOwned::Ipv6PacketInfo(info) => {
+                        Some(Asked::V6(libc::in6_pktinfo {
+                            ipi6_ifindex: 0,
+                            ..info
+                        }))
+                    }
+                    ControlMessageOwned::Ipv4PacketInfo(info) => {
+                        Some(Asked::V4(libc::in_pktinfo {
+                            ipi_ifindex: 0,
+                            ..info
+                        }))
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    io::Error::other("a query arrived without the address it was sent to")
+                })?;
+            Ok((msg.bytes, peer, asked))
+        })
+        .await
+}
+
+/// Sends `answer` to `peer` from `asked`, the address its query was sent to;
+/// see [`recv_query`].
+async fn send_answer(
+    socket: &UdpSocket,
+    answer: &[u8],
+    peer: SocketAddr,
+    asked: Asked,
+) -> io::Result<usize> {
+    let to = SockaddrStorage::from(peer);
+    socket
+        .async_io(Interest::WRITABLE, || {
+            let from = match &asked {
+                Asked::V6(info) => ControlMessage::Ipv6PacketInfo(info),
+                Asked::V4(info) => ControlMessage::Ipv4PacketInfo(info),
+            };
+            Ok(sendmsg(
+                socket.as_raw_fd(),
+                &[IoSlice::new(answer)],
+                &[from],
+                MsgFlags::empty(),
+                Some(&to),
+            )?)
+        })
+        .await
 }
 
 fn record_dns_bindings(bindings: &Bindings, name: &str, response: &[u8]) {
@@ -2013,9 +2163,10 @@ async fn recv_dns_answer(
             Some(query) => query.answered_by(resolver, peer, &buf[..n]),
             // A query the interceptor could not parse is still forwarded, and
             // the resolver's reply goes straight back. There is no evidence to
-            // protect -- nothing binds from it -- and holding the listener for
-            // the whole timeout waiting for an answer that can never be
-            // recognized would stall every later query behind it.
+            // protect -- nothing binds from it -- and waiting the whole
+            // timeout for an answer that can never be recognized would leave
+            // its client unanswered and hold one of the listener's in-flight
+            // slots for nothing.
             None => peer == resolver,
         };
         if answers {
@@ -2028,16 +2179,51 @@ async fn recv_dns_answer(
     }
 }
 
-fn host_resolvers() -> Vec<SocketAddr> {
-    let primary = read_resolvers("/etc/resolv.conf");
-    let systemd_upstream = read_resolvers("/run/systemd/resolve/resolv.conf");
-    select_host_resolvers(primary, systemd_upstream)
+/// The resolvers the host itself uses, which is who the interceptor forwards
+/// the container's lookups to. See [`host_resolvers_in`] for which file wins.
+fn host_resolvers() -> Result<Vec<SocketAddr>> {
+    host_resolvers_in(
+        Path::new("/etc/resolv.conf"),
+        Path::new("/run/systemd/resolve/resolv.conf"),
+    )
 }
 
-fn read_resolvers(path: &str) -> Vec<SocketAddr> {
+/// [`host_resolvers`] over files of the caller's choosing, so a test can stand
+/// in for the host's: `/etc/resolv.conf` (`primary`), then the upstream
+/// servers systemd-resolved lists (`systemd_upstream`).
+///
+/// The first file to name a resolver wins, taken as written, loopback entries
+/// included: forwarding happens from the host's network namespace, where they
+/// answer. On a systemd-resolved host the primary names resolved's own stub,
+/// which routes each name to the link that serves it -- a VPN's domains to
+/// the VPN's server. The upstream file is no stand-in for it. It is a flat
+/// list for programs that bypass resolved, and it leaves out every link that
+/// is not a default route, so a VPN-only name forwarded down it goes to a
+/// resolver that cannot answer it and learns it all the same. It is read only
+/// past a primary that is missing, unreadable, or names nothing.
+///
+/// A host that names no resolver in either is an error naming what each file
+/// held, since forwarding anywhere else would send every name the session
+/// resolves to a party the host never chose.
+fn host_resolvers_in(primary: &Path, systemd_upstream: &Path) -> Result<Vec<SocketAddr>> {
+    let mut held = Vec::new();
+    for path in [primary, systemd_upstream] {
+        match read_resolvers(path) {
+            Ok(resolvers) if !resolvers.is_empty() => return Ok(resolvers),
+            Ok(_) => held.push(format!("`{}` names no nameserver", path.display())),
+            Err(e) => held.push(e.to_string()),
+        }
+    }
+    Err(OutrigError::Configuration(format!(
+        "no DNS resolver for the network interceptor to forward to: {}",
+        held.join("; ")
+    )))
+}
+
+fn read_resolvers(path: &Path) -> Result<Vec<SocketAddr>> {
     std::fs::read_to_string(path)
+        .path_ctx("read", path)
         .map(|text| parse_resolvers(&text))
-        .unwrap_or_default()
 }
 
 fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
@@ -2052,27 +2238,6 @@ fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
         }
     }
     out
-}
-
-fn select_host_resolvers(
-    primary: Vec<SocketAddr>,
-    systemd_upstream: Vec<SocketAddr>,
-) -> Vec<SocketAddr> {
-    if !primary.is_empty() && primary.iter().all(|resolver| resolver.ip().is_loopback()) {
-        let upstream: Vec<_> = systemd_upstream
-            .into_iter()
-            .filter(|resolver| !resolver.ip().is_loopback())
-            .collect();
-        if !upstream.is_empty() {
-            return upstream;
-        }
-    }
-
-    if primary.is_empty() {
-        vec![SocketAddr::from(([1, 1, 1, 1], 53))]
-    } else {
-        primary
-    }
 }
 
 /// Reads the container's current resolver, so the undo armed against the
@@ -2330,24 +2495,25 @@ fn bind_interceptor_sockets(pid: u32) -> Result<InterceptorSockets> {
     let net_ns_path = format!("/proc/{pid}/ns/net");
     let user_ns = StdFile::open(&user_ns_path).path_ctx("open", &user_ns_path)?;
     let net_ns = StdFile::open(&net_ns_path).path_ctx("open", &net_ns_path)?;
-    let (tcp_fd, dns_fd) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
-    let tcp = unsafe { std::net::TcpListener::from_raw_fd(tcp_fd) };
-    let dns = unsafe { std::net::UdpSocket::from_raw_fd(dns_fd) };
+    let (tcp, dns) = bind_interceptor_socket_fds(user_ns.as_raw_fd(), net_ns.as_raw_fd())?;
+    let tcp = std::net::TcpListener::from(tcp);
     tcp.set_nonblocking(true)?;
-    dns.set_nonblocking(true)?;
 
     Ok(InterceptorSockets {
         tcp: TcpListener::from_std(tcp)?,
-        dns: UdpSocket::from_std(dns)?,
+        dns: dns_listener(dns)?,
     })
 }
 
-fn bind_interceptor_socket_fds(user_ns: RawFd, net_ns: RawFd) -> io::Result<(RawFd, RawFd)> {
-    let (_status, fds) =
+fn bind_interceptor_socket_fds(user_ns: RawFd, net_ns: RawFd) -> io::Result<(OwnedFd, OwnedFd)> {
+    let (status, fds) =
         nsfork::fork_collect(|sock| child_bind_and_send_fds(sock, user_ns, net_ns))?;
+    if status != nsfork::Status::OK {
+        return Err(bind_failure(status));
+    }
     let mut fds = fds.into_iter();
     match (fds.next(), fds.next()) {
-        (Some(tcp), Some(dns)) => Ok((tcp.into_raw_fd(), dns.into_raw_fd())),
+        (Some(tcp), Some(dns)) => Ok((tcp, dns)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "network namespace helper did not return listener sockets",
@@ -2355,25 +2521,72 @@ fn bind_interceptor_socket_fds(user_ns: RawFd, net_ns: RawFd) -> io::Result<(Raw
     }
 }
 
+/// Where the listener helper stopped. The numbering is the wire format
+/// between the child and its parent, so the values are stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+enum BindStep {
+    SetnsUser = 1,
+    SetnsNet = 2,
+    TcpListener = 3,
+    DnsListener = 4,
+}
+
+impl BindStep {
+    fn from_code(code: u32) -> Option<Self> {
+        [
+            BindStep::SetnsUser,
+            BindStep::SetnsNet,
+            BindStep::TcpListener,
+            BindStep::DnsListener,
+        ]
+        .into_iter()
+        .find(|step| *step as u32 == code)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BindStep::SetnsUser => "enter the container's user namespace",
+            BindStep::SetnsNet => "enter the container's network namespace",
+            BindStep::TcpListener => "bind the TCP listener",
+            BindStep::DnsListener => "bind the DNS listener on port 53",
+        }
+    }
+}
+
+/// The failure a helper reported in `status`, keeping its errno's kind.
+fn bind_failure(status: nsfork::Status) -> io::Error {
+    let cause = io::Error::from_raw_os_error(status.errno);
+    let step = BindStep::from_code(status.step).map_or("finish", BindStep::label);
+    io::Error::new(
+        cause.kind(),
+        format!("network namespace helper could not {step}: {cause}"),
+    )
+}
+
 fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
-    if nsfork::setns_raw(user_ns, libc::CLONE_NEWUSER).is_err() {
-        return;
+    let fail = |step: BindStep, e: io::Error| {
+        let status = nsfork::Status::failed(step as u32, e.raw_os_error().unwrap_or(0));
+        let _ = nsfork::send_status(sock, status, &[]);
+    };
+    if let Err(e) = nsfork::setns_raw(user_ns, libc::CLONE_NEWUSER) {
+        return fail(BindStep::SetnsUser, e);
     }
     unsafe {
         let _ = libc::setgid(0);
         let _ = libc::setuid(0);
     }
-    if nsfork::setns_raw(net_ns, libc::CLONE_NEWNET).is_err() {
-        return;
+    if let Err(e) = nsfork::setns_raw(net_ns, libc::CLONE_NEWNET) {
+        return fail(BindStep::SetnsNet, e);
     }
 
-    let tcp = match std::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
+    let tcp = match bind_any(SockType::Stream, 0) {
         Ok(listener) => listener,
-        Err(_) => return,
+        Err(e) => return fail(BindStep::TcpListener, e),
     };
-    let dns = match std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 53))) {
+    let dns = match bind_any(SockType::Datagram, 53) {
         Ok(socket) => socket,
-        Err(_) => return,
+        Err(e) => return fail(BindStep::DnsListener, e),
     };
 
     let _ = nsfork::send_status(
@@ -2381,6 +2594,50 @@ fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
         nsfork::Status::OK,
         &[tcp.as_raw_fd(), dns.as_raw_fd()],
     );
+}
+
+/// A socket of type `ty` on `port` of the unspecified address, taking IPv4
+/// and IPv6 alike, and listening when it is a stream.
+///
+/// Both, because [`nft_rules`] redirects both. Its TCP redirect names no
+/// family, so an IPv6 connection is sent to `[::1]` on the same port an IPv4
+/// one is sent to `127.0.0.1` on. An IPv4 socket alone there leaves every
+/// IPv6 connection refused -- never recorded, never decided -- and leaves the
+/// port free in IPv6 for anything else in the container to bind and receive
+/// them on. One `AF_INET6` socket with `IPV6_V6ONLY` cleared holds the port
+/// in both families. The option is set rather than inherited, because
+/// `net.ipv6.bindv6only` changes the default.
+///
+/// Only a kernel with no IPv6 at all, which refuses the `AF_INET6` socket
+/// with `EAFNOSUPPORT`, gets an IPv4 socket instead: it has no IPv6 traffic
+/// for one to miss.
+///
+/// Runs in a forked child, so it allocates nothing; see [`nsfork`].
+fn bind_any(ty: SockType, port: u16) -> io::Result<OwnedFd> {
+    match bind_to(ty, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))) {
+        Err(Errno::EAFNOSUPPORT) => bind_to(ty, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))),
+        bound => bound,
+    }
+    .map_err(io::Error::from)
+}
+
+fn bind_to(ty: SockType, addr: SocketAddr) -> nix::Result<OwnedFd> {
+    use nix::sys::socket::{AddressFamily, Backlog, SockFlag, bind, listen, socket};
+
+    let family = if addr.is_ipv6() {
+        AddressFamily::Inet6
+    } else {
+        AddressFamily::Inet
+    };
+    let fd = socket(family, ty, SockFlag::SOCK_CLOEXEC, None)?;
+    if addr.is_ipv6() {
+        setsockopt(&fd, sockopt::Ipv6V6Only, &false)?;
+    }
+    bind(fd.as_raw_fd(), &SockaddrStorage::from(addr))?;
+    if ty == SockType::Stream {
+        listen(&fd, Backlog::MAXCONN)?;
+    }
+    Ok(fd)
 }
 
 fn delete_nft_table(pid: u32, table: &str) -> Cmd {
@@ -2520,7 +2777,46 @@ fn nft_table_name(session_id: &str) -> String {
 /// `create` is here for: it still fails rather than merging if a table of this
 /// name already exists, and `nft -f` is one transaction either way, so a
 /// failure anywhere in the script leaves nothing behind.
-fn nft_rules(table: &str, tcp_port: u16, dns_port: u16) -> String {
+///
+/// The redirects match IPv4 and IPv6 alike, which is why the sockets they
+/// point at take both; see [`bind_any`].
+///
+/// A nat chain can only rewrite, and the two redirects carry TCP and UDP/53.
+/// Everything else the container emits -- UDP to any other port, which is
+/// how QUIC and so HTTP/3 travel, ICMP, SCTP -- would leave by podman's
+/// default route, reaching neither the proxy that applies policy nor the
+/// audit log. The `egress` chain gives that traffic the policy's `default`:
+/// it matches no `allow` or `deny` entry, which the proxy evaluates, and
+/// `default` is what unmatched traffic gets. The chain's policy is `drop`
+/// under a deny default and `accept` under an allow one -- audit mode, or
+/// `default = "allow"` with a deny list -- where it changes nothing, and the
+/// script keeps one shape for both.
+///
+/// What the chain accepts is what stays in the namespace. It hooks `output`
+/// at `filter` priority, after the nat chain at `dstnat` has rewritten a
+/// redirected packet's destination to loopback, so matching the loopback
+/// destination covers every packet the redirects carry as well as the
+/// container's own loopback traffic, mirroring the two `return`s above. Not
+/// `oif lo`: the output interface a rule sees is the one routing chose before
+/// the hook ran, and the re-route the redirect forces does not refresh it, so
+/// every packet of a redirected flow still names the external interface. The
+/// interceptor's replies -- the proxy's and the DNS listener's, sent to the
+/// container's own address -- are the reply direction of a tracked flow, which
+/// `ct state established` is. `ct status dnat` would name exactly the
+/// redirected flows instead; `established,related` is the conventional idiom
+/// and also covers a reply to anything forwarded into the container, should
+/// there ever be such a thing. A dropped datagram never confirms its conntrack
+/// entry, so nothing becomes `established` from the outside without the
+/// container first being sent a packet. The sender of a dropped datagram gets
+/// `EPERM` from `sendto` rather than a timeout. The container's own ICMPv6
+/// neighbor discovery is dropped too, which costs nothing here: a redirected
+/// flow needs no neighbor, DAD completes on its timer, and upstream
+/// connections are made from the host's namespace.
+fn nft_rules(table: &str, tcp_port: u16, dns_port: u16, policy_default: NetworkAction) -> String {
+    let verdict = match policy_default {
+        NetworkAction::Allow => "accept",
+        NetworkAction::Deny => "drop",
+    };
     format!(
         "\
 create table inet {table}
@@ -2529,14 +2825,26 @@ add rule inet {table} output ip daddr 127.0.0.0/8 return
 add rule inet {table} output ip6 daddr ::1 return
 add rule inet {table} output meta l4proto tcp redirect to :{tcp_port}
 add rule inet {table} output udp dport 53 redirect to :{dns_port}
+add chain inet {table} egress {{ type filter hook output priority filter; policy {verdict}; }}
+add rule inet {table} egress ip daddr 127.0.0.0/8 accept
+add rule inet {table} egress ip6 daddr ::1 accept
+add rule inet {table} egress ct state established,related accept
 "
     )
 }
 
-fn original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
-    match original_dst_v4(stream) {
-        Ok(addr) => Ok(addr),
-        Err(v4_err) => original_dst_v6(stream).map_err(|_| v4_err),
+/// The destination the redirect displaced, asked of the family `peer`
+/// connected over.
+///
+/// Chosen by family rather than by trying IPv4 and falling back. A native
+/// IPv6 socket carries 127.0.0.6 as its IPv4 addresses, so an IPv4 lookup
+/// made for it succeeds whenever some IPv4 flow between those addresses has
+/// the same ports -- and hands this connection that flow's destination.
+fn original_dst(stream: &TcpStream, peer: SocketAddr) -> io::Result<SocketAddr> {
+    if peer.is_ipv4() {
+        original_dst_v4(stream)
+    } else {
+        original_dst_v6(stream)
     }
 }
 
@@ -3241,6 +3549,16 @@ mod tests {
         snapshot
     }
 
+    /// `install_interception` with the ports and policy default that none of
+    /// the ordering and rollback tests here depend on.
+    async fn install<F, Fut>(run: &F, rollback: &mut Rollback, target: &Target) -> Result<()>
+    where
+        F: Fn(Cmd) -> Fut,
+        Fut: Future<Output = Result<Vec<u8>>>,
+    {
+        install_interception(run, rollback, target, 4001, 4002, NetworkAction::Allow).await
+    }
+
     /// A target whose pid is this test process: `Rollback` asks whether the
     /// container is still alive before undoing anything, and this one is.
     fn target() -> Target {
@@ -3378,7 +3696,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
         let failures = rollback.undo_now(&run).await;
@@ -4117,7 +4435,7 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
         assert_eq!(rollback.armed().len(), 2);
@@ -4155,7 +4473,7 @@ mod tests {
         let installing = FakeRunner::default();
         let run = |cmd: Cmd| installing.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
 
@@ -4187,7 +4505,7 @@ mod tests {
         let installing = FakeRunner::default();
         let run = |cmd: Cmd| installing.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
 
@@ -4220,7 +4538,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let cause = install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        let cause = install(&run, &mut rollback, &target())
             .await
             .expect_err("the apply was injected to fail");
 
@@ -4610,11 +4928,11 @@ mod tests {
         let restore = restore_resolv_conf(std::process::id(), "outrig_test", present_snapshot());
         assert!(
             restore
-                .args
+                .exec_args()
                 .iter()
                 .any(|arg| arg.as_os_str().as_bytes() == ORIGINAL_RESOLV.as_bytes()),
             "the snapshot travels as its own argument, whole: {:#?}",
-            restore.args
+            restore.exec_args()
         );
     }
 
@@ -4640,7 +4958,7 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let installed = install_interception(&run, &mut rollback, &target(), 4001, 4002).await;
+        let installed = install(&run, &mut rollback, &target()).await;
         assert!(installed.is_err(), "the nft apply was injected to fail");
         rollback.undo_now(&run).await;
 
@@ -4666,13 +4984,7 @@ mod tests {
         let target = target();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         {
-            let mut installing = Box::pin(install_interception(
-                &run,
-                &mut rollback,
-                &target,
-                4001,
-                4002,
-            ));
+            let mut installing = Box::pin(install(&run, &mut rollback, &target));
             assert!(
                 futures_util::poll!(&mut installing).is_pending(),
                 "the injected install never completes"
@@ -4697,13 +5009,7 @@ mod tests {
         let target = target();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         {
-            let mut installing = Box::pin(install_interception(
-                &run,
-                &mut rollback,
-                &target,
-                4001,
-                4002,
-            ));
+            let mut installing = Box::pin(install(&run, &mut rollback, &target));
             assert!(
                 futures_util::poll!(&mut installing).is_pending(),
                 "the injected nft apply never completes"
@@ -4731,7 +5037,7 @@ mod tests {
             ..target()
         };
 
-        install_interception(&run, &mut rollback, &target, 4001, 4002)
+        install(&run, &mut rollback, &target)
             .await
             .expect("install interception");
 
@@ -4750,7 +5056,7 @@ mod tests {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install_interception(&run, &mut rollback, &target(), 4001, 4002)
+        install(&run, &mut rollback, &target())
             .await
             .expect("install interception");
 
@@ -4804,7 +5110,7 @@ mod tests {
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         let target = target();
         {
-            let installing = install_interception(&run, &mut rollback, &target, 4001, 4002);
+            let installing = install(&run, &mut rollback, &target);
             let cancelled = tokio::time::timeout(Duration::from_millis(50), installing).await;
             assert!(cancelled.is_err(), "the apply was injected to hang");
         }
@@ -4849,7 +5155,7 @@ mod tests {
             let mut rollback =
                 Rollback::new(std::process::id()).expect("this process has a namespace");
 
-            let failed = install_interception(&run, &mut rollback, &target(), 4001, 4002)
+            let failed = install(&run, &mut rollback, &target())
                 .await
                 .expect_err("a table nothing can name exactly fails the attach");
             assert!(
@@ -5354,55 +5660,183 @@ mod tests {
         );
     }
 
+    /// A `dns_loop` on a listener bound the way attach binds one, forwarding
+    /// to `resolvers`: its IPv4 loopback address, the token that ends the
+    /// loop, and the set holding it.
+    async fn spawned_dns_loop(
+        resolvers: Vec<SocketAddr>,
+        bindings: Bindings,
+    ) -> (SocketAddr, CancellationToken, JoinSet<()>) {
+        let socket = dns_listener(bind_any(SockType::Datagram, 0).expect("bind dns listener"))
+            .expect("dns listener");
+        let port = socket.local_addr().expect("dns addr").port();
+        let listener = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(dns_loop(socket, resolvers, bindings, cancel.clone()));
+        (listener, cancel, tasks)
+    }
+
+    async fn send_query(client: &UdpSocket, listener: SocketAddr, txid: u16, name: &str) {
+        client
+            .send_to(&dns_packet(txid, DNS_QUERY_FLAGS, name, &[]), listener)
+            .await
+            .expect("send query");
+    }
+
+    /// The next query the loop forwards to `resolver` within `within`, and
+    /// the address it came from, or `None` when nothing arrives in time.
+    async fn forwarded_query(
+        resolver: &UdpSocket,
+        within: Duration,
+    ) -> Option<(DnsQuery, SocketAddr)> {
+        let mut buf = [0u8; 512];
+        let (n, from) = tokio::time::timeout(within, resolver.recv_from(&mut buf))
+            .await
+            .ok()?
+            .expect("receive the forwarded query");
+        Some((
+            dns_query(&buf[..n]).expect("parse the forwarded query"),
+            from,
+        ))
+    }
+
     /// A forward waits out `DNS_TIMEOUT` per resolver, well past the grace a
-    /// detach allows. The loop has to abandon one in flight, or every detach
-    /// racing a lookup would abort the task and report the abort.
+    /// detach allows. The loop has to abandon every one it has in flight, or
+    /// every detach racing a lookup would abort the task and report the abort
+    /// -- and a lookup it left behind would outlive the attachment.
     #[tokio::test]
-    async fn the_dns_loop_does_not_outlast_a_cancellation_during_a_forward() {
-        // Receives the query and never answers it.
+    async fn the_dns_loop_does_not_outlast_a_cancellation_during_its_forwards() {
+        const PENDING: u16 = 4;
+        // Receives the queries and never answers them.
         let blackhole = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind blackhole");
         let resolver = blackhole.local_addr().expect("blackhole addr");
-
-        let socket = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("bind dns listener");
-        let listener_addr = socket.local_addr().expect("dns addr");
-        let cancel = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(dns_loop(
-            socket,
-            vec![resolver],
-            empty_bindings(),
-            cancel.clone(),
-        ));
+        let baseline = alive_tasks();
+        let (listener, cancel, mut tasks) =
+            spawned_dns_loop(vec![resolver], empty_bindings()).await;
 
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
-        client
-            .send_to(
-                &dns_packet(0x1234, DNS_QUERY_FLAGS, "example.test", &[]),
-                listener_addr,
-            )
-            .await
-            .expect("send query");
-
-        // The forward is demonstrably in flight once the resolver has it.
-        let mut forwarded = [0u8; 512];
-        tokio::time::timeout(Duration::from_secs(5), blackhole.recv_from(&mut forwarded))
-            .await
-            .expect("the query should reach the resolver")
-            .expect("receive the forwarded query");
+        for txid in 0..PENDING {
+            send_query(&client, listener, txid, "example.test").await;
+        }
+        // The forwards are demonstrably in flight once the resolver has them.
+        for _ in 0..PENDING {
+            forwarded_query(&blackhole, DNS_TIMEOUT)
+                .await
+                .expect("every query should reach the resolver");
+        }
 
         cancel.cancel();
-        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
-            while tasks.join_next().await.is_some() {}
-        })
-        .await;
+        let failures = stop_tasks(&mut tasks).await;
         assert!(
-            stopped.is_ok(),
-            "a cancelled dns loop must not wait out {DNS_TIMEOUT:?}"
+            failures.is_empty(),
+            "a cancelled dns loop must not wait out {DNS_TIMEOUT:?}: {failures:#?}"
         );
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "a cancelled dns loop left lookups running"
+        );
+    }
+
+    /// One name a resolver is slow to answer holds up only the client that
+    /// asked for it. Every process in a container shares its DNS listener, so
+    /// a loop forwarding one lookup at a time would stall them all behind it
+    /// for `DNS_TIMEOUT` per resolver.
+    #[tokio::test]
+    async fn a_slow_lookup_does_not_hold_up_an_unrelated_one() {
+        // Played by the test, so the one resolver can hold one lookup
+        // unanswered while it answers another: the two differ only in the
+        // name, so a fast one that waited did not wait on the resolver.
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let bindings = empty_bindings();
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            bindings.clone(),
+        )
+        .await;
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+
+        send_query(&client, listener, 0x1111, "slow.test").await;
+        // Never answered, so this forward is in flight for `DNS_TIMEOUT` from
+        // here.
+        let (slow, _) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the slow query should reach the resolver");
+        assert_eq!(slow.question.name, "slow.test");
+
+        send_query(&client, listener, 0x2222, "fast.test").await;
+        // Well inside the slow forward's `DNS_TIMEOUT`, so this one was
+        // forwarded while that one was still pending, not after it gave up.
+        let (fast, from) = forwarded_query(&resolver, Duration::from_secs(1))
+            .await
+            .expect("an unrelated lookup was not forwarded while a slow one was pending");
+        assert_eq!(fast.question.name, "fast.test");
+        let answer = dns_packet(
+            fast.txid,
+            DNS_RESPONSE_FLAGS,
+            "fast.test",
+            &[Rr::A("fast.test", [198, 51, 100, 9], 60)],
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut reply))
+            .await
+            .expect("the unrelated lookup's answer was not relayed")
+            .expect("receive reply");
+        assert_eq!(dns_txid(&reply[..n]), Some(0x2222));
+        // Bound before the answer went out, so a connection the client opens
+        // on the strength of it is decided with the name in hand.
+        assert_eq!(
+            resolved_names(&bindings, ip("198.51.100.9")),
+            resolved(&["fast.test"])
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The loop forwards at most `DNS_IN_FLIGHT` lookups at once. Past that it
+    /// stops reading, so a burst of queries no resolver answers cannot spawn
+    /// a forward apiece.
+    #[tokio::test]
+    async fn the_dns_loop_forwards_at_most_its_in_flight_limit() {
+        // Receives the queries and never answers them.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![blackhole.local_addr().expect("blackhole addr")],
+            empty_bindings(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        for txid in 0..DNS_IN_FLIGHT + 8 {
+            send_query(&client, listener, txid as u16, "example.test").await;
+        }
+        for _ in 0..DNS_IN_FLIGHT {
+            forwarded_query(&blackhole, DNS_TIMEOUT)
+                .await
+                .expect("every query up to the limit should reach the resolver");
+        }
+        // Well short of `DNS_TIMEOUT`, so no forward has given up and freed
+        // its slot: a query that reaches the resolver in this window is one
+        // the limit let through.
+        assert!(
+            forwarded_query(&blackhole, Duration::from_millis(250))
+                .await
+                .is_none(),
+            "more lookups were forwarded at once than the in-flight limit allows"
+        );
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     /// Connections that have finished do not stay in the set the accept loop
@@ -5621,9 +6055,222 @@ mod tests {
         );
     }
 
+    /// Whether this kernel has IPv6 at all: the same question [`bind_any`]
+    /// asks before falling back to IPv4.
+    fn kernel_has_ipv6() -> bool {
+        !matches!(
+            nix::sys::socket::socket(
+                nix::sys::socket::AddressFamily::Inet6,
+                SockType::Datagram,
+                nix::sys::socket::SockFlag::empty(),
+                None,
+            ),
+            Err(Errno::EAFNOSUPPORT)
+        )
+    }
+
+    const LOOPBACKS: [IpAddr; 2] = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ];
+
+    /// Asserts that `socket`, fresh from [`bind_any`] and bound to `local`,
+    /// takes both families -- or, on a kernel with no IPv6, that it is the
+    /// IPv4 socket `bind_any` falls back to -- and returns the loopbacks it
+    /// should take clients from.
+    fn loopbacks_served_by(
+        socket: &impl std::os::fd::AsFd,
+        local: SocketAddr,
+    ) -> &'static [IpAddr] {
+        if !kernel_has_ipv6() {
+            assert_eq!(local.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            return &LOOPBACKS[..1];
+        }
+        assert_eq!(local.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert!(
+            !nix::sys::socket::getsockopt(socket, sockopt::Ipv6V6Only).expect("IPV6_V6ONLY"),
+            "IPV6_V6ONLY must be cleared, not left to net.ipv6.bindv6only"
+        );
+        &LOOPBACKS
+    }
+
+    /// The redirect sends IPv6 connections to the same port as IPv4 ones, so
+    /// the listener has to take both. An `AF_INET` one refused every IPv6
+    /// connection the container made.
     #[test]
-    fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
-        let rules = nft_rules("outrig_test", 44123, 44124);
+    fn the_tcp_listener_takes_ipv4_and_ipv6_clients() {
+        let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        let local = listener.local_addr().expect("listener addr");
+
+        for &client in loopbacks_served_by(&listener, local) {
+            let _client = std::net::TcpStream::connect(SocketAddr::new(client, local.port()))
+                .unwrap_or_else(|e| panic!("connect from {client}: {e}"));
+            let (_, peer) = listener.accept().expect("accept");
+            assert_eq!(peer.ip().to_canonical(), client);
+        }
+    }
+
+    /// The same for the DNS listener, which a query to an IPv6 resolver is
+    /// redirected to -- and it has to be able to answer both.
+    #[test]
+    fn the_dns_socket_answers_ipv4_and_ipv6_clients() {
+        let socket = std::net::UdpSocket::from(bind_any(SockType::Datagram, 0).expect("bind"));
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let local = socket.local_addr().expect("socket addr");
+
+        let mut buf = [0u8; 16];
+        for &client in loopbacks_served_by(&socket, local) {
+            let sender = std::net::UdpSocket::bind(SocketAddr::new(client, 0)).expect("bind");
+            sender
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            sender
+                .send_to(b"query", SocketAddr::new(client, local.port()))
+                .unwrap_or_else(|e| panic!("send from {client}: {e}"));
+            let (n, peer) = socket.recv_from(&mut buf).expect("recv query");
+            assert_eq!(
+                (&buf[..n], peer.ip().to_canonical()),
+                (&b"query"[..], client)
+            );
+
+            socket.send_to(b"answer", peer).expect("send answer");
+            let n = sender.recv(&mut buf).expect("recv answer");
+            assert_eq!(&buf[..n], b"answer");
+        }
+    }
+
+    /// A query that came by way of the redirect is addressed to loopback, not
+    /// to the resolver it was sent to, and conntrack undoes that only on an
+    /// answer sent back from the same loopback address. Played here without
+    /// the redirect: the client is connected to 127.0.0.3, which the
+    /// listener's unspecified bind takes too, so an answer routing sends from
+    /// 127.0.0.1 instead is one the client never receives.
+    #[tokio::test]
+    async fn an_answer_comes_from_the_address_its_query_was_sent_to() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");
+        let (listener, cancel, mut tasks) = spawned_dns_loop(
+            vec![resolver.local_addr().expect("resolver addr")],
+            empty_bindings(),
+        )
+        .await;
+
+        let client = UdpSocket::bind("127.0.0.2:0").await.expect("bind client");
+        let asked = SocketAddr::from(([127, 0, 0, 3], listener.port()));
+        client.connect(asked).await.expect("connect client");
+        send_query(&client, asked, 0x3333, "addressed.test").await;
+        let (query, from) = forwarded_query(&resolver, DNS_TIMEOUT)
+            .await
+            .expect("the query should reach the resolver");
+        let answer = dns_packet(
+            query.txid,
+            DNS_RESPONSE_FLAGS,
+            "addressed.test",
+            &[Rr::A("addressed.test", [198, 51, 100, 10], 60)],
+        );
+        resolver.send_to(&answer, from).await.expect("send answer");
+
+        let mut reply = [0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut reply))
+            .await
+            .expect("the answer did not come from the address the query was sent to")
+            .expect("receive reply");
+        assert_eq!(dns_txid(&reply[..n]), Some(0x3333));
+
+        cancel.cancel();
+        let failures = stop_tasks(&mut tasks).await;
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// An IPv4 client reaches the dual-stack listener as a v4-mapped IPv6
+    /// peer, and is recorded by the address it actually connected from.
+    #[tokio::test]
+    async fn the_accept_loop_records_an_ipv4_client_by_its_ipv4_address() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let cancel = CancellationToken::new();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(tcp_accept_loop(
+            listener,
+            audit_sink(dir.path()).await,
+            empty_bindings(),
+            allow_all_policy(),
+            cancel.clone(),
+            mpsc::channel(1).0,
+        ));
+
+        // Silent, so it parks in the sniff read and nothing is forwarded.
+        let client = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("connect");
+        let from = client.local_addr().expect("client addr");
+        tokio::time::sleep(SNIFF_TIMEOUT / 5).await;
+        cancel.cancel();
+        stop_tasks(&mut tasks).await;
+
+        let record = only_audit_record(dir.path());
+        assert_eq!(record["id.orig_h"], "127.0.0.1", "{record:#}");
+        assert_eq!(record["id.orig_p"], from.port());
+    }
+
+    /// A native IPv6 socket carries 127.0.0.6 as its IPv4 addresses, so an
+    /// IPv4 lookup made for it finds any IPv4 flow between those addresses on
+    /// the same ports. Such a flow is built here -- to the listener itself,
+    /// from the port the IPv6 connection then uses -- and the IPv6 connection
+    /// must not be handed its destination.
+    #[tokio::test]
+    async fn an_ipv6_connection_is_never_given_an_ipv4_destination() {
+        if !kernel_has_ipv6() {
+            return;
+        }
+        let listener = std::net::TcpListener::from(bind_any(SockType::Stream, 0).expect("bind"));
+        listener.set_nonblocking(true).expect("nonblocking");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let shadow = Ipv4Addr::new(127, 0, 0, 6);
+        let v4 = tokio::net::TcpSocket::new_v4().expect("v4 socket");
+        v4.bind((shadow, 0).into()).expect("bind v4 client");
+        let source = v4.local_addr().expect("v4 client addr").port();
+        let _v4 = v4.connect((shadow, port).into()).await.expect("connect v4");
+        let _ = listener.accept().await.expect("accept v4");
+
+        let v6 = tokio::net::TcpSocket::new_v6().expect("v6 socket");
+        v6.bind((Ipv6Addr::LOCALHOST, source).into())
+            .expect("bind v6 client to the v4 flow's source port");
+        let _v6 = v6
+            .connect((Ipv6Addr::LOCALHOST, port).into())
+            .await
+            .expect("connect v6");
+        let (stream, peer) = listener.accept().await.expect("accept v6");
+
+        let dst = original_dst(&stream, peer);
+        assert!(
+            !matches!(dst, Ok(SocketAddr::V4(_))),
+            "the IPv6 connection from {peer} was given an IPv4 destination: {dst:?}"
+        );
+    }
+
+    #[test]
+    fn a_helper_failure_names_its_step_and_keeps_its_errno() {
+        let err = bind_failure(nsfork::Status::failed(
+            BindStep::DnsListener as u32,
+            libc::EADDRINUSE,
+        ));
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            err.to_string().contains("bind the DNS listener on port 53"),
+            "{err}"
+        );
+    }
+
+    /// The script's shape: `create table` first, then nothing but flat
+    /// `add chain` / `add rule` commands.
+    fn assert_flat_nft_script(rules: &str) {
         let lines: Vec<&str> = rules.lines().collect();
         assert_eq!(
             lines.first().copied(),
@@ -5641,12 +6288,48 @@ mod tests {
              Asserting only that the text contains each rule cannot tell the \
              two apart, which is why it did not: {rules}"
         );
+    }
+
+    #[test]
+    fn nft_rules_redirect_tcp_and_dns_but_skip_loopback() {
+        let rules = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
+        assert_flat_nft_script(&rules);
         assert!(rules.contains("add rule inet outrig_test output ip daddr 127.0.0.0/8 return"));
         assert!(rules.contains("add rule inet outrig_test output ip6 daddr ::1 return"));
         assert!(
             rules.contains("add rule inet outrig_test output meta l4proto tcp redirect to :44123")
         );
         assert!(rules.contains("add rule inet outrig_test output udp dport 53 redirect to :44124"));
+    }
+
+    /// The `egress` chain's policy is the policy's `default`, and that is the
+    /// only thing the default changes about the script. See `nft_rules` for
+    /// why its three accepts are exactly what the redirects carry.
+    #[test]
+    fn nft_rules_give_what_the_redirects_do_not_carry_the_policy_default() {
+        let chain = |verdict: &str| {
+            format!(
+                "add chain inet outrig_test egress \
+                 {{ type filter hook output priority filter; policy {verdict}; }}\n"
+            )
+        };
+        let allow = nft_rules("outrig_test", 44123, 44124, NetworkAction::Allow);
+        let deny = nft_rules("outrig_test", 44123, 44124, NetworkAction::Deny);
+        assert_flat_nft_script(&deny);
+        assert!(allow.contains(&chain("accept")), "{allow}");
+        assert!(deny.contains(&chain("drop")), "{deny}");
+        assert_eq!(
+            allow.replacen(&chain("accept"), &chain("drop"), 1),
+            deny,
+            "the verdict is the whole difference"
+        );
+        for rule in [
+            "add rule inet outrig_test egress ip daddr 127.0.0.0/8 accept",
+            "add rule inet outrig_test egress ip6 daddr ::1 accept",
+            "add rule inet outrig_test egress ct state established,related accept",
+        ] {
+            assert!(deny.contains(rule), "{deny}");
+        }
     }
 
     #[test]
@@ -5670,26 +6353,65 @@ options edns0
         );
     }
 
+    /// On a systemd-resolved host `/etc/resolv.conf` names only the stub, and
+    /// the stub has to win over the LAN resolver the upstream file lists: the
+    /// stub is what sends a VPN's domains to the VPN's server.
     #[test]
-    fn host_resolvers_prefer_systemd_upstream_when_primary_is_stub() {
-        let primary = vec![SocketAddr::from(([127, 0, 0, 53], 53))];
-        let upstream = vec![
-            SocketAddr::from(([127, 0, 0, 54], 53)),
-            SocketAddr::from(([172, 20, 232, 252], 53)),
-        ];
+    fn host_resolvers_keep_the_stub_over_the_systemd_upstream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("resolv.conf");
+        std::fs::write(&primary, "nameserver 127.0.0.53\noptions edns0 trust-ad\n")
+            .expect("write resolv.conf");
+        let upstream = dir.path().join("upstream-resolv.conf");
+        std::fs::write(&upstream, "nameserver 192.168.1.1\n").expect("write upstream resolv.conf");
 
-        assert_eq!(
-            select_host_resolvers(primary, upstream),
-            vec![SocketAddr::from(([172, 20, 232, 252], 53))]
-        );
+        let resolvers = host_resolvers_in(&primary, &upstream).expect("the stub is a resolver");
+        assert_eq!(resolvers, vec![SocketAddr::from(([127, 0, 0, 53], 53))]);
+    }
+
+    /// A primary that is missing or names nothing is passed over, and the
+    /// upstream file is taken as written, loopback entries included.
+    #[test]
+    fn host_resolvers_read_systemd_upstream_past_a_primary_naming_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = dir.path().join("resolv.conf");
+        std::fs::write(&empty, "search example.test\n").expect("write resolv.conf");
+        let upstream = dir.path().join("upstream-resolv.conf");
+        std::fs::write(&upstream, "nameserver 127.0.0.1\nnameserver 10.0.0.53\n")
+            .expect("write upstream resolv.conf");
+
+        for primary in [dir.path().join("missing-resolv.conf"), empty] {
+            let resolvers = host_resolvers_in(&primary, &upstream)
+                .expect("upstream used past a primary naming nothing");
+            assert_eq!(
+                resolvers,
+                vec![
+                    SocketAddr::from(([127, 0, 0, 1], 53)),
+                    SocketAddr::from(([10, 0, 0, 53], 53)),
+                ]
+            );
+        }
     }
 
     #[test]
-    fn host_resolvers_keep_primary_when_it_has_upstream_nameserver() {
-        let primary = vec![SocketAddr::from(([10, 0, 2, 3], 53))];
-        let upstream = vec![SocketAddr::from(([172, 20, 232, 252], 53))];
+    fn host_resolvers_refuse_when_no_file_names_a_resolver() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("resolv.conf");
+        std::fs::write(&primary, "search example.test\n").expect("write resolv.conf");
+        let upstream = dir.path().join("missing-upstream-resolv.conf");
 
-        assert_eq!(select_host_resolvers(primary.clone(), upstream), primary);
+        let Err(OutrigError::Configuration(message)) = host_resolvers_in(&primary, &upstream)
+        else {
+            panic!("expected a configuration error");
+        };
+        assert!(
+            message.contains(&format!("`{}` names no nameserver", primary.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("failed to read `{}`", upstream.display())),
+            "{message}"
+        );
     }
 
     #[test]
@@ -6534,7 +7256,7 @@ options edns0
 
     /// A query the interceptor cannot parse is still forwarded, and its
     /// answer comes straight back. Waiting out the timeout for an answer that
-    /// can never be recognized would stall every query behind it.
+    /// can never be recognized would leave its client unanswered.
     #[tokio::test]
     async fn an_unparsable_query_still_gets_its_answer() {
         let resolver = UdpSocket::bind("127.0.0.1:0").await.expect("bind resolver");

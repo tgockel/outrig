@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use directories::{BaseDirs, ProjectDirs};
 use tempfile::NamedTempFile;
 
+use outrig::config::Config;
 use outrig::error::{IoPathExt, OutrigError, Result};
 
 const REPO_CONFIG_REL: &str = ".agents/outrig/config.toml";
@@ -53,6 +54,27 @@ pub(crate) fn image_dir_rel(name: &str) -> PathBuf {
 }
 
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_all(&[(path, contents)])
+}
+
+/// Writes each file atomically, in order, after staging every one in a temp
+/// file beside its target: creating, writing, or syncing any of them fails
+/// before a single target changes. Only a failed rename can leave the
+/// earlier files written and the later ones not.
+pub(crate) fn write_atomic_all(files: &[(&Path, &str)]) -> Result<()> {
+    let staged = files
+        .iter()
+        .map(|&(path, contents)| stage(path, contents).map(|tmp| (tmp, path)))
+        .collect::<Result<Vec<_>>>()?;
+    for (tmp, path) in staged {
+        tmp.persist(path).map_err(OutrigError::from)?;
+    }
+    Ok(())
+}
+
+/// `contents` in a synced temp file in `path`'s directory, created if
+/// missing. Dropped instead of persisted, the temp file is removed.
+fn stage(path: &Path, contents: &str) -> Result<NamedTempFile> {
     let parent = path.parent().ok_or_else(|| {
         OutrigError::Configuration(format!("path has no parent: {}", path.display()))
     })?;
@@ -60,41 +82,166 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(contents.as_bytes())?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(OutrigError::from)?;
-    Ok(())
+    Ok(tmp)
 }
 
-pub(crate) fn repo_root_from_config_path(repo_cfg: &Path) -> PathBuf {
-    repo_cfg
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+/// The repo config a command reads, and the repo it runs against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoConfig {
+    /// The repo: the default workspace, the session's working directory, and
+    /// what `model-path` resolves against.
+    pub root: PathBuf,
+    /// A `--config` file outside `.agents/outrig/`, read in place of the
+    /// repo's own. `None` reads `<root>/.agents/outrig/config.toml`, which a
+    /// config-less `outrig run` or `outrig mcp` does not have.
+    pub file: Option<PathBuf>,
 }
 
-pub(crate) fn resolve_repo_config(override_path: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
-    match override_path {
-        Some(p) => Ok(p.to_path_buf()),
-        None => find_repo_root_from(cwd).map(|root| repo_config_path(&root)),
+impl RepoConfig {
+    /// The repo at `root`, reading its own `.agents/outrig/config.toml`.
+    pub fn at_root(root: PathBuf) -> Self {
+        Self { root, file: None }
     }
-}
 
-/// Like [`resolve_repo_config`] but never fails when no repo config is found.
-/// `outrig run`/`outrig mcp` may run in a directory with no
-/// `.agents/outrig/config.toml`. With no `--config` override and nothing found
-/// up the tree, synthesize `<cwd>/.agents/outrig/config.toml` -- a path whose
-/// file is absent. [`repo_root_from_config_path`] maps it back to `cwd`, and
-/// `Config::load` treats the missing file as an empty config merged over the
-/// global config.
-pub(crate) fn resolve_repo_config_optional(override_path: Option<&Path>, cwd: &Path) -> PathBuf {
-    match override_path {
-        Some(p) => p.to_path_buf(),
-        None => {
-            let root = find_repo_root_from(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-            repo_config_path(&root)
+    /// The file this reads.
+    pub(crate) fn config_path(&self) -> PathBuf {
+        self.file
+            .clone()
+            .unwrap_or_else(|| repo_config_path(&self.root))
+    }
+
+    pub(crate) fn load(&self, global: &Path) -> Result<Config> {
+        match &self.file {
+            Some(file) => Config::load_file(file, &self.root, Some(global)),
+            None => Config::load(&self.root, Some(global)),
         }
     }
+
+    pub(crate) fn load_for_run(
+        &self,
+        global: &Path,
+        agent_flag: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Config> {
+        match &self.file {
+            Some(file) => Config::load_file_for_run(
+                file,
+                &self.root,
+                Some(global),
+                agent_flag,
+                model_override,
+            ),
+            None => Config::load_for_run(&self.root, Some(global), agent_flag, model_override),
+        }
+    }
+
+    pub(crate) fn load_for_build(&self, global: &Path) -> Result<Config> {
+        match &self.file {
+            Some(file) => Config::load_file_for_build(file, &self.root, Some(global)),
+            None => Config::load_for_build(&self.root, Some(global)),
+        }
+    }
+}
+
+/// The repo config for `ls`/`logs`/`discard`/`clean`/`build`: `--config`
+/// when given (see [`explicit_repo_config`]), else the walk up from `cwd`,
+/// where finding nothing is [`OutrigError::NoRepoConfig`].
+pub(crate) fn resolve_repo_config(override_path: Option<&Path>, cwd: &Path) -> Result<RepoConfig> {
+    match override_path {
+        Some(p) => explicit_repo_config(p, cwd),
+        None => find_repo_root_from(cwd).map(RepoConfig::at_root),
+    }
+}
+
+/// Like [`resolve_repo_config`] but finding no repo config is not an error.
+/// `outrig run`/`outrig mcp` may run in a directory with no
+/// `.agents/outrig/config.toml`. With no `--config` and nothing found up the
+/// tree, `cwd` is the root, and `Config::load` treats its missing file as an
+/// empty config merged over the global config.
+pub(crate) fn resolve_repo_config_optional(
+    override_path: Option<&Path>,
+    cwd: &Path,
+) -> Result<RepoConfig> {
+    match override_path {
+        Some(p) => explicit_repo_config(p, cwd),
+        None => Ok(RepoConfig::at_root(repo_root_or_cwd(cwd))),
+    }
+}
+
+/// `--config <path>`. The file has to exist: the flag names it outright, so
+/// standing in an empty config would run a session it does not describe.
+/// One at `<repo>/.agents/outrig/config.toml` is that repo's own, and means
+/// what running from `<repo>` means. Any other is read on its own, for the
+/// repo found from `cwd` as if no flag were given: where the file sits never
+/// picks the directory mounted as the workspace.
+///
+/// The path is taken against `cwd` first, so the root is absolute. Taken as
+/// written, `--config .agents/outrig/config.toml` has the empty path three
+/// levels up, and the empty path is not the current directory to what
+/// receives it: `Path::new("").exists()` is false, and a path joined to it
+/// stays relative to wherever it is later opened from.
+fn explicit_repo_config(path: &Path, cwd: &Path) -> Result<RepoConfig> {
+    let file: PathBuf = cwd.join(path).components().collect();
+    if !file.is_file() {
+        return Err(OutrigError::Configuration(format!(
+            "--config {} is not an existing file",
+            path.display()
+        )));
+    }
+    if file.ends_with(REPO_CONFIG_REL) {
+        let root = file.ancestors().nth(3).expect("an absolute path ending in \
+            .agents/outrig/config.toml has a third ancestor");
+        return Ok(RepoConfig::at_root(root.to_path_buf()));
+    }
+    Ok(RepoConfig {
+        root: repo_root_or_cwd(cwd),
+        file: Some(file),
+    })
+}
+
+fn repo_root_or_cwd(cwd: &Path) -> PathBuf {
+    find_repo_root_from(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// Refuse a workspace no config declared when it is the invoking user's home
+/// directory or a directory above it. Such a workspace is outrig's own pick --
+/// the repo root, which a run from `~`, an MCP client started in `/`, or a
+/// stray `~/.agents/outrig/config.toml` can make that directory -- and it
+/// would put `~/.ssh` and `~/.gnupg` in the sandbox. A declared
+/// `[workspace] host-path` is the user's pick, and the caller does not ask.
+pub(crate) fn refuse_home_workspace(workspace: &Path, repo_root: &Path) -> Result<()> {
+    match BaseDirs::new() {
+        Some(dirs) => refuse_home_workspace_with(workspace, dirs.home_dir(), repo_root),
+        None => Ok(()),
+    }
+}
+
+/// [`refuse_home_workspace`] against an explicit `home`. Both paths are
+/// compared canonicalized, so a symlink or a `..` cannot spell its way past;
+/// one that will not canonicalize is compared as written.
+fn refuse_home_workspace_with(workspace: &Path, home: &Path, repo_root: &Path) -> Result<()> {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (workspace, home) = (canonical(workspace), canonical(home));
+    if !home.starts_with(&workspace) {
+        return Ok(());
+    }
+    let what = if workspace == home {
+        "your home directory".to_string()
+    } else {
+        format!("above your home directory ({})", home.display())
+    };
+    let repo_cfg = repo_config_path(repo_root);
+    let why = if repo_cfg.is_file() {
+        format!("{} makes it the repo root", repo_cfg.display())
+    } else {
+        "no repo config was found, so it is the current directory".to_string()
+    };
+    Err(OutrigError::Configuration(format!(
+        "refusing to mount {} as the workspace: it is {what}, and {why}\n\
+         help: run outrig from a project directory, or declare [workspace] host-path \
+         to mount it on purpose",
+        workspace.display()
+    )))
 }
 
 /// Build context for one of outrig's built-in images, under the user cache
@@ -153,6 +300,29 @@ mod tests {
         config
     }
 
+    /// A file that can't be staged fails the write before any file changes,
+    /// the ones listed ahead of it included, and leaves no temp file behind.
+    #[test]
+    fn write_atomic_all_changes_nothing_when_a_file_cannot_be_staged() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        fs::write(&first, "old").unwrap();
+        // A regular file where the second target's directory would go.
+        let blocker = tmp.path().join("blocker");
+        fs::write(&blocker, "").unwrap();
+
+        write_atomic_all(&[(&first, "new"), (&blocker.join("second"), "new")])
+            .expect_err("the second file's directory can't be created");
+
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old");
+        let mut left: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["blocker", "first"]);
+    }
+
     #[test]
     fn find_repo_root_missing_returns_documented_error() {
         let tmp = tempdir().unwrap();
@@ -203,12 +373,205 @@ mod tests {
         assert_eq!(root, tmp.path());
     }
 
+    /// `--config <repo>/.agents/outrig/config.toml` is that repo, wherever the
+    /// command runs from: the documented way to point an MCP client at a repo.
     #[test]
-    fn resolve_repo_config_override_skips_walk_up() {
+    fn explicit_repo_config_is_its_own_repo() {
+        let repo = tempdir().unwrap();
+        let config = write_repo_config(repo.path());
+        let elsewhere = tempdir().unwrap();
+
+        for resolve in [resolve_repo_config, resolve_repo_config_optional] {
+            let resolved = resolve(Some(&config), elsewhere.path()).unwrap();
+            assert_eq!(resolved, RepoConfig::at_root(repo.path().to_path_buf()));
+            assert_eq!(resolved.config_path(), config);
+        }
+    }
+
+    /// Any other `--config` file is read in place of the repo's own, and the
+    /// repo is the one found from the working directory -- not the directory
+    /// three levels above the file, which is where #323's `$HOME` came from.
+    #[test]
+    fn explicit_other_file_is_read_for_the_repo_found_from_cwd() {
+        let repo = tempdir().unwrap();
+        write_repo_config(repo.path());
+        let nested = repo.path().join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        let outside = tempdir().unwrap();
+        let file = outside.path().join("deep/ci/outrig.toml");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"# fixture\n").unwrap();
+        // Where the old derivation looked: three levels above the file.
+        write_repo_config(outside.path());
+
+        for resolve in [resolve_repo_config, resolve_repo_config_optional] {
+            let resolved = resolve(Some(&file), &nested).unwrap();
+            assert_eq!(
+                resolved,
+                RepoConfig {
+                    root: repo.path().to_path_buf(),
+                    file: Some(file.clone()),
+                },
+            );
+            assert_eq!(resolved.config_path(), file);
+        }
+    }
+
+    /// Outside any repo, an out-of-tree `--config` runs against the working
+    /// directory, as a config-less run would.
+    #[test]
+    fn explicit_other_file_outside_a_repo_runs_against_cwd() {
+        let cwd = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let file = outside.path().join("outrig.toml");
+        fs::write(&file, b"# fixture\n").unwrap();
+
+        for resolve in [resolve_repo_config, resolve_repo_config_optional] {
+            let resolved = resolve(Some(&file), cwd.path()).unwrap();
+            assert_eq!(resolved.root, cwd.path());
+            assert_eq!(resolved.file.as_deref(), Some(file.as_path()));
+        }
+    }
+
+    /// An explicit `--config` names a file outright, so one that is not there
+    /// -- a typo, or a directory -- stops the command and says which, in
+    /// either shape and even with a repo config to fall back to.
+    #[test]
+    fn explicit_config_that_is_not_a_file_is_refused() {
+        let repo = tempdir().unwrap();
+        write_repo_config(repo.path());
+        for missing in [
+            repo.path().join(".agents/outrig/confg.toml"),
+            repo.path().join("sub/.agents/outrig/config.toml"),
+            repo.path().join("ci/outrig.toml"),
+            repo.path().join(".agents/outrig"),
+        ] {
+            for resolve in [resolve_repo_config, resolve_repo_config_optional] {
+                let err = resolve(Some(&missing), repo.path()).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "configuration: --config {} is not an existing file",
+                        missing.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Without the flag, nothing changes: the walk up decides, and a run or
+    /// mcp session with nothing to find is config-less in the working
+    /// directory.
+    #[test]
+    fn no_flag_walks_up_or_falls_back_to_cwd() {
+        let repo = tempdir().unwrap();
+        write_repo_config(repo.path());
+        let nested = repo.path().join("a");
+        fs::create_dir_all(&nested).unwrap();
+        let bare = tempdir().unwrap();
+
+        let expected = RepoConfig::at_root(repo.path().to_path_buf());
+        assert_eq!(resolve_repo_config(None, &nested).unwrap(), expected);
+        assert_eq!(resolve_repo_config_optional(None, &nested).unwrap(), expected);
+        assert!(matches!(
+            resolve_repo_config(None, bare.path()),
+            Err(OutrigError::NoRepoConfig)
+        ));
+        assert_eq!(
+            resolve_repo_config_optional(None, bare.path()).unwrap(),
+            RepoConfig::at_root(bare.path().to_path_buf()),
+        );
+    }
+
+    /// A relative `--config` is taken against the working directory, so the
+    /// root is absolute in every shape: never the empty path three levels
+    /// above `.agents/outrig/config.toml`, which would leave every path
+    /// resolved against it relative.
+    #[test]
+    fn relative_explicit_config_resolves_against_cwd() {
+        let repo = tempdir().unwrap();
+        write_repo_config(repo.path());
+        fs::create_dir_all(repo.path().join("ci")).unwrap();
+        fs::write(repo.path().join("ci/outrig.toml"), b"# fixture\n").unwrap();
+
+        for canonical in [".agents/outrig/config.toml", "./.agents/outrig/config.toml"] {
+            let resolved = resolve_repo_config(Some(Path::new(canonical)), repo.path()).unwrap();
+            assert_eq!(resolved.root, repo.path(), "--config {canonical}");
+            assert_eq!(resolved.root.as_os_str(), repo.path().as_os_str());
+        }
+        let resolved = resolve_repo_config(Some(Path::new("ci/outrig.toml")), repo.path()).unwrap();
+        assert_eq!(resolved.file, Some(repo.path().join("ci/outrig.toml")));
+    }
+
+    /// The home directory and every directory above it are refused as a
+    /// default workspace, however they are spelled; anything below or beside
+    /// it is not.
+    #[test]
+    fn home_and_its_ancestors_are_refused_as_a_default_workspace() {
         let tmp = tempdir().unwrap();
-        let custom = tmp.path().join("elsewhere/my-config.toml");
-        let resolved = resolve_repo_config(Some(&custom), tmp.path()).unwrap();
-        assert_eq!(resolved, custom);
+        let home = tmp.path().join("home/u");
+        let proj = home.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let elsewhere = tmp.path().join("srv");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let link = tmp.path().join("link-to-home");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+
+        for refused in [
+            home.clone(),
+            home.join("."),
+            proj.join(".."),
+            link,
+            tmp.path().join("home"),
+            PathBuf::from("/"),
+        ] {
+            let err = refuse_home_workspace_with(&refused, &home, &refused).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing to mount"),
+                "{} must be refused: {err}",
+                refused.display(),
+            );
+        }
+        for allowed in [&proj, &elsewhere] {
+            refuse_home_workspace_with(allowed, &home, allowed)
+                .unwrap_or_else(|e| panic!("{} must be allowed: {e}", allowed.display()));
+        }
+    }
+
+    /// The refusal says which default put the workspace there: a repo config
+    /// at the root, or no repo config at all.
+    #[test]
+    fn home_refusal_names_the_default_that_chose_it() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home/u");
+        fs::create_dir_all(&home).unwrap();
+
+        let err = refuse_home_workspace_with(&home, &home, &home).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "configuration: refusing to mount {} as the workspace: it is your home \
+                 directory, and no repo config was found, so it is the current directory\n\
+                 help: run outrig from a project directory, or declare [workspace] host-path \
+                 to mount it on purpose",
+                home.display()
+            ),
+        );
+
+        let config = write_repo_config(&home);
+        let parent = tmp.path().join("home");
+        let err = refuse_home_workspace_with(&home, &home, &home).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("{} makes it the repo root", config.display())),
+            "{err}",
+        );
+        let err = refuse_home_workspace_with(&parent, &home, &parent).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("it is above your home directory ({})", home.display())),
+            "{err}",
+        );
     }
 
     #[test]

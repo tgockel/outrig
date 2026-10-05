@@ -73,8 +73,9 @@ mkdir -p /home/tgockel && chown 1000:1000 /home/tgockel
 ```
 
 Appending, rather than rewriting the files, is deliberate: it keeps their owner and mode, and it
-is safe against a concurrent writer. `/etc/shadow` gets no entry -- nothing in outrig
-authenticates as this user, and the entry `useradd` would write is a locked password.
+is safe against a concurrent writer. The one exception is a reused user entry's home, covered
+below. `/etc/shadow` gets no entry -- nothing in outrig authenticates as this user, and the entry
+`useradd` would write is a locked password.
 
 After bootstrap, every `podman exec` outrig issues -- to start MCP servers, to run anything else
 -- uses `--user=$(id -u):$(id -g)` and `HOME=/home/<user>`. Files written under `/workspace`
@@ -83,7 +84,27 @@ tooling: any base image works, including one with no `useradd`, `groupadd`, or `
 
 The collision dance handles the case where the image already has a group or user at your UID/GID
 (common for `1000:1000` -- the typical first non-root user in many distros). When that happens,
-outrig reuses the existing entry rather than creating a duplicate.
+outrig reuses the existing entry rather than creating a duplicate. `--userns=keep-id` usually
+gets there first: podman appends an entry for you before the bootstrap looks, and that is the
+one reused.
+
+A reused user entry keeps its name, but its home is changed to `/home/<name>` if it names
+another, so `getpwuid()`, `~<name>`, and `su -` agree with `$HOME`. podman's own entry names the
+container's working directory, which for the primary is `/workspace` -- your checkout, where a
+tool that finds its home that way would leave its caches. Only that field changes. The file is
+truncated where the entry starts and the entry and the lines after it appended back, so it keeps
+its owner and mode, and nothing before the entry is rewritten. That rewrite is not atomic, so it
+is done only in a container outrig has just started and nothing else is using yet. A container
+borrowed with `outrig mcp --attach` keeps its entry as it is. The name has to work as a
+directory under `/home`: an entry named `.`, `..`, or anything with a `/` in it fails the
+bootstrap with an error naming the entry, and nothing is written or created.
+
+A `/home/<user>` the image already has is reused too, and `chown`ed to you, as long as it is a
+directory. Unlike `mkdir -p`, anything else there -- a file, a FIFO, or a symlink, even one to a
+directory -- fails the bootstrap with an error naming the path. Taking it anyway would hand every
+tool a `$HOME` it can't write under, and a symlink would redirect the `chown` to whatever it
+points at. `/home` itself may be a symlink to a directory; only the last component is held to
+this.
 
 ## What's mounted, what isn't
 
@@ -108,11 +129,20 @@ access         = "read-write"
 `host-path = "src"` mounts only the source dir. The primary workspace is always read-write and
 becomes the container workdir.
 
+outrig never picks your home directory on its own. With `host-path` undeclared, the workspace is
+the repo root -- the directory holding `.agents/outrig/`, or the current directory when no repo
+config is found -- and a session refuses to start when that is your home directory or a directory
+above it, such as `/` or `/home`. Running from `~`, an MCP client that starts outrig in `/`, or a
+stray `~/.agents/outrig/config.toml` would otherwise put `~/.ssh` in the container. To mount your
+home directory on purpose, declare it, for example `host-path = "~"`.
+
 Extra `workspace.mounts` entries are for supporting directories: sibling repos, generated docs,
-SDK checkouts, model artifacts, or caches. Relative extra host paths resolve against the repo
-root, just like the primary workspace. Their container paths must be absolute, cannot be `/`, and
-must not duplicate the primary workspace or another extra mount. Exact duplicates fail during
-config validation instead of relying on podman mount ordering.
+SDK checkouts, model artifacts, or caches. A relative host path resolves against the repo root
+when the repo config declares it, and beside the file that declares it otherwise -- the global
+config, or a `--config` file kept outside `.agents/outrig/`; a leading `~` is your home directory.
+See [path resolution](../reference/config.md#path-resolution). Their container paths must be
+absolute, cannot be `/`, and must not duplicate the primary workspace or another extra mount.
+Exact duplicates fail during config validation instead of relying on podman mount ordering.
 
 Extra mounts default to `access = "read-only"`. Use `access = "read-write"` only when the agent
 really should mutate that host directory, such as a scratch cache under `/var/tmp`.
@@ -158,11 +188,12 @@ outbound container traffic:
 mode = "audit"
 ```
 
-Audit mode writes one Zeek `conn.log`-style JSON object per connection to
+Audit mode writes one Zeek `conn.log`-style JSON object per TCP connection to
 `<session_dir>/logs/network.jsonl`. Audit mode is allow-and-log only: every connection is still
 allowed, but records include the best known host, destination IP and port, transport, service,
 byte counts, and duration. HTTPS remains opaque except for TLS SNI. URL, method, status, and
-body inspection are deferred.
+body inspection are deferred. The interceptor carries TCP and DNS over UDP/53; any other
+datagram leaves by podman's default route and is not recorded.
 
 Filter mode uses the same interceptor and audit log, then applies global host/port policy
 before opening upstream TCP connections:
@@ -180,6 +211,12 @@ choose `network.mode`, but cannot set `default`, `allow`, or `deny`. Deny entrie
 allow entries, and unmatched connections use `default`. A denied connection is closed
 immediately and still writes a `network.jsonl` record with `outrig.action = "deny"` and zero
 byte counts, so the audit log is the place to diagnose network policy failures.
+
+Entries match TCP connections. Anything else the container sends -- UDP to any port but 53,
+which is how QUIC and so HTTP/3 travel, ICMP, any other transport -- matches no entry and takes
+`default` directly, so a deny default stops it. Such a datagram never reaches the interceptor
+and writes no `network.jsonl` record; see [Reference -> Config](../reference/config.md) for
+what is carried and what the sending tool sees.
 
 A hostname entry in `allow` grants only against a destination outrig resolved to that name
 itself, through the container's own lookup at the interceptor's DNS listener. A name the

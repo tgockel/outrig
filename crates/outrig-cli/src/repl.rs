@@ -74,7 +74,9 @@ impl Repl {
     /// `tokio::signal::ctrl_c()` as the interrupt source. The `banner` is
     /// printed once to stderr before the first prompt; `on_prompt` is invoked
     /// for every non-slash, non-empty input line and its non-empty returned
-    /// text is printed to stdout.
+    /// text is printed to stdout. An interrupt drops the in-flight `on_prompt`
+    /// future mid-await, so anything it moves out of shared state has to go
+    /// back on drop, not in code after the await.
     ///
     /// Slash commands other than the built-in `/help` and `/quit` go to
     /// `on_command` as `(name, whitespace-split args)` -- `("sidecar",

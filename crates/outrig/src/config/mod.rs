@@ -11,13 +11,16 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use nix::unistd::{Uid, User};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub use api_key::{ApiKeyError, ApiKeyRef};
-pub use env_value::{EnvValue, EnvValueError};
+pub use env_value::{EnvValue, EnvValueError, ResolvedEnvValue};
 pub use merge::merge;
-pub use validate::{ConfigValidationError, MountRuleViolation};
+pub use validate::{
+    BuildImageNameError, ConfigValidationError, MountRuleViolation, check_build_image_name,
+};
 pub(crate) use validate::{
     check_entrypoint_hosting, check_sidecar_image, check_sidecar_name, check_view_exclusions,
     is_valid_mcp_server_name, mcp_command_is_empty,
@@ -160,6 +163,11 @@ pub enum ConfigSource {
     /// The global config, as resolved from `--global-config`,
     /// `$XDG_CONFIG_HOME`, or `~/.outrig/`.
     Global { path: PathBuf },
+    /// A repo config read from a file named outright rather than found under
+    /// a repo root, as [`Config::load_file`] reads one. Nothing ties the file
+    /// to a root, so its relative paths resolve beside it, as the global
+    /// config's do.
+    RepoFile { path: PathBuf },
     /// A standalone image project -- the directory holding an `image.toml`.
     Project { dir: PathBuf },
 }
@@ -169,7 +177,9 @@ impl ConfigSource {
     pub fn base_dir(&self) -> &Path {
         match self {
             Self::Repo { root } => root,
-            Self::Global { path } => path.parent().unwrap_or(Path::new("")),
+            Self::Global { path } | Self::RepoFile { path } => {
+                path.parent().unwrap_or(Path::new(""))
+            }
             Self::Project { dir } => dir,
         }
     }
@@ -179,7 +189,7 @@ impl ConfigSource {
     pub fn config_path(&self) -> PathBuf {
         match self {
             Self::Repo { root } => crate::repo::repo_config_path(root),
-            Self::Global { path } => path.clone(),
+            Self::Global { path } | Self::RepoFile { path } => path.clone(),
             // The literal rather than a shared constant: the two sites that
             // actually read this file live in `outrig-cli`, which cannot see a
             // `pub(crate)` constant here, so a constant would centralize
@@ -198,13 +208,62 @@ fn source_base_dir<'a>(source: Option<&'a ConfigSource>, repo_root: &'a Path) ->
     source.map_or(repo_root, ConfigSource::base_dir)
 }
 
-/// Resolve `path` against `base`, leaving absolute paths alone. The one rule,
-/// shared by every config-declared host path.
+/// A config file named by path, made absolute, and the outcome of reading it.
+/// Resolve before reading, and read through the resolved path: a
+/// `--global-config` or `--config` path may be relative, and would otherwise
+/// consult the working directory twice -- once to find the file, once to
+/// record where its relative paths point -- so a directory change in between
+/// could load one file and stamp another's origin. Every path inherited from
+/// the file rides on that origin, the read-write primary bind mount included.
+/// Lexical: no I/O, no symlink resolution.
+///
+/// Failing to resolve means the working directory is unreadable or the path
+/// is empty, in which case no relative path in the file can be given a
+/// meaning; that is an error rather than grounds to keep the relative origin.
+/// What a failed read means is the caller's call.
+fn read_resolved(path: &Path) -> Result<(PathBuf, std::io::Result<String>)> {
+    let path = std::path::absolute(path).path_ctx("resolve", path)?;
+    let text = fs::read_to_string(&path);
+    Ok((path, text))
+}
+
+/// Resolve `path` against `base`: a leading `~` is the invoking user's home
+/// directory, an absolute path is used as-is, and anything else joins `base`.
+/// The one rule, shared by every config-declared host path.
 pub(crate) fn resolve_against(base: &Path, path: &Path) -> PathBuf {
+    let path = expand_tilde(path, home_dir().as_deref());
     if path.is_absolute() {
-        path.to_path_buf()
+        path
     } else {
         base.join(path)
+    }
+}
+
+/// The invoking user's home directory: `HOME`, or the passwd entry's when
+/// `HOME` is unset or empty. Not `std::env::home_dir`, which takes an empty
+/// `HOME` as the answer before Rust 1.90, and the MSRV is 1.88.
+fn home_dir() -> Option<PathBuf> {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => Some(home.into()),
+        _ => User::from_uid(Uid::current())
+            .ok()
+            .flatten()
+            .map(|user| user.dir),
+    }
+}
+
+/// `path` with a leading `~` component replaced by `home`, and anything else
+/// as written. Only a whole `~` component counts, so `~user/...` stays a
+/// relative path and `./~` names a directory that is really called `~`. With
+/// no `home`, or one that is not absolute, `~` is an ordinary directory name,
+/// and [`resolve_against`] joins it onto the base like any other.
+fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
+    let home = home.filter(|home| home.is_absolute());
+    match (path.strip_prefix("~"), home) {
+        // `home.join("")` would add a trailing separator to a bare `~`.
+        (Ok(rest), Some(home)) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -270,9 +329,10 @@ impl Config {
 
     /// Read repo + (optional) global config files, merge with repo precedence,
     /// and validate the merged result against `repo_root`. The repo config
-    /// file is read from `<repo_root>/.agents/outrig/config.toml`.
+    /// file is read from `<repo_root>/.agents/outrig/config.toml`; a missing
+    /// one loads as empty.
     pub fn load(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
-        let merged = Self::load_unvalidated(repo_root, global_path)?;
+        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
         merged.validate(Some(repo_root))?;
         Ok(merged)
     }
@@ -285,10 +345,8 @@ impl Config {
         agent_flag: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
-        let merged = Self::load_unvalidated(repo_root, global_path)?;
-        let agent_model_override =
-            model_override.and(agent_flag.or(merged.default_agent.as_deref()));
-        merged.validate_for_run(Some(repo_root), agent_model_override)?;
+        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
+        merged.validate_for_run(Some(repo_root), agent_flag, model_override)?;
         Ok(merged)
     }
 
@@ -296,50 +354,104 @@ impl Config {
     /// sections, so this preserves image and general validation while skipping
     /// agent/model/provider cross-reference checks.
     pub fn load_for_build(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
-        let merged = Self::load_unvalidated(repo_root, global_path)?;
+        let merged = Self::load_unvalidated(Self::read_repo(repo_root)?, global_path)?;
         merged.validate_for_build(Some(repo_root))?;
         Ok(merged)
     }
 
-    fn load_unvalidated(repo_root: &Path, global_path: Option<&Path>) -> Result<Self> {
+    /// [`load`](Self::load), with the repo config read from `repo_cfg` instead
+    /// of from under `repo_root` -- `outrig --config <path>` for a file
+    /// outside `.agents/outrig/`. Relative paths the file declares resolve
+    /// beside it ([`ConfigSource::RepoFile`]); `repo_root` is still what the
+    /// rest resolves against, the default `[workspace].host-path` and
+    /// `model-path` included. Unlike `load`, a missing `repo_cfg` is an error:
+    /// the caller named that file, and an empty config is not what it meant.
+    ///
+    /// A repo's own `<root>/.agents/outrig/config.toml` belongs to `load`
+    /// instead: its relative paths are written against the root, and read
+    /// through this they would resolve beside the file.
+    pub fn load_file(
+        repo_cfg: &Path,
+        repo_root: &Path,
+        global_path: Option<&Path>,
+    ) -> Result<Self> {
+        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        merged.validate(Some(repo_root))?;
+        Ok(merged)
+    }
+
+    /// [`load_for_run`](Self::load_for_run), with the repo config read from
+    /// `repo_cfg` as [`load_file`](Self::load_file) reads it.
+    pub fn load_file_for_run(
+        repo_cfg: &Path,
+        repo_root: &Path,
+        global_path: Option<&Path>,
+        agent_flag: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Self> {
+        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        merged.validate_for_run(Some(repo_root), agent_flag, model_override)?;
+        Ok(merged)
+    }
+
+    /// [`load_for_build`](Self::load_for_build), with the repo config read
+    /// from `repo_cfg` as [`load_file`](Self::load_file) reads it.
+    pub fn load_file_for_build(
+        repo_cfg: &Path,
+        repo_root: &Path,
+        global_path: Option<&Path>,
+    ) -> Result<Self> {
+        let merged = Self::load_unvalidated(Self::read_repo_file(repo_cfg)?, global_path)?;
+        merged.validate_for_build(Some(repo_root))?;
+        Ok(merged)
+    }
+
+    /// The repo config under `repo_root`. A missing one is not an error:
+    /// `outrig run`/`outrig mcp` may run in a directory with no
+    /// `.agents/outrig/config.toml`, falling back to the global config (and
+    /// built-in defaults). Mirrors the global-file handling in
+    /// [`load_unvalidated`](Self::load_unvalidated).
+    fn read_repo(repo_root: &Path) -> Result<Self> {
         let repo_path = crate::repo::repo_config_path(repo_root);
-        // A missing repo config is not an error: `outrig run`/`outrig mcp` may
-        // run in a directory with no `.agents/outrig/config.toml`, falling back
-        // to the global config (and built-in defaults). Mirrors the global-file
-        // handling below.
         let repo_text = match fs::read_to_string(&repo_path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).path_ctx("read", &repo_path),
         };
-        let mut repo_cfg = Self::load_from_str(&repo_text)?;
-        repo_cfg.validate_as_repo()?;
-        repo_cfg.stamp_source(&ConfigSource::Repo {
-            root: repo_root.to_path_buf(),
-        });
+        Self::repo_side(
+            &repo_text,
+            &ConfigSource::Repo {
+                root: repo_root.to_path_buf(),
+            },
+        )
+    }
 
+    fn read_repo_file(repo_cfg: &Path) -> Result<Self> {
+        let (path, text) = read_resolved(repo_cfg)?;
+        let text = text.path_ctx("read", &path)?;
+        Self::repo_side(&text, &ConfigSource::RepoFile { path })
+    }
+
+    /// Parse a repo-side file, hold it to the repo-only rules, and stamp it.
+    fn repo_side(text: &str, src: &ConfigSource) -> Result<Self> {
+        let repo_cfg = Self::parse_stamped(text, src)?;
+        repo_cfg.validate_as_repo()?;
+        Ok(repo_cfg)
+    }
+
+    fn parse_stamped(text: &str, src: &ConfigSource) -> Result<Self> {
+        let mut cfg = Self::load_from_str(text)?;
+        cfg.stamp_source(src);
+        Ok(cfg)
+    }
+
+    /// Merge `repo_cfg` over the global config at `global_path`, unvalidated.
+    fn load_unvalidated(repo_cfg: Self, global_path: Option<&Path>) -> Result<Self> {
         let global_cfg = match global_path {
             Some(g) => {
-                // Resolve before reading, and read through the resolved path.
-                // `--global-config` takes any path, and a relative one would
-                // otherwise consult the working directory twice -- once to
-                // find the file, once to record where its relative paths point
-                // -- so a directory change in between could load one file and
-                // stamp another's origin. Every path inherited from this file
-                // rides on that origin, the read-write primary bind mount
-                // included. Lexical: no I/O, no symlink resolution.
-                //
-                // A failure here means the working directory is unreadable or
-                // the path is empty, in which case no relative path in the file
-                // can be given a meaning; that is an error rather than grounds
-                // to keep the relative origin.
-                let g = std::path::absolute(g).path_ctx("resolve", g)?;
-                match fs::read_to_string(&g) {
-                    Ok(text) => {
-                        let mut cfg = Self::load_from_str(&text)?;
-                        cfg.stamp_source(&ConfigSource::Global { path: g });
-                        cfg
-                    }
+                let (g, text) = read_resolved(g)?;
+                match text {
+                    Ok(text) => Self::parse_stamped(&text, &ConfigSource::Global { path: g })?,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
                     Err(e) => return Err(e).path_ctx("read", &g),
                 }
@@ -377,8 +489,9 @@ impl Config {
     }
 
     /// Validate every cross-reference rule documented in `doc/reference/config.md`.
-    /// `repo_root: Some(_)` enables `dockerfile`/`context` on-disk existence checks;
-    /// `None` keeps the check pure-structural for unit tests.
+    /// `repo_root: Some(_)` enables the on-disk existence checks for
+    /// config-declared paths; `None` keeps the check pure-structural for unit
+    /// tests.
     pub fn validate(&self, repo_root: Option<&Path>) -> Result<()> {
         validate::validate(self, repo_root)?;
         Ok(())
@@ -607,11 +720,15 @@ impl Config {
         Ok(())
     }
 
+    /// `--model` stands in for the model of the agent the run selects, and
+    /// only that one.
     fn validate_for_run(
         &self,
         repo_root: Option<&Path>,
-        agent_model_override: Option<&str>,
+        agent_flag: Option<&str>,
+        model_override: Option<&str>,
     ) -> Result<()> {
+        let agent_model_override = model_override.and(agent_flag.or(self.default_agent.as_deref()));
         validate::validate_with_options(
             self,
             repo_root,
@@ -1087,14 +1204,22 @@ impl Workspace {
     }
 
     /// [`host_path`](Self::host_path) made absolute against the directory of
-    /// the config file that declared it. A hand-built or default workspace
-    /// falls back to `repo_root`, preserving the library API's existing
-    /// behavior.
+    /// the config file that declared it, or under the home directory when its
+    /// first component is `~`. A hand-built or default workspace falls back to
+    /// `repo_root`, preserving the library API's existing behavior.
     pub fn resolved_host_path(&self, repo_root: &Path) -> PathBuf {
         resolve_against(
             source_base_dir(self.source.as_ref(), repo_root),
             self.host_path(),
         )
+    }
+
+    /// The file to name in a diagnostic about `host-path`, or `None` when no
+    /// file declared it: the built-in `.`, or a value from [`Workspace::new`]
+    /// or [`set_host_path`](Self::set_host_path). Deliberately not defaulted
+    /// to the repo config, for the reason [`ImageConfig::declared_in`] gives.
+    pub(crate) fn declared_in(&self) -> Option<PathBuf> {
+        self.source.as_ref().map(ConfigSource::config_path)
     }
 }
 
@@ -1186,8 +1311,10 @@ impl MountConfig {
     }
 
     /// `host_path` made absolute, against the directory of the file that
-    /// declared it. `repo_root` is the fallback for an entry with no recorded
-    /// source, which is every hand-built [`MountConfig`].
+    /// declared it, or under the home directory when its first component is
+    /// `~`.
+    /// `repo_root` is the fallback for an entry with no recorded source, which
+    /// is every hand-built [`MountConfig`].
     ///
     /// Global and repo mount lists are *concatenated* by [`merge`], so one base
     /// directory provably cannot be right for every element of the result --
@@ -1406,6 +1533,10 @@ fn parse_network_port(raw: &str) -> std::result::Result<u16, String> {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 #[non_exhaustive]
 pub struct NetworkPolicy {
+    /// The verdict for a connection no entry matches, and for traffic the
+    /// interceptor cannot evaluate at all: anything but TCP and DNS over
+    /// UDP/53 is dropped in the kernel under `Deny` and passes unrecorded
+    /// under `Allow`.
     #[serde(default, skip_serializing_if = "NetworkAction::is_deny")]
     pub default: NetworkAction,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2064,7 +2195,8 @@ impl ImageConfig {
     }
 
     /// `dockerfile` and `context` made absolute against
-    /// [`base_dir`](Self::base_dir). Like [`source`](Self::source), this is
+    /// [`base_dir`](Self::base_dir), or under the home directory for a path
+    /// whose first component is `~`. Like [`source`](Self::source), this is
     /// only callable once validation has established the build shape.
     pub fn resolved_build_paths(&self, repo_root: &Path) -> (PathBuf, PathBuf) {
         let base = self.base_dir(repo_root);
@@ -2364,4 +2496,47 @@ where
             StringOrVec::Multi(ss) => ss,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expand(path: &str) -> PathBuf {
+        expand_tilde(Path::new(path), Some(Path::new("/home/you")))
+    }
+
+    /// Compared as strings: `PathBuf` equality ignores a trailing separator,
+    /// which `home.join("")` would leave behind.
+    #[test]
+    fn a_bare_tilde_is_the_home_directory_itself() {
+        assert_eq!(expand("~").as_os_str(), "/home/you");
+        assert_eq!(expand("~/").as_os_str(), "/home/you");
+    }
+
+    #[test]
+    fn a_leading_tilde_component_is_replaced_by_home() {
+        assert_eq!(
+            expand("~/.cache/example"),
+            Path::new("/home/you/.cache/example")
+        );
+    }
+
+    #[test]
+    fn only_a_whole_leading_tilde_component_expands() {
+        for path in ["~alice/src", "./~/src", "src/~", "/abs/~", "relative"] {
+            assert_eq!(expand(path), Path::new(path), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn without_an_absolute_home_a_tilde_is_an_ordinary_name() {
+        for home in [None, Some(Path::new("")), Some(Path::new("relative/home"))] {
+            assert_eq!(
+                expand_tilde(Path::new("~/src"), home),
+                Path::new("~/src"),
+                "{home:?}",
+            );
+        }
+    }
 }

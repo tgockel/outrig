@@ -37,7 +37,7 @@ use outrig::{EmbeddedMcpPolicy, LaunchSpec, Outrig, PythonAgent};
 use crate::builtin_image;
 use crate::cli::session_setup::ProgressSpan;
 use crate::error::{CliError, OutrigError, Result};
-use crate::paths::{default_session_root, repo_root_from_config_path};
+use crate::paths::{RepoConfig, default_session_root, refuse_home_workspace};
 use crate::session::{Session, SessionId, SessionStore, resolve_session_root};
 
 mod converse;
@@ -69,25 +69,25 @@ pub struct RunNewArgs {
 /// Run one `outrig run-new` invocation end to end. Returns the process exit
 /// code.
 pub async fn execute(
-    repo_cfg_path: &Path,
+    repo: &RepoConfig,
     global_cfg_path: &Path,
     session_root_flag: Option<&Path>,
     args: &RunNewArgs,
 ) -> Result<i32> {
-    let repo_root = repo_root_from_config_path(repo_cfg_path);
+    let repo_root = repo.root.clone();
     let span = ProgressSpan::start("loading config");
-    let mut cfg = Config::load_for_run(
-        &repo_root,
-        Some(global_cfg_path),
-        args.agent.as_deref(),
-        args.model.as_deref(),
-    )?;
+    let mut cfg = repo.load_for_run(global_cfg_path, args.agent.as_deref(), args.model.as_deref())?;
     span.done("config loaded");
-    if !repo_cfg_path.exists() {
+    if !repo.config_path().exists() {
         eprintln!(
             "[outrig] no repo config found; using current directory as workspace ({})",
             repo_root.display()
         );
+    }
+    // A workspace no config declared is outrig's pick, and outrig never picks
+    // the home directory or one above it -- the rule `run` applies.
+    if cfg.workspace.declared_host_path().is_none() {
+        refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
     }
 
     // Before anything is pulled or started, so a config that names no usable
@@ -214,15 +214,18 @@ fn image_config_name(
     for note in &injection.notes {
         eprintln!("[outrig] {note}");
     }
-    let name = chosen
-        .or(injection.resolved.map(str::to_string))
-        .ok_or_else(|| {
-            OutrigError::Configuration(
-                "no --image or default-image configured, and outrig's built-in default is \
-                 shadowed by a [sidecars.<name>] block using one of its reserved names"
-                    .to_string(),
-            )
-        })?;
+    let name = match chosen {
+        Some(name) => name,
+        // A reserved name other than `[images.outrig-default]` is declared, so
+        // injection was vetoed and there is nothing to fall back to. Name the
+        // block that did it -- the one the note above names.
+        None => injection.resolved.map(str::to_string).map_err(|block| {
+            OutrigError::Configuration(format!(
+                "no --image or default-image configured, and {block} shadows outrig's \
+                 built-in default, leaving no [images.outrig-default] to fall back to"
+            ))
+        })?,
+    };
     Ok((name, injection.applied))
 }
 

@@ -85,6 +85,13 @@ pub(crate) fn render_prompt() -> String {
          `ENTRYPOINT` rather than replacing it, so OutRig's `sleep infinity` would arrive \
          as arguments to it.\n\
          - Do not add a Dockerfile `USER`; OutRig maps the host UID/GID at runtime.\n\
+         - Install tools under a shared prefix such as `/usr/local`, not in root's `0700` \
+         home; every exec runs as the host UID with `HOME=/home/<user>`. Point state a tool \
+         keeps under `$HOME`, such as rustup's `RUSTUP_HOME` and `CARGO_HOME`, at a writable \
+         directory under that prefix.\n\
+         - Download a prebuilt binary for the architecture the image builds on, chosen at \
+         build time (for example from `uname -m`), not a fixed `amd64`; OutRig builds for \
+         its engine's own architecture, x86-64 or AArch64.\n\
          - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
          - Prefer `/workspace` as the mounted repo path unless the request says otherwise.\n\
          - Return exact file paths and complete file contents.\n\
@@ -131,6 +138,13 @@ pub(crate) fn render_standalone_prompt() -> String {
          `ENTRYPOINT` rather than replacing it, so OutRig's `sleep infinity` would arrive \
          as arguments to it.\n\
          - Do not add a Dockerfile `USER`; OutRig maps the host UID/GID at runtime.\n\
+         - Install tools under a shared prefix such as `/usr/local`, not in root's `0700` \
+         home; every exec runs as the host UID with `HOME=/home/<user>`. Point state a tool \
+         keeps under `$HOME`, such as rustup's `RUSTUP_HOME` and `CARGO_HOME`, at a writable \
+         directory under that prefix.\n\
+         - Download a prebuilt binary for the architecture the image builds on, chosen at \
+         build time (for example from `uname -m`), not a fixed `amd64`; OutRig builds for \
+         its engine's own architecture, x86-64 or AArch64.\n\
          - Install every MCP server binary in the image or ensure it is on `PATH`.\n\
          - `outrig image build` validates `image.toml` and stamps the config into OCI labels.\n\
          - The Dockerfile must not copy `image.toml` or any OutRig config file into the image.\n\
@@ -203,9 +217,13 @@ FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm \
  && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
- | sh -s -- -y --default-toolchain stable --profile default
-ENV PATH=/root/.cargo/bin:$PATH
+       | sh -s -- -y --no-modify-path --default-toolchain stable \
+                  --profile minimal --component rustfmt,clippy \
+ && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 RUN npm install -g @modelcontextprotocol/server-filesystem
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
@@ -288,9 +306,13 @@ FROM docker.io/library/debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git build-essential nodejs npm python3-pip \
  && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
- | sh -s -- -y --default-toolchain stable --profile default
-ENV PATH=/root/.cargo/bin:$PATH
+       | sh -s -- -y --no-modify-path --default-toolchain stable \
+                  --profile minimal --component rustfmt,clippy \
+ && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 RUN npm install -g @modelcontextprotocol/server-filesystem
 RUN pip install --break-system-packages mcp-server-git
 WORKDIR /workspace
@@ -343,6 +365,8 @@ The MCP servers are declared by the image labels, so the repo config does not ne
 mod tests {
     use super::*;
 
+    use crate::image_setup::render::{self, Family, Toolchain};
+
     #[test]
     fn repo_local_prompt_contains_version_docs_and_examples() {
         let prompt = render_prompt();
@@ -366,6 +390,8 @@ mod tests {
             "`[build]` is optional",
             "CMD [\"sleep\", \"infinity\"]",
             "Do not add a Dockerfile `USER`",
+            "not in root's `0700` home",
+            "not a fixed `amd64`",
             "ensure it is on `PATH`",
             "stamps the config into OCI labels",
             "must not copy `image.toml`",
@@ -377,6 +403,25 @@ mod tests {
         }
         assert!(prompt.contains("# Containers"));
         assert!(prompt.contains("# Config Reference"));
+    }
+
+    /// An AI designing an image copies what these show, and both install the
+    /// toolchain `outrig image add` renders for a Debian base. Before #183 they
+    /// carried its `/root/.cargo` install, unusable by the user OutRig runs
+    /// every exec as.
+    #[test]
+    fn rust_examples_install_the_toolchain_image_add_renders() {
+        let fragment = render::toolchain_fragment(Toolchain::Rust, Family::Debian)
+            .expect("rust has a fragment");
+        for (name, example) in [
+            ("RUST_EXAMPLE", RUST_EXAMPLE),
+            ("STANDALONE_EXAMPLE", STANDALONE_EXAMPLE),
+        ] {
+            assert!(
+                example.contains(fragment),
+                "{name} does not carry the rust fragment verbatim:\n{fragment}"
+            );
+        }
     }
 
     #[test]

@@ -71,4 +71,4 @@ proxy hits the same swallowing, and `NO_PROXY` is not obvious as the fix.
 - `plan/done/phase/0002-sidecars/tasks/0002-32-subagent-tree-shutdown-grace.md` -- decision 6
   records the unit-test fix.
 - `crates/outrig-cli/src/llm.rs:538` -- `remote_http_client` and the `#[cfg(test)]` gate.
-- `plan/next/http-client-rebuilt-per-agent-build.md` -- the other finding in the same function.
+- #283 -- the other finding in the same function.

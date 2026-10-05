@@ -65,6 +65,10 @@ pub enum OutrigError {
     #[non_exhaustive]
     Process {
         program: &'static str,
+        /// The arguments as diagnostics show them. An entry resolved from a
+        /// `${VAR}` reference reads `KEY=${VAR}`, which is not necessarily
+        /// what ran: its value went to the command through its environment,
+        /// or stayed out of this field.
         argv: Vec<OsString>,
         exit_code: Option<i32>,
         stderr_tail: String,
@@ -77,6 +81,8 @@ pub enum OutrigError {
     #[non_exhaustive]
     Canceled {
         program: &'static str,
+        /// The arguments as diagnostics show them; see
+        /// [`OutrigError::Process`].
         argv: Vec<OsString>,
     },
 
@@ -84,7 +90,8 @@ pub enum OutrigError {
     /// is not executable, or the fork itself failed. Distinct from
     /// [`OutrigError::Process`], which means the command ran and exited badly.
     /// `command` is the `crate::process::Cmd::render` output, carried
-    /// pre-rendered so this module stays independent of `process`.
+    /// pre-rendered so this module stays independent of `process`. Like
+    /// `Process`'s `argv`, it shows a `${VAR}` entry as the reference.
     #[error("{}", format_spawn(program, command, source))]
     #[non_exhaustive]
     Spawn {

@@ -27,6 +27,7 @@ pub mod sidecar;
 mod userdb;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Mutex, OnceLock};
@@ -38,7 +39,10 @@ use nix::unistd::{Gid, Group, Uid, User};
 use serde_json::Value;
 use tokio::process::Child;
 
-use crate::config::{CapabilityProfile, MountAccess, capability_name_without_prefix};
+use crate::config::{
+    CapabilityProfile, EnvValue, MountAccess, ResolvedEnvValue, capability_name_without_prefix,
+};
+use crate::engine_env;
 use crate::error::{OutrigError, Result};
 use crate::image::ImageTag;
 use crate::process::{self, Cmd, Transcript};
@@ -282,11 +286,56 @@ impl ContainerLaunchSpec {
     }
 }
 
+/// The resolved entries an options type's `env` was set from, which is how a
+/// `${VAR}` value in it is told from a literal when the command is built.
+///
+/// An entry counts only while `env` still holds the value it resolved to: the
+/// map is public, and a value a caller put there since is theirs, passed and
+/// shown as written.
+#[derive(Clone, Default)]
+struct EnvSources(BTreeMap<String, ResolvedEnvValue>);
+
+impl EnvSources {
+    /// The plain values for `env`, and the record of where each came from.
+    fn split(resolved: BTreeMap<String, ResolvedEnvValue>) -> (BTreeMap<String, String>, Self) {
+        let env = resolved
+            .iter()
+            .map(|(key, value)| (key.clone(), value.value().to_owned()))
+            .collect();
+        (env, Self(resolved))
+    }
+
+    fn source_of(&self, key: &str, value: &str) -> Option<&EnvValue> {
+        self.0
+            .get(key)
+            .filter(|resolved| resolved.value() == value)
+            .map(ResolvedEnvValue::source)
+    }
+
+    /// One `--env` per entry of `env`, in the form [`engine_env::push_keyed`]
+    /// picks for it.
+    fn push(&self, cmd: Cmd, env: &BTreeMap<String, String>) -> Cmd {
+        env.iter().fold(cmd, |cmd, (key, value)| {
+            engine_env::push_keyed(cmd, "--env", key, value, self.source_of(key, value))
+        })
+    }
+
+    /// `env` for a `Debug` impl: a reference's entry as the reference.
+    fn shown<'a>(&self, env: &'a BTreeMap<String, String>) -> BTreeMap<&'a str, String> {
+        env.iter()
+            .map(|(key, value)| {
+                let shown = engine_env::shown_value(value, self.source_of(key, value));
+                (key.as_str(), shown)
+            })
+            .collect()
+    }
+}
+
 /// Complete inputs for a `podman create` + `podman init`, the pair
 /// [`Container::create_initialized`] runs. One struct rather than a parameter
 /// list because this call has already grown a parameter once, and every knob
 /// podman's create step accepts but its run step does not lands here.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ContainerCreateOptions {
     /// Image to create the container from.
@@ -299,13 +348,31 @@ pub struct ContainerCreateOptions {
     pub transcript: Option<Transcript>,
     /// Becomes `--env` flags on the create. There is no later exec to carry
     /// them, so an entrypoint-stdio server's environment has to be baked in
-    /// here.
+    /// here. An entry set by [`ContainerCreateOptions::with_resolved_env`]
+    /// from a `${VAR}` reference is passed by name and shown as the
+    /// reference; any other is passed and shown as written.
     pub env: BTreeMap<String, String>,
     /// Bakes the interceptor's loopback resolver in via `--dns`. The
     /// exec-based resolv.conf install is impossible before start.
     pub intercept_dns: bool,
     /// Trailing argv the image's `ENTRYPOINT` receives.
     pub args: Vec<String>,
+    env_sources: EnvSources,
+}
+
+/// `env` as every diagnostic shows it: a `${VAR}` entry as the reference.
+impl fmt::Debug for ContainerCreateOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContainerCreateOptions")
+            .field("image", &self.image)
+            .field("launch", &self.launch)
+            .field("name", &self.name)
+            .field("transcript", &self.transcript)
+            .field("env", &self.env_sources.shown(&self.env))
+            .field("intercept_dns", &self.intercept_dns)
+            .field("args", &self.args)
+            .finish()
+    }
 }
 
 impl ContainerCreateOptions {
@@ -320,6 +387,7 @@ impl ContainerCreateOptions {
             env: BTreeMap::new(),
             intercept_dns: false,
             args: Vec::new(),
+            env_sources: EnvSources::default(),
         }
     }
 
@@ -331,9 +399,18 @@ impl ContainerCreateOptions {
         self
     }
 
-    /// Set the environment baked into the create.
+    /// Set the environment baked into the create, each value passed to
+    /// podman and shown as written.
     pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
         self.env = env;
+        self.env_sources = EnvSources::default();
+        self
+    }
+
+    /// Set the environment baked into the create from resolved config values,
+    /// as [`ExecOptions::with_resolved_env`] does for an exec.
+    pub fn with_resolved_env(mut self, env: BTreeMap<String, ResolvedEnvValue>) -> Self {
+        (self.env, self.env_sources) = EnvSources::split(env);
         self
     }
 
@@ -355,11 +432,14 @@ impl ContainerCreateOptions {
 /// same reason: the environment was the only knob until the working directory
 /// joined it, and each further one would otherwise be another parameter on
 /// four published methods.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ExecOptions {
     /// Added to the environment podman already sets up (`HOME` plus the
     /// mapped user and group). `BTreeMap` order makes the argv deterministic.
+    /// An entry set by [`ExecOptions::with_resolved_env`] from a `${VAR}`
+    /// reference is passed by name and shown as the reference; any other is
+    /// passed and shown as written.
     pub env: BTreeMap<String, String>,
     /// Becomes `--workdir <path>`. `None` emits no flag, leaving the
     /// container's configured working directory -- which is the image's
@@ -370,6 +450,17 @@ pub struct ExecOptions {
     /// knob existed; set it explicitly if a relative or destructive command
     /// must not land there.
     pub workdir: Option<PathBuf>,
+    env_sources: EnvSources,
+}
+
+/// `env` as every diagnostic shows it: a `${VAR}` entry as the reference.
+impl fmt::Debug for ExecOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecOptions")
+            .field("env", &self.env_sources.shown(&self.env))
+            .field("workdir", &self.workdir)
+            .finish()
+    }
 }
 
 impl ExecOptions {
@@ -381,9 +472,23 @@ impl ExecOptions {
         Self::default()
     }
 
-    /// Set the environment added to the exec.
+    /// Set the environment added to the exec, each value passed to podman
+    /// and shown as written.
     pub fn with_env(mut self, env: BTreeMap<String, String>) -> Self {
         self.env = env;
+        self.env_sources = EnvSources::default();
+        self
+    }
+
+    /// Set the environment added to the exec from resolved config values. A
+    /// value resolved from a `${VAR}` reference reaches podman as a bare
+    /// `--env KEY`, with the value in podman's own environment rather than on
+    /// its command line, and every diagnostic shows it as `KEY=${VAR}`. A key
+    /// podman itself reads, or one that is not a plain variable name, keeps
+    /// its value on the command line, still shown as the reference. `env`
+    /// holds the values either way.
+    pub fn with_resolved_env(mut self, env: BTreeMap<String, ResolvedEnvValue>) -> Self {
+        (self.env, self.env_sources) = EnvSources::split(env);
         self
     }
 
@@ -824,9 +929,12 @@ impl Container {
     /// Writes `/etc/passwd` and `/etc/group` from the host, through
     /// descriptors a forked child opened inside the container's namespaces
     /// (see the `namespace` module), so the image needs no `useradd`, `groupadd`,
-    /// or `getent`. Probes first: on podman 5.x, `--userns=keep-id` auto-injects
-    /// the host UID/GID into both files, so there is frequently nothing to
-    /// write.
+    /// or `getent`. Probes first: `--userns=keep-id` auto-injects the host
+    /// UID/GID into both files, so there is frequently nothing to append. A
+    /// reused passwd entry still has its home field pointed at
+    /// [`Container::home_dir`], though -- podman's names the container's
+    /// working directory, which for a primary is the user's checkout -- except
+    /// in a container from [`Container::attach`], whose file is left alone.
     ///
     /// Records the resolved names on the struct for
     /// [`Container::exec_stdio`] to reference. Must be called once, after
@@ -856,9 +964,25 @@ impl Container {
         let group_name = self.resolve_or_append(&db, namespace::Db::Group, &host_group)?;
         let user_name = self.resolve_or_append(&db, namespace::Db::Passwd, &host_user)?;
 
+        // On the reuse path the name, and so the home directory, is whatever
+        // the image put at the host uid -- so it has to be checked before it
+        // becomes a path, and the path goes in the error after that.
+        if !userdb::is_path_component(&user_name) {
+            return Err(self.bootstrap_failed(
+                format!(
+                    "name the home directory after /etc/passwd's {user_name:?} (uid {})",
+                    self.uid
+                ),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "not a single path component",
+                ),
+            ));
+        }
         let home = userdb::home_dir(&user_name);
         namespace::create_home(pid, Path::new(&home), self.uid, self.gid)
-            .map_err(|e| self.bootstrap_failed(e.step.label(), e.io()))?;
+            .map_err(|e| self.bootstrap_failed(format!("{} ({home})", e.step.label()), e.io()))?;
+        self.reconcile_home(&db, &home).await?;
 
         self.log_bootstrap(&format!(
             "user {user_name} and group {group_name} ready in {}, written from the host",
@@ -908,6 +1032,49 @@ impl Container {
         Ok(name)
     }
 
+    /// Point the passwd entry at the host uid to `home` if it names another,
+    /// so `getpwuid` agrees with the `HOME` every exec gets. Only a reused
+    /// entry can disagree; one this bootstrap appended already names `home`.
+    /// Runs after [`namespace::create_home`], so a home that step refuses
+    /// leaves the file as it was.
+    ///
+    /// Only in a container this handle started. The rewrite is safe only while
+    /// nothing else can be using the file, and a failed one is cleaned up only
+    /// by tearing the container down. A borrowed container (`outrig mcp
+    /// --attach`) is already running someone else's processes, and outlives
+    /// this handle, so its entry is left as it is. One outrig started was
+    /// reconciled by its own bootstrap anyway.
+    async fn reconcile_home(&self, db: &namespace::UserDb, home: &str) -> Result<()> {
+        let passwd = namespace::Db::Passwd;
+        let raw = db
+            .read_raw(passwd)
+            .map_err(|e| self.bootstrap_failed(format!("read {}", passwd.path()), e))?;
+        let Some(rehome) = userdb::rehome(&raw, self.uid, home) else {
+            return Ok(());
+        };
+        if self.ownership == ContainerOwnership::Attached {
+            self.log_bootstrap(&format!(
+                "left the home of the {} entry at uid {} as {}, not {home}: the container is \
+                 borrowed, and rewriting the file could lose a live writer's change",
+                passwd.path(),
+                self.uid,
+                rehome.was
+            ))
+            .await;
+            return Ok(());
+        }
+        db.replace_tail(passwd, rehome.at as u64, &rehome.tail)
+            .map_err(|e| self.bootstrap_failed(format!("rewrite {}", passwd.path()), e))?;
+        self.log_bootstrap(&format!(
+            "home of the {} entry at uid {} moved from {} to {home}",
+            passwd.path(),
+            self.uid,
+            rehome.was
+        ))
+        .await;
+        Ok(())
+    }
+
     /// A bootstrap failure, labeled with `step` -- how far the chain into the
     /// container's namespaces got. There is nothing to fall back to, so every
     /// one of them is fatal, and how far it got is the whole diagnostic.
@@ -948,9 +1115,7 @@ impl Container {
             .arg(format!("--user={}:{}", self.uid, self.gid))
             .arg("--env")
             .arg(format!("HOME={}", userdb::home_dir(user_name)));
-        for (k, v) in &options.env {
-            c = c.arg("--env").arg(format!("{k}={v}"));
-        }
+        c = options.env_sources.push(c, &options.env);
         if let Some(workdir) = &options.workdir {
             c = c.arg("--workdir").arg(workdir);
         }
@@ -1125,10 +1290,7 @@ impl Container {
             // caller keeps a handle to try again through, and `Drop` still has
             // its detached removal.
             EngineOutcome::TimedOut => {
-                return Err(OutrigError::Canceled {
-                    program: stop.program,
-                    argv: stop.args,
-                });
+                return Err(stop.canceled_error());
             }
             EngineOutcome::Failed(e) => return Err(e),
         }
@@ -1173,10 +1335,7 @@ impl Container {
             // try again or to abandon it to teardown, and `Drop` still has the
             // detached removal if the handle is let go.
             EngineOutcome::TimedOut => {
-                return Err(OutrigError::Canceled {
-                    program: removal.program,
-                    argv: removal.args,
-                });
+                return Err(removal.canceled_error());
             }
             // Neither disposed of nor discharged, so the caller keeps
             // something to try again through and `Drop` still has its detached
@@ -1391,12 +1550,10 @@ enum EngineOutcome {
 fn classify_engine_call(cmd: &Cmd, outcome: Result<Output>) -> EngineOutcome {
     match outcome {
         Ok(output) if output.status.success() => EngineOutcome::Done,
-        Ok(output) => EngineOutcome::Failed(OutrigError::Process {
-            program: cmd.program,
-            argv: cmd.args.clone(),
-            exit_code: output.status.code(),
-            stderr_tail: process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
-        }),
+        Ok(output) => EngineOutcome::Failed(cmd.process_error(
+            output.status.code(),
+            process::tail_string(&output.stderr, process::STDERR_TAIL_LIMIT),
+        )),
         Err(OutrigError::Canceled { .. }) => EngineOutcome::TimedOut,
         // It could not be run at all, which says nothing about whether the
         // container is gone.
@@ -1521,7 +1678,7 @@ fn attempt_token() -> String {
 /// stamps and selects its own label instead. This stays because it is published
 /// surface, not because anything here needs it; whether it should survive the
 /// next surface review is recorded in
-/// `plan/next/a-container-handle-should-hold-the-id-podman-gave-it.md`.
+/// `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`.
 ///
 /// Synchronous, detached, and needs no tokio runtime, so it is safe from a
 /// `Drop`. It goes through `crate::supervise`, so the `podman rm` it starts
@@ -1595,9 +1752,7 @@ fn build_podman_create_cmd(
     if let Some(pv) = &options.launch.primary_view {
         cmd = cmd.arg("--env").arg(format!("HOME={}", pv.payload_home));
     }
-    for (k, v) in &options.env {
-        cmd = cmd.arg("--env").arg(format!("{k}={v}"));
-    }
+    cmd = options.env_sources.push(cmd, &options.env);
 
     // After the caller's labels; see `build_podman_run_cmd`.
     cmd.arg("--label")
@@ -1609,9 +1764,10 @@ fn build_podman_create_cmd(
 
 /// Flags shared by `podman run` and `podman create`: labels, workspace and
 /// extra bind mounts, keep-id, workspace workdir, capability policy, device
-/// passthrough, and the hardening tail. `--security-opt=no-new-privileges` is
-/// part of that tail only when the launch spec keeps it, and each `unmask`
-/// entry follows it as a second `--security-opt`.
+/// passthrough, the hardening tail, and `--image-volume=ignore`.
+/// `--security-opt=no-new-privileges` is part of that tail only when the
+/// launch spec keeps it, and each `unmask` entry follows it as a second
+/// `--security-opt`.
 fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool) -> Cmd {
     for (key, value) in &launch.labels {
         cmd = cmd.arg("--label").arg(format!("{key}={value}"));
@@ -1678,7 +1834,16 @@ fn append_launch_flags(mut cmd: Cmd, launch: &ContainerLaunchSpec, selinux: bool
     if launch.primary_view.is_some() {
         cmd = cmd.arg("--entrypoint").arg(PRIMARY_VIEW_HELPER_MOUNT);
     }
-    cmd.arg("--pull=never")
+    // No volume for the image's `VOLUME`s: the path keeps what the image's
+    // layers put there, and a write to it lands in the container's own layer,
+    // which `--rm` removes with it. An anonymous volume is not removed with
+    // it when `podman start --attach` is what acts on `--rm`, as it is for an
+    // entrypoint-stdio server (measured against podman 5.7), and each one
+    // left behind held one of podman's `num_locks` until no launch could get
+    // one (#214). The cost is that a declared path the layers never create is
+    // absent rather than an empty mount. `tmpfs` would mount it without
+    // leaking, but holds what is written there in memory.
+    cmd.arg("--image-volume=ignore").arg("--pull=never")
 }
 
 fn append_capability_flags(mut cmd: Cmd, capabilities: &ContainerCapabilities) -> Cmd {
@@ -2125,7 +2290,7 @@ mod tests {
     fn argv(cmd: Cmd) -> Vec<String> {
         std::iter::once(cmd.program.to_string())
             .chain(
-                cmd.args
+                cmd.exec_args()
                     .iter()
                     .map(|arg| arg.to_string_lossy().into_owned()),
             )
@@ -2424,6 +2589,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2481,6 +2647,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2527,6 +2694,7 @@ mod tests {
                 "/host/docs:/resources/docs:ro,Z",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2632,6 +2800,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--dns",
                 "127.0.0.1",
@@ -2671,6 +2840,7 @@ mod tests {
                 "outrig-test-fetch",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2706,6 +2876,7 @@ mod tests {
                 "outrig-test-fs",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--env",
                 "MARKER=1",
@@ -2781,6 +2952,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--entrypoint",
                 "/outrig-enter",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--env",
                 "HOME=/home/tgockel",
@@ -2825,6 +2997,7 @@ mod tests {
                 "outrig-test-noview",
                 "--userns=keep-id",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2869,6 +3042,7 @@ mod tests {
                 "--userns=keep-id",
                 "--cap-drop=NET_RAW",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2915,6 +3089,7 @@ mod tests {
                 "--cap-drop=MKNOD",
                 "--cap-add=NET_BIND_SERVICE",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2953,6 +3128,7 @@ mod tests {
                 "--device=/dev/fuse",
                 "--device=/dev/kvm",
                 "--security-opt=no-new-privileges",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -2993,6 +3169,7 @@ mod tests {
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
                 "--security-opt=unmask=ALL",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3043,6 +3220,7 @@ mod tests {
                 "--device=/dev/net/tun",
                 "--security-opt=no-new-privileges",
                 "--security-opt=unmask=/proc/*",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3081,6 +3259,7 @@ mod tests {
                 "--name",
                 "outrig-test",
                 "--userns=keep-id",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3125,6 +3304,7 @@ mod tests {
                 "--cap-drop=ALL",
                 "--cap-add=SYS_ADMIN",
                 "--device=/dev/fuse",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3164,6 +3344,7 @@ mod tests {
                 "--userns=keep-id",
                 "--device=/dev/fuse",
                 "--security-opt=unmask=/proc/*",
+                "--image-volume=ignore",
                 "--pull=never",
                 "--label",
                 "org.outrig.attempt=testtoken",
@@ -3287,5 +3468,149 @@ mod tests {
                 "pwd",
             ]
         );
+    }
+
+    /// A `${VAR}` entry and a literal, resolved as the MCP and sidecar paths
+    /// hand them over.
+    fn resolved_env() -> BTreeMap<String, ResolvedEnvValue> {
+        BTreeMap::from([
+            (
+                "TOKEN".to_string(),
+                ResolvedEnvValue::assume(EnvValue::EnvRef("FETCH_TOKEN".to_string()), "s3cret"),
+            ),
+            (
+                "ZONE".to_string(),
+                ResolvedEnvValue::assume(EnvValue::Literal("utc".to_string()), "utc"),
+            ),
+        ])
+    }
+
+    /// The exec-stdio client lives as long as the session, so this is the
+    /// argv `ps` shows for all of it.
+    #[test]
+    fn a_resolved_reference_reaches_podman_exec_by_name() {
+        let cmd = bootstrapped_container().build_exec_argv(
+            &["pwd".to_string()],
+            &ExecOptions::new().with_resolved_env(resolved_env()),
+        );
+
+        assert_eq!(
+            argv(cmd.clone()),
+            vec![
+                "podman",
+                "exec",
+                "-i",
+                "--user=1000:1000",
+                "--env",
+                "HOME=/home/dev",
+                "--env",
+                "TOKEN",
+                "--env",
+                "ZONE=utc",
+                "outrig-test-exec",
+                "pwd",
+            ]
+        );
+        assert_eq!(
+            cmd.hidden_env(),
+            [("TOKEN".to_string(), "s3cret".to_string())]
+        );
+        let rendered = cmd.render();
+        assert!(
+            rendered.contains("--env 'TOKEN=${FETCH_TOKEN}' --env ZONE=utc"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+    }
+
+    #[test]
+    fn a_resolved_reference_reaches_podman_create_by_name() {
+        let options = ContainerCreateOptions::new(
+            ImageTag::new("local:test"),
+            ContainerLaunchSpec::default(),
+            "outrig-test-fs",
+        )
+        .with_resolved_env(resolved_env());
+        assert_eq!(options.env["TOKEN"], "s3cret", "env holds the values");
+
+        let cmd = build_podman_create_cmd(&options, false, "org.outrig.attempt=testtoken");
+
+        let args = argv(cmd.clone());
+        assert!(args.windows(2).any(|w| w == ["--env", "TOKEN"]), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--env", "ZONE=utc"]),
+            "{args:?}"
+        );
+        assert!(args.iter().all(|arg| !arg.contains("s3cret")), "{args:?}");
+        assert_eq!(
+            cmd.hidden_env(),
+            [("TOKEN".to_string(), "s3cret".to_string())]
+        );
+        let rendered = cmd.render();
+        assert!(rendered.contains("'TOKEN=${FETCH_TOKEN}'"), "{rendered}");
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+    }
+
+    /// `env` is public. A value put there after resolution is the caller's,
+    /// and the reference it replaced no longer describes it.
+    #[test]
+    fn an_env_entry_changed_after_resolution_is_a_literal() {
+        let mut options = ExecOptions::new().with_resolved_env(resolved_env());
+        options
+            .env
+            .insert("TOKEN".to_string(), "replaced".to_string());
+
+        let cmd = bootstrapped_container().build_exec_argv(&["pwd".to_string()], &options);
+
+        assert!(argv(cmd.clone()).contains(&"TOKEN=replaced".to_string()));
+        assert!(cmd.hidden_env().is_empty());
+        assert!(cmd.render().contains("TOKEN=replaced"));
+    }
+
+    #[test]
+    fn with_env_forgets_resolved_references() {
+        let plain = BTreeMap::from([("TOKEN".to_string(), "s3cret".to_string())]);
+        let exec = bootstrapped_container().build_exec_argv(
+            &["pwd".to_string()],
+            &ExecOptions::new()
+                .with_resolved_env(resolved_env())
+                .with_env(plain.clone()),
+        );
+        let create = build_podman_create_cmd(
+            &ContainerCreateOptions::new(
+                ImageTag::new("local:test"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-fs",
+            )
+            .with_resolved_env(resolved_env())
+            .with_env(plain),
+            false,
+            "org.outrig.attempt=testtoken",
+        );
+
+        for cmd in [exec, create] {
+            assert!(cmd.hidden_env().is_empty());
+            assert!(argv(cmd).contains(&"TOKEN=s3cret".to_string()));
+        }
+    }
+
+    #[test]
+    fn options_debug_shows_a_reference_not_its_value() {
+        let exec = format!("{:?}", ExecOptions::new().with_resolved_env(resolved_env()));
+        let create = format!(
+            "{:?}",
+            ContainerCreateOptions::new(
+                ImageTag::new("local:test"),
+                ContainerLaunchSpec::default(),
+                "outrig-test-fs",
+            )
+            .with_resolved_env(resolved_env())
+        );
+
+        for debug in [exec, create] {
+            assert!(debug.contains("\"TOKEN\": \"${FETCH_TOKEN}\""), "{debug}");
+            assert!(debug.contains("\"ZONE\": \"utc\""), "{debug}");
+            assert!(!debug.contains("s3cret"), "{debug}");
+        }
     }
 }

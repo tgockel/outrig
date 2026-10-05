@@ -5,8 +5,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use rig::agent::{AgentHook, Flow, HookContext, RequestPatch, StepEvent, StepEventKind};
+use rig::agent::{AgentHook, Flow, HookContext, StepEvent, StepEventKind};
 use rig::completion::{CompletionModel, Message, Prompt};
+use rig::tool::ToolCallExtensions;
 use thiserror::Error;
 
 use crate::error::{CliError, Result};
@@ -690,19 +691,11 @@ fn resolve_candidate(
 /// on the variant.
 pub enum RigAgent {
     OpenAi {
-        agent: rig::agent::Agent<
-            retry::RetryingModel<
-                rig::providers::openai::CompletionModel<retry::RetryingHttpClient>,
-            >,
-        >,
+        agent: rig::agent::Agent<retry::RetryingModel<OpenAiModel>>,
         tool_call_max: usize,
     },
     Anthropic {
-        agent: rig::agent::Agent<
-            retry::RetryingModel<
-                rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
-            >,
-        >,
+        agent: rig::agent::Agent<retry::RetryingModel<AnthropicModel>>,
         tool_call_max: usize,
     },
     /// A multi-candidate alias: one agent over a chain that moves between
@@ -838,12 +831,10 @@ async fn build_single(
             request_timeout_secs,
             retry_budget_secs,
         } => {
-            use rig::client::CompletionClient;
-
             let policy = retry_policy(*retry_budget_secs);
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
-            let model = client.completion_model(&candidate.model_identifier);
+            let model = openai_model(&client, candidate);
             Ok(RigAgent::OpenAi {
                 agent: finish_agent(
                     retry::RetryingModel::new(model, policy),
@@ -896,11 +887,9 @@ async fn build_candidate(
             request_timeout_secs,
             ..
         } => {
-            use rig::client::CompletionClient;
-
             let http = remote_http_client(*request_timeout_secs, policy.clone())?;
             let client = openai_client(base_url, api_key, http)?;
-            let model = client.completion_model(&candidate.model_identifier);
+            let model = openai_model(&client, candidate);
             Ok(Box::new(failover::ModelCandidate::new(
                 retry::RetryingModel::new(model, policy.clone()),
                 &candidate.model_name,
@@ -947,6 +936,21 @@ fn openai_client(
         .map_err(|e| LlmResolveError::RigClientBuild(e.to_string()).into())
 }
 
+/// One candidate's OpenAI-style model, wrapped so that every assistant turn in
+/// the history reaches the wire -- see [`OpenAiModel`].
+///
+/// Shared by the single path and the chain for the reason [`openai_client`]
+/// is: a candidate built without the wrapper would quietly send a different
+/// conversation than a lone model sends.
+fn openai_model(
+    client: &rig::providers::openai::CompletionsClient<retry::RetryingHttpClient>,
+    candidate: &ResolvedCandidate,
+) -> OpenAiModel {
+    use rig::client::CompletionClient;
+
+    OpenAiModel(client.completion_model(&candidate.model_identifier))
+}
+
 /// Rig's Anthropic client for one candidate.
 ///
 /// Rig's client owns the protocol: `x-api-key`, the `anthropic-version` header,
@@ -976,10 +980,7 @@ fn anthropic_client(
 fn anthropic_model(
     client: &rig::providers::anthropic::Client<retry::RetryingHttpClient>,
     candidate: &ResolvedCandidate,
-) -> (
-    rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>,
-    Option<u32>,
-) {
+) -> (AnthropicModel, Option<u32>) {
     use rig::client::CompletionClient;
 
     // `completion_model`, never `CompletionModel::with_model`: the two
@@ -1021,7 +1022,192 @@ fn anthropic_model(
         (None, Some(ceiling)) => Some(u32::try_from(ceiling).unwrap_or(u32::MAX)),
         (None, None) => None,
     };
-    (model, max_tokens)
+    (AnthropicModel(model), max_tokens)
+}
+
+type RigAnthropicModel =
+    rig::providers::anthropic::completion::CompletionModel<retry::RetryingHttpClient>;
+
+/// rig's Anthropic model, sent only the reasoning Anthropic itself issued.
+///
+/// rig turns every reasoning block in the history into a native `thinking`
+/// block, and Anthropic takes back only the thinking it issued: a `thinking`
+/// block with the signature it came with, or a `redacted_thinking` block.
+/// Anything else fails the whole request. A conversation can carry another
+/// provider's reasoning, though. An alias chain shares one history across its
+/// candidates, so a turn that a local or OpenAI-style fallback answered is
+/// still there when the next call starts back at an Anthropic head -- which
+/// would then fail every call, long after its own outage ended.
+///
+/// So the history is filtered here, at the one boundary every Anthropic request
+/// crosses, whether it comes from a lone model or a chain candidate. Text, tool
+/// calls, and Anthropic's own thinking pass through untouched. An assistant
+/// message left with nothing is dropped, since Anthropic refuses an empty one.
+/// outrig's own history keeps everything; only what is sent is filtered.
+#[derive(Clone)]
+pub struct AnthropicModel(RigAnthropicModel);
+
+impl CompletionModel for AnthropicModel {
+    type Response = <RigAnthropicModel as CompletionModel>::Response;
+    type StreamingResponse = <RigAnthropicModel as CompletionModel>::StreamingResponse;
+    type Client = <RigAnthropicModel as CompletionModel>::Client;
+
+    /// Never reached by outrig, which builds the model in [`anthropic_model`],
+    /// but rig's trait requires it.
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self(RigAnthropicModel::make(client, model))
+    }
+
+    async fn completion(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::completion::CompletionResponse<Self::Response>,
+        rig::completion::CompletionError,
+    > {
+        request.chat_history = only_anthropic_reasoning(request.chat_history)?;
+        self.0.completion(request).await
+    }
+
+    async fn stream(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig::completion::CompletionError,
+    > {
+        request.chat_history = only_anthropic_reasoning(request.chat_history)?;
+        self.0.stream(request).await
+    }
+
+    /// Delegated for the reason [`retry::RetryingModel`] delegates it: the
+    /// trait's `false` would cost Anthropic guaranteed structured output on
+    /// every turn that has tools.
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.0.composes_native_output_with_tools()
+    }
+}
+
+/// `history` without the reasoning Anthropic did not issue. See
+/// [`AnthropicModel`].
+fn only_anthropic_reasoning(
+    history: rig::OneOrMany<Message>,
+) -> std::result::Result<rig::OneOrMany<Message>, rig::completion::CompletionError> {
+    use rig::completion::message::{AssistantContent, ReasoningContent};
+
+    let kept = history.into_iter().filter_map(|message| match message {
+        Message::Assistant { id, content } => {
+            let content = content.into_iter().filter_map(|part| match part {
+                AssistantContent::Reasoning(mut reasoning) => {
+                    reasoning.content.retain(|block| {
+                        matches!(
+                            block,
+                            ReasoningContent::Text {
+                                signature: Some(_),
+                                ..
+                            } | ReasoningContent::Redacted { .. }
+                        )
+                    });
+                    (!reasoning.content.is_empty())
+                        .then_some(AssistantContent::Reasoning(reasoning))
+                }
+                other => Some(other),
+            });
+            rig::OneOrMany::many(content)
+                .ok()
+                .map(|content| Message::Assistant { id, content })
+        }
+        other => Some(other),
+    });
+    // Never empty in practice: only assistant messages are dropped, and a
+    // request always ends in its prompt.
+    rig::OneOrMany::many(kept).map_err(|e| rig::completion::CompletionError::RequestError(e.into()))
+}
+
+type RigOpenAiModel = rig::providers::openai::CompletionModel<retry::RetryingHttpClient>;
+
+/// rig's OpenAI chat-completions model, sent every assistant turn it is given.
+///
+/// rig converts an assistant message with no text and no tool call into nothing
+/// at all, reasoning notwithstanding -- by design, pinned by its own
+/// `assistant_reasoning_alone_is_dropped`, in 0.42 as in 0.40. Its agent loop
+/// keeps such a turn, though, and so does outrig, which reports the reasoning:
+/// a reasoning model stopped at its output ceiling produces exactly that turn.
+/// Left to rig, the next request would carry the prompts on either side of it
+/// as two user messages in a row. The model would never learn it had answered,
+/// and an endpoint that requires alternating roles would refuse the request.
+///
+/// So each such message gets an empty text part here, at the one boundary every
+/// OpenAI-style request crosses, whether it comes from a lone model or a chain
+/// candidate. rig then sends it as an assistant message with empty content and
+/// its reasoning in `reasoning_content`, as it already sends reasoning beside
+/// text: the empty reply the turn actually was. outrig's own history keeps the
+/// turn as rig returned it, since a chain sends that history to its other
+/// candidates too, and Anthropic refuses an empty text block.
+#[derive(Clone)]
+pub struct OpenAiModel(RigOpenAiModel);
+
+impl CompletionModel for OpenAiModel {
+    type Response = <RigOpenAiModel as CompletionModel>::Response;
+    type StreamingResponse = <RigOpenAiModel as CompletionModel>::StreamingResponse;
+    type Client = <RigOpenAiModel as CompletionModel>::Client;
+
+    /// Never reached by outrig, which builds the model in [`openai_model`],
+    /// but rig's trait requires it.
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self(RigOpenAiModel::make(client, model))
+    }
+
+    async fn completion(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::completion::CompletionResponse<Self::Response>,
+        rig::completion::CompletionError,
+    > {
+        keep_textless_turns(&mut request.chat_history);
+        self.0.completion(request).await
+    }
+
+    async fn stream(
+        &self,
+        mut request: rig::completion::CompletionRequest,
+    ) -> std::result::Result<
+        rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        rig::completion::CompletionError,
+    > {
+        keep_textless_turns(&mut request.chat_history);
+        self.0.stream(request).await
+    }
+
+    /// Delegated for the reason [`retry::RetryingModel`] delegates it: the
+    /// trait's `false` would cost OpenAI guaranteed structured output on every
+    /// turn that has tools.
+    fn composes_native_output_with_tools(&self) -> bool {
+        self.0.composes_native_output_with_tools()
+    }
+}
+
+/// Give every assistant message rig's OpenAI conversion would drop an empty
+/// text part. See [`OpenAiModel`].
+///
+/// The test is rig's own -- no text and no tool call -- rather than "only
+/// reasoning", so that nothing it drops is missed.
+fn keep_textless_turns(history: &mut rig::OneOrMany<Message>) {
+    use rig::completion::message::AssistantContent;
+
+    for message in history.iter_mut() {
+        if let Message::Assistant { content, .. } = message
+            && !content.iter().any(|part| {
+                matches!(
+                    part,
+                    AssistantContent::Text(_) | AssistantContent::ToolCall(_)
+                )
+            })
+        {
+            content.push(AssistantContent::text(""));
+        }
+    }
 }
 
 /// Say, once per model, that outrig picked an output-token ceiling nobody asked
@@ -1069,13 +1255,17 @@ impl RigAgent {
     /// the resolved tool-call max. If the hook terminates the loop, Rig
     /// returns the partial chat history it had accumulated; outrig splices in
     /// that new suffix so the user can send a follow-up prompt to continue.
+    /// A turn whose later model call fails for good, or whose future is
+    /// dropped part-way (Ctrl-C), keeps its partial history the same way, up
+    /// to its latest model call -- see [`OutrigPromptHook`]'s `checkpoint`.
     pub async fn run_turn(&self, prompt: &str, history: &mut Vec<Message>) -> Result<TurnEnd> {
         let hook = OutrigPromptHook::new(self.tool_call_max());
         self.run_turn_with(prompt, history, hook).await
     }
 
-    /// Run one round for a subagent: traces carry `label`, and each model call
-    /// picks up whatever the parent has queued through `injections`.
+    /// Run one round for a subagent: traces carry `label`, and the last result
+    /// of each tool batch carries whatever the parent has queued through
+    /// `injections` to the model.
     ///
     /// Subagent outcomes come from `outrig__set_result`, not from this return
     /// value -- the text is for the transcript log, and
@@ -1303,12 +1493,16 @@ pub enum TurnStop {
     /// The tool-call budget ran out, or a hook stopped the loop. Whatever the
     /// turn managed is spliced into the history, so it can be continued.
     Interrupted(String),
-    /// The LLM endpoint stayed transiently broken -- rate-limited, or
-    /// unreachable -- for as long as the retry budget allowed. Nothing was
-    /// spliced, so the prompt itself is what wants resending. A subagent round
-    /// publishes this as a *failed* round rather than a quiet stop: an
-    /// unreachable endpoint is infrastructure for the parent to act on, not a
-    /// report the model declined to write.
+    /// The LLM endpoint stayed broken -- rate-limited, unreachable, or
+    /// answering with nothing usable -- for as long as retries allowed.
+    /// Whatever the turn completed before the failing call is spliced into the
+    /// history, as for `Interrupted`. Only a turn that failed on its first call
+    /// has nothing to splice, and only there is the prompt itself what wants
+    /// resending. A subagent round publishes this as a *failed* round rather
+    /// than a quiet stop: an unreachable endpoint is infrastructure for the
+    /// parent to act on, not a report the model declined to write. A round
+    /// that reported, and that its parent sent nothing since, keeps the report
+    /// instead (#310).
     EndpointFailed(String),
 }
 
@@ -1328,6 +1522,130 @@ impl TurnStop {
     }
 }
 
+/// Keeps what a turn completed if the turn is dropped while rig drives it.
+///
+/// The REPL drops an in-flight turn on Ctrl-C, and `Drop` is the only code that
+/// runs then: no error comes back to splice from, so the tool calls the turn
+/// already ran would leave with rig's copy of the history, and the next prompt
+/// could run them again (#197). Armed only across rig's loop. Every way out
+/// past it commits the turn's history itself, so once disarmed there is
+/// nothing left for this to do.
+struct KeepOnDrop<'h> {
+    history: Option<&'h mut Vec<Message>>,
+    hook: &'h OutrigPromptHook,
+}
+
+impl<'h> KeepOnDrop<'h> {
+    fn arm(history: &'h mut Vec<Message>, hook: &'h OutrigPromptHook) -> Self {
+        Self {
+            history: Some(history),
+            hook,
+        }
+    }
+
+    /// Rig's loop is over: hand `history` back for the turn to commit.
+    fn disarm(mut self) -> &'h mut Vec<Message> {
+        self.history.take().expect("armed until disarmed")
+    }
+}
+
+impl Drop for KeepOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(history) = self.history.take() {
+            self.hook.keep_checkpoint(history);
+        }
+    }
+}
+
+/// Puts back what a turn's tool calls changed outside the conversation, for
+/// every call whose result the turn's history ends up without.
+///
+/// `outrig__get_result` is why this exists. It moves the parent's read
+/// position past the result it returns as the call runs, but the result
+/// reaches the history only when the turn keeps it, and rig keeps a batch's
+/// results together or not at all. A turn dropped while a later call in the
+/// same batch was still running (Ctrl-C), or one that ended in an error, left
+/// the result out of the history and the read position past it, so the next
+/// read of a subagent that had gone idle blocked for good (#251). A steer that
+/// went out on a tool result is taken back the same way: see
+/// [`InjectionSource`].
+///
+/// Reaches the tool calls through rig's per-run [`ToolCallExtensions`], which
+/// keeps this module unaware of the subagent registry, as [`InjectionSource`]
+/// does. Settled in step with the history: what the hook's `checkpoint`
+/// carries stands wherever the checkpoint is kept, everything stands wherever
+/// rig's whole transcript is, and the rest is undone, newest first, when the
+/// turn's last handle drops. A drop because it is the one way out every path
+/// shares -- a turn dropped on Ctrl-C runs no other code.
+#[derive(Clone, Default)]
+pub struct TurnUndo(Arc<std::sync::Mutex<UndoLog>>);
+
+#[derive(Default)]
+struct UndoLog {
+    /// The undos, in the order the tool calls that recorded them ran.
+    entries: Vec<Box<dyn FnOnce() + Send>>,
+    /// How many of `entries` the hook's checkpoint carries: those recorded
+    /// before the turn's latest model call.
+    carried: usize,
+}
+
+impl TurnUndo {
+    /// The turn a tool call is part of, from the extensions rig hands the
+    /// call. `None` outside a turn, where nothing is put back.
+    pub(crate) fn of(extensions: &ToolCallExtensions) -> Option<&TurnUndo> {
+        extensions.get::<TurnUndo>()
+    }
+
+    /// Record how to undo what the running tool call changed, should the turn's
+    /// history not keep the call's result.
+    pub(crate) fn record(&self, undo: impl FnOnce() + Send + 'static) {
+        self.log().entries.push(Box::new(undo));
+    }
+
+    /// A model call is going out, and its checkpoint carries every tool call
+    /// recorded so far.
+    fn carry(&self) {
+        let mut log = self.log();
+        log.carried = log.entries.len();
+    }
+
+    /// The history kept the checkpoint: what it carries stands.
+    fn keep_carried(&self) {
+        let mut log = self.log();
+        let carried = std::mem::take(&mut log.carried);
+        log.entries.drain(..carried);
+    }
+
+    /// The history kept rig's whole transcript: everything stands.
+    fn keep_all(&self) {
+        let mut log = self.log();
+        log.entries.clear();
+        log.carried = 0;
+    }
+
+    /// The extensions that carry this log to the turn's tool calls.
+    fn extensions(&self) -> ToolCallExtensions {
+        let mut extensions = ToolCallExtensions::new();
+        extensions.insert(self.clone());
+        extensions
+    }
+
+    fn log(&self) -> std::sync::MutexGuard<'_, UndoLog> {
+        self.0.lock().expect("turn-undo mutex poisoned")
+    }
+}
+
+impl Drop for UndoLog {
+    fn drop(&mut self) {
+        // Newest first, so each undo finds things as its own call left them:
+        // two reads of one subagent put back oldest first would leave the
+        // position where the later read found it, not the earlier.
+        while let Some(undo) = self.entries.pop() {
+            undo();
+        }
+    }
+}
+
 async fn run_turn_inner<M: CompletionModel + 'static>(
     agent: &rig::agent::Agent<M>,
     prompt: &str,
@@ -1338,13 +1656,16 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     // Cloned rather than moved: the clone shares the hook's atomics, so it can
     // still be asked afterwards whether the stop was OutRig's doing.
     let observer = hook.clone();
-    let result = agent
+    let turn = agent
         .prompt(prompt.to_string())
         .history(history.clone())
         .max_turns(max_turns)
+        .tool_extensions(observer.undo.extensions())
         .add_hook(hook)
-        .extended_details()
-        .await;
+        .extended_details();
+    let kept = KeepOnDrop::arm(history, &observer);
+    let result = turn.await;
+    let history = kept.disarm();
 
     match result {
         Ok(response) => {
@@ -1352,6 +1673,7 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
                 .messages
                 .expect("rig populates messages on extended_details");
             history.extend(messages);
+            observer.undo.keep_all();
             // `output` is the final turn's *text* parts concatenated, so a turn
             // that produced only reasoning lands here as "". Rig hands the
             // structured turn back in `content`; consulting it is what keeps a
@@ -1373,6 +1695,64 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
     }
 }
 
+/// What the user is told when the primary's turn ends early with its completed
+/// work kept.
+///
+/// One line for every such end -- a hook stop, the tool-call max, an endpoint
+/// that failed past the turn's first model call -- because each leaves the same
+/// thing behind: history ending in tool calls and their answers, for the next
+/// prompt to carry on from.
+const PARTIAL_HISTORY_RETAINED: &str = "[outrig] partial history retained -- send another prompt \
+     (e.g. \"continue\") to keep going, or \"/reset\" to drop it.";
+
+/// What the user is told when the primary's turn ends having kept nothing: its
+/// first model call failed, so the prompt itself is what wants resending.
+const HISTORY_UNCHANGED: &str =
+    "[outrig] history unchanged -- send the prompt again to retry, or \"/quit\" to stop.";
+
+/// End the *turn* -- not the session -- because the endpoint failed.
+///
+/// The shared tail of [`handle_prompt_error`]'s three endpoint arms: a chain
+/// that exhausted every candidate, one endpoint that stayed transiently broken
+/// for its whole budget, and a response rig could not use. They differ in
+/// `reason`, and the chain additionally prints its per-candidate report through
+/// `tried`; everything after that is common.
+///
+/// The failed call's error carries no history, so what the turn completed
+/// comes from the hook's checkpoint instead. Past the turn's first model call
+/// the checkpoint holds tool calls that already ran, so the advice is the
+/// "continue" the truncation paths give: sending the prompt again would run
+/// them a second time. A turn that failed on its first call has nothing to
+/// keep, and only there is the prompt itself what wants resending. A
+/// subagent's round keeps its checkpoint the same way, for the parent's next
+/// send to carry on from, but is given neither: see
+/// [`OutrigPromptHook::turn_end_notice`]. No budget is named, because with
+/// `retry-budget-secs = 0` there was none; the retry progress lines above name
+/// it whenever there was one.
+fn endpoint_failed(
+    reason: String,
+    tried: Option<&str>,
+    history: &mut Vec<Message>,
+    hook: &OutrigPromptHook,
+) -> Result<TurnEnd> {
+    let advice = if hook.keep_checkpoint(history) {
+        PARTIAL_HISTORY_RETAINED
+    } else {
+        HISTORY_UNCHANGED
+    };
+    eprintln!("{}", hook.turn_end_notice(&reason, tried, advice));
+    Ok(TurnEnd {
+        // Nothing belongs on stdout: the model never spoke, or spoke only in
+        // tool calls, which the history now holds. `repl.rs`'s
+        // `if !reply.is_empty()` guard handles it.
+        reply: String::new(),
+        stopped: Some(TurnStop::EndpointFailed(reason)),
+        // Nothing to salvage: the call that failed produced no turn to salvage
+        // from. The `stopped` reason above is what gets reported.
+        recovered: None,
+    })
+}
+
 /// Turn a loop-ending error into a [`TurnEnd`], or pass it on.
 ///
 /// `hook` is the turn's own hook, consulted to tell OutRig's deliberate stops
@@ -1382,47 +1762,15 @@ async fn run_turn_inner<M: CompletionModel + 'static>(
 /// be reported to a subagent's parent as an ordinary "stopped before
 /// reporting", which reads like the model's doing and hides a bug.
 ///
-/// The remaining two recoverable cases are both the endpoint's doing: one that
-/// stayed transiently broken -- rate-limited, or unreachable -- for the whole
-/// retry budget, and one that answered with a body rig could not turn into a
-/// completion. Either used to end the process: the error reached `repl.rs`'s
+/// The remaining recoverable cases are the endpoint's doing: one that stayed
+/// transiently broken -- rate-limited, or unreachable -- for the whole retry
+/// budget, a chain whose candidates all failed with at least one of them that
+/// way, and one that answered with a body rig could not turn into a
+/// completion. Each used to end the process: the error reached `repl.rs`'s
 /// `res?` and unwound past the REPL loop, tearing down the containers and
-/// dropping the conversation. They end the *turn* instead, so the user can wait
-/// out the window and send the prompt again in the same session.
-/// End the *turn* -- not the session -- because the endpoint failed.
-///
-/// The shared tail of [`handle_prompt_error`]'s three endpoint arms: a chain
-/// that exhausted every candidate, one endpoint that stayed transiently broken
-/// for its whole budget, and a response rig could not use. They differ in
-/// `reason`, and the chain additionally prints its per-candidate report through
-/// `tried`; everything after that is common, because all three leave the
-/// history untouched.
-///
-/// The advice is deliberately not the "continue" advice the truncation paths
-/// give: nothing was appended, so there is no partial turn to continue -- the
-/// prompt itself is what wants resending. No budget is named, because with
-/// `retry-budget-secs = 0` there was none; the retry progress lines above name
-/// it whenever there was one.
-fn endpoint_failed(reason: String, tried: Option<&str>) -> Result<TurnEnd> {
-    eprintln!("[outrig] {reason}; ending turn");
-    if let Some(tried) = tried {
-        eprintln!("[outrig] tried:\n{tried}");
-    }
-    eprintln!(
-        "[outrig] history unchanged -- send the prompt again to retry, \
-         or \"/quit\" to stop."
-    );
-    Ok(TurnEnd {
-        // The model never spoke, so nothing belongs on stdout. `repl.rs`'s
-        // `if !reply.is_empty()` guard handles it.
-        reply: String::new(),
-        stopped: Some(TurnStop::EndpointFailed(reason)),
-        // Nothing to salvage: the endpoint never produced a turn to salvage
-        // from. The `stopped` reason above is what gets reported.
-        recovered: None,
-    })
-}
-
+/// dropping the conversation. They end the *turn* instead, keeping what it
+/// completed, so the user can wait out the window and carry on in the same
+/// session.
 fn handle_prompt_error(
     err: rig::completion::PromptError,
     history: &mut Vec<Message>,
@@ -1452,29 +1800,34 @@ fn handle_prompt_error(
             // propagating it names them all without re-rendering.
             return Err(err.into());
         }
-        return endpoint_failed("every model candidate failed".to_string(), Some(&tried));
+        return endpoint_failed(
+            "every model candidate failed".to_string(),
+            Some(&tried),
+            history,
+            hook,
+        );
     }
 
     // Handled ahead of the match because it shares almost nothing with the
-    // other two: no history to splice, no reply to print, and different advice.
+    // other two: the error carries no history, so what the turn keeps comes
+    // from the hook's checkpoint, and there is no reply to print.
     if let Some(label) = retry::exhausted_transient_label(&err) {
-        // `PromptError::CompletionError` carries no `chat_history`, so a turn
-        // that died on a *later* model call loses the tool calls it already
-        // ran. Filed as
-        // `plan/next/partial-turn-history-on-failed-model-call.md`.
         return endpoint_failed(
             format!("LLM endpoint failed and did not recover ({label})"),
             None,
+            history,
+            hook,
         );
     }
 
     // A response rig could not use, still unusable after `RetryingModel` spent
-    // its attempts. Handled the same way and for the same reasons: nothing was
-    // appended, and the prompt is what wants resending.
+    // its attempts. Handled the same way, and for the same reasons.
     if let Some(detail) = retry::unusable_response_label(&err) {
         return endpoint_failed(
             format!("the model returned a response outrig could not use ({detail})"),
             None,
+            history,
+            hook,
         );
     }
 
@@ -1485,8 +1838,8 @@ fn handle_prompt_error(
         } => match hook.stop_reason() {
             Some(ours) => (ours, chat_history),
             // Nothing in OutRig asked for this, so it is rig's own. Propagating
-            // keeps it an error: the round driver publishes it as a failed
-            // round, which names it as a fault rather than a tidy stop.
+            // keeps it an error: the round driver treats it as a failed round,
+            // which names it as a fault rather than a tidy stop.
             None => {
                 return Err(rig::completion::PromptError::PromptCancelled {
                     reason,
@@ -1505,12 +1858,17 @@ fn handle_prompt_error(
         ),
         other => return Err(other.into()),
     };
-    eprintln!("[outrig] {reason}; ending turn");
     eprintln!(
-        "[outrig] partial history retained -- send another prompt \
-         (e.g. \"continue\") to keep going, or \"/reset\" to drop it."
+        "{}",
+        hook.turn_end_notice(&reason, None, PARTIAL_HISTORY_RETAINED)
     );
     extend_history_with_new_suffix(history, chat_history);
+    // Everything stands, not only what the checkpoint carries: the hook stops
+    // the loop only at a model call, and rig runs out of turns only before
+    // one, so every batch that ran is in rig's transcript. Rig's own
+    // `MaxTurnsError` comes before the hook sees that call, so its last batch
+    // is in the transcript but in no checkpoint.
+    hook.undo.keep_all();
     Ok(TurnEnd {
         reply: format!("(turn ended: {reason})"),
         stopped: Some(TurnStop::Interrupted(reason)),
@@ -1529,14 +1887,17 @@ fn extend_history_with_new_suffix(history: &mut Vec<Message>, returned: Vec<Mess
     }
 }
 
-/// Supplies messages to splice into a turn's history at its next model call.
+/// Supplies the steers a parent has queued for the round in flight, each
+/// already marked as the parent's, to append to the last result of a tool
+/// batch that a model call is going to read. `crate::subagent::injection` says
+/// why a result, and why that one.
 ///
 /// A closure rather than a concrete type so this module stays unaware of the
 /// subagent registry: `subagent` hands one in that reads its queued steers.
-/// Called on *every* model call in the turn, because rig's `RequestPatch` is
-/// per-turn and non-sticky -- a steer applied once would vanish from the next
-/// call.
-pub type InjectionSource = Arc<dyn Fn() -> Vec<Message> + Send + Sync>;
+/// What it returns counts as delivered, and it records on the turn's
+/// [`TurnUndo`] how to take that back, for a turn whose history ends up
+/// without the result.
+pub type InjectionSource = Arc<dyn Fn(&TurnUndo) -> Vec<String> + Send + Sync>;
 
 /// Consecutive identical failures before the model is told that repeating the
 /// call is pointless.
@@ -1615,12 +1976,30 @@ pub struct OutrigPromptHook {
     cap_reached: Arc<AtomicBool>,
     max: usize,
     /// Prefixes trace lines so concurrent subagents are tellable apart. The
-    /// primary agent leaves it unset and its traces keep their original shape.
+    /// primary agent leaves it unset and its traces keep their original shape,
+    /// down to the advice its turn ends with: see
+    /// [`OutrigPromptHook::turn_end_notice`].
     label: Option<Arc<str>>,
+    /// Present for subagents only: the parent's steers, which the last result
+    /// of each tool batch carries to the model. See [`InjectionSource`].
     injections: Option<InjectionSource>,
+    /// How many results of the running tool batch are still to come, so the
+    /// last of them can carry the parent's steers. Set from the model turn
+    /// that asks for the batch, before any of it runs.
+    batch_left: Arc<AtomicUsize>,
     /// Present for subagents only, which is what keeps the breaker off the
     /// primary agent's loop. See [`RepeatTracker`].
     repeats: Option<Arc<std::sync::Mutex<RepeatTracker>>>,
+    /// The breaker's stop reason, once it has tripped, held until the next
+    /// model call ends the round.
+    ///
+    /// Not a terminate from the failing call's result: rig records a batch's
+    /// results only once the whole batch settles, so the history it hands
+    /// back would end in a tool call with no result -- which OpenAI and
+    /// Anthropic reject on every later round (#231). Kept apart from
+    /// `stop_reason` until then, so a cancellation rig raises for itself in
+    /// between is not taken for this stop.
+    breaker_stop: Arc<std::sync::OnceLock<String>>,
     /// Why this hook asked the loop to stop, once it has.
     ///
     /// Recorded here rather than recovered from the cancellation rig reports,
@@ -1630,6 +2009,26 @@ pub struct OutrigPromptHook {
     /// anything else can be surfaced as the fault it is instead of being
     /// dressed up as an orderly end.
     stop_reason: Arc<std::sync::Mutex<Option<String>>>,
+    /// The turn's whole transcript as of its latest model call past the first:
+    /// the history it started from, its prompt, and every tool call that has
+    /// run, each answered by its result.
+    ///
+    /// Rig hands a turn's history back when the turn finishes and when a hook
+    /// cancels it, but not when a model call fails: an endpoint that stayed
+    /// down, or a response that stayed unusable, arrives as
+    /// `PromptError::CompletionError`, which carries none. A turn whose future
+    /// is dropped returns nothing at all. Either way the tool calls that
+    /// already ran would leave with rig's copy, and the next prompt could run
+    /// them again (#197). `CompletionCall` is where rig shows that copy whole,
+    /// so the hook keeps it there: rig's own record, the one a cancellation
+    /// carries out in `chat_history`, rather than a second one assembled from
+    /// tool events that could drift from it.
+    ///
+    /// Skipped on the first call, which no tool has run before: a turn that
+    /// fails there leaves the history as it was.
+    checkpoint: Arc<std::sync::Mutex<Option<Vec<Message>>>>,
+    /// The turn's [`TurnUndo`], settled alongside `checkpoint`.
+    undo: TurnUndo,
 }
 
 impl OutrigPromptHook {
@@ -1640,8 +2039,12 @@ impl OutrigPromptHook {
             max,
             label: None,
             injections: None,
+            batch_left: Arc::default(),
             repeats: None,
+            breaker_stop: Arc::default(),
             stop_reason: Arc::new(std::sync::Mutex::new(None)),
+            checkpoint: Arc::default(),
+            undo: TurnUndo::default(),
         }
     }
 
@@ -1653,6 +2056,21 @@ impl OutrigPromptHook {
             .clone()
     }
 
+    /// Why the turn's next model call is not going to be made, once that is
+    /// already decided: the breaker tripped, or the tool-call cap was reached.
+    ///
+    /// A bare reason, no "ending turn": `handle_prompt_error` prints it and a
+    /// subagent's parent is shown it, so a suffix here reads twice in the log
+    /// and lands in the parent's error as trailing noise.
+    fn pending_stop(&self) -> Option<String> {
+        if let Some(reason) = self.breaker_stop.get() {
+            return Some(reason.clone());
+        }
+        self.cap_reached
+            .load(Ordering::SeqCst)
+            .then(|| format!("tool-call iteration max ({}) reached", self.max))
+    }
+
     /// Record the reason and hand it to rig, so the same string reaches the
     /// log, the caller, and -- for a subagent -- its parent.
     fn stop(&self, reason: String) -> Flow {
@@ -1660,9 +2078,29 @@ impl OutrigPromptHook {
         Flow::terminate(reason)
     }
 
-    /// The subagent form: traces carry the subagent's name, each model call
-    /// picks up whatever the parent has queued, and a tool call that keeps
-    /// failing identically stops the round.
+    /// Splice what the turn completed before its latest model call into
+    /// `history`, and say whether there was anything to keep. What those
+    /// calls changed outside the conversation stands with them.
+    ///
+    /// Taken rather than read, so the work is kept once whichever way out of
+    /// the turn reaches it first.
+    fn keep_checkpoint(&self, history: &mut Vec<Message>) -> bool {
+        let checkpoint = self
+            .checkpoint
+            .lock()
+            .expect("checkpoint mutex poisoned")
+            .take();
+        let Some(transcript) = checkpoint else {
+            return false;
+        };
+        extend_history_with_new_suffix(history, transcript);
+        self.undo.keep_carried();
+        true
+    }
+
+    /// The subagent form: traces carry the subagent's name, the last result of
+    /// each tool batch carries whatever the parent has queued, and a tool call
+    /// that keeps failing identically stops the round.
     pub fn for_subagent(max: usize, label: &str, injections: InjectionSource) -> Self {
         Self {
             label: Some(Arc::from(label)),
@@ -1678,47 +2116,108 @@ impl OutrigPromptHook {
             None => String::new(),
         }
     }
+
+    /// What stderr is told when the turn ends early: why, and for the primary,
+    /// what to do next.
+    ///
+    /// The reason carries this hook's label, as its tool-call traces do, and so
+    /// does a failed chain's `tried:` report under it. `advice` is about the
+    /// primary's conversation -- send the prompt again, `continue`, `/reset`,
+    /// `/quit` -- so a subagent's round leaves it out. What a subagent does
+    /// next is its parent's call, and following the advice acted on the
+    /// primary instead: `/reset` cleared the primary's history (#309).
+    ///
+    /// Returned rather than printed, so the wording is assertable without
+    /// capturing stderr.
+    fn turn_end_notice(&self, reason: &str, tried: Option<&str>, advice: &str) -> String {
+        let prefix = self.trace_prefix();
+        let mut lines = vec![format!("[outrig] {prefix}{reason}; ending turn")];
+        lines.extend(tried.map(|tried| format!("[outrig] {prefix}tried:\n{tried}")));
+        if self.label.is_none() {
+            lines.push(advice.to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// The parent's steers for the tool result rig is reporting: whatever is
+    /// queued, if this is its batch's last result and no stop is pending for
+    /// the model call after it, and nothing otherwise. Rig's own turn budget is
+    /// set past the cap, so no other stop comes first.
+    fn steers_for_result(&self) -> Vec<String> {
+        let Some(source) = &self.injections else {
+            return Vec::new();
+        };
+        // A batch rig never sized wraps the count, and a wrapped count reads
+        // as no batch's last until the next turn sets it.
+        let last = self.batch_left.fetch_sub(1, Ordering::SeqCst) == 1;
+        if !last || self.pending_stop().is_some() {
+            return Vec::new();
+        }
+        source(&self.undo)
+    }
 }
 
 impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
-    // The hook only acts on `CompletionCall` and `ToolCall`; narrowing
-    // `observes` keeps it off every other event, where `on_event` below would
-    // just no-op anyway.
+    // Rig consults `observes` only for the per-token `TextDelta` and
+    // `ToolCallDelta` events and hands every hook each other event, so
+    // `on_event` checks for itself what applies. The arms say which events
+    // this hook acts on.
     fn observes(&self, kind: StepEventKind) -> bool {
         match kind {
             StepEventKind::CompletionCall | StepEventKind::ToolCall => true,
-            // Only subagents run the repeat breaker, so the primary agent stays
-            // off the per-result path entirely.
+            // Only subagents run the repeat breaker or take steers.
             StepEventKind::ToolResult => self.repeats.is_some(),
+            StepEventKind::ModelTurnFinished => self.injections.is_some(),
             _ => false,
         }
     }
 
     async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
         match event {
-            StepEvent::CompletionCall { history, .. } => {
-                if self.cap_reached.load(Ordering::SeqCst) {
-                    // Bare reason, no "ending turn": `handle_prompt_error`
-                    // prints it and a subagent's parent is shown it, so a
-                    // suffix here reads twice in the log and lands in the
-                    // parent's error as trailing noise.
-                    return self.stop(format!("tool-call iteration max ({}) reached", self.max));
+            StepEvent::CompletionCall {
+                prompt,
+                history,
+                turn,
+            } => {
+                // Rig's transcript as of this call, kept in case the call
+                // fails or the turn is dropped during it, along with the tool
+                // calls it carries. See `checkpoint` and `undo`.
+                if turn > 1 {
+                    *self.checkpoint.lock().expect("checkpoint mutex poisoned") =
+                        Some(history.iter().chain([prompt]).cloned().collect());
+                    self.undo.carry();
                 }
-                // Steers are re-applied on every model call, not just the one
-                // after they arrive: the patch is per-turn and non-sticky.
-                if let Some(source) = &self.injections {
-                    let steers = source();
-                    if !steers.is_empty() {
-                        let mut patched = history.to_vec();
-                        patched.extend(steers);
-                        return Flow::patch_request(RequestPatch::new().history(patched));
-                    }
+                if let Some(reason) = self.pending_stop() {
+                    return self.stop(reason);
                 }
+                Flow::cont()
+            }
+            StepEvent::ModelTurnFinished { content, .. } if self.injections.is_some() => {
+                // Every call the model asked for gets a result, the skipped
+                // ones included, so this counts down to the batch's last.
+                let calls = content
+                    .iter()
+                    .filter(|part| matches!(part, rig::message::AssistantContent::ToolCall(_)))
+                    .count();
+                self.batch_left.store(calls, Ordering::SeqCst);
                 Flow::cont()
             }
             StepEvent::ToolCall {
                 tool_name, args, ..
             } => {
+                // The round ends at its next model call, so what the model
+                // batched after the call that tripped the breaker must not
+                // run. Rig runs a batch's calls one at a time, so "after" is
+                // call order. Ahead of the cap, so the skip is not counted
+                // against it and the breaker stays the reason the round
+                // reports.
+                if let Some(reason) = self.breaker_stop.get() {
+                    return Flow::skip(format!(
+                        "[outrig] tool call not executed: {reason}, so the turn was \
+                         ended before this call could run. Repeat the tool call if \
+                         still needed."
+                    ));
+                }
                 let n = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
                 if n > self.max {
                     self.cap_reached.store(true, Ordering::SeqCst);
@@ -1742,35 +2241,103 @@ impl<M: CompletionModel> AgentHook<M> for OutrigPromptHook {
                 outcome,
                 ..
             } => {
-                let Some(repeats) = &self.repeats else {
-                    return Flow::cont();
+                let verdict = match &self.repeats {
+                    Some(repeats) => repeats
+                        .lock()
+                        .expect("repeat-tracker mutex poisoned")
+                        .observe(tool_name, args, outcome.is_error()),
+                    // Only subagents run the breaker.
+                    None => RepeatVerdict::Allow,
                 };
-                let verdict = repeats
-                    .lock()
-                    .expect("repeat-tracker mutex poisoned")
-                    .observe(tool_name, args, outcome.is_error());
-                match verdict {
-                    RepeatVerdict::Allow => Flow::cont(),
+                let note = match verdict {
+                    RepeatVerdict::Allow => None,
                     // Rewrite rather than skip: the tool already ran, and the
                     // model needs to keep seeing *why* it failed alongside the
                     // note that repeating it will not change that.
-                    RepeatVerdict::Nudge => Flow::rewrite_result(format!(
-                        "{result}\n\n[outrig] this is the same call to {tool_name} with the \
-                         same arguments as the previous one, and it failed the same way. \
+                    RepeatVerdict::Nudge => Some(format!(
+                        "[outrig] this is the same call to {tool_name} with the same \
+                         arguments as the previous one, and it failed the same way. \
                          Repeating it will not change the outcome -- change the arguments \
                          or do something else.",
                     )),
                     // No trace of its own: `handle_prompt_error` prints every
                     // terminate reason, and the round driver passes this one to
                     // the parent as the cause it stopped.
-                    RepeatVerdict::Stop => self.stop(format!(
-                        "{tool_name} failed {REPEAT_TERMINATE_AT} times in a row with \
-                         identical arguments"
-                    )),
+                    RepeatVerdict::Stop => {
+                        let reason = format!(
+                            "{tool_name} failed {REPEAT_TERMINATE_AT} times in a row with \
+                             identical arguments"
+                        );
+                        let note = format!(
+                            "[outrig] {reason}, so the turn was ended here. Repeating it \
+                             will not change the outcome -- change the arguments or do \
+                             something else."
+                        );
+                        // Set once at most: every call after this one is
+                        // skipped above, and a skip is not a failure.
+                        let _ = self.breaker_stop.set(reason);
+                        Some(note)
+                    }
+                };
+                // After the verdict, which can stop the round at its next model
+                // call and so leave this result for no model to read.
+                let notes: Vec<String> = note.into_iter().chain(self.steers_for_result()).collect();
+                if notes.is_empty() {
+                    return Flow::cont();
                 }
+                Flow::rewrite_result(format!("{result}\n\n{}", notes.join("\n\n")))
             }
             _ => Flow::cont(),
         }
+    }
+}
+
+/// Hands every tool result to the model as the tool returned it, through
+/// [`as_written`].
+///
+/// The agent's own hook rather than part of [`OutrigPromptHook`]: it holds no
+/// state, so [`finish_agent`] attaches it once and every run of every agent
+/// has it, a subagent's included. It can go whole with the move to rig 0.41 or
+/// later, which no longer re-parses tool results.
+struct ResultsAsWritten;
+
+impl<M: CompletionModel> AgentHook<M> for ResultsAsWritten {
+    // Off the streaming path's per-token deltas, like `OutrigPromptHook`.
+    fn observes(&self, kind: StepEventKind) -> bool {
+        kind == StepEventKind::ToolResult
+    }
+
+    async fn on_event(&self, _ctx: &HookContext, event: StepEvent<'_, M>) -> Flow {
+        match event {
+            StepEvent::ToolResult { result, .. } => as_written(result),
+            _ => Flow::cont(),
+        }
+    }
+}
+
+/// What to tell rig about a tool result so the model reads it as the tool
+/// returned it: nothing, if rig sends it that way, and otherwise a rewrite to
+/// the same text (#253).
+///
+/// Rig 0.40 reads each result its hooks leave alone for structure
+/// (`ToolResultContent::from_tool_output`). A JSON object with a top-level
+/// `response` key goes out as that value alone, re-serialized, plus the
+/// images listed in `parts`, and one shaped as an image goes out as that
+/// image. The rest of the object is dropped without a marker, and an image
+/// fails the turn on a provider that cannot take one there, as the OpenAI arm
+/// never can. A tool's text is never meant that way, and rig sends a rewrite
+/// as written.
+///
+/// Rig's own parser decides, so whatever it would reshape is caught, not just
+/// the shapes known here. The rest is left alone because a rewrite costs the
+/// result rig's log line, which then says only that a hook rewrote it.
+fn as_written(result: &str) -> Flow {
+    use rig::message::ToolResultContent;
+
+    let content = ToolResultContent::from_tool_output(result);
+    match (content.len(), content.first_ref()) {
+        (1, ToolResultContent::Text(text)) if text.text == result => Flow::cont(),
+        _ => Flow::rewrite_result(result),
     }
 }
 
@@ -1798,7 +2365,10 @@ fn finish_agent<M: rig::completion::CompletionModel + 'static>(
     if let Some(max_tokens) = max_tokens {
         builder = builder.max_tokens(max_tokens as u64);
     }
-    builder.tools(session_tool::boxed(&tools)).build()
+    builder
+        .tools(session_tool::boxed(&tools))
+        .add_hook(ResultsAsWritten)
+        .build()
 }
 
 #[cfg(test)]
@@ -1890,27 +2460,56 @@ mod tests {
         );
     }
 
-    /// The breaker is subagent-only, and `observes` is what enforces it: the
-    /// primary agent never even sees the events it keys off.
+    /// The breaker and steers are subagent-only, and a primary agent's hook
+    /// declares no interest in the events they key off.
     #[test]
-    fn only_subagent_hooks_watch_tool_results() {
-        let injections: InjectionSource = Arc::new(Vec::new);
+    fn only_subagent_hooks_watch_tool_batches() {
+        let injections: InjectionSource = Arc::new(|_: &TurnUndo| Vec::new());
         let subagent = OutrigPromptHook::for_subagent(10, "audit", injections);
         let primary = OutrigPromptHook::new(10);
 
-        assert!(
-            AgentHook::<rig::providers::openai::CompletionModel>::observes(
-                &subagent,
-                StepEventKind::ToolResult
-            )
-        );
-        assert!(
-            !AgentHook::<rig::providers::openai::CompletionModel>::observes(
-                &primary,
-                StepEventKind::ToolResult
-            ),
-            "the primary agent keeps its existing behavior"
-        );
+        for kind in [StepEventKind::ToolResult, StepEventKind::ModelTurnFinished] {
+            assert!(
+                AgentHook::<rig::providers::openai::CompletionModel>::observes(&subagent, kind),
+                "{kind:?}"
+            );
+            assert!(
+                !AgentHook::<rig::providers::openai::CompletionModel>::observes(&primary, kind),
+                "the primary agent keeps its existing behavior: {kind:?}"
+            );
+        }
+    }
+
+    /// A result rig sends as written is left to it: plain text, and JSON in no
+    /// shape rig reads for structure. Rewriting those too would cost every
+    /// result rig's log line, for nothing.
+    #[test]
+    fn a_result_rig_sends_as_written_is_left_alone() {
+        for result in [
+            "pong:ping",
+            "",
+            r#"{"status": 200, "body": "ok"}"#,
+            r#"[{"response": "not at the top level"}]"#,
+            r#"{"type": "image", "data": "iVBORw0KGgo="}"#,
+            r#"ToolCallError: {"response": "not JSON as a whole"}"#,
+        ] {
+            assert_eq!(as_written(result), Flow::cont(), "{result}");
+        }
+    }
+
+    /// A result rig would reshape goes back to it as a rewrite to the same
+    /// text, which it sends as written (#253).
+    #[test]
+    fn a_result_rig_would_reshape_is_rewritten_to_itself() {
+        for result in [
+            r#"{"request": {"url": "/api/health"}, "response": {"status": 200}}"#,
+            r#"{"response": "Blue.", "done": true, "done_reason": "length"}"#,
+            r#"{"response": "Rendered.", "parts": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}"#,
+            r#"{"parts": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}"#,
+            r#"{"type": "image", "data": "https://example.com/x.png", "mimeType": "image/png"}"#,
+        ] {
+            assert_eq!(as_written(result), Flow::rewrite_result(result), "{result}");
+        }
     }
 
     /// A cut-short turn has to carry *why* out of the loop. Flattening both
@@ -1993,6 +2592,61 @@ mod tests {
         assert!(stopped.reason().contains("(52)"), "got: {stopped:?}");
     }
 
+    /// #309: a subagent's round that ended early printed the primary's lines,
+    /// unlabeled, with advice about the primary's conversation -- `/reset`
+    /// cleared the primary's history. The round's end now carries its label,
+    /// as its tool calls do, and no advice, whichever the turn would have
+    /// given.
+    #[test]
+    fn a_subagent_round_ends_under_its_label_without_advice() {
+        let injections: InjectionSource = Arc::new(|_: &TurnUndo| Vec::new());
+        let hook = OutrigPromptHook::for_subagent(10, "probe", injections);
+
+        for advice in [PARTIAL_HISTORY_RETAINED, HISTORY_UNCHANGED] {
+            assert_eq!(
+                hook.turn_end_notice("tool-call iteration max (10) reached", None, advice),
+                "[outrig]   [probe] tool-call iteration max (10) reached; ending turn"
+            );
+        }
+        assert_eq!(
+            hook.turn_end_notice(
+                "every model candidate failed",
+                Some("  fast -- HTTP 503"),
+                HISTORY_UNCHANGED
+            ),
+            "[outrig]   [probe] every model candidate failed; ending turn\n\
+             [outrig]   [probe] tried:\n  fast -- HTTP 503"
+        );
+    }
+
+    /// The primary's turn ends with the lines the REPL has always printed,
+    /// advice included.
+    #[test]
+    fn the_primary_turn_ends_with_its_advice() {
+        let hook = OutrigPromptHook::new(10);
+
+        assert_eq!(
+            hook.turn_end_notice(
+                "tool-call iteration max (10) reached",
+                None,
+                PARTIAL_HISTORY_RETAINED
+            ),
+            "[outrig] tool-call iteration max (10) reached; ending turn\n\
+             [outrig] partial history retained -- send another prompt (e.g. \"continue\") \
+             to keep going, or \"/reset\" to drop it."
+        );
+        assert_eq!(
+            hook.turn_end_notice(
+                "every model candidate failed",
+                Some("  fast -- HTTP 503"),
+                HISTORY_UNCHANGED
+            ),
+            "[outrig] every model candidate failed; ending turn\n\
+             [outrig] tried:\n  fast -- HTTP 503\n\
+             [outrig] history unchanged -- send the prompt again to retry, or \"/quit\" to stop."
+        );
+    }
+
     /// Both turn paths read the stop cause straight off the hook, so a hook
     /// that stopped nothing is what makes an ordinary turn report no cause.
     /// Were it to report one, every normal round would hand its parent a
@@ -2014,6 +2668,52 @@ mod tests {
             observer.stop_reason().as_deref(),
             Some("tool-call iteration max (50) reached")
         );
+    }
+
+    /// What a turn's tool calls changed is undone for exactly the calls the
+    /// history did not keep, newest first, and only once the turn's last
+    /// handle is gone: rig holds two of its own, in the hook it was given and
+    /// in the extensions its tool calls read.
+    #[test]
+    fn a_turn_undoes_what_its_history_did_not_keep_newest_first() {
+        let undone = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = |undo: &TurnUndo, call: u32| {
+            let undone = undone.clone();
+            undo.record(move || undone.lock().expect("undone poisoned").push(call));
+        };
+        let take = || std::mem::take(&mut *undone.lock().expect("undone poisoned"));
+
+        // The checkpoint carries the first call, and the history keeps the
+        // checkpoint. The two calls after it ran in a batch it never got.
+        let undo = TurnUndo::default();
+        record(&undo, 1);
+        undo.carry();
+        record(&undo, 2);
+        record(&undo, 3);
+        undo.keep_carried();
+        let rigs = undo.clone();
+        drop(undo);
+        assert!(take().is_empty(), "nothing is undone while a handle is left");
+        drop(rigs);
+        assert_eq!(take(), [3, 2]);
+
+        // The history keeps rig's whole transcript.
+        let undo = TurnUndo::default();
+        record(&undo, 1);
+        undo.carry();
+        record(&undo, 2);
+        undo.keep_all();
+        drop(undo);
+        assert!(take().is_empty());
+
+        // The history keeps nothing -- the turn errored -- so a call the
+        // checkpoint carried is undone too.
+        let undo = TurnUndo::default();
+        record(&undo, 1);
+        undo.carry();
+        record(&undo, 2);
+        drop(undo);
+        assert_eq!(take(), [2, 1]);
     }
 
     #[test]

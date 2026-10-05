@@ -187,7 +187,9 @@ fn header_template(family: Family) -> &'static str {
     }
 }
 
-fn toolchain_fragment(t: Toolchain, family: Family) -> Option<&'static str> {
+/// The install lines `render` emits for toolchain `t` on `family`, or `None`
+/// for `Toolchain::None`.
+pub(crate) fn toolchain_fragment(t: Toolchain, family: Family) -> Option<&'static str> {
     let frag = match (t, family) {
         (Toolchain::Rust, Family::Debian) => RUST_DEBIAN,
         (Toolchain::Rust, Family::Alpine) => RUST_ALPINE,

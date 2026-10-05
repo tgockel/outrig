@@ -36,7 +36,9 @@ use crate::cli::volume_arg::CliVolume;
 use crate::cli::watcher::{LABEL_INSTANCE, SessionWatcher, SidecarRef};
 use crate::error::{CliError, OutrigError, Result};
 use crate::llm;
-use crate::paths::{default_session_root, repo_root_from_config_path};
+use crate::paths::{
+    RepoConfig, default_session_root, refuse_home_workspace, repo_config_path,
+};
 use crate::session::{self, Session, SessionId, SessionStore};
 use outrig::config::{
     Config, ImageConfig, McpServerSpec, MountConfig, NetworkMode, SidecarOnFailure, SidecarStart,
@@ -95,7 +97,7 @@ fn format_elapsed(duration: Duration) -> String {
 /// Inputs to [`setup`]. Borrowed to keep the call site cheap; the lifetime
 /// is the caller's stack frame.
 pub struct SessionSetupArgs<'a> {
-    pub repo_cfg_path: &'a Path,
+    pub repo: &'a RepoConfig,
     pub global_cfg_path: &'a Path,
     pub session_root_flag: Option<&'a Path>,
     pub image_flag: Option<&'a str>,
@@ -128,7 +130,8 @@ pub struct SessionSetupArgs<'a> {
     /// `outrig mcp show-merged`, which plans placement (including sidecar
     /// label merges) without launching sidecar containers.
     pub start_sidecars: bool,
-    /// CLI `--env` overlay entries. Consulted during setup only for
+    /// CLI `--env` overlay entries. Setup rejects a `SERVER:` prefix the
+    /// merged plan does not declare, and resolves the overlay only for
     /// entrypoint-stdio sidecars, whose env must be resolved at container
     /// create time (`podman start` carries no `--env`); exec-stdio servers
     /// keep resolving at connect time in [`connect_mcp_clients`].
@@ -255,8 +258,8 @@ pub struct SessionSetup {
     pub session: Session,
     pub log_dir: PathBuf,
     pub store: SessionStore,
-    /// Directory the repo config was resolved against; mid-session sidecar
-    /// starts resolve mount paths against it.
+    /// The repo the session runs against; mid-session sidecar starts resolve
+    /// mount paths without a declaring file against it.
     pub repo_root: PathBuf,
     pub attached: bool,
     /// The session fell through to outrig's built-in default image-config.
@@ -282,20 +285,18 @@ struct AttachResolution {
 /// Run the shared bootstrap. Returns once the container is up, the runtime
 /// user is bootstrapped, and the session directory + log dir exist.
 pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
-    let repo_root = repo_root_from_config_path(args.repo_cfg_path);
+    let repo_root = args.repo.root.clone();
     let span = ProgressSpan::start("loading config");
     let mut cfg = if args.llm_session {
-        Config::load_for_run(
-            &repo_root,
-            Some(args.global_cfg_path),
-            args.agent_flag,
-            args.model_override,
-        )?
+        args.repo
+            .load_for_run(args.global_cfg_path, args.agent_flag, args.model_override)?
     } else {
-        Config::load(&repo_root, Some(args.global_cfg_path))?
+        args.repo.load(args.global_cfg_path)?
     };
     span.done("config loaded");
-    if !args.repo_cfg_path.exists() {
+    // No config of its own at the root means the root is the working
+    // directory by default, whether or not `--config` supplied the settings.
+    if !repo_config_path(&repo_root).exists() {
         eprintln!(
             "[outrig] no repo config found; using current directory as workspace ({})",
             repo_root.display()
@@ -315,6 +316,11 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         Some(target) => Some(resolve_attach_target(target, args.image_flag, &store)?),
         None => None,
     };
+    // A workspace no config declared is outrig's pick, and outrig never picks
+    // the home directory or one above it. An attached session mounts nothing.
+    if attach.is_none() && cfg.workspace.declared_host_path().is_none() {
+        refuse_home_workspace(&cfg.workspace.resolved_host_path(&repo_root), &repo_root)?;
+    }
     let network_mode = args.network_mode_override.unwrap_or(cfg.network.mode());
     if attach.is_some() && matches!(network_mode, NetworkMode::Audit | NetworkMode::Filter) {
         return Err(OutrigError::Configuration(
@@ -402,7 +408,9 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             Some(image)
                 if builtin_image::is_reserved(image) && !cfg.images.contains_key(image) =>
             {
-                fall_back_to_builtin(&mut cfg, false);
+                // A veto surfaces below as the name not resolving, after the
+                // note naming the block -- accurate, since they typed it.
+                let _ = fall_back_to_builtin(&mut cfg, false);
                 (image.to_string(), false)
             }
             Some(image) => (image.to_string(), true),
@@ -415,18 +423,17 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
             {
                 Some(image) => (image, false),
                 None => match fall_back_to_builtin(&mut cfg, true) {
-                    Some(name) => (name.to_string(), false),
-                    // A reserved *sidecar* name is declared but the matching
-                    // image-config is not, so injection was vetoed and there is
-                    // nothing to fall back to. Say what the session lacks
-                    // rather than naming a block the user never wrote.
-                    None => {
-                        return Err(OutrigError::Configuration(
-                            "no --image or default-image configured, and outrig's built-in \
-                             default is shadowed by a [sidecars.<name>] block using one of \
-                             its reserved names"
-                                .to_string(),
-                        )
+                    Ok(name) => (name.to_string(), false),
+                    // A reserved name other than `[images.outrig-default]` is
+                    // declared, so injection was vetoed and there is nothing to
+                    // fall back to. Name the block that did it -- the one the
+                    // note above names -- rather than one the user never wrote.
+                    Err(block) => {
+                        return Err(OutrigError::Configuration(format!(
+                            "no --image or default-image configured, and {block} shadows \
+                             outrig's built-in default, leaving no [images.outrig-default] \
+                             to fall back to"
+                        ))
                         .into());
                     }
                 },
@@ -643,6 +650,7 @@ pub async fn setup(args: SessionSetupArgs<'_>) -> Result<SessionSetup> {
         instance_salt: &instance_salt,
         cfg: &cfg,
         repo_root: &repo_root,
+        image_cfg_name: &image_cfg_name,
         image_cfg: &image_cfg,
         image_tag: &image_tag,
         sid: &sid,
@@ -713,6 +721,7 @@ struct SidecarPhaseArgs<'a> {
     repo_root: &'a Path,
     /// See [`SessionContainers::instance_salt`].
     instance_salt: &'a str,
+    image_cfg_name: &'a str,
     image_cfg: &'a ImageConfig,
     image_tag: &'a ImageTag,
     sid: &'a SessionId,
@@ -788,8 +797,8 @@ pub(crate) async fn launch_declared_sidecar(
 }
 
 /// Build the placement plan (config + primary and sidecar label merges),
-/// start `start = "auto"` sidecars, and attach the network interceptor to
-/// every running container.
+/// check `--env SERVER:` names against it, start `start = "auto"` sidecars,
+/// and attach the network interceptor to every running container.
 ///
 /// Failure routing: image-ensure / start / bootstrap / interceptor-attach
 /// failures on a sidecar follow its `on-failure` (`warn` logs, drops the
@@ -850,6 +859,11 @@ async fn setup_sidecars_and_network(
 
         to_start.push((name, tag, sc));
     }
+
+    // Every label has merged, so the plan is complete. Checked here rather
+    // than after `setup` returns so an undeclared name takes `setup`'s abort
+    // path, which stops the containers and finalizes the session record.
+    check_env_servers(args.cli_env, &plan, args.image_cfg_name)?;
 
     // Phase C -- start the auto sidecars concurrently, inserting in name order.
     start_auto_sidecars(&plan, &args, to_start, containers).await?;
@@ -933,6 +947,25 @@ async fn resolve_sidecar_images(
     .await
     .into_iter()
     .collect()
+}
+
+/// Reject an `--env SERVER:KEY=VALUE` naming a server the full merged plan
+/// does not declare. A server in a sidecar the session does not start still
+/// counts: a manual sidecar's servers get the overlay from `/sidecar add`.
+fn check_env_servers(
+    cli_env: &CliEnvEntries,
+    plan: &SessionMcpPlan,
+    image_cfg_name: &str,
+) -> Result<()> {
+    for name in cli_env.per_server_names() {
+        if !plan.servers.contains_key(name) {
+            return Err(OutrigError::Configuration(format!(
+                "--env {name}:...: image '{image_cfg_name}' has no MCP server '{name}'"
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Start the `start = "auto"` sidecars concurrently, then insert them into
@@ -1289,8 +1322,11 @@ async fn create_one_entrypoint_sidecar(
     let ctx = args.start_ctx();
     let mut launch = sidecar_launch_base(&ctx, sc);
     let (_, env_spec) = spec.normalize();
-    let env =
-        outrig::resolve_mcp_env(server_name, env_spec, &args.cli_env.for_server(server_name))?;
+    let env = outrig::resolve_mcp_env_values(
+        server_name,
+        env_spec,
+        &args.cli_env.for_server(server_name),
+    )?;
     let intercept_dns = args.network_mode != NetworkMode::Default;
 
     // A `view = "primary"` sidecar runs `outrig-enter` as its ENTRYPOINT (set in
@@ -1318,7 +1354,7 @@ async fn create_one_entrypoint_sidecar(
     let span = ProgressSpan::start(format!("creating sidecar {} (entrypoint held)", sc.name));
     let options = ContainerCreateOptions::new(tag.clone(), launch, container_name)
         .with_transcript(args.transcript.cloned())
-        .with_env(env)
+        .with_resolved_env(env)
         .with_intercept_dns(intercept_dns)
         .with_args(create_args);
     let container = Container::create_initialized(options).await?;
@@ -1697,5 +1733,46 @@ mod tests {
                 .contains("image-config \"\" does not match any [images.<name>]"),
             "unexpected error: {err}"
         );
+    }
+
+    /// [`check_env_servers`] against a plan declaring `fs` on the primary and
+    /// `lint` in a `start = "manual"` sidecar the session does not start.
+    fn check_env(raw: &[&str]) -> Result<()> {
+        let cfg: Config = toml::from_str(
+            r#"
+[sidecars.lint]
+image = "mcp-lint-img"
+start = "manual"
+
+[images.x]
+dockerfile = "D"
+context = "."
+
+[images.x.mcp]
+fs   = ["mcp-fs", "/w"]
+lint = { command = ["mcp-lint"], sidecar = "lint" }
+"#,
+        )
+        .expect("config parses");
+        let plan = sidecar::plan_from_config(&cfg, &cfg.images["x"]);
+        let raw: Vec<String> = raw.iter().map(|entry| entry.to_string()).collect();
+        let cli_env = CliEnvEntries::parse(&raw).expect("--env entries parse");
+        check_env_servers(&cli_env, &plan, "x")
+    }
+
+    #[test]
+    fn an_env_server_the_plan_does_not_declare_is_rejected() {
+        let err = check_env(&["fs:A=1", "nope:DEBUG=1"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "configuration: --env nope:...: image 'x' has no MCP server 'nope'"
+        );
+    }
+
+    #[test]
+    fn declared_servers_global_entries_and_no_entries_pass_the_env_check() {
+        check_env(&["fs:A=1", "lint:B=2"]).expect("a manual sidecar's server is declared");
+        check_env(&["GLOBAL=1"]).expect("a global entry names no server");
+        check_env(&[]).expect("an empty overlay names no server");
     }
 }

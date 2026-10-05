@@ -66,3 +66,45 @@ async fn build_then_cache_hit_under_100ms() {
         "cache hit should be near-instant, took {elapsed:?}"
     );
 }
+
+/// A `${VAR}` build-arg goes to buildah as a bare `--build-arg KEY`, the value
+/// in buildah's own environment rather than on its command line. buildah's
+/// man page does not document that form; this is what pins it.
+#[tokio::test]
+async fn a_referenced_build_arg_reaches_buildah_by_name() {
+    common::init_tracing();
+
+    let var = "OUTRIG_E2E_IMAGE_BUILD_REFERENCED";
+    // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+    // races; no other test reads or writes this name.
+    unsafe { std::env::set_var(var, "by-name-324") };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = dir.path();
+    let marker = ctx
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("tempdir path should have a UTF-8 filename");
+    std::fs::write(
+        ctx.join("Dockerfile"),
+        format!(
+            "FROM docker.io/library/alpine:latest\n# cache-bust: {marker}\nARG PROBE\n\
+             RUN test \"$PROBE\" = by-name-324\n",
+        ),
+    )
+    .expect("write Dockerfile");
+
+    let mut cfg = common::fixture_build_config();
+    cfg.build_args = std::collections::BTreeMap::from([(
+        "PROBE".to_string(),
+        outrig::config::EnvValue::EnvRef(var.to_string()),
+    )]);
+
+    let built = image::ensure_image(&cfg, ctx, false)
+        .await
+        .expect("the RUN sees the referenced value");
+
+    let _ = std::process::Command::new("buildah")
+        .args(["rmi", built.tag.as_str()])
+        .output();
+}

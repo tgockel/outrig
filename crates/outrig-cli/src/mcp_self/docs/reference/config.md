@@ -129,13 +129,29 @@ Accepted modes:
 - `audit`: allow all outbound session-container traffic, but write Zeek `conn.log`-style
   records to `<session_dir>/logs/network.jsonl`.
 - `filter`: install the same interceptor as audit mode, write the same audit log, and enforce
-  global allow/deny policy before opening upstream TCP connections.
+  global allow/deny policy before opening upstream TCP connections. Traffic the interceptor
+  cannot carry -- UDP to any port but 53, ICMP, anything else -- follows `default` directly.
 
 Audit and filter mode require host `nft` and `nsenter` plus permission to enter the rootless podman
 container's user/network namespaces. It rewrites the session container's `/etc/resolv.conf` to
 send DNS to the per-session in-namespace DNS listener, installs nftables redirection for
-outbound TCP and UDP/53, and removes the nftables table during teardown. If either mode is
-requested and setup fails, the session fails before MCP servers launch.
+outbound TCP and UDP/53 over both IPv4 and IPv6, and removes the nftables table during teardown.
+A lookup a tool sends to some other resolver address, such as `dig @8.8.8.8`, is redirected to
+the same listener and answered from the address it was sent to. The listener forwards each
+lookup on its own, up to 64 at once per container, so one name a host resolver is slow to answer
+does not hold up the container's other lookups. If either mode is requested and setup fails, the
+session fails before MCP servers launch.
+
+Lookups are forwarded to the host's own resolvers: the `nameserver` entries in the host's
+`/etc/resolv.conf`, in order. Forwarding happens in the host's network namespace, so a loopback
+entry answers just as it does for the host. On a host using systemd-resolved, that entry is its
+stub, `127.0.0.53`, and resolved routes each container lookup as it routes the host's own: a
+name in a VPN's routing domain goes to the VPN's server. A bare single-label name such as `nas`
+can reach resolved as it is, since the resolver interception installs names none of the host's
+search domains, and resolved does not look such a name up over DNS by default -- name such a
+host in full. When `/etc/resolv.conf` is missing or names no nameserver, the listener uses the
+upstream servers systemd-resolved lists in `/run/systemd/resolve/resolv.conf` instead. If
+neither file names a resolver, setup fails rather than choosing one on the host's behalf.
 
 Filter policy lives in the global config only:
 
@@ -157,6 +173,15 @@ Filter evaluation checks `deny` entries first, then `allow` entries, then `defau
 connections are closed immediately and still write an audit record with
 `outrig.action = "deny"`, `outrig.rule`, and zero byte counts. `mode = "filter"` requires at
 least one `allow` or `deny` entry, even when `default = "allow"`.
+
+`allow` and `deny` entries match TCP connections, which the interceptor carries and can name a
+host for. Anything else the container sends -- UDP to any port but 53, which is how QUIC and so
+HTTP/3 travel, ICMP, any other transport -- matches no entry and takes `default` directly. Under
+`default = "deny"` the kernel drops it, by a rule in the same nftables table: the sending tool
+fails at once with "Operation not permitted" rather than reaching the network. Such a datagram
+never reaches the interceptor, so it writes no `network.jsonl` record. Under `default = "allow"`,
+and in audit mode, it leaves by podman's default route, unrecorded. DNS over UDP/53 and traffic
+between processes in the container over loopback are carried either way.
 
 ### What a hostname rule matches
 
@@ -413,10 +438,11 @@ governs it.
 
 When every candidate has failed the report names each one's reason, and what ends depends
 on why. If at least one failed recoverably -- a rate limit, an unusable response -- the
-**turn** ends and the prompt can be sent again. If every one was terminal, such as a `401`
-at each vendor, the **session** ends, exactly as that failure ends it for a single model:
-no resend can satisfy credentials that are refused everywhere. `outrig run-new` ends the
-round either way, and its session goes on.
+**turn** ends, keeping any tool calls it had already run, and can be continued, or sent
+again if it failed on its first call. If every one was terminal, such as a `401` at each
+vendor, the **session** ends, exactly as that failure ends it for a single model: no resend
+can satisfy credentials that are refused everywhere. `outrig run-new` ends the round either
+way, and its session goes on.
 
 A single-target alias is pure renaming, so it keeps its target's own errors -- an unset key
 still names the variable rather than becoming one line of a list.
@@ -597,9 +623,9 @@ container-path = "/resources/cache"
 access         = "read-write"
 ```
 
-- `host-path` (path, optional, default: `"."`): primary workspace host path. A
-  relative value resolves against the directory of the file that declared it --
-  see [path resolution](#path-resolution).
+- `host-path` (path, optional, default: `"."`): primary workspace host path, an
+  existing directory. A relative value resolves against the directory of the
+  file that declared it -- see [path resolution](#path-resolution).
 - `container-path` (path, optional, default: `"/workspace"`): where the primary
   workspace is mounted in the container.
 - `workspace.mounts` (array, optional, default: `[]`): extra directory bind-mounts.
@@ -644,8 +670,11 @@ name must be a valid container image repository component -- see the validation 
 - `context` (path, required\*): path to the build context, same rule.
 - `build-args` (table str->str, optional, default: `{}`): extra Dockerfile `ARG`s.
   Keys are ARG names. Values are either literal strings or `${VAR}` references resolved
-  from the host environment at `outrig build` time; see the MCP `env` value syntax
-  below.
+  from the host environment at `outrig build` time. A reference reaches buildah by name and
+  outrig shows it only as the reference, as the
+  [MCP `env` value syntax](#mcp-env-value-syntax) below describes for podman. buildah itself
+  records every build-arg a `RUN` step sees, value included, in the image's history
+  (`podman history --no-trunc`), so a build-arg does not keep a secret out of the image.
 
 ### Use-existing-image (new form)
 
@@ -812,8 +841,10 @@ image, or declare any other MCP command that should run inside the container.
 - `command` (array of strings, required unless using the short form or the entrypoint-stdio
   form): argv of the MCP server.
 - `env` (table str->str, optional, default: `{}`): env vars set on the `podman exec`
-  invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env` (visible
-  to `podman inspect` on the host, like exec argv).
+  invocation -- or, for entrypoint-stdio servers, baked in via `podman create --env`, which
+  stores them in the container's config, visible to `podman inspect` on the host. A `${VAR}`
+  value reaches podman by name rather than on its command line; see the
+  [value syntax](#mcp-env-value-syntax).
 - `sidecar` (string, optional): run this server in the named
   [`[sidecars.<sc>]`](#sidecarssc) container instead of the primary.
   With `command`, the server is exec-stdio in that container; *without* `command`, that
@@ -854,7 +885,8 @@ Notes:
 - The server name appears in `outrig logs <session> <server>` and as the prefix on every tool
   the server advertises (`<server>__<tool>`).
 - Each `env` value is either a literal string forwarded verbatim or a `${VAR}` reference
-  resolved from the host environment at MCP startup -- see the subsection below.
+  resolved from the host environment at MCP startup and shown only as the reference -- see the
+  subsection below.
 - Images can provide the same table via their `org.outrig.mcp` OCI label (placement keys are
   repo-config-only and rejected in labels). Repo config entries override image entries by
   server name; see
@@ -958,6 +990,45 @@ verbatim, including malformed-looking references (lower-case names, unmatched br
 embedded substitution). If the named host env var is unset when the MCP server is about to
 start, MCP startup fails with an error naming the variable, the server, and the env key.
 
+A reference's value stays out of what outrig prints and off podman's command line, which any
+local user can read with `ps` for as long as the command runs -- for an exec-stdio server, the
+whole session. outrig's errors, the `--verbose` transcript (`container.log` and the terminal),
+and the `RUST_LOG=debug` log all show the entry as `GH_TOKEN=${GITHUB_TOKEN}`, the way the
+config wrote it. podman is given a bare `--env GH_TOKEN`, with the value in podman's own
+environment, which only your user can read, and copies it into the container from there.
+`build-args` reach buildah the same way, as a bare `--build-arg`.
+
+The exception is a key podman or buildah would read from that environment themselves, where
+setting it would change what they do. Such a key keeps its value on the command line, though
+outrig still shows it as the reference:
+
+- process and locale: `HOME`, `PATH`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TZ`,
+  `TZDIR`, `LANG`, `LANGUAGE`, `SUDO_USER`, `container`, and any key starting `LC_`, `LD_`,
+  `XDG_`, or `CLICOLOR`
+- proxies: any key ending `_PROXY`, in either case
+- the Go runtime and its TLS roots: `GODEBUG`, `GOGC`, `GOMAXPROCS`, `GOMEMLIMIT`,
+  `GOTRACEBACK`, `SSL_CERT_FILE`, `SSL_CERT_DIR`
+- systemd and D-Bus: `NOTIFY_SOCKET`, `INVOCATION_ID`, `JOURNAL_STREAM`, and any key starting
+  `LISTEN_`, `WATCHDOG_`, or `DBUS_`
+- the containers stack: `REGISTRY_AUTH_FILE`, `REGISTRIES_CONFIG_PATH`, `GNUPGHOME`,
+  `SSH_AUTH_SOCK`, `SOURCE_DATE_EPOCH`, `BUILD_REGISTRY_SOURCES`, `CI_DESIRED_DATABASE`,
+  `SUPPRESS_BOLTDB_WARNING`, `DISABLE_HC_SYSTEMD`, `LOGLEVEL`, `OPT`, `MOBY_DISABLE_PIGZ`,
+  `BBOLT_VERIFY`, `BURNTSUSHI_TOML_110`, and any key starting `CONTAINER_`, `CONTAINERS_`,
+  `STORAGE_`, `BUILDAH_`, `PODMAN_`, `DOCKER_`, `CNI_`, or `OCICRYPT_`
+- internal markers: any key starting `_`, such as `_PODMAN_PAUSE` or `_CONTAINERS_*`
+
+The list covers what podman 4.9 and 5.7 and buildah 1.33 and 1.42 read, including the libraries
+they are built from.
+
+A proxy key that references the variable of its own name, such as
+`HTTPS_PROXY = "${HTTPS_PROXY}"`, is passed by name all the same: podman and buildah already
+have that value and read proxies as they find them. No other key on the list is, even
+self-referenced, because the engine may rewrite its own copy first -- buildah makes a relative
+`TMPDIR` absolute. A key that is not a plain variable name (`^[A-Za-z_][A-Za-z0-9_]*$`) keeps
+its value on the command line too. To keep a secret off it, give the secret a key outside these.
+
+outrig cannot redact what the server, or a build step, prints itself.
+
 See [Concepts -> MCP Servers](../concepts/mcp-servers.md).
 
 ## Resolution: which file wins
@@ -1004,13 +1075,26 @@ concatenated `workspace.mounts` list can hold entries with different base direct
 | Declared in                  | Relative paths resolve against         |
 |------------------------------|----------------------------------------|
 | `.agents/outrig/config.toml` | the repo root                          |
+| `--config <path>`            | `<path>`'s parent directory            |
 | `~/.outrig/config.toml`      | that file's directory (`~/.outrig/`)   |
 | `--global-config <path>`     | `<path>`'s parent directory            |
+
+A `--config` path that ends in `.agents/outrig/config.toml` is that repo's own config and takes the
+first row; any other takes the second. See
+[Reference -> CLI](https://tgockel.github.io/outrig/reference/cli.html#global-flags).
 
 Absolute paths are used as-is and ignore the rule entirely. This applies to
 `[images.<name>].dockerfile` and `.context`, to `[workspace].host-path`, and to `host-path` in
 both `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]`. Because `[workspace]` merges per key,
 a `host-path` inherited from the global file resolves beside that file, not from the repo root.
+
+A path whose first component is `~` starts from your home directory instead: `~` alone is the
+home directory, and `~/.cache/example` a directory inside it. Like an absolute path, it means the
+same place whichever file declares it. The `~` has to be the whole first component, so
+`~alice/src` is an ordinary relative path, and `./~/src` reaches a directory really named `~`.
+Nothing else is expanded: the `${VAR}` form that `api-key`, `build-args`, and MCP `env` accept is
+literal in a path. Your home directory is `$HOME`, or your passwd entry's when `HOME` is unset or
+empty; without either, `~` is an ordinary directory name too.
 
 Provenance is recorded, not written back. A merged config is a flattened snapshot: re-serializing
 one emits each inherited path as the literal text its source file used, without the base
@@ -1023,10 +1107,10 @@ The practical effect is that a global `[images.<name>]` can use the build shape:
 and context live beside `~/.outrig/config.toml` and are found from any repo on the machine.
 
 Because provenance is recorded per entry, a diagnostic about a config-declared path names the
-file that declared it, as a trailing `(declared in "<path>")`. Every image and mount rule
-carries it -- including the mount rules that judge the value rather than look for a directory,
-since the question it answers is which file to go edit. The reported path stays the raw config
-value rather than the resolved one:
+file that declared it, as a trailing `(declared in "<path>")`. Every image,
+`[workspace].host-path`, and mount rule carries it -- including the mount rules that judge the
+value rather than look for a directory, since the question it answers is which file to go edit.
+The reported path stays the raw config value rather than the resolved one:
 
 ```
 workspace mount host-path "shared" does not exist (declared in "/home/you/.outrig/config.toml")
@@ -1193,16 +1277,18 @@ image-config in the merged config but does not require agent/model/provider wiri
 - An entrypoint host hosts exactly one MCP server and must be `start = "auto"`.
 - `args` is rejected in an `org.outrig.mcp` label and in standalone `image.toml`, alongside the
   placement keys: labels declare exec-stdio servers, whose arguments belong in `command`.
-- `dockerfile` and `context` must exist on disk, resolved against the declaring file's directory
-  (build path only). The error names both the path as written and the file that declared it.
+- `dockerfile` and `context` must exist on disk, resolved against the declaring file's directory,
+  or your home directory for a leading `~` (build path only). The error names both the path as
+  written and the file that declared it.
 - Each `[images.<name>]` must set exactly one of: `image-name`, or `dockerfile` + `context`.
   Setting both shapes, neither, `image-name` with `build-args`, or only one of
   `dockerfile`/`context` without the other is an error.
 - `image-name` must not be empty.
 - A build-from-Dockerfile `[images.<name>]` block key must be a valid container image
-  repository component -- lowercase alphanumeric separated by `.`, `_`, or `-`
-  (`^[a-z0-9]+([._-]+[a-z0-9]+)*$`) -- because it becomes the built image's repository.
-  Image-name configs are exempt: their block key is just a label.
+  repository component -- lowercase letters and digits, separated by one `.`, one or two `_`,
+  or a run of `-` (`^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$`), the separators podman accepts --
+  because it becomes the built image's repository. Image-name configs are exempt: their block
+  key is just a label.
 - Every `[images.<name>.security].capability-profile`, if set, must be one of
   `default`, `no-net-raw`, or `drop-all`.
 - Every capability name in `cap-drop` or `cap-add` must be non-empty and match
@@ -1230,8 +1316,10 @@ image-config in the merged config but does not require agent/model/provider wiri
   entry would be several paths wearing one entry's clothes; declare one path per entry.
 - Unmask paths must not be duplicated within one `unmask` list.
 - `session-root`, if set, must be an absolute path; outrig creates it if missing.
-- Every `workspace.mounts[*].host-path`, if validated with a repo root, must exist and be a
-  directory. Relative host paths resolve against the declaring file's directory.
+- `workspace.host-path` and every `workspace.mounts[*].host-path`, if validated with a repo root,
+  must exist and be a directory. Relative host paths resolve against the declaring file's
+  directory, and a leading `~` is your home directory; an undeclared `workspace.host-path` is
+  `.`, the repo root.
 - Every `workspace.mounts[*].container-path` must be absolute and must not be `/`.
 - Extra workspace mount `container-path` values must be unique, including no collision with the
   primary workspace `container-path`.

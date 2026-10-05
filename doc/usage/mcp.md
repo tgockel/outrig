@@ -43,8 +43,9 @@ outrig mcp self
   choose Podman's default networking, network audit logging, or global network filtering for
   this fresh session.
 - `--session-dir <path>` (default: `<session-root>/<sid>`): writes to a known path.
-- `--config <path>` (default: walks up from cwd; if not found, run config-less): path to repo
-  `config.toml`.
+- `--config <path>` (default: walks up from cwd; if not found, run config-less): read the repo
+  config from this file instead. See [Reference -> CLI](../reference/cli.md#global-flags) for
+  which repo the session runs against.
 - `--global-config <path>` (default: `~/.outrig/config.toml`): path to global config.
 - `--session-root <path>` (default: config, then XDG data directory): root for all sessions.
 - `--volume <host:container[:ro|rw]>` (repeatable): bind an extra host directory into the
@@ -93,7 +94,9 @@ only to explicit `--image` values and to raw image refs saved in session records
 config. With no agent it resolves no model and no provider either, so a working podman is all
 it needs -- the built-in default supplies the image and two MCP servers. Pass
 `--image <local-ref>` to proxy a different image instead; its proxied MCP servers come from
-that image's `org.outrig.mcp` labels.
+that image's `org.outrig.mcp` labels. As with `outrig run`, the current directory can't be your
+home directory or one above it unless a config declares `[workspace] host-path` -- so an MCP
+client that starts outrig in `/` or `~` needs `--config` naming a repo.
 
 With `--attach`, image-config selection is different:
 
@@ -196,7 +199,8 @@ session's copy or with another attacher.
 
 Put `outrig` on `PATH`, or use an absolute path to the binary in each client config.
 MCP clients may start servers with a different working directory than your shell, so
-passing an absolute `--config` path is the least surprising setup.
+passing the absolute path of the repo's `.agents/outrig/config.toml` as `--config` is the least
+surprising setup.
 
 Claude Code can add a stdio server from the command line:
 
@@ -282,8 +286,9 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
 ## What Happens, in Order
 
 1. **Locate config.** Walks up from the current directory until
-   `.agents/outrig/config.toml` is found, or fails. The MCP host's `cwd` therefore
-   needs to be the repo, or pass `--config <path>` explicitly.
+   `.agents/outrig/config.toml` is found, else runs config-less there. The MCP host's
+   `cwd` therefore needs to be the repo, or pass `--config <repo>/.agents/outrig/config.toml`
+   explicitly.
 2. **Resolve image.** Uses explicit `--image` first. Config entries win; an
    unknown explicit value is treated as a local Podman image ref. Without
    explicit `--image`, top-level `default-image` still names a config block.
@@ -297,11 +302,11 @@ Streamable HTTP protocol and the `/mcp` path over that socket.
    declared sidecar's image is resolved, its label merged (scoped to that sidecar), and
    `start = "auto"` sidecars are started as `outrig-<sid>-<sc>`. An entrypoint-stdio
    sidecar (inline `image`, no `command`) is instead created and initialized with its
-   ENTRYPOINT held un-executed, env baked in via `podman create --env`. Sidecar failures
-   follow the block's `on-failure` key. A `start = "manual"` sidecar stays planned but
-   unstarted -- its servers are skipped with a notice. `outrig mcp` has no mid-session
-   start surface; manual sidecars are started from the `outrig run` REPL
-   (`/sidecar add <name>`) or the library API.
+   ENTRYPOINT held un-executed, env baked in via `podman create --env` (a `${VAR}` value by
+   name, from podman's own environment). Sidecar failures follow the block's `on-failure`
+   key. A `start = "manual"` sidecar stays planned but unstarted -- its servers are skipped
+   with a notice. `outrig mcp` has no mid-session start surface; manual sidecars are started
+   from the `outrig run` REPL (`/sidecar add <name>`) or the library API.
 5. **Start network interception, if enabled.** The interceptor attaches to the primary
    and every sidecar -- including created-but-not-started entrypoint sidecars, whose
    first packet is therefore already subject to policy. Fresh sessions can write

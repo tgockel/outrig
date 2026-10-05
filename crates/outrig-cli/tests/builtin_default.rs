@@ -6,78 +6,18 @@
 //!
 //! Two mechanisms make that true. Every assertion here is about *name
 //! resolution*, which happens before the first podman call -- and for the
-//! commands that would go on to pull, [`run_outrig`] puts a `podman` and
+//! commands that would go on to pull, [`common::run_outrig`] puts a `podman` and
 //! `buildah` that fail immediately on `PATH`. Without that stub,
 //! `outrig build --image outrig-default` really pulls ~300 MB on a cold
 //! machine and then trips the timeout. It also pins `XDG_CACHE_HOME` to a
 //! tempdir so the built-in's materialized Dockerfile never touches the
 //! developer's real `~/.cache/outrig`.
 
-use std::os::unix::fs::PermissionsExt as _;
+mod common;
+
 use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
 
-use tokio::process::Command;
-use tokio::time::timeout;
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// A global config that resolves a model, so a run gets past model wiring and
-/// into the image cascade. The provider is never contacted.
-const GLOBAL_WITH_MODEL: &str = r#"
-default-model = "fast"
-
-[providers.openai]
-style    = "openai"
-base-url = "http://127.0.0.1:1/v1"
-api-key  = "${OUTRIG_TEST_KEY}"
-
-[models.fast]
-provider   = "openai"
-identifier = "test-model"
-"#;
-
-/// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
-/// probes and pulls fail instantly instead of hitting the network.
-fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
-    for name in ["podman", "buildah"] {
-        let stub = dir.join(name);
-        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("write runtime stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod runtime stub");
-    }
-    let mut path = std::ffi::OsString::from(dir);
-    path.push(":");
-    path.push(std::env::var_os("PATH").unwrap_or_default());
-    path
-}
-
-/// Run `outrig` in `cwd` and return whether it succeeded, plus its stderr.
-async fn run_outrig(cwd: &Path, args: &[&str]) -> (bool, String) {
-    let stubs = tempfile::tempdir().expect("tempdir stubs");
-    let cache = tempfile::tempdir().expect("tempdir cache");
-
-    let output = timeout(
-        TEST_TIMEOUT,
-        Command::new(env!("CARGO_BIN_EXE_outrig"))
-            .args(args)
-            .current_dir(cwd)
-            .env("OUTRIG_TEST_KEY", "test-key")
-            .env("PATH", stub_runtime_path(stubs.path()))
-            .env("XDG_CACHE_HOME", cache.path())
-            .stdin(Stdio::null())
-            .output(),
-    )
-    .await
-    .expect("outrig timed out")
-    .expect("spawn outrig");
-
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
+use common::{GLOBAL_WITH_MODEL, run_outrig};
 
 /// Write a repo config and a global config into a fresh tempdir repo.
 fn repo_with(config_toml: &str) -> tempfile::TempDir {
@@ -239,36 +179,60 @@ async fn a_user_declared_reserved_name_wins_and_is_reported() {
         !stderr.contains("using outrig's built-in default"),
         "the built-in must not also claim to be in play: {stderr}"
     );
+    assert!(
+        !stderr.contains("no --image") && !stderr.contains("does not match any"),
+        "the user's own block must still resolve after the veto: {stderr}"
+    );
 }
 
-/// Declaring a reserved *sidecar* name vetoes injection but leaves no
-/// `[images.outrig-default]` behind. The session must say what it lacks rather
-/// than name a block the user never wrote.
+/// Declaring any reserved name but `[images.outrig-default]` vetoes injection
+/// and leaves no `[images.outrig-default]` behind. The session must name the
+/// block that did it -- the one the note names -- rather than one the user
+/// never wrote. It used to blame a `[sidecars.<name>]` block for all four.
+/// Run through `mcp`, which reaches the cascade without resolving a model.
 #[tokio::test]
-async fn a_shadowing_sidecar_reports_the_missing_image_not_a_phantom_block() {
-    let repo =
-        repo_with("[sidecars.outrig-default-fs]\nimage = \"docker.io/library/alpine:latest\"\n");
-    let sessions = tempfile::tempdir().expect("tempdir sessions");
+async fn a_veto_without_a_default_image_names_the_vetoing_block() {
+    for (kind, other, field) in [
+        ("images", "sidecars", "image-name"),
+        ("sidecars", "images", "image"),
+    ] {
+        for name in ["outrig-default-fs", "outrig-default-shell"] {
+            let repo = repo_with(&format!(
+                "[{kind}.{name}]\n{field} = \"docker.io/library/alpine:latest\"\n"
+            ));
+            let sessions = tempfile::tempdir().expect("tempdir sessions");
 
-    let (ok, stderr) = run_outrig(
-        repo.path(),
-        &[
-            "--global-config",
-            &global_arg(repo.path()),
-            "--session-root",
-            sessions.path().to_str().expect("utf-8"),
-            "run",
-        ],
-    )
-    .await;
+            let (ok, stderr) = run_outrig(
+                repo.path(),
+                &[
+                    "--global-config",
+                    &global_arg(repo.path()),
+                    "--session-root",
+                    sessions.path().to_str().expect("utf-8"),
+                    "mcp",
+                ],
+            )
+            .await;
 
-    assert!(!ok, "nothing resolves an image here:\n{stderr}");
-    assert!(
-        stderr.contains("shadowed by a [sidecars.<name>] block"),
-        "the error should explain the veto: {stderr}"
-    );
-    assert!(
-        !stderr.contains("image-config \"outrig-default\" does not match"),
-        "must not name a block the user never wrote: {stderr}"
-    );
+            let block = format!("`[{kind}.{name}]`");
+            assert!(!ok, "{block}: nothing resolves an image here:\n{stderr}");
+            let error = stderr
+                .lines()
+                .find(|line| line.starts_with("error:"))
+                .unwrap_or_else(|| panic!("{block}: no error line: {stderr}"));
+            assert!(
+                error.contains(&block) && error.contains("leaving no [images.outrig-default]"),
+                "the error should name {block} and what it leaves missing: {stderr}"
+            );
+            assert!(
+                !stderr.contains(&format!("[{other}.{name}]"))
+                    && !stderr.contains("[sidecars.<name>]"),
+                "{block}: must not name a block the user never wrote: {stderr}"
+            );
+            assert!(
+                !stderr.contains("image-config \"outrig-default\" does not match"),
+                "{block}: must not name a block the user never wrote: {stderr}"
+            );
+        }
+    }
 }

@@ -217,8 +217,8 @@ let result = agent.run_turn(&line, &mut h).await;
 Two things follow, and they are the two complaints that started this. Nothing can touch history
 mid-round, because during the await it is a local inside a future. And an interrupt loses all of
 it: cancellation drops that future, the write-back never runs, and the cell keeps the empty vector
-`mem::take` left -- which is `plan/next/repl-interrupt-history-loss.md`, "SIGINT silently empties
-conversation history."
+`mem::take` left -- the "SIGINT silently empties conversation history" defect `outrig run`
+carried until 0.2.1 fixed it.
 
 The store owns the history; a round borrows a view of it. That is the same change in both cases.
 
@@ -229,9 +229,9 @@ later model call failed, and a placeholder standing in for a missing tool result
 call did not happen. An unknown outcome stays unknown. Repairing history is not a reason to re-run
 anything that was already accepted.
 
-Worth sequencing with this: `plan/next/partial-turn-history-on-failed-model-call.md` proposes
-accumulating history in the hook so OutRig holds its own copy, and warns the fix is only right "if
-the hook's copy becomes *the* copy rather than a second one." A store makes that true by
+Worth sequencing with this: #197 (partial turn history on a failed model call) proposed
+accumulating history in the hook so OutRig holds its own copy, and warned the fix is only right
+"if the hook's copy becomes *the* copy rather than a second one." A store makes that true by
 construction.
 
 ## Rejected alternatives

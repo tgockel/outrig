@@ -48,7 +48,7 @@ futures-util       = { workspace = true, features = ["std", "async-await", "asyn
 heck               = { workspace = true }
 ignore             = { workspace = true }
 jiff               = { workspace = true, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
-nix                = { workspace = true, features = ["user", "fs", "process", "signal"] }
+nix                = { workspace = true, features = ["user", "fs", "process", "signal", "net", "uio"] }
 rand               = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 regex              = { workspace = true, features = ["std", "perf", "unicode"] }
 # The agent loop's; private, so no rig or reqwest type reaches the public surface.

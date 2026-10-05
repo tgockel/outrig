@@ -26,7 +26,8 @@ outrig build [--image <name>]
 - `--all` (default: off): build every image-config defined in the config file. The built-in
   default is deliberately not among them -- `--all` means the image-configs *you* declared,
   and pulling and building outrig's fallback in every repo would be a surprise.
-- `--config <path>` (default: walks up from cwd): use a non-default config path.
+- `--config <path>` (default: walks up from cwd): read the repo config from this file instead.
+  See [Reference -> CLI](../reference/cli.md#global-flags) for how its paths resolve.
 - `--no-cache` (default: off): force rebuild even on cache hit. Passes `--no-cache`
   to `buildah`.
 
@@ -43,12 +44,19 @@ outrig build [--image <name>]
      ```
      buildah build --tag <image-config-name>:outrig-tmp-... \
                    --file <dockerfile> \
-                   [user build-args] \
+                   [--build-arg KEY=value | --build-arg KEY ...] \
                    <context>
      ```
+     A literal build-arg is passed as `KEY=value`. A `${VAR}` one is passed as a bare `KEY`,
+     with the value in buildah's environment rather than on its command line, and outrig's
+     errors and logs show it as `KEY=${VAR}` -- see
+     [the value syntax](../reference/config.md#mcp-env-value-syntax).
      Then it reads any inherited/Dockerfile `org.outrig.mcp` label, overlays
      `[images.<name>.mcp]`, and commits the final `<image-config-name>:<hash>` image with the
      merged `org.outrig.mcp` label.
+     The temporary tag is then removed, whether or not the build succeeded. If buildah refuses
+     the removal, outrig warns and reissues it in the background rather than leaving the tag
+     behind; the build's own result stands either way.
      The repository is the `[images.<name>]` block key, so the built image is self-describing
      in `podman images`; the `<hash>` is the content-addressed cache key.
 

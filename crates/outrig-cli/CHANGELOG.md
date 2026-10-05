@@ -79,6 +79,306 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that provided it. The default build is unchanged, since the backend was never in it; the
   lockfile loses the several hundred crates that only `--features local-llm` pulled in.
 
+## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.1) - 2026-10-04
+
+The first patch release since 0.2.0: fixes, and one change to the MCP revision `outrig mcp`
+negotiates. Two of the fixes are worth knowing before upgrading. A session whose default
+workspace would be your home directory, or a directory above it, now refuses to start rather than
+mount it read-write; declare `[workspace] host-path` to mount it on purpose. And every build image
+whose context is in a git repository gets a new cache key, so each rebuilds once.
+
+### Changed
+
+- **`outrig mcp` and `outrig mcp self` answer an `initialize` asking for `2026-07-28` in
+  `2025-11-25`.** That revision replaced the handshake with per-request metadata, so an
+  `initialize` cannot grant it; the MCP SDK enforces that since the move to rmcp 3.4. A client
+  speaking `2026-07-28` names it in every request's `_meta` and is answered in it. A revision
+  named that way that outrig does not serve is refused with an error listing the ones it does.
+
+### Fixed
+
+- **`--network filter` with `default = "deny"` let any UDP tool through.** The interceptor's
+  redirects carry TCP and DNS; a datagram of any other kind -- QUIC and so HTTP/3, ICMP, anything
+  else -- left by podman's default route, unfiltered and unrecorded. It is now dropped in the
+  kernel under a deny default, and the sending tool fails at once with "Operation not permitted".
+  Fixed in `outrig`; see that crate's changelog for what the chain accepts. A dropped datagram
+  still writes no `network.jsonl` record; recording them is #419.
+- **A `${VAR}` build-arg or MCP `env` value stays out of outrig's output and `ps`.** A config's
+  `build-args` or `env` entry, or an `--env [SERVER:]KEY=${VAR}`, was resolved before podman or
+  buildah was called and printed as its value wherever the command was. A failed `outrig build`
+  or entrypoint-sidecar create put it on stderr with no flag given -- in CI, into the job log.
+  `-v` wrote it to `container.log` and the terminal, `RUST_LOG=debug` traced it, and every
+  exec-stdio server's `podman exec` carried it on a command line any local user could read for
+  the whole session. Each is now shown as `KEY=${VAR}`, and podman and buildah get the value
+  through their environment instead. A key they read themselves, such as `HOME`, `TMPDIR`, or
+  `HTTPS_PROXY`, keeps its value on their command line, except a proxy variable referencing the
+  variable of its own name; the config reference's MCP `env` value syntax lists them. buildah
+  still records a build-arg's value in the image's history.
+- **A workspace outrig picks by default is never your home directory.** With no config declaring
+  `[workspace] host-path`, the workspace is the repo root, and nothing checked what that was.
+  `outrig run` or `outrig mcp` from `~` with no repo config, an MCP client that started outrig in
+  `/`, or a stray `~/.agents/outrig/config.toml` above the working directory mounted the home
+  directory, or one above it, read-write at `/workspace`, with `~/.ssh` and `~/.gnupg` inside.
+  Such a session now refuses to start, naming the directory and whether a repo config or the
+  current directory chose it. Declaring `host-path`, such as `"~"`, still mounts it on purpose, as
+  `--volume` does.
+- **`--config` reads the file it names.** `outrig run`, `outrig mcp`, and `outrig build` took the
+  directory three levels above the path as the repo and read that repo's
+  `.agents/outrig/config.toml`, never the named file. The two agree only for a path that already
+  ends that way. Any other was ignored without a word: the command ran on whatever config sat
+  three levels up, or none, and for `run` and `mcp` that directory -- for an absolute path, an
+  ancestor such as your home directory -- was mounted read-write as the workspace. The named file
+  is now the one read. One at `<repo>/.agents/outrig/config.toml` still means that repo; any other
+  is read for the repo found from the current directory, as without the flag, and its relative
+  paths resolve beside it, as a `--global-config` file's do. A `--config` that is not an existing
+  file is now an error wherever the flag is read, where `run` and `mcp` started config-less and
+  `ls`, `logs`, `discard`, and `clean` went on without it.
+- **A tool result that is JSON reaches the model as the tool returned it.** rig, which runs the
+  agent loop, read every tool result for structure. One that was a JSON object with a top-level
+  `response` key reached the model as that value alone, with nothing to say the rest was missing:
+  a WireMock stub mapping read through the `fs` server came through without the `request` it
+  matches, and an Ollama reply without the `done_reason` that says it was cut off. One carrying an
+  image -- in a `parts` list, or shaped as one -- was sent as that image. An OpenAI-style provider
+  cannot be sent an image there, nor the native Anthropic one an image given by URL, so the
+  request failed to build and `outrig run` ended, or a subagent's round failed. Every tool result
+  now reaches the model as the text the tool returned.
+- **A subagent round that ends early says so under the subagent's name, without advice meant for
+  your own turn.** When a subagent's round hit its tool-call max or the repeat breaker, or a model
+  call in it failed for good, stderr got the lines printed when the primary's turn ends early,
+  with no label: `[outrig] <reason>; ending turn`, then advice to send the prompt again or
+  `/quit`, to send `continue`, or to `/reset`. That advice acts on the primary's conversation:
+  `/reset` cleared the primary's history, and resending reran the primary's turn. The reason now
+  carries the subagent's label, as its tool calls do, and the advice is left out, since what a
+  subagent does next is its parent's call.
+- **A follow-up sent to a busy subagent after it reported gets an answer.** `outrig__subagent_send`
+  to a subagent whose round had already called `outrig__set_result` reached its model on the next
+  tool result, but the round still counted the earlier report as its answer. When the subagent
+  then ended the round without reporting again, `outrig__get_result` for a parent that had read
+  the report waited until interrupted, and `outrig__wait_results` never listed the subagent. The
+  parent now reads `subagent stopped without calling outrig__set_result`, as it does for a
+  follow-up that started a round of its own; a parent that had not read the report yet gets the
+  report first.
+- **A subagent's report outlasts a failure later in its round.** When a subagent reported with
+  `outrig__set_result` and a model call after that failed for good -- a rate limit or outage that
+  outlasted `retry-budget-secs`, every candidate in an alias chain failing, a response outrig
+  could not use, a request the endpoint refused -- `round failed: <reason>` was published over
+  the report. A parent that read once the round was over was told the round failed, and the report
+  was gone from the inbox and from the transcript's outcome; one that read sooner got the report,
+  then the failure. The report now stands, and the failure is noted beside it, on stderr and in
+  the subagent's transcript. A message the parent sent after the report is still answered with
+  the failure, since the report could not have answered it.
+- **A turn that produced only reasoning reaches the next request on an OpenAI-style provider.**
+  With `style = "openai"`, a turn whose reply was nothing but reasoning, such as one cut off at
+  the output-token ceiling, stayed in the conversation but was left out of every later request,
+  a subagent's later rounds included. The prompts on either side of it reached the model as two
+  user messages in a row: the model answered without knowing it had taken that turn, and an
+  endpoint that requires alternating roles refused the next prompt with a `400` that ended
+  `outrig run`. The turn is now sent as an assistant reply with no text and its reasoning in
+  `reasoning_content`, as reasoning beside text already was. The advice printed after such a turn
+  no longer asks you to restate what you need rather than refer back to it; it says instead that
+  the model may not see the reasoning printed above it.
+- **A message sent to a busy subagent no longer fails its round.** `outrig__subagent_send` to a
+  subagent partway through a round put the message between the subagent's latest tool call and
+  that call's result, which OpenAI and Anthropic refuse. Every model call but a round's first
+  follows a tool call, so nearly every such message failed the round: the parent read
+  `round failed`, and the subagent's history lost the round's work. The message now reaches the
+  subagent appended to its next tool results, and stays there in its history.
+- **A subagent result a turn read but did not keep can be read again.** `outrig__get_result` moves
+  the parent's read position past the result it returns as it runs, but the result reaches the
+  conversation only when the turn keeps it. Ctrl-C while another tool call made alongside the read
+  was still running dropped the result with that call -- and a subagent round that ended in an
+  error dropped every call it made -- but the read position stayed moved, so the next
+  `outrig__get_result` for a subagent with nothing newer to report blocked until interrupted, and
+  `outrig__wait_results` never listed it. A read the turn does not keep now moves the read position
+  back, and the next read returns that result; one the conversation keeps stays consumed.
+- **A turn that fails after running a tool call keeps the call and its result.** When a model
+  call failed for good -- a rate limit or outage that outlasted `retry-budget-secs`, every
+  candidate in an alias chain failing, a response outrig could not use -- the turn ended with the
+  conversation as it stood before the prompt, and outrig advised sending the prompt again. Past
+  the turn's first model call, that conversation was missing tool calls that had already run, so
+  the resend could run them a second time: a file written twice, a command run again. Ctrl-C
+  mid-turn dropped them the same way. The tool calls whose results had gone back to the model now
+  stay in the conversation with those results, and outrig advises sending another prompt (e.g.
+  "continue") instead. A failure on a turn's first model call still leaves the conversation
+  unchanged. A subagent round that fails this way keeps its tool calls for the round its parent
+  starts next.
+- **A local reply cut off inside a multi-byte character warns that it may be incomplete.** With
+  `local-llm`, a turn whose `max-tokens` ceiling landed partway through a character such as an
+  emoji ended as if it had finished. mistralrs-core 0.8.1 drops that turn's last chunk, and with
+  it the finish reason, the cut character, and any text it was still holding back, which is the
+  whole reply when it opened like a tool call. When the cut came before anything was sent, the
+  empty stream was reported as an error that ended `outrig run`. outrig now warns on stderr that
+  the reply may be incomplete, keeps what did arrive, and ends only the turn. The missing text
+  cannot be recovered.
+- **Subagents sharing a name keep separate transcripts.** A name is unique only among one agent's
+  subagents, so two subagents could each launch an `audit`, and a subagent could give a child its
+  own name, but every subagent wrote `logs/subagent-<name>.log`. Same-named subagents appended to
+  one file, their prompts and outcomes mixed with nothing to tell them apart. A subagent launched
+  by another subagent now writes into a directory named for its parent, such as
+  `logs/subagent-parent-a/subagent-audit.log`; the primary's subagents keep their file names. Each
+  launch starts its transcript with a header naming the subagent's whole path, such as
+  `=== subagent parent-a/audit ===`, including a launch that named no model, which used to write
+  no header. `outrig logs <session>` lists the nested transcripts too.
+- **`--config .agents/outrig/config.toml` takes `.` as the repo root**, as its `./`-prefixed
+  spelling always did. A relative path of exactly three components derived the empty path
+  instead, so a bare `model-path = "local.gguf"` validated clean and then reached the mistralrs
+  loader with an empty directory, which it looks up on Hugging Face rather than opening.
+- **`outrig config init` says what a relative `model-path` is relative to.** The local-path
+  prompt now reads `Local model-path (absolute, or relative to the repo root)`, and its `?` help
+  recommends an absolute path for the global config, which serves every repo. An answer relative
+  to the directory `config init` ran in wrote a config that failed validation naming a file that
+  exists. The answer is still stored as typed.
+- **A subagent's children inherit its model, not its parent's.** A subagent launched with
+  `model = "fast"` gave any child that named no model the model of the agent that launched *it*,
+  with that model's provider and `max-tokens`, and its own `outrig__subagent` schema offered that
+  model as "yours". Both now follow the model the subagent itself runs under.
+- **A vetoed built-in default names the block that vetoed it.** With no image named, a repo
+  declaring `[images.outrig-default-fs]` or `[images.outrig-default-shell]` ended startup with
+  an error blaming a `[sidecars.<name>]` block, contradicting the note just above it. The error
+  now names the declared block, the same one the note names, and says it leaves no
+  `[images.outrig-default]` to fall back to.
+- **Ctrl-C during a turn keeps the conversation.** Interrupting a prompt in `outrig run` emptied
+  the session's history, so every later prompt reached the model with no earlier context, and
+  nothing said so. The conversation as it stood before the interrupted prompt now survives, as
+  the docs always promised; a turn interrupted before it finished is still not added to it.
+- **A local model's reasoning-only turn is reported as reasoning.** With `local-llm`, a model
+  whose chat template marks out its reasoning, as a `<think>` block does, lost that reasoning on
+  the way in. A turn that produced nothing else, such as one cut off at `max-tokens` mid-thought,
+  was reported to the user and to a subagent's parent as having produced no content at all. It
+  is now reported as hidden reasoning, most likely cut off at the output-token ceiling, with the
+  reasoning printed after it on stderr. Reasoning is still not streamed, so stdout carries only
+  the reply.
+- **An Anthropic model is sent back only the reasoning it issued.** An alias chain keeps one
+  history across its candidates, so a turn another candidate answered stays in it. Reasoning in
+  such a turn, like an OpenAI-style endpoint's `reasoning_content`, reached the Anthropic API as a
+  `thinking` block with no signature, which it refuses. After one move, a chain headed by an
+  Anthropic model failed at its head on every later call and stayed on its fallback. Reasoning
+  Anthropic did not issue, a local model's included, is now left out of what it is sent; text,
+  tool calls, and Anthropic's own thinking are sent as before.
+- **The GGUF picker lists files in a repo's subdirectories.** With `local-llm`, the picker that
+  `outrig config init` and `outrig init` offer after a Hugging Face `model-id` listed only the
+  repo's top level, so a quantization kept in a directory of its own was never offered. A repo
+  holding only those, like `unsloth/DeepSeek-R1-GGUF`, was refused as holding no `.gguf` files,
+  and setup ended there without writing a config. The picker now lists the whole repo and writes
+  each pick's path inside it, directory included. Enter takes the first file that is a whole
+  model by itself: never one shard of a split quantization, which would download in full and
+  then fail to load, and nothing at all when the repo holds only shards. A listing with no
+  `.gguf` file now drops to the manual `model-file` prompt instead of ending setup. A revision
+  containing `/`, like the `refs/pr/N` Hugging Face gives a pull request, now lists too; it used
+  to fail and fall back to that prompt.
+- **`outrig mcp --listen` no longer strands a client whose `initialize` asks for a revision
+  outside the served list.** The request was routed by the revision it asked for, so one sorting
+  at or after `2026-07-28` took the stateless path and got no `Mcp-Session-Id`, yet was answered
+  in `2025-11-25`, a revision that needs one. Its next request was refused with `422`. Every
+  `initialize` now opens a session.
+- **A message sent to a subagent as it finishes a round reaches it.** `outrig__subagent_send`
+  answered `injected into the round in flight` for a subagent whose round had already made its
+  last model call, and the message never reached the model. The subagent went idle, and the
+  message surfaced only if a later round ran, attached to that round's work. It now runs as a
+  round of its own, in the order it was sent, behind any message already waiting. If the round
+  failed instead, the message is kept for the parent's next prompt.
+- **A subagent with a round waiting no longer reads as stopped.** A subagent whose round ended
+  without `outrig__set_result`, and that was already sent another message, went idle between
+  the two rounds. `outrig__get_result` or `outrig__wait_results` in that gap, such as one made
+  straight after the send, answered with how the old round stopped instead of waiting for the
+  new one. A subagent now stays working while a round is waiting, and a message sent to an idle
+  one ends that stop at once.
+- **A subagent the repeat breaker stopped can still be redirected.** The breaker ends a
+  subagent's round once the same tool call has failed four times in a row, and it left that
+  fourth call without a result in the subagent's history. OpenAI and Anthropic reject a history
+  in that shape, so every later round on the subagent failed, including one started by
+  `outrig__subagent_send`, until the subagent was released. The fourth call now gets its result,
+  with a note that the round ended there, before the round stops.
+- **A run refused for an unknown `--env` server no longer lists as running.** `outrig run` and
+  `outrig mcp` refused a `--env SERVER:KEY=VALUE` whose `SERVER` the image does not declare only
+  after writing the session record and starting the container, and then exited without
+  finalizing the record: `outrig ls` showed the failed run with no exit code and a duration that
+  kept growing, and its containers were left to a detached removal. The name is now checked as
+  soon as the MCP table is merged, before any sidecar starts, and the refusal ends the session
+  like any other startup failure: exit code 1, containers stopped, and a container borrowed with
+  `--attach` left running. `outrig mcp show-merged`, which ignored such a name, now refuses it.
+- **The `rust` toolchain `outrig image add` generates works as you.** The generated Dockerfile
+  installed rustup into root's home and put only `/root/.cargo/bin` on `PATH`, but outrig execs
+  nothing as root: every exec gets your UID and `HOME=/home/<user>`. `/root` is `0700`, so
+  `cargo` was `Permission denied`, and where it could be reached, rustup looked for its
+  toolchains under that `HOME` and reported that it could not choose a version of cargo to run.
+  The image built cleanly either way. The toolchain now installs where the official `rust` images
+  put it, with `RUSTUP_HOME=/usr/local/rustup` and `CARGO_HOME=/usr/local/cargo` both writable,
+  so cargo can fill its registry cache as you. It is also the `minimal` profile plus `rustfmt`
+  and `clippy`, the components `image add` lists, where it was the `default` profile: the image
+  no longer carries the offline docs `rustup doc` opens, about 0.9 GB. `outrig init`, which runs
+  `image add`, gets the same toolchain. `outrig design prompt` shows it in both Rust examples, and
+  its rules now say to install tools outside root's home. A Dockerfile generated earlier keeps its
+  old lines; replace its `# rust toolchain` section with the one in `doc/usage/image.md`.
+- **`outrig image add` takes an inline `images` table.** A repo config spelling `images` as an
+  inline table, `images = { base = { ... } }`, which outrig loads like any other, made `image add`
+  panic after it had written the new Dockerfile. The config was left without the block, and the
+  Dockerfile then refused a plain retry, while `--force` panicked the same way. `outrig init`,
+  which runs `image add`, did too. The inline table is now rewritten as a standard `[images]`
+  table holding the same entries, with the new `[images.<name>]` block after it; comments between
+  the entries of a multi-line inline table are not kept. An `images` that is not a table at all,
+  such as `images = "legacy"` or `[[images]]`, is refused before the first prompt, where it
+  panicked too. Nothing is written until every prompt is answered, and a config that can't be
+  written leaves the Dockerfile unwritten too.
+- **`outrig image add` refuses a name it can't build.** The name was used as given, while the
+  block it writes is held to the build-image rule when the config loads. `outrig image add
+  RustDev` wrote a Dockerfile and an `[images.RustDev]` block that `outrig build` and `outrig run`
+  then refused, and every image-config in the file stopped loading with it. A name like `../x` or
+  `/tmp/x` put the Dockerfile outside `.agents/outrig/images/`. The name must now be one the image
+  can be built under: lowercase letters and digits, separated by one `.`, one or two `_`, or a run
+  of `-`. One passed as `<name>` that isn't is refused before the first prompt, even with
+  `--force`, and nothing is written. One typed at the prompt, `outrig init`'s included, is asked
+  for again. Either way the error is the one loading a config with that block gives, and says
+  what is wrong with the name. The prompt's `?` help used to advertise a rule that allowed
+  uppercase. A repo folder whose name holds a letter outside ASCII now suggests `standard` rather
+  than a name Enter could never get past.
+- **`outrig image init` refuses a name its image can't be tagged with.** The directory name
+  becomes the image's ref, which podman requires be lowercase, yet `RustDev` passed, and
+  `outrig image build` then failed to tag the image. The name now follows the same rule as `image
+  add`'s. That also admits names the old rule refused, such as `rust.dev` or `2024-tools`; the
+  generated README quotes a dotted name in its `[images."rust.dev"]` header. A name of 64 hex
+  digits is refused, whatever it starts with: the ref carries no tag, and podman reads it as an
+  image ID.
+- **The `go` toolchain `outrig image add` generates runs on AArch64.** The generated Dockerfile
+  downloaded Go's x86-64 archive on every machine, and an archive unpacks whatever it holds: on
+  an AArch64 host the image built cleanly, and `go` then failed with `exec format error` the
+  first time anything ran it. The archive is now chosen at build time for the architecture the
+  image is built on, x86-64 or AArch64, and checked against its published SHA-256 before it is
+  unpacked; on any other architecture the build fails naming it. The toolchain is also
+  Go 1.27.1, where it was 1.22.0, which Go stopped supporting in February 2025. `outrig init`,
+  which runs `image add`, gets the same toolchain. `doc/concepts/containers.md` and the rules
+  `outrig design prompt` gives now say to download a prebuilt binary for the image's
+  architecture. A Dockerfile generated earlier keeps its old lines; replace its `# go toolchain`
+  section with the one `image add` writes now.
+- **`outrig mcp self` refuses `--env`, `--network`, and `--volume`.** It started with any of them
+  and ignored them, so a client configuration carrying one looked correct, and an `--env` every
+  other `outrig mcp` path refuses as malformed was taken too. Each now exits with an error naming
+  the option to remove, as `--image`, `--session-dir`, `--attach`, and `--listen` already did.
+- **`outrig image add <name>` in a fresh repo makes `<name>` its `default-image`.** Where no
+  `.agents/outrig/config.toml` exists yet, `image add` first sets one up through `outrig init`'s
+  prompts, which asked for an image-config name of their own and wrote it as `default-image`;
+  the image-config itself was scaffolded under `<name>`. Accepting the suggested
+  `<repo-folder>-standard` left a `default-image` naming no image-config, so `outrig build` and
+  `outrig run` refused the config. Given a `<name>`, the setup now writes it as `default-image`
+  without asking for one; given none, it asks, and the answer names both. A repo that already
+  has a config keeps its `default-image`.
+- **A `[workspace] host-path` that doesn't exist is refused when the config loads.** A typo in
+  it validated, and `outrig run` failed only at `podman run`, with podman's `statfs` error, which
+  names the resolved path but neither the key nor the file. `outrig run`, `outrig mcp`, and
+  `outrig build` now refuse it at load, as they already refused an extra mount's missing
+  `host-path`, with an error naming the value as written and the config file that declared it.
+  A `host-path` that names a file rather than a directory is refused the same way. The default
+  `.` is checked too, as the repo root, so `--config <root>/.agents/outrig/config.toml` with a
+  `<root>` that doesn't exist now stops at load rather than at `podman run`.
+- **A `~` at the start of a config path is your home directory.** The sidecar example in the
+  config reference and the containers page mounts `host-path = "~/.cache/example"`, and a config
+  holding it could never load: `~` was taken as a directory of that name beside the config, and
+  the error said `"~/.cache/example" does not exist` even when it did. `~` alone, or as the first
+  component of a path, now stands for your home directory in `dockerfile`, `context`,
+  `model-path`, and every `host-path`, from either config file, and in `--volume` and a
+  standalone `image.toml`'s `[build]` paths. `~user/...` is not expanded, and neither is
+  `${VAR}`.
+
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-cli-v0.2.0) - 2026-09-23
 
 The first release since 0.1.0. Everything below is measured against **0.1.0**, and

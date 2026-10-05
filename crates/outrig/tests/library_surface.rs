@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use outrig::config::{Config, McpServerSpec};
+use outrig::config::{Config, EnvValue, McpServerSpec, ResolvedEnvValue};
 use outrig::{
     CapabilityProfile, CapabilitySpec, EmbeddedMcpPolicy, ExecOptions, LaunchSpec, MountAccess,
     MountSpec, NetworkAction, NetworkMode, NetworkPolicy, Outrig, SidecarSpec, SidecarView,
@@ -165,6 +165,31 @@ fn sidecar_containers_labeled(sidecar: &str) -> Vec<String> {
         .expect("podman ps");
     String::from_utf8_lossy(&output.stdout)
         .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Names of the volumes mounted into `container`, read off the engine rather
+/// than the argv outrig sent: an image's `VOLUME` gets one from podman without
+/// any flag asking for it.
+fn volume_mounts_of(container: &str) -> Vec<String> {
+    let output = std::process::Command::new("podman")
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}} {{end}}{{end}}",
+            container,
+        ])
+        .output()
+        .expect("podman container inspect");
+    assert!(
+        output.status.success(),
+        "podman container inspect {container} failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
         .map(str::to_string)
         .collect()
 }
@@ -454,6 +479,51 @@ async fn launch_with_entrypoint_sidecar_serves_tools() {
         Vec::<String>::new(),
         "shutdown should remove the sidecar container"
     );
+}
+
+/// An image's `VOLUME` gets no volume. Podman would make an anonymous one per
+/// declaration, and an entrypoint-stdio container's outlived it: the
+/// `podman start --attach` client that acts on `--rm` removes the container
+/// without its volumes, and each one left behind held a podman lock until no
+/// launch could get one. The sidecar is #214's repro, the stock filesystem
+/// image plus `VOLUME /data`.
+#[tokio::test]
+async fn entrypoint_sidecar_gets_no_volume_for_its_image_volume() {
+    let _guard = E2E_LOCK.lock().await;
+    init_tracing();
+
+    let sidecar_tag = format!(
+        "localhost/outrig-library-surface-volume-sidecar-{}:latest",
+        std::process::id(),
+    );
+    build_image_from_dockerfile(
+        &sidecar_tag,
+        &format!("FROM {MCP_FS_IMAGE}\nVOLUME /data\n"),
+    );
+    // Stock: nothing here asks anything of the primary but that it run.
+    ensure_image(UBUNTU_IMAGE);
+
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let spec = LaunchSpec::from_image(
+        UBUNTU_IMAGE,
+        BTreeMap::new(),
+        session_dir.path().join("logs"),
+    )
+    .with_sidecar(
+        SidecarSpec::from_image("volumed", sidecar_tag.as_str())
+            .with_entrypoint_server("fs", ["/tmp"]),
+    );
+
+    let outrig = Outrig::launch(&spec).await.expect("Outrig::launch");
+    let sidecars = sidecar_containers_labeled("volumed");
+    assert_eq!(sidecars.len(), 1, "one sidecar container: {sidecars:?}");
+    assert_eq!(
+        volume_mounts_of(&sidecars[0]),
+        Vec::<String>::new(),
+        "the image's `VOLUME /data` got a volume, which outlives the sidecar"
+    );
+
+    outrig.shutdown().await.expect("shutdown");
 }
 
 /// `view = "primary"` from the library: an off-the-shelf Alpine MCP image
@@ -868,6 +938,25 @@ async fn exec_capture_runs_a_command_in_the_primary() {
         .expect("exec_capture");
     assert!(out.status.success(), "exit: {:?}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+
+    // A value resolved from a `${VAR}` reference goes to podman as a bare
+    // `--env KEY`, which podman fills from its own environment.
+    let var = "OUTRIG_E2E_LIBRARY_SURFACE_REFERENCED";
+    // SAFETY: edition 2024 marks `env::set_var` unsafe because of multi-thread
+    // races; no other test reads or writes this name.
+    unsafe { std::env::set_var(var, "by-name") };
+    let referenced =
+        ResolvedEnvValue::resolve(EnvValue::EnvRef(var.to_string())).expect("the variable is set");
+    let out = outrig
+        .exec_capture(
+            &["sh".into(), "-lc".into(), "printf %s \"$GREETING\"".into()],
+            &ExecOptions::new()
+                .with_resolved_env(BTreeMap::from([("GREETING".to_string(), referenced)])),
+        )
+        .await
+        .expect("exec_capture");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "by-name");
 
     // A non-zero exit is data on the Output, not an error.
     let failed = outrig

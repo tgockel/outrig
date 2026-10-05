@@ -1,9 +1,9 @@
 # 0002 -- Sidecars
 
-Open. Its finished tasks are already in `plan/done/phase/0002-sidecars/tasks/`; the queue that
-remains is in `plan/todo/`. This page was written once the phase was most of the way through,
-when `plan/` moved to phase-scoped numbering, so its first two sections describe work that has
-largely landed and the exit criteria are what is still being held to.
+Closed. Every task is in `tasks/`, and each file's `## Decisions` section remains authoritative
+for anything this page summarizes. This page was written once the phase was most of the way
+through, when `plan/` moved to phase-scoped numbering, so its first two sections describe work
+that had largely landed and the exit criteria are what the rest of the phase was held to.
 
 ## Goal
 
@@ -57,19 +57,32 @@ and 0.2.0 ships with a migration guide for anyone on 0.1.
 
 ## Tasks
 
-Numbered `0002-01` onward, with no gaps. Finished tasks are in
-`plan/done/phase/0002-sidecars/tasks/`; `0002-49` through `0002-54` are queued in
-`plan/todo/`, and `plan/todo/README.md` carries the per-step index and the sequencing
-rationale.
+Numbered `0002-01` through `0002-55`, with no gaps, all in `tasks/`. `plan/todo/README.md`
+keeps the sequencing rationale for the release-gate tail (`0002-37` onward) and the note on why
+`0002-55` sits above `0002-54` although it landed first.
 
 ## Out of scope
 
-- TLS-terminating inspection (`plan/next/network-interceptor-mitm.md`). The interceptor gains
-  multi-container reach and correct policy semantics, not visibility into payloads.
-- macOS and Windows hosts. Both stay declared and unreachable; see
-  `plan/next/macos-host-support.md` and `plan/next/windows-host-support.md`.
+- TLS-terminating inspection (#294). The interceptor gains multi-container reach and
+  correct policy semantics, not visibility into payloads.
+- macOS and Windows hosts. Both stay declared and unreachable; see #295 and #296.
 - Removing the deprecated in-process local-LLM backend. 0.2.0 decides what the deprecated
   surface does; the removal itself landed on the 0.3 line (`version/0.3.x`).
 - The post-0.2.0 buffer that the release audit surfaced. It is catalogued under
   "Not queued, deliberately" in `plan/todo/README.md`, and is deferred by decision rather than
   by omission.
+
+## Decisions
+
+**Closed 2026-10-04**, at tags `outrig-v0.2.0` and `outrig-cli-v0.2.0`. The phase's work
+shipped as 0.2.0 on 2026-09-23: the release commit (`8881ba2`) landed `0002-54` with four
+acceptance criteria recorded as outstanding -- `cargo publish`, the two tags, the GitHub
+release, and the install smoke test -- because publication is the maintainer's, not the
+commit's. The maintainer did all four the same day; crates.io carries both crates at 0.2.0,
+both tags point at `8881ba2`, and release `outrig-cli-v0.2.0` exists. This page waited on that
+record and was moved here with the 0.2.1 release, which is why the close is dated eleven days
+after the version it closes on.
+
+The 43 fixes between 0.2.0 and 0.2.1 are not phase work. They are tracked by the 0.2.1 GitHub
+milestone and the two changelogs, and what they set aside for later went into the `plan/next/`
+buffer, which `plan/todo/README.md` describes under "Not queued, deliberately".

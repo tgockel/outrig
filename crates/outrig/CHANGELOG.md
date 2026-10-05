@@ -185,12 +185,263 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `localhost` `base-url` -- see
   [Local models](../../doc/concepts/llm-providers.md#local-models).
 
+## [0.2.1](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.1) - 2026-10-04
+
+The first patch release since 0.2.0. Every change to the public surface is additive -- the three
+items under **Added** -- and the one requirement that moves is rmcp, now 3.4.1 or newer. Two of
+the fixes change what a consumer sees without asking: every container now runs with
+`--image-volume=ignore`, so a path an image declares as a `VOLUME` holds what the image's layers
+put there rather than an empty volume, and a `~` that starts a config path now stands for the
+home directory. The rest are fixes, each described below.
+
+### Added
+
+- **`Config::load_file`, `load_file_for_run`, and `load_file_for_build` read the repo config from
+  a file the caller names.** They mirror `load`, `load_for_run`, and `load_for_build`, which read
+  it from `<repo_root>/.agents/outrig/config.toml`, and still take that root: the default
+  `[workspace].host-path` and `model-path` resolve against it. Relative paths the file declares
+  resolve beside it, as the global config's do, and its entries record it as a new
+  `ConfigSource::RepoFile { path }`, so a diagnostic names the file that was read. A missing file
+  is an error, not an empty config. `outrig --config` uses them for a file outside
+  `.agents/outrig/`.
+
+- **`config::check_build_image_name(name)`** checks a name against the rule `Config::validate`
+  holds a build image's `[images.<name>]` key to, so a tool that writes such a block can check
+  the name before it does. It returns a `BuildImageNameError`, a non-exhaustive enum saying what
+  is wrong: the name is empty, holds a character a repository can't, starts or ends with a
+  separator, or separates its parts with a run podman refuses. `outrig image add` and `outrig
+  image init` check their names with it, and `ConfigValidationError::BuildImageNameInvalid`
+  explains a name the way it does.
+
+- **`config::ResolvedEnvValue` keeps a resolved `${VAR}` value beside the reference it came
+  from.** `ResolvedEnvValue::resolve` resolves an `EnvValue` as `EnvValue::resolve` does,
+  `value()` and `source()` read the two back, and `Debug` prints only the source.
+  `outrig::resolve_mcp_env_values` is `resolve_mcp_env` returning them, and
+  `ContainerCreateOptions::with_resolved_env` and `ExecOptions::with_resolved_env` take them.
+  `env` holds the values. An entry resolved from a reference reaches podman as a bare `--env KEY`,
+  its value in podman's own environment rather than on its command line, and is shown as
+  `KEY=${VAR}` wherever outrig shows the command. An entry a caller changes in `env` afterwards
+  is passed as the literal it now is, and `with_env` drops the references.
+
+### Changed
+
+- **rmcp 3.4.1 or newer is required**, up from 3.1.0. rmcp is public here through
+  `outrig::mcp_proxy`, and rmcp 3.4 deprecated the `ServerInfo` alias `ProxyServer::get_info`
+  was spelled with. It now returns `rmcp::model::ServerConfig`, the name that replaces it. Both
+  alias `InitializeResult`, so no caller changes, and one that still spells `ServerInfo` gets
+  rmcp's deprecation warning rather than an error. The newer rmcp also changes what a served
+  `ProxyServer` negotiates. `2026-07-28` replaced the `initialize` handshake with per-request
+  metadata, so an `initialize` asking for that revision is now answered in `2025-11-25`, the
+  server's default. A client speaking `2026-07-28` names it in each request's `_meta` instead
+  and is answered in it. `SUPPORTED_PROTOCOL_VERSIONS` governs those requests too: one naming a
+  revision outside the list is refused rather than answered in a fallback.
+
+- **A config path that starts with `~` resolves under the home directory.** A `~` first component
+  in `dockerfile`, `context`, `model-path`, or any workspace, mount, or sidecar-mount `host-path`
+  now stands for the invoking user's home directory -- `HOME`, or the passwd entry's when `HOME`
+  is unset or empty, whichever Rust built the crate -- in `resolved_host_path`,
+  `resolved_build_paths`, and `resolved_model_path`. It named a directory called `~` under the
+  path's base, so the sidecar mount in the config reference's own example, `~/.cache/example`,
+  could never load. Every host path takes the one rule, so hand-built entries,
+  `LaunchSpec::from_config`, the paths `Outrig::launch` builds from, and `image::build_standalone`
+  expand it too. Only a whole `~` component counts: `~user/...` stays relative, and with no
+  absolute home directory `~` keeps its old meaning.
+
 ### Fixed
 
-- **The `outrig-enter` launcher builds on Rust 1.99.** It declared C's `open` without the variadic
-  tail C gives it, and 1.99 rejects a declaration of a symbol the standard library links that
-  disagrees with the runtime's. Without `OUTRIG_REQUIRE_ENTER` the build went on with a warning
-  and `view = "primary"` sidecars unavailable; with it, the build failed.
+- **`filter` mode with `default = "deny"` now stops what the interceptor cannot carry.** The
+  nftables table interception installs held one nat chain, which can only rewrite: TCP was
+  redirected to the proxy and UDP/53 to the DNS listener, and every other datagram the container
+  sent -- UDP to any port but 53, which is how QUIC and so HTTP/3 travel, ICMP, anything else --
+  left by podman's default route. It met no policy and wrote no `network.jsonl` record, so under
+  a deny default one flag, `curl --http3-only`, reached any host unrecorded. Such a datagram
+  matches no `allow` or `deny` entry, and `default` is what unmatched traffic gets: a second
+  chain in the same table now gives it exactly that. Under `default = "deny"` the chain drops
+  it, so the sending tool fails at once with `EPERM` rather than reaching the network; under an
+  allow default -- audit mode included -- the chain accepts, and nothing changes. The chain
+  accepts loopback, which is where the redirects send what they carry, and the established
+  direction, which is the interceptor's own replies, and the one teardown still removes both
+  chains. A dropped datagram still writes no record, since it never reaches the interceptor;
+  recording them is #419.
+
+- **A `${VAR}` build-arg or MCP `env` value stays out of outrig's output and off podman's and
+  buildah's command lines.** Each was resolved to its host value before the `buildah build
+  --build-arg`, `podman create --env`, or `podman exec --env` argv was built, and every
+  diagnostic printed that argv as it ran: the `Process`, `Canceled`, and `Spawn` errors, the
+  transcript line written before each command, and the `outrig::process` debug trace. The value
+  also sat in `/proc/<pid>/cmdline`, readable by every local user, for as long as the client ran
+  -- for an exec-stdio server's `podman exec`, the whole session. Every build path, entrypoint
+  sidecar, and `McpClient::connect_via_podman_exec*` now passes such a value by name, as a bare
+  `--env KEY` or `--build-arg KEY` with the value in the client's environment, and shows it as
+  `KEY=${VAR}`. A key the client reads itself -- `HOME`, `PATH`, `TMPDIR`, the proxies, the
+  `XDG_*`, `LD_*`, and `CONTAINERS_*` families, any key starting `_`, and the rest the config
+  reference lists -- keeps its value on the command line, as does a key that is not a plain
+  variable name; either is still shown as the reference. Only a proxy variable referencing the
+  variable of its own name is passed by name regardless. **The `argv` of `OutrigError::Process`
+  and `OutrigError::Canceled` is now the argv as shown**, as `Spawn`'s `command` already was, so
+  for such an entry it is not what ran. `ExecOptions` and `ContainerCreateOptions` show a
+  referenced entry as the reference in `Debug` too. A caller that hands `resolve_mcp_env`'s
+  strings to `with_env` still passes and shows them as written; `resolve_mcp_env_values` and
+  `with_resolved_env` replace that pair.
+
+- **An image rebuilds when a file changes in a build context git ignores.** When an ignore rule
+  excluded the context directory or one above it, as for `.agents/` kept out of version control,
+  git listed none of its files. The cache key covered only the `Dockerfile`, build args, and
+  labels, so editing a script the `Dockerfile` copies left it unchanged: `outrig build` and
+  `outrig run` reported a cache hit on an image built from the old content, and two checkouts of
+  such a context shared a tag. A file force-added there narrowed the key to the tracked files
+  instead. Wherever ignore rules match every file in a context, as they do there or as `private/*`
+  does for a context of `private`, every file now counts, tracked or not, by path, permission
+  bits, and content. Editor and build leftovers count there too, so a change to one rebuilds.
+
+- **`Config::validate` checks the primary `[workspace].host-path` on disk.** Given a repo root,
+  it held every `[[workspace.mounts]]` and `[sidecars.<sc>.mounts]` `host-path` to an existing
+  directory but read nothing of `[workspace].host-path`. A typo there validated, and the session
+  failed at `podman run`, with podman's `statfs` error naming the resolved path but neither the
+  key nor the file. That `host-path` is now held to the same rule, resolved the same way, so
+  `Config::load`, `load_for_run`, and `load_for_build` refuse it -- the last as it refuses a bad
+  mount, though a build never mounts the workspace. Two new `ConfigValidationError` variants
+  report it, `WorkspaceHostMissing` and `WorkspaceHostNotDirectory`, each carrying the `path` as
+  written and, as `declared_in`, the file that declared it. `declared_in` is `None` for the
+  built-in `.` and for a value set through `Workspace::new` or `Workspace::set_host_path`.
+  `Config::validate(None)` still checks nothing on disk, so a caller that validates before
+  creating its workspace directory is unaffected.
+
+- **A finished session leaves no volumes behind.** Podman made an anonymous volume for each
+  `VOLUME` a container's image declares, and an entrypoint-stdio sidecar's were never removed.
+  When its server exited, the `podman start --attach` client was what acted on `--rm`, and
+  podman, through 5.7 at least, removes the container on that path without its volumes. Each
+  volume left behind held one of podman's `num_locks`, 2048 by default, until launches on the
+  host failed with `allocating lock for new volume: ... exceeded num_locks`. A sidecar built on
+  `docker.io/searxng/searxng`, which declares two, leaked two per session. A primary leaked its
+  volumes only when outrig force-removed it. Every container now runs with
+  `--image-volume=ignore`, so podman makes no volume at all: the path holds what the image's
+  layers put there, and writes to it land in the container's own layer, which `--rm` already
+  removes. A declared path the layers never create is now absent, where podman mounted an empty
+  volume over it, so an image whose program expects the directory has to create it. Upgrading
+  does not remove volumes already leaked. They are anonymous and name no container, so
+  `podman volume prune`, which removes every volume no container uses, is what clears them.
+
+- **An image rebuilds when an uncommitted file in its build context changes.** When the context
+  was in a git repo, the cache key hashed only the files git tracks, yet buildah is handed the
+  whole directory. A file not yet committed -- a helper script beside a freshly scaffolded
+  `Dockerfile` -- could be copied into the image without counting toward its tag. Editing it
+  left the key unchanged, so `outrig build` and `outrig run` reported a cache hit on an image
+  built from the old content, and two contexts that differed only in such files shared a tag.
+  The key now covers every file in the context that `.gitignore` does not exclude, committed or
+  not, by path, permission bits, and content, so a rename or a `chmod +x` rebuilds too. A
+  symlink also counts by what `COPY` would copy through it, resolved inside the context the way
+  buildah resolves it. A tracked file deleted without `git rm`, a symlink to a directory, or a
+  submodule in the context used to fail the key computation outright. The first is now hashed as
+  absent, and a submodule or nested repository is hashed by the same rule in its own
+  repository. A file `.gitignore` excludes still does not count when copied by its own path,
+  unless the context itself is ignored or every file in it is. Every build image whose context
+  is in a git repo gets a new key, so each rebuilds once after upgrading.
+
+- **`audit`/`filter` interception now covers IPv6.** The nftables redirect matched TCP of either
+  family, but the interceptor listened on IPv4 only. So every IPv6 connection from the container
+  was refused: it was not in `network.jsonl`, and a filter policy never saw it. The IPv6 literal
+  and CIDR entries `[network]` documents could never match anything. Rootless podman gives
+  containers an IPv6 route by default, and resolvers prefer IPv6 when there is one, so ordinary
+  tools hit this first. The TCP and DNS listeners now take both families on one socket each. That
+  also holds their ports in IPv6, so another process in the container can no longer bind the
+  IPv6 side and receive redirected connections itself. An IPv4 connection is still recorded under
+  its IPv4 `id.orig_h`. A kernel with no IPv6 support at all gets IPv4-only listeners, as before.
+
+- **A lookup sent to any resolver but the installed one is now answered.** Interception rewrites
+  the container's resolver to `127.0.0.1`, but a tool that names its own server (`dig @8.8.8.8`,
+  or a runtime with a built-in resolver list) has its query redirected to the DNS listener. The
+  answer went back from the container's own address rather than the one the query was redirected
+  to, so the client discarded it and the lookup timed out. Answers now leave from the address
+  each query arrived at, for IPv4 and IPv6 alike.
+
+- **Intercepted DNS no longer falls back to a hard-coded public resolver.** When the host's
+  `/etc/resolv.conf` was missing, unreadable, or named no nameserver, the `audit`/`filter`
+  DNS listener forwarded every lookup to Cloudflare at `1.1.1.1:53`, without saying so anywhere.
+  It did this even when systemd-resolved's `/run/systemd/resolve/resolv.conf` named a usable
+  upstream, which had already been read and was then thrown away. That upstream is now used
+  whenever `/etc/resolv.conf` names nothing. If neither file names a resolver, attaching fails
+  with a `Configuration` error that says what each file held, so a host that had been resolving
+  through Cloudflare now fails `audit`/`filter` setup instead.
+
+- **Intercepted DNS follows systemd-resolved's split-DNS routing.** When the host's
+  `/etc/resolv.conf` named only loopback addresses -- on a systemd-resolved host, its stub at
+  `127.0.0.53` -- the `audit`/`filter` DNS listener passed over them and forwarded every lookup
+  straight to the servers in `/run/systemd/resolve/resolv.conf`. That file is a flat list that
+  leaves out every link that is not a default route, such as a VPN serving only its own domains,
+  so a container's lookup of a name only the VPN serves went to the LAN's resolver, which could
+  not answer it and learned the name all the same. The listener now forwards to whatever
+  `/etc/resolv.conf` names, a loopback stub included, so resolved routes each container lookup
+  as it routes the host's own, including through a VPN that connects mid-session, which the
+  list read at attach never saw. One consequence: a bare single-label name such as `nas` that
+  the LAN's resolver used to answer can now reach resolved as it is, since the resolver
+  interception installs names none of the host's search domains, and resolved does not look such
+  a name up over DNS by default. Such a name has to be given in full.
+
+- **One slow DNS lookup no longer stalls the container's others.** The interceptor's DNS
+  listener forwarded one query at a time and did not read the next until the current one was
+  answered or had waited out its 5s timeout at every host resolver. So one name a resolver was
+  slow to answer held up every lookup from every process in that container, a large enough burst
+  behind it overflowed the socket and was silently dropped, and in `filter` mode a stalled
+  lookup recorded no binding, so a connection the policy allows could be denied. Each lookup is
+  now forwarded in its own task, up to 64 at once per attachment. Past that the listener stops
+  reading until one finishes. A detach abandons whatever is still in flight, as before.
+
+- **The runtime-user bootstrap refuses a home that is not a directory.** If the image already
+  had `/home/<user>` as a regular file, a FIFO, or a symlink, `Container::bootstrap_user` took
+  the existing path as done, `chown`ed it -- through the symlink, onto its target, which could
+  be a file in the bind-mounted workspace -- and reported the user ready, so every later exec
+  ran with a `HOME` it could not use. The home directory is now opened as a directory without
+  following a final symlink and `chown`ed through that descriptor, and anything else fails the
+  bootstrap with `BootstrapNamespace`, whose `step` now names the home path. This is stricter
+  than `mkdir -p` in one place: a symlink to a directory at `/home/<user>` is refused too. A
+  symlinked `/home` still works.
+
+- **`getpwuid()` now names the same home as `$HOME`.** When `/etc/passwd` already had an entry
+  at the host uid, `Container::bootstrap_user` reused its name but never read its home, and
+  created and exported `/home/<name>` regardless. That is the default path: `--userns=keep-id`
+  plants an entry before bootstrap runs, with the container's working directory as its home --
+  `/workspace` for a primary. So `$HOME` was right, but `~<name>`, `su -`, `sudo`, and anything
+  else that asks NSS got the user's checkout, and per-user state written that way landed in the
+  repo. A reused entry's home field is now rewritten to `/home/<name>` when it names something
+  else, including a six-field entry with no shell, whose last field glibc reads as the home.
+  Nothing else in the entry changes. The file is truncated at the entry and it and the lines
+  after it appended back, so it keeps its inode, owner, and mode. That is not atomic, so it is
+  done only in a container the bootstrap's own handle started. A container from
+  `Container::attach` (`outrig mcp --attach`) may already be running other processes, and its
+  entry is left as it was.
+
+- **The runtime-user bootstrap refuses a reused name that is not a directory name.** A name
+  taken from the image's `/etc/passwd` became `/home/<name>` unchecked, so an entry named `..`
+  had bootstrap `chown` the container's `/` to the session user, `../etc` did the same to
+  `/etc`, and `a/b` created a root-owned `/home/a` on the way. A name of `.` or `..`, or one
+  containing `/`, now fails the bootstrap with `BootstrapNamespace` naming the entry, before
+  anything is created or written. A host user name that sanitizes to `.` or `..` falls back to
+  `u<uid>`, as an empty one already did.
+
+- **A refused image cleanup no longer disarms its retry.** A build removed its temporary
+  `outrig-tmp-*` tag, and a failed label-stamping pass its `outrig-label-*` working container,
+  then released the guard that owed the removal whether or not buildah had done it. A removal
+  refused for a transient reason -- a lock, a busy image -- left the resource behind with nothing
+  coming for it, and a temporary tag stays tagged, so pruning never collects it. The guard now
+  stays armed unless the removal worked or buildah reports the target as not there, and a
+  refusal is logged as a warning and reissued in the background under the guard's usual bounded
+  retries. The build's own result is returned either way.
+
+- **A build image's name is held to the separators podman accepts.** The name becomes the
+  repository of the image's tag, and the rule let any run of `.`, `_`, and `-` separate its
+  parts. `a..b`, `a._b`, `a-.b`, and `a___b` validated, and `outrig build` and `outrig run` then
+  failed when buildah refused the tag as an "invalid reference format". Parts are now separated
+  by one `.`, one or two `_`, or a run of `-`, as in podman's reference grammar. A name this
+  newly refuses could never have been built. The error now names what is wrong -- the character
+  or the separator -- rather than restating the whole rule.
+
+- **The filesystem-view helper builds with Rust 1.99.** The `outrig-enter` launcher declares the
+  libc functions it calls itself, and declared `open` without the `...` that ends its C
+  prototype. The standard library calls `open` too, so Rust 1.99 refuses that declaration by
+  default, and the build script's compile of the launcher failed. The build went on with only a
+  cargo warning, and every `view = "primary"` sidecar then failed to start with "this outrig was
+  built without the filesystem-view helper". `open` is now declared variadic, as in C.
 
 ## [0.2.0](https://github.com/tgockel/outrig/releases/tag/outrig-v0.2.0) - 2026-09-23
 

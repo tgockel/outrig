@@ -410,7 +410,34 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
     let mock_addr = listener.local_addr().expect("mock addr");
     let (request_tx, mut request_rx) = mpsc::unbounded_channel();
-    let server_handle = tokio::spawn(run_mock_openai_resume(listener, request_tx));
+    // A second tool call, which the max refuses.
+    let second = (
+        200,
+        json!({
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "fs__read_text_file",
+                            "arguments": "{\"path\":\"/workspace/README.md\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }),
+    );
+    let server_handle = tokio::spawn(run_mock_openai_resume(listener, request_tx, second));
 
     let repo_dir = tempfile::tempdir().expect("tempdir repo");
     write_smoke_config(repo_dir.path(), &mock_addr.to_string());
@@ -525,6 +552,131 @@ async fn max_tool_calls_retains_partial_history_for_continue() {
     assert!(
         continue_index > synthetic_tool_result_index,
         "follow-up prompt did not come after synthetic tool result: {third_messages_json}",
+    );
+}
+
+/// A model call that fails for good after a tool call ran keeps that call, and
+/// says so: the advice is to continue, not to send the prompt again, which
+/// would run the tool call a second time (#197).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_failure_after_a_tool_call_retains_it_for_continue() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let mock_addr = listener.local_addr().expect("mock addr");
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    let rate_limited = (
+        429,
+        json!({"error": {"message": "slow down", "type": "rate_limit_error"}}),
+    );
+    let server_handle = tokio::spawn(run_mock_openai_resume(listener, request_tx, rate_limited));
+
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    // Retries off, so the 429 ends the turn at once.
+    write_config(
+        repo_dir.path(),
+        &mock_addr.to_string(),
+        r#"
+default-agent = "smoke"
+retry-budget-secs = 0
+"#,
+        r#"
+[agents.smoke]
+model = "fast"
+preamble = "test"
+"#,
+    );
+
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let session_dir = tempfile::tempdir().expect("tempdir session");
+    let sessions_s = sessions.path().to_str().expect("sessions path utf-8");
+    let session_dir_s = session_dir.path().to_str().expect("session dir path utf-8");
+
+    let captured = run_child_with_input(
+        &[
+            "--session-root",
+            sessions_s,
+            "run",
+            "--session-dir",
+            session_dir_s,
+        ],
+        repo_dir.path(),
+        b"start\ncontinue\n",
+    )
+    .await;
+    server_handle.abort();
+
+    let mut requests = Vec::new();
+    for i in 0..3 {
+        let req = timeout(Duration::from_secs(5), request_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("mock server did not capture request {}", i + 1))
+            .expect("mock server request channel closed");
+        requests.push(req);
+    }
+
+    assert!(
+        captured.status.success(),
+        "outrig run exited with {:?}; stderr was: {}",
+        captured.status,
+        captured.stderr
+    );
+    assert!(
+        captured
+            .stderr
+            .contains("[outrig] LLM endpoint failed and did not recover (HTTP 429"),
+        "stderr lacked the failure: {}",
+        captured.stderr
+    );
+    assert!(
+        captured
+            .stderr
+            .contains("[outrig] partial history retained -- send another prompt"),
+        "stderr lacked the advice to continue: {}",
+        captured.stderr
+    );
+    assert!(
+        !captured.stderr.contains("history unchanged"),
+        "advising a resend would run the tool call again: {}",
+        captured.stderr
+    );
+    assert!(
+        captured.stdout.contains("continued from retained history"),
+        "stdout lacked continuation reply: {}",
+        captured.stdout
+    );
+
+    let third_messages = requests[2]
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("third request has messages array");
+    let third_messages_json = serde_json::to_string(third_messages).expect("messages serialize");
+    let tool_call_index = assistant_tool_call_index(third_messages, "call_1", "fs__list_directory")
+        .unwrap_or_else(|| {
+            panic!("third request lacked the tool call that ran: {third_messages_json}")
+        });
+    let tool_result = third_messages
+        .get(tool_call_index + 1)
+        .unwrap_or_else(|| panic!("the tool call had no following message: {third_messages_json}"));
+    assert!(
+        tool_result.get("role").and_then(Value::as_str) == Some("tool")
+            && tool_result.get("tool_call_id").and_then(Value::as_str) == Some("call_1"),
+        "the tool call was not answered by its result: {third_messages_json}",
+    );
+    let continue_index = third_messages
+        .iter()
+        .position(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && json_contains_str(message, "continue")
+        })
+        .unwrap_or_else(|| panic!("third request lacked follow-up prompt: {third_messages_json}"));
+    assert!(
+        continue_index > tool_call_index + 1,
+        "follow-up prompt did not come after the kept tool result: {third_messages_json}",
     );
 }
 
@@ -688,7 +840,14 @@ async fn run_mock_openai_capturing(
     }
 }
 
-async fn run_mock_openai_resume(listener: TcpListener, request_tx: mpsc::UnboundedSender<Value>) {
+/// A turn that ends early, then a `continue` that resumes it. The first request
+/// is answered with a tool call and every one after the second with a final
+/// reply; `second`, a status and a body, is what ends the turn early.
+async fn run_mock_openai_resume(
+    listener: TcpListener,
+    request_tx: mpsc::UnboundedSender<Value>,
+    second: (u16, Value),
+) {
     let mut request_count = 0u32;
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
@@ -697,72 +856,56 @@ async fn run_mock_openai_resume(listener: TcpListener, request_tx: mpsc::Unbound
         request_count += 1;
         let request = drain_request(&mut sock).await.unwrap_or(Value::Null);
         let _ = request_tx.send(request);
-        let body = match request_count {
-            1 => json!({
-                "id": "chatcmpl-1",
-                "object": "chat.completion",
-                "created": 0,
-                "model": "gpt-4o-mini",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "fs__list_directory",
-                                "arguments": "{\"path\":\"/workspace\"}"
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-            }),
-            2 => json!({
-                "id": "chatcmpl-2",
-                "object": "chat.completion",
-                "created": 0,
-                "model": "gpt-4o-mini",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call_2",
-                            "type": "function",
-                            "function": {
-                                "name": "fs__read_text_file",
-                                "arguments": "{\"path\":\"/workspace/README.md\"}"
-                            }
-                        }]
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-            }),
-            _ => json!({
-                "id": "chatcmpl-3",
-                "object": "chat.completion",
-                "created": 0,
-                "model": "gpt-4o-mini",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "I continued from retained history."
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-            }),
+        let (status, body) = match request_count {
+            1 => (
+                200,
+                json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-4o-mini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "fs__list_directory",
+                                    "arguments": "{\"path\":\"/workspace\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }),
+            ),
+            2 => second.clone(),
+            _ => (
+                200,
+                json!({
+                    "id": "chatcmpl-3",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-4o-mini",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "I continued from retained history."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }),
+            ),
         };
         let body_str = serde_json::to_string(&body).unwrap_or_default();
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body_str.len(),
             body_str
         );

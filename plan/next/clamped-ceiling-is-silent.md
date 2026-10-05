@@ -18,37 +18,20 @@ not whether the clamp itself is right.
 
 ## The same gap, one layer over
 
-The clamped value never leaves `build_agent`. It is a local handed to `finish_agent`, so nothing
-else in the process can see the ceiling that actually applies -- and one caller needs to.
-`build_subagent_agent` (`crates/outrig-cli/src/subagent/mod.rs`) constructs `SetResultTool` from
-the *unclamped* `resolved.max_tokens` before it calls `build_agent`, so a subagent whose report is
-truncated prints "the max-tokens in effect for agent X is 128000 -- raise it" when 64000 was in
-effect and raising it cannot work.
-
-That is the same defect the subagent ceiling fix removed one layer down, where the parent's number
-was being reported for a subagent that never used it -- so the argument for fixing it is already
-made and recorded in the comment at that `SetResultTool` construction. It is narrow today
-(anthropic-style provider, recognized identifier, over-ceiling config, truncated report), which is
-why it was left rather than fixed under a "just the fix" scope.
-
-Both halves want the same thing: **the effective ceiling resolved once and stored where everyone
-reads it**, rather than computed at the moment of client construction and discarded. A field on
-`ResolvedAgent` is the obvious home; the obstacle is that the published ceiling is only knowable
-after building a rig completion model, which is `build_agent`'s job and not the resolver's. Worth
-solving properly rather than by passing the number down a second path.
+The clamped value never leaves `build_agent`, so a truncated subagent report quotes the configured
+number instead of the one in effect. That half is a bug, filed as #258. Its fix and this
+warning want the same thing: **the effective ceiling resolved once and stored where everyone reads
+it**, rather than computed at the moment of client construction and discarded.
 
 ## Shape
 
-Follow `warn_fallback_ceiling` rather than inventing a second convention: `std::sync::Once`, one
-stderr line, naming the identifier, the configured value, and the ceiling it was lowered to.
+Follow `warn_fallback_ceiling` rather than inventing a second convention: one stderr line, naming
+the identifier, the configured value, and the ceiling it was lowered to.
 
-The one real design question is **once per process or once per (model, ceiling) pair**. The
-fallback warning is once per process because it fires on a session-wide gap and a subagent fan-out
-repeating it would bury the traces around it. A clamp is per-model, and the interesting case is
-precisely a *second* model -- a parent at 128000 and a subagent clamped to 64000 are two different
-facts, and once-per-process reports only the first. A small keyed set (`Mutex<HashSet<String>>`
-or a `OnceLock` of one) keyed on the model name is probably right, but it is a new pattern in this
-file and should be argued rather than assumed.
+The question of once per process versus once per model is settled by that precedent.
+`warn_fallback_ceiling` now keys a `Mutex<BTreeSet<String>>` on the model name, so a parent at
+128000 and a subagent clamped to 64000 each get their line. What is still open is whether a
+warning that fires on a *correct* config earns its place at all.
 
 Worth pairing with `plan/next/validate-max-tokens-against-the-ceiling.md`: if validation rejects
 the over-ceiling config at load, the only configs that reach the clamp are ones validation could

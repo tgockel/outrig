@@ -30,8 +30,10 @@ If you run `outrig image add` in a directory without an `.agents/outrig/config.t
 ```
 
 Answering `y` walks the same repo-config prompts that
-[`outrig init`](https://tgockel.github.io/outrig/usage/init.html) uses (workspace, default
-agent, preamble), then continues with the `image add` flow.
+[`outrig init`](https://tgockel.github.io/outrig/usage/init.html) uses (models, default agent,
+preamble, image-config name, workspace), then continues with the `image add` flow for the
+image-config you named. Given a `<name>`, it skips the image-config name prompt: `<name>` is
+both the image-config `image add` scaffolds and the new config's `default-image`.
 Answering `n` exits with the same error a strict `find` would have produced -- run
 `outrig init` later when you're ready.
 
@@ -46,12 +48,20 @@ outrig image add [<name>] [--force]
 | `<name>`        | prompted | Image-config name (becomes `[images.<name>]`).              |
 | `--force`       | off      | Overwrite existing Dockerfile/config entries for this name. |
 
+The name keys the `[images.<name>]` block, names the Dockerfile's directory, and becomes the
+repository of the image built from it, so it must be lowercase letters and digits, separated by
+one `.`, one or two `_`, or a run of `-` (e.g. `rust-dev`; see
+[Reference -> Config](../reference/config.md#validation-rules)). A `<name>` that isn't is refused
+before the first prompt, even with `--force`, and nothing is written; one typed at the prompt is
+asked for again.
+
 ### Run it
 
 Every prompt shows the default in `[default: ...]`; press Enter to accept it. Type `?` and
 Enter at any prompt for an explanation of what's being asked plus the available options.
 The default image-config name is `<repo-folder>-standard` (kebab-cased), so the example
-below assumes a `hello-outrig` repo.
+below assumes a `hello-outrig` repo. A folder name with a letter outside ASCII, which no image
+name can hold, suggests `standard` instead.
 
 ```sh
 $ cd hello-outrig
@@ -82,7 +92,7 @@ by hand, not an exhaustive Dockerfile generator.
   rust    rustup + stable toolchain (cargo, rustfmt, clippy).
   node    Node 20 LTS via NodeSource.
   python  CPython 3.12 with pip and venv.
-  go      Go 1.22.
+  go      Go 1.27.
   none    Just the base image -- nothing extra installed.
 
   See: https://tgockel.github.io/outrig/usage/image.html#known-toolchains
@@ -99,7 +109,7 @@ The toolchain prompt offers curated options that cover the common cases:
 | `rust`   | `rustup` + the stable toolchain, `cargo`, `rustfmt`, `clippy`.    |
 | `node`   | Node 20 LTS via the base image's package manager (or NodeSource). |
 | `python` | CPython 3.12 with `pip` and `venv`.                               |
-| `go`     | Go 1.22.                                                          |
+| `go`     | Go 1.27.                                                          |
 | `none`   | Just the base image.                                              |
 
 You can pick more than one. The Dockerfile is a starting point -- edit it freely afterwards.
@@ -130,7 +140,7 @@ matching `[images.<name>]` block without being limited to the built-in template 
 
 ### What gets written
 
-`.agents/outrig/images/hello-outrig-standard/Dockerfile` (excerpt):
+`.agents/outrig/images/hello-outrig-standard/Dockerfile`:
 
 ```Dockerfile
 FROM docker.io/library/debian:bookworm-slim
@@ -141,9 +151,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # rust toolchain
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-       | sh -s -- -y --default-toolchain stable --profile default
-ENV PATH=/root/.cargo/bin:$PATH
+       | sh -s -- -y --no-modify-path --default-toolchain stable \
+                  --profile minimal --component rustfmt,clippy \
+ && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
 # node toolchain
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -162,6 +176,14 @@ user management. outrig sets up a user matching your host UID/GID at run time, w
 entries into the container from the host (see
 [Concepts -> Workspace](../concepts/workspace.md#uidgid-runtime-user-mapping)).
 
+That user is not root, so the `rust` toolchain installs under `/usr/local`, as the official `rust`
+images do, with `RUSTUP_HOME` and `CARGO_HOME` set and left writable (see
+[Concepts -> Containers](../concepts/containers.md#dont-set-up-a-user-in-the-dockerfile)): cargo
+keeps its registry cache in `CARGO_HOME`, and rustup installs any toolchain a project's
+`rust-toolchain.toml` pins into `RUSTUP_HOME`. To add to either -- `rustup component add`,
+`cargo install` -- extend that `RUN` ahead of its `chmod`; a `RUN` of its own leaves what it adds
+writable by root alone.
+
 Appended to `.agents/outrig/config.toml`:
 
 ```toml
@@ -172,6 +194,14 @@ context    = ".agents/outrig/images/hello-outrig-standard"
   [images.hello-outrig-standard.mcp]
   fs = { command = ["mcp-server-filesystem", "/workspace"] }
 ```
+
+If your config spells `images` as an inline table, `images = { base = { ... } }`, `image add`
+first rewrites it as a standard `[images]` table holding the same entries, since the new blocks
+can't nest inside an inline one. The table lands after your top-level keys. Comments above the
+`images` line and at its end move to the `[images]` header; comments between the entries of a
+multi-line inline table are not kept. An `images` that isn't a table at all, such as
+`images = "legacy"` or `[[images]]`, is refused before the first prompt, even with `--force`, and
+nothing is written.
 
 ### Re-running
 
@@ -186,6 +216,9 @@ error: .agents/outrig/images/hello-outrig-standard/Dockerfile
 
 With `--force`, the Dockerfile is replaced and the `[images.<name>]` block is rewritten in
 place (preserving surrounding TOML).
+
+Nothing is written until every prompt is answered, and a config that can't be written leaves the
+Dockerfile unwritten too, new or replaced, so a retry isn't refused over it.
 
 ## outrig image init
 
@@ -215,9 +248,10 @@ outrig image init [<dir>] [--force]
 | `<dir>`         | current dir | Project directory; its name becomes the image ref.  |
 | `--force`       | off         | Overwrite the generated files if they already exist. |
 
-The directory name must match `^[a-zA-Z][a-zA-Z0-9_-]*$` (e.g. `rust-dev`). A target that
-resolves to no usable name is rejected; `.` and the no-argument form use the current
-directory's name.
+The directory name becomes the image's ref, so it follows the same rule as an `image add` name:
+lowercase letters and digits, separated by one `.`, one or two `_`, or a run of `-` (e.g.
+`rust-dev`), though not 64 hex digits, which podman reads as an image ID. A target that resolves
+to no usable name is rejected; `.` and the no-argument form use the current directory's name.
 
 ### What gets written
 

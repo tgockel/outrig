@@ -220,7 +220,31 @@ async fn wait_for_stderr_value(stderr: Arc<Mutex<String>>, prefix: &str) -> Stri
     .unwrap_or_else(|_| panic!("stderr lacked {prefix:?}: {}", stderr.lock().unwrap()))
 }
 
-async fn initialize_http_session(client: &reqwest::Client, url: &str, id: u64) -> String {
+/// An MCP session opened over `--listen`: the id the server issued, and the
+/// protocol revision it answered the `initialize` in.
+struct HttpSession {
+    id: String,
+    protocol_version: String,
+}
+
+impl HttpSession {
+    /// A POST to `url` inside this session, naming its id and revision.
+    fn post(&self, client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
+        client
+            .post(url)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", &self.id)
+            .header("Mcp-Protocol-Version", &self.protocol_version)
+    }
+}
+
+async fn initialize_http_session(
+    client: &reqwest::Client,
+    url: &str,
+    id: u64,
+    requested_version: &str,
+) -> HttpSession {
     let response = client
         .post(url)
         .header("Accept", "application/json, text/event-stream")
@@ -230,7 +254,7 @@ async fn initialize_http_session(client: &reqwest::Client, url: &str, id: u64) -
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": requested_version,
                 "capabilities": {},
                 "clientInfo": {
                     "name": "outrig-test",
@@ -249,18 +273,23 @@ async fn initialize_http_session(client: &reqwest::Client, url: &str, id: u64) -
     let session_id = response
         .headers()
         .get("mcp-session-id")
-        .expect("mcp-session-id header")
+        .unwrap_or_else(|| panic!("initialize requesting {requested_version} issued no session id"))
         .to_str()
         .expect("session id utf-8")
         .to_string();
-    let _ = response.text().await.expect("initialize body");
+    let body = response.text().await.expect("initialize body");
+    let initialize = json_rpc_response(&body, id);
+    let protocol_version = initialize["result"]["protocolVersion"]
+        .as_str()
+        .unwrap_or_else(|| panic!("initialize answered no protocolVersion: {initialize}"))
+        .to_string();
 
-    let response = client
-        .post(url)
-        .header("Accept", "application/json, text/event-stream")
-        .header("Content-Type", "application/json")
-        .header("mcp-session-id", &session_id)
-        .header("Mcp-Protocol-Version", "2025-06-18")
+    let session = HttpSession {
+        id: session_id,
+        protocol_version,
+    };
+    let response = session
+        .post(client, url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
@@ -274,23 +303,19 @@ async fn initialize_http_session(client: &reqwest::Client, url: &str, id: u64) -
         "initialized notification should be accepted"
     );
 
-    session_id
+    session
 }
 
 async fn post_http_mcp(
     client: &reqwest::Client,
     url: &str,
-    session_id: &str,
+    session: &HttpSession,
     id: u64,
     method: &str,
     params: Value,
 ) -> Value {
-    let response = client
-        .post(url)
-        .header("Accept", "application/json, text/event-stream")
-        .header("Content-Type", "application/json")
-        .header("mcp-session-id", session_id)
-        .header("Mcp-Protocol-Version", "2025-06-18")
+    let response = session
+        .post(client, url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -536,21 +561,27 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
     wait_for_stderr_value(stderr_buf.clone(), "[outrig] mcp server ready").await;
 
     let client = reqwest::Client::new();
-    let session_a = initialize_http_session(&client, &url, 1).await;
-    let session_b = initialize_http_session(&client, &url, 2).await;
+    let session_a = initialize_http_session(&client, &url, 1, "2025-06-18").await;
+    // A revision outside the pinned list still opens a live session, answered in
+    // the server's default. Routed by the revision it asked for instead, this
+    // request would take the stateless path: no session id, and the next
+    // request refused with a 422 (#228).
+    let session_b = initialize_http_session(&client, &url, 2, "2027-01-01").await;
+    assert_eq!(session_a.protocol_version, "2025-06-18");
+    assert_eq!(
+        session_b.protocol_version, "2025-11-25",
+        "an unsupported revision should fall back to the server's default"
+    );
     assert_ne!(
-        session_a, session_b,
+        session_a.id, session_b.id,
         "each HTTP client should get a distinct MCP session"
     );
 
-    for (idx, session_id) in [session_a.as_str(), session_b.as_str()]
-        .into_iter()
-        .enumerate()
-    {
+    for (idx, session) in [&session_a, &session_b].into_iter().enumerate() {
         let list = post_http_mcp(
             &client,
             &url,
-            session_id,
+            session,
             10 + idx as u64,
             "tools/list",
             serde_json::json!({}),
@@ -570,7 +601,7 @@ async fn mcp_listen_http_serves_multiple_independent_sessions() {
         let call = post_http_mcp(
             &client,
             &url,
-            session_id,
+            session,
             20 + idx as u64,
             "tools/call",
             serde_json::json!({
@@ -856,4 +887,116 @@ async fn mcp_attach_exits_when_host_stops_container() {
         stderr.contains("attached container") && stderr.contains("stopped"),
         "stderr should explain host container stop: {stderr}"
     );
+}
+
+/// Run `outrig mcp <args> --env no_such_server:DEBUG=1` with stdin closed and
+/// assert it fails with the undeclared-server error. Returns the session
+/// records left under `session_root`.
+async fn run_mcp_with_undeclared_env_server(
+    session_root: &Path,
+    repo: &Path,
+    args: &[&str],
+) -> Vec<Session> {
+    let output = timeout(
+        TEST_TIMEOUT,
+        Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .arg("--session-root")
+            .arg(session_root)
+            .arg("mcp")
+            .args(args)
+            .args(["--env", "no_such_server:DEBUG=1"])
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("subprocess did not exit within {TEST_TIMEOUT:?}"))
+    .expect("run outrig mcp");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- subprocess stderr ---\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "outrig mcp should fail; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("image 'smoke' has no MCP server 'no_such_server'"),
+        "stderr should name the undeclared server: {stderr}"
+    );
+    SessionStore::new(session_root.to_path_buf())
+        .list()
+        .expect("list sessions")
+        .sessions
+}
+
+/// An undeclared `--env SERVER:` name is refused after the session record
+/// exists and its container runs; the refusal still finalizes the record and
+/// stops the container (#182).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_env_for_undeclared_server_finalizes_session_and_stops_container() {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+
+    let listed = run_mcp_with_undeclared_env_server(sessions.path(), repo_dir.path(), &[]).await;
+    assert_eq!(listed.len(), 1, "expected one session record: {listed:?}");
+    let session = &listed[0];
+    assert_eq!(session.exit_code, Some(1), "{session:?}");
+    assert!(session.ended_at.is_some(), "{session:?}");
+
+    let ps = Command::new("podman")
+        .args(["ps", "-a", "--filter"])
+        .arg(format!("name={}", session.container_name))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .await
+        .expect("podman ps");
+    let leftovers = String::from_utf8_lossy(&ps.stdout);
+    assert!(
+        leftovers.trim().is_empty(),
+        "container `{}` is still alive: {leftovers}",
+        session.container_name
+    );
+}
+
+/// The same refusal under `--attach` finalizes only the attacher's own record
+/// and leaves the borrowed container running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_attach_env_for_undeclared_server_leaves_borrowed_container_running() {
+    let repo_dir = tempfile::tempdir().expect("tempdir repo");
+    write_mcp_config(repo_dir.path());
+
+    let image = ensure_fixture_image().await;
+    let container = start_fixture_container(&image, repo_dir.path()).await;
+    let sessions = tempfile::tempdir().expect("tempdir sessions");
+    let host_sid = create_host_session(sessions.path(), repo_dir.path(), &container, &image);
+
+    let listed = run_mcp_with_undeclared_env_server(
+        sessions.path(),
+        repo_dir.path(),
+        &["--attach", host_sid.as_str()],
+    )
+    .await;
+    let attacher = listed
+        .iter()
+        .find(|session| session.id != host_sid)
+        .expect("attacher writes its own session record");
+    assert_eq!(attacher.exit_code, Some(1), "{attacher:?}");
+    assert!(attacher.ended_at.is_some(), "{attacher:?}");
+    let host = listed
+        .iter()
+        .find(|session| session.id == host_sid)
+        .expect("host session record");
+    assert_eq!(
+        host.ended_at, None,
+        "attacher must not end the host session"
+    );
+
+    assert!(
+        Container::is_running(container.name())
+            .await
+            .expect("podman inspect"),
+        "failed attacher must not stop the borrowed container"
+    );
+    container.stop(Duration::from_secs(2)).await.expect("stop");
 }

@@ -3,6 +3,7 @@
 //! against `git` and `tar`.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -22,21 +23,51 @@ fn make_ctx(files: &[(&str, &str)]) -> tempfile::TempDir {
     dir
 }
 
+fn git(p: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(p)
+        .args(args)
+        .status()
+        .expect("spawn git");
+    assert!(status.success(), "git {args:?} failed in {p:?}");
+}
+
+/// Make `p` a repository with everything already in it committed. Files
+/// written afterwards stay untracked.
 fn git_init(p: &Path) {
-    let run = |args: &[&str]| {
-        let status = Command::new("git")
-            .current_dir(p)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed in {p:?}");
-    };
-    run(&["init", "-q", "-b", "main"]);
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "test"]);
-    run(&["config", "commit.gpgsign", "false"]);
-    run(&["add", "-A"]);
-    run(&["commit", "-q", "-m", "init", "--allow-empty"]);
+    git(p, &["init", "-q", "-b", "main"]);
+    git(p, &["config", "user.email", "test@example.com"]);
+    git(p, &["config", "user.name", "test"]);
+    git(p, &["config", "commit.gpgsign", "false"]);
+    git(p, &["add", "-A"]);
+    git(p, &["commit", "-q", "-m", "init", "--allow-empty"]);
+}
+
+/// `git check-ignore -q <rel>`'s exit code in `repo`: 0 when `rel` is ignored,
+/// 1 when it is not, and 128 on an error.
+fn check_ignore(repo: &Path, rel: &str) -> Option<i32> {
+    Command::new("git")
+        .current_dir(repo)
+        .args(["check-ignore", "-q", rel])
+        .status()
+        .expect("spawn git")
+        .code()
+}
+
+/// Pin that `rel` is untracked but not ignored, so a test of that case cannot
+/// quietly become a second copy of the gitignore one. Only 1 passes: an error
+/// is no answer.
+fn assert_not_ignored(repo: &Path, rel: &str) {
+    assert_eq!(
+        check_ignore(repo, rel),
+        Some(1),
+        "{rel} must not be gitignored"
+    );
+}
+
+/// Pin that `rel` is gitignored, so a test of an ignored file exercises one.
+fn assert_ignored(repo: &Path, rel: &str) {
+    assert_eq!(check_ignore(repo, rel), Some(0), "{rel} must be gitignored");
 }
 
 async fn key(dockerfile: &Path, args: &BTreeMap<String, String>, ctx: &Path) -> String {
@@ -145,14 +176,439 @@ async fn gitignored_file_does_not_affect_key_when_in_git() {
     assert_eq!(ka, kb, "untracked ignored file must not affect the key");
 
     // Force-add the previously-ignored file: now it's tracked, key must change.
-    let status = Command::new("git")
-        .current_dir(ctx_b.path())
-        .args(["add", "-f", "ignored.log"])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    git(ctx_b.path(), &["add", "-f", "ignored.log"]);
     let kb2 = key(&ctx_b.path().join("Dockerfile"), &args, ctx_b.path()).await;
     assert_ne!(kb, kb2, "tracking a new file must change the key");
+}
+
+/// Where ignore rules exclude every file in a context -- the directory is
+/// ignored, itself or through one above it, or every file in it is -- they
+/// say nothing about which are build inputs, yet buildah is handed all of
+/// them, so all of them count. A file tracked although a rule matches it, as a
+/// force-added one is, is excluded all the same.
+#[tokio::test]
+async fn context_whose_every_file_is_ignored_keys_every_file() {
+    // Where the rule lives, the rule, the context, and whether its
+    // `Dockerfile` is force-added.
+    for (rules, rule, ctx_rel, tracked) in [
+        (".gitignore", "private/\n", "private/ctx", false),
+        (".gitignore", "private/\n", "private/ctx", true),
+        (".gitignore", "/ctx/\n", "ctx", false),
+        (".git/info/exclude", "private/\n", "private/ctx", false),
+        (".gitignore", "private/*\n", "private", false),
+        (".gitignore", "private/*\n", "private", true),
+        ("images/coding/.gitignore", "*\n", "images/coding", true),
+    ] {
+        let dockerfile_rel = format!("{ctx_rel}/Dockerfile");
+        let helper_rel = format!("{ctx_rel}/helper.sh");
+        let repo = make_ctx(&[
+            (rules, rule),
+            (&dockerfile_rel, "FROM scratch\nCOPY helper.sh /helper.sh\n"),
+            (&helper_rel, "echo v1\n"),
+        ]);
+        git_init(repo.path());
+        if tracked {
+            git(repo.path(), &["add", "-f", &dockerfile_rel]);
+            git(repo.path(), &["commit", "-q", "-m", "force-add"]);
+        }
+        assert_ignored(repo.path(), &helper_rel);
+
+        let ctx = repo.path().join(ctx_rel);
+        let dockerfile = ctx.join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, &ctx).await;
+        std::fs::write(ctx.join("helper.sh"), "echo v2\n").unwrap();
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, &ctx).await,
+            "{rule:?} in {rules}, Dockerfile tracked {tracked}: an edit in {ctx_rel} must change the key"
+        );
+    }
+}
+
+/// Image tags are host-wide, so two checkouts of an ignored context share one
+/// only while their files match.
+#[tokio::test]
+async fn ignored_contexts_share_a_key_only_while_their_files_match() {
+    let checkout = || {
+        let repo = make_ctx(&[
+            (".gitignore", "private/\n"),
+            (
+                "private/ctx/Dockerfile",
+                "FROM scratch\nCOPY helper.sh /helper.sh\n",
+            ),
+            ("private/ctx/helper.sh", "echo v1\n"),
+        ]);
+        git_init(repo.path());
+        repo
+    };
+    let (a, b) = (checkout(), checkout());
+    let (ctx_a, ctx_b) = (a.path().join("private/ctx"), b.path().join("private/ctx"));
+
+    let args = BTreeMap::new();
+    let ka = key(&ctx_a.join("Dockerfile"), &args, &ctx_a).await;
+    assert_eq!(
+        ka,
+        key(&ctx_b.join("Dockerfile"), &args, &ctx_b).await,
+        "identical ignored contexts must share a key"
+    );
+
+    std::fs::write(ctx_b.join("helper.sh"), "echo v2\n").unwrap();
+    assert_ne!(
+        ka,
+        key(&ctx_b.join("Dockerfile"), &args, &ctx_b).await,
+        "ignored contexts that differ in a file must not share a key"
+    );
+}
+
+/// Ignore rules that admit any file in a context still filter it: ones that
+/// ignore everything they do not name, and ones beside a file tracked although
+/// a rule matches it.
+#[tokio::test]
+async fn rules_admitting_any_file_still_filter_the_context() {
+    // The context's own `.gitignore`, and whether `keep.log` is force-added.
+    for (rules, tracked) in [("*\n!.gitignore\n!Dockerfile\n", false), ("*.log\n", true)] {
+        let repo = make_ctx(&[
+            ("images/coding/.gitignore", rules),
+            ("images/coding/Dockerfile", "FROM alpine\n"),
+            ("images/coding/keep.log", "kept\n"),
+        ]);
+        git_init(repo.path());
+        if tracked {
+            git(repo.path(), &["add", "-f", "images/coding/keep.log"]);
+            git(repo.path(), &["commit", "-q", "-m", "force-add"]);
+        }
+        let ctx = repo.path().join("images/coding");
+        let dockerfile = ctx.join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, &ctx).await;
+
+        std::fs::write(ctx.join("out.log"), "build output\n").unwrap();
+        assert_ignored(repo.path(), "images/coding/out.log");
+        assert_eq!(
+            before,
+            key(&dockerfile, &args, &ctx).await,
+            "{rules:?}, keep.log tracked {tracked}: a file the rules exclude must not count"
+        );
+    }
+}
+
+/// buildah is handed the whole context directory, so a file nobody has
+/// committed yet is as much a build input as a tracked one.
+#[tokio::test]
+async fn untracked_nonignored_file_changes_key() {
+    let ctx = make_ctx(&[(
+        "Dockerfile",
+        "FROM scratch\nCOPY generated.txt /generated.txt\n",
+    )]);
+    git_init(ctx.path());
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let absent = key(&dockerfile, &args, ctx.path()).await;
+
+    std::fs::write(ctx.path().join("generated.txt"), "v1").unwrap();
+    assert_not_ignored(ctx.path(), "generated.txt");
+    let added = key(&dockerfile, &args, ctx.path()).await;
+    assert_ne!(
+        absent, added,
+        "adding an untracked file must change the key"
+    );
+
+    std::fs::write(ctx.path().join("generated.txt"), "v2-different").unwrap();
+    let edited = key(&dockerfile, &args, ctx.path()).await;
+    assert_ne!(
+        added, edited,
+        "changing an untracked, non-ignored context file must change the key"
+    );
+}
+
+/// A tracked file removed without `git rm` is still in the index, but not in
+/// what buildah receives. It hashes as absent rather than failing the key.
+#[tokio::test]
+async fn deleted_tracked_file_is_skipped() {
+    let a = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("gone.txt", "x")]);
+    let b = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    git_init(a.path());
+    git_init(b.path());
+    std::fs::remove_file(a.path().join("gone.txt")).unwrap();
+
+    let args = BTreeMap::new();
+    let ka = key(&a.path().join("Dockerfile"), &args, a.path()).await;
+    let kb = key(&b.path().join("Dockerfile"), &args, b.path()).await;
+    assert_eq!(ka, kb, "the key follows the worktree, not the index");
+}
+
+/// `COPY` keeps names and permission bits, so a rename or a `chmod +x` on an
+/// entrypoint changes the image and must change the key.
+#[tokio::test]
+async fn path_and_mode_are_part_of_the_key() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("entry.sh", "true\n")]);
+    git_init(ctx.path());
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+
+    let original = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::set_permissions(
+        ctx.path().join("entry.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let executable = key(&dockerfile, &args, ctx.path()).await;
+    assert_ne!(original, executable, "a mode change must change the key");
+
+    std::fs::rename(ctx.path().join("entry.sh"), ctx.path().join("start.sh")).unwrap();
+    let renamed = key(&dockerfile, &args, ctx.path()).await;
+    assert_ne!(executable, renamed, "a rename must change the key");
+}
+
+#[tokio::test]
+async fn subdirectory_context_hashes_its_own_files() {
+    let repo = make_ctx(&[
+        ("outside.txt", "o"),
+        ("images/coding/Dockerfile", "FROM alpine\n"),
+        ("images/coding/tracked.txt", "t"),
+    ]);
+    git_init(repo.path());
+    let ctx = repo.path().join("images/coding");
+    std::fs::write(ctx.join("untracked.txt"), "v1").unwrap();
+    let dockerfile = ctx.join("Dockerfile");
+    let args = BTreeMap::new();
+
+    let before = key(&dockerfile, &args, &ctx).await;
+    std::fs::write(repo.path().join("outside.txt"), "changed").unwrap();
+    std::fs::write(repo.path().join("stray.txt"), "new").unwrap();
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, &ctx).await,
+        "files outside the context must not affect the key"
+    );
+
+    std::fs::write(ctx.join("untracked.txt"), "v2").unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, &ctx).await,
+        "an untracked file inside a subdirectory context must count"
+    );
+}
+
+/// git lists an untracked nested repository as one `dir/` entry. It is hashed
+/// by the same rule, in its own repository, so its own `.gitignore` applies.
+#[tokio::test]
+async fn nested_repo_in_context_is_hashed() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    // The outer commit comes first: `add -A` over an existing nested
+    // repository would record it as a gitlink instead of leaving it untracked.
+    git_init(ctx.path());
+    let lib = ctx.path().join("vendor/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("lib.txt"), "v1").unwrap();
+    std::fs::write(lib.join(".gitignore"), "build/\n").unwrap();
+    git_init(&lib);
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+
+    std::fs::create_dir_all(lib.join("build")).unwrap();
+    std::fs::write(lib.join("build/out.o"), "artifact").unwrap();
+    assert_eq!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "a file the nested repository ignores must not count"
+    );
+
+    std::fs::write(lib.join("lib.txt"), "v2").unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an edit inside a nested repository must change the key"
+    );
+}
+
+/// An uninitialized submodule is a gitlink over a directory git does not treat
+/// as a repository -- no `.git`, or one git rejects, which it looks past to
+/// the enclosing repository. Whatever is in that directory reaches buildah,
+/// so it counts.
+#[tokio::test]
+async fn uninitialized_submodule_is_hashed() {
+    for marker in ["none", "empty .git directory", "dangling .git link"] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+        git_init(ctx.path());
+        git(
+            ctx.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,0123456789abcdef0123456789abcdef01234567,sub",
+            ],
+        );
+        let sub = ctx.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        match marker {
+            "empty .git directory" => std::fs::create_dir(sub.join(".git")).unwrap(),
+            "dangling .git link" => {
+                std::os::unix::fs::symlink("missing", sub.join(".git")).unwrap()
+            }
+            _ => {}
+        }
+
+        let dockerfile = ctx.path().join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, ctx.path()).await;
+        std::fs::write(sub.join("stray.txt"), "x").unwrap();
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, ctx.path()).await,
+            "{marker}: a file inside the submodule directory must change the key"
+        );
+    }
+}
+
+/// `COPY <link> <dest>` copies what the link points at, resolved with the
+/// context as `/`: an absolute target and a `..` past the top both stay
+/// inside it. That may be a file or a whole directory git never lists, like
+/// the refs under `.git`.
+#[tokio::test]
+async fn symlink_keys_what_it_resolves_to() {
+    for target in [
+        ".git/refs/heads/main",
+        "/.git/refs/heads/main",
+        "../../.git/refs/heads/main",
+        ".git/refs",
+        "/.git/refs/heads",
+    ] {
+        let ctx = make_ctx(&[("Dockerfile", "FROM scratch\nCOPY revision /revision\n")]);
+        git_init(ctx.path());
+        std::os::unix::fs::symlink(target, ctx.path().join("revision")).unwrap();
+
+        let dockerfile = ctx.path().join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, ctx.path()).await;
+        git(ctx.path(), &["commit", "-q", "--allow-empty", "-m", "next"]);
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, ctx.path()).await,
+            "moving the ref that `revision -> {target}` copies must change the key"
+        );
+    }
+}
+
+/// `COPY <link> <dest>` keeps the permission bits of the file it copies, and
+/// that file is not otherwise in the key when git does not list it.
+#[tokio::test]
+async fn symlink_keys_the_mode_of_what_it_resolves_to() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM scratch\nCOPY cfg /cfg\n")]);
+    git_init(ctx.path());
+    let stamp = ctx.path().join(".git/stamp");
+    std::fs::write(&stamp, "x").unwrap();
+    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(".git/stamp", ctx.path().join("cfg")).unwrap();
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::set_permissions(&stamp, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "a mode change on the file a link resolves to must change the key"
+    );
+}
+
+/// buildah resolves every `COPY` source against the build context, so a link
+/// inside a nested repository resolves there too, not in the nested root.
+#[tokio::test]
+async fn symlink_in_a_nested_repo_resolves_against_the_context() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n")]);
+    git_init(ctx.path());
+    let lib = ctx.path().join("vendor/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("lib.txt"), "v1").unwrap();
+    git_init(&lib);
+    std::os::unix::fs::symlink("/.git/refs/heads/main", lib.join("revision")).unwrap();
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    git(ctx.path(), &["commit", "-q", "--allow-empty", "-m", "next"]);
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "moving the context's own ref must change the key"
+    );
+}
+
+/// A link inside a tree another link copies is followed too: `COPY
+/// meta/selected` resolves both links, and lands on a file git never lists.
+#[tokio::test]
+async fn symlink_inside_a_linked_directory_keys_what_it_resolves_to() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM scratch\nCOPY meta/selected /selected\n")]);
+    git_init(ctx.path());
+    let buildmeta = ctx.path().join(".git/buildmeta");
+    std::fs::create_dir(&buildmeta).unwrap();
+    std::fs::write(ctx.path().join(".git/stamp"), "v1").unwrap();
+    std::os::unix::fs::symlink("/.git/stamp", buildmeta.join("selected")).unwrap();
+    std::os::unix::fs::symlink(".git/buildmeta", ctx.path().join("meta")).unwrap();
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let before = key(&dockerfile, &args, ctx.path()).await;
+    std::fs::write(ctx.path().join(".git/stamp"), "v2").unwrap();
+    assert_ne!(
+        before,
+        key(&dockerfile, &args, ctx.path()).await,
+        "an edit to the file a nested link resolves to must change the key"
+    );
+}
+
+/// buildah cleans a link's target before resolving any of it -- a relative
+/// one joined to the link's directory first -- so `alias/..` cancels even
+/// though `alias` is a link: `revision` names `./stamp.txt`, not
+/// `data/stamp.txt`.
+#[tokio::test]
+async fn symlink_target_is_cleaned_before_it_is_resolved() {
+    for target in ["alias/../stamp.txt", "/alias/../stamp.txt"] {
+        let ctx = make_ctx(&[
+            ("Dockerfile", "FROM scratch\nCOPY revision /revision\n"),
+            (".gitignore", "stamp.txt\n"),
+            ("stamp.txt", "v1"),
+            ("data/stamp.txt", "inner"),
+            ("data/sub/.keep", ""),
+        ]);
+        std::os::unix::fs::symlink("data/sub", ctx.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink(target, ctx.path().join("revision")).unwrap();
+        git_init(ctx.path());
+
+        let dockerfile = ctx.path().join("Dockerfile");
+        let args = BTreeMap::new();
+        let before = key(&dockerfile, &args, ctx.path()).await;
+        std::fs::write(ctx.path().join("stamp.txt"), "v2").unwrap();
+        assert_ne!(
+            before,
+            key(&dockerfile, &args, ctx.path()).await,
+            "`revision -> {target}` copies ./stamp.txt, so editing it must change the key"
+        );
+    }
+}
+
+/// A link that leads back into what is already being hashed -- a pair naming
+/// each other, a link to the context itself -- ends there instead of hanging
+/// or failing the key.
+#[tokio::test]
+async fn symlink_loops_end() {
+    let ctx = make_ctx(&[("Dockerfile", "FROM alpine\n"), ("d/f.txt", "x")]);
+    git_init(ctx.path());
+    std::os::unix::fs::symlink("b", ctx.path().join("a")).unwrap();
+    std::os::unix::fs::symlink("a", ctx.path().join("b")).unwrap();
+    std::os::unix::fs::symlink(".", ctx.path().join("here")).unwrap();
+    std::os::unix::fs::symlink("..", ctx.path().join("d/up")).unwrap();
+
+    let dockerfile = ctx.path().join("Dockerfile");
+    let args = BTreeMap::new();
+    let k1 = key(&dockerfile, &args, ctx.path()).await;
+    let k2 = key(&dockerfile, &args, ctx.path()).await;
+    assert_eq!(k1, k2);
 }
 
 #[tokio::test]

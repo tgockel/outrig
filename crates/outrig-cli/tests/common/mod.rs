@@ -2,7 +2,9 @@
 //! `tests/` as test binaries; subdirectories with `mod.rs` are
 //! conventional shared modules (no phantom `common` test binary).
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -134,6 +136,23 @@ impl RecordedRequest {
             .find(|(k, _)| k == name)
             .map(|(_, v)| v.as_str())
     }
+
+    /// The conversation the request carried. OpenAI's chat completions and
+    /// Anthropic's messages both send it as a top-level `messages` array.
+    #[allow(dead_code)]
+    pub fn messages(&self) -> &[serde_json::Value] {
+        self.body["messages"].as_array().expect("a messages array")
+    }
+
+    /// The role of each of [`Self::messages`], in order: what an endpoint that
+    /// requires alternating roles checks.
+    #[allow(dead_code)]
+    pub fn roles(&self) -> Vec<&str> {
+        self.messages()
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect()
+    }
 }
 
 /// One canned response. Status is separate from body so a script can put a
@@ -148,6 +167,8 @@ pub struct CannedResponse {
     /// `Content-Length`, and `Connection` are always sent and are not listed
     /// here.
     pub headers: Vec<(String, String)>,
+    /// Answer nothing at all; see [`Self::held`].
+    pub held: bool,
 }
 
 impl CannedResponse {
@@ -162,6 +183,18 @@ impl CannedResponse {
             status,
             body,
             headers: Vec::new(),
+            held: false,
+        }
+    }
+
+    /// A request the mock records and never answers, holding the connection
+    /// open until the client gives up on it: a model call still in flight,
+    /// which is where a test drops a turn to do what Ctrl-C does.
+    #[allow(dead_code)]
+    pub fn held() -> Self {
+        Self {
+            held: true,
+            ..Self::status(0, serde_json::Value::Null)
         }
     }
 
@@ -215,6 +248,16 @@ async fn serve_mock_http(
             return;
         };
         served += 1;
+
+        if canned.held {
+            // Off the accept loop, so later requests are still served. Reading
+            // to EOF is what notices the client has dropped the request.
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let _ = sock.read_to_end(&mut Vec::new()).await;
+            });
+            continue;
+        }
 
         let body = serde_json::to_string(&canned.body).expect("canned body serializes");
         let extra: String = canned
@@ -324,6 +367,88 @@ pub fn unset_test_env(var: &str) {
     unsafe { std::env::remove_var(var) }
 }
 
+/// Build `cfg`'s `[agents.coding]` through the real `resolve_agent` ->
+/// `build_agent` path, for a test whose providers point at
+/// [`start_mock_http`] mocks.
+///
+/// `vars` are the test's own env-var names for its fake keys, each set to `key`
+/// -- unique per test, which is what makes the `set_test_env` calls safe. A
+/// slice rather than one name because a failover chain has a key per
+/// candidate, and candidate selection drops any row whose key is unset -- so a
+/// chain that set only the head's var would resolve to a chain of one.
+#[allow(dead_code)]
+pub async fn build_mock_agent(
+    cfg: &outrig::config::Config,
+    key: &str,
+    vars: &[&str],
+    tools: Vec<outrig_cli::session_tool::SessionTool>,
+) -> outrig_cli::llm::RigAgent {
+    for var in vars {
+        set_test_env(var, key);
+    }
+    let resolved = outrig_cli::llm::resolve_agent(cfg, Some("coding")).expect("resolves");
+    for var in vars {
+        unset_test_env(var);
+    }
+
+    outrig_cli::llm::build_agent(&resolved, tools)
+        .await
+        .expect("agent builds")
+}
+
+/// The name [`FixedTool`] registers under.
+#[allow(dead_code)]
+pub const FIXED_TOOL: &str = "outrig_test_fixed";
+
+/// A tool that returns `output` whatever it is called with, so a test can put
+/// exact text in a tool result and look for it in the request that follows.
+#[allow(dead_code)]
+pub struct FixedTool {
+    pub output: &'static str,
+}
+
+impl rig::tool::ToolDyn for FixedTool {
+    fn name(&self) -> String {
+        FIXED_TOOL.to_string()
+    }
+
+    fn description(&self) -> String {
+        "Return a fixed text.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    fn call<'a>(
+        &'a self,
+        _args: String,
+    ) -> rig::wasm_compat::WasmBoxedFuture<'a, std::result::Result<String, rig::tool::ToolError>>
+    {
+        Box::pin(async move { Ok(self.output.to_string()) })
+    }
+}
+
+/// Tool results rig 0.40 would not send as written: each is JSON in a shape
+/// its `ToolResultContent::from_tool_output` reads as structured (#253).
+///
+/// * A WireMock stub mapping, as a file read returns it. It has a top-level
+///   `response` key, so it would reach the model as that value alone,
+///   re-serialized, and without the `request` it matches.
+/// * A `response` beside image `parts`, which would reach it as the quoted
+///   `response` and an image.
+/// * An object shaped as an image, which would reach it as that image.
+#[allow(dead_code)]
+pub const RESULTS_RIG_RESHAPES: [&str; 3] = [
+    r#"{
+  "request": { "method": "GET", "url": "/api/health" },
+  "response": { "status": 200, "body": "ok" }
+}
+"#,
+    r#"{"response": "Rendered the chart.", "parts": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}"#,
+    r#"{"type": "image", "data": "https://example.com/x.png", "mimeType": "image/png"}"#,
+];
+
 /// Materialize `<root>/<sid>/session.json` from [`sample_session`], letting
 /// `mutate` reshape the JSON first. Tests on-disk shapes the current code
 /// wouldn't write itself -- legacy key names, dropped fields, corruption --
@@ -358,4 +483,80 @@ pub fn as_legacy_image_key(value: &mut serde_json::Value) {
 #[allow(dead_code)]
 pub fn drop_image_tag(value: &mut serde_json::Value) {
     value.as_object_mut().expect("object").remove("image_tag");
+}
+
+#[allow(dead_code)]
+const RUN_OUTRIG_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A global config that resolves a model, so a run gets past model wiring and
+/// into the image cascade. The provider is never contacted.
+#[allow(dead_code)]
+pub const GLOBAL_WITH_MODEL: &str = r#"
+default-model = "fast"
+
+[providers.openai]
+style    = "openai"
+base-url = "http://127.0.0.1:1/v1"
+api-key  = "${OUTRIG_TEST_KEY}"
+
+[models.fast]
+provider   = "openai"
+identifier = "test-model"
+"#;
+
+/// A `PATH` whose `podman` and `buildah` exit non-zero immediately, so image
+/// probes and pulls fail instantly instead of hitting the network.
+#[allow(dead_code)]
+fn stub_runtime_path(dir: &Path) -> std::ffi::OsString {
+    for name in ["podman", "buildah"] {
+        let stub = dir.join(name);
+        std::fs::write(&stub, "#!/bin/sh\nexit 1\n").expect("write runtime stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod runtime stub");
+    }
+    let mut path = std::ffi::OsString::from(dir);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    path
+}
+
+/// Run `outrig` in `cwd` and return whether it succeeded, plus its stderr.
+/// `podman` and `buildah` are stubs that fail at once (see
+/// `builtin_default.rs`), and `XDG_CACHE_HOME` is a tempdir, so nothing
+/// reaches the network or the developer's real cache.
+#[allow(dead_code)]
+pub async fn run_outrig(cwd: &Path, args: &[&str]) -> (bool, String) {
+    run_outrig_with_env(cwd, args, &[]).await
+}
+
+/// [`run_outrig`] with extra environment variables, set last so they win.
+#[allow(dead_code)]
+pub async fn run_outrig_with_env(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> (bool, String) {
+    let stubs = tempfile::tempdir().expect("tempdir stubs");
+    let cache = tempfile::tempdir().expect("tempdir cache");
+
+    let output = tokio::time::timeout(
+        RUN_OUTRIG_TIMEOUT,
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_outrig"))
+            .args(args)
+            .current_dir(cwd)
+            .env("OUTRIG_TEST_KEY", "test-key")
+            .env("PATH", stub_runtime_path(stubs.path()))
+            .env("XDG_CACHE_HOME", cache.path())
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("outrig timed out")
+    .expect("spawn outrig");
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }

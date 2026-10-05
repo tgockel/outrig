@@ -337,6 +337,42 @@ async fn logs_no_server_lists_files_with_sizes() {
     assert!(!out.contains("fs.stderr"), "should strip .stderr: {out}");
 }
 
+/// A subagent launched by another subagent writes its transcript into a
+/// directory named for that parent, so the listing has to descend to show it,
+/// at any depth.
+#[tokio::test]
+async fn logs_no_server_lists_nested_subagent_transcripts() {
+    let root = tempfile::tempdir().expect("tempdir root");
+    let store = SessionStore::new(root.path().to_path_buf());
+    let sid = SessionId("20260501T134412-3f2a".into());
+    let mut s = sample_session(&sid);
+    let dir = store.create(&sid, None, &mut s).expect("create");
+    std::fs::create_dir_all(dir.join("logs/subagent-audit/subagent-audit")).expect("nested dirs");
+    let names = [
+        "subagent-audit.log",
+        "subagent-audit/subagent-audit.log",
+        "subagent-audit/subagent-audit/subagent-deep.log",
+    ];
+    for name in names {
+        write_log(&dir, name, b"=== subagent ===\n");
+    }
+
+    let (mut sw, stdout_r) = duplex(4096);
+    let (mut ew, _stderr_r) = duplex(4096);
+    logs::execute_with(&mut sw, &mut ew, &dir.join("logs"), None, false)
+        .await
+        .expect("logs");
+    drop(sw);
+    drop(ew);
+
+    let out = drain(stdout_r).await;
+    let listed: Vec<&str> = out
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(listed, names, "got: {out}");
+}
+
 #[tokio::test]
 async fn logs_with_server_cats_file() {
     let root = tempfile::tempdir().expect("tempdir root");

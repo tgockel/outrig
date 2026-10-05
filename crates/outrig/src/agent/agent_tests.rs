@@ -1380,7 +1380,7 @@ async fn the_default_window_leaves_out_the_third_round_of_ten() {
     );
 }
 
-/// `plan/next/repl-interrupt-history-loss.md`, in `run-new`: interrupting a
+/// The interrupt history loss `outrig run` had until 0.2.1, in `run-new`: interrupting a
 /// round -- which drops its future, while the model is being called or while
 /// Python runs -- no longer takes the conversation with it. The store owns
 /// it, not the round.

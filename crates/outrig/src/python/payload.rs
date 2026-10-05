@@ -36,7 +36,7 @@ pub(super) const PAYLOAD: &str = env!("OUTRIG_PYTHON_PAYLOAD");
 ///
 /// Built for the *target* architecture. podman will run a foreign-arch image
 /// under emulation without saying so, and this does not detect that; see
-/// `plan/next/enter-arch-mismatch.md`, which the launcher shares.
+/// `plan/next/python-payload-arch-mismatch.md`, and #285 for the launcher's half.
 pub(crate) async fn host_dir() -> Result<PathBuf> {
     if ARCHIVE.is_empty() {
         return Err(not_embedded());

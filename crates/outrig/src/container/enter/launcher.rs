@@ -59,8 +59,7 @@
 //! instead of the graft, which `canon.rs` explains in full. That closes the
 //! paths this file names. It does not close the ones ld.so goes on to find for
 //! itself -- a `DT_NEEDED` library that is an absolute symlink escapes by the
-//! identical mechanism, as does musl's `/etc/ld-musl-<arch>.path`; see
-//! `plan/next/enter-musl-loader-reads-the-primarys-path-file.md`.
+//! identical mechanism, as does musl's `/etc/ld-musl-<arch>.path`; see #268.
 //!
 //! This file is compiled only by the `outrig` crate's `build.rs`, always for a
 //! Linux musl target; it is not part of the normal `cargo build`. The logic it

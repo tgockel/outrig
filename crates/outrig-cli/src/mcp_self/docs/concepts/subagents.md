@@ -55,7 +55,9 @@ everywhere afterward.
 ### Choosing the subagent's model
 
 `outrig__subagent` takes an optional `model`. Omit it and the subagent runs under the model the
-launching agent is running under, which is what every call above does.
+launching agent is running under, which is what every call above does. That holds at every depth:
+a subagent launched onto `fast` is the launching agent for its own children, so they run on `fast`
+too unless they name another.
 
 ```
 outrig__subagent({"name": "grep-callers", "prompt": "...", "model": "fast"})
@@ -108,7 +110,11 @@ explicitly also makes failure honest -- a subagent that runs out of tool calls n
 the parent is told it stopped rather than handed a status string dressed up as an answer.
 
 A subagent may call it more than once. The inbox keeps only the latest value, so a later call
-simply supersedes an earlier one, and calling it does not end the subagent's round.
+simply supersedes an earlier one, and calling it does not end the subagent's round. A failure
+later in the round does not supersede it: if a model call after the report fails for good, the
+parent still reads the report, and the failure is noted on stderr and in the subagent's transcript.
+If the parent sent a message after the report, though, the report is no answer to it, and the
+parent reads the failure instead.
 
 Both fields are required, which is deliberate. An earlier shape took `{result}` or `{error}` as
 two optional strings, and models called it as `{}` constantly -- a schema where every field is
@@ -161,8 +167,8 @@ The same shape shows up beyond `set_result`: a model that cannot act on a tool e
 re-emit the identical call rather than try something else. Within a subagent round, OutRig counts
 consecutive failures of the same tool called with **identical arguments**. The second such failure
 gets a note appended to the tool result saying that repeating will not change the outcome; the
-fourth ends the round. Changing the arguments, or any call that succeeds, resets the count -- a
-subagent taking the hint is making progress, not looping.
+fourth ends the round, and its result says so. Changing the arguments, or any call that succeeds,
+resets the count -- a subagent taking the hint is making progress, not looping.
 
 A round ended this way publishes nothing, so its parent is told the reason it stopped rather than
 the bare "stopped without calling `outrig__set_result`". The same is true of a round that runs out
@@ -178,6 +184,12 @@ Each subagent's inbox carries a version, and the parent keeps a read position ag
 `outrig__get_result` blocks until there is something newer than what the parent last saw, returns
 it, and moves the read position past it. Reading twice with nothing new in between blocks rather
 than returning the same answer again.
+
+A read counts once its result is in the parent's conversation. A turn can end without it: Ctrl-C
+keeps only the tool calls whose results had already gone back to the model, so a read made
+alongside a call still running is dropped with that call, and a subagent round that ends in an
+error keeps none of its calls. The read position moves back for such a read, and the next
+`outrig__get_result` returns that result again rather than block for a newer one.
 
 `outrig__wait_results` blocks on the same condition across several subagents and reports **names
 only**. Results can be large, so a call that returned three of them at once is exactly the
@@ -204,8 +216,16 @@ outrig__get_result({"name": "audit-mcp"})
 
 Finishing a round does not end a subagent. It goes idle with its history intact, and
 `outrig__subagent_send` reopens it -- to follow up on a result, or to redirect one that is still
-working. A running subagent sees the message at its next step, so the parent never has to know
-whether it is busy. Idle subagents live until released or until the session ends.
+working. That holds for a round its model endpoint failed, too: the parent reads `round failed`, or
+the round's report if it sent nothing after that, and the tool calls the round had already run stay
+in its history, so a send picks up from them rather than running them again. A running subagent sees
+the message at its next step, appended to its next tool results, so the parent never has to know
+whether it is busy. A report the round made before the message is no answer to it: if the round ends
+without reporting again, reading its result says the subagent stopped. One already past its last
+step when the message arrives runs it as a round of its own instead. Rounds run in the order their
+messages were sent, and a subagent with one waiting is not idle: reading its result waits for that
+round rather than returning how the last one stopped. Idle subagents live until released or until
+the session ends.
 
 `outrig__subagent_release` takes the whole list or none of it. If any name in the call is unknown
 -- or named twice -- nothing is released and every subagent in that call stays live, with its
@@ -233,14 +253,27 @@ subagent, or ending the session, tears down everything it launched with it.
 Nothing reaches stdout except the primary agent's reply, so `outrig run > out.txt` still captures
 only the model's text. Subagent activity shows up two other ways:
 
-- On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name.
-- In `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr logs, holding that
-  subagent's prompts, replies, and published outcomes.
+- On stderr, with each trace labeled by name. Concurrent subagents interleave; filter by name. A
+  round that ends early -- at its tool-call max, at the repeat breaker, or on a model call that
+  failed for good -- says why on a line labeled the same way. It leaves out the advice printed
+  when the primary's turn ends early: `continue`, `/reset`, and the rest act on the primary's
+  conversation, and what a subagent does next is its parent's call.
+- In a transcript holding that subagent's prompts, replies, and published outcomes. A subagent the
+  primary launched writes `<session_dir>/logs/subagent-<name>.log`, beside the MCP servers' stderr
+  logs. One launched by a subagent writes into a directory named for its parent, beside the
+  parent's own transcript: `audit`'s subagent `scan` writes `logs/subagent-audit/subagent-scan.log`,
+  and `scan`'s own go in `logs/subagent-audit/subagent-scan/`. Subagents sharing a name under
+  different parents never share a file.
+
+Each launch starts its transcript with a header naming the subagent's whole path, and its model
+when the launch named one, such as `=== subagent audit/scan ===`. A name released and launched
+again appends to the same file, under a header of its own.
 
 Ctrl-C behaves as it always has: it abandons whatever the parent was waiting on and returns you to
 the prompt. Subagents keep running and are still collectable on the next turn -- the same way an
-abandoned `shell__exec` keeps running to completion inside the container. A second Ctrl-C ends the
-session, and everything shuts down with it.
+abandoned `shell__exec` keeps running to completion inside the container. So is a result the
+interrupted turn had read but not yet handed to the model. A second Ctrl-C ends the session, and
+everything shuts down with it.
 
 ## The shared workspace
 

@@ -10,15 +10,15 @@ See [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md) for the workflow conventions.
 
 ## Active phases
 
-- [0002 -- sidecars](../phase/0002-sidecars/README.md) -- tools move out of the agent's
-  primary image and into sidecar containers OutRig places, and the public surface of both
-  crates is narrowed, sealed, and frozen for 0.2.0.
 - [0003 -- python](../phase/0003-python/README.md) -- an agent acts by writing Python into a
   persistent interpreter in its container rather than by calling MCP tools, and the agent loop
   moves into `outrig`. The code lands on `version/0.3.x`.
 
 ## Recently completed
 
+- [0002 -- sidecars](../done/phase/0002-sidecars/README.md) -- closed 2026-10-04, at the
+  0.2.0 tags. Tools moved out of the agent's primary image and into sidecar containers OutRig
+  places, and the public surface of both crates was narrowed, sealed, and frozen.
 - [0001 -- bootstrap](../done/phase/0001-bootstrap/README.md) -- closed 2026-06-26.
 
 ## Per-step index
@@ -137,8 +137,7 @@ get, a `plan/next/` entry.
 - The panic-hook sweep removing by requested name is **no longer buffered** -- `0002-55` fixed it,
   and what that task could not reach is refiled as
   `plan/next/panic-hook-sweep-is-never-driven-by-a-panic.md`,
-  `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`, and
-  `plan/next/a-forked-child-inherits-the-parents-cleanup-obligations.md`.
+  `plan/next/removal-cmd-has-an-arm-nothing-reaches.md`, and #272.
 - The four-site `[security]` lowering (`plan/next/launch-spec-security-lowering.md`) is the same
   silent-drop class as `0002-41` and stays buffered: `0002-41` fixed a block that was not lowered
   at all, which was the bug; the four sites are ergonomics. It is *not* the same conversion --
@@ -146,10 +145,10 @@ get, a `plan/next/` entry.
 - `Transcript` is a concrete public sink and therefore an extension-point commitment that `0002-47`
   does not cover.
 - Dynamic sidecar add has no removal or handle-lifecycle contract.
-- Device colon grammar, mount lexical normalization, and the silent Anthropic ceiling remain
-  buffered. Startup-banner testing no longer does: `0002-49` pulled it in, since three of its
-  documentation corrections are what the banner would have regressed. What it could not reach --
-  the mid-turn failover move announcement -- is refiled as
+- The silent Anthropic ceiling remains buffered; device colon grammar and mount lexical
+  normalization are now #263 and #262. Startup-banner testing is no longer buffered: `0002-49`
+  pulled it in, since three of its documentation corrections are what the banner would have
+  regressed. What it could not reach -- the mid-turn failover move announcement -- is refiled as
   `plan/next/failover-move-announcement-untested.md`.
 - The workspace rustdoc output-name collision now has one, filed by `0002-52` while adding the
   `cargo rustdoc` gate whose `-p` and `--lib` work around it:

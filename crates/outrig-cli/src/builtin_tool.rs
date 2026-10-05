@@ -16,14 +16,15 @@
 
 use std::sync::Arc;
 
-use rig::tool::{ToolDyn, ToolError};
+use rig::tool::{ToolCallExtensions, ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::llm::TurnUndo;
 use crate::rig_tool::truncate_for_llm;
-use crate::subagent::SubagentRegistry;
 use crate::subagent::state::{Outcome, SubagentShared, TRUNCATED_REPORT};
+use crate::subagent::{Read, SubagentRegistry};
 
 /// Wraps a failure as the model-visible tool error.
 #[derive(Debug, thiserror::Error)]
@@ -335,7 +336,8 @@ struct GetArgs {
 }
 
 /// `outrig__get_result`: block until this subagent has something new, return
-/// it, and advance the parent's read position past it.
+/// it, and advance the parent's read position past it -- for good once the
+/// turn keeps the result, and back again through [`TurnUndo`] if it does not.
 #[derive(Clone)]
 pub struct GetResultTool {
     registry: Arc<SubagentRegistry>,
@@ -347,6 +349,30 @@ impl GetResultTool {
         Self {
             registry,
             result_cap_bytes,
+        }
+    }
+
+    /// The call, with the turn it is part of when there is one.
+    async fn get(&self, args: String, turn: Option<&TurnUndo>) -> Result<String, ToolError> {
+        let args: GetArgs = parse_args(&args)?;
+        let Read { outcome, claim } = match self.registry.read(&args.name).await {
+            Ok(read) => read,
+            Err(e) => return fail(e),
+        };
+        // Recorded whichever way the outcome reaches the model: an error moved
+        // the position just as a result did. Weak, so an undo still pending
+        // cannot keep the registry -- and the session tools it holds -- alive.
+        if let Some(turn) = turn {
+            let registry = Arc::downgrade(&self.registry);
+            turn.record(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.put_back(claim);
+                }
+            });
+        }
+        match outcome {
+            Outcome::Result(text) => Ok(truncate_for_llm(&text, self.result_cap_bytes)),
+            Outcome::Error(text) => fail(truncate_for_llm(&text, self.result_cap_bytes)),
         }
     }
 }
@@ -377,14 +403,17 @@ impl ToolDyn for GetResultTool {
     }
 
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
-        Box::pin(async move {
-            let args: GetArgs = parse_args(&args)?;
-            match self.registry.get_result(&args.name).await {
-                Ok(Outcome::Result(text)) => Ok(truncate_for_llm(&text, self.result_cap_bytes)),
-                Ok(Outcome::Error(text)) => fail(truncate_for_llm(&text, self.result_cap_bytes)),
-                Err(e) => fail(e),
-            }
-        })
+        Box::pin(self.get(args, None))
+    }
+
+    /// The path rig takes: a turn hands each call its extensions, and
+    /// [`TurnUndo::of`] finds the turn among them.
+    fn call_with_extensions<'a>(
+        &'a self,
+        args: String,
+        extensions: &'a ToolCallExtensions,
+    ) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        Box::pin(self.get(args, TurnUndo::of(extensions)))
     }
 }
 

@@ -3,8 +3,7 @@
 > **Evidence for `plan/todo/0002-47-narrow-or-freeze-the-low-level-surfaces.md`.** This entry is the
 > concrete measurement of what an rmcp major costs outrig, which is the input to 0002-47's
 > verdict on whether `ProxyServer`'s rmcp coupling is frozen as supported 0.2.x surface or
-> narrowed. The upstream issue and the three unhandled list methods stay here as work in
-> their own right.
+> narrowed. The upstream issue stays here as work in its own right.
 
 `rmcp` 3.1.0 lists every revision it knows in `ProtocolVersion::KNOWN_VERSIONS`, and
 `ServerHandler::supported_protocol_versions` defaults to exactly that list. A server that does not
@@ -19,32 +18,18 @@ rejecting `tools/list` outright and loading zero tools. No outrig source changed
 underneath it. Fixed by emitting the fields and pinning
 `outrig::mcp_proxy::SUPPORTED_PROTOCOL_VERSIONS`.
 
-Two things worth doing:
+Two things were worth doing; the second is done:
 
 1. **Upstream it.** rmcp should either populate the fields a negotiated revision requires, or
    default `supported_protocol_versions` to the revisions it can actually serve rather than to
    every revision it can name. Worth an issue against `modelcontextprotocol/rust-sdk`; the fix
    here is a workaround for a gap other rmcp servers will hit identically.
 
-2. **The other list methods are already answering, and already malformed.** The same
-   `paginated_result!` macro backs `ListResourcesResult`, `ListResourceTemplatesResult`, and
-   `ListPromptsResult`, and rmcp dispatches all three to default `ServerHandler` bodies that
-   return `List*Result::default()`. Advertised capabilities do not gate dispatch, so although
-   both servers declare `tools` only, a client that asks anyway gets a *successful* empty result
-   carrying `resultType` but neither `ttlMs` nor `cacheScope` -- the identical malformed shape
-   that broke `tools/list`. Measured against `outrig mcp self` on `2026-07-28`:
-
-   ```
-   {"id":2,"result":{"resultType":"complete","resources":[]}}
-   {"id":3,"result":{"resultType":"complete","prompts":[]}}
-   {"id":4,"result":{"resultType":"complete","resourceTemplates":[]}}
-   ```
-
-   A capability-respecting client never asks, which is why this hurt nobody yet. The fix is
-   probably not to fill in cache metadata for lists that do not exist, but to override the three
-   methods on both handlers to return `method_not_found`, matching the tools-only capability set
-   both servers actually advertise. Whoever adds resources or prompts for real inherits the
-   original gap on top, and the unit tests added for `tools/list` will not catch either.
+2. **The other list methods.** Fixed in `c70e37d`: both handlers answer `resources/list`,
+   `resources/templates/list`, and `prompts/list` with method-not-found, matching the tools-only
+   capability set they advertise, instead of rmcp's malformed empty success. Only `outrig mcp
+   self` has a wire test for it (`crates/outrig-cli/tests/mcp_self.rs`); nothing drives the
+   proxy's overrides. Whoever adds resources or prompts for real inherits the cache-metadata gap.
 
 `SUPPORTED_PROTOCOL_VERSIONS` needs review on every rmcp upgrade: adding an entry is an assertion
 that both servers meet that revision's requirements. The regression test in
@@ -56,5 +41,5 @@ kind of reason. 0002-47 narrowed `OutrigError`'s rmcp payloads to an outrig-owne
 `McpSessionError`, which classifies `rmcp::service::ServiceError` into an `McpFailureKind`.
 `ServiceError` is `#[non_exhaustive]`, so the mapping carries a wildcard: a variant a later rmcp
 adds classifies as `Other` and compiles silently. `every_rmcp_service_error_is_classified` names
-all eight variants rmcp 3.1.0 declares, so the list of what was classified deliberately is in the
+all eight variants rmcp 3.4.1 declares, so the list of what was classified deliberately is in the
 tree -- but nothing fails when a ninth appears. Check both on the same upgrade.
