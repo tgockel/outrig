@@ -32,7 +32,9 @@ Two properties keep the boundary deliberate. First, placement is repo-config-onl
 server into some other container. Second, the agent cannot grow its own environment -- there is
 no agent-invocable tool that starts sidecars; new containers come from the config or the
 operator. Session network policy covers every container, so a sidecar is not a way around
-audit or filter mode.
+audit or filter mode. Installing and removing that policy runs nothing from a container's image,
+either: outrig rewrites and restores the container's `/etc/resolv.conf` itself, so a hostile
+image gets no foothold outside its own namespaces while policy is being put in place.
 
 [Subagents](subagents.md) do not bend this. An agent can launch one with `outrig__subagent`, but a
 subagent runs in the container that is already there, over the MCP connections that are already

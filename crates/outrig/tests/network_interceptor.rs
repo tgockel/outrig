@@ -689,6 +689,149 @@ async fn filter_mode_denies_matching_host_before_upstream_bytes() {
         .expect("stop container");
 }
 
+/// Starts a container whose `/bin/sh` records when the host ran it.
+///
+/// The shell writes `/tmp/sh-ran` whenever it runs outside the container's pid
+/// namespace, where `/proc/self` names nothing. That is a shell the host
+/// started in the container's mount namespace alone, as interception's
+/// resolver edits once did. A shell started inside the container records
+/// nothing.
+///
+/// The file holds the names of the environment the shell was handed, never
+/// the values. A failure prints it, and the values would be the secrets of
+/// whoever ran the test.
+async fn start_recording_shell_container(dir: &Path) -> Container {
+    let context = dir.join("image");
+    std::fs::create_dir_all(&context).expect("image context dir");
+    std::fs::write(
+        context.join("Dockerfile"),
+        r#"
+FROM docker.io/library/alpine:latest
+RUN /bin/busybox rm /bin/sh \
+ && printf '%s\n' '#!/bin/busybox sh' \
+      '[ -e /proc/self ] || env | /bin/busybox cut -d= -f1 > /tmp/sh-ran' \
+      'exec /bin/busybox sh "$@"' > /bin/sh \
+ && /bin/busybox chmod 755 /bin/sh
+"#,
+    )
+    .expect("write Dockerfile");
+    let image = image::ensure_image(&common::fixture_build_config(), &context, false)
+        .await
+        .expect("ensure recording-shell image")
+        .tag;
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    start_bootstrapped_container(&image, &workspace).await
+}
+
+/// Fails with what the image's shell recorded, if it ran from the host.
+fn assert_no_host_shell_ran(container: &Container) {
+    let ran = try_capture(
+        Command::new("podman")
+            .arg("exec")
+            .arg(container.name())
+            .args(["cat", "/tmp/sh-ran"]),
+    );
+    assert!(
+        !ran.status.success(),
+        "the image's /bin/sh ran outside the container's namespaces, handed: {}",
+        String::from_utf8_lossy(&ran.stdout)
+    );
+}
+
+/// Installing and removing interception runs nothing from the container's
+/// image. Its resolver is read, rewritten and put back by outrig itself, so a
+/// hostile image's `sh` never gets outrig's environment or the host's network
+/// namespace -- the trust boundary audit and filter mode exist to hold (#328).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attach_and_detach_run_nothing_from_the_image() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let before = read_resolv_conf(&container);
+
+    let mut interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    let during = read_resolv_conf(&container);
+    assert!(
+        String::from_utf8_lossy(&during).contains("nameserver 127.0.0.1"),
+        "resolver under interception: {}",
+        String::from_utf8_lossy(&during)
+    );
+    assert_no_host_shell_ran(&container);
+
+    interceptor
+        .detach(container.name())
+        .await
+        .expect("detach the container");
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "detach should restore the resolver byte for byte"
+    );
+    assert_no_host_shell_ran(&container);
+
+    interceptor
+        .shutdown()
+        .await
+        .expect("shutdown the interceptor");
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
+/// An interceptor dropped rather than shut down has put the resolver back by
+/// the time the drop returns -- read here with no waiting -- and its redirect
+/// table goes shortly after, through the reaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_interceptor_has_put_the_resolver_back() {
+    let _guard = E2E_LOCK.lock().await;
+    common::init_tracing();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = start_recording_shell_container(dir.path()).await;
+    let pid = container_root_pid(&container);
+    let before = read_resolv_conf(&container);
+
+    let interceptor = NetworkInterceptor::start(
+        &container,
+        &dir.path().join("logs"),
+        container.session_suffix(),
+    )
+    .await
+    .expect("start interceptor");
+    assert_ne!(read_resolv_conf(&container), before);
+    drop(interceptor);
+
+    assert_eq!(
+        read_resolv_conf(&container),
+        before,
+        "the resolver is back before the drop returns"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while netns_has_outrig_table(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the redirect table should be deleted by the reaper"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_no_host_shell_ran(&container);
+
+    container
+        .stop(Duration::from_secs(2))
+        .await
+        .expect("stop container");
+}
+
 /// A table that replaced interception's own under the same name is not
 /// interception's to delete. The undo names the handle the kernel assigned
 /// the table `attach` created, and a handle is never reissued -- so a

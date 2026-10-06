@@ -1,10 +1,8 @@
 //! Entering a container's namespaces from the host to bootstrap its user.
 //!
-//! The ordering is forced. A forked child joins the container's *user*
-//! namespace first -- `setns(CLONE_NEWUSER)` grants a full capability set in
-//! the namespace it joins, so the child can then `setuid(0)` and become the
-//! container's root -- and only then its mount namespace. Joining the mount
-//! namespace straight from the host is EPERM.
+//! A forked child joins them through [`nsfork::UserMountNs`], which owns the
+//! forced ordering: user namespace, then the container's root, then the mount
+//! namespace.
 //!
 //! Two passes, because a forked child of a live tokio process must stay to
 //! raw syscalls (see [`crate::nsfork`]) and so cannot parse anything:
@@ -92,6 +90,25 @@ impl NsStep {
     }
 }
 
+impl From<nsfork::NsFile> for NsStep {
+    fn from(file: nsfork::NsFile) -> Self {
+        match file {
+            nsfork::NsFile::User => NsStep::OpenUserNsFile,
+            nsfork::NsFile::Mount => NsStep::OpenMountNsFile,
+        }
+    }
+}
+
+impl From<nsfork::EnterStep> for NsStep {
+    fn from(step: nsfork::EnterStep) -> Self {
+        match step {
+            nsfork::EnterStep::SetnsUser => NsStep::SetnsUser,
+            nsfork::EnterStep::SetIds => NsStep::SetIds,
+            nsfork::EnterStep::SetnsMount => NsStep::SetnsMount,
+        }
+    }
+}
+
 /// A failure entering the namespace or acting inside it.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NsError {
@@ -112,7 +129,7 @@ impl NsError {
     fn last(step: NsStep) -> Self {
         Self {
             step,
-            errno: errno(),
+            errno: nsfork::errno(),
         }
     }
 
@@ -205,24 +222,24 @@ impl UserDb {
 /// Reads nothing and writes nothing -- on any failure the container is exactly
 /// as it was.
 pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
-    let ns = NsFiles::open(pid)?;
+    let ns = open_ns(pid)?;
     let passwd = CString::new(Db::Passwd.path()).expect("static path");
     let group = CString::new(Db::Group.path()).expect("static path");
 
     let (status, fds) = nsfork::fork_collect(|sock| {
-        if let Err(step) = enter(&ns) {
-            reply_failure(sock, step);
+        if let Err((step, errno)) = ns.enter() {
+            reply_failure(sock, step.into(), errno);
             return;
         }
         // O_RDWR (not O_WRONLY): the parent reads through the same fd.
         let passwd_fd = unsafe { libc::open(passwd.as_ptr(), libc::O_RDWR | libc::O_APPEND) };
         if passwd_fd == -1 {
-            reply_failure(sock, NsStep::OpenPasswd);
+            reply_failure(sock, NsStep::OpenPasswd, nsfork::errno());
             return;
         }
         let group_fd = unsafe { libc::open(group.as_ptr(), libc::O_RDWR | libc::O_APPEND) };
         if group_fd == -1 {
-            reply_failure(sock, NsStep::OpenGroup);
+            reply_failure(sock, NsStep::OpenGroup, nsfork::errno());
             return;
         }
         let _ = nsfork::send_status(sock, nsfork::Status::OK, &[passwd_fd, group_fd]);
@@ -251,12 +268,12 @@ pub(super) fn open_user_db(pid: u32) -> Result<UserDb, NsError> {
 /// `uid`:`gid`. Created inside the container's user namespace it would
 /// otherwise belong to the container's root.
 pub(super) fn create_home(pid: u32, home: &Path, uid: u32, gid: u32) -> Result<(), NsError> {
-    let ns = NsFiles::open(pid)?;
+    let ns = open_ns(pid)?;
     let dirs = mkdir_p_paths(home)?;
 
     let (status, _fds) = nsfork::fork_collect(|sock| {
-        if let Err(step) = enter(&ns) {
-            reply_failure(sock, step);
+        if let Err((step, errno)) = ns.enter() {
+            reply_failure(sock, step.into(), errno);
             return;
         }
         let status = match make_home(&dirs, uid, gid) {
@@ -299,7 +316,7 @@ fn mkdir_p_paths(home: &Path) -> Result<Vec<CString>, NsError> {
 fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), NsError> {
     for dir in dirs {
         let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
-        if rc == -1 && errno() != libc::EEXIST {
+        if rc == -1 && nsfork::errno() != libc::EEXIST {
             return Err(NsError::last(NsStep::Mkdir));
         }
     }
@@ -324,49 +341,16 @@ fn make_home(dirs: &[CString], uid: u32, gid: u32) -> Result<(), NsError> {
     result
 }
 
-/// The namespace files, opened in the parent so that a failure to open them
-/// never involves a child at all.
-struct NsFiles {
-    user: File,
-    mount: File,
+/// The container's namespace files, opened in the parent so that a failure to
+/// open them never involves a child at all.
+fn open_ns(pid: u32) -> Result<nsfork::UserMountNs, NsError> {
+    nsfork::UserMountNs::open(pid).map_err(|(file, e)| NsError::new(file.into(), &e))
 }
 
-impl NsFiles {
-    fn open(pid: u32) -> Result<Self, NsError> {
-        let user = File::open(format!("/proc/{pid}/ns/user"))
-            .map_err(|e| NsError::new(NsStep::OpenUserNsFile, &e))?;
-        let mount = File::open(format!("/proc/{pid}/ns/mnt"))
-            .map_err(|e| NsError::new(NsStep::OpenMountNsFile, &e))?;
-        Ok(Self { user, mount })
-    }
-}
-
-/// Join the container's namespaces. Runs in the forked child: syscalls only.
-fn enter(ns: &NsFiles) -> Result<(), NsStep> {
-    use std::os::fd::AsRawFd as _;
-
-    // EINVAL means the container has no user namespace of its own -- rootful
-    // podman -- so we are already where we need to be and are already root.
-    match nsfork::setns_raw(ns.user.as_raw_fd(), libc::CLONE_NEWUSER) {
-        Ok(()) => {
-            // Joining granted a full capability set in that namespace; spend
-            // it on becoming the container's root, which owns /etc.
-            if unsafe { libc::setgid(0) } == -1 || unsafe { libc::setuid(0) } == -1 {
-                return Err(NsStep::SetIds);
-            }
-        }
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-        Err(_) => return Err(NsStep::SetnsUser),
-    }
-
-    nsfork::setns_raw(ns.mount.as_raw_fd(), libc::CLONE_NEWNS).map_err(|_| NsStep::SetnsMount)?;
-    Ok(())
-}
-
-/// Report `step`, with the errno of the syscall that just failed, to the
-/// parent. Runs in the forked child: syscalls only.
-fn reply_failure(sock: RawFd, step: NsStep) {
-    let _ = nsfork::send_status(sock, nsfork::Status::failed(step as u32, errno()), &[]);
+/// Report `step`, with `errno`, to the parent. Runs in the forked child:
+/// syscalls only.
+fn reply_failure(sock: RawFd, step: NsStep, errno: i32) {
+    nsfork::send_failure(sock, step as u32, errno);
 }
 
 fn check_reply(status: nsfork::Status) -> Result<(), NsError> {
@@ -393,10 +377,6 @@ fn cstring(path: &Path) -> Result<CString, NsError> {
         step: NsStep::Mkdir,
         errno: libc::EINVAL,
     })
-}
-
-fn errno() -> i32 {
-    io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -19,14 +19,12 @@
 //! that name.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs::File as StdFile;
 use std::future::Future;
 use std::io::{self, IoSlice, IoSliceMut, Write as _};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -58,12 +56,15 @@ use crate::nsfork;
 use crate::process::{self, Cmd, Transcript};
 use crate::supervise::{Reissue, detach_cleanup_chain};
 
+mod resolv_conf;
+use resolv_conf::{Resolver, Restore};
+
 const NETWORK_LOG: &str = "network.jsonl";
 
 /// Resolver the interceptor requires inside every attached container: DNS to
 /// the loopback listener, `ndots:0` so bare names resolve without
-/// search-domain expansion. Installed by `podman exec` on running containers
-/// ([`install_resolv_conf`]) and baked in via `podman create --dns` for
+/// search-domain expansion. Written into running containers by attach
+/// ([`intercepted_resolv`]) and baked in via `podman create --dns` for
 /// entrypoint-stdio containers, which cannot be exec'd before start.
 pub(crate) const INTERCEPT_DNS_NAMESERVER: &str = "127.0.0.1";
 pub(crate) const INTERCEPT_DNS_OPTION: &str = "ndots:0";
@@ -86,22 +87,6 @@ const DNS_IN_FLIGHT: usize = 64;
 /// `ClientHello` or a request head is far smaller; this is the ceiling.
 const SNIFF_BUFFER: usize = 16 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
-/// Leading byte [`read_resolv_conf`] answers with when the container has a
-/// resolver file; anything else means it has none.
-const RESOLV_PRESENT: u8 = b'1';
-/// The probe's verdict for a resolver that is a symbolic link to something
-/// that does not exist. `[ -e ]` alone reports that as absent, which is the
-/// one shape whose restore would destroy the original: installing follows the
-/// link and creates its target, while `rm -f` removes the link.
-const RESOLV_DANGLING: u8 = b'L';
-/// The largest resolver a restore can promise to put back.
-///
-/// The bytes travel as one `execve` argument, and Linux caps a single argument
-/// at `MAX_ARG_STRLEN`, 128 KiB. Arming an undo whose process could never
-/// start -- and finding that out only after the resolver had been replaced --
-/// is the failure this bound exists to make impossible. A resolver file
-/// anywhere near it is not a resolver file.
-const MAX_RESOLV_SNAPSHOT: usize = 64 * 1024;
 /// How many audit records may be queued ahead of the writer. Bounded so a
 /// stalled log applies backpressure to the connections producing records
 /// instead of growing, and so a session cannot be made to hold an unbounded
@@ -562,9 +547,19 @@ impl NetworkInterceptor {
         let tcp_port = sockets.tcp.local_addr()?.port();
         let dns_port = sockets.dns.local_addr()?.port();
 
-        let target = Target::for_attach(name, pid, &self.session_id, container.dns_preconfigured());
+        let target = Target::for_attach(pid, &self.session_id);
         let transcript = container.transcript();
         let run = |cmd: Cmd| run_step(cmd, transcript.clone());
+        // A dns-preconfigured container had the loopback resolver baked in via
+        // `podman create --dns` (`podman exec` cannot reach it before start),
+        // so there is no resolver here to change and none to change back.
+        // Opening it changes nothing, so a resolver that could not be put back
+        // is refused here with nothing to undo.
+        let resolver = if container.dns_preconfigured() {
+            None
+        } else {
+            Some(Resolver::open(resolv_conf::Place::Container(pid), name)?)
+        };
 
         // The undo log is this frame's, so a caller that drops this future
         // while a command is in flight drops it too, and its destructor puts
@@ -576,6 +571,7 @@ impl NetworkInterceptor {
             &run,
             &mut rollback,
             &target,
+            resolver,
             tcp_port,
             dns_port,
             self.policy.default,
@@ -824,15 +820,11 @@ struct InterceptorSockets {
 /// Everything the commands that install and remove interception are keyed to.
 #[derive(Debug, Clone)]
 struct Target {
-    name: String,
     pid: u32,
     table: String,
     /// What the installed resolver is stamped with. Separate from `table` on
     /// purpose: see [`resolv_marker`].
     marker: String,
-    /// A container whose resolver was baked in by `podman create --dns` has
-    /// no resolv.conf to snapshot and none to put back.
-    dns_preconfigured: bool,
 }
 
 impl Target {
@@ -844,13 +836,11 @@ impl Target {
     /// container first. A marker that *was* the table name would tell an actor
     /// in that namespace which table to create ahead of outrig, making its
     /// `create table` fail and its rollback delete a table it never made.
-    fn for_attach(name: &str, pid: u32, session_id: &str, dns_preconfigured: bool) -> Self {
+    fn for_attach(pid: u32, session_id: &str) -> Self {
         Self {
-            name: name.to_string(),
             pid,
             table: nft_table_name(session_id),
             marker: attach_nonce(),
-            dns_preconfigured,
         }
     }
 }
@@ -860,9 +850,10 @@ impl Target {
 /// Every mutation is armed here *before* it is made, so no instant exists at
 /// which the container is changed with nothing responsible for changing it
 /// back. The ordinary paths discharge it awaited and report what failed
-/// ([`Self::undo_now`]); a destructor cannot await, so `Drop` hands the same
-/// commands to [`crate::supervise`], which runs them as detached processes
-/// that survive this runtime being torn down.
+/// ([`Self::undo_now`]). A destructor cannot await, so `Drop` puts the
+/// resolver back itself -- that is file I/O through a descriptor, done before
+/// it returns -- and hands the commands to [`crate::supervise`], which runs
+/// them as detached processes that survive this runtime being torn down.
 #[derive(Debug)]
 struct Rollback {
     /// The container's init pid: how the commands get to the namespace, and
@@ -872,9 +863,8 @@ struct Rollback {
     /// and inode. Compared before any undo is issued, so a pid that has been
     /// handed to another container does not carry this attach's undos into it.
     netns: (u64, u64),
-    /// Undo commands in the order their mutations were made, discharged in
-    /// reverse.
-    undo: Vec<Cmd>,
+    /// Undos in the order their mutations were made, discharged in reverse.
+    undo: Vec<Undo>,
     /// Mutations this made and then could neither undo nor keep owed: they are
     /// reported with whatever the caller is told, and nothing reissues them.
     ///
@@ -941,13 +931,13 @@ impl Rollback {
     /// whichever mutation a cancellation landed in the middle of.
     ///
     /// Returns where it was armed, for [`narrow`](Self::narrow).
-    fn arm(&mut self, undo: Cmd) -> usize {
-        self.undo.push(undo);
+    fn arm(&mut self, undo: impl Into<Undo>) -> usize {
+        self.undo.push(undo.into());
         self.undo.len() - 1
     }
 
     /// Take an armed undo back, so nothing issues it later.
-    fn disarm(&mut self, armed: usize) -> Option<Cmd> {
+    fn disarm(&mut self, armed: usize) -> Option<Undo> {
         (armed < self.undo.len()).then(|| self.undo.remove(armed))
     }
 
@@ -966,14 +956,15 @@ impl Rollback {
     /// unable to reach anything the command it replaces could not.
     fn narrow(&mut self, armed: usize, undo: Cmd) {
         if let Some(slot) = self.undo.get_mut(armed) {
-            *slot = undo;
+            *slot = Undo::Run(undo);
         }
     }
 
     /// Discharges every armed undo, most recent first, returning one
-    /// rendering per command that failed. A command stays armed until it has
+    /// rendering per undo that failed. A command stays armed until it has
     /// returned, so a cancellation mid-command leaves it to `Drop` rather
-    /// than dropping it on the floor.
+    /// than dropping it on the floor; the resolver's undo has no await in it
+    /// for a cancellation to land in.
     async fn undo_now<F, Fut>(&mut self, run: &F) -> Vec<OutrigError>
     where
         F: Fn(Cmd) -> Fut,
@@ -1003,7 +994,7 @@ impl Rollback {
             NamespaceAnswer::Is(_) => {}
         }
         // Walked back to front by index, and an entry leaves the list only
-        // once its command has *returned* successfully. Everything not yet
+        // once its undo has *returned* successfully. Everything not yet
         // discharged therefore stays in `self.undo` across every await,
         // including the one in flight, so a caller cancelled here drops a
         // future that owns nothing and the destructor still holds every
@@ -1013,13 +1004,16 @@ impl Rollback {
         // this used to do -- got both halves wrong: a cancellation mid-command
         // lost the command, since it existed only in the dropped frame, and
         // the ones it kept came back newest-first for `Drop` to reverse a
-        // second time, undoing the resolver before the redirect that pointed
-        // at it.
+        // second time.
         let mut idx = self.undo.len();
         while idx > 0 {
             idx -= 1;
-            match run(self.undo[idx].clone()).await {
-                Ok(_) => {
+            let discharged = match &mut self.undo[idx] {
+                Undo::Run(cmd) => run(cmd.clone()).await.map(drop),
+                Undo::InProcess(restore) => restore.apply(),
+            };
+            match discharged {
+                Ok(()) => {
                     self.undo.remove(idx);
                 }
                 Err(e) => failures.push(e),
@@ -1030,7 +1024,32 @@ impl Rollback {
 
     #[cfg(test)]
     fn armed(&self) -> Vec<String> {
-        self.undo.iter().map(Cmd::render).collect()
+        self.undo
+            .iter()
+            .map(|undo| match undo {
+                Undo::Run(cmd) => cmd.render(),
+                Undo::InProcess(restore) => restore.describe(),
+            })
+            .collect()
+    }
+}
+
+/// One obligation a [`Rollback`] holds.
+#[derive(Debug)]
+enum Undo {
+    /// A command, run as a process of its own.
+    Run(Cmd),
+    /// Work this process does itself: the resolver put back through the
+    /// descriptor attach opened it with. Never a process, because the only one
+    /// that could reach the file from inside the container's mount namespace
+    /// is one of the image's own binaries, which is what [`resolv_conf`]
+    /// exists to avoid.
+    InProcess(Restore),
+}
+
+impl From<Cmd> for Undo {
+    fn from(cmd: Cmd) -> Self {
+        Undo::Run(cmd)
     }
 }
 
@@ -1042,17 +1061,37 @@ impl Drop for Rollback {
         if matches!(self.same_namespace(), NamespaceAnswer::Gone) {
             return;
         }
-        // One obligation, not one apiece. Handing the reaper each command
-        // separately hands it no ordering -- every call spawns its own child
-        // and returns -- and the resolver must not go back while the redirect
-        // aimed at it is still there, or the container resolves through a rule
-        // pointing at a listener that is gone.
+        // The resolver goes back here, before this returns, and so before the
+        // redirect the reaper is about to remove -- the reverse of the awaited
+        // path's order. It has to: no process can put it back without running
+        // one of the container's own binaries, and work left on this thread
+        // past `drop` would not survive the process exiting. The order costs
+        // nothing the other would not. Until the redirect goes, the restored
+        // resolver's port-53 traffic is carried to a listener that is
+        // stopping; with the order reversed, the loopback resolver points at
+        // that same listener until the restore lands.
+        //
+        // The commands stay one obligation, not one apiece: handing the reaper
+        // each separately hands it no ordering, since every call spawns its
+        // own child and returns.
         //
         // Issued once: these select namespaces by pid, and the kernel hands
         // pids out again. A retry landing after the container exited would
-        // enter whatever holds that pid now -- rewriting some other
-        // container's resolver, or dropping its nft table.
-        let ordered: Vec<Cmd> = self.undo.drain(..).rev().collect();
+        // enter whatever holds that pid now and drop *its* nft table.
+        let mut ordered = Vec::new();
+        for undo in self.undo.drain(..).rev() {
+            match undo {
+                Undo::Run(cmd) => ordered.push(cmd),
+                Undo::InProcess(mut restore) => {
+                    if let Err(e) = restore.apply() {
+                        tracing::warn!(
+                            target: "outrig::network",
+                            "interception dropped rather than detached could not be undone: {e}"
+                        );
+                    }
+                }
+            }
+        }
         detach_cleanup_chain(ordered, Reissue::Once);
     }
 }
@@ -1076,13 +1115,14 @@ impl Drop for Rollback {
 /// promptly and never retried (`Reissue::Once`), but "unlikely" is the claim,
 /// not "impossible".
 ///
-/// The stronger identity is an open descriptor on the namespace, which cannot
-/// be recycled while it is held. It is not used because these undos have to
-/// survive the thing that armed them: they are issued from a destructor with
-/// no runtime, through commands `supervise` spawns and may re-spawn, and an
-/// inherited descriptor does not survive an `exec` that closes it -- carrying
-/// one would mean outrig's own launcher in place of `nsenter` on the one path
-/// that must work when everything else is being torn down.
+/// The stronger identity is an open descriptor, which cannot be recycled while
+/// it is held. The resolver's undo has one -- on the file itself, which it
+/// acts through in this process -- and so does not depend on this at all. The
+/// nft undos do not: they are issued from a destructor with no runtime,
+/// through commands `supervise` spawns and may re-spawn, and an inherited
+/// descriptor does not survive an `exec` that closes it -- carrying one would
+/// mean outrig's own launcher in place of `nsenter` on the one path that must
+/// work when everything else is being torn down.
 fn namespace_id(pid: u32) -> NamespaceAnswer {
     use std::os::unix::fs::MetadataExt;
     classify_namespace(
@@ -1148,8 +1188,10 @@ async fn run_step(cmd: Cmd, transcript: Option<Transcript>) -> Result<Vec<u8>> {
 /// resolver and point it at the DNS listener, then install the redirect
 /// table, whose `egress` chain gives traffic the redirects do not carry the
 /// policy's `default`. Split from the socket and task plumbing, and
-/// parameterized over how a command runs, so the ordering and the rollback
-/// are exercisable without a container.
+/// parameterized over how a command runs and where the resolver is, so the
+/// ordering and the rollback are exercisable without a container.
+///
+/// `resolver` is `None` for a container with no resolver to change.
 ///
 /// All-or-nothing rests on `rollback` belonging to the caller: a failure
 /// returns with the undos armed, and a caller who drops this future
@@ -1158,6 +1200,7 @@ async fn install_interception<F, Fut>(
     run: &F,
     rollback: &mut Rollback,
     target: &Target,
+    resolver: Option<Resolver>,
     tcp_port: u16,
     dns_port: u16,
     policy_default: NetworkAction,
@@ -1166,14 +1209,22 @@ where
     F: Fn(Cmd) -> Fut,
     Fut: Future<Output = Result<Vec<u8>>>,
 {
-    // A dns-preconfigured container had the loopback resolver baked in via
-    // `podman create --dns` (`podman exec` cannot reach it before start), so
-    // there is nothing here to change and nothing to change back.
-    if !target.dns_preconfigured {
-        let snapshot =
-            checked_resolv_snapshot(&target.name, run(read_resolv_conf(target.pid)).await?)?;
-        rollback.arm(restore_resolv_conf(target.pid, &target.marker, snapshot));
-        run(install_resolv_conf(target.pid, &target.marker)).await?;
+    if let Some(resolver) = resolver {
+        let mut restore = resolver
+            .stage(intercepted_resolv(&target.marker).into_bytes())
+            .map_err(|e| {
+                let resolv_conf::NotCreated { error, left } = *e;
+                if let Some(left) = left {
+                    rollback.leave_behind(left);
+                }
+                error
+            })?;
+        // Armed whether or not the write worked, since one that failed partway
+        // has still changed the file. Nothing awaits between the two, so no
+        // cancellation can land between them either.
+        let written = restore.install();
+        rollback.arm(Undo::InProcess(restore));
+        written?;
     }
 
     let mut rules = tempfile::NamedTempFile::new()?;
@@ -2825,133 +2876,8 @@ fn parse_resolvers(text: &str) -> Vec<SocketAddr> {
     out
 }
 
-/// Reads the container's current resolver, so the undo armed against the
-/// install can put exactly that state back.
-///
-/// Answers with [`RESOLV_PRESENT`] followed by the file's bytes, or with `0`
-/// and nothing else when the container has no resolver file at all. A bare
-/// `cat` could report neither: it cannot tell an absent file from an empty
-/// one, and it fails on the absent one, which would make a container that
-/// never had a resolver impossible to attach to rather than a state to put
-/// back.
-fn read_resolv_conf(pid: u32) -> Cmd {
-    nsenter_sh(pid).args([
-        "if [ -L /etc/resolv.conf ] && [ ! -e /etc/resolv.conf ]; then printf L; \
-             elif [ -e /etc/resolv.conf ]; then printf 1; cat /etc/resolv.conf; \
-             else printf 0; fi",
-    ])
-}
-
-/// The command that puts back whatever [`read_resolv_conf`] found: the file
-/// with exactly its old bytes, or its absence.
-fn restore_resolv_conf(pid: u32, marker: &str, snapshot: Vec<u8>) -> Cmd {
-    match snapshot.split_first() {
-        Some((&RESOLV_PRESENT, original)) => write_resolv_conf(pid, marker, original.to_vec()),
-        _ => remove_resolv_conf(pid, marker),
-    }
-}
-
-/// The inverse of an absent resolver.
-///
-/// Reachable only for a container that has no resolver file at all. Podman
-/// bind-mounts one, and `rm` on a bind mount fails with `EBUSY` -- checked
-/// against podman 4.9.3 -- so for a container it created the snapshot says
-/// present and this is never the undo that gets armed. Where it is armed the
-/// file is a real one and the removal works; where it somehow is not, the
-/// failure is reported and the undo stays armed rather than being dropped.
-fn remove_resolv_conf(pid: u32, marker: &str) -> Cmd {
-    let installed = intercepted_resolv(marker);
-    let bytes = installed.len().to_string();
-    nsenter_sh(pid)
-        .args([REMOVE_RESOLV_SCRIPT, "_", ""])
-        .arg(installed)
-        .arg(bytes)
-}
-
-/// Points the resolver at the DNS listener.
-///
-/// Unguarded, unlike the undos: this is the change, and what it is replacing
-/// is whatever the snapshot just read.
-fn install_resolv_conf(pid: u32, marker: &str) -> Cmd {
-    nsenter_sh(pid)
-        .args(["printf '%s' \"$1\" > /etc/resolv.conf", "_"])
-        .arg(intercepted_resolv(marker))
-}
-
-/// Writes the bytes handed in as `$1` to the resolver file.
-///
-/// They ride in as an argument rather than interpolated into the script, so
-/// nothing between the snapshot and the file interprets them -- no quoting, no
-/// escape processing -- and `printf '%s'` adds no newline of its own. What an
-/// argument cannot carry is a NUL, and it cannot carry more than
-/// `MAX_ARG_STRLEN`; [`checked_resolv_snapshot`] refuses both before anything
-/// is mutated, because a restore that cannot be spawned is not a restore.
-///
-/// A `const` so a test can run this exact script rather than a paraphrase: the
-/// claim is that it reproduces arbitrary bytes, and a copy proves that about
-/// the copy.
-/// Acts only on a resolver carrying this attach's own marker.
-///
-/// Pure shell, deliberately. The obvious spelling is `printf ... | cmp -s -`,
-/// and `cmp` is not something a container has to have: a missing one exits
-/// 127, which `|| exit 0` reads as "not ours" -- so the undo would skip
-/// silently and `detach` would report success over a resolver still pointing
-/// at a stopped listener. `case` and `cat` are what the snapshot already
-/// needs, so this adds no dependency of its own.
-///
-/// A read that *fails* is not a mismatch. Discarding `cat`'s status made an
-/// unreadable resolver look like one that was never this attach's: the undo
-/// exited zero, teardown struck it off, and `detach` reported success over a
-/// container still pointing at a listener that has stopped. An absent file is
-/// the one case that legitimately owes nothing, and it is checked separately
-/// so it cannot be confused with a file that is there and could not be read.
-///
-/// The whole installed text, not just the marker it carries. Containment of
-/// the marker answers "did this attach install this", but not "is this still
-/// what it installed" -- a resolver manager that changed the nameservers and
-/// left the comment alone would have had its work discarded. The marker is
-/// still what makes the text unique to this attachment; comparing all of it is
-/// what keeps a later legitimate change.
-///
-/// Both sides go through command substitution with a `.` appended inside it.
-/// Command substitution strips trailing newlines, so without that a file that
-/// gained or lost a terminal newline compared equal to one that had not --
-/// byte-distinct state the undo would then have overwritten, which is the
-/// opposite of the contract. The sentinel is the last thing in each
-/// substitution, so nothing before it is stripped, and the comparison needs no
-/// external tool.
-///
-/// The byte count is checked where `wc` exists, because a shell variable is
-/// not a byte string: implementations differ on what command substitution does
-/// with an embedded NUL, and one that drops them would let a resolver with a
-/// NUL added after installation compare equal to one without. `wc -c` reads
-/// the file rather than a variable, and `-eq` rather than `=` because some
-/// `wc`s pad their output.
-///
-/// Guarded by `command -v`, a builtin, and deliberately so. A container need
-/// not ship `wc`, and an unguarded call exits 127 -- which `|| exit 0` reads
-/// as "not this attach's", retiring the undo while `detach` reports success
-/// over a resolver still pointing at a stopped listener. That is the `cmp`
-/// mistake again, and it is worse than the gap it closes: without `wc` the
-/// text comparison still stands, and what is lost is only a NUL inserted after
-/// installation on a shell that drops NULs in substitution.
-const RESTORE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; fi; \
-     current=$(cat /etc/resolv.conf && printf .) || exit 1; \
-     [ \"$current\" = \"$(printf '%s.' \"$2\")\" ] || exit 0; \
-     if command -v wc > /dev/null 2>&1; then \
-     [ \"$(wc -c < /etc/resolv.conf)\" -eq \"$3\" ] || exit 0; fi; \
-     printf '%s' \"$1\" > /etc/resolv.conf";
-
-/// The inverse of an absent resolver, under the same marker.
-const REMOVE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; fi; \
-     current=$(cat /etc/resolv.conf && printf .) || exit 1; \
-     [ \"$current\" = \"$(printf '%s.' \"$2\")\" ] || exit 0; \
-     if command -v wc > /dev/null 2>&1; then \
-     [ \"$(wc -c < /etc/resolv.conf)\" -eq \"$3\" ] || exit 0; fi; \
-     rm -f /etc/resolv.conf";
-
-/// What [`install_resolv_conf`] writes, and therefore what an undo expects to
-/// find before it acts.
+/// What attach writes into the resolver, and therefore what its undo expects
+/// to find before it acts.
 ///
 /// The trailing comment carries `marker`, which is [`attach_nonce`]'s and
 /// *not* the table's name -- the two are drawn independently, and
@@ -2962,10 +2888,9 @@ const REMOVE_RESOLV_SCRIPT: &str = "if [ ! -e /etc/resolv.conf ]; then exit 0; f
 /// need to create that table first and make `create table` fail.
 ///
 /// Per attach rather than per outrig, because the text is otherwise identical
-/// for every attachment: a pid reused by *another* outrig container would
-/// satisfy a shared sentinel and get the first container's resolver written
-/// into it. Resolver files ignore `#` lines, so this costs the container
-/// nothing.
+/// for every attachment, and the undo's guard is a question about this
+/// attach's install. Resolver files ignore `#` lines, so this costs the
+/// container nothing.
 fn intercepted_resolv(marker: &str) -> String {
     format!(
         "nameserver {INTERCEPT_DNS_NAMESERVER}\noptions {INTERCEPT_DNS_OPTION}\n{}\n",
@@ -2985,81 +2910,6 @@ fn intercepted_resolv(marker: &str) -> String {
 /// nothing.
 fn resolv_marker(marker: &str) -> String {
     format!("# {marker}")
-}
-
-/// Reads the probe's verdict and refuses every resolver state this could not
-/// faithfully put back.
-///
-/// Refusing here is the whole point. Each of these describes a container whose
-/// resolver an undo could not restore, and discovering that after the resolver
-/// had already been replaced would leave exactly the state this task exists to
-/// prevent: loopback DNS with nothing listening and no way back.
-fn checked_resolv_snapshot(container: &str, snapshot: Vec<u8>) -> Result<Vec<u8>> {
-    let refuse = |why: String| {
-        Err(OutrigError::Configuration(format!(
-            "container {container:?} cannot be network-intercepted: {why}"
-        )))
-    };
-    match snapshot.split_first() {
-        Some((&RESOLV_DANGLING, _)) => refuse(
-            "/etc/resolv.conf is a symbolic link to a file that does not exist. \
-             Installing would follow the link and create its target, and undoing \
-             that would remove the link itself"
-                .to_string(),
-        ),
-        Some((&RESOLV_PRESENT, original)) if original.contains(&0) => refuse(
-            "/etc/resolv.conf contains a NUL byte, which cannot be carried in the \
-             argument a restore would put it back with"
-                .to_string(),
-        ),
-        Some((&RESOLV_PRESENT, original)) if original.len() > MAX_RESOLV_SNAPSHOT => {
-            refuse(format!(
-                "/etc/resolv.conf is {} bytes, past the {MAX_RESOLV_SNAPSHOT} a \
-                 restore can carry in one argument",
-                original.len()
-            ))
-        }
-        Some((&RESOLV_PRESENT, _)) => Ok(snapshot),
-        Some((_, _)) => Ok(snapshot),
-        None => refuse("reading /etc/resolv.conf produced no verdict".to_string()),
-    }
-}
-
-/// Puts `content` back, but only if the resolver still holds what this attach
-/// installed.
-///
-/// The guard is what keeps a delayed undo honest. These commands name a
-/// namespace by pid, and the kernel hands pids out again: an undo that runs
-/// after its container exited -- because the command before it in the chain
-/// was slow, or because a destructor fired late -- would otherwise write one
-/// container's resolver into whatever holds that pid now. Checking the content
-/// first also means an undo will not clobber a resolver that something else
-/// legitimately changed after interception was installed.
-fn write_resolv_conf(pid: u32, marker: &str, content: Vec<u8>) -> Cmd {
-    let installed = intercepted_resolv(marker);
-    let bytes = installed.len().to_string();
-    nsenter_sh(pid)
-        .args([RESTORE_RESOLV_SCRIPT, "_"])
-        .arg(OsString::from_vec(content))
-        .arg(installed)
-        .arg(bytes)
-}
-
-/// A shell inside the container's user and mount namespaces, run as a process
-/// this host owns.
-///
-/// Deliberately not `podman exec`. That starts the shell under conmon, so
-/// killing the client -- which is all a dropped future can do -- leaves the
-/// writer running: measured against podman 4.9.3, a `podman exec` whose client
-/// was killed went on to complete its write two seconds later, and a rollback
-/// racing that loses. `nsenter` execs the shell directly, so it *is* the
-/// process this owns, and killing it kills the writer -- which is what carries
-/// [`crate::process::Owned`]'s guarantee across the container boundary.
-fn nsenter_sh(pid: u32) -> Cmd {
-    Cmd::new("nsenter")
-        .arg("-t")
-        .arg(pid.to_string())
-        .args(["-U", "-m", "--", "sh", "-c"])
 }
 
 fn require_tool(name: &str) -> Result<()> {
@@ -3158,8 +3008,7 @@ fn bind_failure(status: nsfork::Status) -> io::Error {
 
 fn child_bind_and_send_fds(sock: RawFd, user_ns: RawFd, net_ns: RawFd) {
     let fail = |step: BindStep, e: io::Error| {
-        let status = nsfork::Status::failed(step as u32, e.raw_os_error().unwrap_or(0));
-        let _ = nsfork::send_status(sock, status, &[]);
+        nsfork::send_failure(sock, step as u32, e.raw_os_error().unwrap_or(0));
     };
     if let Err(e) = nsfork::setns_raw(user_ns, libc::CLONE_NEWUSER) {
         return fail(BindStep::SetnsUser, e);
@@ -3280,10 +3129,8 @@ fn delete_nft_table_by_handle(pid: u32, netns: u64, handle: u64) -> Cmd {
     // The shell, `readlink` and `nft` are the *host's*: only the user and
     // network namespaces are entered, not the mount namespace, so this asks
     // nothing of the container's image.
-    Cmd::new("nsenter")
-        .arg("-t")
-        .arg(pid.to_string())
-        .args(["-U", "-n", "--", "sh", "-c"])
+    nsenter_net(pid)
+        .args(["--", "sh", "-c"])
         .arg(NFT_DELETE_IN_NAMESPACE)
         .arg("_")
         .arg(format!("net:[{netns}]"))
@@ -3320,10 +3167,21 @@ fn table_handle_in(output: &[u8], table: &str) -> Option<u64> {
 }
 
 fn nsenter_nft(pid: u32) -> Cmd {
+    nsenter_net(pid).arg("nft")
+}
+
+/// `nsenter` into the container's user and network namespaces, and no
+/// others -- the one way this module builds an `nsenter`.
+///
+/// Never the mount namespace. Entering it makes `/` the container's, so the
+/// program `nsenter` goes on to run is the image's own binary, started from
+/// this process with its environment and outside the container's pid and
+/// network namespaces (#328). Left out, what runs is the host's.
+fn nsenter_net(pid: u32) -> Cmd {
     Cmd::new("nsenter")
         .arg("-t")
         .arg(pid.to_string())
-        .args(["-U", "-n", "nft"])
+        .args(["-U", "-n"])
 }
 
 /// A value for one attach that nothing else can have chosen.
@@ -3884,7 +3742,6 @@ fn dns_label(bytes: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt as _;
 
     /// [`run_step`], holding the tracing gate for as long as it emits.
     ///
@@ -4073,10 +3930,72 @@ mod tests {
     }
 
     /// The resolver the fake container is holding before attach touches it.
-    /// The apostrophe is load-bearing: it is the one byte that can end a
-    /// single-quoted shell string, so a restore that mishandles it is a
-    /// restore that does not put the file back.
     const ORIGINAL_RESOLV: &str = "nameserver 10.0.2.3\nsearch it's.test\n";
+
+    /// A stand-in for the container's `/etc/resolv.conf`: a file in a tempdir,
+    /// holding [`ORIGINAL_RESOLV`].
+    ///
+    /// Never the real one. These tests run as whatever runs `cargo test`, and
+    /// a resolver opened by this process's own pid would, for root, be the
+    /// host's.
+    struct FakeResolver {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl FakeResolver {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("resolv.conf");
+            std::fs::write(&path, ORIGINAL_RESOLV).expect("write the fake resolver");
+            Self { _dir: dir, path }
+        }
+
+        /// The resolver, opened by the same child attach uses, entering
+        /// nothing.
+        fn open(&self) -> Resolver {
+            Resolver::open(self.place(), "outrig-test").expect("open the fake resolver")
+        }
+
+        fn place(&self) -> resolv_conf::Place {
+            resolv_conf::Place::host(&self.path)
+        }
+
+        fn read(&self) -> String {
+            std::fs::read_to_string(&self.path).expect("read the fake resolver")
+        }
+
+        /// The undo attach arms after installing over [`ORIGINAL_RESOLV`],
+        /// acting through `file`. Leaves the fake holding what the install
+        /// wrote.
+        fn installed_restore(&self, file: StdFile) -> Undo {
+            let installed = intercepted_resolv(&target().marker);
+            std::fs::write(&self.path, &installed).expect("install");
+            Undo::InProcess(Restore::new(
+                file,
+                self.place(),
+                Some(ORIGINAL_RESOLV.as_bytes().to_vec()),
+                installed.into_bytes(),
+            ))
+        }
+
+        /// [`Self::installed_restore`], able to put the resolver back.
+        fn restore(&self) -> Undo {
+            let read_write = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .expect("open read-write");
+            self.installed_restore(read_write)
+        }
+
+        /// [`Self::installed_restore`] through a descriptor that cannot write,
+        /// so the guard passes and the restore fails.
+        fn failing_restore(&self) -> Undo {
+            let read_only = StdFile::open(&self.path).expect("open read-only");
+            self.installed_restore(read_only)
+        }
+    }
 
     /// The handle [`FakeRunner`] says nft assigned the table it created.
     const FAKE_HANDLE: u64 = 7;
@@ -4089,6 +4008,11 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         ran: Mutex<Vec<String>>,
+        /// The resolver file a test is watching, and what it held as each
+        /// command ran -- which is how the resolver's in-process steps are
+        /// placed among the commands.
+        resolver: Option<PathBuf>,
+        resolver_seen: Mutex<Vec<String>>,
         /// Fragment of a rendered command that should fail instead of run.
         fail_on: Option<&'static str>,
         /// Fragment of a rendered command that should never complete, which
@@ -4106,6 +4030,12 @@ mod tests {
                 .lock()
                 .expect("fake runner log")
                 .push(rendered.clone());
+            if let Some(resolver) = &self.resolver {
+                self.resolver_seen
+                    .lock()
+                    .expect("fake runner log")
+                    .push(std::fs::read_to_string(resolver).unwrap_or_default());
+            }
             if self.hang_on.is_some_and(|needle| rendered.contains(needle)) {
                 std::future::pending::<()>().await;
             }
@@ -4114,10 +4044,9 @@ mod tests {
                     "injected failure: {rendered}"
                 )));
             }
-            // nft answers an `--echo --handle` apply with what it committed;
-            // every other command here is a resolver read, whose answer is the
-            // snapshot. Without this the tests would exercise only the
-            // unnarrowed undo, which is the fallback rather than the rule.
+            // nft answers an `--echo --handle` apply with what it committed.
+            // Without this the tests would exercise only the unnarrowed undo,
+            // which is the fallback rather than the rule.
             if rendered.contains("--echo --handle") {
                 return Ok(self.echo.clone().unwrap_or_else(|| {
                     format!(
@@ -4127,41 +4056,58 @@ mod tests {
                     .into_bytes()
                 }));
             }
-            Ok(present_snapshot())
+            Ok(Vec::new())
         }
 
         fn ran(&self) -> Vec<String> {
             self.ran.lock().expect("fake runner log").clone()
         }
-    }
 
-    /// What [`read_resolv_conf`] answers for a container holding
-    /// [`ORIGINAL_RESOLV`].
-    fn present_snapshot() -> Vec<u8> {
-        let mut snapshot = vec![RESOLV_PRESENT];
-        snapshot.extend_from_slice(ORIGINAL_RESOLV.as_bytes());
-        snapshot
+        /// What the watched resolver held as each command ran.
+        fn resolver_seen(&self) -> Vec<String> {
+            self.resolver_seen.lock().expect("fake runner log").clone()
+        }
+
+        /// A runner watching `resolver`.
+        fn watching(resolver: &FakeResolver) -> Self {
+            Self {
+                resolver: Some(resolver.path.clone()),
+                ..Self::default()
+            }
+        }
     }
 
     /// `install_interception` with the ports and policy default that none of
-    /// the ordering and rollback tests here depend on.
-    async fn install<F, Fut>(run: &F, rollback: &mut Rollback, target: &Target) -> Result<()>
+    /// the ordering and rollback tests here depend on, against `resolver`.
+    async fn install<F, Fut>(
+        run: &F,
+        rollback: &mut Rollback,
+        target: &Target,
+        resolver: &FakeResolver,
+    ) -> Result<()>
     where
         F: Fn(Cmd) -> Fut,
         Fut: Future<Output = Result<Vec<u8>>>,
     {
-        install_interception(run, rollback, target, 4001, 4002, NetworkAction::Allow).await
+        install_interception(
+            run,
+            rollback,
+            target,
+            Some(resolver.open()),
+            4001,
+            4002,
+            NetworkAction::Allow,
+        )
+        .await
     }
 
     /// A target whose pid is this test process: `Rollback` asks whether the
     /// container is still alive before undoing anything, and this one is.
     fn target() -> Target {
         Target {
-            name: "outrig-test".to_string(),
             pid: std::process::id(),
             table: "outrig_test".to_string(),
             marker: "outrig_marker".to_string(),
-            dns_preconfigured: false,
         }
     }
 
@@ -4226,43 +4172,6 @@ mod tests {
         );
     }
 
-    /// The restore script reproduces whatever that container happened to have.
-    /// The bytes travel as `$1` so no quoting rule stands between them and the
-    /// file, but the script still has to be right: `printf '%s'` and not
-    /// `echo`, no newline of its own, and the redirect where it belongs.
-    #[tokio::test]
-    async fn the_restore_script_reproduces_arbitrary_bytes() {
-        const NASTY: &[u8] =
-            b"nameserver 10.0.0.1 # ' \"$(touch pwned)\" `id` \\ '' \n%s%d\noptions x";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        // The guard has to pass for the write to happen at all, so the file
-        // starts out holding what an install would have put there.
-        std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-
-        // The production script, with only its redirect retargeted.
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg(OsString::from_vec(NASTY.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("the restore script must run");
-
-        assert_eq!(std::fs::read(&target).expect("restored").as_slice(), NASTY);
-        assert!(
-            !dir.path().join("pwned").exists(),
-            "the snapshot is data, and must never be evaluated"
-        );
-    }
-
     /// A command whose only effect is a file a test can wait for.
     fn touch(path: &Path) -> Cmd {
         Cmd::new("/bin/sh")
@@ -4282,34 +4191,40 @@ mod tests {
         }
     }
 
-    /// Attach mutates, and detach undoes, in opposite orders: the redirect
-    /// table goes before the resolver that was pointed at it.
+    /// Attach mutates, and detach undoes, in opposite orders: the resolver is
+    /// pointed at the listener before the redirect table goes in, and the
+    /// table goes before the resolver is put back.
     #[tokio::test]
     async fn interception_is_undone_in_the_reverse_of_the_order_it_was_installed() {
-        let fake = FakeRunner::default();
+        let resolver = FakeResolver::new();
+        let fake = FakeRunner::watching(&resolver);
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        install(&run, &mut rollback, &target())
+        install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
         let failures = rollback.undo_now(&run).await;
 
         assert!(failures.is_empty(), "{failures:#?}");
         let ran = fake.ran();
-        assert_eq!(ran.len(), 5, "{ran:#?}");
-        assert!(ran[0].contains("cat /etc/resolv.conf"), "{ran:#?}");
-        assert!(ran[1].contains("nameserver 127.0.0.1"), "{ran:#?}");
-        assert!(ran[2].contains("nft --echo --handle -f"), "{ran:#?}");
+        assert_eq!(ran.len(), 2, "{ran:#?}");
+        assert!(ran[0].contains("nft --echo --handle -f"), "{ran:#?}");
         assert!(
-            ran[3].contains("delete table inet handle") && ran[3].contains("nsenter"),
+            ran[1].contains("delete table inet handle") && ran[1].contains("nsenter"),
             "{ran:#?}"
         );
         assert!(
-            ran[3].contains(&FAKE_HANDLE.to_string()),
+            ran[1].contains(&FAKE_HANDLE.to_string()),
             "the handle travels as an argument: {ran:#?}"
         );
-        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
+        let installed = intercepted_resolv(&target().marker);
+        assert_eq!(
+            fake.resolver_seen(),
+            [installed.clone(), installed],
+            "the resolver is installed before the apply and still installed at the delete"
+        );
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV, "and put back after it");
         assert!(rollback.armed().is_empty(), "{:#?}", rollback.armed());
     }
 
@@ -4966,7 +4881,7 @@ mod tests {
     #[test]
     fn a_resolver_marker_never_names_the_table_it_was_attached_with() {
         for _ in 0..64 {
-            let target = Target::for_attach("outrig-a", 1, "sid-1", false);
+            let target = Target::for_attach(1, "sid-1");
             assert_ne!(
                 target.marker, target.table,
                 "publishing the marker must tell nobody the table's name"
@@ -5056,8 +4971,9 @@ mod tests {
             ..FakeRunner::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
+        install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
         assert_eq!(rollback.armed().len(), 2);
@@ -5088,16 +5004,14 @@ mod tests {
     }
 
     /// What survives a partial undo survives in arming order, because `Drop`
-    /// reverses it. Retained newest-first it would be reversed a second time
-    /// and put the resolver back before removing the redirect aimed at it.
+    /// walks it in reverse. Retained newest-first it would be reversed a
+    /// second time.
     #[tokio::test]
     async fn a_partly_discharged_rollback_keeps_its_arming_order() {
-        let installing = FakeRunner::default();
-        let run = |cmd: Cmd| installing.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
-            .await
-            .expect("install interception");
+        rollback.arm(resolver.failing_restore());
+        rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
         let undoing = FakeRunner {
             fail_on: Some("nsenter"),
@@ -5124,21 +5038,20 @@ mod tests {
     /// forgetting an obligation.
     #[tokio::test]
     async fn an_undo_that_fails_stays_armed_for_the_destructor() {
-        let installing = FakeRunner::default();
-        let run = |cmd: Cmd| installing.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
-            .await
-            .expect("install interception");
+        rollback.arm(resolver.failing_restore());
+        rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
-        let undoing = FakeRunner {
-            fail_on: Some("nameserver 10.0.2.3"),
-            ..FakeRunner::default()
-        };
+        let undoing = FakeRunner::default();
         let undo = |cmd: Cmd| undoing.run(cmd);
         let residue = rollback.undo_now(&undo).await;
 
         assert_eq!(residue.len(), 1, "{residue:#?}");
+        assert!(
+            residue[0].to_string().contains("/etc/resolv.conf"),
+            "the failure names what it could not put back: {residue:#?}"
+        );
         assert_eq!(
             rollback.armed().len(),
             1,
@@ -5160,17 +5073,18 @@ mod tests {
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let cause = install(&run, &mut rollback, &target())
+        let resolver = FakeResolver::new();
+        let cause = install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect_err("the apply was injected to fail");
 
         let failing_undo = FakeRunner {
-            fail_on: Some("nameserver 10.0.2.3"),
+            fail_on: Some("delete table"),
             ..FakeRunner::default()
         };
         let undo = |cmd: Cmd| failing_undo.run(cmd);
         let residue = rollback.undo_now(&undo).await;
-        assert!(!residue.is_empty(), "the restore was injected to fail");
+        assert!(!residue.is_empty(), "the table delete was injected to fail");
 
         let reported = OutrigError::NetworkAttachNotUndone(Box::new(NetworkAttachFailure {
             container: "outrig-test".to_string(),
@@ -5181,391 +5095,9 @@ mod tests {
         assert!(text.contains("outrig-test"), "{text}");
         assert!(text.contains("could not be fully undone"), "{text}");
         assert!(
-            text.contains("nameserver 10.0.2.3"),
+            text.contains("delete table inet outrig_test"),
             "the residue is named, not just counted: {text}"
         );
-    }
-
-    /// A resolver that is a link to nothing. `[ -e ]` calls it absent, but
-    /// installing would follow the link and create its target, and the undo
-    /// for an absent resolver is `rm -f` -- which would take the link and
-    /// leave the file. Refused before anything is written.
-    #[tokio::test]
-    async fn a_dangling_resolver_link_refuses_the_attach() {
-        let err = checked_resolv_snapshot("outrig-test", vec![RESOLV_DANGLING])
-            .expect_err("a dangling link cannot be put back");
-        assert!(err.to_string().contains("symbolic link"), "{err}");
-    }
-
-    /// The bytes ride back as one `execve` argument, which is binary-safe
-    /// except for the two things an argument cannot be. Both are refused
-    /// before the resolver is touched, because the alternative is finding out
-    /// afterwards -- with loopback DNS installed and no way to undo it.
-    #[tokio::test]
-    async fn a_resolver_no_argument_could_carry_refuses_the_attach() {
-        let mut with_nul = vec![RESOLV_PRESENT];
-        with_nul.extend_from_slice(b"nameserver 10.0.0.1\0\n");
-        let err = checked_resolv_snapshot("outrig-test", with_nul.clone())
-            .expect_err("a NUL cannot be carried in an argument");
-        assert!(err.to_string().contains("NUL"), "{err}");
-
-        let mut oversized = vec![RESOLV_PRESENT];
-        oversized.resize(MAX_RESOLV_SNAPSHOT + 2, b'x');
-        let err = checked_resolv_snapshot("outrig-test", oversized)
-            .expect_err("an oversized resolver cannot be carried in an argument");
-        assert!(err.to_string().contains("past the"), "{err}");
-
-        // The refusal is not theoretical: the command such a snapshot would
-        // build cannot be spawned at all, which is why the check has to come
-        // before the mutation rather than after it.
-        let doomed = write_resolv_conf(std::process::id(), "outrig_test", with_nul[1..].to_vec());
-        assert!(
-            doomed.to_tokio_command().spawn().is_err(),
-            "a NUL in argv is refused by the kernel interface itself"
-        );
-    }
-
-    /// The undo only fires if the resolver still holds what this attach put
-    /// there. These commands name a namespace by pid and the kernel reuses
-    /// pids, so an undo delayed past its container's exit -- by a slow command
-    /// ahead of it in the chain, or a destructor firing late -- would
-    /// otherwise write one container's resolver into whatever holds that pid
-    /// now. The real script is run here, not a paraphrase of it.
-    #[tokio::test]
-    async fn a_restore_leaves_a_resolver_it_did_not_install_alone() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\nsearch example.test\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-        let restore = |content: &[u8]| {
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script.clone())
-                .arg("_")
-                .arg(OsString::from_vec(content.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string())
-        };
-
-        // Holding what the install wrote: the undo fires.
-        std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-        run_step_gated(restore(ORIGINAL), None)
-            .await
-            .expect("the restore must run");
-        assert_eq!(std::fs::read(&target).expect("restored"), ORIGINAL);
-
-        // Holding something else -- a replacement container behind a reused
-        // pid, or a resolver something changed after interception: left alone.
-        std::fs::write(&target, b"nameserver 9.9.9.9\n").expect("third party");
-        run_step_gated(restore(ORIGINAL), None)
-            .await
-            .expect("the guard makes this a no-op, not a failure");
-        assert_eq!(
-            std::fs::read(&target).expect("untouched"),
-            b"nameserver 9.9.9.9\n",
-            "an undo must not clobber a resolver it did not install"
-        );
-    }
-
-    /// A terminal newline added or removed is byte-distinct state, and taking
-    /// it back would overwrite it. Command substitution strips trailing
-    /// newlines, so without a sentinel inside it the two compare equal.
-    #[tokio::test]
-    async fn a_restore_sees_a_trailing_newline_added_or_removed() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        for changed in [
-            format!("{}\n", intercepted_resolv("outrig_test")),
-            intercepted_resolv("outrig_test")
-                .trim_end_matches('\n')
-                .to_string(),
-        ] {
-            std::fs::write(&target, &changed).expect("write");
-            run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(script.clone())
-                    .arg("_")
-                    .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await
-            .expect("the guard makes this a no-op, not a failure");
-
-            assert_eq!(
-                std::fs::read_to_string(&target).expect("untouched"),
-                changed,
-                "a file differing only in its terminal newline is still a \
-                 different file: {changed:?}"
-            );
-        }
-    }
-
-    /// A byte the shell cannot carry is still a byte in the file. Shells
-    /// differ on what command substitution does with an embedded NUL, so the
-    /// guard checks the file's own byte count as well as its text.
-    #[tokio::test]
-    async fn a_restore_sees_a_nul_added_after_it_installed() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        // What the install wrote, with a NUL inserted into it.
-        let mut tampered = intercepted_resolv("outrig_test").into_bytes();
-        tampered.insert(0, 0);
-        std::fs::write(&target, &tampered).expect("tamper");
-
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("the guard makes this a no-op, not a failure");
-
-        assert_eq!(
-            std::fs::read(&target).expect("untouched"),
-            tampered,
-            "a resolver carrying bytes the install never wrote is not this attach's"
-        );
-    }
-
-    /// A resolver that cannot be read is not a resolver that belongs to
-    /// someone else. Discarding the read's status made the two look alike, so
-    /// the undo exited zero, teardown struck it off, and `detach` reported
-    /// success over a container still pointing at a stopped listener.
-    #[tokio::test]
-    async fn an_unreadable_resolver_fails_the_undo_rather_than_skipping_it() {
-        use std::os::unix::fs::PermissionsExt as _;
-        if nix::unistd::Uid::effective().is_root() {
-            // Root reads it regardless, so there is nothing to observe.
-            return;
-        }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-
-        for script in [RESTORE_RESOLV_SCRIPT, REMOVE_RESOLV_SCRIPT] {
-            std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000))
-                .expect("make unreadable");
-            let script =
-                script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-            let outcome = run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(script)
-                    .arg("_")
-                    .arg("nameserver 10.0.2.3\n")
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await;
-
-            assert!(
-                outcome.is_err(),
-                "an unreadable resolver has to fail the undo, not retire it"
-            );
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
-                .expect("restore permissions");
-        }
-    }
-
-    /// An absent resolver owes nothing, and must not be confused with one that
-    /// is there and could not be read.
-    #[tokio::test]
-    async fn an_absent_resolver_retires_the_undo_quietly() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg("nameserver 10.0.2.3\n")
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("an absent resolver is not a failure");
-        assert!(!target.exists(), "and nothing is written in its place");
-    }
-
-    /// Neither undo may depend on a utility a container is not required to
-    /// have. The obvious spelling used `cmp`, which a minimal image need not
-    /// ship: a missing one exits 127, `|| exit 0` reads that as "not ours",
-    /// and the undo skips while `detach` reports success -- the resolver left
-    /// pointing at a listener that has stopped.
-    #[tokio::test]
-    async fn neither_undo_needs_anything_beyond_a_shell_and_cat() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        // A PATH holding only what the undos actually declare: `cat`, which
-        // the snapshot already needs, and `rm`, which the absent-resolver undo
-        // is. `wc` and `cmp` are not declared, and an undo that quietly
-        // retires itself because one of them is missing is the failure this
-        // is for.
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).expect("bin dir");
-        for tool in ["cat", "rm"] {
-            let real = ["/bin", "/usr/bin"]
-                .into_iter()
-                .map(|d| PathBuf::from(d).join(tool))
-                .find(|p| p.exists())
-                .unwrap_or_else(|| panic!("no {tool} to link"));
-            std::os::unix::fs::symlink(&real, bin.join(tool)).expect("link tool");
-        }
-
-        for (script, expected) in [
-            (RESTORE_RESOLV_SCRIPT, b"nameserver 10.0.2.3\n".to_vec()),
-            (REMOVE_RESOLV_SCRIPT, Vec::new()),
-        ] {
-            std::fs::write(&target, intercepted_resolv("outrig_test")).expect("install");
-            let script =
-                script.replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-            // Only what the snapshot already needs is on PATH: no `cmp`, no
-            // `wc`. An undo that quietly retires itself because a utility is
-            // missing is the failure this is for.
-            let pared = format!("PATH={}; {script}", bin.display());
-            run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(pared)
-                    .arg("_")
-                    .arg(OsString::from_vec(b"nameserver 10.0.2.3\n".to_vec()))
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await
-            .expect("the undo must run");
-
-            if expected.is_empty() {
-                assert!(!target.exists(), "the remove must have happened");
-            } else {
-                assert_eq!(std::fs::read(&target).expect("restored"), expected);
-            }
-        }
-    }
-
-    /// A resolver something has legitimately changed since is no longer the
-    /// one this attach installed, and taking it back would discard that
-    /// change. The marker says who installed it; the rest of the text says
-    /// whether it is still what was installed, and both have to hold.
-    #[tokio::test]
-    async fn a_restore_keeps_a_change_made_after_it_was_installed() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        for changed in [
-            // A resolver manager pointing somewhere else, marker untouched.
-            intercepted_resolv("outrig_test").replace("127.0.0.1", "9.9.9.9"),
-            // An option added, marker untouched.
-            format!("{}search added.test\n", intercepted_resolv("outrig_test")),
-        ] {
-            std::fs::write(&target, &changed).expect("write");
-            run_step_gated(
-                Cmd::new("/bin/sh")
-                    .args(["-c"])
-                    .arg(script.clone())
-                    .arg("_")
-                    .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                    .arg(intercepted_resolv("outrig_test"))
-                    .arg(intercepted_resolv("outrig_test").len().to_string()),
-                None,
-            )
-            .await
-            .expect("the guard makes this a no-op, not a failure");
-
-            assert_eq!(
-                std::fs::read_to_string(&target).expect("untouched"),
-                changed,
-                "an undo must not discard a change made after it installed: {changed:?}"
-            );
-        }
-    }
-
-    /// A pid reused by *another outrig-attached container* is the case a
-    /// shared sentinel cannot see: every attachment installs the same resolver
-    /// text, so the guard would pass and write the first container's resolver
-    /// into the second. The sentinel carries the attach's own table name,
-    /// which is unique to it.
-    #[tokio::test]
-    async fn a_restore_leaves_another_outrig_containers_resolver_alone() {
-        const ORIGINAL: &[u8] = b"nameserver 10.0.2.3\n";
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("resolv.conf");
-        let script = RESTORE_RESOLV_SCRIPT
-            .replace("/etc/resolv.conf", target.to_str().expect("utf-8 tempdir"));
-
-        // The file holds what a *different* attachment installed.
-        std::fs::write(&target, intercepted_resolv("outrig_other")).expect("other install");
-        run_step_gated(
-            Cmd::new("/bin/sh")
-                .args(["-c"])
-                .arg(script)
-                .arg("_")
-                .arg(OsString::from_vec(ORIGINAL.to_vec()))
-                .arg(intercepted_resolv("outrig_test"))
-                .arg(intercepted_resolv("outrig_test").len().to_string()),
-            None,
-        )
-        .await
-        .expect("the guard makes this a no-op, not a failure");
-
-        assert_eq!(
-            std::fs::read(&target).expect("untouched"),
-            intercepted_resolv("outrig_other").into_bytes(),
-            "one attachment's undo must not reach another's container"
-        );
-    }
-
-    /// The resolver a restore writes is the bytes the snapshot read, with
-    /// nothing in between: they travel as an argument, so no quoting rule has
-    /// to hold for the file to come back exactly as it was.
-    #[test]
-    fn a_restore_carries_the_original_resolver_bytes_verbatim() {
-        let restore = restore_resolv_conf(std::process::id(), "outrig_test", present_snapshot());
-        assert!(
-            restore
-                .exec_args()
-                .iter()
-                .any(|arg| arg.as_os_str().as_bytes() == ORIGINAL_RESOLV.as_bytes()),
-            "the snapshot travels as its own argument, whole: {:#?}",
-            restore.exec_args()
-        );
-    }
-
-    /// Having no resolver file at all is a state too, and the one a bare `cat`
-    /// could neither report nor put back: the restore for it removes the file
-    /// the install created rather than leaving an empty one behind.
-    #[test]
-    fn a_container_with_no_resolver_file_is_restored_to_having_none() {
-        let restore = restore_resolv_conf(std::process::id(), "outrig_test", b"0".to_vec());
-        let rendered = restore.render();
-        assert!(rendered.contains("rm -f /etc/resolv.conf"), "{rendered}");
     }
 
     /// A failed nft apply is a failed attach, and the resolver mutation that
@@ -5573,49 +5105,23 @@ mod tests {
     /// though the table never landed.
     #[tokio::test]
     async fn a_failed_nft_apply_still_restores_the_resolver() {
+        let resolver = FakeResolver::new();
         let fake = FakeRunner {
             fail_on: Some("--echo --handle"),
-            ..Default::default()
+            ..FakeRunner::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
 
-        let installed = install(&run, &mut rollback, &target()).await;
+        let installed = install(&run, &mut rollback, &target(), &resolver).await;
         assert!(installed.is_err(), "the nft apply was injected to fail");
-        rollback.undo_now(&run).await;
+        let residue = rollback.undo_now(&run).await;
 
+        assert!(residue.is_empty(), "{residue:#?}");
         let ran = fake.ran();
-        assert_eq!(ran.len(), 5, "{ran:#?}");
-        assert!(ran[3].contains("delete table inet outrig_test"), "{ran:#?}");
-        assert!(ran[4].contains("nameserver 10.0.2.3"), "{ran:#?}");
-    }
-
-    /// Cancelled with the resolver install in flight. The undo log belongs to
-    /// the caller, not to the dropped future, so the restore is still armed
-    /// afterwards -- armed before the install ran, precisely so that a
-    /// cancellation landing inside it cannot slip between the two.
-    #[tokio::test]
-    async fn cancelling_the_resolver_install_leaves_the_restore_armed() {
-        // Only the write matches: the snapshot `printf`s too, but nothing
-        // redirects into the file except the install this aims at.
-        let fake = FakeRunner {
-            hang_on: Some("> /etc/resolv.conf"),
-            ..Default::default()
-        };
-        let run = |cmd: Cmd| fake.run(cmd);
-        let target = target();
-        let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        {
-            let mut installing = Box::pin(install(&run, &mut rollback, &target));
-            assert!(
-                futures_util::poll!(&mut installing).is_pending(),
-                "the injected install never completes"
-            );
-        }
-
-        let armed = rollback.armed();
-        assert_eq!(armed.len(), 1, "{armed:#?}");
-        assert!(armed[0].contains("nameserver 10.0.2.3"), "{armed:#?}");
+        assert_eq!(ran.len(), 2, "{ran:#?}");
+        assert!(ran[1].contains("delete table inet outrig_test"), "{ran:#?}");
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV);
     }
 
     /// Cancelled with the nft apply in flight: both mutations are armed, so
@@ -5629,9 +5135,10 @@ mod tests {
         };
         let run = |cmd: Cmd| fake.run(cmd);
         let target = target();
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         {
-            let mut installing = Box::pin(install(&run, &mut rollback, &target));
+            let mut installing = Box::pin(install(&run, &mut rollback, &target, &resolver));
             assert!(
                 futures_util::poll!(&mut installing).is_pending(),
                 "the injected nft apply never completes"
@@ -5654,14 +5161,18 @@ mod tests {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        let target = Target {
-            dns_preconfigured: true,
-            ..target()
-        };
 
-        install(&run, &mut rollback, &target)
-            .await
-            .expect("install interception");
+        install_interception(
+            &run,
+            &mut rollback,
+            &target(),
+            None,
+            4001,
+            4002,
+            NetworkAction::Allow,
+        )
+        .await
+        .expect("install interception");
 
         let ran = fake.ran();
         assert_eq!(ran.len(), 1, "{ran:#?}");
@@ -5677,8 +5188,9 @@ mod tests {
     async fn the_table_undo_is_narrowed_to_the_handle_the_kernel_assigned() {
         let fake = FakeRunner::default();
         let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
-        install(&run, &mut rollback, &target())
+        install(&run, &mut rollback, &target(), &resolver)
             .await
             .expect("install interception");
 
@@ -5729,10 +5241,11 @@ mod tests {
             ..Default::default()
         };
         let run = |cmd: Cmd| fake.run(cmd);
+        let resolver = FakeResolver::new();
         let mut rollback = Rollback::new(std::process::id()).expect("this process has a namespace");
         let target = target();
         {
-            let installing = install(&run, &mut rollback, &target);
+            let installing = install(&run, &mut rollback, &target, &resolver);
             let cancelled = tokio::time::timeout(Duration::from_millis(50), installing).await;
             assert!(cancelled.is_err(), "the apply was injected to hang");
         }
@@ -5774,10 +5287,11 @@ mod tests {
                 ..Default::default()
             };
             let run = |cmd: Cmd| fake.run(cmd);
+            let resolver = FakeResolver::new();
             let mut rollback =
                 Rollback::new(std::process::id()).expect("this process has a namespace");
 
-            let failed = install(&run, &mut rollback, &target())
+            let failed = install(&run, &mut rollback, &target(), &resolver)
                 .await
                 .expect_err("a table nothing can name exactly fails the attach");
             assert!(
@@ -5835,18 +5349,34 @@ mod tests {
     #[test]
     fn a_dropped_rollback_still_issues_its_undo_commands() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let resolver = dir.path().join("resolver");
-        let table = dir.path().join("table");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
 
         {
             let mut rollback =
                 Rollback::new(std::process::id()).expect("this process has a namespace");
-            rollback.arm(touch(&resolver));
-            rollback.arm(touch(&table));
+            rollback.arm(touch(&first));
+            rollback.arm(touch(&second));
         }
 
-        wait_for(&resolver);
-        wait_for(&table);
+        wait_for(&first);
+        wait_for(&second);
+    }
+
+    /// The resolver is the one undo a destructor cannot hand to a process, so
+    /// it puts it back itself -- and has, by the time it returns. No waiting
+    /// here: a restore that only happened later would be one the process can
+    /// exit before.
+    #[test]
+    fn a_dropped_rollback_has_put_the_resolver_back_when_it_returns() {
+        let resolver = FakeResolver::new();
+        {
+            let mut rollback =
+                Rollback::new(std::process::id()).expect("this process has a namespace");
+            rollback.arm(resolver.restore());
+        }
+
+        assert_eq!(resolver.read(), ORIGINAL_RESOLV);
     }
 
     /// Detaching a container that has already exited is a success: its
@@ -5876,16 +5406,19 @@ mod tests {
             undo: Vec::new(),
             left_behind: Vec::new(),
         };
-        rollback.arm(write_resolv_conf(
-            std::process::id(),
-            "outrig_test",
-            ORIGINAL_RESOLV.as_bytes().to_vec(),
-        ));
+        let resolver = FakeResolver::new();
+        rollback.arm(resolver.restore());
+        rollback.arm(delete_nft_table(std::process::id(), "outrig_test"));
 
         let failures = rollback.undo_now(&run).await;
 
         assert!(failures.is_empty(), "{failures:#?}");
         assert!(fake.ran().is_empty(), "{:#?}", fake.ran());
+        assert_eq!(
+            resolver.read(),
+            intercepted_resolv(&target().marker),
+            "nothing is put back into a namespace the undos were not armed against"
+        );
     }
 
     /// An answer the kernel would not give is not "the namespace is gone".

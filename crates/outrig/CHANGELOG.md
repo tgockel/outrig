@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Network attach and detach run nothing from the container's image.** Under audit and filter,
+  `NetworkInterceptor::attach` pointed a container's `/etc/resolv.conf` at its DNS listener, and
+  `detach` put it back, by running a shell through `nsenter` in the container's mount namespace
+  -- which made that shell, and the `cat` and `printf` it ran, the image's own binaries. They ran
+  with outrig's whole environment, API keys included, in the host's network and pid namespaces,
+  before the redirect rules existed and again after they were removed: a sidecar image could
+  read the host's secrets and send them anywhere, in the mode that exists to stop that. outrig
+  now opens the file from a child that joins the container's user and mount namespaces as its
+  root and hands the descriptor back, and reads, rewrites, and restores it through that
+  descriptor, so no binary from the image runs. The restore is still byte for byte. An
+  `/etc/resolv.conf` that is not a regular file -- a FIFO, a device, a directory -- now refuses
+  the attach instead of being read, as does one larger than the file-size limit (`RLIMIT_FSIZE`)
+  outrig runs under, which writing back would have ended outrig with `SIGXFSZ`; one holding a NUL
+  byte no longer does. An install that failed partway, leaving the resolver empty or half
+  written, read that as someone else's change and retired its own undo; the original now goes
+  back. An interceptor dropped without `shutdown` has put the resolver back by the time the drop
+  returns.
 - **`host.containers.internal` reaches the host under audit and filter on podman 5.** Rootless
   podman 5 networks a container with pasta and maps the alias, and `host.docker.internal`, to
   `169.254.1.2`, which pasta's `--map-guest-addr` sends to the address it assigned the container

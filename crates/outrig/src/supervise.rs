@@ -173,10 +173,8 @@ pub(crate) fn detach_cleanup(cmd: Cmd, reissue: Reissue) {
 ///
 /// Handing the reaper one command at a time hands it no ordering: each call
 /// spawns its own child and returns, so two cleanups race. Where the second
-/// depends on the first having finished -- removing a redirect before
-/// restoring the resolver that pointed at it, so the container is never left
-/// resolving through a rule aimed at a listener that is gone -- they have to
-/// arrive as one obligation, which is what this is.
+/// depends on the first having finished, they have to arrive as one
+/// obligation, which is what this is.
 ///
 /// Every command runs, in the order given. They are sequenced, not
 /// conditional: the later ones are owed whatever became of the earlier, and
@@ -302,8 +300,8 @@ fn hand_back(unqueued: Wait, program: &'static str) {
     // Reached only when the reaper thread has died *and* no thread can be made,
     // at which point a short block is the least bad of three bad options: the
     // tail started beside a head still running is the ordering failure the
-    // chain exists to prevent, and dropping it loses the resolver undo for
-    // good, after the listeners it points at have stopped.
+    // chain exists to prevent, and dropping it loses the tail's obligations
+    // for good.
     tracing::debug!(
         target: "outrig::supervise",
         "the rest of a cleanup chain has no thread to sequence it; \
@@ -376,9 +374,8 @@ fn proved_gone(head: &mut Child, patience: Duration) -> bool {
 /// Reached only when the reaper is unavailable or gone, which is also the only
 /// path on which ordering cannot be kept: there is nothing left to notice one
 /// command ending and start the next. Launching them anyway is the lesser
-/// loss -- the alternative is dropping them, which for the delete-then-restore
-/// chain means a live container left pointing at a DNS listener that has
-/// stopped, with nothing coming to put it back.
+/// loss -- the alternative is dropping them, with nothing coming to discharge
+/// what they owed.
 fn spawn_orphaned_chain(then: std::collections::VecDeque<Cmd>) {
     if then.is_empty() {
         return;
@@ -403,14 +400,12 @@ fn spawn_orphaned_chain(then: std::collections::VecDeque<Cmd>) {
 /// The commands as a single `sh` that runs them in order.
 ///
 /// A sequencer that needs no runtime and no reaper, for the path where
-/// neither is available. Ordering still has to hold there: the resolver must
-/// not go back while the redirect aimed at it is still in place, and launching
-/// the commands side by side is exactly that failure.
+/// neither is available. Ordering still has to hold there, and launching the
+/// commands side by side is exactly that failure.
 ///
 /// Every argv element is passed as a positional parameter and referenced by
-/// index, so nothing is interpolated into the script -- which matters because
-/// one of those elements is a container's resolver, arbitrary bytes that no
-/// quoting rule gets to see.
+/// index, so nothing is interpolated into the script: an argument is bytes
+/// that no quoting rule gets to see.
 fn ordered_shell(cmds: std::collections::VecDeque<Cmd>) -> Cmd {
     let mut script = String::new();
     let mut argv: Vec<std::ffi::OsString> = Vec::new();
@@ -1171,7 +1166,7 @@ mod tests {
     }
 
     /// Argv travels as positional parameters, so a command carrying arbitrary
-    /// bytes -- a container's resolver -- is never interpolated into a script.
+    /// bytes is never interpolated into a script.
     #[test]
     fn an_ordered_shell_passes_argv_rather_than_quoting_it() {
         let dir = tempfile::tempdir().expect("tempdir");

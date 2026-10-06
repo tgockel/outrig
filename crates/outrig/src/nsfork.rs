@@ -12,9 +12,18 @@
 //! lock. The helpers here allocate nothing and return
 //! [`io::Error::from_raw_os_error`] (which doesn't allocate either) rather than
 //! [`io::Error::other`] on the paths a child can reach.
+//!
+//! A child that acts on a container's files enters it with [`UserMountNs`]: the
+//! container's user namespace first -- `setns(CLONE_NEWUSER)` grants a full
+//! capability set in the namespace it joins, so the child can then `setuid(0)`
+//! and become the container's root -- and only then its mount namespace.
+//! Joining the mount namespace straight from the host is `EPERM`. What runs
+//! there is this process's own code: nothing is `exec`ed, so nothing the
+//! container's image holds is ever run.
 
+use std::fs::File;
 use std::io;
-use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
 use nix::libc;
 
@@ -103,6 +112,12 @@ where
     let _ = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
 
     received
+}
+
+/// Report that the child stopped at `step`, with `errno`, passing nothing
+/// back. Safe to call from a forked child.
+pub(crate) fn send_failure(sock: RawFd, step: u32, errno: i32) {
+    let _ = send_status(sock, Status::failed(step, errno), &[]);
 }
 
 /// Send one status message, optionally passing `fds` to the peer. Safe to call
@@ -216,6 +231,66 @@ pub(crate) fn setns_raw(fd: RawFd, nstype: libc::c_int) -> io::Result<()> {
 pub(crate) fn close_fd(fd: RawFd) {
     unsafe {
         libc::close(fd);
+    }
+}
+
+/// The errno of the syscall that just failed. Safe to call from a forked
+/// child.
+pub(crate) fn errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Which of a container's namespace files [`UserMountNs::open`] could not
+/// open, in the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NsFile {
+    User,
+    Mount,
+}
+
+/// Where [`UserMountNs::enter`] stopped, in the child. Each caller maps these
+/// onto wire codes of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnterStep {
+    SetnsUser,
+    SetIds,
+    SetnsMount,
+}
+
+/// A container's user and mount namespace files, opened in the parent so
+/// that a failure to open them never involves a child at all.
+pub(crate) struct UserMountNs {
+    user: File,
+    mount: File,
+}
+
+impl UserMountNs {
+    pub(crate) fn open(pid: u32) -> Result<Self, (NsFile, io::Error)> {
+        let user = File::open(format!("/proc/{pid}/ns/user")).map_err(|e| (NsFile::User, e))?;
+        let mount = File::open(format!("/proc/{pid}/ns/mnt")).map_err(|e| (NsFile::Mount, e))?;
+        Ok(Self { user, mount })
+    }
+
+    /// Join the container's namespaces as its root. Runs in the forked child:
+    /// syscalls only. A failure carries the errno of the call that failed,
+    /// read before anything else can overwrite it.
+    pub(crate) fn enter(&self) -> Result<(), (EnterStep, i32)> {
+        // EINVAL means the container has no user namespace of its own --
+        // rootful podman -- so we are already where we need to be and are
+        // already root.
+        match setns_raw(self.user.as_raw_fd(), libc::CLONE_NEWUSER) {
+            Ok(()) => {
+                // Joining granted a full capability set in that namespace;
+                // spend it on becoming the container's root, which owns /etc.
+                if unsafe { libc::setgid(0) } == -1 || unsafe { libc::setuid(0) } == -1 {
+                    return Err((EnterStep::SetIds, errno()));
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+            Err(e) => return Err((EnterStep::SetnsUser, e.raw_os_error().unwrap_or(0))),
+        }
+        setns_raw(self.mount.as_raw_fd(), libc::CLONE_NEWNS)
+            .map_err(|e| (EnterStep::SetnsMount, e.raw_os_error().unwrap_or(0)))
     }
 }
 
