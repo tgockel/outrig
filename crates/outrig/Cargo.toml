@@ -70,14 +70,21 @@ tracing-subscriber = { workspace = true, features = ["std", "fmt", "ansi", "trac
 walkdir            = { workspace = true }
 
 # `build.rs` fetches, verifies, and embeds the static CPython every session
-# mounts; see `src/python/archive.rs`, which it shares with this crate's tests.
+# mounts, and the pure-Python wheels unpacked beside it; see
+# `src/python/archive.rs`, which it shares with this crate's tests. A wheel's
+# members are deflated, which `miniz_oxide` inflates at build time, so the
+# runtime unpacks a tar as it unpacks the payload; it also deflates the two
+# Python programs behind the `-c` bootstrap each is passed as.
 [build-dependencies]
-ruzstd = { workspace = true, features = ["std"] }
-sha2   = { workspace = true }
-tar    = { workspace = true }
-ureq   = { workspace = true, features = ["rustls"] }
+miniz_oxide = { workspace = true, features = ["with-alloc"] }
+ruzstd      = { workspace = true, features = ["std"] }
+sha2        = { workspace = true }
+tar         = { workspace = true }
+ureq        = { workspace = true, features = ["rustls"] }
 
 [dev-dependencies]
+# `archive.rs`'s tests build a synthetic wheel to convert.
+miniz_oxide = { workspace = true, features = ["with-alloc"] }
 # `resource` starts the interpreter under a memory ceiling of the test's choosing.
 nix      = { workspace = true, features = ["resource"] }
 reqwest  = { workspace = true, features = ["json", "rustls"] }

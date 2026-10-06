@@ -17,6 +17,8 @@ pub(crate) mod payload;
 pub(crate) mod recovery;
 
 #[cfg(test)]
+pub(crate) mod relay;
+#[cfg(test)]
 pub(crate) mod testing;
 
 // What `build.rs` checks the payload with before embedding it. Shared by
@@ -35,3 +37,7 @@ mod host_tests;
 #[cfg(test)]
 #[path = "interpreter_tests.rs"]
 mod interpreter_tests;
+
+#[cfg(test)]
+#[path = "binding_tests.rs"]
+mod binding_tests;

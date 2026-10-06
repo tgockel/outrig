@@ -10,8 +10,10 @@ This page replaces `pyro-remote-objects.md`. It is the mechanism: what a binding
 how its packages arrive, why paths need no translating, how requests cross, what crosses, and what
 the agent sees. `boundary-policy.md` decides what is allowed to cross, `security.md` says why the
 host is where it runs and what that grants, and `lifecycle.md` says how it stops. The design was
-settled in the planning round of 2026-09-30 and none of it is built. `0003-16` through `0003-18`
-are spikes that test the riskiest parts first; `0003-20` and `0003-21` build the rest.
+settled in the planning round of 2026-09-30. `0003-16` through `0003-18` are spikes that test the
+riskiest parts first -- `0003-16` ran the transport and the interception on the host, with both
+sides started by tests, and its `## Decisions` records what held -- and `0003-20` and `0003-21`
+build the rest.
 
 GitPython is the example throughout, and nothing here is specific to it. No mechanism on this page
 names a library, a type, or a parameter: there are no per-library schemas, classification tables,
@@ -206,8 +208,12 @@ would give the container the host's interpreter -- `eval`, `execute`, and arbitr
 **There is no socket.** RPyC frames are carried as messages of the interpreter protocol that
 already connects the host to the interpreter (`harness-components.md`), as their own message kind,
 `rpc`. The Rust owner relays them to the binding's process over its stdin and stdout, through a
-bounded queue per binding, and replies return the same way. Every frame is bounded, and one over
-the bound is refused rather than buffered (`0003-16`). Only the interpreter can reach a binding: a
+bounded queue per binding, and replies return the same way. A frame travels in parts of at most
+512 KiB, one per line, so no protocol line passes 1 MiB; a frame holds at most 128 MiB of data,
+and one declaring more is refused rather than buffered, in either direction, by closing the
+connection it arrived on with the reason (`0003-16`). RPyC's own compression is off on both
+sides, and a frame flagged compressed is refused the same way: a small frame could otherwise
+inflate without limit inside the binding process. Only the interpreter can reach a binding: a
 program the agent starts inherits neither protocol descriptor, and a forked child closes both, so
 a subprocess -- and everything else in the container -- has no channel to a binding at all. Code
 inside the interpreter does, which is why enforcement does not trust the container side.
@@ -232,12 +238,20 @@ table. Every request a kernel sends passes through it before RPyC acts on it, an
 
 - **An unknown handler is denied.** A conformance test enumerates the pinned table and fails if a
   handler is added, so an RPyC upgrade cannot bring a new request type in unexamined.
+- **A request's target is an object the binding handed out.** Every handler but `ping`, `close`,
+  `getroot` and `inspect` names the object it acts on, and that object must arrive as a reference
+  to one this connection sent by reference. A by-value target would let `str.format`, a public
+  method, read attributes through its format string; so would the `str` type itself, which a
+  library can return, so `format` and `format_map` are also denied on a `str` target.
 - **Members are public or denied.** A public name -- one without a leading underscore -- may be
   read, written, deleted, and called, and policy decides each request. Private and dunder names
   are denied, except those on RPyC's safe list: `__iter__`, `__next__`, `__len__`, `__getitem__`,
   `__contains__`, `__enter__`, `__exit__`, the operators, and a few more. That keeps `__class__`,
   `__dict__`, `__globals__`, `__mro__`, and `__subclasses__` -- the attributes through which one
-  object reaches the rest of the host interpreter -- out of reach.
+  object reaches the rest of the host interpreter -- out of reach. A comparison request names
+  one of the comparison operators and nothing else.
+- **Frames and tracebacks never leave.** A generator's `gi_frame` is a public name, and a frame's
+  `f_globals` another, so a result that is or holds a frame or traceback object is denied.
 - **Pickle is off.** No request is answered with pickled bytes.
 - **The host never imports a module the container names.** An exception a container callback
   raises reaches the host as itself only if its type is a builtin; any other type arrives as RPyC's
@@ -270,6 +284,12 @@ Arguments, from the container:
   `str` or `bytes` that `os.fspath` returned. The copy is made once, in the agent's own execution,
   before the request is sent. The host never calls back into the container to read an argument,
   and what policy sees is what the library receives.
+- **A subclass of a by-value type crosses as its base value**, read through the base type's own
+  method so that no override runs: an `IntEnum` member arrives as its `int`, a named tuple as a
+  `tuple`, a `str` subclass as a `str`, and an `OrderedDict`, `defaultdict` or `Counter` as a
+  `dict`. The host receives the plain value, so a library that checks `isinstance(flag,
+  ItsEnum)` sees an `int`; refusing instead would have made every flag and named tuple an error
+  the agent fixes by hand (`0003-16`, fork 3).
 - **A proxy the host handed out** goes back as itself, if it belongs to the kernel whose
   connection the request travels on: the binding keeps one object table per kernel, shared by that
   kernel's connections ("Calls are synchronous"), and resolves it to the original host object. A
@@ -313,7 +333,11 @@ generic exception class, carrying the same name, args, and attributes.
 
 The host's traceback text is kept in the request's outcome event (`boundary-policy.md`) and dropped
 from the error the agent sees. It describes the library's internals rather than the agent's code,
-and it costs the model context; whoever reads the event has it.
+and it costs the model context; whoever reads the event has it. In its place the host sends its
+own one-line rendering of the exception -- what `traceback.format_exception_only` gives -- so an
+exception whose `__str__` reads private state the rebuilt copy lacks, as GitPython's
+`GitCommandError` reads `_cmdline`, still says in the container what it said on the host
+(`0003-16`, fork 4). RPyC prints that line under its "Remote Traceback" heading in `str(e)`.
 
 Args and attributes carry whatever the library put in them -- a command line, its output, a remote
 URL. Nothing scrubs them, for the reason nothing translates paths: no library-neutral rule can tell
@@ -551,14 +575,6 @@ pure-Python client that is hosted like any library. The trait idea is
   declared it; `0003-20` states it for `[bindings]`.
 - What a binding process dying mid-session does. Its calls in flight are `unknown`; whether the
   session continues without the binding, and how later uses fail, is `0003-20`'s and `0003-21`'s.
-- Whether a `str` or `int` subclass -- an enum member, say -- crosses as its base value or is
-  refused like other container objects. `0003-16` settles the argument rules.
-- How a rebuilt exception describes itself. RPyC rebuilds one without running `__init__`, sends
-  only public attributes, and appends the host's traceback to its `str()`. A class whose `__str__`
-  reads private state then prints as `<Unprintable exception>` -- GitPython's `GitCommandError`
-  reads `_cmdline` and `_cause` -- and the host's message was in the traceback text this design
-  drops. Keeping the traceback's last line, which is the host's rendering of the message, is one
-  answer; `0003-16` decides.
 - Whether the stub iterates a returned container in batches with RPyC's `buffiter`, which would
   make one request per batch rather than per item.
 - Whether four connections per kernel and binding is the right bound. `0003-17`'s measurements of
@@ -567,15 +583,16 @@ pure-Python client that is hosted like any library. The trait idea is
 
 ## Unverified
 
-- Every RPyC fact on this page is read from the 6.0.2 source, not exercised: the 20-handler table,
-  the handlers that skip `_check_attr`, `Service._protocol`, the 30-second default, `bind_threads`
-  marked experimental, a request served on whichever thread reads it, the per-thread connection
-  advice in `serve_threaded`'s docstring, `ThreadedServer` starting a thread per connection, a
-  proxy sending its requests on the connection that produced it (`netref.syncreq`), a proxy from
-  another connection boxed as a reference into the sender (`Connection._box`), the object table
-  per connection (`_local_objects`), the by-value types in `brine`, class resolution through
-  `sys.modules`, how `vinegar` dumps and rebuilds exceptions, a safe list without `__call__`, and
-  the `_rpyc_getattr` hooks consulted where `_check_attr` is.
+- `0003-16` exercised these RPyC facts on 6.0.2, with both sides running on the host: the
+  20-handler table and its replacement through `Service._protocol`, a proxy sending its requests
+  on the connection that produced it (`netref.syncreq`), the object table per connection
+  (`_local_objects`) and its reference counts, the by-value types in `brine`, class resolution
+  through `sys.modules`, how `vinegar` dumps and rebuilds exceptions, a safe list without
+  `__call__`, and the nested `inspect` a proxy's class is built from. Still read rather than
+  exercised: the 30-second default and `bind_threads` (both turned off in config), a request
+  served on whichever thread reads it, the per-thread connection advice in `serve_threaded`'s
+  docstring, `ThreadedServer` starting a thread per connection, and the `_rpyc_getattr` hooks
+  consulted where `_check_attr` is, which the interception never calls.
 - That a kernel's connections can share one object table without breaking RPyC's reference
   counting, and that the container side can send a proxy's request on a connection other than
   its own, is reasoned from `_box`, `_unbox` and the `del` handler, not tested. The spike's
@@ -587,7 +604,9 @@ pure-Python client that is hosted like any library. The trait idea is
   its object only when no connection holds it. `0003-17` tests each; if the table or the routing
   fails it also measures the alternative its fork 4 names --
   one connection per kernel and binding, with replies out of order -- and then stops and reports.
-- The two CVEs are described from their published advisories and were not reproduced.
+- The two CVEs are described from their published advisories. `0003-16` sent each one's request
+  by hand -- a comparison naming `__getattribute__`, and a host method copying and pickling a
+  callback it was given -- and both are refused; neither was reproduced against stock RPyC.
 - The GitPython facts are read from the 3.2.0 wheel: `repo.head` building a new `HEAD` per access,
   commit hooks started with a copy of the environment, `execute` taking `env` and `shell`,
   `GitCommandWrapperType`, `CommandError.__str__`, the docstrings saying a `Git` object is not
@@ -597,10 +616,12 @@ pure-Python client that is hosted like any library. The trait idea is
   and `_open`, not observed.
 - What the spikes must confirm before anything is built on this page. A spike that cannot confirm
   its part stops and reports to the maintainer, who decides what follows:
-  - `0003-16`: every handler is intercepted, the conformance test fails on a changed table, a raw
-    client is refused (a comparison on `__getattribute__`, a proxy pickled, `__globals__`,
-    `__mro__`, `__subclasses__`, a method listing of private names, an inflated reference count),
-    copied containers arrive as builtins, and a large result is bounded.
+  - `0003-16` -- confirmed: every handler is intercepted, the conformance test fails on a changed
+    table, a raw client is refused (a comparison on `__getattribute__`, a proxy pickled,
+    `__globals__`, `__mro__`, `__subclasses__`, a method listing of private names, an inflated
+    reference count), copied containers arrive as builtins, and a large result is bounded. Its
+    `## Decisions` record what else the spike found: a by-value target reaching attributes
+    through `str.format`, and a generator's frame reaching the host's globals, both now denied.
   - `0003-17`: another kernel progresses while one blocks for ten seconds, two kernels' calls to
     one binding overlap on the host and never overlap under `serialize = true`, two `to_thread`
     workers' calls from one kernel overlap and never receive each other's replies, a proxy's

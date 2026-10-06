@@ -1,4 +1,5 @@
-//! The static CPython every session mounts, and where it lives on the host.
+//! The static CPython every session mounts, the pure-Python wheels unpacked
+//! beside it, and where they live on the host.
 //!
 //! `build.rs` fetches the pinned `python-build-standalone` release, verifies
 //! it, and embeds it. A session's first start unpacks it under the user's cache
@@ -6,6 +7,13 @@
 //! [`PAYLOAD_MOUNT`]. Nothing falls back to whatever `python3` the image
 //! happens to carry, which would be a different interpreter with a different
 //! library, or none at all.
+//!
+//! RPyC, which carries hosted-object requests between the interpreter and each
+//! binding process, arrives the same way: `build.rs` fetches the pinned wheel,
+//! lays its members out as a tar, and embeds that, and [`rpyc_dir`] unpacks it
+//! once into a directory named for the pin. A binding process imports RPyC
+//! from that directory, and `0003-21` mounts it read-only in the container
+//! beside the payload.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +39,24 @@ static ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/python.tar.zst
 /// to -- so a new pin unpacks beside an old one rather than over it.
 pub(super) const PAYLOAD: &str = env!("OUTRIG_PYTHON_PAYLOAD");
 
+/// The part of the payload archive that is the interpreter: `python/build`
+/// beside it is the build's leftovers.
+const PAYLOAD_SUBTREE: &str = "python/install";
+
+/// The RPyC wheel's members, as `build.rs` laid them out under the pin's name;
+/// empty when that build could not fetch the wheel.
+#[cfg_attr(not(test), allow(dead_code))]
+static RPYC_ARCHIVE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/",
+    env!("OUTRIG_RPYC_DIR"),
+    ".tar.zst"
+));
+
+/// The wheel's name less `.whl`, the directory it unpacks to and the root of
+/// every member in [`RPYC_ARCHIVE`].
+pub(super) const RPYC: &str = env!("OUTRIG_RPYC_DIR");
+
 /// The payload's directory on the host, ready to bind at [`PAYLOAD_MOUNT`],
 /// unpacked from the embedded archive the first time it is asked for.
 ///
@@ -41,15 +67,9 @@ pub(crate) async fn host_dir() -> Result<PathBuf> {
     if ARCHIVE.is_empty() {
         return Err(not_embedded());
     }
-    let root = cache_root(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
-        .ok_or_else(|| {
-            OutrigError::Configuration(
-                "cannot place the Python payload: neither an absolute XDG_CACHE_HOME nor HOME \
-                 is set"
-                    .to_string(),
-            )
-        })?;
-    let dir = root.join("outrig/python").join(PAYLOAD);
+    let dir = cache_dir("python payload")?
+        .join("outrig/python")
+        .join(PAYLOAD);
     if dir.is_dir() {
         runnable_from(&dir)?;
         return Ok(dir);
@@ -57,10 +77,45 @@ pub(crate) async fn host_dir() -> Result<PathBuf> {
     // The blocking task, not this future, holds the lock through the unpack,
     // so a launch cancelled while it waits cannot let another start a second.
     let target = dir.clone();
-    tokio::task::spawn_blocking(move || unpack_once(ARCHIVE, &target))
+    tokio::task::spawn_blocking(move || {
+        let parent = target.parent().expect("the payload directory has a parent");
+        std::fs::create_dir_all(parent).path_ctx("create", parent)?;
+        runnable_from(parent)?;
+        unpack_once(ARCHIVE, &target, PAYLOAD_SUBTREE)
+    })
+    .await
+    .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
+    Ok(dir)
+}
+
+/// The vendored RPyC's directory on the host, holding the `rpyc` package,
+/// unpacked from the embedded wheel the first time it is asked for. Binding
+/// processes import from it, and `0003-21` mounts it read-only in the
+/// container beside the payload.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn rpyc_dir() -> Result<PathBuf> {
+    if RPYC_ARCHIVE.is_empty() {
+        return Err(wheel_not_embedded());
+    }
+    let dir = cache_dir("RPyC wheel")?.join("outrig/wheels").join(RPYC);
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    let target = dir.clone();
+    tokio::task::spawn_blocking(move || unpack_once(RPYC_ARCHIVE, &target, RPYC))
         .await
         .map_err(|e| OutrigError::Io(std::io::Error::other(e)))??;
     Ok(dir)
+}
+
+/// The user's cache directory, or a configuration error naming `what` could
+/// not be placed.
+fn cache_dir(what: &str) -> Result<PathBuf> {
+    cache_root(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")).ok_or_else(|| {
+        OutrigError::Configuration(format!(
+            "cannot place the {what}: neither an absolute XDG_CACHE_HOME nor HOME is set"
+        ))
+    })
 }
 
 /// The payload's mount: [`host_dir`], bound read-only at [`PAYLOAD_MOUNT`],
@@ -128,13 +183,13 @@ fn lock_path(dir: &Path) -> PathBuf {
     dir.with_file_name(format!(".{}.lock", name.to_string_lossy()))
 }
 
-/// Unpack `archive` to `dir` unless another thread or process has by the time
-/// this one holds the lock. One unpack decodes through a 128 MiB window and
-/// writes about 170 MB, so concurrent first launches must not each do it.
-fn unpack_once(archive: &[u8], dir: &Path) -> Result<()> {
-    let parent = dir.parent().expect("the payload directory has a parent");
+/// Unpack `archive`'s `subtree` to `dir` unless another thread or process has
+/// by the time this one holds the lock. One payload unpack decodes through a
+/// 128 MiB window and writes about 170 MB, so concurrent first launches must
+/// not each do it.
+fn unpack_once(archive: &[u8], dir: &Path, subtree: &str) -> Result<()> {
+    let parent = dir.parent().expect("the unpack directory has a parent");
     std::fs::create_dir_all(parent).path_ctx("create", parent)?;
-    runnable_from(parent)?;
     let lock = lock_path(dir);
     let file = std::fs::File::create(&lock).path_ctx("create", &lock)?;
     let _held = Flock::lock(file, FlockArg::LockExclusive)
@@ -143,7 +198,7 @@ fn unpack_once(archive: &[u8], dir: &Path) -> Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
-    unpack(archive, dir)
+    unpack(archive, dir, subtree)
 }
 
 /// What a build that degraded to an empty archive says at session start.
@@ -154,6 +209,16 @@ fn not_embedded() -> OutrigError {
         "this outrig was built without its Python payload: {reason}\n\
          help: rebuild with network access, or with OUTRIG_PYTHON_ARCHIVE naming a copy \
          of {PAYLOAD}.tar.zst"
+    ))
+}
+
+/// As [`not_embedded`], for the RPyC wheel; `build.rs` records why in
+/// `OUTRIG_RPYC_UNAVAILABLE_REASON`.
+fn wheel_not_embedded() -> OutrigError {
+    let reason = option_env!("OUTRIG_RPYC_UNAVAILABLE_REASON").unwrap_or("unknown");
+    OutrigError::Configuration(format!(
+        "this outrig was built without its RPyC wheel: {reason}\n\
+         help: rebuild with network access, or with OUTRIG_RPYC_WHEEL naming a copy of {RPYC}.whl"
     ))
 }
 
@@ -170,12 +235,12 @@ fn cache_root(xdg_cache_home: Option<OsString>, home: Option<OsString>) -> Optio
         })
 }
 
-/// Unpack `archive`'s `python/install` tree to `dir`. It goes to a sibling
-/// first and is renamed into place once complete, so `dir` either holds a
-/// whole payload or does not exist. [`unpack_once`] keeps two from racing;
-/// should one still lose a rename, it uses the winner's tree.
-fn unpack(archive: &[u8], dir: &Path) -> Result<()> {
-    let parent = dir.parent().expect("the payload directory has a parent");
+/// Unpack `archive`'s `subtree` to `dir`. It goes to a sibling first and is
+/// renamed into place once complete, so `dir` either holds a whole tree or
+/// does not exist. [`unpack_once`] keeps two from racing; should one still
+/// lose a rename, it uses the winner's tree.
+fn unpack(archive: &[u8], dir: &Path, subtree: &str) -> Result<()> {
+    let parent = dir.parent().expect("the unpack directory has a parent");
     std::fs::create_dir_all(parent).path_ctx("create", parent)?;
     let stage = tempfile::Builder::new()
         .prefix(".unpack-")
@@ -183,36 +248,33 @@ fn unpack(archive: &[u8], dir: &Path) -> Result<()> {
         .path_ctx("create a directory in", parent)?;
     let at = stage.path();
     fn unpacking<T>(result: std::io::Result<T>, at: &Path) -> Result<T> {
-        result.path_ctx("unpack Python into", at)
+        result.path_ctx("unpack into", at)
     }
 
     // No window limit, as in `build.rs`: these bytes matched the pinned digest
-    // before they were embedded, and that archive needs 128 MiB.
+    // before they were embedded, and the payload's archive needs 128 MiB.
     let decoder = ruzstd::decoding::StreamingDecoder::new_with_max_window_size(archive, u64::MAX)
         .map_err(std::io::Error::other);
     let mut tar = tar::Archive::new(unpacking(decoder, at)?);
     for entry in unpacking(tar.entries(), at)? {
         let mut entry = unpacking(entry, at)?;
-        if !entry
-            .path()
-            .is_ok_and(|path| path.starts_with("python/install"))
-        {
+        if !entry.path().is_ok_and(|path| path.starts_with(subtree)) {
             continue;
         }
         // `unpack_in` refuses a member that would land outside the stage and
-        // says so by returning `false`; a tree missing one is not a payload.
+        // says so by returning `false`; a tree missing one is not whole.
         if !unpacking(entry.unpack_in(at), at)? {
             return Err(OutrigError::Configuration(format!(
-                "the embedded Python payload has a member outside its tree: {}",
+                "the embedded archive has a member outside its tree: {}",
                 String::from_utf8_lossy(&entry.path_bytes())
             )));
         }
     }
 
-    match std::fs::rename(stage.path().join("python/install"), dir) {
+    match std::fs::rename(stage.path().join(subtree), dir) {
         Ok(()) => Ok(()),
         Err(_) if dir.is_dir() => Ok(()),
-        Err(e) => Err(e).path_ctx("move the Python payload to", dir),
+        Err(e) => Err(e).path_ctx("move the unpacked tree to", dir),
     }
 }
 
@@ -324,7 +386,7 @@ mod tests {
 
         let waiter = {
             let dir = dir.clone();
-            std::thread::spawn(move || unpack_once(b"not an archive", &dir))
+            std::thread::spawn(move || unpack_once(b"not an archive", &dir, PAYLOAD_SUBTREE))
         };
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("winner"), b"").unwrap();
@@ -338,7 +400,7 @@ mod tests {
     fn only_the_install_tree_is_unpacked() {
         let cache = tempfile::tempdir().unwrap();
         let dir = cache.path().join("python").join(PAYLOAD);
-        unpack(&archive(), &dir).unwrap();
+        unpack(&archive(), &dir, PAYLOAD_SUBTREE).unwrap();
 
         assert_eq!(
             std::fs::read(dir.join("bin/python3")).unwrap(),
@@ -362,11 +424,56 @@ mod tests {
     fn losing_the_race_to_unpack_uses_the_winners_tree() {
         let cache = tempfile::tempdir().unwrap();
         let dir = cache.path().join(PAYLOAD);
-        unpack(&archive(), &dir).unwrap();
+        unpack(&archive(), &dir, PAYLOAD_SUBTREE).unwrap();
         std::fs::write(dir.join("winner"), b"").unwrap();
 
-        unpack(&archive(), &dir).unwrap();
+        unpack(&archive(), &dir, PAYLOAD_SUBTREE).unwrap();
         assert!(dir.join("winner").exists());
+    }
+
+    /// A wheel's tar, as `build.rs` lays one out: every member under the pin.
+    fn wheel_archive() -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, bytes) in [
+            (format!("{RPYC}/rpyc/__init__.py"), &b"package"[..]),
+            (
+                format!("{RPYC}/rpyc-6.0.2.dist-info/WHEEL"),
+                b"Wheel-Version: 1.0\n",
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        ruzstd::encoding::compress_to_vec(&tar[..], ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    #[test]
+    fn a_wheel_unpacks_under_its_pin() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = cache.path().join("wheels").join(RPYC);
+        unpack_once(&wheel_archive(), &dir, RPYC).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("rpyc/__init__.py")).unwrap(),
+            b"package"
+        );
+        assert!(dir.join("rpyc-6.0.2.dist-info/WHEEL").exists());
+        let beside: Vec<_> = std::fs::read_dir(cache.path().join("wheels"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".lock"))
+            .collect();
+        assert_eq!(beside, [RPYC], "the stage was left behind");
+    }
+
+    #[test]
+    fn a_build_without_the_wheel_says_what_would_supply_it() {
+        let err = wheel_not_embedded().to_string();
+        assert!(err.contains("built without its RPyC wheel"), "{err}");
+        assert!(err.contains("OUTRIG_RPYC_WHEEL"), "{err}");
+        assert!(err.contains(&format!("{RPYC}.whl")), "{err}");
     }
 
     #[test]

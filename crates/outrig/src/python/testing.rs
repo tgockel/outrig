@@ -6,9 +6,14 @@
 //! the real interpreter this way.
 
 use std::future::Future;
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 
 use serde_json::{Value, json};
 use tokio::io::{
@@ -76,6 +81,102 @@ pub(crate) async fn start_on_host_with(events: Events) -> Interpreter {
     within(Interpreter::from_child(spawn(Some(PRIMARY)).await, events))
         .await
         .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// How a test starts the interpreter on the host. By default: in the test's
+/// working directory, with [`host_home`] as `HOME`, under the ceiling it sets
+/// itself.
+#[derive(Default)]
+pub(crate) struct Start<'a> {
+    /// A soft `RLIMIT_DATA` already in place when it starts.
+    pub(crate) ceiling: Option<u64>,
+    /// Its working directory, which it takes for the workspace.
+    pub(crate) dir: Option<&'a Path>,
+    /// Its `HOME`, under which pip installs.
+    pub(crate) home: Option<&'a Path>,
+}
+
+/// The payload's `python3` as the host-side harnesses run it: `HOME` set for
+/// tests and pip's variable cleared, every stream piped, and a process group
+/// of its own, so a harness's `Drop` reaches the children it starts.
+pub(crate) fn python_command(home: Option<&Path>) -> Command {
+    let mut command = Command::new(python());
+    command
+        .env("HOME", home.map_or_else(host_home, Path::to_path_buf))
+        .env_remove("PYTHONUSERBASE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command
+}
+
+/// The interpreter as `Interpreter::start` starts it, on the host, per `start`.
+pub(crate) fn interpreter_command(start: &Start) -> Command {
+    let mut command = python_command(start.home);
+    command.args(ARGS).arg(PRIMARY);
+    if let Some(dir) = start.dir {
+        command.current_dir(dir);
+    }
+    if let Some(bytes) = start.ceiling {
+        let (_, hard) = getrlimit(Resource::RLIMIT_DATA).expect("RLIMIT_DATA");
+        // SAFETY: the closure runs between fork and exec, and makes one
+        // async-signal-safe call that neither allocates nor takes a lock.
+        unsafe {
+            command.pre_exec(move || {
+                setrlimit(Resource::RLIMIT_DATA, bytes, hard).map_err(std::io::Error::from)
+            });
+        }
+    }
+    command
+}
+
+/// Everything `pipe` yields, gathered on a thread of its own as it arrives.
+pub(crate) fn capture(mut pipe: impl Read + Send + 'static) -> Arc<Mutex<String>> {
+    let sink = Arc::new(Mutex::new(String::new()));
+    let into = Arc::clone(&sink);
+    std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        while let Ok(n @ 1..) = pipe.read(&mut buf) {
+            into.lock()
+                .expect("stderr lock")
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    });
+    sink
+}
+
+/// The embedded payload's interpreter, unpacked once for the whole binary.
+pub(crate) fn python() -> &'static Path {
+    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
+    PYTHON.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime to unpack the payload on");
+        let dir = runtime
+            .block_on(payload::host_dir())
+            .expect("the payload this build embedded");
+        dir.join("bin/python3")
+    })
+}
+
+/// Python written indented inside a Rust test, dedented.
+pub(crate) fn py(source: &str) -> String {
+    let lines: Vec<&str> = source
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .collect();
+    let indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| line.get(indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------- a fake transport

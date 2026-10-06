@@ -11,23 +11,22 @@
 //! Nothing waits on a sleep or a wall-clock threshold. Where a test needs two
 //! things to overlap, a flag file or an `asyncio.Event` gates one on the other.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ExitStatus};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit, setrlimit};
+use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::sysinfo::sysinfo;
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 
-use super::host::{ARGS, PRIMARY};
+use super::host::PRIMARY;
 use super::payload;
-use super::testing::{PIP_PROBE, host_home};
+use super::testing::{PIP_PROBE, Start, capture, interpreter_command, py};
 
 /// How long any one reply may take. Generous for a loaded CI runner; nothing
 /// here comes close.
@@ -58,39 +57,6 @@ fn eventually<T>(mut check: impl FnMut() -> Option<T>, waited_for: impl FnOnce()
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-/// The embedded payload's interpreter, unpacked once for the whole binary.
-fn python() -> &'static Path {
-    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
-    PYTHON.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a runtime to unpack the payload on");
-        let dir = runtime
-            .block_on(payload::host_dir())
-            .expect("the payload this build embedded");
-        dir.join("bin/python3")
-    })
-}
-
-/// Python written indented inside a Rust test, dedented.
-fn py(source: &str) -> String {
-    let lines: Vec<&str> = source
-        .lines()
-        .skip_while(|line| line.trim().is_empty())
-        .collect();
-    let indent = lines
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.len() - line.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    lines
-        .iter()
-        .map(|line| line.get(indent..).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// A path nothing exists at until the test says so.
@@ -142,7 +108,7 @@ impl Flag {
     }
 }
 
-struct Interpreter {
+pub(super) struct Interpreter {
     child: Child,
     stdin: Option<ChildStdin>,
     replies: Receiver<Result<Value, String>>,
@@ -150,20 +116,8 @@ struct Interpreter {
     ready: Value,
 }
 
-/// How a test starts the interpreter. By default: in the test's working
-/// directory, with [`host_home`] as `HOME`, under the ceiling it sets itself.
-#[derive(Default)]
-struct Start<'a> {
-    /// A soft `RLIMIT_DATA` already in place when it starts.
-    ceiling: Option<u64>,
-    /// Its working directory, which it takes for the workspace.
-    dir: Option<&'a Path>,
-    /// Its `HOME`, under which pip installs.
-    home: Option<&'a Path>,
-}
-
 impl Interpreter {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         Self::spawn(&Start::default())
     }
 
@@ -178,34 +132,12 @@ impl Interpreter {
     }
 
     fn spawn(start: &Start) -> Self {
-        let mut command = Command::new(python());
-        command
-            .args(ARGS)
-            .arg(PRIMARY)
-            .env("HOME", start.home.map_or_else(host_home, Path::to_path_buf))
-            .env_remove("PYTHONUSERBASE")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // A group of its own, so `Drop` reaches the children tests start.
-            .process_group(0);
-        if let Some(dir) = start.dir {
-            command.current_dir(dir);
-        }
-        if let Some(bytes) = start.ceiling {
-            let (_, hard) = getrlimit(Resource::RLIMIT_DATA).expect("RLIMIT_DATA");
-            // SAFETY: the closure runs between fork and exec, and makes one
-            // async-signal-safe call that neither allocates nor takes a lock.
-            unsafe {
-                command.pre_exec(move || {
-                    setrlimit(Resource::RLIMIT_DATA, bytes, hard).map_err(std::io::Error::from)
-                });
-            }
-        }
-        let mut child = command.spawn().expect("the interpreter starts");
+        let mut child = interpreter_command(start)
+            .spawn()
+            .expect("the interpreter starts");
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
-        let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+        let stderr = capture(child.stderr.take().expect("stderr is piped"));
 
         let (tx, replies) = channel();
         std::thread::spawn(move || {
@@ -224,17 +156,6 @@ impl Interpreter {
                 }
             }
         });
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&stderr);
-        std::thread::spawn(move || {
-            let mut buf = [0; 4096];
-            while let Ok(n @ 1..) = stderr_pipe.read(&mut buf) {
-                sink.lock()
-                    .expect("stderr lock")
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
-        });
-
         let mut interpreter = Self {
             child,
             stdin,
@@ -289,7 +210,7 @@ impl Interpreter {
         result
     }
 
-    fn exec(&mut self, id: u64, source: &str) -> Value {
+    pub(super) fn exec(&mut self, id: u64, source: &str) -> Value {
         self.exec_in(PRIMARY, id, source)
     }
 
@@ -300,7 +221,7 @@ impl Interpreter {
         text(&result["output"])
     }
 
-    fn output(&mut self, id: u64, source: &str) -> String {
+    pub(super) fn output(&mut self, id: u64, source: &str) -> String {
         self.output_in(PRIMARY, id, source)
     }
 

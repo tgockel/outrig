@@ -102,7 +102,6 @@ phase.
 
 | Task      | What it settles                                                    |
 | --------- | ------------------------------------------------------------------ |
-| `0003-16` | RPyC crosses the interpreter pipe; every request is intercepted    |
 | `0003-17` | A host call blocks only its caller                                 |
 | `0003-18` | A binding's process dies with its owner                            |
 

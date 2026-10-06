@@ -15,8 +15,11 @@ Every session's container gets OutRig's own static CPython, mounted read-only at
 `build.rs` downloads a pinned `python-build-standalone` release once per machine, verifies its
 SHA-256, and embeds it, and the first launch unpacks it under `$XDG_CACHE_HOME/outrig/python`.
 For a build with no network, set `OUTRIG_PYTHON_ARCHIVE` to a copy of the archive; without either,
-the build warns and every launch fails with a message saying so. OutRig reserves `/outrig` inside
-the container, so neither the workspace nor a mount may be placed there.
+the build warns and every launch fails with a message saying so. The same build fetches and
+embeds the pinned RPyC wheel that carries hosted-object requests between the interpreter and a
+binding's process; `OUTRIG_RPYC_WHEEL` names a local copy of it for a build with no network.
+OutRig reserves `/outrig` inside the container, so neither the workspace nor a mount may be
+placed there.
 
 ## Example
 

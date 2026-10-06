@@ -88,8 +88,10 @@ use crate::events::{Event, Events, PRIMARY_SUBJECT};
 
 use super::payload::PAYLOAD_MOUNT;
 
-/// The program the interpreter runs, passed on its command line.
-const PROGRAM: &str = include_str!("interpreter.py");
+/// The program the interpreter runs, passed on its command line: `build.rs`
+/// stages `interpreter.py` compressed behind a one-line bootstrap, since Linux
+/// caps one argument at 128 KiB and the source is past that.
+const PROGRAM: &str = include_str!(concat!(env!("OUT_DIR"), "/interpreter.bootstrap"));
 
 /// What the payload's `python3` is started with, ahead of the agent id. `-I`
 /// isolates it: no `PYTHON*` variable or other configuration the image carries

@@ -41,6 +41,7 @@ Five things here are load-bearing rather than incidental:
 
 import ast
 import asyncio
+import base64
 import builtins
 import collections
 import contextlib
@@ -51,6 +52,7 @@ import functools
 import importlib
 import inspect
 import io
+import itertools
 import json
 import math
 import mmap
@@ -61,6 +63,7 @@ import shlex
 import shutil
 import signal
 import site
+import struct
 import subprocess
 import sys
 import threading
@@ -1076,6 +1079,524 @@ class _Help:
 builtins.help = _Help()
 
 
+# ---------------------------------------------------------------------------- hosted objects
+
+# A binding is a library running in a process on the host, which agent code reaches through RPyC
+# proxies. Its frames travel as `rpc` lines of this protocol, tagged by agent, binding and
+# connection, and the host relays them to the binding's process: nothing here listens on a
+# socket. The reader thread routes each part of a frame to its connection's channel, and the
+# kernel thread waiting for a reply waits on that channel's condition variable, so it never reads
+# the protocol itself and releases the GIL while it waits.
+#
+# Nothing on this side is enforcement. Agent code runs in this process and can write frames of its
+# own, so every check that matters is the binding's, on the host. What this side does is make the
+# ordinary case work: it copies a `list`, `dict`, `set` or path into a by-value form the host
+# rebuilds as a builtin, sends a subclass of a by-value type as its base value, marks a callable so
+# the host can call it back while the request runs, and refuses -- before anything is sent -- an
+# object that could only cross as a reference into this process, or a proxy that belongs to another
+# connection. The frame channel is a copy of the binding program's; keep them the same.
+
+PART_MAX = 512 * 1024  # bytes of frame data in one `rpc` line
+FRAME_MAX = 128 << 20  # bytes of data in one RPyC frame, either direction
+BUFFER_MAX = 2 * FRAME_MAX  # bytes one connection holds unread, the frame in progress included
+FRAME_OVERHEAD = 64  # bytes charged for each frame held, for the object that holds it
+
+# RPyC's own frame header: a 4-byte length and a 1-byte compressed flag, then the data and a
+# newline. Kept on the wire as RPyC's `Channel` writes it, so a compressed frame is refused by a
+# direct check rather than inferred.
+FRAME_HEADER = struct.Struct("!LB")
+FLUSHER = b"\n"
+
+# Boxing labels of this transport's own, beside RPyC's four: the shim's copies of the builtin
+# containers, and a callable marked for the host to call back.
+LABEL_LIST = 101
+LABEL_DICT = 102
+LABEL_SET = 103
+LABEL_FROZENSET = 104
+LABEL_CALLABLE = 105
+
+# The vendored RPyC, imported by `main` from the directory it is given, and the connection class
+# built over it; `None` when the interpreter was started without one.
+_rpyc = None
+_Hosted = None
+_rpyc_missing = "this interpreter was started without RPyC, so it has no hosted objects"
+# The reader thread, which must never wait for a reply it alone delivers.
+_reader_thread = None
+# Every open connection's channel, for the reader thread: (agent, binding, number) -> channel.
+_rpc_channels = {}
+
+
+class FrameChannel:
+    """RPyC's channel, over `rpc` lines rather than a stream.
+
+    Frames arrive in parts, each one line, from the thread reading the protocol; `put` joins them
+    and `poll` waits for a whole one on a condition variable, so the thread serving the connection
+    never reads the protocol itself. A frame is sent in parts the same way, each written whole
+    under the process's send lock.
+
+    Bounds are enforced here, in both directions: a part over `PART_MAX`, a part before a frame's
+    last that is not full, a frame whose header claims more than `FRAME_MAX`, a compressed frame,
+    or more than `BUFFER_MAX` bytes held unread -- each frame charged `FRAME_OVERHEAD` beyond its
+    bytes -- closes the channel with the reason, and the waiting reader raises `EOFError` saying
+    why. A frame is never half-delivered: `recv` returns whole frames or raises.
+    """
+
+    def __init__(self, write):
+        # `write(part, more)` writes one part as one protocol line.
+        self._write = write
+        self._cond = threading.Condition()
+        self._reason = None  # why the channel closed; `None` while it is open
+        self._frames = collections.deque()  # whole frames, data only
+        self._held = 0  # bytes in `_frames`
+        self._parts = []  # the frame in progress, header and flusher stripped
+        self._received = 0  # bytes of it so far, header and flusher included
+        self._expected = 0  # bytes it declares, header and flusher included
+
+    @property
+    def closed(self):
+        return self._reason is not None
+
+    @property
+    def reason(self):
+        return self._reason
+
+    def fileno(self):
+        raise OSError("a frame channel has no descriptor")
+
+    def close(self, reason="closed"):
+        """Mark the channel closed -- the first reason stands -- drop what it holds, and wake every
+        waiter. Writes nothing. Returns the reason in effect."""
+        with self._cond:
+            if self._reason is None:
+                self._reason = reason
+            self._frames.clear()
+            self._parts = []
+            self._held = self._received = 0
+            self._cond.notify_all()
+            return self._reason
+
+    def put(self, part, more):
+        """Take one part of a frame, from the reading thread. Returns `None`, or the reason this
+        closed the channel, which the caller reports to the other side.
+
+        Everything that can fail is decided, and a finished frame joined, before anything changes,
+        so a caller that retries after running out of memory never applies a part twice.
+        """
+        with self._cond:
+            if self._reason is not None:
+                return None
+            if len(part) > PART_MAX:
+                return self.close(f"a part of {len(part)} bytes is past the {PART_MAX}-byte bound")
+            expected = self._expected
+            if not self._parts:
+                # The first part carries the header.
+                if len(part) < FRAME_HEADER.size:
+                    return self.close("a frame shorter than its header")
+                length, compressed = FRAME_HEADER.unpack_from(part)
+                if compressed:
+                    return self.close("a compressed frame; compression is off on this transport")
+                if length > FRAME_MAX:
+                    return self.close(
+                        f"a frame of {length} bytes is past the {FRAME_MAX}-byte bound"
+                    )
+                expected = FRAME_HEADER.size + length + len(FLUSHER)
+            if more and len(part) != PART_MAX:
+                # Every part but the last is full, which bounds how many parts hold one frame.
+                return self.close(
+                    f"a part before a frame's last carries {PART_MAX} bytes, not {len(part)}"
+                )
+            received = self._received + len(part)
+            if received > expected or (not more and received != expected):
+                return self.close(
+                    f"a frame's parts carry {received} bytes against the {expected} its header "
+                    f"declares"
+                )
+            if not more and not part.endswith(FLUSHER):
+                return self.close("a frame without its trailing newline")
+            if self._held + received + FRAME_OVERHEAD > BUFFER_MAX:
+                return self.close(f"more than {BUFFER_MAX} bytes of frames held unread")
+            data = memoryview(part)[FRAME_HEADER.size if not self._parts else 0 :]
+            if more:
+                self._parts.append(data)
+                self._received, self._expected = received, expected
+                return None
+            frame = b"".join([*self._parts, data[: len(data) - len(FLUSHER)]])
+            self._frames.append(frame)
+            self._held += len(frame) + FRAME_OVERHEAD
+            self._parts = []
+            self._received = 0
+            self._cond.notify_all()
+            return None
+
+    def poll(self, timeout):
+        """Whether a frame is ready, waiting up to `timeout` -- RPyC's `Timeout`, seconds, or
+        `None` -- for one. True once the channel has closed, so the reader learns why."""
+        left = timeout.timeleft() if hasattr(timeout, "timeleft") else timeout
+        with self._cond:
+            return self._cond.wait_for(lambda: bool(self._frames) or self._reason is not None, left)
+
+    def recv(self):
+        """The next whole frame's data, or `EOFError` with the reason the channel closed."""
+        with self._cond:
+            if self._frames:
+                data = self._frames.popleft()
+                self._held -= len(data) + FRAME_OVERHEAD
+                return data
+            raise EOFError(self._reason or "no frame is ready")
+
+    def send(self, data):
+        """Send one frame of `data`, in parts. Refuses a frame past the bound before writing any of
+        it; a write that fails part way closes the channel, since the other side holds a torn
+        frame."""
+        if len(data) > FRAME_MAX:
+            raise ValueError(f"a frame of {len(data)} bytes is past the {FRAME_MAX}-byte bound")
+        if self._reason is not None:
+            raise EOFError(self._reason)
+        segments = collections.deque(
+            [FRAME_HEADER.pack(len(data), 0), memoryview(data), FLUSHER]
+        )
+        while True:
+            part = bytearray()
+            while segments and len(part) < PART_MAX:
+                segment = segments.popleft()
+                take = PART_MAX - len(part)
+                part += segment[:take]
+                if take < len(segment):
+                    segments.appendleft(segment[take:])
+            more = bool(segments)
+            try:
+                self._write(bytes(part), more)
+            except BaseException:
+                self.close("a frame could not be written whole")
+                raise
+            if not more:
+                return
+
+
+class _Context(threading.local):
+    """Per thread: the callables marked for the request being sent, or `None` while a callback's
+    return value is being boxed, where a callable is refused."""
+
+    marks = None
+
+
+def _load_rpyc(directory):
+    """Import RPyC from `directory` and build the connection class over it."""
+    global _rpyc, _Hosted, _rpyc_missing
+    sys.path.append(directory)
+    try:
+        import rpyc
+    except Exception as e:
+        _rpyc_missing = f"RPyC could not be imported from {directory}: {e!r}"
+        _diag(_rpyc_missing)
+        return
+    _rpyc = rpyc
+    _Hosted = _connection_class(rpyc)
+
+
+def _connection_class(rpyc):
+    """The connection class a kernel opens to a binding, built over the imported `rpyc`."""
+    consts = rpyc.core.consts
+    brine = rpyc.core.brine
+    vinegar = rpyc.core.vinegar
+    netref = rpyc.core.netref
+    Connection = rpyc.core.protocol.Connection
+    get_id_pack = rpyc.lib.get_id_pack
+
+    # The container may import a module the host names, so a host exception arrives as the
+    # library's own class where its module imports here. No timer: a hosted call takes as long as
+    # the library takes.
+    config = dict(
+        allow_pickle=False,
+        import_custom_exceptions=True,
+        instantiate_custom_exceptions=True,
+        propagate_SystemExit_locally=False,
+        propagate_KeyboardInterrupt_locally=False,
+        sync_request_timeout=None,
+        bind_threads=False,
+    )
+    # A subclass of a by-value type crosses as its base value, read through the base type's own
+    # method so that no override of the subclass's runs.
+    bases = (
+        (int, int.__int__),
+        (float, float.__float__),
+        (complex, complex.__complex__),
+        (str, str.__str__),
+        (bytes, lambda value: memoryview(value).tobytes()),
+        (tuple, lambda value: tuple.__getitem__(value, slice(None))),
+    )
+    # The containers the shim copies, nested ones included, read through the base's own methods.
+    copies = (
+        (dict, LABEL_DICT, dict.items),
+        (list, LABEL_LIST, list.__iter__),
+        (set, LABEL_SET, set.__iter__),
+        (frozenset, LABEL_FROZENSET, frozenset.__iter__),
+    )
+
+    class Hosted(Connection):
+        """One kernel's connection to one binding."""
+
+        def __init__(self, channel, *, agent, binding, number):
+            self.agent = agent
+            self.binding = binding
+            self.number = number
+            super().__init__(
+                rpyc.core.service.VoidService(),
+                channel,
+                dict(config, connid=f"{agent}/{binding}#{number}"),
+            )
+            self._context = _Context()
+            # Releases of proxies, from `BaseNetref.__del__`, held until the next request: a
+            # finalizer can run inside `_write_line`, which holds the process's send lock.
+            self._pending_dels = collections.deque()
+
+        @property
+        def names(self):
+            return f"binding {self.binding!r} on agent {self.agent!r}"
+
+        # ------------------------------------------------------------------ requests
+
+        def _send(self, msg, seq, args):
+            """RPyC's, without its shared send queue -- a frame past the bound raises in the thread
+            that asked, and a finalizer's release is queued by `_async_request` rather than sent --
+            and when a frame could not be written whole, which closed the channel, the binding is
+            told, so it releases the connection's objects and thread."""
+            data = brine.I1.pack(msg) + brine.dump((seq, args))
+            try:
+                with self._sendlock:
+                    self._channel.send(data)
+            except BaseException:
+                if self._channel.closed and not self._closed:
+                    self.close_with(self._channel.reason)
+                raise
+
+        def _async_request(self, handler, args=(), callback=(lambda a, b: None)):
+            if handler == consts.HANDLE_DEL:
+                proxy, count = args
+                self._pending_dels.append(
+                    (object.__getattribute__(proxy, "____id_pack__"), count)
+                )
+                return
+            self._flush_dels()
+            if handler == consts.HANDLE_CTXEXIT:
+                args = self._ctxexit_args(args)
+            saved = self._context.marks
+            self._context.marks = marks = []
+            try:
+                seq = self._get_seq_id()
+
+                def done(is_exc, obj):
+                    try:
+                        callback(is_exc, obj)
+                    finally:
+                        self._release(marks)
+
+                self._request_callbacks[seq] = done
+                try:
+                    self._send(consts.MSG_REQUEST, seq, (handler, self._box(args)))
+                except BaseException:
+                    self._request_callbacks.pop(seq, None)
+                    self._release(marks)
+                    raise
+            finally:
+                self._context.marks = saved
+
+        def _release(self, marks):
+            for id_pack in marks:
+                with contextlib.suppress(KeyError):
+                    self._local_objects.decref(id_pack)
+
+        def _flush_dels(self):
+            while True:
+                try:
+                    id_pack, count = self._pending_dels.popleft()
+                except IndexError:
+                    return
+                seq = self._get_seq_id()
+                self._request_callbacks[seq] = lambda is_exc, obj: None
+                boxed = (
+                    consts.LABEL_TUPLE,
+                    ((consts.LABEL_LOCAL_REF, id_pack), (consts.LABEL_VALUE, count)),
+                )
+                self._send(consts.MSG_REQUEST, seq, (consts.HANDLE_DEL, boxed))
+
+        def _ctxexit_args(self, args):
+            """A proxy's `__exit__` sends only the exception's type. The exception itself is
+            `sys.exception()` while a `with` block unwinds, and goes by value when its type is the
+            one sent; otherwise the type alone, and `None` stays `None`."""
+            proxy, exc = args
+            if exc is None:
+                return (proxy, None)
+            current = sys.exception()
+            if current is not None and type(current) is exc:
+                dump = vinegar.dump(
+                    exc, current, None, include_local_traceback=False, include_local_version=False
+                )
+            else:
+                dump = ((exc.__module__, exc.__name__), (), (), "")
+            return (proxy, dump)
+
+        # ------------------------------------------------------------------ boxing
+
+        def _box(self, obj, seen=frozenset()):
+            """The shim: box an argument, or raise `TypeError` naming what cannot cross."""
+            if brine.dumpable(obj):
+                return consts.LABEL_VALUE, obj
+            if type(obj) is tuple:
+                return consts.LABEL_TUPLE, tuple(self._box(item, seen) for item in obj)
+            # Before anything else: a proxy of a host list answers `isinstance(proxy, list)`, and
+            # a proxy of a host method is callable.
+            if isinstance(obj, netref.BaseNetref):
+                conn = object.__getattribute__(obj, "____conn__")
+                if conn is self:
+                    return consts.LABEL_LOCAL_REF, object.__getattribute__(obj, "____id_pack__")
+                raise TypeError(
+                    f"a proxy of {getattr(conn, 'names', 'another connection')} cannot be passed "
+                    f"to {self.names}: a hosted object crosses only to its own binding, on the "
+                    f"connection that produced it"
+                )
+            for base, label, read in copies:
+                if isinstance(obj, base):
+                    if id(obj) in seen:
+                        raise TypeError("a container that contains itself cannot be sent")
+                    inner = seen | {id(obj)}
+                    if base is dict:
+                        return label, tuple(
+                            (self._box(key, inner), self._box(value, inner))
+                            for key, value in read(obj)
+                        )
+                    return label, tuple(self._box(item, inner) for item in read(obj))
+            if isinstance(obj, os.PathLike):
+                return self._box(os.fspath(obj), seen)
+            for base, read in bases:
+                if isinstance(obj, base):
+                    return self._box(read(obj), seen)
+            if callable(obj):
+                marks = self._context.marks
+                if marks is None:
+                    raise TypeError(
+                        f"a callable of type {_type_name(type(obj))} cannot be returned from a "
+                        f"callback: only values go back to the host"
+                    )
+                id_pack = get_id_pack(obj)
+                self._local_objects.add(id_pack, obj)
+                marks.append(id_pack)
+                return LABEL_CALLABLE, id_pack
+            raise TypeError(
+                f"an object of type {_type_name(type(obj))} cannot be passed to a hosted object: "
+                f"only values, lists, dicts, sets, paths, callables, and the binding's own proxies "
+                f"cross. `list()` a generator, or pass what the object holds."
+            )
+
+        def _unbox_exc(self, raw):
+            try:
+                return super()._unbox_exc(raw)
+            except Exception as e:
+                return vinegar.GenericException(
+                    f"an exception from {self.names} could not be rebuilt: {e!r}"
+                )
+
+        # ------------------------------------------------------------------ dispatch
+
+        def _dispatch(self, data):
+            """Route one frame. Every path releases the receive lock exactly once, and a frame
+            that cannot be decoded closes the connection with the reason rather than leaving a
+            call waiting."""
+            released = False
+            try:
+                msg = data[0]
+                if msg == consts.MSG_REQUEST:
+                    self._recvlock.release()
+                    released = True
+                    seq, args = brine.load(data[1:])
+                    self._dispatch_request(seq, args)
+                elif msg == consts.MSG_REPLY:
+                    seq, args = brine.load(data[1:])
+                    try:
+                        obj = self._unbox(args)
+                    except Exception as e:
+                        # A reference this side no longer holds, say: the call that asked fails,
+                        # and the connection carries on.
+                        is_exc, obj = True, vinegar.GenericException(
+                            f"a reply from {self.names} could not be rebuilt: {e!r}"
+                        )
+                    else:
+                        is_exc = False
+                    self._seq_request_callback(msg, seq, is_exc, obj)
+                    self._recvlock.release()
+                    released = True
+                elif msg == consts.MSG_EXCEPTION:
+                    self._recvlock.release()
+                    released = True
+                    seq, args = brine.load(data[1:])
+                    self._seq_request_callback(msg, seq, True, self._unbox_exc(args))
+                else:
+                    raise ValueError(f"message type {msg!r}")
+            except (EOFError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:
+                if not released:
+                    self._recvlock.release()
+                reason = f"an undecodable frame from {self.names}: {type(e).__name__}: {e}"
+                self.close_with(reason)
+                raise EOFError(reason) from None
+
+        def _dispatch_request(self, seq, raw_args):
+            """Serve the host's call of a callback. What it returns goes back by the argument
+            rules with callables refused too; an interrupt or exit it raised is answered and
+            then raised here, so the execution ends with it."""
+            saved = self._context.marks
+            self._context.marks = None
+            raised = None
+            try:
+                try:
+                    handler, args = raw_args
+                    args = self._unbox(args)
+                    res = self._HANDLERS[handler](self, *args)
+                    reply = (consts.MSG_REPLY, self._box(res))
+                except BaseException as e:
+                    t, v, tb = sys.exc_info()
+                    self._last_traceback = tb
+                    reply = (consts.MSG_EXCEPTION, self._box_exc(t, v, tb))
+                    if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                        raised = e
+            finally:
+                self._context.marks = saved
+            self._send(reply[0], seq, reply[1])
+            if raised is not None:
+                raise raised
+
+        # ------------------------------------------------------------------ closing
+
+        def close(self):
+            """Mark closed and clean up, writing nothing: RPyC's `close` makes a synchronous
+            request of the other side, which may be gone, and `__del__` reaches here."""
+            if self._closed:
+                return
+            self._closed = True
+            self._cleanup(_anyway=True)
+
+        def close_with(self, reason):
+            """Close for `reason`, telling the host first."""
+            _rpc_channels.pop((self.agent, self.binding, self.number), None)
+            with contextlib.suppress(Exception):
+                _write_line(
+                    _encode(
+                        {
+                            "t": "rpc",
+                            "agent": self.agent,
+                            "binding": self.binding,
+                            "id": self.number,
+                            "closed": reason,
+                        }
+                    )
+                )
+            self._channel.close(reason)
+            self.close()
+
+    return Hosted
+
+
 # ---------------------------------------------------------------------------- kernels
 
 _kernels = {}
@@ -1940,9 +2461,62 @@ class Kernel:
         self._bg = collections.deque()
         self._bg_len = 0
         self._bg_dropped = collections.Counter()
+        # Hosted objects: one connection per binding, opened on the thread that first asks, and
+        # numbered for the life of the kernel so a frame for a closed one is never taken for a
+        # new one's.
+        self._hosted = {}
+        self._hosted_lock = threading.Lock()
+        self._hosted_numbers = collections.defaultdict(lambda: itertools.count(1))
 
     def announce(self):
         _send({"t": "ready", "agent": self.agent, "version": _VERSION})
+
+    def hosted(self, binding):
+        """The root of `binding` -- an object in a process on the host -- as a proxy over this
+        kernel's connection to it.
+
+        The connection is opened on the calling thread at first use, and again after one closed;
+        a proxy from a closed connection raises `EOFError` with the reason. Never on the reader
+        thread, which is what delivers the reply this waits for.
+        """
+        if _Hosted is None:
+            raise RuntimeError(_rpyc_missing)
+        if threading.current_thread() is _reader_thread:
+            raise RuntimeError("a hosted object cannot be resolved on the reader thread")
+        if not isinstance(binding, str) or not binding:
+            raise TypeError("a binding is named by a non-empty str")
+        with self._hosted_lock:
+            conn = self._hosted.get(binding)
+            if conn is None or conn.closed or conn._channel.closed:
+                if conn is not None:
+                    _rpc_channels.pop((self.agent, binding, conn.number), None)
+                conn = self._open_hosted(binding)
+                self._hosted[binding] = conn
+        return conn.root
+
+    def _open_hosted(self, binding):
+        agent = self.agent
+        number = next(self._hosted_numbers[binding])
+
+        def write(part, more):
+            # Encoded without the reserve: running out of memory while sending the agent's own
+            # frame is the agent's to see.
+            _write_line(
+                _encode(
+                    {
+                        "t": "rpc",
+                        "agent": agent,
+                        "binding": binding,
+                        "id": number,
+                        "data": base64.b64encode(part).decode("ascii"),
+                        "more": more,
+                    }
+                )
+            )
+
+        channel = FrameChannel(write)
+        _rpc_channels[(agent, binding, number)] = channel
+        return _Hosted(channel, agent=agent, binding=binding, number=number)
 
     def serve(self):
         """Run this kernel's loop on the calling thread for the life of the process."""
@@ -2360,6 +2934,7 @@ _MACHINERY = frozenset(
         asyncio.base_events.BaseEventLoop._run_once,
         asyncio.events.Handle._run,
         _write_line,
+        FrameChannel.send,
         _before_fork,
         _after_fork_in_parent,
         _after_fork_in_child,
@@ -2492,6 +3067,49 @@ def _pending(kernel, request_id, _):
     _send({"t": "pending", "agent": kernel.agent, "id": request_id, "channels": channels})
 
 
+def _rpc(kernel, number, message):
+    """Hand one part of an RPyC frame to the channel of connection `number`, or drop it. Reader
+    thread only.
+
+    A part for a connection that has closed, or that this kernel never opened, is answered with a
+    close notice rather than buffered, so nothing waits on it. The part is decoded before anything
+    changes, so `_handle`'s retry after running out of memory never applies one twice; the notice
+    comes after, and is given up rather than retried.
+    """
+    binding = message.get("binding")
+    if not isinstance(binding, str):
+        raise ValueError("an rpc message without a binding")
+    channel = _rpc_channels.get((kernel.agent, binding, number))
+    if "closed" in message:
+        if channel is not None:
+            channel.close(f"the host closed this connection: {message['closed']}")
+        return
+    part = base64.b64decode(message.get("data", ""), validate=True)
+    if channel is None or channel.closed:
+        _rpc_notice(kernel.agent, binding, number, "this connection is closed")
+        return
+    more = message.get("more") is True
+    try:
+        reason = channel.put(part, more)
+    except MemoryError:
+        # Once more on the reserve, as `_handle` would retry; then the call waiting on this frame
+        # is told rather than left waiting for a part that will never be held.
+        _give_reserve()
+        try:
+            reason = channel.put(part, more)
+        except MemoryError:
+            reason = channel.close("no memory to hold a frame from the binding")
+    if reason is not None:
+        _rpc_notice(kernel.agent, binding, number, reason)
+
+
+def _rpc_notice(agent, binding, number, reason):
+    try:
+        _send({"t": "rpc", "agent": agent, "binding": binding, "id": number, "closed": reason})
+    except MemoryError:
+        _diag(f"connection {number} to {binding!r} closed, but saying so failed: no memory")
+
+
 # What each message addressed to an agent does, with the id it carries. `inv` is answered on the
 # agent's loop; the rest are handled here, on the reader thread.
 _ROUTES = {
@@ -2502,6 +3120,7 @@ _ROUTES = {
     "turn": _turn,
     "observe": _observe,
     "inv": _inventory,
+    "rpc": _rpc,
     "cpu": lambda kernel, request_id, _: kernel.cpu(request_id),
     "cancel": lambda kernel, request_id, _: kernel.cancel(request_id),
     "interrupt": lambda kernel, request_id, message: kernel.interrupt(
@@ -2569,12 +3188,17 @@ def _read():
 
 
 def main():
-    if len(sys.argv) != 2 or not _valid_agent(sys.argv[1]):
-        _diag(f"usage: python3 -I -c <program> <agent-id>; got {sys.argv[1:]!r}")
+    if len(sys.argv) not in (2, 3) or not _valid_agent(sys.argv[1]):
+        _diag(f"usage: python3 -I -c <program> <agent-id> [<rpyc-dir>]; got {sys.argv[1:]!r}")
         os._exit(2)
-    global _primary
+    global _primary, _reader_thread
     # Before any agent exists, and every process it starts inherits it.
     _set_ceiling()
+    # Before the workspace joins `sys.path`, so a module there named `rpyc` is not what this
+    # process imports, and before any agent code runs, so `sys.modules` holds this copy for the
+    # interpreter's life: a later `pip install rpyc` changes nothing in here.
+    if len(sys.argv) == 3:
+        _load_rpyc(sys.argv[2])
     _open_imports()
     primary = Kernel(sys.argv[1])
     primary.thread = threading.current_thread()
@@ -2583,7 +3207,8 @@ def main():
     # Before the reader starts, so no interrupt can arrive with nothing to handle it.
     signal.signal(signal.SIGINT, _on_sigint)
     primary.announce()
-    threading.Thread(target=_read, name="reader", daemon=True).start()
+    _reader_thread = threading.Thread(target=_read, name="reader", daemon=True)
+    _reader_thread.start()
     primary.serve()
 
 

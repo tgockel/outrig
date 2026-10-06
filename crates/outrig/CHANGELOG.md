@@ -162,6 +162,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the archive warns and embeds nothing (`OUTRIG_REQUIRE_PYTHON=1` makes that an error), and every
   `Outrig::launch` in the result fails with `OutrigError::Configuration` saying why. The embedded
   archive adds about 36 MB to a binary that links the crate.
+- **The build also embeds RPyC 6.0.2**, the library that will carry requests between the agent's
+  interpreter and a library hosted in a process on the host. `build.rs` fetches the pinned wheel,
+  verifies its SHA-256, and embeds its members as a tar; the first use unpacks them under
+  `$XDG_CACHE_HOME/outrig/wheels`. `OUTRIG_RPYC_WHEEL` names a local copy for a build with no
+  network, and a build that cannot fetch it degrades as one without the Python payload does. The
+  transport runs in this crate's tests on the host alone; no session uses it yet.
 - **`/outrig` is reserved inside the container.** `Outrig::launch` refuses a workspace or mount
   whose container path is `/outrig` or under it, with `OutrigError::Configuration`.
 

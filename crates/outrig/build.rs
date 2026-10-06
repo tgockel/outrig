@@ -18,17 +18,19 @@
 //!
 //! It also fetches the static CPython every session mounts, verifies it against
 //! the pin below, and hands it to `include_bytes!` the same way (see
-//! `src/python/`). A plain `cargo build` is the whole setup: the archive is
-//! downloaded once per machine into the user's cache, and a build that cannot
-//! reach it degrades exactly as a missing musl target does.
+//! `src/python/`), and does the same for each pure-Python wheel in [`WHEELS`],
+//! unpacked beside the payload. A plain `cargo build` is the whole setup: each
+//! archive is downloaded once per machine into the user's cache, and a build
+//! that cannot reach one degrades exactly as a missing musl target does.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-// The payload checks: `verify_archive`, and the ELF parser it rests on. See
-// `src/python/archive.rs` for why they are shared by `include!`.
+// The payload and wheel checks: `verify_archive`, `verify_digest`, `wheel_to_tar`,
+// and the ELF parser they rest on. See `src/python/archive.rs` for why they are
+// shared by `include!`.
 include!("src/container/enter/elf.rs");
 include!("src/python/archive.rs");
 
@@ -56,6 +58,8 @@ fn main() {
 
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR is set for build scripts");
     python_payload(Path::new(&out_dir));
+    wheels(Path::new(&out_dir));
+    programs(Path::new(&out_dir));
     let dest = Path::new(&out_dir).join("outrig-enter");
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -185,13 +189,43 @@ const PY_PINS: &[(&str, &str, &str, u16)] = &[
 /// A local copy of the pinned archive, for a build with no network. Verified
 /// exactly as a download is.
 const PY_ARCHIVE_ENV: &str = "OUTRIG_PYTHON_ARCHIVE";
-/// As [`REQUIRE_ENTER`], for the Python payload.
+/// As [`REQUIRE_ENTER`], for the Python payload and the wheels beside it.
 const REQUIRE_PYTHON: &str = "OUTRIG_REQUIRE_PYTHON";
 /// As [`REASON_ENV`]; `src/python/payload.rs` reads it back.
 const PY_REASON_ENV: &str = "OUTRIG_PYTHON_UNAVAILABLE_REASON";
 /// The archive's name less `.tar.zst`, which `src/python/payload.rs` unpacks
 /// under: a new pin unpacks beside an old one rather than over it.
 const PY_PAYLOAD_ENV: &str = "OUTRIG_PYTHON_PAYLOAD";
+
+/// A pure-Python wheel the build embeds and a session unpacks beside the
+/// payload, as `src/python/payload.rs` describes.
+struct Wheel {
+    /// The wheel's file name, which is also the download cache's key.
+    name: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+    /// A local copy, for a build with no network; as [`PY_ARCHIVE_ENV`].
+    local_env: &'static str,
+    /// As [`PY_REASON_ENV`].
+    reason_env: &'static str,
+    /// The name less `.whl`, which is the directory the wheel unpacks to and
+    /// the artifact's name under `OUT_DIR`; `payload.rs` reads it back.
+    dir_env: &'static str,
+}
+
+/// Every wheel embedded, one row per pin. RPyC carries hosted-object requests
+/// between the interpreter and each binding process; its one declared
+/// dependency, `plumbum`, is used only by its command-line tools, so it is not
+/// pinned here.
+const WHEELS: &[Wheel] = &[Wheel {
+    name: "rpyc-6.0.2-py3-none-any.whl",
+    url: "https://files.pythonhosted.org/packages/3f/99/\
+          2e119d541d596daea39643eb9312b47c7847383951300f889166938035b1/rpyc-6.0.2-py3-none-any.whl",
+    sha256: "8072308ad30725bc281c42c011fc8c922be15f3eeda6eafb2917cafe1b6f00ec",
+    local_env: "OUTRIG_RPYC_WHEEL",
+    reason_env: "OUTRIG_RPYC_UNAVAILABLE_REASON",
+    dir_env: "OUTRIG_RPYC_DIR",
+}];
 
 /// Fetch, verify, and stage the Python payload as `OUT_DIR/python.tar.zst`.
 fn python_payload(out_dir: &Path) {
@@ -212,8 +246,11 @@ fn python_payload(out_dir: &Path) {
     let payload = format!("cpython-{PY_VERSION}+{PY_RELEASE}-{triple}-noopt+static-full");
     println!("cargo:rustc-env={PY_PAYLOAD_ENV}={payload}");
     let name = format!("{payload}.tar.zst");
+    let url = format!(
+        "https://github.com/astral-sh/python-build-standalone/releases/download/{PY_RELEASE}/{name}"
+    );
 
-    let archive = match fetch_python(&name, sha256, out_dir) {
+    let archive = match fetch_artifact(&url, &name, sha256, PY_ARCHIVE_ENV, out_dir) {
         Ok(archive) => archive,
         Err(why) => return python_unavailable(&dest, &why),
     };
@@ -229,14 +266,121 @@ fn python_payload(out_dir: &Path) {
     std::fs::write(&dest, &archive).expect("write the Python payload");
 }
 
-/// The pinned archive's bytes, from [`PY_ARCHIVE_ENV`] if it is set, else from
-/// the per-user download cache, else downloaded into it. Whether to trust them
-/// is `verify_archive`'s call, not this one's.
-fn fetch_python(name: &str, sha256: &str, out_dir: &Path) -> Result<Vec<u8>, String> {
-    if let Some(path) = std::env::var_os(PY_ARCHIVE_ENV) {
+/// Fetch, verify, and stage each of [`WHEELS`] as `OUT_DIR/<dir>.tar.zst`: the
+/// wheel's members inflated and laid out under `<dir>/`, so the runtime unpacks
+/// it exactly as it unpacks the payload.
+fn wheels(out_dir: &Path) {
+    for wheel in WHEELS {
+        println!("cargo:rerun-if-env-changed={}", wheel.local_env);
+        let dir = wheel
+            .name
+            .strip_suffix(".whl")
+            .expect("a wheel's file name ends in .whl");
+        println!("cargo:rustc-env={}={dir}", wheel.dir_env);
+        let dest = out_dir.join(format!("{dir}.tar.zst"));
+
+        let bytes = match fetch_artifact(
+            wheel.url,
+            wheel.name,
+            wheel.sha256,
+            wheel.local_env,
+            out_dir,
+        ) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                artifact_unavailable(
+                    &dest,
+                    wheel.reason_env,
+                    &why,
+                    &format!(
+                        "hosted objects will be unavailable until a build embeds {}",
+                        wheel.name
+                    ),
+                );
+                continue;
+            }
+        };
+        // As for the payload: a wheel that fails here is the wrong one, not a
+        // missing one, and no build embeds it.
+        let tar = verify_digest(&bytes, wheel.sha256)
+            .and_then(|()| wheel_to_tar(&bytes, dir))
+            .unwrap_or_else(|why| panic!("outrig: refusing the wheel {}: {why}", wheel.name));
+        let compressed = ruzstd::encoding::compress_to_vec(
+            &tar[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        std::fs::write(&dest, compressed).expect("write the wheel's tar");
+    }
+}
+
+/// The Python programs passed to the payload's interpreter as its `-c`
+/// argument, by the name of the bootstrap `OUT_DIR` gets for each.
+const PROGRAMS: &[(&str, &str)] = &[
+    ("interpreter", "src/python/interpreter.py"),
+    ("binding", "src/python/binding.py"),
+];
+
+/// Linux caps one argument string at 32 pages, and the interpreter's source
+/// is past that.
+const ARG_STRLEN_MAX: usize = 128 * 1024;
+
+/// Stage each program as the one-line `-c` argument that runs it: its source
+/// compressed and base64-encoded behind a bootstrap that inflates, compiles
+/// and executes it in `__main__`, exactly as the source itself would run.
+fn programs(out_dir: &Path) {
+    for (name, path) in PROGRAMS {
+        println!("cargo:rerun-if-changed={path}");
+        let source = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&source, 9);
+        let bootstrap = format!(
+            "import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(\"{}\")),\
+             \"<{name}>\",\"exec\"))",
+            base64(&compressed)
+        );
+        assert!(
+            bootstrap.len() < ARG_STRLEN_MAX,
+            "outrig: {path} is {} bytes as a -c argument, past the {ARG_STRLEN_MAX} Linux allows \
+             one argument; it has to shrink, or travel as a file",
+            bootstrap.len()
+        );
+        let dest = out_dir.join(format!("{name}.bootstrap"));
+        std::fs::write(&dest, bootstrap)
+            .unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    }
+}
+
+/// Standard base64 with padding, as Python's `base64.b64decode` reads it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let bits =
+            chunk.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b)) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((bits >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The pinned artifact's bytes, from `local_env` if it is set, else from the
+/// per-user download cache, else downloaded from `url` into it. Whether to
+/// trust them is the caller's verification's call, not this one's.
+fn fetch_artifact(
+    url: &str,
+    name: &str,
+    sha256: &str,
+    local_env: &str,
+    out_dir: &Path,
+) -> Result<Vec<u8>, String> {
+    if let Some(path) = std::env::var_os(local_env) {
         let path = PathBuf::from(path);
         return std::fs::read(&path)
-            .map_err(|e| format!("cannot read {PY_ARCHIVE_ENV}={}: {e}", path.display()));
+            .map_err(|e| format!("cannot read {local_env}={}: {e}", path.display()));
     }
     // Once per machine, not once per target directory, profile, and feature
     // set -- each of which gets its own `OUT_DIR`, the fallback.
@@ -261,17 +405,14 @@ fn fetch_python(name: &str, sha256: &str, out_dir: &Path) -> Result<Vec<u8>, Str
             Some((dir, file))
         })
         .ok_or_else(|| format!("cannot write {partial} to the download cache or OUT_DIR"))?;
-    let url = format!(
-        "https://github.com/astral-sh/python-build-standalone/releases/download/{PY_RELEASE}/{name}"
-    );
     let path = dir.join(name);
-    let downloaded = download(&url, file)
+    let downloaded = download(url, file)
         .and_then(|()| std::fs::rename(dir.join(&partial), &path).map_err(|e| e.to_string()));
     if let Err(e) = downloaded {
         let _ = std::fs::remove_file(dir.join(&partial));
         return Err(format!(
-            "cannot download {url}: {e} -- rebuild with network access, or set \
-             {PY_ARCHIVE_ENV} to a copy of {name}"
+            "cannot download {url}: {e} -- rebuild with network access, or set {local_env} to \
+             a copy of {name}"
         ));
     }
     std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
@@ -306,18 +447,30 @@ fn download(url: &str, mut file: std::fs::File) -> Result<(), String> {
 }
 
 /// As [`unavailable`], for the Python payload: sessions then fail at start with
-/// `msg`. Also names a path that never exists as an input, which makes cargo
-/// rerun this script on every build until one succeeds -- the usual remedy is
-/// simply to rebuild with network, and nothing else it tracks would change.
+/// `msg`.
 fn python_unavailable(dest: &Path, msg: &str) {
+    artifact_unavailable(
+        dest,
+        PY_REASON_ENV,
+        msg,
+        "sessions will not start until a build embeds Python",
+    );
+}
+
+/// As [`unavailable`], for the payload and the wheels, with `consequence` on
+/// the cargo warning and `msg` carried to the runtime in `reason_env`. Also
+/// names a path that never exists as an input, which makes cargo rerun this
+/// script on every build until one succeeds -- the usual remedy is simply to
+/// rebuild with network, and nothing else it tracks would change.
+fn artifact_unavailable(dest: &Path, reason_env: &str, msg: &str, consequence: &str) {
     if std::env::var_os(REQUIRE_PYTHON).is_some() {
         panic!("outrig: {msg} ({REQUIRE_PYTHON} is set)");
     }
-    println!("cargo:warning=outrig: {msg}; sessions will not start until a build embeds Python");
-    println!("cargo:rustc-env={PY_REASON_ENV}={msg}");
+    println!("cargo:warning=outrig: {msg}; {consequence}");
+    println!("cargo:rustc-env={reason_env}={msg}");
     println!(
         "cargo:rerun-if-changed={}",
         dest.with_extension("retry").display()
     );
-    std::fs::write(dest, []).expect("write empty Python payload");
+    std::fs::write(dest, []).expect("write an empty artifact");
 }
